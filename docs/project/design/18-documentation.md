@@ -35,7 +35,7 @@ User documentation is a Sphinx site hosted on Read the Docs, organised by the Di
 | CLI | clap definitions in crates/muructl | a build step writes MyST pages and man pages |
 | Configuration | serde and schemars types in muru-config | JSON Schema, then MyST tables with defaults and descriptions |
 | Admin API | proto/muru/admin/v1 | protoc-gen-doc style output, plus gateway paths from annotations |
-| Python API | python/muru with docstrings and stubs | sphinx.ext.autodoc |
+| Python API | packages/muru/python/muru with docstrings and stubs | sphinx.ext.autodoc |
 | Events and metrics | registries in muru-controller and muru-edge | a build step lists names, labels and descriptions |
 
 Generated pages are rebuilt in CI, and a check fails if the committed copies are stale, so reviews show reference changes alongside code changes.
