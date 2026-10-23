@@ -97,6 +97,14 @@ and are repeated here so that an agent needs nothing else to start work.
   fails, keep the feature branch, report the failure, and wait for
   instructions.
 
+- Feature branches are squash-merged into `develop`, so each change lands as
+  one commit whose message is the pull request title and description, and
+  fix-up commits on the branch disappear. Release pull requests from
+  `develop` into `main` use a normal merge commit, so `main` keeps the full
+  history of each release and tags sit on a real merge point. Never use
+  rebase merges, which are disabled in the repository settings; do not rebase
+  or force-push a branch that has been pushed, either.
+
 ## Project process
 
 - Run the relevant `just test` targets before reporting work as complete,
