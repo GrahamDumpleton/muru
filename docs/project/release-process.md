@@ -33,7 +33,12 @@ setup, for each of the two distributions, is to register the workflow as a
 publisher on PyPI: project name `muru` (then `muructl`), owner
 `GrahamDumpleton`, repository `muru`, workflow `release.yml`, environment
 `pypi`. Before the first release this is done as a "pending publisher",
-which creates the project on first publish. The GitHub side is the `pypi`
+which creates the project on first publish. PyPI may refuse a second
+pending publisher for the same workflow while the first is still pending;
+in that case publish the first distribution, register the second project's
+publisher (now that the first is a real publisher), and re-run the failed
+publish job. The publish step skips files that already exist on PyPI, so
+the re-run uploads only what is missing. The GitHub side is the `pypi`
 environment, limited to release tags and requiring a maintainer's approval.
 
 TestPyPI is not used: the workflow installs every built wheel in a clean
