@@ -140,13 +140,15 @@ jobs:
         run: |
           set -eu
           expected="${{ needs.version.outputs.pep440 }}"
+          cargo="${{ needs.version.outputs.cargo }}"
           for py in $PYTHONS; do
             uv python install "$py"
             uv venv --python "$py" "venv-$py"
             uv pip install --python "venv-$py" --no-index --no-build --find-links dist muru muructl
             got=$("venv-$py/bin/python" -c 'import muru; print(muru.__version__)')
             [ "$got" = "$expected" ] || { echo "muru.__version__ is $got, expected $expected" >&2; exit 1; }
-            "venv-$py/bin/muructl" --version | grep -F "$expected" || { echo "muructl --version does not report $expected" >&2; exit 1; }
+            # The binary reports the Cargo form of the version (0.1.0-alpha.1), the wheel the PEP 440 form (0.1.0a1).
+            "venv-$py/bin/muructl" --version | grep -F -e "$cargo" -e "$expected" || { echo "muructl --version does not report $cargo" >&2; exit 1; }
             echo "ok $py"
           done
 
