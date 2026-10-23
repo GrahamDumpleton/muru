@@ -5,6 +5,7 @@ repos:
   - repo: local
     hooks:
       - id: no-em-dashes
+        stages: [pre-commit]
         name: no em dashes in text files
         entry: sh scripts/check-no-em-dashes.sh
         language: system
@@ -17,18 +18,21 @@ repos:
         stages: [commit-msg]
 
       - id: ruff-format
+        stages: [pre-commit]
         name: ruff format
         entry: uv run ruff format
         language: system
         types: [python]
 
       - id: ruff-check
+        stages: [pre-commit]
         name: ruff check
         entry: uv run ruff check --fix
         language: system
         types: [python]
 
       - id: rustfmt
+        stages: [pre-commit]
         name: rustfmt
         entry: sh -c 'if command -v cargo >/dev/null 2>&1; then cargo fmt --all; else echo "cargo not found; skipping rustfmt"; fi'
         language: system
