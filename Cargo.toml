@@ -30,7 +30,7 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-pyo3 = { version = "0.27", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module"] }
 thiserror = "2"
 tracing = "0.1"
 

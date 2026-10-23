@@ -50,8 +50,12 @@ fn main() -> anyhow::Result<()> {
     // Nothing is implemented yet; the skeleton only establishes the command shape.
     let name = match cli.command {
         Command::Run => "run",
-        Command::Daemon { command: DaemonCommand::Run } => "daemon run",
-        Command::Edge { command: EdgeCommand::Run } => "edge run",
+        Command::Daemon {
+            command: DaemonCommand::Run,
+        } => "daemon run",
+        Command::Edge {
+            command: EdgeCommand::Run,
+        } => "edge run",
     };
     anyhow::bail!("muructl {name} is not implemented yet; see docs/project/roadmap.md")
 }
