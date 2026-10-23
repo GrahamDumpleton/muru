@@ -150,6 +150,9 @@ and are repeated here so that an agent needs nothing else to start work.
 | `just test-linux` | Linux suites inside the development container |
 | `just docs` | Build the documentation with warnings as errors |
 | `just docs-latex` | Check the LaTeX source for the PDF builds cleanly (the PDF itself is built on Read the Docs) |
+| `just changelog-draft` | Preview the changelog the fragments would produce |
+| `just changelog` | Build the changelog from the fragments, in the release pull request |
+| `just bump X.Y.Z` | Set the version in Cargo.toml, the only place it is stated |
 | `nox -s tests-3.13` | Python tests on one interpreter, created with uv |
 
 ## Test markers

@@ -10,7 +10,8 @@ with attestations, so no long-lived tokens exist. The design is in
 
 1. Release pull request from `develop` to `main`: version bump with
    `just bump X.Y.Z` (Cargo.toml is the only place the version is stated),
-   changelog built from the towncrier fragments, documentation updated.
+   changelog built from the towncrier fragments (`just changelog`),
+   documentation updated.
 
 2. Merge, then tag `vX.Y.Z` on `main` (`git tag vX.Y.Z && git push origin
    vX.Y.Z`). The workflow refuses a tag that does not match Cargo.toml.

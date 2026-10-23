@@ -140,7 +140,15 @@ bump version:
 
 # Preview the changelog that the fragments would produce.
 changelog-draft:
-    uv run towncrier build --draft
+    uv run towncrier build --draft --version "$(just version-pep440)"
+
+# Build the changelog from the fragments, for the release pull request.
+changelog:
+    uv run towncrier build --yes --version "$(just version-pep440)"
+
+# Print the project version in PEP 440 form, as PyPI shows it.
+version-pep440:
+    @uv run python -c "from packaging.version import Version; print(Version('$(just version)'))"
 
 # Remove build output.
 clean:
