@@ -1,5 +1,9 @@
 version: 2
 
+# The PDF is built by the pdf job below; listing it here publishes it.
+formats:
+  - pdf
+
 build:
   os: ubuntu-24.04
   tools:
@@ -16,6 +20,10 @@ build:
     build:
       html:
         - UV_PROJECT_ENVIRONMENT="$READTHEDOCS_VIRTUALENV_PATH" uv run sphinx-build -W --keep-going -b html docs "$READTHEDOCS_OUTPUT/html"
+      pdf:
+        - UV_PROJECT_ENVIRONMENT="$READTHEDOCS_VIRTUALENV_PATH" uv run sphinx-build -W --keep-going -b latex docs "$READTHEDOCS_OUTPUT/latex"
+        - make -C "$READTHEDOCS_OUTPUT/latex" all-pdf LATEXMKOPTS="-interaction=nonstopmode -f"
+        - mkdir -p "$READTHEDOCS_OUTPUT/pdf" && cp "$READTHEDOCS_OUTPUT/latex/muru.pdf" "$READTHEDOCS_OUTPUT/pdf/muru.pdf"
 
 sphinx:
   configuration: docs/conf.py
