@@ -1,0 +1,44 @@
+name: Feature request
+description: Describe a problem or requirement for the maintainer to consider
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A clearly stated requirement is more useful than a patch. Implementation suggestions are welcome but not required.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: requirement
+    attributes:
+      label: Desired behaviour, stated as a requirement
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: input
+    id: scale
+    attributes:
+      label: Who is affected and at what scale
+  - type: input
+    id: section
+    attributes:
+      label: Related specification section, if known
+      description: For example 4.11 (upload offloading).
+  - type: checkboxes
+    id: testing
+    attributes:
+      label: Testing
+      options:
+        - label: I am willing to test an implementation.

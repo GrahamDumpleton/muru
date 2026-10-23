@@ -1,0 +1,23 @@
+# Documentation link check on pull requests that touch the docs. The build
+# with warnings as errors runs in ci.yml; Read the Docs builds previews.
+
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "CHANGELOG.md"
+      - "pyproject.toml"
+      - ".github/workflows/docs.yml"
+
+jobs:
+  linkcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --only-group docs
+      - run: uv run sphinx-build -b linkcheck docs docs/_build/linkcheck

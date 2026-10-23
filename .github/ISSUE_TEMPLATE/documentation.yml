@@ -1,0 +1,20 @@
+name: Documentation
+description: Something in the documentation is wrong, missing or unclear
+labels: [documentation]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page or URL
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong, missing or unclear
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested correction

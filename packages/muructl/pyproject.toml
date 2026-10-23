@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "muructl"
+dynamic = ["version"]   # taken from Cargo.toml by maturin
+description = "Muru: routing edge, control plane and Python runtime for WSGI and ASGI applications"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Graham Dumpleton" }]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Server",
+]
+
+[project.optional-dependencies]
+uv = ["uv>=0.5"]
+
+[project.urls]
+Homepage = "https://github.com/GrahamDumpleton/muru"
+Documentation = "https://muru.readthedocs.io/"
+Repository = "https://github.com/GrahamDumpleton/muru"
+Changelog = "https://github.com/GrahamDumpleton/muru/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+manifest-path = "../../crates/muructl/Cargo.toml"
+bindings = "bin"

@@ -1,0 +1,83 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Muru accepts contributions as requirements and bug reports rather than pull requests; see CONTRIBUTING.md.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences on what goes wrong.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Muru version
+      description: Output of `muructl --version`.
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version and build
+      description: For example 3.13.2, or 3.14t for a free-threaded build.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      description: For example Ubuntu 24.04 x86_64, or macOS 15 arm64.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How Muru runs
+      options:
+        - muructl run (development mode)
+        - user daemon
+        - system daemon
+        - container release
+    validations:
+      required: true
+  - type: input
+    id: framework
+    attributes:
+      label: Interface and framework
+      description: WSGI or ASGI, and the framework and version, for example Django 5.2.
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration excerpt
+      description: The relevant configuration, with secrets removed.
+      render: toml
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Output of `muructl debug report` (it redacts secrets), or relevant log lines and events.
+      render: text
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the existing issues and discussions.
+          required: true

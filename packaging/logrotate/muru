@@ -1,0 +1,15 @@
+# External rotation for Muru log files (design specification section 11.3).
+# Set rotate = 'external' on the sinks so built-in rotation is disabled.
+
+/var/log/muru/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/bin/muructl logs reopen --workers >/dev/null 2>&1 || true
+    endscript
+}

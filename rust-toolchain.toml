@@ -1,0 +1,4 @@
+# Latest stable for releases; the minimum supported version is checked in CI.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

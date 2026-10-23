@@ -1,0 +1,3 @@
+# Temporary working files live here and are never part of the repository.
+*
+!.gitignore

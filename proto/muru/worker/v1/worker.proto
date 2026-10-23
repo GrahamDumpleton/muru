@@ -1,0 +1,108 @@
+// Worker protocol between the edge and Python workers (design specification
+// section 5). This is the draft from the specification; the exact messages
+// are a phase 0 deliverable and change additively within a major version.
+
+syntax = "proto3";
+
+package muru.worker.v1;
+
+service Worker {
+  // One HTTP request.
+  rpc Handle(stream RequestFrame) returns (stream ResponseFrame);
+  // One WebSocket.
+  rpc Socket(stream SocketFrame) returns (stream SocketFrame);
+  // Load, memory, GIL and loop signals.
+  rpc Status(StatusRequest) returns (StatusReply);
+  // Drain, reopen logs, log levels, stacks, precheck mode.
+  rpc Control(ControlRequest) returns (ControlReply);
+}
+
+message RequestFrame {
+  oneof frame {
+    RequestHead head = 1;
+    bytes body = 2;
+    Trailers trailers = 3;
+    Cancel cancel = 4;
+  }
+}
+
+message ResponseFrame {
+  oneof frame {
+    ResponseHead head = 1;
+    bytes body = 2;
+    FileHint file = 3;
+    Trailers trailers = 4;
+    InternalRedirect redirect = 5;
+  }
+}
+
+message RequestHead {
+  string protocol_version = 1;      // for example 1.0
+  string request_id = 2;
+  string method = 3;
+  string scheme = 4;
+  bytes raw_path = 5;
+  bytes query = 6;
+  repeated Header headers = 7;      // ordered raw byte pairs
+  Peer client = 8;                  // resolved client
+  Peer server = 9;
+  Peer proxy = 10;                  // original peer when behind trusted proxies
+  TlsInfo tls = 11;
+  string mount = 12;
+  string script_name = 13;
+  string route = 14;
+  string release = 15;
+  uint64 deadline_unix_ms = 16;
+  optional uint64 content_length = 17;
+  bool body_buffered = 18;
+  uint64 max_body_size = 19;
+  InternalContext internal = 20;    // REDIRECT_* values, trusted redirect headers, error reason
+  map<string, string> host_captures = 21;
+  repeated UploadRef uploads = 22;  // descriptors delivered on the side channel
+  bool precheck = 23;
+}
+
+// The messages below are placeholders to be completed in phase 0.
+
+message Header {
+  bytes name = 1;
+  bytes value = 2;
+}
+
+message Peer {
+  string address = 1;
+  uint32 port = 2;
+}
+
+message TlsInfo {}
+
+message InternalContext {}
+
+message UploadRef {
+  string ref = 1;
+}
+
+message ResponseHead {
+  uint32 status = 1;
+  repeated Header headers = 2;
+}
+
+message FileHint {}
+
+message InternalRedirect {}
+
+message Trailers {
+  repeated Header headers = 1;
+}
+
+message Cancel {}
+
+message SocketFrame {}
+
+message StatusRequest {}
+
+message StatusReply {}
+
+message ControlRequest {}
+
+message ControlReply {}

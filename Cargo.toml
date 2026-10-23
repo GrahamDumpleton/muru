@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# muru-py needs a Python interpreter to build, so plain `cargo check` and
+# `cargo test` leave it out; `just dev` builds it through maturin.
+default-members = [
+    "crates/muructl",
+    "crates/muru-common",
+    "crates/muru-config",
+    "crates/muru-proto",
+    "crates/muru-edge",
+    "crates/muru-controller",
+    "crates/muru-supervisor",
+    "crates/muru-dashboard",
+    "crates/muru-testkit",
+]
+
+[workspace.package]
+# The only place the project version is stated. Change it with `just bump`.
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/GrahamDumpleton/muru"
+homepage = "https://github.com/GrahamDumpleton/muru"
+authors = ["Graham Dumpleton"]
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+pyo3 = { version = "0.27", features = ["extension-module"] }
+thiserror = "2"
+tracing = "0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

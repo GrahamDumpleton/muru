@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-*/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# Documentation
+/docs/_build/
+
+# Editors and systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Fuzzing and benchmarks
+/fuzz/artifacts/
+/fuzz/corpus/
+/bench/results/
+
+# Local tooling
+/.env
+/.envrc

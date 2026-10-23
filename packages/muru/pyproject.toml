@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "muru"
+dynamic = ["version"]   # taken from Cargo.toml by maturin
+description = "Muru runtime library for WSGI and ASGI applications"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Graham Dumpleton" }]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Server",
+]
+
+[project.urls]
+Homepage = "https://github.com/GrahamDumpleton/muru"
+Documentation = "https://muru.readthedocs.io/"
+Repository = "https://github.com/GrahamDumpleton/muru"
+Changelog = "https://github.com/GrahamDumpleton/muru/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+manifest-path = "../../crates/muru-py/Cargo.toml"
+python-source = "../../python"
+module-name = "muru._native"
+features = ["pyo3/extension-module"]

@@ -1,0 +1,15 @@
+[package]
+name = "muru-edge"
+description = "The Muru edge: listeners, TLS, virtual hosts, routing, the request pipeline, upstreams, static files and uploads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

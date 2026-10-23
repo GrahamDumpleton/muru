@@ -1,0 +1,125 @@
+# Development workspace for Muru. This project is never published: the two
+# distributions live under packages/muru and packages/muructl. This file holds
+# the shared development environment and tool configuration.
+
+[project]
+name = "muru-workspace"
+version = "0"   # never published; the project version lives in Cargo.toml
+description = "Development workspace for Muru (not published)"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "maturin>=1.8,<2",
+    "mypy>=1.14",
+    "nox>=2025.2.9",
+    "pre-commit>=4.0",
+    "pytest>=8.3",
+    "ruff>=0.9",
+    "towncrier>=24.8",
+]
+docs = [
+    "furo>=2024.8.6",
+    "myst-parser>=4.0",
+    "sphinx>=8.1",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.6",
+    "sphinxcontrib-mermaid>=1.0",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev", "docs"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["scratch", "docs/_build", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "D", "ANN", "RUF"]
+ignore = [
+    "ANN401",  # Any is sometimes the honest type
+    "D105",    # dunder methods implementing standard protocols need no docstring
+    "D107",    # __init__ is documented on the class
+    "D202",    # the project puts a blank line after a function docstring (AGENTS.md)
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+    "RUF012",  # mutable class attributes are fine in this code base
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ANN"]
+"docs/**" = ["D"]
+"noxfile.py" = ["D"]
+"bench/**" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.isort]
+known-first-party = ["muru"]
+
+[tool.mypy]
+strict = true
+files = ["python/muru"]
+mypy_path = "python"
+python_version = "3.11"
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["python"]
+addopts = "-m 'not requires_docker and not requires_network and not requires_root and not slow'"
+markers = [
+    "requires_docker: needs a container runtime",
+    "requires_network: needs network access",
+    "requires_root: needs root (cgroups, user switching)",
+    "requires_linux: needs Linux-only features",
+    "slow: takes a long time",
+]
+
+[tool.towncrier]
+name = "Muru"
+directory = "changelog.d"
+filename = "CHANGELOG.md"
+start_string = "<!-- towncrier release notes start -->\n"
+underlines = ["", "", ""]
+title_format = "## {version} ({project_date})"
+issue_format = "[#{issue}](https://github.com/GrahamDumpleton/muru/issues/{issue})"
+
+[[tool.towncrier.type]]
+directory = "added"
+name = "Added"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "changed"
+name = "Changed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "deprecated"
+name = "Deprecated"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "removed"
+name = "Removed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "fixed"
+name = "Fixed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "security"
+name = "Security"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "docs"
+name = "Documentation"
+showcontent = true

@@ -1,0 +1,17 @@
+{
+  "name": "muru",
+  "build": {
+    "dockerfile": "../images/dev/Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "mounts": [
+    "source=muru-cargo-target,target=/workspace/target,type=volume",
+    "source=muru-venv,target=/workspace/.venv,type=volume"
+  ],
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/workspace/target"
+  },
+  "postCreateCommand": "just bootstrap"
+}

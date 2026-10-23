@@ -1,0 +1,15 @@
+[package]
+name = "muru-testkit"
+description = "Test harness for Muru: spawning the daemon, fake workers, HTTP clients and fixtures."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

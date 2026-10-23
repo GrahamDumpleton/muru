@@ -1,0 +1,40 @@
+# Linux virtual machine for Linux-only tests (design specification section
+# 15.6): a recent Ubuntu with systemd, cgroups v2 delegation and Docker
+# running natively. Start with `just vm-up`, open a shell with
+# `just vm-shell`. Also usable with OrbStack machines.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends build-essential pkg-config git curl ca-certificates just docker.io
+      usermod -aG docker "${LIMA_CIDATA_USER:-ubuntu}" || true
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      curl -LsSf https://astral.sh/uv/install.sh | sh

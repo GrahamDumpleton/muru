@@ -1,0 +1,3 @@
+# Keep the directory even when it holds no fragments.
+!.gitignore
+!README.md

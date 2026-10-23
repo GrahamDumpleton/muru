@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/GrahamDumpleton/muru/discussions
+    about: Ask questions and discuss open-ended ideas in GitHub Discussions.
+  - name: Security vulnerability
+    url: https://github.com/GrahamDumpleton/muru/security/advisories/new
+    about: Report security problems privately through a security advisory.
+  - name: Documentation
+    url: https://muru.readthedocs.io/
+    about: Tutorials, how-to guides, reference and the design specification.

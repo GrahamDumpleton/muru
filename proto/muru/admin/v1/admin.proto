@@ -1,0 +1,6 @@
+// Admin API (design specification section 10.6 and Appendix B). Message
+// shapes are defined during phase 2; this file reserves the package.
+
+syntax = "proto3";
+
+package muru.admin.v1;

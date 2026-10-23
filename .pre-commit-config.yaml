@@ -1,0 +1,36 @@
+# Mechanical checks of the rules in AGENTS.md. `just bootstrap` installs these
+# as git hooks (pre-commit and commit-msg) in .git/hooks.
+
+repos:
+  - repo: local
+    hooks:
+      - id: no-em-dashes
+        name: no em dashes in text files
+        entry: sh scripts/check-no-em-dashes.sh
+        language: system
+        pass_filenames: false
+
+      - id: commit-message
+        name: commit message has no agent attribution
+        entry: sh scripts/check-commit-message.sh
+        language: system
+        stages: [commit-msg]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+
+      - id: rustfmt
+        name: rustfmt
+        entry: sh -c 'if command -v cargo >/dev/null 2>&1; then cargo fmt --all; else echo "cargo not found; skipping rustfmt"; fi'
+        language: system
+        types: [rust]
+        pass_filenames: false
