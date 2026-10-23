@@ -14,7 +14,8 @@ rollback are policy changes, not restarts.
 ```{admonition} Status
 :class: warning
 
-Muru is at the design stage. Nothing here is released yet. The
+Muru is at the design stage. Pre-releases of the 0.1.0 line are on PyPI,
+but nothing runs yet. The
 [design specification](project/design/index.md) describes what is being built
 and the [roadmap](project/roadmap.md) describes in what order.
 ```

@@ -28,18 +28,19 @@ with attestations, so no long-lived tokens exist. The design is in
 ## Publishing setup
 
 Releases are published only by the release workflow, using PyPI trusted
-publishing (OpenID Connect), so no API tokens exist anywhere. The one-time
-setup, for each of the two distributions, is to register the workflow as a
-publisher on PyPI: project name `muru` (then `muructl`), owner
-`GrahamDumpleton`, repository `muru`, workflow `release.yml`, environment
-`pypi`. Before the first release this is done as a "pending publisher",
-which creates the project on first publish. PyPI may refuse a second
-pending publisher for the same workflow while the first is still pending;
-in that case publish the first distribution, register the second project's
-publisher (now that the first is a real publisher), and re-run the failed
-publish job. The publish step skips files that already exist on PyPI, so
-the re-run uploads only what is missing. The GitHub side is the `pypi`
+publishing (OpenID Connect), so no API tokens exist anywhere. Both
+distributions, `muru` and `muructl`, have the workflow registered as their
+publisher on PyPI: owner `GrahamDumpleton`, repository `muru`, workflow
+`release.yml`, environment `pypi`. The GitHub side is the `pypi`
 environment, limited to release tags and requiring a maintainer's approval.
+
+If a further distribution is ever added, register it on PyPI as a "pending
+publisher" with the same details before its first release; the project is
+created on first publish. PyPI accepts only one pending publisher for a
+given workflow at a time, so if the first release of two new distributions
+fails on the second one, register its publisher after the first has
+published and re-run the publish job. The publish step skips files that
+already exist on PyPI, so a re-run uploads only what is missing.
 
 TestPyPI is not used: the workflow installs every built wheel in a clean
 environment before publishing, and an upload-level problem on a pre-release

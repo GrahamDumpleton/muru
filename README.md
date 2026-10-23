@@ -1,5 +1,12 @@
 # Muru
 
+[![CI](https://github.com/GrahamDumpleton/muru/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/GrahamDumpleton/muru/actions/workflows/ci.yml)
+[![Documentation](https://img.shields.io/readthedocs/muru?label=docs)](https://muru.readthedocs.io/)
+[![PyPI muructl](https://img.shields.io/pypi/v/muructl?label=muructl)](https://pypi.org/project/muructl/)
+[![PyPI muru](https://img.shields.io/pypi/v/muru?label=muru)](https://pypi.org/project/muru/)
+[![Python versions](https://img.shields.io/pypi/pyversions/muru)](https://pypi.org/project/muru/)
+[![Licence](https://img.shields.io/github/license/GrahamDumpleton/muru)](https://github.com/GrahamDumpleton/muru/blob/main/LICENSE)
+
 Muru is a routing edge, control plane and Python runtime for serving WSGI and
 ASGI applications, with zero-downtime releases, traffic management and
 Python-aware process management.
@@ -14,8 +21,8 @@ rollback are policy changes, not restarts. The same model runs from
 
 ## Status
 
-Muru is at the design stage. Nothing is released and nothing runs yet. This
-repository holds the project skeleton, the
+Muru is at the design stage. Pre-releases of the 0.1.0 line are on PyPI,
+but nothing runs yet. This repository holds the project skeleton, the
 [design specification](docs/project/design/index.md) and the initial
 [architecture decision records](docs/project/adr/index.md). The
 [roadmap](docs/project/roadmap.md) lists the phases, starting with a phase 0
