@@ -107,3 +107,17 @@ jobs:
           enable-cache: true
       - run: uv sync --only-group docs
       - run: uv run sphinx-build -W --keep-going -b html docs docs/_build/html
+
+  ci-ok:
+    # One check for branch rules to require, so the job list and matrices can
+    # change without the rules going stale. Fails if any job did not succeed.
+    needs: [lint, rust, msrv, extension, python, docs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo 'A required job did not succeed:'
+          echo '${{ toJSON(needs) }}'
+          exit 1
+      - run: echo "all jobs succeeded"
