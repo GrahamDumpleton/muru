@@ -94,6 +94,10 @@ bench:
 docs:
     uv run sphinx-build -W --keep-going -b html docs docs/_build/html
 
+# Build the LaTeX source for the PDF, which Read the Docs turns into the PDF (no TeX needed here).
+docs-latex:
+    uv run sphinx-build -W --keep-going -b latex docs docs/_build/latex
+
 # Check documentation links.
 docs-linkcheck:
     uv run sphinx-build -b linkcheck docs docs/_build/linkcheck

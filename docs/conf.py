@@ -25,6 +25,7 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.intersphinx",
     "sphinxcontrib.mermaid",
+    "mermaid_fallback",
     "sphinx_copybutton",
     "sphinx_design",
     "adr_index",
@@ -56,6 +57,8 @@ autodoc_typehints = "description"
 copybutton_prompt_text = r">>> |\.\.\. |\$ "
 copybutton_prompt_is_regexp = True
 
-linkcheck_ignore = [
-    r"https://github.com/GrahamDumpleton/muru.*",  # private until the first release
-]
+# PDF output, built on Read the Docs from the LaTeX builder. Mermaid diagrams
+# appear as source listings there (see docs/_ext/mermaid_fallback.py).
+latex_documents = [("index", "muru.tex", "Muru", author, "manual")]
+latex_show_urls = "footnote"
+latex_elements = {"papersize": "a4paper"}

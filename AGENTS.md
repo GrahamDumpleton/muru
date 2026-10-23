@@ -149,6 +149,7 @@ and are repeated here so that an agent needs nothing else to start work.
 | `just test-docker` | Container scenarios (needs a container runtime) |
 | `just test-linux` | Linux suites inside the development container |
 | `just docs` | Build the documentation with warnings as errors |
+| `just docs-latex` | Check the LaTeX source for the PDF builds cleanly (the PDF itself is built on Read the Docs) |
 | `nox -s tests-3.13` | Python tests on one interpreter, created with uv |
 
 ## Test markers
