@@ -54,7 +54,7 @@ jobs:
       # that package as the project and try to build it instead.
       - run: uvx --from 'maturin>=1.8,<2' maturin sdist --out dist
         working-directory: packages/${{ matrix.package }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist-${{ matrix.package }}
           path: packages/${{ matrix.package }}/dist/*.tar.gz
@@ -89,7 +89,7 @@ jobs:
             uv python install ${{ env.PYTHONS }}
             for py in ${{ env.PYTHONS }}; do ln -sf "$(uv python find "$py")" "/usr/local/bin/python$py"; done
           args: --release --out dist ${{ matrix.package == 'muru' && '--interpreter python3.11 python3.12 python3.13 python3.14 python3.14t python3.15 python3.15t' || '' }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.package }}-${{ matrix.target }}
           path: packages/${{ matrix.package }}/dist/*.whl
@@ -115,7 +115,7 @@ jobs:
             for py in $PYTHONS; do interpreters="$interpreters --interpreter $(uv python find --no-project $py)"; done
           fi
           uvx --from 'maturin>=1.8,<2' maturin build --release --out dist $interpreters
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.package }}-${{ matrix.runner }}
           path: packages/${{ matrix.package }}/dist/*.whl
