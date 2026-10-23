@@ -50,7 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-      - run: uv run maturin sdist --out dist
+      # maturin runs as a tool: inside a package directory, uv run would treat
+      # that package as the project and try to build it instead.
+      - run: uvx --from 'maturin>=1.8,<2' maturin sdist --out dist
         working-directory: packages/${{ matrix.package }}
       - uses: actions/upload-artifact@v4
         with:
@@ -102,9 +104,9 @@ jobs:
         run: |
           interpreters=""
           if [ "${{ matrix.package }}" = muru ]; then
-            for py in $PYTHONS; do interpreters="$interpreters --interpreter $(uv python find $py)"; done
+            for py in $PYTHONS; do interpreters="$interpreters --interpreter $(uv python find --no-project $py)"; done
           fi
-          uv run maturin build --release --out dist $interpreters
+          uvx --from 'maturin>=1.8,<2' maturin build --release --out dist $interpreters
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.package }}-${{ matrix.runner }}
