@@ -17,9 +17,9 @@ with attestations, so no long-lived tokens exist. The design is in
 
 3. Watch the release workflow: it builds wheels and sdists for every
    platform and interpreter, installs them in clean environments and checks
-   the version, publishes to TestPyPI and verifies the install from there,
-   then waits. Approve the `pypi` environment to publish to PyPI; the GitHub
-   Release with notes from the changelog and checksums follows.
+   the version, then waits. Approve the `pypi` environment to publish to
+   PyPI; the GitHub Release with notes from the changelog and checksums
+   follows.
 
 4. Check the GitHub Release, the images and the documentation version.
 
@@ -29,13 +29,16 @@ with attestations, so no long-lived tokens exist. The design is in
 
 Releases are published only by the release workflow, using PyPI trusted
 publishing (OpenID Connect), so no API tokens exist anywhere. The one-time
-setup, for each of the two distributions and on both PyPI and TestPyPI, is
-to register the workflow as a publisher: project name `muru` (then
-`muructl`), owner `GrahamDumpleton`, repository `muru`, workflow
-`release.yml`, environment `pypi` on PyPI and `testpypi` on TestPyPI.
-Before the first release this is done as a "pending publisher", which
-creates the project on first publish. The GitHub side is two environments,
-`testpypi` and `pypi`, with `pypi` requiring a maintainer's approval.
+setup, for each of the two distributions, is to register the workflow as a
+publisher on PyPI: project name `muru` (then `muructl`), owner
+`GrahamDumpleton`, repository `muru`, workflow `release.yml`, environment
+`pypi`. Before the first release this is done as a "pending publisher",
+which creates the project on first publish. The GitHub side is the `pypi`
+environment, limited to release tags and requiring a maintainer's approval.
+
+TestPyPI is not used: the workflow installs every built wheel in a clean
+environment before publishing, and an upload-level problem on a pre-release
+costs only a version number.
 
 ## Pre-releases
 
