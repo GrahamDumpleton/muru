@@ -42,9 +42,11 @@ spike that benchmarks the edge-to-worker protocol.
 
 ## Install
 
-Not yet available. When released, `uv tool install muructl` installs the
-command line, and the daemon installs the `muru` runtime library for each
-interpreter it manages.
+Pre-releases of the 0.1.0 line are on PyPI to claim the names and exercise
+the release pipeline; they do not serve requests yet. `uv tool install
+muructl` installs the command line, and the daemon will install the `muru`
+runtime library for each interpreter it manages. The first version that
+works is 0.1.0.
 
 ## Five-minute start
 

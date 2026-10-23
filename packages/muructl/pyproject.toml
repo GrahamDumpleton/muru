@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "muructl"
 dynamic = ["version"]   # taken from Cargo.toml by maturin
-description = "Muru: routing edge, control plane and Python runtime for WSGI and ASGI applications"
+description = "Muru routing edge, control plane and Python runtime for WSGI and ASGI applications"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Graham Dumpleton" }]

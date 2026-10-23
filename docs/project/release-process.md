@@ -50,10 +50,10 @@ costs only a version number.
 Until the first usable version, every release is a pre-release of the 0.1.0
 line: `0.1.0-alpha.1` in Cargo.toml and the tag (`v0.1.0-alpha.1`), which
 is `0.1.0a1` on PyPI (maturin converts the version to PEP 440 form, and the
-release workflow checks the result). pip installs pre-releases only with
-`--pre` or an explicit version, while uv installs them by default when no
-final release exists, so nobody gets a non-functional package by accident.
-The first final release, `0.1.0`, is the first version that serves requests.
+release workflow checks the result). While a project has only pre-releases,
+pip and uv both install the newest of them by default; once a final release
+exists, later pre-releases need `--pre` or an explicit version. The first
+final release, `0.1.0`, is the first version that serves requests.
 
 ## Versioning
 
