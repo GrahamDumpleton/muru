@@ -37,9 +37,7 @@ The source repository is github.com/GrahamDumpleton/muru, and images are publish
 flowchart LR
   T[Tag vX.Y.Z pushed] --> B[Build matrix with maturin-action: wheels, sdists, binaries]
   B --> S[Smoke tests: install wheels in clean environments, muructl run fixture apps, import checks on every Python]
-  S --> TP[Publish to TestPyPI]
-  TP --> V[Install from TestPyPI and verify]
-  V --> A{Approval for the pypi environment}
+  S --> A{Approval for the pypi environment}
   A --> P[Publish to PyPI with trusted publishing and attestations]
   P --> G[GitHub Release: notes from changelog, binaries, checksums, SBOM]
   P --> I[Build, test, sign and push base images]
@@ -55,6 +53,6 @@ flowchart LR
 
 1. Release pull request from develop to main: version bump in Cargo.toml (the only place the version is stated; the distributions, the Python package and the documentation take it from there), changelog built, documentation updated.
 2. Merge, then tag vX.Y.Z on main.
-3. Watch release.yml, approve the pypi environment after the TestPyPI verification.
+3. Watch release.yml, approve the pypi environment once the builds and smoke tests have passed.
 4. Check the GitHub Release, images and documentation version.
 5. Announce, including protocol and configuration compatibility notes.
