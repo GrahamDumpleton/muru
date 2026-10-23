@@ -68,8 +68,8 @@ check_tool() {
 
 check_tool cc true "xcode-select --install" "apt install build-essential pkg-config" cc --version
 check_tool git true "xcode-select --install" "apt install git"
-check_tool rustup true "brew install rustup && rustup-init" "see https://rustup.rs"
-check_tool cargo true "rustup-init" "see https://rustup.rs"
+check_tool rustup true "brew install rustup, then rustup toolchain install stable" "see https://rustup.rs"
+check_tool cargo true "rustup toolchain install stable, and put \$(brew --prefix rustup)/bin on PATH in ~/.zprofile" "rustup toolchain install stable, and put ~/.cargo/bin on PATH"
 check_tool uv true "brew install uv" "see https://docs.astral.sh/uv/getting-started/installation/"
 check_tool just true "brew install just" "apt install just, or cargo install just"
 check_tool cargo-nextest true "just bootstrap" "just bootstrap" cargo nextest --version
