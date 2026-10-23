@@ -1,0 +1,189 @@
+# Build, test and publish a release from a tag (design specification section
+# 17.3). Nothing is published unless every build and smoke test passes, and
+# publishing to PyPI waits for approval of the pypi environment.
+#
+# The tag must match the Cargo workspace version: tag v0.1.0-alpha.1 for
+# version = "0.1.0-alpha.1", which PyPI knows as 0.1.0a1.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  PYTHONS: "3.11 3.12 3.13 3.14 3.14t 3.15 3.15t"
+
+jobs:
+  version:
+    # Check that the tag names the version in Cargo.toml, and work out the
+    # PEP 440 form of it that the wheels and sdists will carry.
+    runs-on: ubuntu-latest
+    outputs:
+      cargo: ${{ steps.v.outputs.cargo }}
+      pep440: ${{ steps.v.outputs.pep440 }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - id: v
+        run: |
+          cargo=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$tag" != "$cargo" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo" >&2
+            exit 1
+          fi
+          pep440=$(uv run --no-project --with packaging python -c "from packaging.version import Version; print(Version('$cargo'))")
+          echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
+          echo "pep440=$pep440" >> "$GITHUB_OUTPUT"
+          echo "releasing $cargo (PyPI $pep440)"
+
+  sdist:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [muru, muructl]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv run maturin sdist --out dist
+        working-directory: packages/${{ matrix.package }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist-${{ matrix.package }}
+          path: packages/${{ matrix.package }}/dist/*.tar.gz
+
+  wheels-linux:
+    # manylinux and musllinux wheels are built in maturin's containers, for
+    # every interpreter the container provides.
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [muru, muructl]
+        include:
+          - { runner: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: packages/${{ matrix.package }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist ${{ matrix.package == 'muru' && '--find-interpreter' || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.package }}-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: packages/${{ matrix.package }}/dist/*.whl
+
+  wheels-macos:
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [muru, muructl]
+        runner: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: uv python install $PYTHONS
+      - name: Build wheels
+        working-directory: packages/${{ matrix.package }}
+        run: |
+          interpreters=""
+          if [ "${{ matrix.package }}" = muru ]; then
+            for py in $PYTHONS; do interpreters="$interpreters --interpreter $(uv python find $py)"; done
+          fi
+          uv run maturin build --release --out dist $interpreters
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.package }}-${{ matrix.runner }}
+          path: packages/${{ matrix.package }}/dist/*.whl
+
+  smoke:
+    # Install the built wheels in clean environments and check they work.
+    needs: [version, sdist, wheels-linux, wheels-macos]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - name: Install and check every interpreter
+        run: |
+          set -eu
+          expected="${{ needs.version.outputs.pep440 }}"
+          for py in $PYTHONS; do
+            uv python install "$py"
+            uv venv --python "$py" "venv-$py"
+            uv pip install --python "venv-$py" --no-index --find-links dist muru muructl
+            got=$("venv-$py/bin/python" -c 'import muru; print(muru.__version__)')
+            [ "$got" = "$expected" ] || { echo "muru.__version__ is $got, expected $expected" >&2; exit 1; }
+            "venv-$py/bin/muructl" --version | grep -F "$expected" || { echo "muructl --version does not report $expected" >&2; exit 1; }
+            echo "ok $py"
+          done
+
+  publish-pypi:
+    # Waits for a maintainer to approve the pypi environment.
+    needs: [version, smoke]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/muru/${{ needs.version.outputs.pep440 }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+
+  github-release:
+    needs: [version, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from the changelog
+        run: |
+          v="${{ needs.version.outputs.pep440 }}"
+          awk -v v="$v" '
+            $0 ~ "^## " v " " { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "No changelog entry for $v." > notes.md
+          cat notes.md
+      - name: Checksums
+        run: (cd dist && sha256sum * > SHA256SUMS)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "${{ needs.version.outputs.cargo }}" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --title "${{ needs.version.outputs.cargo }}" --notes-file notes.md $prerelease
