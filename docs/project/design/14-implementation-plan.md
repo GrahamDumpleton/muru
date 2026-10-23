@@ -142,6 +142,7 @@ The repository's AGENTS.md (with CLAUDE.md pointing to it) carries the following
 - Commit messages never include a co-authored-by trailer or any other agent attribution.
 - An agent never commits on its own initiative. It finishes the piece of work, summarises it and waits to be told to commit. Permission to commit covers only the work it was given for and does not carry forward to later steps of a multi-step plan, each of which needs its own review and instruction. Uncommitted changes are how review happens, so committing early makes review harder.
 - Work happens on feature branches merged into develop, and releases are made from main through a release pull request from develop (section 17.4). After merging a feature branch into develop and pushing, the work is not treated as landed until the GitHub Actions run for the pushed merge has passed (checked with gh run list --branch develop and gh run watch). Only then is the change reported as on the remote and the feature branch deleted. If CI fails, the feature branch is kept, the failure is reported, and the agent waits for instructions.
+- Feature branches are squash-merged into develop, so each change lands as one commit, and release pull requests from develop into main use a normal merge commit, so main keeps the full history of each release. Rebase merges are never used, and pushed branches are never rebased or force-pushed.
 
 **Project process**
 
