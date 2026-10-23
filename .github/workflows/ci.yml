@@ -73,6 +73,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: uv python install ${{ matrix.python }}
       - run: echo "PYO3_PYTHON=$(uv python find ${{ matrix.python }})" >> "$GITHUB_ENV"
       - run: cargo clippy -p muru-py --all-targets -- -D warnings
 
