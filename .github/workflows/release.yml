@@ -169,6 +169,11 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           attestations: true
+          # Both distributions upload in one step. If one of them is refused
+          # (for example, its trusted publisher is not registered yet), the
+          # job can be re-run once that is fixed without the files already on
+          # PyPI failing the upload.
+          skip-existing: true
 
   github-release:
     needs: [version, publish-pypi]
