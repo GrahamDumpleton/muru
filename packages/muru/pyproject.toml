@@ -31,6 +31,6 @@ Changelog = "https://github.com/GrahamDumpleton/muru/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "../../crates/muru-py/Cargo.toml"
-python-source = "../../python"
+python-source = "python"
 module-name = "muru._native"
 features = ["pyo3/extension-module"]
