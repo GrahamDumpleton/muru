@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Local extensions and the runtime library, for autodoc.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "_ext"))
-sys.path.insert(0, str(ROOT / "python"))
+sys.path.insert(0, str(ROOT / "packages" / "muru" / "python"))
 
 project = "Muru"
 author = "Graham Dumpleton"

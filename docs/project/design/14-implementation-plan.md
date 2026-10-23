@@ -31,10 +31,10 @@ muru/
     muru-dashboard/          embedded dashboard assets and handlers
     muru-py/                 PyO3 extension (muru._native): worker gRPC server, bridges, watchdog, side channel
     muru-testkit/            test harness: spawn daemon, fake workers, HTTP clients, fixtures
-  python/muru/               runtime library Python sources, py.typed and stubs
   packages/
     muructl/pyproject.toml   maturin, bindings = bin
-    muru/pyproject.toml      maturin, PyO3 version-specific extension plus python/muru
+    muru/pyproject.toml      maturin, PyO3 version-specific extension plus the Python sources
+    muru/python/muru/        runtime library Python sources, py.typed and stubs
   dashboard/                 templates, styles and vendored htmx and uPlot
   tests/
     python/                  pytest for the runtime library

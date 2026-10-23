@@ -166,9 +166,8 @@ on macOS, but it must not be skipped silently when it could have run.
 | Path | Holds |
 | --- | --- |
 | `crates/` | Rust workspace crates (section 14.1 of the specification) |
-| `python/muru/` | The runtime library's Python sources |
 | `proto/` | Worker and admin protocol definitions |
-| `packages/` | The two PyPI distributions, muructl and muru |
+| `packages/` | The two PyPI distributions; `packages/muru/python/muru/` holds the runtime library's Python sources |
 | `docs/` | Sphinx documentation, including the specification and ADRs |
 | `tests/` | Python, integration and conformance tests and fixture applications |
 | `changelog.d/` | towncrier changelog fragments |
