@@ -1,18 +1,32 @@
 //! The `muructl` binary: CLI, subcommand dispatch and development mode.
 //!
-//! Phase 0 scope: `muructl run` starts a Python host that preloads one WSGI
-//! application and forks workers, then serves HTTP in front of them
-//! (design specification sections 3.1 and 6.1). Every command is defined
-//! once with clap, which later generates help, man pages and the CLI
-//! reference (section 14.4 and Appendix A).
+//! `muructl run` starts a Python host that preloads one WSGI application
+//! and forks workers, then serves HTTP in front of them (design
+//! specification sections 6.1 and 13.1). With --reload, a changed source
+//! file starts a new release behind the same edge (section 9.8). Every
+//! command is defined once with clap, which later generates help, man
+//! pages and the CLI reference (section 14.4 and Appendix A).
+
+mod host;
+mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use tokio::sync::mpsc;
+
+use crate::host::{HostProcess, HostSpec};
+use crate::watch::Watch;
+
+/// How long a host may take to get its workers listening.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the watcher looks for changes.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// How long changes must have stopped before a reload starts.
+const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Routing edge, control plane and Python runtime for WSGI and ASGI applications.
 #[derive(Parser)]
@@ -83,6 +97,24 @@ struct RunArgs {
     /// for example 500ms or 2s.
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     slow: Duration,
+
+    /// Start a new release when a watched source file changes.
+    #[arg(long)]
+    reload: bool,
+
+    /// Directory to watch for changes; defaults to --chdir or the current
+    /// directory. Repeatable.
+    #[arg(long = "reload-dir", value_name = "DIR")]
+    reload_dir: Vec<PathBuf>,
+
+    /// Files that count as source, relative to a watched directory.
+    /// Repeatable; the default is `**/*.py`.
+    #[arg(long = "reload-include", value_name = "GLOB")]
+    reload_include: Vec<String>,
+
+    /// Files that never trigger a reload. Repeatable.
+    #[arg(long = "reload-exclude", value_name = "GLOB")]
+    reload_exclude: Vec<String>,
 
     /// Python interpreter with the muru runtime library installed.
     /// Defaults to the active virtualenv's interpreter, else python3 on PATH.
@@ -223,79 +255,34 @@ fn python_interpreter(explicit: Option<PathBuf>) -> PathBuf {
     }
 }
 
-/// Development mode: one host with forked workers behind an embedded edge.
+/// Development mode: one host with forked workers behind an embedded edge,
+/// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.workers >= 1, "--workers must be at least 1");
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
-    let python = python_interpreter(args.python);
+    let spec = HostSpec {
+        python: python_interpreter(args.python.clone()),
+        app: args.app.clone(),
+        workers: args.workers,
+        threads: args.threads,
+        preload: args.preload.as_str(),
+        hooks: args.hooks.clone(),
+        chdir: args.chdir.clone(),
+        tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
+    };
 
-    let mut command = tokio::process::Command::new(&python);
-    command
-        .arg("-m")
-        .arg("muru.host")
-        .arg("--app")
-        .arg(&args.app)
-        .arg("--socket-dir")
-        .arg(&run_dir)
-        .arg("--workers")
-        .arg(args.workers.to_string())
-        .arg("--threads")
-        .arg(args.threads.to_string())
-        .arg("--preload")
-        .arg(args.preload.as_str())
-        .stdin(Stdio::piped());
-    if let Some(hooks) = &args.hooks {
-        command.arg("--hooks").arg(hooks);
-    }
-    if args.link == Link::Tcp {
-        command
-            .arg("--tcp-base-port")
-            .arg(args.tcp_base_port.to_string());
-    }
-    if let Some(dir) = &args.chdir {
-        command.current_dir(dir);
-    }
-    let mut host = command
-        .spawn()
-        .with_context(|| format!("starting the host with {}", python.display()))?;
-    // The host exits when this end of its stdin closes, whatever happens here.
-    let host_stdin = host.stdin.take();
-
-    let sockets: Vec<PathBuf> = (0..args.workers)
-        .map(|index| match args.link {
-            Link::Unix => run_dir.join(format!("worker-{index}.sock")),
-            Link::Tcp => {
-                let port = args.tcp_base_port + u16::try_from(index).unwrap_or(0);
-                PathBuf::from(format!("127.0.0.1:{port}"))
-            }
-        })
-        .collect();
-    let started = Instant::now();
-    loop {
-        let ready = match args.link {
-            Link::Unix => sockets.iter().all(|path| path.exists()),
-            Link::Tcp => sockets.iter().all(|address| {
-                std::net::TcpStream::connect(address.to_str().unwrap_or("")).is_ok()
-            }),
-        };
-        if ready {
-            break;
-        }
-        if let Some(status) = host.try_wait()? {
-            anyhow::bail!("the host exited with {status} before its workers were ready");
-        }
-        anyhow::ensure!(
-            started.elapsed() < Duration::from_secs(60),
-            "the workers did not start within 60 seconds"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut current = HostProcess::start(&spec, &run_dir, 1)?;
+    if let Err(error) = current.wait_ready(START_TIMEOUT).await {
+        current.stop().await;
+        let _ = std::fs::remove_dir_all(&run_dir);
+        return Err(error);
     }
 
     let edge = muru_edge::Edge::bind(muru_edge::Config {
         listen: args.bind,
-        sockets,
+        sockets: current.sockets.clone(),
         slots: args.threads,
         development: true,
         access_log,
@@ -309,27 +296,118 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         args.threads
     );
 
-    let outcome = tokio::select! {
-        result = edge.run() => result,
-        _ = tokio::signal::ctrl_c() => Ok(()),
-        status = host.wait() => Err(anyhow::anyhow!("the host exited with {}", status?)),
+    let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
+    if args.reload {
+        let directories = if args.reload_dir.is_empty() {
+            vec![args.chdir.clone().unwrap_or_else(|| PathBuf::from("."))]
+        } else {
+            args.reload_dir.clone()
+        };
+        let directories: Vec<PathBuf> = directories
+            .into_iter()
+            .map(|directory| directory.canonicalize().unwrap_or(directory))
+            .collect();
+        let include = if args.reload_include.is_empty() {
+            vec!["**/*.py".to_owned()]
+        } else {
+            args.reload_include.clone()
+        };
+        let watch = Watch::new(directories, &include, &args.reload_exclude)?;
+        println!(
+            "muru: watching {} for changes",
+            watch
+                .directories()
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tokio::spawn(watch.run(WATCH_INTERVAL, changed_tx));
+    } else {
+        drop(changed_tx);
+    }
+
+    let pools = edge.pools();
+    let mut serving = tokio::spawn(edge.run());
+    let mut release = 1;
+    let outcome = loop {
+        tokio::select! {
+            served = &mut serving => {
+                break served.map_err(anyhow::Error::from).and_then(|result| result);
+            }
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+            status = current.exited() => {
+                break Err(anyhow::anyhow!("the host exited with {}", status?));
+            }
+            Some(path) = changed.recv() => {
+                let mut paths = vec![path];
+                settle(&mut changed, &mut paths).await;
+                println!("muru: reloading, {} changed", describe(&paths));
+                loop {
+                    release += 1;
+                    let mut next = match HostProcess::start(&spec, &run_dir, release) {
+                        Ok(next) => next,
+                        Err(error) => {
+                            println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                            break;
+                        }
+                    };
+                    tokio::select! {
+                        ready = next.wait_ready(START_TIMEOUT) => match ready {
+                            Ok(()) => {
+                                match muru_edge::link::LinkPool::new(&next.sockets, args.threads) {
+                                    Ok(pool) => pools.replace(pool),
+                                    Err(error) => {
+                                        println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                        next.stop().await;
+                                        break;
+                                    }
+                                }
+                                println!("muru: switched to release r{release}");
+                                let previous = std::mem::replace(&mut current, next);
+                                tokio::spawn(previous.stop());
+                                break;
+                            }
+                            Err(error) => {
+                                println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                next.stop().await;
+                                break;
+                            }
+                        },
+                        Some(path) = changed.recv() => {
+                            // Section 9.8: a release still starting is abandoned
+                            // when more changes arrive.
+                            let mut paths = vec![path];
+                            settle(&mut changed, &mut paths).await;
+                            println!("muru: {} changed again, restarting the reload", describe(&paths));
+                            next.stop().await;
+                        }
+                    }
+                }
+            }
+        }
     };
 
-    // Stop the host: SIGTERM, and its stdin closes when we drop it.
-    if let Some(pid) = host.id() {
-        // SAFETY: kill(2) with a valid pid and signal has no memory-safety
-        // preconditions; the pid belongs to the child we spawned.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
-        }
-    }
-    drop(host_stdin);
-    if tokio::time::timeout(Duration::from_secs(10), host.wait())
-        .await
-        .is_err()
-    {
-        let _ = host.kill().await;
-    }
+    current.stop().await;
     let _ = std::fs::remove_dir_all(&run_dir);
     outcome
+}
+
+/// Keep collecting changes until none has arrived for the debounce period.
+async fn settle(changed: &mut mpsc::Receiver<PathBuf>, paths: &mut Vec<PathBuf>) {
+    while let Ok(Some(path)) = tokio::time::timeout(DEBOUNCE, changed.recv()).await {
+        paths.push(path);
+    }
+}
+
+/// Name the changed files briefly: the first, and how many more.
+fn describe(paths: &[PathBuf]) -> String {
+    let first = paths
+        .first()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    match paths.len() {
+        0 | 1 => first,
+        more => format!("{first} and {} more", more - 1),
+    }
 }

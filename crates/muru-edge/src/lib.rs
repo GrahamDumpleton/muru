@@ -11,7 +11,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use http::header::{
@@ -50,11 +50,31 @@ pub struct Config {
 /// Concurrent streams accepted per HTTP/2 connection (section 4.18).
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 
+/// The worker pool requests go to, replaceable while the edge runs: a
+/// reload switches to the new release's workers by swapping it (section
+/// 9.8). Each request takes the pool current when it arrives.
+pub struct Pools {
+    current: RwLock<Arc<link::LinkPool>>,
+}
+
+impl Pools {
+    /// The pool for a request arriving now.
+    pub fn current(&self) -> Arc<link::LinkPool> {
+        Arc::clone(&self.current.read().expect("pools poisoned"))
+    }
+
+    /// Send new requests to another set of workers. Requests in flight
+    /// finish on the pool they started with.
+    pub fn replace(&self, pool: link::LinkPool) {
+        *self.current.write().expect("pools poisoned") = Arc::new(pool);
+    }
+}
+
 /// A bound edge, ready to run.
 pub struct Edge {
     listener: TcpListener,
     local: SocketAddr,
-    pool: Arc<link::LinkPool>,
+    pools: Arc<Pools>,
     request_ids: Arc<errors::RequestIds>,
     protocols: Arc<auto::Builder<TokioExecutor>>,
     development: bool,
@@ -64,7 +84,12 @@ pub struct Edge {
 impl Edge {
     /// Bind the listener and prepare the worker pools.
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
-        let pool = Arc::new(link::LinkPool::new(&config.sockets, config.slots)?);
+        let pools = Arc::new(Pools {
+            current: RwLock::new(Arc::new(link::LinkPool::new(
+                &config.sockets,
+                config.slots,
+            )?)),
+        });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let listener = TcpListener::bind(config.listen).await?;
         let local = listener.local_addr()?;
@@ -78,7 +103,7 @@ impl Edge {
         Ok(Self {
             listener,
             local,
-            pool,
+            pools,
             request_ids: Arc::new(errors::RequestIds::new()),
             protocols: Arc::new(protocols),
             development: config.development,
@@ -96,12 +121,17 @@ impl Edge {
         Arc::clone(&self.access_log)
     }
 
+    /// The worker pools, for switching releases while running.
+    pub fn pools(&self) -> Arc<Pools> {
+        Arc::clone(&self.pools)
+    }
+
     /// Accept connections until an accept error occurs.
     pub async fn run(self) -> anyhow::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
             let _ = stream.set_nodelay(true);
-            let pool = Arc::clone(&self.pool);
+            let pools = Arc::clone(&self.pools);
             let ids = Arc::clone(&self.request_ids);
             let protocols = Arc::clone(&self.protocols);
             let local = self.local;
@@ -109,7 +139,7 @@ impl Edge {
             let access_log = Arc::clone(&self.access_log);
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
-                    let pool = Arc::clone(&pool);
+                    let pool = pools.current();
                     let access_log = Arc::clone(&access_log);
                     let request_id = ids.next();
                     async move {

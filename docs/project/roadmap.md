@@ -17,6 +17,10 @@ Current position: phase 1 in progress. Phase 0 landed the framed worker
 link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a fixed pool of
 long-lived application threads and the benchmark harness. Phase 1 so far
 has the WSGI conformance suite (`just conformance`) and the bridge
-behaviour it pins down, request body handling at the edge (buffering,
-the size limit and 100-continue), and the host lifecycle: preload modes
-with the import check, hooks and `muru.context()`.
+behaviour it pins down, request body handling at the edge (buffering, the
+size limit and 100-continue), the host lifecycle (preload modes with the
+import check, hooks and `muru.context()`), HTTP/2 with h2spec, negotiated
+error pages and request identifiers, the access log, and watch reload in
+`muructl run`. Still to come in phase 1: TLS in development, the
+remaining limits and timeouts, tagged worker output, and the minimal
+dashboard.
