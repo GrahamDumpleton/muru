@@ -111,4 +111,11 @@ daemon reports readiness and stopping with sd_notify, SIGTERM and SIGINT
 detach as `daemon stop` does, SIGHUP and `muructl daemon reload` re-read
 the `[proxy]` table, and `daemon stop --timeout` bounds the wait
 (reloading listeners, limits and sinks, journald and socket activation
-later). Next from phase 2: the full read-only dashboard.
+later). The daemon's dashboard (section 10.7) has its first slice:
+`--dashboard` or a `[dashboard]` table serves, on a loopback address, the
+node, every application's releases with their workers and slots, hosts
+and routes, recent requests and events and each serving release's log
+tail, as htmx-refreshed pages and as JSON on the gateway paths, with
+`/metrics` beside them (charts over time, Server-Sent Events, worker
+inspection and mutating actions later). Next from phase 2: worker
+inspection.

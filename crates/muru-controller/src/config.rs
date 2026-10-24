@@ -191,6 +191,13 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
         );
     }
 
+    if document.dashboard.is_some() {
+        plan.warnings.push(
+            "the [dashboard] table belongs in the daemon configuration file and was not applied"
+                .to_owned(),
+        );
+    }
+
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
     }

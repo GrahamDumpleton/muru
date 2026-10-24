@@ -54,6 +54,8 @@ pub struct Config {
     pub access_log: Option<PathBuf>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
+    /// Where the dashboard and JSON gateway are served, or nowhere.
+    pub dashboard: Option<SocketAddr>,
     /// The webhooks events are delivered to (section 11.5).
     pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
@@ -62,6 +64,11 @@ pub struct Config {
 
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
+    /// Everything the dashboard shows (section 10.7).
+    Dashboard {
+        /// Answered with the data.
+        done: oneshot::Sender<muru_dashboard::NodeData>,
+    },
     /// The node's metrics as the Prometheus text exposition.
     Metrics {
         /// Answered with the text.
@@ -191,6 +198,8 @@ pub struct Info {
     pub edge_pid: std::sync::atomic::AtomicU32,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
+    /// Where the dashboard is served, or nowhere.
+    pub dashboard: Option<SocketAddr>,
 }
 
 /// What a ReopenLogs command reached.
@@ -250,6 +259,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     let metrics = config.metrics;
+    let dashboard = config.dashboard;
     let sinks = std::mem::take(&mut config.sinks);
     let locations = config.locations;
 
@@ -360,6 +370,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
+        dashboard,
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -376,6 +387,21 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("cannot listen for metrics on {address}"))?;
             Some(tokio::spawn(crate::metrics::serve(
+                listener,
+                handle.commands.clone(),
+            )))
+        }
+        None => None,
+    };
+
+    // The dashboard and gateway (section 10.7), on an internal address.
+
+    let pages = match dashboard {
+        Some(address) => {
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("cannot listen for the dashboard on {address}"))?;
+            Some(tokio::spawn(crate::dashboard::serve(
                 listener,
                 handle.commands.clone(),
             )))
@@ -516,6 +542,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         delivery.abort();
     }
 
+    if let Some(pages) = pages {
+        pages.abort();
+    }
+
     let _ = std::fs::remove_file(&socket);
     outcome
 }
@@ -581,6 +611,211 @@ fn command_mentions(pid: u32, path: &Path) -> bool {
 }
 
 impl Daemon {
+    /// Everything the dashboard shows (section 10.7): the node from the
+    /// daemon's own facts, the releases from the store and the hosts,
+    /// the requests and pools from the edge, and each serving release's
+    /// log tail from its file.
+    async fn dashboard_data(&mut self) -> muru_dashboard::NodeData {
+        use muru_dashboard::{
+            AppRow, EventRow, HostRow, LogPanel, NodeData, NodeRequestRow, ReleaseRow, RouteRow,
+            Summary,
+        };
+        use muru_edge::access::{format_bytes, format_duration};
+
+        let recent = match self.edge.recent(200).await {
+            Ok(recent) => recent,
+            Err(error) => {
+                tracing::debug!(%error, "the edge's recent requests could not be read");
+                pb::RecentRequests::default()
+            }
+        };
+
+        let mut totals: Vec<u64> = recent
+            .records
+            .iter()
+            .map(|record| record.total_us)
+            .collect();
+        totals.sort_unstable();
+        let percentile = |fraction: f64| -> String {
+            if totals.is_empty() {
+                return "-".to_owned();
+            }
+
+            let index = ((totals.len() - 1) as f64 * fraction).round() as usize;
+            format_duration(Duration::from_micros(totals[index]))
+        };
+        let summary = Summary {
+            rate: format!(
+                "{:.1}",
+                recent.minute_requests as f64 / recent.minute_seconds.max(1) as f64
+            ),
+            p50: percentile(0.5),
+            p95: percentile(0.95),
+            errors: recent.minute_errors,
+            in_flight: recent.pools.iter().map(|pool| pool.busy as usize).sum(),
+        };
+
+        let mut apps = Vec::new();
+
+        for app in self.store.apps().unwrap_or_default() {
+            let mut releases = Vec::new();
+
+            for release in self.store.releases(Some(&app.name)).unwrap_or_default() {
+                let workers = self
+                    .running
+                    .get(&(app.name.clone(), release.id.clone()))
+                    .map_or(0, |running| {
+                        running.sockets.len()
+                            + running
+                                .groups
+                                .iter()
+                                .map(|group| group.sockets.len())
+                                .sum::<usize>()
+                    });
+                let pools: Vec<&pb::PoolState> = recent
+                    .pools
+                    .iter()
+                    .filter(|pool| pool.app == app.name && pool.release == release.id)
+                    .collect();
+                releases.push(ReleaseRow {
+                    id: release.id.clone(),
+                    state: release.state.as_str().to_owned(),
+                    serving: app.current.as_deref() == Some(release.id.as_str()),
+                    message: release.message.clone(),
+                    workers,
+                    slots_busy: pools.iter().map(|pool| pool.busy as usize).sum(),
+                    slots_total: pools.iter().map(|pool| pool.slots as usize).sum(),
+                    waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
+                    created: clock_hms(release.created_unix_ms),
+                });
+            }
+
+            releases.reverse();
+            apps.push(AppRow {
+                name: app.name.clone(),
+                current: app.current.clone().unwrap_or_default(),
+                previous: app.previous.clone().unwrap_or_default(),
+                releases,
+            });
+        }
+
+        let hosts = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, host)| HostRow {
+                name,
+                names: host.names,
+                listeners: host.listeners,
+                tls: host.tls.is_some(),
+                default: host.default,
+            })
+            .collect();
+        let routes = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|route| RouteRow {
+                host: route.host,
+                path: route.path,
+                app: route.app,
+            })
+            .collect();
+        let requests = recent
+            .records
+            .iter()
+            .rev()
+            .map(|record| NodeRequestRow {
+                time: clock_hms(record.started_unix_ms),
+                status: record.status as u16,
+                status_class: (record.status / 100) as u16,
+                reason: record.reason.clone(),
+                method: record.method.clone(),
+                target: record.target.clone(),
+                release: if record.app.is_empty() {
+                    "-".to_owned()
+                } else {
+                    format!("{}@{}", record.app, record.release)
+                },
+                host: record.host.clone(),
+                bytes: format_bytes(record.bytes),
+                total: format_duration(Duration::from_micros(record.total_us)),
+                queue: format_duration(Duration::from_micros(record.queue_us)),
+                application: format_duration(Duration::from_micros(record.application_us)),
+                worker: if record.worker < 0 {
+                    "-".to_owned()
+                } else {
+                    record.worker.to_string()
+                },
+                request_id: record.request_id.clone(),
+            })
+            .collect();
+        let latest = self.store.last_event_sequence().unwrap_or(0);
+        let mut events: Vec<EventRow> = self
+            .store
+            .events_after(latest.saturating_sub(50), 50)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|event| EventRow {
+                sequence: event.sequence,
+                time: clock_hms(event.time_unix_ms),
+                level: event.level.to_owned(),
+                kind: event.kind,
+                subject: event.subject,
+                message: event.message,
+            })
+            .collect();
+        events.reverse();
+        let mut logs = Vec::new();
+
+        for app in &apps {
+            if app.current.is_empty() {
+                continue;
+            }
+
+            let path = self.locations.release_log(&app.name, &app.current);
+            logs.push(LogPanel {
+                app: app.name.clone(),
+                release: app.current.clone(),
+                lines: crate::logs::last_lines(&path, 40).await,
+            });
+        }
+
+        NodeData {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            pid: std::process::id(),
+            uptime: muru_dashboard::uptime(Duration::from_millis(
+                crate::model::now_unix_ms().saturating_sub(self.info.started_unix_ms),
+            )),
+            listeners: self
+                .info
+                .listeners
+                .iter()
+                .map(|(address, tls)| {
+                    format!("{}://{address}", if *tls { "https" } else { "http" })
+                })
+                .collect(),
+            edge_pid: self
+                .info
+                .edge_pid
+                .load(std::sync::atomic::Ordering::Relaxed),
+            snapshot_version: self.edge.snapshot_version(),
+            metrics: self
+                .info
+                .metrics
+                .map(|address| format!("http://{address}/metrics")),
+            summary,
+            apps,
+            hosts,
+            routes,
+            requests,
+            events,
+            logs,
+        }
+    }
+
     /// Section 13.3: re-read the configuration file for what can change
     /// while running, which is the [proxy] table; listeners, limits, the
     /// metrics listener and the event sinks are read at start.
@@ -812,6 +1047,9 @@ impl Daemon {
             }
             Command::Metrics { done } => {
                 let _ = done.send(self.metrics().await);
+            }
+            Command::Dashboard { done } => {
+                let _ = done.send(self.dashboard_data().await);
             }
             Command::Shutdown { .. } => {}
         }
@@ -1511,6 +1749,17 @@ impl Daemon {
 }
 
 /// A wall clock time as HH:MM UTC, for messages.
+/// A Unix time as HH:MM:SS, UTC.
+fn clock_hms(unix_ms: u64) -> String {
+    let seconds = (unix_ms / 1000) % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
 fn clock(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!("{:02}:{:02} UTC", seconds / 3600, (seconds % 3600) / 60)

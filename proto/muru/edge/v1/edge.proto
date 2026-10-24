@@ -22,6 +22,9 @@ service EdgeControl {
   // The edge's metrics as samples (section 11.1), which the daemon
   // aggregates across edges and serves.
   rpc GetMetrics(MetricsRequest) returns (MetricsReport);
+  // Recent requests, the last minute's counters and the state of every
+  // worker pool, for the dashboard (section 10.7).
+  rpc GetRecent(RecentRequest) returns (RecentRequests);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
 }
@@ -123,4 +126,48 @@ message Sample {
 message Label {
   string name = 1;
   string value = 2;
+}
+
+message RecentRequest {
+  uint32 limit = 1;                     // most recent records wanted
+}
+
+message RecentRequests {
+  repeated AccessRecord records = 1;    // oldest first
+  uint64 minute_requests = 2;
+  uint64 minute_errors = 3;
+  uint64 minute_seconds = 4;
+  repeated PoolState pools = 5;
+}
+
+// One access log record (section 11.2).
+message AccessRecord {
+  uint64 started_unix_ms = 1;
+  string request_id = 2;
+  string client = 3;
+  string app = 4;
+  string release = 5;
+  string host = 6;
+  string group = 7;
+  string mount = 8;
+  string method = 9;
+  string target = 10;
+  uint32 status = 11;
+  string reason = 12;
+  uint64 bytes = 13;
+  int32 worker = 14;                    // -1 when no worker served it
+  uint64 queue_us = 15;
+  uint64 application_us = 16;
+  uint64 total_us = 17;
+}
+
+// One worker pool's state.
+message PoolState {
+  string app = 1;
+  string release = 2;
+  string group = 3;
+  uint32 workers = 4;
+  uint32 slots = 5;
+  uint32 busy = 6;
+  uint32 waiting = 7;
 }

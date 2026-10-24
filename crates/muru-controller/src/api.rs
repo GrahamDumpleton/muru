@@ -90,6 +90,10 @@ impl Admin for Service {
                 .metrics
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
+            dashboard: info
+                .dashboard
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
         }))
     }
 

@@ -1,0 +1,45 @@
+<h2>Last minute</h2>
+<div class="tiles">
+  <div class="tile"><div class="label">Requests/s</div><div class="value">{{ data.summary.rate }}</div></div>
+  <div class="tile"><div class="label">p50</div><div class="value">{{ data.summary.p50 }}</div></div>
+  <div class="tile"><div class="label">p95</div><div class="value">{{ data.summary.p95 }}</div></div>
+  <div class="tile"><div class="label">Errors (5xx)</div><div class="value">{{ data.summary.errors }}</div></div>
+  <div class="tile"><div class="label">In flight</div><div class="value">{{ data.summary.in_flight }}</div></div>
+</div>
+<h2 style="margin-top:1rem">Applications and releases</h2>
+<table>
+  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th></tr>
+  {% for app in data.apps %}
+  {% for release in app.releases %}
+  <tr>
+    <td>{{ app.name }}@{{ release.id }}</td>
+    <td class="state-{{ release.state }}">{{ release.state }}</td>
+    <td>{% if release.serving %}yes{% endif %}</td>
+    <td class="num">{{ release.workers }}</td>
+    <td class="num">{{ release.slots_busy }}</td>
+    <td class="num">{{ release.slots_total }}</td>
+    <td class="num">{{ release.waiting }}</td>
+    <td>{{ release.created }}</td>
+    <td>{{ release.message }}</td>
+  </tr>
+  {% endfor %}
+  {% endfor %}
+</table>
+{% if !data.hosts.is_empty() %}
+<h3>Virtual hosts</h3>
+<table>
+  <tr><th>Host</th><th>Names</th><th>Listeners</th><th>TLS</th><th>Default</th></tr>
+  {% for host in data.hosts %}
+  <tr><td>{{ host.name }}</td><td>{{ host.names.join(", ") }}</td><td>{{ host.listeners.join(", ") }}</td><td>{% if host.tls %}yes{% endif %}</td><td>{% if host.default %}yes{% endif %}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if !data.routes.is_empty() %}
+<h3>Routes</h3>
+<table>
+  <tr><th>Host</th><th>Path</th><th>Application</th></tr>
+  {% for route in data.routes %}
+  <tr><td>{{ route.host }}</td><td>{{ route.path }}</td><td>{{ route.app }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}

@@ -1,0 +1,6 @@
+<h2>Logs</h2>
+{% for panel in data.logs %}
+<h3>{{ panel.app }}@{{ panel.release }}</h3>
+<pre>{% for line in panel.lines %}{{ line }}
+{% endfor %}</pre>
+{% endfor %}

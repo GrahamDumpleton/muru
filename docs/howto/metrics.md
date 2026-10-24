@@ -37,8 +37,9 @@ scrape_configs:
       - targets: ["127.0.0.1:9464"]
 ```
 
-In development mode the dashboard serves `/metrics` beside its pages, at
-`http://127.0.0.1:8081/metrics` unless `--dashboard` says otherwise.
+The [dashboard](dashboard.md) serves `/metrics` beside its pages too: in
+development mode at `http://127.0.0.1:8081/metrics` unless `--dashboard`
+says otherwise, and under the daemon on the dashboard's address.
 
 ## What is reported
 

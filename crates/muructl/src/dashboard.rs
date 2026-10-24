@@ -148,7 +148,7 @@ fn collect(inputs: &Inputs) -> Data {
     Data {
         app: inputs.app.clone(),
         release: inputs.release.load(Ordering::Relaxed),
-        uptime: uptime(inputs.started.elapsed()),
+        uptime: muru_dashboard::uptime(inputs.started.elapsed()),
         development: inputs.development,
         listen: inputs.listen.to_string(),
         https: inputs.https.map(|address| address.to_string()),
@@ -156,17 +156,5 @@ fn collect(inputs: &Inputs) -> Data {
         workers,
         requests,
         logs: inputs.logs.recent(LOG_LINES),
-    }
-}
-
-fn uptime(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-
-    if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
     }
 }

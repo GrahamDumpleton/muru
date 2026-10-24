@@ -65,23 +65,9 @@ async fn tail_into(path: PathBuf, lines: usize, follow: bool, sender: mpsc::Send
     // The end of the file as it is now, line by line from the back.
 
     if let Ok(metadata) = tokio::fs::metadata(&path).await {
-        let start = metadata.len().saturating_sub(TAIL_BYTES);
-
-        if let Ok((text, _)) = read_from(&path, start).await {
-            let mut recent: Vec<&str> = text.lines().collect();
-
-            // A read that started mid-file begins with a partial line.
-
-            if start > 0 && !recent.is_empty() {
-                recent.remove(0);
-            }
-
-            let skip = recent.len().saturating_sub(lines);
-
-            for line in recent.into_iter().skip(skip) {
-                if sender.send(line.to_owned()).await.is_err() {
-                    return;
-                }
+        for line in last_lines(&path, lines).await {
+            if sender.send(line).await.is_err() {
+                return;
             }
         }
 
@@ -134,6 +120,31 @@ async fn tail_into(path: PathBuf, lines: usize, follow: bool, sender: mpsc::Send
             }
         }
     }
+}
+
+/// The last `lines` lines of a file, oldest first, from its last
+/// `TAIL_BYTES`; none for a file that cannot be read.
+pub async fn last_lines(path: &Path, lines: usize) -> Vec<String> {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return Vec::new();
+    };
+
+    let start = metadata.len().saturating_sub(TAIL_BYTES);
+
+    let Ok((text, _)) = read_from(path, start).await else {
+        return Vec::new();
+    };
+
+    let mut recent: Vec<&str> = text.lines().collect();
+
+    // A read that started mid-file begins with a partial line.
+
+    if start > 0 && !recent.is_empty() {
+        recent.remove(0);
+    }
+
+    let skip = recent.len().saturating_sub(lines);
+    recent.into_iter().skip(skip).map(str::to_owned).collect()
 }
 
 /// The file from `position` to its end as text, and how many bytes that was.

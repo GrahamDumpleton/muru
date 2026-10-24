@@ -155,6 +155,12 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "ADDRESS")]
     metrics: Option<SocketAddr>,
 
+    /// Serve the read-only dashboard and JSON gateway on this loopback
+    /// address, instead of the [dashboard] table's listen address (none
+    /// by default).
+    #[arg(long, value_name = "ADDRESS")]
+    dashboard: Option<SocketAddr>,
+
     #[command(flatten)]
     locations: LocationArgs,
 }
@@ -171,6 +177,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     let limits = limits_from(&document)?;
     let metrics = metrics_from(&document, args.metrics)?;
+    let dashboard = dashboard_from(&document, args.dashboard)?;
     let sinks = sinks_from(&document)?;
 
     // The edge writes the access log to a file in the log directory as
@@ -200,6 +207,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         proxy: document.proxy.clone(),
         access_log,
         metrics,
+        dashboard,
         sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
     })
@@ -240,6 +248,10 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     if let Some(metrics) = args.metrics {
         command.arg("--metrics").arg(metrics.to_string());
+    }
+
+    if let Some(dashboard) = args.dashboard {
+        command.arg("--dashboard").arg(dashboard.to_string());
     }
 
     command.args(args.locations.as_arguments());
@@ -371,6 +383,10 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
 
     if !status.metrics.is_empty() {
         println!("metrics  http://{}/metrics", status.metrics);
+    }
+
+    if !status.dashboard.is_empty() {
+        println!("dashboard http://{}/", status.dashboard);
     }
 
     println!("state    {}", status.state_dir);
@@ -1349,6 +1365,38 @@ fn metrics_from(
         })?)),
         None => Ok(None),
     }
+}
+
+/// The dashboard address: the flag, else the [dashboard] table's listen
+/// address, else none; loopback only, as section 10.7 has it.
+fn dashboard_from(
+    document: &muru_config::Document,
+    flag: Option<SocketAddr>,
+) -> anyhow::Result<Option<SocketAddr>> {
+    let address = match flag {
+        Some(address) => Some(address),
+        None => document
+            .dashboard
+            .as_ref()
+            .and_then(|dashboard| dashboard.listen.as_deref())
+            .map(|address| {
+                address.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "[dashboard] listen = {address:?} is not an address such as 127.0.0.1:8090"
+                    )
+                })
+            })
+            .transpose()?,
+    };
+
+    if let Some(address) = address {
+        anyhow::ensure!(
+            address.ip().is_loopback(),
+            "the dashboard is only served on loopback addresses, not {address}"
+        );
+    }
+
+    Ok(address)
 }
 
 /// The event sinks of the configuration file, checked, with their

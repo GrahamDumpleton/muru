@@ -77,6 +77,7 @@ message Status {
   uint32 releases = 9;
   uint32 edge_pid = 10;             // the edge process serving the listeners
   string metrics = 11;              // the metrics listener's address, or empty
+  string dashboard = 12;            // the dashboard's address, or empty
 }
 
 message ListAppsRequest {}

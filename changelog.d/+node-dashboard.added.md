@@ -1,0 +1,1 @@
+The daemon serves a read-only dashboard and JSON gateway on a loopback address given with `--dashboard` or a `[dashboard]` table: the node, every application's releases with their workers and slots, hosts and routes, recent requests, events and each serving release's log tail, with `/metrics` beside them.

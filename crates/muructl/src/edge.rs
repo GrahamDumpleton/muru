@@ -339,6 +339,68 @@ impl EdgeControl for Control {
         Ok(Response::new(pb::MetricsReport { samples }))
     }
 
+    async fn get_recent(
+        &self,
+        request: Request<pb::RecentRequest>,
+    ) -> Result<Response<pb::RecentRequests>, Status> {
+        let limit = request.into_inner().limit.max(1) as usize;
+        let minute = self.access_log.last_minute();
+        let routing = self.pools.current();
+        let mut pools = Vec::new();
+
+        for app_pools in routing.app_pools() {
+            let (app, release) = app_pools.labels();
+
+            for (group, pool) in app_pools.pools() {
+                let workers = pool.workers();
+                pools.push(pb::PoolState {
+                    app: app.to_owned(),
+                    release: release.to_owned(),
+                    group,
+                    workers: workers.len() as u32,
+                    slots: workers.iter().map(|worker| worker.slots as u32).sum(),
+                    busy: workers.iter().map(|worker| worker.in_flight as u32).sum(),
+                    waiting: pool.waiting() as u32,
+                });
+            }
+        }
+
+        let records = self
+            .access_log
+            .recent(limit)
+            .into_iter()
+            .map(|record| pb::AccessRecord {
+                started_unix_ms: record
+                    .started
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64),
+                request_id: record.request_id,
+                client: record.client.to_string(),
+                app: record.app,
+                release: record.release,
+                host: record.host,
+                group: record.group,
+                mount: record.mount,
+                method: record.method,
+                target: record.target,
+                status: u32::from(record.status),
+                reason: record.reason,
+                bytes: record.bytes,
+                worker: record.worker.map_or(-1, |worker| worker as i32),
+                queue_us: record.queue.as_micros() as u64,
+                application_us: record.application.as_micros() as u64,
+                total_us: record.total.as_micros() as u64,
+            })
+            .collect();
+        Ok(Response::new(pb::RecentRequests {
+            records,
+            minute_requests: minute.requests,
+            minute_errors: minute.errors,
+            minute_seconds: minute.seconds,
+            pools,
+        }))
+    }
+
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {
         let _ = self.stop.try_send(());
         Ok(Response::new(pb::Stopped {}))

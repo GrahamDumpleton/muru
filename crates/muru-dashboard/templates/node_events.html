@@ -1,0 +1,7 @@
+<h2>Events</h2>
+<table>
+  <tr><th class="num">Seq</th><th>Time</th><th>Level</th><th>Type</th><th>Subject</th><th>Message</th></tr>
+  {% for event in data.events %}
+  <tr class="level-{{ event.level }}"><td class="num">{{ event.sequence }}</td><td>{{ event.time }}</td><td>{{ event.level }}</td><td>{{ event.kind }}</td><td>{{ event.subject }}</td><td style="white-space: normal">{{ event.message }}</td></tr>
+  {% endfor %}
+</table>

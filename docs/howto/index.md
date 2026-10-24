@@ -33,4 +33,5 @@ logging
 metrics
 events
 systemd
+dashboard
 ```

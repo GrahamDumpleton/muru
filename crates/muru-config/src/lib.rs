@@ -335,6 +335,17 @@ pub struct Logging {
     pub python: Option<PythonLogging>,
 }
 
+/// The `[dashboard]` table (section 10.7): where the daemon serves its
+/// read-only dashboard and JSON gateway.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dashboard {
+    /// The loopback address the dashboard is served on, such as
+    /// 127.0.0.1:8090; not served when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+}
+
 /// An `[[events.sink]]` entry (section 11.5): a webhook that receives
 /// events as signed CloudEvents requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -584,6 +595,9 @@ pub struct Document {
     /// Event sinks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Events>,
+    /// The dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard: Option<Dashboard>,
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
@@ -625,6 +639,10 @@ impl Document {
 
         if other.events.is_some() {
             self.events = other.events;
+        }
+
+        if other.dashboard.is_some() {
+            self.dashboard = other.dashboard;
         }
 
         if other.proxy.is_some() {

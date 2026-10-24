@@ -213,6 +213,22 @@ impl EdgeProcess {
         Ok(())
     }
 
+    /// The version of the snapshot the edge was last given.
+    pub fn snapshot_version(&self) -> u64 {
+        self.snapshot.version
+    }
+
+    /// Recent requests, the last minute's counters and the pools' state,
+    /// for the dashboard (section 10.7).
+    pub async fn recent(&self, limit: u32) -> anyhow::Result<pb::RecentRequests> {
+        let mut client = connect(&self.spec.control).await?;
+        Ok(client
+            .get_recent(pb::RecentRequest { limit })
+            .await
+            .map_err(|status| anyhow::anyhow!("the edge did not answer: {}", status.message()))?
+            .into_inner())
+    }
+
     /// The edge's metrics as samples (section 11.1).
     pub async fn metrics(&self) -> anyhow::Result<Vec<muru_edge::metrics::Sample>> {
         let mut client = connect(&self.spec.control).await?;
