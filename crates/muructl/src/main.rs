@@ -57,6 +57,17 @@ struct RunArgs {
     #[arg(long, default_value_t = 4)]
     threads: usize,
 
+    /// Import the application in the host before forking: auto preloads
+    /// when the import is fork-safe and imports per worker otherwise, true
+    /// fails instead, false imports in each worker.
+    #[arg(long, default_value = "auto")]
+    preload: Preload,
+
+    /// Module providing the lifecycle hooks: on_load, pre_fork, post_fork,
+    /// on_ready, on_drain, on_exit and on_reopen_logs.
+    #[arg(long)]
+    hooks: Option<String>,
+
     /// Python interpreter with the muru runtime library installed.
     /// Defaults to the active virtualenv's interpreter, else python3 on PATH.
     #[arg(long)]
@@ -80,6 +91,23 @@ struct RunArgs {
 enum Link {
     Unix,
     Tcp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Preload {
+    Auto,
+    True,
+    False,
+}
+
+impl Preload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Preload::Auto => "auto",
+            Preload::True => "true",
+            Preload::False => "false",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -162,7 +190,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .arg(args.workers.to_string())
         .arg("--threads")
         .arg(args.threads.to_string())
+        .arg("--preload")
+        .arg(args.preload.as_str())
         .stdin(Stdio::piped());
+    if let Some(hooks) = &args.hooks {
+        command.arg("--hooks").arg(hooks);
+    }
     if args.link == Link::Tcp {
         command
             .arg("--tcp-base-port")

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -150,6 +151,24 @@ class Server:
             time.sleep(0.02)
         return False
 
+    def worker_pids(self) -> dict[int, int]:
+        """Return the current pid of each worker index, from the host's log."""
+
+        pids: dict[int, int] = {}
+        for line in self.log().splitlines():
+            if "started as pid" in line:
+                words = line.split()
+                pids[int(words[words.index("worker") + 1])] = int(words[-1])
+        return pids
+
+    def host_pid(self) -> int:
+        """Return the pid of the host process, from its log prefix."""
+
+        for line in self.log().splitlines():
+            if line.startswith("muru.host["):
+                return int(line[len("muru.host[") : line.index("]")])
+        raise AssertionError("the host has not logged anything")
+
     def stop(self) -> None:
         """Stop the server and its workers."""
 
@@ -177,8 +196,18 @@ def wait_for_port(port: int, process: subprocess.Popen[bytes], timeout: float = 
     raise RuntimeError("muructl did not start listening in time")
 
 
-def start(app: str, workers: int = 2, threads: int = 2, chdir: Path = FIXTURES) -> Server:
-    """Start muructl for `module:callable`, skipping the test when it cannot run."""
+def start(
+    app: str,
+    workers: int = 2,
+    threads: int = 2,
+    chdir: Path = FIXTURES,
+    args: Sequence[str] = (),
+) -> Server:
+    """Start muructl for `module:callable`, skipping the test when it cannot run.
+
+    `args` are further `muructl run` options. When muructl exits before its
+    workers are ready, the RuntimeError raised carries its output.
+    """
 
     muructl = muructl_path()
     if muructl is None:
@@ -204,6 +233,7 @@ def start(app: str, workers: int = 2, threads: int = 2, chdir: Path = FIXTURES) 
                 sys.executable,
                 "--chdir",
                 str(chdir),
+                *args,
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,
@@ -211,10 +241,9 @@ def start(app: str, workers: int = 2, threads: int = 2, chdir: Path = FIXTURES) 
     server = Server(port, process, log, workers, threads)
     try:
         wait_for_port(port, process)
-    except RuntimeError:
+    except RuntimeError as error:
         server.stop()
-        print(server.log(), file=sys.stderr)
-        raise
+        raise RuntimeError(f"{error}\n{server.log()}") from error
     return server
 
 

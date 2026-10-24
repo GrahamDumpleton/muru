@@ -19,6 +19,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use muru_proto::frame::{self, flag, kind};
 use muru_proto::worker::v1 as pb;
 use prost::Message;
+use pyo3::prelude::*;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -40,9 +41,32 @@ const SMALL_PAYLOAD: usize = 16 * 1024;
 type Reader = BufReader<OwnedReadHalf>;
 type Writer = OwnedWriteHalf;
 
+/// Python callables run at points in the worker's life (section 6.3).
+pub struct Lifecycle {
+    /// Runs when the stop signal arrives, before requests in flight finish.
+    pub on_drain: Option<Py<PyAny>>,
+    /// Runs after the application threads have stopped.
+    pub on_exit: Option<Py<PyAny>>,
+    /// Runs on SIGUSR1.
+    pub on_reopen_logs: Option<Py<PyAny>>,
+}
+
+impl Lifecycle {
+    /// Call a hook with the interpreter attached, reporting any exception.
+    fn call(hook: Option<&Py<PyAny>>) {
+        if let Some(hook) = hook {
+            Python::attach(|py| {
+                if let Err(error) = hook.call0(py) {
+                    wsgi::report(py, &error);
+                }
+            });
+        }
+    }
+}
+
 /// Bind the socket and serve link connections until SIGTERM or SIGINT, then
 /// let the application threads finish their work.
-pub fn serve(socket_path: &str, shared: Arc<Shared>) -> Result<(), BoxError> {
+pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Result<(), BoxError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("muru-link")
@@ -50,18 +74,23 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>) -> Result<(), BoxError> {
         .build()?;
 
     let accepting = Arc::clone(&shared);
+    let reopen_logs = lifecycle.on_reopen_logs.as_ref();
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
-        let shutdown = shutdown_signal();
-        tokio::pin!(shutdown);
+        let mut signals = Signals::new()?;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
                     tokio::spawn(serve_connection(stream, Arc::clone(&accepting)));
                 }
-                _ = &mut shutdown => break,
+                stop = signals.next() => {
+                    if stop {
+                        break;
+                    }
+                    Lifecycle::call(reopen_logs);
+                }
             }
         }
         Ok(())
@@ -69,26 +98,39 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>) -> Result<(), BoxError> {
 
     // Requests already running finish on their threads while the runtime
     // still carries their responses; then everything stops.
+    Lifecycle::call(lifecycle.on_drain.as_ref());
     shared.pool.shutdown();
+    Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
     served
 }
 
-/// Resolve when SIGTERM or SIGINT arrives.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
+/// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks
+/// it to reopen its logs.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+}
 
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(signal) => signal,
-        Err(_) => return,
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(signal) => signal,
-        Err(_) => return,
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+impl Signals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            usr1: signal(SignalKind::user_defined1())?,
+        })
+    }
+
+    /// Wait for a signal: true to stop, false to reopen logs.
+    async fn next(&mut self) -> bool {
+        tokio::select! {
+            _ = self.term.recv() => true,
+            _ = self.int.recv() => true,
+            _ = self.usr1.recv() => false,
+        }
     }
 }
 

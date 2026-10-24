@@ -37,7 +37,7 @@ The host never serves requests, so its memory stays clean and shared copy-on-wri
 
 | Value | Behaviour |
 | --- | --- |
-| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen |
+| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead: it re-executes itself without preload, so nothing the import left behind reaches a worker. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen. The on_load hook has run once in the host by then, and runs again in each worker |
 | true | Preload, and treat any finding of the import check as a release failure during warm-up. For applications whose imports are known to be fork-safe, so that a regression is caught instead of silently costing the preload benefits |
 | false | Import in each worker. The check is skipped |
 
@@ -66,12 +66,14 @@ Hooks live in a module named by the hooks setting. Each receives a context objec
 | Hook | Runs in | Typical use |
 | --- | --- | --- |
 | on_load | host, after import | validate configuration, warm fork-safe caches |
-| pre_fork | host | close sockets and files that must not be shared |
-| post_fork | worker | reopen database connections, reseed, start background threads |
-| on_ready | worker | final warm-up |
-| on_drain | worker | stop background work, flush |
-| on_exit | worker | clean up |
-| on_reopen_logs | worker | reopen application-owned log files |
+| pre_fork | host, once before the first fork | close sockets and files that must not be shared |
+| post_fork | worker, after fork | reopen database connections, reseed, start background threads |
+| on_ready | worker, before its sockets are announced | final warm-up |
+| on_drain | worker, when told to stop, before requests in flight finish | stop background work, flush |
+| on_exit | worker, after the application threads have stopped | clean up |
+| on_reopen_logs | worker, on SIGUSR1 | reopen application-owned log files |
+
+An exception from on_load, pre_fork, post_fork or on_ready fails the host or the worker it runs in; one from on_drain, on_exit or on_reopen_logs is logged. Before every fork the host checks that it is still single-threaded and logs a warning naming the thread count otherwise, since threads do not exist in the child.
 
 ## 6.4 Process and threading models
 

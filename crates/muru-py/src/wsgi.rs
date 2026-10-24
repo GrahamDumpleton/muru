@@ -741,7 +741,7 @@ fn run_app<'py>(
 /// `PyErr::print` is not used because it exits the process for SystemExit,
 /// and an application raising SystemExit is a failed request, not a reason
 /// to stop serving.
-fn report(py: Python<'_>, error: &PyErr) {
+pub(crate) fn report(py: Python<'_>, error: &PyErr) {
     let printed = py
         .import(intern!(py, "traceback"))
         .and_then(|module| module.call_method1(intern!(py, "print_exception"), (error.value(py),)));

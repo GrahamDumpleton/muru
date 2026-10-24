@@ -28,15 +28,32 @@ fn version() -> &'static str {
 /// and kept for the life of the worker, each thread attached to the
 /// interpreter once. The calling thread blocks, with the interpreter
 /// detached, until the server stops.
+///
+/// `on_drain` is called when the stop signal arrives, before the
+/// application threads finish their requests, `on_exit` once they have, and
+/// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3).
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4))]
-fn serve(py: Python<'_>, socket_path: String, app: Py<PyAny>, threads: usize) -> PyResult<()> {
+#[pyo3(signature = (socket_path, app, threads=4, on_drain=None, on_exit=None, on_reopen_logs=None))]
+fn serve(
+    py: Python<'_>,
+    socket_path: String,
+    app: Py<PyAny>,
+    threads: usize,
+    on_drain: Option<Py<PyAny>>,
+    on_exit: Option<Py<PyAny>>,
+    on_reopen_logs: Option<Py<PyAny>>,
+) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
     let shared = pool::Shared::new(app, errors, threads)
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let shared = Arc::new(shared);
+    let lifecycle = link::Lifecycle {
+        on_drain,
+        on_exit,
+        on_reopen_logs,
+    };
 
-    py.detach(move || link::serve(&socket_path, shared))
+    py.detach(move || link::serve(&socket_path, shared, lifecycle))
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
