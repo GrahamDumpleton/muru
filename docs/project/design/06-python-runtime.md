@@ -167,6 +167,7 @@ The daemon starts hosts itself and imports applications as modules, so applicati
 | muru.logging.default_config() | dictConfig dictionary matching the platform logging defaults |
 | muru.request_id() | Current request id, from a context variable |
 | muru.RequestTimeout | BaseException subclass raised by the soft timeout |
+| breakpoint() | The runtime library's breakpoint hook waits for muructl debug attach (section 11.7); outside Muru it is the ordinary pdb |
 | muru.host | Host entry point module (python -m muru.host). Internal |
 
 The API is typed (shipped with stub files) and every function is safe to call outside Muru.

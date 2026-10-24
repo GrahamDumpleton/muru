@@ -48,7 +48,14 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |
 | Observability | muructl logs reopen [--workers] | Reopen log files after external rotation | 11.3 |
 | Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset | 11.4 |
-| Observability | muructl debug stacks TARGET | Python stack dumps | 11.7 |
+| Observability | muructl debug stacks TARGET | Python stacks of every thread with the request each is serving, merged across workers. Flags: --worker | 11.7 |
+| Observability | muructl debug tasks TARGET | asyncio task tree and loop lag of ASGI workers | 11.7 |
+| Observability | muructl debug profile TARGET --for | Sampling profile written as collapsed stacks or pstats. Flags: --worker, --requests, --path, --format | 11.7 |
+| Observability | muructl debug trace TARGET --for | In-process sys.monitoring trace. Flags: --worker, --requests, --path, --force | 11.7 |
+| Observability | muructl debug memory TARGET | Resident size, gc counts and object counts; --trace --for for allocation sites, --diff for a snapshot comparison | 11.7 |
+| Observability | muructl debug attach TARGET --worker N | pdb in a worker over the admin API; --dap for debuggers speaking the Debug Adapter Protocol | 11.7 |
+| Observability | muructl debug exec TARGET --worker N -- CODE | Run a snippet in a worker (admin, audited, off in production by default) | 11.7 |
+| Observability | muructl debug inspect TARGET | sys.path, modules, redacted environment, settings, descriptors and threads | 11.7 |
 | Images and tools | muructl image check IMAGE | Probe an image against the contract | 8.6 |
 | Images and tools | muructl image build, dockerfile | Build an image or print the generated Dockerfile (later) | 8.6 |
 | Images and tools | muructl tools install uv | Managed copy of uv | 8.4 |
