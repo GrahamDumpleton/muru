@@ -29,7 +29,7 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
-askama = "0.14"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
