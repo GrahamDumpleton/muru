@@ -78,7 +78,8 @@ re-adoption.
 
 `systemctl reload` runs `muructl daemon reload`, which re-reads the
 configuration file for what can change while the daemon runs: today the
-`[proxy]` table, which the edge is given at once. Listeners, limits, the
+`[proxy]` and `[compression]` tables, which the edge is given at once.
+Listeners, limits, the
 metrics listener and event sinks are read when the daemon starts, and the
 reload says so. SIGHUP does the same as the command.
 

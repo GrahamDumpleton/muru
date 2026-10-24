@@ -92,6 +92,21 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
         return generate()
 
+    if path == "/text":
+        body = (b"The quick brown fox jumps over the lazy dog. " * 100)[:4096]
+        headers = [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+        ]
+        if query.get("compress") == "off":
+            headers.append(("X-Muru-Compress", "off"))
+        if query.get("transform") == "no":
+            headers.append(("Cache-Control", "no-transform"))
+        if query.get("encoded") == "yes":
+            headers.append(("Content-Encoding", "identity"))
+        start_response("200 OK", headers)
+        return [body]
+
     if path == "/large":
         start_response(
             "200 OK",

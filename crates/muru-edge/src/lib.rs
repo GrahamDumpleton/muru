@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 pub mod access;
+pub mod compression;
 pub mod errors;
 pub mod link;
 pub mod metrics;
@@ -65,6 +66,8 @@ pub struct Config {
     pub access_log: access::Config,
     /// Timeouts and header limits.
     pub limits: Limits,
+    /// How responses are compressed (section 4.17).
+    pub compression: compression::Compression,
     /// The HTTPS listener, when TLS is on.
     pub https: Option<Https>,
 }
@@ -136,6 +139,8 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 /// request takes the tables current when it arrives.
 pub struct Pools {
     current: RwLock<Arc<routing::Routing>>,
+    /// The compression policy a development run keeps across replacements.
+    compression: compression::Compression,
 }
 
 impl Pools {
@@ -147,7 +152,7 @@ impl Pools {
     /// Send new requests to another application's workers, with no
     /// hosts. Requests in flight finish on the pool they started with.
     pub fn replace(&self, pools: routing::AppPools) {
-        self.apply(routing::Routing::single(pools));
+        self.apply(routing::Routing::single(pools).with_compression(self.compression.clone()));
     }
 
     /// Switch to the tables of a new snapshot.
@@ -301,16 +306,20 @@ impl Edge {
         }
 
         let pools = Arc::new(Pools {
-            current: RwLock::new(Arc::new(routing::Routing::single(
-                routing::AppPools::connect(
-                    &config.app,
-                    &config.release,
-                    &config.sockets,
-                    &config.groups,
-                    &config.mounts,
+            current: RwLock::new(Arc::new(
+                routing::Routing::single(
+                    routing::AppPools::connect(
+                        &config.app,
+                        &config.release,
+                        &config.sockets,
+                        &config.groups,
+                        &config.mounts,
+                    )
+                    .await?,
                 )
-                .await?,
-            ))),
+                .with_compression(config.compression.clone()),
+            )),
+            compression: config.compression.clone(),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
 
@@ -504,6 +513,11 @@ async fn serve<I>(
 
             let routing = shared.pools.current();
             let forwarded = routing.trust().resolve(&peer, request.headers_mut());
+            let accept_encoding = request
+                .headers()
+                .get(http::header::ACCEPT_ENCODING)
+                .cloned();
+            let method = request.method().clone();
 
             let scheme: &'static str = match forwarded.scheme.as_deref() {
                 Some("https") => "https",
@@ -556,7 +570,7 @@ async fn serve<I>(
                 secure || shared.https_port.is_none(),
             );
 
-            let mut response = match (redirect_to, decision) {
+            let response = match (redirect_to, decision) {
                 (Some(to), _) => link::redirect_to_https(request, &context, to),
                 (
                     None,
@@ -597,6 +611,16 @@ async fn serve<I>(
                     ),
                 ),
             };
+
+            // Section 4.17: compressed for the client when the policy and
+            // the response allow it.
+
+            let mut response = compression::apply(
+                routing.compression(),
+                &method,
+                accept_encoding.as_ref(),
+                response,
+            );
 
             // Section 4.19: every response names its request.
 

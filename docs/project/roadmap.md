@@ -163,5 +163,12 @@ answer), `tasks` (the event loop's tasks and lag) and `inspect`, and
 from outside the process with PEP 768 is deferred by
 [ADR 0025](adr/0025-in-process-inspection-first.md); profiling, tracing,
 memory tracing, attach, exec and the automatic captures are phase 3.
-Next from phase 2: connection limits, compression and static files at
-the edge.
+Response compression (section 4.17) is in: the edge compresses
+responses the client accepts with br, zstd or gzip in the configured
+preference order, for the listed content types and sizes, chunk by chunk
+for streamed bodies, never for a response already encoded or opted out
+with X-Muru-Compress or Cache-Control: no-transform, from the daemon's
+`[compression]` table (applied on reload) or `muructl run`'s defaults
+(per-host and per-route settings, precompressed static variants and
+request decompression later). Next from phase 2: connection limits and
+static files at the edge.

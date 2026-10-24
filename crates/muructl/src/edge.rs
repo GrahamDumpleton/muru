@@ -166,6 +166,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             development: false,
             access_log,
             limits: args.limits(),
+            compression: muru_edge::compression::Compression::default(),
             https: None,
         },
         inherited,

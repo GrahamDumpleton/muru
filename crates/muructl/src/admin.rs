@@ -129,7 +129,7 @@ pub enum DaemonCommand {
     },
 
     /// Re-read the daemon's configuration file for what can change while
-    /// it runs: the [proxy] table.
+    /// it runs: the [proxy] and [compression] tables.
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
@@ -241,6 +241,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         listeners,
         limits,
         proxy: document.proxy.clone(),
+        compression: document.compression.clone(),
         access_log,
         metrics,
         dashboard,

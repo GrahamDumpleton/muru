@@ -212,7 +212,7 @@ unchanged by an upgrade, so no unit restart is involved.
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
 daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
-configuration file for the `[proxy]` table. The [systemd
+configuration file for the `[proxy]` and `[compression]` tables. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else the
 socket in the runtime directory.

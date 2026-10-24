@@ -263,6 +263,11 @@ struct RunArgs {
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<String>,
 
+    /// Do not compress responses (section 4.17); they are compressed for
+    /// clients that accept br, zstd or gzip otherwise.
+    #[arg(long)]
+    no_compression: bool,
+
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
     /// dashboard unless asked for), but this is still not the supported
@@ -1041,6 +1046,10 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     };
     let document = Document {
         listener: listeners,
+        compression: args.no_compression.then(|| muru_config::Compression {
+            enabled: Some(false),
+            ..Default::default()
+        }),
         limits: Some(muru_config::Limits {
             max_body_size: Some(muru_config::format_size(limits.max_body_size)),
             max_header_bytes: Some(muru_config::format_size(limits.max_header_bytes as u64)),
@@ -1331,6 +1340,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         development,
         access_log,
         limits: limits(&args),
+        compression: if args.no_compression {
+            muru_edge::compression::Compression::off()
+        } else {
+            muru_edge::compression::Compression::default()
+        },
         https: tls.as_ref().map(|tls| tls.https.clone()),
     })
     .await

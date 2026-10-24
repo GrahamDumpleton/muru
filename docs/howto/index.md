@@ -28,6 +28,7 @@ behind-a-proxy
 worker-groups
 mounts
 https
+compression
 timeouts
 recycling
 memory

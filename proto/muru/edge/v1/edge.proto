@@ -36,6 +36,16 @@ message Snapshot {
   repeated Route routes = 4;
   repeated AppWorkers apps = 5;
   Proxy proxy = 6;                      // trusted proxies; nothing trusted when absent
+  Compression compression = 7;          // section 4.17; the defaults when absent
+}
+
+// Section 4.17: how responses are compressed for clients.
+message Compression {
+  bool enabled = 1;
+  repeated string encodings = 2;        // br, zstd, gzip in preference order; the defaults when empty
+  uint64 min_size = 3;                  // bytes; the default when 0
+  repeated string types = 4;            // content types, exact or family/*; the defaults when empty
+  string level = 5;                     // fast, default or best; default when empty
 }
 
 // Section 4.7: which peers may speak for the client, and how.

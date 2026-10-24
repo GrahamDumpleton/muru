@@ -51,6 +51,8 @@ pub struct Config {
     pub limits: muru_edge::Limits,
     /// Trusted proxies and the headers taken from them (section 4.7).
     pub proxy: Option<muru_config::Proxy>,
+    /// How responses are compressed (section 4.17).
+    pub compression: Option<muru_config::Compression>,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
     /// Where the Prometheus exposition is served, or nowhere.
@@ -294,6 +296,8 @@ struct Daemon {
     logs: Logs,
     /// The [proxy] table of the configuration file, for every snapshot.
     proxy: Option<pb::Proxy>,
+    /// The [compression] table, for every snapshot.
+    compression: pb::Compression,
     running: HashMap<(String, String), Running>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
@@ -326,6 +330,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         muru_edge::proxy::Trust::from_snapshot(proxy)
             .map_err(|error| anyhow::anyhow!("[proxy]: {error}"))?;
     }
+
+    let compression = compression_message(config.compression.as_ref())
+        .map_err(|error| anyhow::anyhow!("[compression]: {error}"))?;
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
@@ -506,6 +513,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         info,
         logs: Logs::default(),
         proxy,
+        compression,
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
@@ -777,6 +785,36 @@ fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
     }
 }
 
+/// The [compression] table as the snapshot carries it, checked: the
+/// defaults of section 4.17 where the table is silent.
+fn compression_message(
+    table: Option<&muru_config::Compression>,
+) -> Result<pb::Compression, String> {
+    let Some(table) = table else {
+        return Ok(muru_edge::compression::Compression::default().to_message());
+    };
+
+    let min_size = match &table.min_size {
+        Some(text) => {
+            muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))?
+        }
+        None => 0,
+    };
+
+    let message = pb::Compression {
+        enabled: table.enabled.unwrap_or(true),
+        encodings: table.encodings.clone(),
+        min_size,
+        types: table.types.clone(),
+        level: table.level.clone().unwrap_or_default(),
+    };
+
+    // Checked the way the edge will read it, so a bad word is refused
+    // here rather than in the edge's log.
+
+    muru_edge::compression::Compression::from_snapshot(&message).map(|policy| policy.to_message())
+}
+
 /// A host's certificate chain and key as PEM text, for the snapshot.
 fn read_pem_pair(certificate: &str, key: &str) -> anyhow::Result<(String, String)> {
     let chain =
@@ -1044,20 +1082,23 @@ impl Daemon {
                 .map_err(|error| format!("[proxy]: {error}"))?;
         }
 
-        let changed = proxy != self.proxy;
+        let compression = compression_message(document.compression.as_ref())
+            .map_err(|error| format!("[compression]: {error}"))?;
+        let changed = proxy != self.proxy || compression != self.compression;
         self.proxy = proxy;
+        self.compression = compression;
 
         if changed {
             self.push_snapshot().await?;
         }
 
         let message = format!(
-            "reloaded {}: the [proxy] table {}; listeners, limits, metrics and event sinks are read at start",
+            "reloaded {}: the [proxy] and [compression] tables {}; listeners, limits, metrics and event sinks are read at start",
             path.display(),
             if changed {
-                "changed and the edge has it"
+                "changed and the edge has them"
             } else {
-                "is unchanged"
+                "are unchanged"
             }
         );
         self.events
@@ -1711,6 +1752,7 @@ impl Daemon {
             routes,
             apps,
             proxy: self.proxy.clone(),
+            compression: Some(self.compression.clone()),
         }
     }
 

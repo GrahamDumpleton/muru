@@ -520,6 +520,28 @@ pub struct Limits {
     pub response_idle_timeout: Option<String>,
 }
 
+/// The `[compression]` table (section 4.17): how the edge compresses
+/// responses. Every key is optional, with the defaults of appendix C.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compression {
+    /// Whether responses are compressed at all (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The encodings offered in preference order: br, zstd and gzip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encodings: Vec<String>,
+    /// The smallest body worth compressing, for example 1KB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_size: Option<String>,
+    /// The content types compressed: exact types or a family as text/*.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+    /// How hard to compress: fast, default or best.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+}
+
 /// A listener, one of the `[[listener]]` entries (appendix C), in the
 /// daemon's own file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,6 +707,9 @@ pub struct Document {
     /// Trusted proxies and the headers taken from them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<Proxy>,
+    /// How responses are compressed (section 4.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,

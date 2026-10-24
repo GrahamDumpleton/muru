@@ -212,6 +212,7 @@ fn group_prefix(path: &str) -> String {
 pub struct Routing {
     version: u64,
     trust: Trust,
+    compression: crate::compression::Compression,
     default: Arc<AppPools>,
     apps: HashMap<String, Arc<AppPools>>,
     hosts: Vec<Host>,
@@ -246,6 +247,7 @@ impl Routing {
         Self {
             version: 0,
             trust: Trust::default(),
+            compression: crate::compression::Compression::default(),
             default: Arc::new(pools),
             apps: HashMap::new(),
             hosts: Vec::new(),
@@ -298,9 +300,16 @@ impl Routing {
             None => Trust::default(),
         };
 
+        let compression = match &snapshot.compression {
+            Some(message) => crate::compression::Compression::from_snapshot(message)
+                .map_err(|error| anyhow::anyhow!("compression: {error}"))?,
+            None => crate::compression::Compression::default(),
+        };
+
         let mut routing = Self {
             version: snapshot.version,
             trust,
+            compression,
             default,
             apps,
             hosts: Vec::new(),
@@ -379,6 +388,18 @@ impl Routing {
     /// Which peers may speak for the client (section 4.7).
     pub fn trust(&self) -> &Trust {
         &self.trust
+    }
+
+    /// How responses are compressed (section 4.17).
+    pub fn compression(&self) -> &crate::compression::Compression {
+        &self.compression
+    }
+
+    /// The same tables with this compression policy, for a development
+    /// run, which has no snapshot to carry it.
+    pub fn with_compression(mut self, compression: crate::compression::Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Whether any virtual host is declared.
@@ -567,6 +588,7 @@ mod tests {
     fn snapshot() -> pb::Snapshot {
         pb::Snapshot {
             version: 7,
+            compression: None,
             worker_sockets: Vec::new(),
             hosts: vec![
                 pb::Host {
