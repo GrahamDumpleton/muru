@@ -2,7 +2,7 @@
 //! `muru.admin.v1` service over the admin Unix socket, which muructl and
 //! the dashboard's gateway speak.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -12,8 +12,9 @@ use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::config::{self, Action, Change, Plan};
 use crate::daemon::{Command, Handle};
-use crate::model::{Event, Release, ReleaseSpec, ReleaseState};
+use crate::model::{Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
 
 /// Serve the API on the socket until the returned future ends.
 pub async fn serve(
@@ -101,7 +102,16 @@ impl Admin for Service {
         request: Request<pb::DeployRequest>,
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
-        let spec = resolve_spec(&self.handle, &request)?;
+        let previous = self
+            .handle
+            .store
+            .app(&request.app)
+            .ok()
+            .and_then(|app| app.current.or(app.previous))
+            .and_then(|id| self.handle.store.release(&request.app, &id).ok())
+            .map(|release| release.spec);
+        let spec =
+            config::resolve_spec(&request, previous.as_ref()).map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -322,126 +332,206 @@ impl Admin for Service {
         let _ = done_rx.await;
         Ok(Response::new(pb::ShutdownResponse {}))
     }
-}
 
-/// Resolve a deploy request into a release spec: the request's settings,
-/// then the source's [tool.muru] table, then the application's previous
-/// release, then the defaults of section 13.1.
-fn resolve_spec(handle: &Handle, request: &pb::DeployRequest) -> Result<ReleaseSpec, Status> {
-    let source = Path::new(&request.source);
-    if !source.is_dir() {
-        return Err(Status::invalid_argument(format!(
-            "{} is not a directory",
-            source.display()
-        )));
-    }
-    let source = source
-        .canonicalize()
-        .map_err(|error| Status::invalid_argument(format!("{}: {error}", request.source)))?;
-    let table = muru_config::load_project(&source)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?
-        .map(|(_, table)| table)
-        .unwrap_or_default();
-    let previous = handle
-        .store
-        .app(&request.app)
-        .ok()
-        .and_then(|app| app.current.or(app.previous))
-        .and_then(|id| handle.store.release(&request.app, &id).ok())
-        .map(|release| release.spec);
-
-    // The entrypoint from the request replaces the table's with its
-    // factory settings, as muructl run does (section 13.1).
-
-    let (entrypoint, from_table) = if !request.entrypoint.is_empty() {
-        (request.entrypoint.clone(), false)
-    } else if let Some(entrypoint) = table.entrypoint.clone() {
-        (entrypoint, true)
-    } else if let Some(previous) = &previous {
-        (previous.entrypoint.clone(), false)
-    } else {
-        return Err(Status::invalid_argument(format!(
-            "{} has no entrypoint in its [tool.muru] table; give one as module:callable",
-            source.display()
-        )));
-    };
-    let factory = match (request.factory, from_table) {
-        (Some(true), _) => Some(parse_or(
-            &request.factory_phase,
-            muru_config::FactoryPhase::Worker,
-        )?),
-        (Some(false), _) => None,
-        (None, true) if table.factory == Some(true) => Some(
-            table
-                .factory_phase
-                .unwrap_or(muru_config::FactoryPhase::Worker),
-        ),
-        (None, _) => None,
-    };
-
-    let python = if !request.python.is_empty() {
-        PathBuf::from(&request.python)
-    } else {
-        let venv = source.join(".venv").join("bin").join("python");
-        if venv.is_file() {
-            venv
-        } else if let Some(previous) = &previous {
-            previous.python.clone()
-        } else {
-            PathBuf::from("python3")
+    async fn apply_config(
+        &self,
+        request: Request<pb::ApplyConfigRequest>,
+    ) -> Result<Response<pb::ConfigReport>, Status> {
+        let request = request.into_inner();
+        let document = match muru_config::Document::parse(&request.document) {
+            Ok(document) => document,
+            Err(error) => return Ok(Response::new(parse_failure(error))),
+        };
+        let plan = config::plan(&self.handle.store, &document, request.prune);
+        let mut report = report_message(&plan);
+        if !plan.errors.is_empty() || request.dry_run {
+            return Ok(Response::new(report));
         }
-    };
 
-    Ok(ReleaseSpec {
-        source,
-        entrypoint,
-        interface: match request.interface.as_str() {
-            "" => table.interface.unwrap_or(muru_config::Interface::Auto),
-            given => given.parse().map_err(|error: muru_config::ParseError| {
-                Status::invalid_argument(error.to_string())
-            })?,
-        },
-        python,
-        processes: request
-            .processes
-            .or(table.processes.map(|value| value as u32))
-            .or(previous.as_ref().map(|previous| previous.processes))
-            .unwrap_or(1),
-        threads: request
-            .threads
-            .or(table.threads.map(|value| value as u32))
-            .or(previous.as_ref().map(|previous| previous.threads))
-            .unwrap_or(4),
-        sync_threads: request
-            .sync_threads
-            .or(table.sync_threads.map(|value| value as u32))
-            .unwrap_or(8),
-        concurrency: request
-            .concurrency
-            .or(table.concurrency.map(|value| value as u32))
-            .unwrap_or(1000),
-        preload: match request.preload.as_str() {
-            "" => table.preload.unwrap_or(muru_config::Preload::Auto),
-            given => given.parse().map_err(|error: muru_config::ParseError| {
-                Status::invalid_argument(error.to_string())
-            })?,
-        },
-        hooks: (!request.hooks.is_empty())
-            .then(|| request.hooks.clone())
-            .or(table.hooks),
-        factory,
-    })
+        // The plan is carried out in order, each change's outcome going
+        // into the report; a failure does not stop the rest.
+
+        let mut failures = 0;
+        for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
+            message.outcome = self.carry_out(change).await;
+            if message.outcome.starts_with("failed") {
+                failures += 1;
+            }
+        }
+        report.applied = true;
+
+        let summary = format!(
+            "{} changes applied, {} failed, {} releases unchanged",
+            plan.changes.len(),
+            failures,
+            plan.unchanged
+        );
+        self.handle.events.emit(
+            "config.applied",
+            "config",
+            if failures == 0 { "notice" } else { "warning" },
+            &summary,
+        );
+        Ok(Response::new(report))
+    }
+
+    async fn diff_config(
+        &self,
+        request: Request<pb::DiffConfigRequest>,
+    ) -> Result<Response<pb::ConfigReport>, Status> {
+        let document = match muru_config::Document::parse(&request.into_inner().document) {
+            Ok(document) => document,
+            Err(error) => return Ok(Response::new(parse_failure(error))),
+        };
+
+        // A diff shows both directions: what the document would add and
+        // what desired state holds beyond it.
+
+        let plan = config::plan(&self.handle.store, &document, true);
+        Ok(Response::new(report_message(&plan)))
+    }
+
+    async fn export_config(
+        &self,
+        request: Request<pb::ExportConfigRequest>,
+    ) -> Result<Response<pb::ExportConfigResponse>, Status> {
+        let request = request.into_inner();
+        let app = (!request.app.is_empty()).then_some(request.app.as_str());
+        let document =
+            config::export(&self.handle.store, app, request.all_releases).map_err(not_found)?;
+        let text = document.to_toml().map_err(internal)?;
+
+        Ok(Response::new(pb::ExportConfigResponse {
+            document: text,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            node: config::hostname(),
+            time_unix_ms: now_unix_ms(),
+            state_version: self.handle.store.state_version().map_err(internal)?,
+        }))
+    }
 }
 
-fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
-    text: &str,
-    default: T,
-) -> Result<T, Status> {
-    if text.is_empty() {
-        return Ok(default);
+impl Service {
+    /// Carry out one change of a plan and say how it went: an outcome
+    /// starting with "failed" is counted as a failure.
+    async fn carry_out(&self, change: &Change) -> String {
+        let outcome = match &change.action {
+            Action::CreateApp => self
+                .handle
+                .store
+                .ensure_app(&change.app)
+                .map(|_| "created".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::Deploy(spec) => self.deploy_declared(change, spec).await,
+            Action::RemoveRelease => self.remove_release(change).await,
+            Action::RemoveApp => self
+                .handle
+                .store
+                .delete_app(&change.app)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+        };
+
+        outcome.unwrap_or_else(|error| format!("failed: {error}"))
     }
-    text.parse()
-        .map_err(|error: muru_config::ParseError| Status::invalid_argument(error.to_string()))
+
+    /// Deploy a declared release under its declared id and wait for the
+    /// outcome, as a deploy with --wait does.
+    async fn deploy_declared(&self, change: &Change, spec: &ReleaseSpec) -> Result<String, String> {
+        let (created_tx, created_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Deploy {
+                app: change.app.clone(),
+                spec: spec.clone(),
+                id: change.id.clone(),
+                retain: crate::daemon::RETENTION,
+                created: created_tx,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| STOPPING.to_owned())?;
+
+        created_rx.await.map_err(|_| STOPPING.to_owned())??;
+        let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
+
+        let serving = self
+            .handle
+            .store
+            .app(&release.app)
+            .ok()
+            .and_then(|app| app.current)
+            .as_deref()
+            == Some(release.id.as_str());
+        Ok(format!(
+            "{}{}",
+            release.state,
+            if serving { " and serving" } else { "" }
+        ))
+    }
+
+    /// Drain a release if it runs, then drop its record.
+    async fn remove_release(&self, change: &Change) -> Result<String, String> {
+        let id = change.id.clone().unwrap_or_default();
+        let running = self
+            .handle
+            .store
+            .release(&change.app, &id)
+            .is_ok_and(|release| release.state.is_running());
+
+        let mut outcome = "removed";
+        if running {
+            let (done_tx, done_rx) = oneshot::channel();
+            self.handle
+                .commands
+                .send(Command::Drain {
+                    app: change.app.clone(),
+                    id: id.clone(),
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| STOPPING.to_owned())?;
+            done_rx.await.map_err(|_| STOPPING.to_owned())??;
+            outcome = "stopped and removed";
+        }
+
+        self.handle
+            .store
+            .delete_release(&change.app, &id)
+            .map_err(|error| error.to_string())?;
+        Ok(outcome.to_owned())
+    }
+}
+
+/// The outcome when the daemon's command loop has gone.
+const STOPPING: &str = "the daemon is stopping";
+
+/// A report with one parse error and nothing else.
+fn parse_failure(error: String) -> pb::ConfigReport {
+    pb::ConfigReport {
+        errors: vec![error],
+        ..Default::default()
+    }
+}
+
+fn report_message(plan: &Plan) -> pb::ConfigReport {
+    pb::ConfigReport {
+        errors: plan.errors.clone(),
+        warnings: plan.warnings.clone(),
+        changes: plan
+            .changes
+            .iter()
+            .map(|change| pb::ConfigChange {
+                action: change.action.name().to_owned(),
+                subject: change.subject(),
+                detail: change.detail.clone(),
+                outcome: String::new(),
+            })
+            .collect(),
+        unchanged: plan.unchanged,
+        applied: false,
+    }
 }
 
 fn app_message(app: crate::model::App) -> pb::App {

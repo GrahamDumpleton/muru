@@ -1,7 +1,8 @@
 //! The commands that run or talk to the daemon (design specification
-//! sections 13.2 and 13.3, appendix A): `daemon run`, `daemon start`,
-//! `daemon stop`, `daemon status`, `up`, `deploy`, `app list`, `release
-//! list`, `release wait`, `rollback`, `drain`, `status` and `events`.
+//! sections 10.4, 13.2 and 13.3, appendix A): `daemon run`, `daemon
+//! start`, `daemon stop`, `daemon status`, `up`, `deploy`, `app list`,
+//! `release list`, `release wait`, `rollback`, `drain`, `status`,
+//! `events`, `apply`, `config export` and `config diff`.
 
 use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
@@ -596,6 +597,301 @@ pub async fn drain(release: String, socket: SocketArgs) -> anyhow::Result<()> {
         release.app, release.id, release.state
     );
     Ok(())
+}
+
+/// What `apply` takes.
+#[derive(Args)]
+pub struct ApplyArgs {
+    /// The file to apply, or a directory whose .toml files are applied together.
+    #[arg(short = 'f', long = "file", value_name = "FILE or DIR")]
+    file: PathBuf,
+
+    /// Report what would change and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Also remove the applications and releases the files do not contain.
+    #[arg(long)]
+    prune: bool,
+
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// Apply declarative configuration. The exit code is 0 when nothing
+/// changed or everything applied, 2 for a dry run with changes planned
+/// and 1 for errors.
+pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
+    let document = load_documents(&args.file)?;
+    let mut client = client::connect(&args.socket.socket()).await?;
+    let report = client
+        .apply_config(pb::ApplyConfigRequest {
+            document: document.to_toml().context("writing the configuration")?,
+            dry_run: args.dry_run,
+            prune: args.prune,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+    } else {
+        print_report(&report, args.dry_run);
+    }
+    Ok(exit_code(&report, args.dry_run))
+}
+
+/// The configuration subcommands.
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Write desired state as a file that applies back without changes.
+    Export {
+        /// One application rather than all.
+        #[arg(long, value_name = "NAME")]
+        app: Option<String>,
+
+        /// Every release of each application, not only the one that serves.
+        #[arg(long)]
+        all_releases: bool,
+
+        /// Write JSON rather than TOML.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Compare a file, or a directory of files, with desired state.
+    Diff {
+        /// The file, or a directory whose .toml files are read together.
+        #[arg(short = 'f', long = "file", value_name = "FILE or DIR")]
+        file: PathBuf,
+
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Export desired state, with a header naming where it came from.
+pub async fn config_export(
+    app: Option<String>,
+    all_releases: bool,
+    json: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let export = client
+        .export_config(pb::ExportConfigRequest {
+            app: app.unwrap_or_default(),
+            all_releases,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if json {
+        let document =
+            muru_config::Document::parse(&export.document).map_err(anyhow::Error::msg)?;
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+
+    println!(
+        "# Muru desired state: muructl {} on {}, {}, state version {}.\n\
+         # Applying this file to the daemon it came from changes nothing.\n",
+        export.version,
+        export.node,
+        format_time(export.time_unix_ms),
+        export.state_version
+    );
+    print!("{}", export.document);
+    Ok(())
+}
+
+/// Compare a file with desired state. The exit code is 0 when they
+/// match, 2 when they differ and 1 for errors.
+pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyhow::Result<i32> {
+    let document = load_documents(&file)?;
+    let mut client = client::connect(&socket.socket()).await?;
+    let report = client
+        .diff_config(pb::DiffConfigRequest {
+            document: document.to_toml().context("writing the configuration")?,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+    } else {
+        print_report(&report, true);
+    }
+    Ok(exit_code(&report, true))
+}
+
+/// Read one file, or every .toml file of a directory in name order, into
+/// one document, with relative source paths taken from each file's
+/// directory.
+fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
+    let mut files = Vec::new();
+    if path.is_dir() {
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
+        {
+            let entry = entry?.path();
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            {
+                files.push(entry);
+            }
+        }
+        files.sort();
+        if files.is_empty() {
+            anyhow::bail!("{} holds no .toml files", path.display());
+        }
+    } else {
+        files.push(path.to_path_buf());
+    }
+
+    let mut document = muru_config::Document::default();
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let mut parsed = muru_config::Document::parse(&text)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+
+        // Sources are resolved here, where the file is, since the daemon
+        // may run elsewhere.
+
+        let base = file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        for app in parsed.app.values_mut() {
+            for release in app.release.values_mut() {
+                if let Some(source) = &release.source
+                    && Path::new(source).is_relative()
+                {
+                    release.source = Some(base.join(source).display().to_string());
+                }
+            }
+        }
+
+        document
+            .merge(parsed)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+    }
+
+    Ok(document)
+}
+
+/// Print a report as people read it.
+fn print_report(report: &pb::ConfigReport, dry_run: bool) {
+    if !report.errors.is_empty() {
+        println!("muru: nothing applied; the configuration has errors:");
+        for error in &report.errors {
+            println!("  {error}");
+        }
+    } else if report.changes.is_empty() {
+        println!(
+            "muru: no changes ({} release{} as declared)",
+            report.unchanged,
+            if report.unchanged == 1 { "" } else { "s" }
+        );
+    } else {
+        println!(
+            "muru: {}",
+            if report.applied {
+                "applied"
+            } else if dry_run {
+                "plan (nothing changed)"
+            } else {
+                "plan"
+            }
+        );
+        for change in &report.changes {
+            let what = if report.applied {
+                change.outcome.as_str()
+            } else {
+                change.detail.as_str()
+            };
+            println!("  {:<15} {:<24} {what}", change.action, change.subject);
+        }
+        if report.unchanged > 0 {
+            println!(
+                "  {} release{} as declared",
+                report.unchanged,
+                if report.unchanged == 1 { "" } else { "s" }
+            );
+        }
+    }
+
+    for warning in &report.warnings {
+        println!("muru: warning: {warning}");
+    }
+}
+
+/// Section 10.4: 0 for no changes, 2 for changes planned, 1 for errors;
+/// after an apply, 1 when any change failed.
+fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
+    if !report.errors.is_empty() {
+        return 1;
+    }
+    if report.applied {
+        let failed = report
+            .changes
+            .iter()
+            .any(|change| change.outcome.starts_with("failed"));
+        return if failed { 1 } else { 0 };
+    }
+    if planning && !report.changes.is_empty() {
+        return 2;
+    }
+
+    0
+}
+
+fn report_json(report: &pb::ConfigReport) -> serde_json::Value {
+    serde_json::json!({
+        "errors": report.errors,
+        "warnings": report.warnings,
+        "changes": report.changes.iter().map(|change| serde_json::json!({
+            "action": change.action,
+            "subject": change.subject,
+            "detail": change.detail,
+            "outcome": change.outcome,
+        })).collect::<Vec<_>>(),
+        "unchanged": report.unchanged,
+        "applied": report.applied,
+    })
+}
+
+/// Unix milliseconds as an RFC 3339 instant in UTC.
+fn format_time(unix_ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp((unix_ms / 1000) as i64)
+        .map(|time| {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                time.year(),
+                time.month() as u8,
+                time.day(),
+                time.hour(),
+                time.minute(),
+                time.second()
+            )
+        })
+        .unwrap_or_default()
 }
 
 /// Show or follow the events.

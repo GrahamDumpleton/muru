@@ -6,8 +6,9 @@
 The daemon serves one or more applications on one node, each deployed
 from a source directory with the blue/green strategy, with rollback,
 drains and an event log, through an edge process of its own, and it can
-be stopped and started again without interrupting traffic. What is still
-to come: virtual hosts and TLS, declarative configuration, canaries, and
+be stopped and started again without interrupting traffic. Applications
+and their releases can be declared in files and applied, exported and
+compared. What is still to come: virtual hosts and TLS, canaries, and
 the rest of the roadmap.
 ```
 
@@ -61,6 +62,64 @@ release is recorded, and `release wait` waits for a state.
 A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves
 the previous release serving and reports the failure.
+
+## Declaring applications in files
+
+A file declares applications and their releases with the keys `muructl
+deploy` takes, and `muructl apply -f FILE` makes the daemon match it:
+
+```toml
+[app.shop.release.r1]
+source = "/srv/shop"
+entrypoint = "shop.wsgi:application"
+python = "/srv/shop/.venv/bin/python"
+processes = 2
+threads = 8
+```
+
+```
+muructl apply -f shop.toml
+muructl apply -f config/ --dry-run
+muructl apply -f config/ --prune
+muructl config export > config/shop.toml
+muructl config diff -f config/
+```
+
+Each `[app.NAME.release.ID]` table needs a `source`; a relative path is
+taken from the file's own directory. The other keys are those of the
+`[tool.muru]` table (`entrypoint`, `interface`, `factory`,
+`factory_phase`, `python`, `processes`, `threads`, `sync_threads`,
+`concurrency`, `preload` and `hooks`), and what a table leaves out comes
+from the source's `[tool.muru]` table and then the defaults, exactly as
+a deploy resolves them. A directory applies every `.toml` file in it, in
+name order, as one configuration.
+
+An apply creates the applications the files name, deploys each declared
+release the daemon does not have (in id order, so the last declared
+release of an application is the one that serves) and leaves a release
+that is already recorded as declared alone. Releases are immutable: a
+declared release whose settings differ from the recorded ones is an
+error, and the file is applied only when it has no errors at all. Unknown
+keys, invalid names, a missing source directory and a source without an
+entrypoint are errors too. `[[listener]]` entries and the `[limits]`
+table belong in the daemon's own configuration file; in an applied file
+they are reported as warnings and not applied.
+
+`--dry-run` prints the plan and changes nothing. `--prune` also removes
+the applications and releases the files do not contain: a running
+release drains and stops first. `--json` writes the report as JSON. The
+exit code is 0 when there is nothing to do or everything applied, 2 for
+a dry run with changes planned, and 1 for errors.
+
+`muructl config export` writes desired state as a file of this form, with
+a header naming the daemon's version, the node, the time and the state
+version. It writes the release that serves each application, every key
+spelled out, so applying the file back to the daemon it came from changes
+nothing; `--all-releases` writes every release, `--app NAME` one
+application, and `--json` the same document as JSON. `muructl config
+diff -f FILE` compares a file with desired state in both directions,
+listing what the file would add and what the daemon holds that the file
+does not, with exit code 2 when they differ.
 
 ## Where things live
 

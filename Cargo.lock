@@ -1077,6 +1077,7 @@ dependencies = [
  "muru-proto",
  "rcgen",
  "rustls-pki-types",
+ "serde_json",
  "time",
  "tokio",
  "tokio-stream",

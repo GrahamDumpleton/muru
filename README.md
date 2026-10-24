@@ -27,7 +27,8 @@ WebSockets, forked workers with an import check before the fork, lifecycle
 hooks and ASGI lifespan, watch reload, an access log and a small dashboard,
 tested with plain WSGI and ASGI, Flask, Django, Starlette and FastAPI on
 regular and free-threaded Python. The daemon serves applications deployed from source
-directories with blue/green releases, rollback and drains; traffic
+directories with blue/green releases, rollback and drains, declared in
+files or on the command line; virtual hosts, TLS in the daemon, traffic
 management and the rest of the daemon are still to come; the
 [roadmap](docs/project/roadmap.md) lists the phases. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
@@ -76,7 +77,7 @@ macOS on CPython 3.11 to 3.15, including the free-threaded builds.
 
 ## Five-minute start
 
-Today, in development:
+Today:
 
 ```
 muructl run app:application --reload     # HTTP on 8080, restarts on change
@@ -84,11 +85,15 @@ muructl run --https                      # HTTPS on 8443 with a local certificat
 muructl run . --port auto                # the project's [tool.muru] table, free ports
 ```
 
+```
+muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
+muructl apply -f config/                 # applications and releases declared in files
+```
+
 Planned:
 
 ```
-muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
-muructl apply -f config/                 # several applications, virtual hosts, TLS
+muructl apply -f config/                 # virtual hosts and TLS in the same files
 muructl rollout canary shop@r43          # canary with gates and rollback
 ```
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 
 from support import server as support
 
@@ -34,6 +35,7 @@ def print_config(*args: str) -> dict[str, object]:
 def test_a_project_run_is_written_as_a_release() -> None:
     document = print_config(str(PROJECTS / "shop"), "--https", "--max-body-size", "25MB")
     release = document["app"]["shop"]["release"]["r1"]  # type: ignore[index]
+    assert Path(release["source"]).resolve() == (PROJECTS / "shop").resolve()
     assert release["entrypoint"] == "shop.wsgi:application"
     assert release["processes"] == 2
     assert release["threads"] == 3
@@ -51,7 +53,7 @@ def test_a_project_run_is_written_as_a_release() -> None:
 
 def test_a_factory_entrypoint_keeps_its_factory_settings() -> None:
     document = print_config(str(PROJECTS / "factory"), "--interface", "wsgi")
-    release = document["app"]["factory_site"]["release"]["r1"]  # type: ignore[index]
+    release = document["app"]["factory-site"]["release"]["r1"]  # type: ignore[index]
     assert release["factory"] is True
     assert release["factory_phase"] == "worker"
     assert release["interface"] == "wsgi"

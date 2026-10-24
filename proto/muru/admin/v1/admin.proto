@@ -39,6 +39,12 @@ service Admin {
 
   // Stop the daemon: detaching by default, or draining everything first.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Declarative configuration (section 10.4): apply a document, compare
+  // one with desired state, or export desired state as one.
+  rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
+  rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
+  rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
 }
 
 message GetStatusRequest {}
@@ -181,3 +187,44 @@ message ShutdownRequest {
 }
 
 message ShutdownResponse {}
+
+// A document as muructl apply reads it: TOML with [app.NAME.release.ID]
+// tables, source paths already absolute.
+message ApplyConfigRequest {
+  string document = 1;
+  bool dry_run = 2;                 // report the plan and change nothing
+  bool prune = 3;                   // also remove what the document does not contain
+}
+
+message DiffConfigRequest {
+  string document = 1;
+}
+
+// What an apply would do, or did. With errors nothing is applied.
+message ConfigReport {
+  repeated string errors = 1;       // validation: unknown keys, bad values, missing sources, immutable releases
+  repeated string warnings = 2;     // what the daemon took no action on
+  repeated ConfigChange changes = 3;
+  uint32 unchanged = 4;             // releases already as declared
+  bool applied = 5;                 // the changes were carried out
+}
+
+message ConfigChange {
+  string action = 1;                // create-app, deploy, drain, remove-release, remove-app
+  string subject = 2;               // app, or app@release
+  string detail = 3;                // what the release runs, or why it goes
+  string outcome = 4;               // after an apply: ready, failed: ..., stopped, removed
+}
+
+message ExportConfigRequest {
+  string app = 1;                   // one application, else all
+  bool all_releases = 2;            // every release, not only the one that serves
+}
+
+message ExportConfigResponse {
+  string document = 1;              // TOML
+  string version = 2;               // the daemon's version
+  string node = 3;                  // the host name
+  uint64 time_unix_ms = 4;
+  uint64 state_version = 5;         // the last event sequence number
+}

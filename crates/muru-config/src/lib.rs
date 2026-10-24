@@ -178,13 +178,20 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// A release definition, the `[app.NAME.release.ID]` table (appendix C).
-/// Phase 1 holds the keys a development run uses; `muructl run
-/// --print-config` writes one so a laptop setup can become a declared
-/// release.
+/// A release definition, the `[app.NAME.release.ID]` table (appendix C):
+/// the keys a deploy takes. `muructl run --print-config` writes one so a
+/// laptop setup can become a declared release, and `muructl apply` reads
+/// them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Release {
-    /// The application as module:callable.
+    /// The source directory. A relative path is taken from the file's
+    /// directory. Required by `muructl apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The application as module:callable, else from the source's
+    /// `[tool.muru]` table.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub entrypoint: String,
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +228,7 @@ pub struct Release {
 /// The `[limits]` table (appendix C): sizes and durations as the
 /// configuration writes them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Largest request body, for example 10MB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +258,7 @@ pub struct Limits {
 
 /// A listener, one of the `[[listener]]` entries (appendix C).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Listener {
     /// The address, as IP:PORT.
     pub address: String,
@@ -260,15 +269,19 @@ pub struct Listener {
 
 /// An application's table and its releases.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct App {
     /// Releases by identifier.
     #[serde(default)]
     pub release: BTreeMap<String, Release>,
 }
 
-/// A declarative configuration file as `muructl apply` will read it: the
-/// subset a development run can describe.
+/// A declarative configuration file as `muructl apply` reads it and
+/// `muructl config export` writes it (section 10.4): listeners and limits,
+/// which belong to the daemon's own file, and applications with their
+/// releases.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Document {
     /// Listeners.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -285,6 +298,34 @@ impl Document {
     /// The document as TOML.
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
+    }
+
+    /// Parse a document, with unknown keys and wrong types reported the
+    /// way toml reports them, with their line.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        toml::from_str(text).map_err(|error| error.to_string())
+    }
+
+    /// Fold another document into this one: its listeners are appended,
+    /// its limits replace these when given, and its applications and
+    /// releases are added. A release declared in both is an error.
+    pub fn merge(&mut self, other: Document) -> Result<(), String> {
+        self.listener.extend(other.listener);
+        if other.limits.is_some() {
+            self.limits = other.limits;
+        }
+
+        for (name, app) in other.app {
+            let entry = self.app.entry(name.clone()).or_default();
+            for (id, release) in app.release {
+                if entry.release.contains_key(&id) {
+                    return Err(format!("release {name}@{id} is declared twice"));
+                }
+                entry.release.insert(id, release);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -463,6 +504,7 @@ mod tests {
                 release: BTreeMap::from([(
                     "r1".to_owned(),
                     Release {
+                        source: Some("/srv/shop".to_owned()),
                         entrypoint: "shop.wsgi:application".to_owned(),
                         processes: Some(2),
                         preload: Some(Preload::Auto),
@@ -480,6 +522,21 @@ mod tests {
         assert!(text.contains("[[listener]]"), "{text}");
         let back: Document = toml::from_str(&text).unwrap();
         assert_eq!(back, document);
+    }
+
+    #[test]
+    fn a_document_rejects_unknown_keys_and_merges_releases() {
+        let error = Document::parse("[app.shop.release.r1]\nentry_point = 'a:b'\n").unwrap_err();
+        assert!(error.contains("entry_point"), "{error}");
+
+        let mut first = Document::parse("[app.shop.release.r1]\nentrypoint = 'a:b'\n").unwrap();
+        let second = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
+        first.merge(second).unwrap();
+        assert_eq!(first.app["shop"].release.len(), 2);
+
+        let again = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
+        let error = first.merge(again).unwrap_err();
+        assert_eq!(error, "release shop@r2 is declared twice");
     }
 
     #[test]

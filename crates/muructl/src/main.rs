@@ -95,6 +95,15 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
+    /// Apply declarative configuration from a file or a directory of files.
+    Apply(Box<admin::ApplyArgs>),
+
+    /// Export, compare or inspect declarative configuration.
+    Config {
+        #[command(subcommand)]
+        command: admin::ConfigCommand,
+    },
+
     /// Show or follow the daemon's events.
     Events {
         /// Keep printing events as they happen.
@@ -459,6 +468,18 @@ fn main() -> anyhow::Result<()> {
         Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
+        Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
+        Command::Config { command } => match command {
+            admin::ConfigCommand::Export {
+                app,
+                all_releases,
+                json,
+                socket,
+            } => runtime.block_on(admin::config_export(app, all_releases, json, socket)),
+            admin::ConfigCommand::Diff { file, json, socket } => {
+                exit_with(runtime, admin::config_diff(file, json, socket))
+            }
+        },
         Command::Events {
             follow,
             after,
@@ -468,6 +489,21 @@ fn main() -> anyhow::Result<()> {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
     }
+}
+
+/// Run a command whose result is an exit code (section 10.4: 0 for no
+/// changes, 2 for changes planned, 1 for errors) and exit with it.
+fn exit_with(
+    runtime: tokio::runtime::Runtime,
+    command: impl std::future::Future<Output = anyhow::Result<i32>>,
+) -> anyhow::Result<()> {
+    let code = runtime.block_on(command)?;
+    if code == 0 {
+        return Ok(());
+    }
+
+    drop(runtime);
+    std::process::exit(code)
 }
 
 /// Parse NAME=DURATION for --timeout.
@@ -668,7 +704,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
 fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     use muru_config::{App, Document, Listener, Release};
 
-    let name = app_name(&resolved.entrypoint);
+    let name = app_name(&resolved.entrypoint).replace('_', "-");
     let limits = limits(args);
     let (http, https) = addresses(args);
     let mut listeners = vec![Listener {
@@ -682,6 +718,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         });
     }
     let release = Release {
+        source: Some(resolved.project.display().to_string()),
         entrypoint: resolved.entrypoint.clone(),
         interface: (resolved.interface != muru_config::Interface::Auto)
             .then_some(resolved.interface),
@@ -720,8 +757,9 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     };
     let text = document.to_toml().context("writing the configuration")?;
     Ok(format!(
-        "# The declarative equivalent of this muructl run, for muructl apply (phase 2).\n\
-         # The release is written as r1; muructl deploy numbers releases itself.\n\n{text}"
+        "# The declarative equivalent of this muructl run, for muructl apply.\n\
+         # The release is written as r1; muructl deploy numbers releases itself.\n\
+         # Listeners and limits belong in the daemon configuration file.\n\n{text}"
     ))
 }
 

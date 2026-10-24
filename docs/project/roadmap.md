@@ -45,5 +45,9 @@ and handed back over SCM_RIGHTS to a daemon that restarts), and daemon
 detach with re-adoption of the edge and the hosts, so a daemon restart
 never interrupts traffic, and warm retention of the superseded release
 for an instant rollback (whole, until the host control socket brings the
-warm floor of section 9.1). Next from phase 2: virtual hosts, TLS and the
-declarative configuration (apply, export, diff).
+warm floor of section 9.1). Declarative configuration has its first
+slice: `muructl apply -f` with dry runs and prune, `config export` and
+`config diff` over the ApplyConfig, ExportConfig and DiffConfig
+operations of appendix B, for applications and releases (listeners and
+limits stay in the daemon's own file until virtual hosts arrive). Next
+from phase 2: virtual hosts and TLS.

@@ -224,6 +224,37 @@ impl Store {
         })
     }
 
+    /// Remove a release record. The caller makes sure it is not running.
+    pub fn delete_release(&self, app: &str, id: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM releases WHERE app = ?1 AND id = ?2",
+                params![app, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove an application and its release records. The caller makes
+    /// sure none of them is running.
+    pub fn delete_app(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM releases WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// The sequence number of the last event: a version of the whole
+    /// store, since every change to it is an event.
+    pub fn state_version(&self) -> Result<u64, StoreError> {
+        self.with(|connection| {
+            let last: Option<i64> =
+                connection.query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0))?;
+            Ok(last.unwrap_or(0) as u64)
+        })
+    }
+
     /// Move a release to a state, with a message saying why or what next.
     pub fn set_release_state(
         &self,

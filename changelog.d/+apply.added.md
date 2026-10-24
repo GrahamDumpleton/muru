@@ -1,0 +1,1 @@
+`muructl apply -f FILE or DIR` deploys the applications and releases a declarative file declares, with `--dry-run`, `--prune` and `--json`; `muructl config export` writes desired state as such a file and `muructl config diff -f` compares one with it. Release tables take a `source` key, which `muructl run --print-config` now writes.
