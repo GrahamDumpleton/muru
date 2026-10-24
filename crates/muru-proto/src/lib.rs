@@ -31,3 +31,13 @@ pub mod admin {
         tonic::include_proto!("muru.admin.v1");
     }
 }
+
+/// The edge control protocol, package `muru.edge.v1`, between the daemon
+/// and its edge processes.
+pub mod edge {
+    /// Version 1 of the edge control protocol.
+    #[allow(missing_docs, clippy::all, clippy::pedantic)]
+    pub mod v1 {
+        tonic::include_proto!("muru.edge.v1");
+    }
+}

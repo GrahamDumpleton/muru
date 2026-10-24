@@ -171,16 +171,29 @@ pub struct Edge {
 impl Edge {
     /// Bind the listeners and prepare the worker pools.
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
-        let pools = Arc::new(Pools {
-            current: RwLock::new(Arc::new(link::LinkPool::connect(&config.sockets).await?)),
-        });
-        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let http = TcpListener::bind(config.listen)
             .await
             .map_err(|source| BindError {
                 address: config.listen,
                 source,
             })?;
+        Self::with_listener(config, http).await
+    }
+
+    /// Prepare the edge on a listener bound elsewhere: the daemon creates
+    /// the listening socket and hands it to the edge process (section 2.3),
+    /// so the edge can be replaced without refusing connections.
+    pub async fn adopt(config: Config, listener: std::net::TcpListener) -> anyhow::Result<Self> {
+        listener.set_nonblocking(true)?;
+        let http = TcpListener::from_std(listener)?;
+        Self::with_listener(config, http).await
+    }
+
+    async fn with_listener(config: Config, http: TcpListener) -> anyhow::Result<Self> {
+        let pools = Arc::new(Pools {
+            current: RwLock::new(Arc::new(link::LinkPool::connect(&config.sockets).await?)),
+        });
+        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let local = http.local_addr()?;
         let mut https = None;
         let mut redirect_to = None;

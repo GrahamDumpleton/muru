@@ -4,5 +4,9 @@ SOURCE` creates a release from a source directory, starts it, moves
 traffic to it when every worker is ready and drains the release that
 served before, so no request is refused during a deploy. `muructl release
 list` and `wait`, `rollback`, `drain`, `events` and `status` manage and
-watch it; a release whose host dies is started again. The edge runs in
-the daemon process for now, and `daemon stop` drains everything with it.
+watch it; a release whose host dies is started again. The edge runs as a
+process of its own on a socket the daemon binds and hands to it, and is
+started again on the same socket if it dies. `daemon stop` detaches,
+leaving the edge and the hosts serving for the next daemon to take over,
+so a daemon restart costs no request; `daemon stop --shutdown` drains
+and stops everything.

@@ -40,17 +40,27 @@ pub struct HostSpec {
     pub tcp_base_port: Option<u16>,
     /// Serve in the host process itself, with no fork (section 13.1).
     pub single: bool,
+    /// Keep running when this process goes away, and write output to this
+    /// file instead of pipes, so a daemon can re-adopt the host after it
+    /// restarts (section 13.3). None relays the output to this process.
+    pub detach_to: Option<PathBuf>,
 }
 
 /// A running host and the sockets its workers listen on.
 pub struct HostProcess {
-    child: Child,
+    process: Process,
     stdin: Option<ChildStdin>,
     /// The worker link sockets (paths, or addresses for the TCP link).
     pub sockets: Vec<PathBuf>,
     run_dir: PathBuf,
     /// The release number within this run, from 1.
     pub release: u32,
+}
+
+/// A host this process spawned, or one it adopted from a previous daemon.
+enum Process {
+    Child(Child),
+    Adopted(u32),
 }
 
 impl HostProcess {
@@ -86,9 +96,30 @@ impl HostProcess {
             .arg(spec.preload.as_str())
             .arg("--interface")
             .arg(spec.interface.as_str())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(Stdio::piped());
+        match &spec.detach_to {
+            Some(log) => {
+                let log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log)
+                    .with_context(|| format!("opening {}", log.display()))?;
+                command.stdout(log.try_clone()?).stderr(log);
+                // Its own session, so the daemon's signals and terminal do
+                // not reach it.
+                // SAFETY: setsid is async-signal-safe and the closure runs
+                // in the child between fork and exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
+            }
+            None => {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+        }
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
         }
@@ -100,6 +131,9 @@ impl HostProcess {
         }
         if spec.single {
             command.arg("--single");
+        }
+        if spec.detach_to.is_some() {
+            command.arg("--detach");
         }
         let base_port = spec
             .tcp_base_port
@@ -131,12 +165,49 @@ impl HostProcess {
             })
             .collect();
         Ok(Self {
-            child,
+            process: Process::Child(child),
             stdin,
             sockets,
             run_dir,
             release,
         })
+    }
+
+    /// Take over a host a previous daemon started: it is checked to be
+    /// alive and its workers to be listening, and is stopped with signals
+    /// rather than waited for, since it is not this process's child.
+    pub fn adopt(
+        pid: u32,
+        sockets: Vec<PathBuf>,
+        run_dir: PathBuf,
+        release: u32,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(alive(pid), "process {pid} is gone");
+        anyhow::ensure!(
+            sockets.iter().all(|socket| listening(socket)),
+            "the workers of process {pid} are not listening"
+        );
+
+        Ok(Self {
+            process: Process::Adopted(pid),
+            stdin: None,
+            sockets,
+            run_dir,
+            release,
+        })
+    }
+
+    /// The host's pid.
+    pub fn pid(&self) -> Option<u32> {
+        match &self.process {
+            Process::Child(child) => child.id(),
+            Process::Adopted(pid) => Some(*pid),
+        }
+    }
+
+    /// The release run directory.
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
     }
 
     /// Wait until every worker listens, or the host exits or the time is up.
@@ -146,8 +217,8 @@ impl HostProcess {
             if self.sockets.iter().all(|socket| listening(socket)) {
                 return Ok(());
             }
-            if let Some(status) = self.child.try_wait()? {
-                anyhow::bail!("the host exited with {status} before its workers were ready");
+            if let Some(status) = self.try_exited()? {
+                anyhow::bail!("the host {status} before its workers were ready");
             }
             anyhow::ensure!(
                 started.elapsed() < timeout,
@@ -160,33 +231,80 @@ impl HostProcess {
 
     /// Resolve when the host exits.
     pub async fn exited(&mut self) -> std::io::Result<ExitStatus> {
-        self.child.wait().await
+        match &mut self.process {
+            Process::Child(child) => child.wait().await,
+            Process::Adopted(pid) => {
+                let pid = *pid;
+                while alive(pid) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Ok(ExitStatus::default())
+            }
+        }
     }
 
-    /// Whether the host has exited, without waiting.
-    pub fn try_exited(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+    /// Whether the host has exited, without waiting: a sentence saying how
+    /// when it has.
+    pub fn try_exited(&mut self) -> std::io::Result<Option<String>> {
+        match &mut self.process {
+            Process::Child(child) => Ok(child
+                .try_wait()?
+                .map(|status| format!("exited with {status}"))),
+            Process::Adopted(pid) => Ok((!alive(*pid)).then(|| "is gone".to_owned())),
+        }
     }
 
     /// Stop the host: SIGTERM and its stdin closed, then SIGKILL after a
     /// grace period. Its workers finish the requests they are serving.
     pub async fn stop(mut self) {
-        if let Some(pid) = self.child.id() {
+        if let Some(pid) = self.pid() {
             // SAFETY: kill(2) with a valid pid and signal has no memory-safety
-            // preconditions; the pid belongs to the child we spawned.
+            // preconditions; the pid is a host this daemon started or adopted.
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
         }
         drop(self.stdin.take());
-        if tokio::time::timeout(Duration::from_secs(10), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
+
+        let grace = Duration::from_secs(10);
+        match &mut self.process {
+            Process::Child(child) => {
+                if tokio::time::timeout(grace, child.wait()).await.is_err() {
+                    let _ = child.kill().await;
+                }
+            }
+            Process::Adopted(pid) => {
+                let pid = *pid;
+                let started = Instant::now();
+                while alive(pid) && started.elapsed() < grace {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if alive(pid) {
+                    // SAFETY: as above.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
         }
         let _ = std::fs::remove_dir_all(&self.run_dir);
     }
+
+    /// Leave the host running and forget it, for a daemon that detaches.
+    pub fn release(self) {
+        drop(self.stdin);
+        if let Process::Child(mut child) = self.process {
+            // The child must not be killed when its handle drops.
+            let _ = child.try_wait();
+            std::mem::forget(child);
+        }
+    }
+}
+
+/// Whether a process exists.
+pub fn alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 checks for the process and sends nothing.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 /// Whether a worker accepts connections on its socket. The edge connects

@@ -5,11 +5,10 @@
 
 The daemon serves one or more applications on one node, each deployed
 from a source directory with the blue/green strategy, with rollback,
-drains and an event log. What is still to come: separate edge processes,
-hosts that outlive a daemon restart, warm retention of drained releases,
-virtual hosts and TLS, declarative configuration, canaries, and the rest
-of the roadmap. `muructl daemon stop` drains and stops every release with
-the daemon; detaching arrives with host re-adoption.
+drains and an event log, through an edge process of its own, and it can
+be stopped and started again without interrupting traffic. What is still
+to come: warm retention of drained releases, virtual hosts and TLS,
+declarative configuration, canaries, and the rest of the roadmap.
 ```
 
 `muructl run` is for development. For an application that stays up, start
@@ -86,8 +85,29 @@ timeouts, with the same keys `muructl run --print-config` writes.
 `muructl daemon start` starts the daemon in the background, logging to
 `daemon.log` in the log directory, and waits until it answers; `muructl
 up` does the same and is harmless when one already runs. `muructl daemon
-status` and `muructl status` show the daemon, its listener and its
-locations. `muructl daemon run` runs it in the foreground, for a service
+status` and `muructl status` show the daemon, its edge process, its
+listener and its locations.
+
+The daemon binds the listening socket itself and hands it to an edge
+process started from the same executable, which carries the traffic;
+the daemon is never on the request path. If the edge exits, the daemon
+starts another on the same socket with the same routing, and connections
+made in between wait in the socket's backlog rather than being refused.
+The edge's own output goes to `edge.log` in the log directory, and each
+release's host writes to `apps/APP/RELEASE.log` there.
+
+## Stopping and restarting
+
+`muructl daemon stop` detaches: the daemon exits, and the edge and every
+host keep serving exactly as they were. The next `muructl daemon start`
+(or `up`, or a service manager restarting the unit) finds them through
+the records in the runtime directory, takes them over, and carries on,
+so a daemon restart or upgrade never costs a request. `muructl daemon
+stop --shutdown` drains every release, stops the hosts and the edge, and
+then exits, for taking a node out of service.
+
+A host whose daemon is gone keeps its workers; a host that dies takes
+its workers with it, and the next daemon starts its release again. `muructl daemon run` runs it in the foreground, for a service
 manager or a terminal. Commands find the daemon through its admin socket:
 `--socket` or `MURU_SOCKET`, else the socket in the runtime directory.
 

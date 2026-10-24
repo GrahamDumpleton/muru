@@ -1,0 +1,43 @@
+// Control protocol between the daemon and its edge processes (design
+// specification sections 2.3 and 4.4). The daemon spawns each edge with its
+// listener sockets and pushes routing snapshots over the edge's control
+// socket. Internal; messages change additively within a major version.
+//
+// First slice: a snapshot is the list of worker sockets of the release that
+// serves. Virtual hosts, routes, certificates and the rest of section 4.4
+// are added as their features land.
+
+syntax = "proto3";
+
+package muru.edge.v1;
+
+service EdgeControl {
+  // Replace the routing snapshot. The edge connects to the workers before
+  // it answers, and keeps the last good snapshot if that fails.
+  rpc Apply(Snapshot) returns (Applied);
+  // The edge's pid, listener and snapshot version.
+  rpc GetStatus(EdgeStatusRequest) returns (EdgeStatus);
+  // Stop accepting and exit once the requests in flight have finished.
+  rpc Stop(StopRequest) returns (Stopped);
+}
+
+message Snapshot {
+  uint64 version = 1;
+  repeated string worker_sockets = 2;
+}
+
+message Applied {
+  uint64 version = 1;
+}
+
+message EdgeStatusRequest {}
+
+message EdgeStatus {
+  uint32 pid = 1;
+  string listen = 2;
+  uint64 snapshot_version = 3;
+}
+
+message StopRequest {}
+
+message Stopped {}

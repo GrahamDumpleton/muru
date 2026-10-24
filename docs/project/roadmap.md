@@ -38,9 +38,11 @@ first slice is in: the state store (SQLite), the locations of section
 13.8, the admin API of appendix B over the admin socket with the deploy,
 release, rollback, drain, event and status operations, `muructl daemon
 run`, `start`, `stop` and `status`, `up`, `deploy`, `release list` and
-`wait`, `rollback`, `drain`, `events` and `status`, with the edge embedded
-in the daemon process and the blue/green strategy. Next from phase 2:
-separate edge processes with listener handoff (ADR 0002), host
-re-adoption so a daemon restart or detach never interrupts traffic, warm
-retention of drained releases, then virtual hosts, TLS and the declarative
-configuration (apply, export, diff).
+`wait`, `rollback`, `drain`, `events` and `status`, the blue/green
+strategy, the edge as a process of its own (ADR 0002) on a listener the
+daemon binds and hands down (respawned on the same socket if it dies,
+and handed back over SCM_RIGHTS to a daemon that restarts), and daemon
+detach with re-adoption of the edge and the hosts, so a daemon restart
+never interrupts traffic. Next from phase 2: warm retention of drained
+releases, then virtual hosts, TLS and the declarative configuration
+(apply, export, diff).

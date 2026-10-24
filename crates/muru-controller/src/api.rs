@@ -69,6 +69,7 @@ impl Admin for Service {
             started_unix_ms: info.started_unix_ms,
             apps: apps.len() as u32,
             releases: releases.len() as u32,
+            edge_pid: info.edge_pid.load(std::sync::atomic::Ordering::Relaxed),
         }))
     }
 
@@ -302,11 +303,14 @@ impl Admin for Service {
         &self,
         request: Request<pb::ShutdownRequest>,
     ) -> Result<Response<pb::ShutdownResponse>, Status> {
-        let _ = request.into_inner().drain;
+        let drain = request.into_inner().drain;
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
-            .send(Command::Shutdown { done: done_tx })
+            .send(Command::Shutdown {
+                drain,
+                done: done_tx,
+            })
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?;
         let _ = done_rx.await;

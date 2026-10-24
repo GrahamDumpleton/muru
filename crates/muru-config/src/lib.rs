@@ -141,6 +141,32 @@ pub fn format_size(bytes: u64) -> String {
     bytes.to_string()
 }
 
+/// Parse a duration such as 250ms, 1.5s, 2m, 1h or 2 (seconds), as the
+/// configuration and the command line write them.
+pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
+    let text = text.trim();
+    let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = text.strip_suffix('h') {
+        (number, 3600.0)
+    } else if let Some(number) = text.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1.0)
+    } else {
+        (text, 1.0)
+    };
+
+    let value: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration, for example 250ms, 1.5s or 2m"))?;
+    if value < 0.0 || !value.is_finite() {
+        return Err(format!("{text:?} is not a duration"));
+    }
+    Ok(std::time::Duration::from_secs_f64(value * scale))
+}
+
 /// Write a duration the way the configuration accepts it: whole seconds
 /// as `5s`, otherwise milliseconds as `250ms`.
 pub fn format_duration(duration: Duration) -> String {

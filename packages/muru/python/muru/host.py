@@ -259,10 +259,12 @@ class Host:
         tcp_base_port: int | None = None,
         sync_threads: int = 8,
         concurrency: int = 1000,
+        detach: bool = False,
     ) -> None:
         self.release = release
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
+        self.detach = detach
         self.worker_count = workers
         self.threads = threads
         self.sync_threads = sync_threads
@@ -448,9 +450,12 @@ class Host:
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
 
+        # Section 13.3: a host under the daemon outlives it, so the daemon
+        # can be restarted or upgraded and re-adopt it; one under muructl
+        # run stops when its parent's end of stdin closes.
         watch_stdin = False
         try:
-            if not os.isatty(0):
+            if not self.detach and not os.isatty(0):
                 selector.register(0, selectors.EVENT_READ)
                 watch_stdin = True
         except OSError:
@@ -660,6 +665,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="run one full collection after preload (section 6.2 step 2)",
     )
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="keep running when the parent goes away, for a daemon that re-adopts hosts",
+    )
     return parser.parse_args(argv)
 
 
@@ -757,6 +767,7 @@ def main(argv: list[str] | None = None) -> int:
         args.tcp_base_port,
         sync_threads=args.sync_threads,
         concurrency=args.concurrency,
+        detach=args.detach,
     )
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees

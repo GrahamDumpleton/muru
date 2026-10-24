@@ -110,10 +110,10 @@ pub enum DaemonCommand {
     /// Start the daemon in the background and wait until it answers.
     Start(DaemonRunArgs),
 
-    /// Stop the daemon: its releases are drained and stopped with it.
+    /// Stop the daemon, leaving hosts and the edge serving for the next
+    /// daemon to re-adopt; with --shutdown, drain and stop everything.
     Stop {
-        /// Drain every release and stop everything (the only behaviour
-        /// until detaching arrives with host re-adoption).
+        /// Drain every release, stop the edge and the hosts, then exit.
         #[arg(long)]
         shutdown: bool,
 
@@ -150,13 +150,11 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     };
     let limits = limits_from(&document)?;
 
-    // The access log goes to a file in the log directory as JSON lines.
+    // The edge writes the access log to a file in the log directory as
+    // JSON lines.
     std::fs::create_dir_all(&locations.logs.path)
         .with_context(|| format!("creating {}", locations.logs.path.display()))?;
-    let access_log = muru_edge::access::Config {
-        destination: muru_edge::access::Destination::File(locations.logs.path.join("access.log")),
-        ..muru_edge::access::Config::default()
-    };
+    let access_log = Some(locations.logs.path.join("access.log"));
 
     for (name, location) in [
         ("config", &locations.config),
@@ -176,6 +174,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         listen,
         limits,
         access_log,
+        executable: std::env::current_exe().context("finding the muructl executable")?,
     })
     .await
 }
@@ -250,14 +249,15 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
 /// Stop the daemon through its API and wait for its process to go.
 pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<()> {
-    let _ = shutdown;
     let path = socket.socket();
     let mut client = client::connect(&path).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
-    client.shutdown(pb::ShutdownRequest { drain: true }).await?;
+    client
+        .shutdown(pb::ShutdownRequest { drain: shutdown })
+        .await?;
 
     // The daemon removes its socket as it exits; a process that has exited
     // but not been reaped would still answer kill(0), so the socket is the
@@ -269,7 +269,11 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
             Err(_) => false,
         };
         if !answering && (!path.exists() || !process_alive(status.pid)) {
-            println!("muru: daemon stopped");
+            if shutdown {
+                println!("muru: daemon stopped; releases drained and stopped");
+            } else {
+                println!("muru: daemon detached; hosts and the edge keep serving");
+            }
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -286,6 +290,7 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
         .into_inner();
 
     println!("daemon   pid {} version {}", status.pid, status.version);
+    println!("edge     pid {}", status.edge_pid);
     println!("serving  {}", status.listeners.join(" and "));
     println!("socket   {}", status.socket);
     println!("state    {}", status.state_dir);
@@ -694,7 +699,7 @@ fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Li
         ),
     ] {
         if let Some(text) = value {
-            *field = crate::parse_duration(text).map_err(anyhow::Error::msg)?;
+            *field = muru_config::parse_duration(text).map_err(anyhow::Error::msg)?;
         }
     }
     Ok(limits)

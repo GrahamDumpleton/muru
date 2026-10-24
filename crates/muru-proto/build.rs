@@ -17,10 +17,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             &[
                 "../../proto/muru/worker/v1/worker.proto",
                 "../../proto/muru/admin/v1/admin.proto",
+                "../../proto/muru/edge/v1/edge.proto",
             ],
             &["../../proto"],
         )?;
     println!("cargo:rerun-if-changed=../../proto/muru/worker/v1/worker.proto");
     println!("cargo:rerun-if-changed=../../proto/muru/admin/v1/admin.proto");
+    println!("cargo:rerun-if-changed=../../proto/muru/edge/v1/edge.proto");
     Ok(())
 }

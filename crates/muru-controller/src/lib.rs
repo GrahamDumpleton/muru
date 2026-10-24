@@ -8,7 +8,9 @@
 pub mod api;
 pub mod client;
 pub mod daemon;
+pub mod edges;
 pub mod events;
+pub mod fdpass;
 pub mod host;
 pub mod locations;
 pub mod logs;

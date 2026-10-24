@@ -95,11 +95,16 @@ class Daemon:
     def log(self) -> str:
         return self.log_path.read_text(errors="replace")
 
-    def stop(self) -> None:
-        """Stop the daemon through its API, or kill it if that fails."""
+    def stop(self, shutdown: bool = True) -> None:
+        """Stop the daemon through its API, or kill it if that fails.
+
+        With shutdown, every release and the edge stop with it, which is
+        what a test's clean-up wants; without it the daemon detaches.
+        """
 
         if self.process.poll() is None:
-            completed = self.muructl("daemon", "stop", check=False)
+            arguments = ["daemon", "stop", "--shutdown"] if shutdown else ["daemon", "stop"]
+            completed = self.muructl(*arguments, check=False)
             try:
                 self.process.wait(timeout=60)
             except subprocess.TimeoutExpired:
@@ -111,8 +116,12 @@ class Daemon:
                 )
 
 
-def start_daemon(base: Path) -> Daemon:
-    """Start a daemon in the foreground with directories under `base`."""
+def start_daemon(base: Path, run_dir: Path | None = None, port: int | None = None) -> Daemon:
+    """Start a daemon in the foreground with directories under `base`.
+
+    A second daemon over the same `run_dir` and `port` re-adopts what the
+    first left running.
+    """
 
     muructl = support.muructl_path()
     if muructl is None:
@@ -123,10 +132,10 @@ def start_daemon(base: Path) -> Daemon:
     # The runtime directory holds the admin socket, whose path is limited
     # to about a hundred bytes, so it goes under /tmp rather than pytest's
     # deep temporary directory.
-    run_dir = Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
-    port = support.free_port()
+    run_dir = run_dir or Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    port = port or support.free_port()
     log_path = base / "daemon.out"
-    with log_path.open("wb") as handle:
+    with log_path.open("ab") as handle:
         process = subprocess.Popen(
             [
                 str(muructl),
@@ -311,10 +320,10 @@ def test_release_wait_and_no_wait(daemon: Daemon) -> None:
 def test_a_dead_host_is_started_again(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     pid = json.loads(daemon.get("/info").body)["pid"]
-    host_pid = next(
-        int(line.split("[")[1].split("]")[0])
-        for line in daemon.log().splitlines()
-        if line.startswith("muru.host[")
+    # The host writes to its own log; its pid is in the daemon's record.
+    record = (daemon.run_dir / "apps" / "shop" / "r1" / "host.toml").read_text()
+    host_pid = int(
+        next(line.split("=")[1] for line in record.splitlines() if line.startswith("pid"))
     )
     os.kill(host_pid, signal.SIGKILL)
 
@@ -328,15 +337,15 @@ def test_a_dead_host_is_started_again(daemon: Daemon) -> None:
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
 
 
-def test_current_release_is_started_again_after_a_restart(tmp_path: Path) -> None:
+def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> None:
     first = start_daemon(tmp_path)
     try:
         first.deploy("shop", SHOP)
         assert first.get("/").status == 200
     finally:
-        first.stop()
+        first.stop(shutdown=True)
 
-    second = start_daemon(tmp_path)
+    second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
     try:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and second.get("/").status != 200:
@@ -347,6 +356,50 @@ def test_current_release_is_started_again_after_a_restart(tmp_path: Path) -> Non
         ]
     finally:
         second.stop()
+
+
+def edge_pid_of(daemon: Daemon) -> int:
+    """The edge process pid from the status output."""
+
+    status = daemon.muructl("status").stdout
+    return int(next(line.split()[2] for line in status.splitlines() if line.startswith("edge")))
+
+
+def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path) -> None:
+    first = start_daemon(tmp_path)
+    second = None
+    try:
+        first.deploy("shop", SHOP)
+        pid = json.loads(first.get("/info").body)["pid"]
+        edge_pid = edge_pid_of(first)
+
+        # The daemon goes; the edge and the host do not.
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        assert first.get("/").status == 200
+        assert json.loads(first.get("/info").body)["pid"] == pid
+
+        # The next daemon takes them over, with no gap and no new processes.
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        assert edge_pid_of(second) == edge_pid
+        assert json.loads(second.get("/info").body)["pid"] == pid
+        assert second.releases("shop") == [
+            {"release": "shop@r1", "state": "ready", "serving": "yes"}
+        ]
+        assert "release.adopted" in second.events()
+
+        # And deploys keep working through the adopted edge.
+        assert second.deploy("shop", SHOP) == "muru: release shop@r2 is ready and serving"
+        assert json.loads(second.get("/info").body)["pid"] != pid
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+        second.stop(shutdown=True)
+
+    listing = subprocess.run(
+        ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False
+    ).stdout
+    assert not any(first.run_dir.name in line for line in listing.splitlines())
 
 
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
@@ -388,11 +441,42 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         assert f"http://127.0.0.1:{port}" in status.stdout
     finally:
         stopped = subprocess.run(
-            [str(muructl), "daemon", "stop", *location],
+            [str(muructl), "daemon", "stop", "--shutdown", *location],
             capture_output=True,
             text=True,
             check=False,
             timeout=120,
         )
     assert "daemon stopped" in stopped.stdout, stopped.stdout + stopped.stderr
+    assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()
+
+
+def test_status_names_the_edge_process(daemon: Daemon) -> None:
+    status = daemon.muructl("status").stdout
+    edge_pid = int(next(line.split()[2] for line in status.splitlines() if line.startswith("edge")))
+
+    assert edge_pid != daemon.process.pid
+    assert os.path.exists(f"/proc/{edge_pid}") or os.kill(edge_pid, 0) is None
+
+
+def test_a_dead_edge_is_started_again_without_refusing_connections(daemon: Daemon) -> None:
+    daemon.deploy("shop", SHOP)
+    status = daemon.muructl("status").stdout
+    edge_pid = int(next(line.split()[2] for line in status.splitlines() if line.startswith("edge")))
+
+    # The daemon holds the listener too, so a connection made while no
+    # edge runs waits in the backlog and is served by the new edge.
+    os.kill(edge_pid, signal.SIGKILL)
+    time.sleep(0.2)
+    assert daemon.get("/").status == 200
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and "edge.restarted" not in daemon.events():
+        time.sleep(0.1)
+    assert "edge.restarted" in daemon.events()
+    new_status = daemon.muructl("status").stdout
+    new_pid = int(
+        next(line.split()[2] for line in new_status.splitlines() if line.startswith("edge"))
+    )
+    assert new_pid != edge_pid

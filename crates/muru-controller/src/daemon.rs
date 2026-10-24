@@ -2,22 +2,23 @@
 //! releases toward it and serves the admin API (design specification
 //! sections 9.1, 9.5, 10.1 and 13.3).
 //!
-//! This is the first slice: one node, one edge embedded in the daemon
-//! process, applications deployed from source directories with the
-//! blue/green strategy (start the new release, move traffic when it is
-//! ready, drain the previous one), rollback to the previous release, drains
-//! and events. Separate edge processes, re-adoption of hosts across daemon
+//! This is the first slice: one node, one edge process (ADR 0002) on a
+//! listener the daemon binds and hands down, applications deployed from
+//! source directories with the blue/green strategy (start the new release,
+//! move traffic when it is ready, drain the previous one), rollback to the
+//! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
@@ -41,8 +42,10 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Timeouts and limits for the edge.
     pub limits: muru_edge::Limits,
-    /// Where the access log goes.
-    pub access_log: muru_edge::access::Config,
+    /// Where the edge writes the access log, or none.
+    pub access_log: Option<PathBuf>,
+    /// The executable to spawn edges from, normally the daemon's own.
+    pub executable: PathBuf,
 }
 
 /// A request for the reconciler, answered when it has been carried out.
@@ -76,11 +79,31 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
-    /// Stop the daemon.
+    /// Stop the daemon: detaching, with hosts and the edge left serving
+    /// for the next daemon to re-adopt, or draining everything first.
     Shutdown {
+        /// Drain and stop every release and the edge before exiting.
+        drain: bool,
         /// Where the acknowledgement goes, before the daemon exits.
         done: oneshot::Sender<()>,
     },
+}
+
+/// What a previous daemon left behind about its edge, for re-adoption
+/// (section 10.2), in the runtime directory.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EdgeRecord {
+    pid: u32,
+    control: PathBuf,
+    listener_socket: PathBuf,
+}
+
+/// What a previous daemon left behind about a release's host, in the
+/// release's run directory.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HostRecord {
+    pid: u32,
+    sockets: Vec<PathBuf>,
 }
 
 /// What the API needs to talk to a running daemon.
@@ -104,6 +127,8 @@ pub struct Info {
     pub listen: SocketAddr,
     /// When the daemon started, Unix milliseconds.
     pub started_unix_ms: u64,
+    /// The edge process's pid, for status.
+    pub edge_pid: std::sync::atomic::AtomicU32,
 }
 
 /// A running release: its host and the sockets its workers listen on.
@@ -117,7 +142,8 @@ struct Daemon {
     store: Arc<Store>,
     events: Events,
     locations: Locations,
-    pools: Arc<muru_edge::Pools>,
+    edge: EdgeProcess,
+    info: Arc<Info>,
     logs: Logs,
     running: HashMap<(String, String), Running>,
 }
@@ -134,19 +160,58 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&locations.state_store())?);
     let events = Events::new(Arc::clone(&store));
 
-    // The edge is up before any release, answering 503 until one serves.
-    let edge = muru_edge::Edge::bind(muru_edge::Config {
-        listen: config.listen,
-        sockets: Vec::new(),
-        development: false,
-        access_log: config.access_log,
-        limits: config.limits,
-        https: None,
-    })
-    .await?;
-    let listen = edge.local_addr();
-    let pools = edge.pools();
-    let mut serving = tokio::spawn(edge.run());
+    // An edge a previous daemon left running is taken over, with its
+    // listener handed back. Otherwise the daemon binds the listener and
+    // keeps its own copy, so the edge process can be replaced while
+    // connections wait in the backlog; the edge is up before any release,
+    // answering 503 until one serves.
+    let control = locations.run.path.join("edge.sock");
+    let listener_socket = locations.run.path.join("edge-listener.sock");
+    let edge_log = locations.logs.path.join("edge.log");
+    let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
+        Some(record) => EdgeProcess::adopt(
+            record.pid,
+            config.executable.clone(),
+            record.control,
+            record.listener_socket,
+            edge_log.clone(),
+            config.access_log.clone(),
+            config.limits.clone(),
+        )
+        .await
+        .map_err(|error| tracing::info!(%error, "no edge to re-adopt"))
+        .ok(),
+        None => None,
+    };
+    let edge = match adopted {
+        Some(edge) => {
+            tracing::info!(pid = edge.pid().unwrap_or(0), "re-adopted the edge");
+            edge
+        }
+        None => {
+            let listener = std::net::TcpListener::bind(config.listen)
+                .with_context(|| format!("cannot listen on {}", config.listen))?;
+            EdgeProcess::spawn(EdgeSpec {
+                executable: config.executable,
+                listener,
+                control,
+                listener_socket,
+                log: edge_log,
+                access_log: config.access_log,
+                limits: config.limits,
+            })
+            .await?
+        }
+    };
+    let listen = edge.listen()?;
+    write_record(
+        &locations.run.path.join("edge.toml"),
+        &EdgeRecord {
+            pid: edge.pid().unwrap_or(0),
+            control: edge.control().to_path_buf(),
+            listener_socket: edge.listener_socket().to_path_buf(),
+        },
+    );
 
     // The admin API on its socket.
     let (commands, mut inbox) = mpsc::channel::<Command>(16);
@@ -154,12 +219,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         locations: locations.clone(),
         listen,
         started_unix_ms: crate::model::now_unix_ms(),
+        edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
     });
     let handle = Handle {
         store: Arc::clone(&store),
         events: events.clone(),
         commands,
-        info,
+        info: Arc::clone(&info),
     };
     let socket = locations.admin_socket();
     let api = crate::api::serve(socket.clone(), handle).await?;
@@ -178,7 +244,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         store,
         events,
         locations,
-        pools,
+        edge,
+        info,
         logs: Logs::default(),
         running: HashMap::new(),
     };
@@ -186,37 +253,82 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass.
+    let mut drain_on_exit = true;
     let outcome = loop {
         tokio::select! {
             command = inbox.recv() => match command {
-                Some(Command::Shutdown { done }) => {
+                Some(Command::Shutdown { drain, done }) => {
+                    drain_on_exit = drain;
                     let _ = done.send(());
                     break Ok(());
                 }
                 Some(command) => daemon.carry_out(command).await,
                 None => break Ok(()),
             },
-            served = &mut serving => {
-                break served.map_err(anyhow::Error::from).and_then(|result| result);
-            }
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => daemon.check_hosts().await,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                daemon.check_edge().await;
+                daemon.check_hosts().await;
+            }
         }
     };
 
-    daemon.stop_all().await;
+    // Section 13.3: by default the daemon detaches, leaving hosts and the
+    // edge serving for the next daemon to re-adopt; with drain it takes
+    // everything down with it.
+    if drain_on_exit {
+        daemon.stop_all().await;
+        daemon.edge.stop().await;
+        let _ = std::fs::remove_file(daemon.locations.run.path.join("edge.toml"));
+        daemon
+            .events
+            .emit("daemon.stopped", "daemon", "info", "stopped");
+    } else {
+        daemon.detach();
+        daemon.events.emit(
+            "daemon.detached",
+            "daemon",
+            "info",
+            "detached; hosts and the edge keep serving",
+        );
+    }
     let _ = std::fs::remove_file(&socket);
-    daemon
-        .events
-        .emit("daemon.stopped", "daemon", "info", "stopped");
     outcome
 }
 
+/// Read a record a previous daemon wrote, if there is one it can decode.
+fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&text).ok()
+}
+
+/// Write a record for the next daemon.
+fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
+    let written = toml::to_string(record)
+        .map_err(std::io::Error::other)
+        .and_then(|text| std::fs::write(path, text));
+    if let Err(error) = written {
+        tracing::error!(%error, path = %path.display(), "writing a record failed");
+    }
+}
+
+/// Whether a process's command line names the path, which is how a host
+/// record is checked against the process that has its pid now.
+fn command_mentions(pid: u32, path: &Path) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output();
+    match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
+        Err(_) => false,
+    }
+}
+
 impl Daemon {
-    /// Start the releases that were serving when the last daemon stopped.
-    /// Hosts are not re-adopted yet, so they are started afresh.
+    /// Re-adopt the hosts a previous daemon left running (section 10.2),
+    /// and start again the release that served if its host is gone.
     async fn restore(&mut self) {
         let apps = match self.store.apps() {
             Ok(apps) => apps,
@@ -227,9 +339,14 @@ impl Daemon {
         };
 
         for app in apps {
-            // Whatever was running is gone with the previous daemon.
+            // A release in a running state is taken over when its host is
+            // still there and listening; otherwise it is gone with the
+            // previous daemon.
             if let Ok(releases) = self.store.releases(Some(&app.name)) {
                 for release in releases.iter().filter(|release| release.state.is_running()) {
+                    if self.adopt_host(&release.app, &release.id) {
+                        continue;
+                    }
                     let _ = self.store.set_release_state(
                         &release.app,
                         &release.id,
@@ -242,6 +359,13 @@ impl Daemon {
             let Some(current) = app.current.clone() else {
                 continue;
             };
+            if self
+                .running
+                .contains_key(&(app.name.clone(), current.clone()))
+            {
+                self.switch_to(&app.name, &current).await;
+                continue;
+            }
             match self.start(&app.name, &current).await {
                 Ok(()) => self.switch_to(&app.name, &current).await,
                 Err(error) => {
@@ -253,6 +377,44 @@ impl Daemon {
                     );
                 }
             }
+        }
+    }
+
+    /// Take over a release's host from its record, if it is still there.
+    fn adopt_host(&mut self, app: &str, id: &str) -> bool {
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
+            return false;
+        };
+        if !command_mentions(record.pid, &run_dir) {
+            return false;
+        }
+
+        match HostProcess::adopt(record.pid, record.sockets.clone(), run_dir.join("r1"), 1) {
+            Ok(host) => {
+                let sockets = host.sockets.clone();
+                self.running
+                    .insert((app.to_owned(), id.to_owned()), Running { host, sockets });
+                self.events.emit(
+                    "release.adopted",
+                    &format!("{app}@{id}"),
+                    "info",
+                    &format!("re-adopted the host (pid {})", record.pid),
+                );
+                true
+            }
+            Err(error) => {
+                tracing::info!(%error, "release {app}@{id} could not be re-adopted");
+                false
+            }
+        }
+    }
+
+    /// Leave every host and the edge running, for the next daemon.
+    fn detach(&mut self) {
+        let running = std::mem::take(&mut self.running);
+        for (_, running) in running {
+            running.host.release();
         }
     }
 
@@ -381,6 +543,7 @@ impl Daemon {
             chdir: Some(spec.source.clone()),
             tcp_base_port: None,
             single: false,
+            detach_to: Some(self.host_log(app, id)),
         };
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let started = Instant::now();
@@ -406,6 +569,13 @@ impl Daemon {
         }
 
         let sockets = host.sockets.clone();
+        write_record(
+            &run_dir.join("host.toml"),
+            &HostRecord {
+                pid: host.pid().unwrap_or(0),
+                sockets: sockets.clone(),
+            },
+        );
         self.running
             .insert((app.to_owned(), id.to_owned()), Running { host, sockets });
         self.set_state(&release, ReleaseState::Ready, "");
@@ -429,9 +599,9 @@ impl Daemon {
             return;
         };
 
-        match muru_edge::link::LinkPool::connect(&running.sockets).await {
-            Ok(pool) => {
-                self.pools.replace(pool);
+        let sockets = running.sockets.clone();
+        match self.edge.apply(&sockets).await {
+            Ok(()) => {
                 self.events.emit(
                     "traffic.switched",
                     &subject,
@@ -444,7 +614,7 @@ impl Daemon {
                     "release.failed",
                     &subject,
                     "error",
-                    &format!("the edge could not connect to the workers: {error:#}"),
+                    &format!("the edge could not take the release: {error:#}"),
                 );
             }
         }
@@ -477,10 +647,12 @@ impl Daemon {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         self.set_state(&release, ReleaseState::Stopping, "stopping the host");
+        let record = running.host.run_dir().join("..").join("host.toml");
         let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
         if stopped.is_err() {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
         }
+        let _ = std::fs::remove_file(record);
         self.set_state(&release, ReleaseState::Stopped, "");
         self.events
             .emit("release.stopped", &subject, "info", "stopped");
@@ -523,7 +695,7 @@ impl Daemon {
             .map_err(|error| error.to_string())?;
 
         if record.current.as_deref() == Some(id) {
-            self.pools.replace(muru_edge::link::LinkPool::empty());
+            self.clear_traffic().await;
             self.store
                 .set_app_releases(app, None, Some(id))
                 .map_err(|error| error.to_string())?;
@@ -542,15 +714,15 @@ impl Daemon {
     async fn check_hosts(&mut self) {
         let mut exited = Vec::new();
         for (key, running) in &mut self.running {
-            if let Ok(Some(status)) = running.host.try_exited() {
-                exited.push((key.clone(), status));
+            if let Ok(Some(how)) = running.host.try_exited() {
+                exited.push((key.clone(), how));
             }
         }
 
-        for ((app, id), status) in exited {
+        for ((app, id), how) in exited {
             self.running.remove(&(app.clone(), id.clone()));
             let subject = format!("{app}@{id}");
-            let message = format!("the host exited with {status}");
+            let message = format!("the host {how}");
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Failed, &message);
             }
@@ -565,7 +737,7 @@ impl Daemon {
                 .as_deref()
                 == Some(id.as_str());
             if serving {
-                self.pools.replace(muru_edge::link::LinkPool::empty());
+                self.clear_traffic().await;
                 self.events.emit(
                     "release.restarting",
                     &subject,
@@ -579,9 +751,40 @@ impl Daemon {
         }
     }
 
+    /// Point the edge at no workers at all.
+    async fn clear_traffic(&mut self) {
+        if let Err(error) = self.edge.apply(&[]).await {
+            tracing::error!(%error, "clearing the edge's snapshot failed");
+        }
+    }
+
+    /// An edge that died is started again on the same listener with the
+    /// last snapshot (section 2.4).
+    async fn check_edge(&mut self) {
+        match self.edge.check().await {
+            Ok(false) => {}
+            Ok(true) => {
+                self.info.edge_pid.store(
+                    self.edge.pid().unwrap_or(0),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.events.emit(
+                    "edge.restarted",
+                    "edge",
+                    "warning",
+                    "the edge process exited and was started again on the same listener",
+                );
+            }
+            Err(error) => {
+                self.events
+                    .emit("edge.failed", "edge", "error", &format!("{error:#}"));
+            }
+        }
+    }
+
     /// Stop every host, for shutdown.
     async fn stop_all(&mut self) {
-        self.pools.replace(muru_edge::link::LinkPool::empty());
+        self.clear_traffic().await;
         let running = std::mem::take(&mut self.running);
         for ((app, id), running) in running {
             if let Ok(release) = self.store.release(&app, &id) {
@@ -592,6 +795,13 @@ impl Daemon {
                 self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
             }
         }
+    }
+
+    /// Where a release's host writes its output.
+    fn host_log(&self, app: &str, id: &str) -> PathBuf {
+        let dir = self.locations.logs.path.join("apps").join(app);
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{id}.log"))
     }
 
     fn set_state(&self, release: &Release, state: ReleaseState, message: &str) {

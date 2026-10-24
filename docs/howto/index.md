@@ -6,7 +6,7 @@ are written as each capability lands.
 Still to be written, as their features land:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
-- Running under systemd (the unit file of the design specification works once the daemon detaches).
+- Running under systemd.
 - Virtual hosts and TLS in production.
 - Behind a load balancer or CDN (trusted proxies).
 - Worker groups and mounts.

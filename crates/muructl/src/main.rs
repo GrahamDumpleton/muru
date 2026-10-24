@@ -10,6 +10,7 @@
 mod admin;
 mod dashboard;
 mod devcert;
+mod edge;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -111,7 +112,7 @@ enum Command {
     /// Run an edge process (internal, started by the daemon).
     Edge {
         #[command(subcommand)]
-        command: EdgeCommand,
+        command: edge::EdgeCommand,
     },
 }
 
@@ -183,7 +184,7 @@ struct RunArgs {
 
     /// Requests at least this slow count as errors for --access-log errors,
     /// for example 500ms or 2s.
-    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    #[arg(long, default_value = "1s", value_parser = muru_config::parse_duration)]
     slow: Duration,
 
     /// Largest request body accepted, for example 100MB or 512KB (KB, MB
@@ -407,12 +408,6 @@ enum Link {
     Tcp,
 }
 
-#[derive(Subcommand)]
-enum EdgeCommand {
-    /// Run an edge process.
-    Run,
-}
-
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -468,33 +463,13 @@ fn main() -> anyhow::Result<()> {
             socket,
         } => runtime.block_on(admin::events(follow, after, socket)),
         Command::Edge {
-            command: EdgeCommand::Run,
-        } => anyhow::bail!("muructl edge run is not implemented yet; see docs/project/roadmap.md"),
+            command: edge::EdgeCommand::Run(args),
+        } => runtime.block_on(edge::run(*args)),
     }
-}
-
-/// Parse a duration such as 250ms, 1.5s or 2 (seconds).
-pub(crate) fn parse_duration(text: &str) -> Result<Duration, String> {
-    let text = text.trim();
-    let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
-        (number, 0.001)
-    } else if let Some(number) = text.strip_suffix('s') {
-        (number, 1.0)
-    } else {
-        (text, 1.0)
-    };
-    let value: f64 = number
-        .trim()
-        .parse()
-        .map_err(|_| format!("{text:?} is not a duration such as 500ms or 2s"))?;
-    if value < 0.0 {
-        return Err("a duration cannot be negative".to_owned());
-    }
-    Ok(Duration::from_secs_f64(value * scale))
 }
 
 /// Parse NAME=DURATION for --timeout.
-fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
+pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     let (name, duration) = text
         .split_once('=')
         .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example queue=5s"))?;
@@ -512,7 +487,7 @@ fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle or response_idle"
         ));
     }
-    Ok((name.to_owned(), parse_duration(duration)?))
+    Ok((name.to_owned(), muru_config::parse_duration(duration)?))
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -874,6 +849,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
+        detach_to: None,
     };
 
     let logs = Logs::default();

@@ -53,6 +53,7 @@ message Status {
   uint64 started_unix_ms = 7;
   uint32 apps = 8;
   uint32 releases = 9;
+  uint32 edge_pid = 10;             // the edge process serving the listeners
 }
 
 message ListAppsRequest {}
