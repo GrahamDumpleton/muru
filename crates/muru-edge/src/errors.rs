@@ -88,17 +88,21 @@ impl Format {
             return Format::Text;
         };
         let mut wants_json = false;
+
         for item in accept.split(',') {
             let media = item.split(';').next().unwrap_or("").trim();
+
             if media.eq_ignore_ascii_case("text/html") {
                 return Format::Html;
             }
+
             if media.eq_ignore_ascii_case("application/json")
                 || media.eq_ignore_ascii_case("application/problem+json")
             {
                 wants_json = true;
             }
         }
+
         if wants_json {
             Format::Problem
         } else {
@@ -118,6 +122,7 @@ pub fn respond(
         .detail
         .as_deref()
         .filter(|_| negotiation.development);
+
     let (content_type, body) = match negotiation.format {
         Format::Html => (
             "text/html; charset=utf-8",
@@ -132,6 +137,7 @@ pub fn respond(
             text(problem, title, request_id, detail),
         ),
     };
+
     let length = body.len();
     let body = Full::new(Bytes::from(body))
         .map_err(|never: Infallible| match never {})
@@ -142,9 +148,11 @@ pub fn respond(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
     if let Some(seconds) = problem.retry_after {
         headers.insert(RETRY_AFTER, HeaderValue::from(seconds));
     }
+
     response
 }
 
@@ -157,13 +165,16 @@ fn text(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) 
         request_id,
         problem.description
     );
+
     if let Some(detail) = detail {
         body.push('\n');
         body.push_str(detail);
+
         if !detail.ends_with('\n') {
             body.push('\n');
         }
     }
+
     body
 }
 
@@ -176,10 +187,12 @@ fn json(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) 
         json_string(problem.reason),
         json_string(request_id)
     );
+
     if let Some(detail) = detail {
         body.push_str(",\"traceback\":");
         body.push_str(&json_string(detail));
     }
+
     body.push_str("}\n");
     body
 }
@@ -207,17 +220,20 @@ fn html(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) 
         escape(problem.reason),
         escape(request_id)
     );
+
     if let Some(detail) = detail {
         body.push_str("<pre>");
         body.push_str(&escape(detail));
         body.push_str("</pre>\n");
     }
+
     body.push_str("<footer>Muru</footer>\n</main>\n</body>\n</html>\n");
     body
 }
 
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+
     for character in text.chars() {
         match character {
             '&' => out.push_str("&amp;"),
@@ -227,12 +243,14 @@ fn escape(text: &str) -> String {
             _ => out.push(character),
         }
     }
+
     out
 }
 
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
+
     for character in text.chars() {
         match character {
             '"' => out.push_str("\\\""),
@@ -246,6 +264,7 @@ fn json_string(text: &str) -> String {
             other => out.push(other),
         }
     }
+
     out.push('"');
     out
 }
@@ -273,11 +292,13 @@ impl RequestIds {
     /// Seed the random part from the process's own hash randomisation.
     pub fn new() -> Self {
         let mut random = 0u128;
+
         for _ in 0..2 {
             let mut hasher = RandomState::new().build_hasher();
             hasher.write_u64(std::process::id().into());
             random = (random << 64) | u128::from(hasher.finish());
         }
+
         Self {
             state: Mutex::new(IdState {
                 last_millis: 0,
@@ -294,18 +315,22 @@ impl RequestIds {
             .unwrap_or(0)
             & ((1u64 << 48) - 1);
         let mut state = self.state.lock().expect("request id state poisoned");
+
         if millis > state.last_millis {
             state.last_millis = millis;
         } else {
             // Same millisecond, or the clock stepped back: stay monotonic.
+
             state.random = (state.random + 1) & ((1u128 << 80) - 1);
         }
         let value = (u128::from(state.last_millis) << 80) | state.random;
         let mut out = [b'0'; 26];
+
         for (index, slot) in out.iter_mut().enumerate() {
             let shift = 125 - 5 * index as u32;
             *slot = CROCKFORD[((value >> shift) & 31) as usize];
         }
+
         String::from_utf8(out.to_vec()).unwrap_or_default()
     }
 }

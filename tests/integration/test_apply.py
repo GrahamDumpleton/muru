@@ -1,0 +1,242 @@
+"""Declarative configuration (design specification section 10.4).
+
+`muructl apply -f` deploys the releases a file declares, changes nothing
+when applied again, plans without acting under --dry-run, prunes what the
+file no longer contains, and refuses a file with errors without applying
+any of it. `config export` writes desired state as a file that applies
+back without changes, and `config diff` reports drift either way.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+from support.daemon import FACTORY, SHOP, Daemon
+from support.daemon import daemon as daemon_fixture
+
+daemon = daemon_fixture
+
+SHOP_SOURCE = os.path.realpath(SHOP)
+
+
+def release(app: str, release_id: str, source: Path | str = SHOP, **settings: object) -> str:
+    """One `[app.NAME.release.ID]` table, with this interpreter."""
+
+    lines = [
+        f"[app.{app}.release.{release_id}]",
+        f"source = '{source}'",
+        f"python = '{sys.executable}'",
+    ]
+
+    for key, value in settings.items():
+        written = f"'{value}'" if isinstance(value, str) else value
+        lines.append(f"{key} = {written}")
+
+    return "\n".join(lines) + "\n\n"
+
+
+def apply(daemon: Daemon, path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return daemon.muructl("apply", "-f", str(path), *arguments, check=False)
+
+
+def test_apply_deploys_declared_releases_and_is_idempotent(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1"))
+
+    first = apply(daemon, config)
+    assert first.returncode == 0, first.stdout + first.stderr
+    lines = first.stdout.splitlines()
+    assert lines[0] == "muru: applied"
+    assert lines[1].split() == ["create-app", "shop", "created"]
+    assert lines[2].split() == ["deploy", "shop@r1", "ready", "and", "serving"]
+    assert daemon.get("/").status == 200
+    assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+    assert "config.applied" in daemon.events()
+
+    # The same file again changes nothing.
+
+    again = apply(daemon, config)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert again.stdout.strip() == "muru: no changes (1 object as declared)"
+    assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+
+
+def test_dry_run_plans_without_changing_anything(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1"))
+    apply(daemon, config)
+    config.write_text(release("shop", "r1") + release("shop", "r2", threads=1))
+
+    planned = apply(daemon, config, "--dry-run")
+    assert planned.returncode == 2, planned.stdout + planned.stderr
+    lines = planned.stdout.splitlines()
+    assert lines[0] == "muru: plan (nothing changed)"
+    assert lines[1].split()[:2] == ["deploy", "shop@r2"]
+    assert "shop.wsgi:application 2x1" in lines[1]
+    assert lines[2].strip() == "1 object as declared"
+    assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+
+    # The JSON report says the same.
+
+    report = json.loads(apply(daemon, config, "--dry-run", "--json").stdout)
+    assert report["errors"] == []
+    assert report["applied"] is False
+    assert report["unchanged"] == 1
+    assert [(change["action"], change["subject"]) for change in report["changes"]] == [
+        ("deploy", "shop@r2")
+    ]
+
+    # Applying for real moves traffic to r2 and keeps r1 warm.
+
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert daemon.releases("shop") == [
+        {"release": "shop@r2", "state": "ready", "serving": "yes"},
+        {"release": "shop@r1", "state": "retained", "serving": ""},
+    ]
+
+
+def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1") + release("shop", "r2"))
+    apply(daemon, config)
+
+    # Without --prune, a release missing from the file is left alone.
+
+    config.write_text(release("shop", "r2"))
+    kept = apply(daemon, config)
+    assert kept.stdout.strip() == "muru: no changes (1 object as declared)"
+    assert [row["release"] for row in daemon.releases("shop")] == ["shop@r2", "shop@r1"]
+
+    pruned = apply(daemon, config, "--prune")
+    assert pruned.returncode == 0, pruned.stdout + pruned.stderr
+    assert pruned.stdout.splitlines()[1].split() == [
+        "remove-release",
+        "shop@r1",
+        "stopped",
+        "and",
+        "removed",
+    ]
+    assert daemon.releases("shop") == [{"release": "shop@r2", "state": "ready", "serving": "yes"}]
+
+    # An empty file with --prune removes the application itself.
+
+    config.write_text("# nothing declared\n")
+    emptied = apply(daemon, config, "--prune")
+    assert emptied.returncode == 0, emptied.stdout + emptied.stderr
+    actions = [line.split()[:2] for line in emptied.stdout.splitlines()[1:]]
+    assert actions == [["remove-release", "shop@r2"], ["remove-app", "shop"]]
+    assert daemon.muructl("app", "list").stdout.strip() == "no applications"
+    assert daemon.get("/").status == 503
+
+
+def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> None:
+    daemon.deploy("shop", SHOP)
+
+    exported = daemon.muructl("config", "export").stdout
+    assert exported.startswith("# Muru desired state: muructl ")
+    document = tomllib.loads(exported)
+    r1 = document["app"]["shop"]["release"]["r1"]
+    assert r1["source"] == SHOP_SOURCE
+    assert r1["entrypoint"] == "shop.wsgi:application"
+    assert r1["python"] == sys.executable
+    assert (r1["processes"], r1["threads"], r1["hooks"]) == (2, 3, "shop.hooks")
+    assert (r1["interface"], r1["preload"]) == ("auto", "auto")
+
+    config = tmp_path / "export.toml"
+    config.write_text(exported)
+    assert apply(daemon, config).stdout.strip() == "muru: no changes (1 object as declared)"
+    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+
+    # By default only the serving release is written; --all-releases
+    # writes every release, and --json the same document as JSON.
+
+    daemon.deploy("shop", SHOP, "--threads", "1")
+    current = tomllib.loads(daemon.muructl("config", "export").stdout)
+    assert list(current["app"]["shop"]["release"]) == ["r2"]
+    every = tomllib.loads(daemon.muructl("config", "export", "--all-releases").stdout)
+    assert list(every["app"]["shop"]["release"]) == ["r1", "r2"]
+    as_json = json.loads(daemon.muructl("config", "export", "--json").stdout)
+    assert as_json["app"]["shop"]["release"]["r2"]["threads"] == 1
+
+
+def test_diff_reports_drift_in_both_directions(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(release("shop", "r1"))
+    apply(daemon, config)
+
+    # A deploy made by hand is not in the file; a release in the file is
+    # not in the daemon.
+
+    daemon.deploy("shop", SHOP)
+    config.write_text(release("shop", "r1") + release("shop", "r3"))
+    diff = daemon.muructl("config", "diff", "-f", str(config), check=False)
+    assert diff.returncode == 2, diff.stdout + diff.stderr
+    actions = [line.split()[:2] for line in diff.stdout.splitlines()[1:3]]
+    assert actions == [["deploy", "shop@r3"], ["remove-release", "shop@r2"]]
+    assert daemon.releases("shop")[0]["release"] == "shop@r2", "a diff changes nothing"
+
+
+def test_a_file_with_errors_applies_nothing(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+
+    # An unknown key is reported with its line.
+
+    config.write_text(release("shop", "r1") + "[app.shop.release.r2]\nentry_point = 'a:b'\n")
+    unknown = apply(daemon, config)
+    assert unknown.returncode == 1
+    assert "entry_point" in unknown.stderr, unknown.stdout + unknown.stderr
+    assert daemon.releases("shop") == []
+
+    # A release without a source, a bad name and a changed release are
+    # all named, and the valid release beside them is not deployed.
+
+    config.write_text(release("shop", "r1"))
+    apply(daemon, config)
+    config.write_text(
+        release("shop", "r1", threads=1)
+        + "[app.shop.release.r2]\nentrypoint = 'a:b'\n\n"
+        + release("Blog", "r1")
+        + release("blog", "r1")
+    )
+    invalid = apply(daemon, config)
+    assert invalid.returncode == 1, invalid.stdout + invalid.stderr
+    lines = invalid.stdout.splitlines()
+    assert lines[0] == "muru: nothing applied; the configuration has errors:"
+    errors = "\n".join(lines[1:])
+    assert '"Blog" is not a valid application name' in errors
+    assert "shop@r1 already exists with different settings (threads 1, recorded 3)" in errors
+    assert "shop@r2 has no source directory" in errors
+    assert "blog" not in daemon.muructl("app", "list").stdout
+    assert daemon.releases() == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
+
+
+def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    relative = os.path.relpath(SHOP, config)
+    (config / "10-shop.toml").write_text(release("shop", "r1", source=relative))
+    (config / "20-factory.toml").write_text(
+        release("factory", "r1", source=FACTORY, interface="wsgi")
+    )
+    (config / "notes.txt").write_text("not configuration\n")
+
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert sorted(row["release"] for row in daemon.releases()) == ["factory@r1", "shop@r1"]
+    assert all(row["state"] == "ready" for row in daemon.releases())
+    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "shop").stdout)
+    assert exported["app"]["shop"]["release"]["r1"]["source"] == SHOP_SOURCE
+    assert "factory" not in exported["app"]
+
+    # Listeners and limits in an applied file are reported, not applied.
+
+    (config / "30-node.toml").write_text("[[listener]]\naddress = '127.0.0.1:9999'\n")
+    warned = apply(daemon, config)
+    assert warned.returncode == 0, warned.stdout + warned.stderr
+    assert "warning: [[listener]] entries belong in the daemon configuration file" in warned.stdout

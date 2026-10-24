@@ -20,6 +20,7 @@ use http::header::{
 };
 use http::{Response, StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
@@ -31,7 +32,11 @@ use tokio_rustls::TlsAcceptor;
 pub mod access;
 pub mod errors;
 pub mod link;
+pub mod metrics;
+pub mod proxy;
+pub mod routing;
 pub mod tls;
+pub mod websocket;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -41,10 +46,19 @@ pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 pub struct Config {
     /// Address for the HTTP listener. Port 0 picks a free port.
     pub listen: SocketAddr,
-    /// Unix socket paths of the workers.
+    /// The application's name, as the access log labels its requests;
+    /// empty when a snapshot will name it.
+    pub app: String,
+    /// The release the workers serve, for the access log; empty when a
+    /// snapshot will name it.
+    pub release: String,
+    /// Unix socket paths of the default group's workers. Each worker's
+    /// HELLO says how many requests it takes at once.
     pub sockets: Vec<PathBuf>,
-    /// Requests a worker handles at once, which bounds its connection pool.
-    pub slots: usize,
+    /// The named worker groups, with the paths that select them.
+    pub groups: Vec<routing::GroupSockets>,
+    /// The named mounts, with the paths that select them.
+    pub mounts: Vec<routing::MountPath>,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
     /// Where the access log goes and what it leaves out.
@@ -87,6 +101,13 @@ pub struct Limits {
     pub body_idle_timeout: Duration,
     /// How long a worker may pause mid-response before it is cut off.
     pub response_idle_timeout: Duration,
+    /// Largest WebSocket message accepted from a client, else close 1009
+    /// (websocket.max_message_size in section 4.18).
+    pub websocket_max_message_size: usize,
+    /// How often an idle WebSocket client is pinged.
+    pub websocket_ping_interval: Duration,
+    /// How long a WebSocket may stay silent before it is closed with 1001.
+    pub websocket_idle_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -100,6 +121,9 @@ impl Default for Limits {
             request_deadline: Duration::from_secs(300),
             body_idle_timeout: Duration::from_secs(60),
             response_idle_timeout: Duration::from_secs(60),
+            websocket_max_message_size: 1024 * 1024,
+            websocket_ping_interval: Duration::from_secs(30),
+            websocket_idle_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -107,24 +131,37 @@ impl Default for Limits {
 /// Concurrent streams accepted per HTTP/2 connection (section 4.18).
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 
-/// The worker pool requests go to, replaceable while the edge runs: a
-/// reload switches to the new release's workers by swapping it (section
-/// 9.8). Each request takes the pool current when it arrives.
+/// The routing tables requests go through, replaceable while the edge
+/// runs: a reload or a snapshot swaps them (sections 4.4 and 9.8). Each
+/// request takes the tables current when it arrives.
 pub struct Pools {
-    current: RwLock<Arc<link::LinkPool>>,
+    current: RwLock<Arc<routing::Routing>>,
 }
 
 impl Pools {
-    /// The pool for a request arriving now.
-    pub fn current(&self) -> Arc<link::LinkPool> {
+    /// The tables for a request arriving now.
+    pub fn current(&self) -> Arc<routing::Routing> {
         Arc::clone(&self.current.read().expect("pools poisoned"))
     }
 
-    /// Send new requests to another set of workers. Requests in flight
-    /// finish on the pool they started with.
-    pub fn replace(&self, pool: link::LinkPool) {
-        *self.current.write().expect("pools poisoned") = Arc::new(pool);
+    /// Send new requests to another application's workers, with no
+    /// hosts. Requests in flight finish on the pool they started with.
+    pub fn replace(&self, pools: routing::AppPools) {
+        self.apply(routing::Routing::single(pools));
     }
+
+    /// Switch to the tables of a new snapshot.
+    pub fn apply(&self, routing: routing::Routing) {
+        *self.current.write().expect("pools poisoned") = Arc::new(routing);
+    }
+}
+
+/// A listener handed to the edge by the daemon, with whether it carries TLS.
+pub struct Inherited {
+    /// The bound, listening socket.
+    pub listener: std::net::TcpListener,
+    /// Terminate TLS with the certificates of the snapshot's hosts.
+    pub tls: bool,
 }
 
 /// A listener could not be bound, most often because the port is in use.
@@ -148,35 +185,72 @@ struct Shared {
     limits: Arc<Limits>,
     /// Where plain HTTP requests are redirected instead of being served.
     redirect_to: Option<SocketAddr>,
+    /// The port of the first TLS listener, for hosts that insist on HTTPS.
+    https_port: Option<u16>,
 }
 
 /// A bound edge, ready to run.
 pub struct Edge {
-    http: TcpListener,
+    listeners: Vec<(TcpListener, SocketAddr, Option<TlsAcceptor>)>,
     local: SocketAddr,
-    https: Option<(TcpListener, SocketAddr, TlsAcceptor)>,
     shared: Arc<Shared>,
 }
 
 impl Edge {
     /// Bind the listeners and prepare the worker pools.
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
-        let pools = Arc::new(Pools {
-            current: RwLock::new(Arc::new(link::LinkPool::new(
-                &config.sockets,
-                config.slots,
-            )?)),
-        });
-        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let http = TcpListener::bind(config.listen)
             .await
             .map_err(|source| BindError {
                 address: config.listen,
                 source,
             })?;
-        let local = http.local_addr()?;
-        let mut https = None;
+        Self::with_listener(config, http).await
+    }
+
+    /// Prepare the edge on listeners bound elsewhere: the daemon creates
+    /// the listening sockets and hands them to the edge process (section
+    /// 2.3), so the edge can be replaced without refusing connections. TLS
+    /// listeners take their certificates from the resolver, which each
+    /// snapshot fills.
+    pub async fn adopt(
+        config: Config,
+        inherited: Vec<Inherited>,
+        resolver: Arc<tls::Resolver>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !inherited.is_empty(),
+            "the edge needs at least one listener"
+        );
+        let tls_config = tls::server_config_with_resolver(resolver)?;
+        let mut listeners = Vec::new();
+
+        for inherited in inherited {
+            inherited.listener.set_nonblocking(true)?;
+            let listener = TcpListener::from_std(inherited.listener)?;
+            let acceptor = inherited
+                .tls
+                .then(|| TlsAcceptor::from(Arc::clone(&tls_config)));
+            listeners.push((listener, acceptor));
+        }
+
+        Self::with_listeners(config, listeners).await
+    }
+
+    async fn with_listener(config: Config, http: TcpListener) -> anyhow::Result<Self> {
+        Self::with_listeners(config, vec![(http, None)]).await
+    }
+
+    async fn with_listeners(
+        config: Config,
+        mut listeners: Vec<(TcpListener, Option<TlsAcceptor>)>,
+    ) -> anyhow::Result<Self> {
+        let local = listeners[0].0.local_addr()?;
         let mut redirect_to = None;
+
+        // Every listener is bound before the workers are connected, so a
+        // client that finds one port open finds them all open.
+
         if let Some(secure) = config.https {
             let listener = TcpListener::bind(secure.listen)
                 .await
@@ -184,14 +258,43 @@ impl Edge {
                     address: secure.listen,
                     source,
                 })?;
-            let bound = listener.local_addr()?;
+
             if secure.only {
-                redirect_to = Some(bound);
+                redirect_to = Some(listener.local_addr()?);
             }
-            https = Some((listener, bound, TlsAcceptor::from(secure.config)));
+
+            listeners.push((listener, Some(TlsAcceptor::from(secure.config))));
         }
+
+        let pools = Arc::new(Pools {
+            current: RwLock::new(Arc::new(routing::Routing::single(
+                routing::AppPools::connect(
+                    &config.app,
+                    &config.release,
+                    &config.sockets,
+                    &config.groups,
+                    &config.mounts,
+                )
+                .await?,
+            ))),
+        });
+        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
+
+        let mut bound = Vec::with_capacity(listeners.len());
+
+        for (listener, acceptor) in listeners {
+            let address = listener.local_addr()?;
+            bound.push((listener, address, acceptor));
+        }
+
+        let https_port = bound
+            .iter()
+            .find(|(_, _, acceptor)| acceptor.is_some())
+            .map(|(_, address, _)| address.port());
+
         // Each connection is served as HTTP/1.1 or, when it opens with the
         // HTTP/2 preface, as HTTP/2.
+
         let limits = Arc::new(config.limits);
         let mut protocols = auto::Builder::new(TokioExecutor::new());
         protocols
@@ -205,11 +308,12 @@ impl Edge {
             .http2()
             .timer(TokioTimer::new())
             .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
-            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX));
+            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX))
+            // RFC 8441: WebSockets over HTTP/2 arrive as extended CONNECT.
+            .enable_connect_protocol();
         Ok(Self {
-            http,
+            listeners: bound,
             local,
-            https,
             shared: Arc::new(Shared {
                 pools,
                 request_ids: errors::RequestIds::new(),
@@ -218,18 +322,30 @@ impl Edge {
                 access_log,
                 limits,
                 redirect_to,
+                https_port,
             }),
         })
     }
 
-    /// The address the HTTP listener is bound to.
+    /// The address the first listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local
     }
 
-    /// The address the HTTPS listener is bound to, when there is one.
+    /// The address of the first TLS listener, when there is one.
     pub fn https_addr(&self) -> Option<SocketAddr> {
-        self.https.as_ref().map(|(_, bound, _)| *bound)
+        self.listeners
+            .iter()
+            .find(|(_, _, acceptor)| acceptor.is_some())
+            .map(|(_, address, _)| *address)
+    }
+
+    /// Every listener's address and whether it carries TLS.
+    pub fn listeners(&self) -> Vec<(SocketAddr, bool)> {
+        self.listeners
+            .iter()
+            .map(|(_, address, acceptor)| (*address, acceptor.is_some()))
+            .collect()
     }
 
     /// The access log, for the dashboard and the CLI.
@@ -242,16 +358,16 @@ impl Edge {
         Arc::clone(&self.shared.pools)
     }
 
-    /// Accept connections until an accept error occurs.
+    /// Accept connections on every listener until one fails.
     pub async fn run(self) -> anyhow::Result<()> {
-        let plain = accept(self.http, self.local, None, Arc::clone(&self.shared));
-        match self.https {
-            Some((listener, bound, acceptor)) => {
-                let secure = accept(listener, bound, Some(acceptor), self.shared);
-                tokio::try_join!(plain, secure).map(|_| ())
-            }
-            None => plain.await,
-        }
+        let accepting = self
+            .listeners
+            .into_iter()
+            .map(|(listener, address, acceptor)| {
+                accept(listener, address, acceptor, Arc::clone(&self.shared))
+            });
+
+        futures::future::try_join_all(accepting).await.map(|_| ())
     }
 }
 
@@ -267,6 +383,7 @@ async fn accept(
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let shared = Arc::clone(&shared);
+
         match acceptor.clone() {
             None => {
                 tokio::spawn(serve(stream, peer, local, None, shared));
@@ -275,11 +392,13 @@ async fn accept(
                 tokio::spawn(async move {
                     // A client that never finishes its handshake is cut off
                     // as one that never finishes its request head would be.
+
                     let handshake = tokio::time::timeout(
                         shared.limits.header_read_timeout,
                         acceptor.accept(stream),
                     )
                     .await;
+
                     match handshake {
                         Ok(Ok(stream)) => {
                             let info = tls::info(stream.get_ref().1);
@@ -310,35 +429,131 @@ async fn serve<I>(
     let scheme = if tls.is_some() { "https" } else { "http" };
     let redirect_to = shared.redirect_to.filter(|_| tls.is_none());
     let state = Arc::clone(&shared);
-    let service = service_fn(move |request| {
+    let listener = local.to_string();
+    let service = service_fn(move |mut request: http::Request<Incoming>| {
         let shared = Arc::clone(&shared);
         let tls = tls.clone();
+        let listener = listener.clone();
         let request_id = shared.request_ids.next();
         async move {
-            let context = link::Context {
+            // Section 4.7: forwarding headers from a trusted proxy say who
+            // the client is and how it connected; from anyone else they
+            // are removed.
+
+            let routing = shared.pools.current();
+            let forwarded = routing.trust().resolve(&peer, request.headers_mut());
+
+            let scheme: &'static str = match forwarded.scheme.as_deref() {
+                Some("https") => "https",
+                Some("http") => "http",
+                _ => scheme,
+            };
+
+            let secure = tls.is_some() || scheme == "https";
+            let redirect_to = redirect_to.filter(|_| !secure);
+
+            let mut context = link::Context {
                 request_id: &request_id,
-                peer,
+                peer: forwarded.client.unwrap_or(peer),
+                proxy: forwarded.client.map(|_| peer),
                 local,
                 scheme,
                 tls: tls.as_deref(),
                 development: shared.development,
                 access_log: Arc::clone(&shared.access_log),
                 limits: Arc::clone(&shared.limits),
+                server_name: None,
+                app: String::new(),
+                release: String::new(),
+                group: String::new(),
+                snapshot: routing.version(),
+                mount: String::new(),
+                mount_path: String::new(),
+                forwarded_host: forwarded.host.clone(),
+                forwarded_port: forwarded.port,
+                prefix: forwarded.prefix.clone(),
             };
-            let mut response = match redirect_to {
-                Some(to) => link::redirect_to_https(request, &context, to),
-                None => link::handle(request, shared.pools.current(), &context).await,
+
+            // Sections 4.3 and 4.5: the host the client asked for and the
+            // path select the application, or refuse the request. With no
+            // TLS listener there is nowhere to redirect to, so a host's
+            // https_redirect is ignored.
+
+            let host = forwarded.host.clone().or_else(|| {
+                request
+                    .headers()
+                    .get(HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .or_else(|| request.uri().host().map(str::to_owned))
+            });
+            let decision = routing.select(
+                host.as_deref(),
+                request.uri().path(),
+                &listener,
+                secure || shared.https_port.is_none(),
+            );
+
+            let mut response = match (redirect_to, decision) {
+                (Some(to), _) => link::redirect_to_https(request, &context, to),
+                (
+                    None,
+                    routing::Decision::Serve {
+                        selection,
+                        server_name,
+                    },
+                ) => {
+                    context.server_name = server_name;
+                    context.app = selection.app;
+                    context.release = selection.release;
+                    context.group = selection.group;
+                    context.mount = selection.mount;
+                    context.mount_path = selection.script_name;
+                    link::handle(request, selection.pool, &context).await
+                }
+                (None, routing::Decision::Redirect) => link::redirect_to_https(
+                    request,
+                    &context,
+                    SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443)),
+                ),
+                (None, routing::Decision::Misdirected) => link::reject(
+                    request,
+                    &context,
+                    errors::Problem::new(
+                        StatusCode::MISDIRECTED_REQUEST,
+                        "misdirected",
+                        "No virtual host answers to that name on this listener.",
+                    ),
+                ),
+                (None, routing::Decision::NoRoute) => link::reject(
+                    request,
+                    &context,
+                    errors::Problem::new(
+                        StatusCode::NOT_FOUND,
+                        "no_route",
+                        "The virtual host has no route for this path.",
+                    ),
+                ),
             };
+
             // Section 4.19: every response names its request.
+
             if let Ok(value) = HeaderValue::from_str(&request_id) {
                 response
                     .headers_mut()
                     .insert(errors::X_REQUEST_ID.clone(), value);
             }
+
             Ok::<_, Infallible>(response)
         }
     });
-    let connection = state.protocols.serve_connection(TokioIo::new(io), service);
+
+    // With upgrades, so a 101 hands the connection over for WebSockets.
+
+    let connection = state
+        .protocols
+        .serve_connection_with_upgrades(TokioIo::new(io), service);
+
     if let Err(error) = connection.await {
         tracing::debug!(%peer, %error, "connection ended with an error");
     }
@@ -394,21 +609,50 @@ pub(crate) fn request_head(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
     let named_in_connection = connection_options(&parts.headers);
+
     // HTTP/2 carries the host in :authority rather than a Host header, and
-    // applications expect HTTP_HOST either way.
-    let host = match (parts.headers.get(HOST), parts.uri.authority()) {
-        (None, Some(authority)) => Some(pb::Header {
-            name: Bytes::from_static(b"host"),
-            value: Bytes::copy_from_slice(authority.as_str().as_bytes()),
-        }),
+    // applications expect HTTP_HOST either way; a host forwarded by a
+    // trusted proxy replaces what the proxy itself asked for.
+
+    let forwarded_host = context
+        .forwarded_host
+        .as_deref()
+        .map(|host| Bytes::copy_from_slice(host.as_bytes()));
+
+    let authority = match (parts.headers.get(HOST), parts.uri.authority()) {
+        (None, Some(authority)) => Some(Bytes::copy_from_slice(authority.as_str().as_bytes())),
         _ => None,
     };
+
+    let host = forwarded_host.or(authority).map(|value| pb::Header {
+        name: Bytes::from_static(b"host"),
+        value,
+    });
+    let replaces_host = context.forwarded_host.is_some();
+
+    // A prefix the proxy stripped is put back, so SCRIPT_NAME and
+    // PATH_INFO (ASGI root_path and path) come out as the client sent
+    // them; the mount's path joins it as SCRIPT_NAME (section 6.7).
+
+    let raw_path = match &context.prefix {
+        Some(prefix) => Bytes::from(format!("{prefix}{}", parts.uri.path())),
+        None => Bytes::copy_from_slice(parts.uri.path().as_bytes()),
+    };
+
+    let script_name = format!(
+        "{}{}",
+        context.prefix.as_deref().unwrap_or_default(),
+        context.mount_path
+    );
+
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
         request_id: context.request_id.to_owned(),
         method: parts.method.as_str().to_owned(),
         scheme: context.scheme.to_owned(),
-        raw_path: Bytes::copy_from_slice(parts.uri.path().as_bytes()),
+        raw_path,
+        script_name,
+        mount: context.mount.clone(),
         query: parts
             .uri
             .query()
@@ -420,10 +664,17 @@ pub(crate) fn request_head(
                 // Section 4.7: a name with an underscore could masquerade as
                 // another header's HTTP_ key, so it never reaches the
                 // application, and neither does anything hop-by-hop.
+
                 let name = name.as_str();
+
                 if name.contains('_') || is_hop_by_hop(name, &named_in_connection) {
                     return None;
                 }
+
+                if replaces_host && name == "host" {
+                    return None;
+                }
+
                 Some(pb::Header {
                     name: Bytes::copy_from_slice(name.as_bytes()),
                     value: Bytes::copy_from_slice(value.as_bytes()),
@@ -436,12 +687,17 @@ pub(crate) fn request_head(
         }),
         server: Some(pb::Peer {
             address: local.ip().to_string(),
-            port: u32::from(local.port()),
+            port: u32::from(context.forwarded_port.unwrap_or_else(|| local.port())),
+        }),
+        proxy: context.proxy.map(|proxy| pb::Peer {
+            address: proxy.ip().to_string(),
+            port: u32::from(proxy.port()),
         }),
         tls: context.tls.cloned(),
         content_length,
         http_version: format!("{:?}", parts.version),
         expect_continue: expects_continue(parts) && content_length != Some(0),
+        server_name: context.server_name.clone().unwrap_or_default(),
         ..Default::default()
     }
 }
@@ -464,6 +720,7 @@ pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>)
             headers.append(name, value);
         }
     }
+
     headers.insert(SERVER, HeaderValue::from_static("muru"));
 }
 
@@ -496,5 +753,6 @@ pub(crate) fn close_after(
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
     }
+
     response
 }

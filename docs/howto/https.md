@@ -3,8 +3,9 @@
 ```{admonition} Status
 :class: note
 
-Development mode. Certificates for production listeners are configured on
-virtual hosts, which arrive with the daemon.
+Development mode. Under the daemon, certificates belong to virtual hosts
+and TLS listeners serve them by name: see
+[virtual hosts and TLS](virtual-hosts.md).
 ```
 
 ```

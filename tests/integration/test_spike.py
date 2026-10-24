@@ -24,6 +24,7 @@ THREADS = 2
 @pytest.fixture(scope="module")
 def server() -> Iterator[support.Server]:
     instance = support.start("plain_wsgi:application", workers=WORKERS, threads=THREADS)
+
     try:
         yield instance
     finally:
@@ -40,10 +41,12 @@ def test_hello(server: support.Server) -> None:
 
 def test_requests_spread_over_forked_workers(server: support.Server) -> None:
     pids = set()
+
     for _ in range(WORKERS * 10):
         response = server.get("/info")
         assert response.status == 200
         pids.add(json.loads(response.body)["pid"])
+
     assert len(pids) == WORKERS
 
 
@@ -112,6 +115,7 @@ def test_not_found(server: support.Server) -> None:
 
 def test_keep_alive_connection(server: support.Server) -> None:
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
+
     try:
         for _ in range(20):
             connection.request("GET", "/")
@@ -137,6 +141,7 @@ def test_thread_locals_survive_across_requests(server: support.Server) -> None:
     # Section 6.5: application threads are long-lived, so a threading.local
     # value set by one request is still there for a later request on the
     # same thread. Six threads serve these requests, so counts must climb.
+
     counts = []
     for _ in range(WORKERS * THREADS * 8):
         counts.append(json.loads(server.get("/threadlocal").body)["count"])
@@ -146,6 +151,7 @@ def test_thread_locals_survive_across_requests(server: support.Server) -> None:
 def test_each_request_gets_a_fresh_context(server: support.Server) -> None:
     # Section 6.5: a context variable set during one request is not visible
     # to the next request on the same thread.
+
     for _ in range(WORKERS * THREADS * 4):
         assert json.loads(server.get("/context").body) == {"inherited": None}
 
@@ -154,7 +160,9 @@ def test_unread_body_keeps_the_connection_alive(server: support.Server) -> None:
     # Section 4.6: a response sent before the request body was read, with
     # the rest of the body under the discard limit, leaves the client
     # connection usable and the worker link connection back in its pool.
+
     payload = b"x" * (512 * 1024)
+
     with socket.create_connection(("127.0.0.1", server.port), timeout=30) as sock:
         for _ in range(3):
             sock.sendall(
@@ -162,9 +170,12 @@ def test_unread_body_keeps_the_connection_alive(server: support.Server) -> None:
             )
             sock.sendall(payload)
             assert read_response(sock) == b"ignored\n"
+
         sock.sendall(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
         assert read_response(sock) == b"Hello, world!\n"
+
     # Every slot must still be free: more requests than slots succeed at once.
+
     with ThreadPoolExecutor(max_workers=12) as pool:
         statuses = list(pool.map(lambda _i: server.get("/").status, range(24)))
     assert statuses == [200] * 24
@@ -174,10 +185,12 @@ def read_response(sock: socket.socket) -> bytes:
     """Read one HTTP/1.1 response with a Content-Length and return its body."""
 
     data = b""
+
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(65536)
         assert chunk, "the connection was closed"
         data += chunk
+
     head, _, body = data.partition(b"\r\n\r\n")
     status_line = head.split(b"\r\n", 1)[0]
     assert status_line.startswith(b"HTTP/1.1 200")
@@ -188,8 +201,10 @@ def read_response(sock: socket.socket) -> bytes:
             if line.lower().startswith(b"content-length:")
         )
     )
+
     while len(body) < length:
         chunk = sock.recv(65536)
         assert chunk, "the connection was closed"
         body += chunk
+
     return body

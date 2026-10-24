@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use muru_dashboard::{Data, RequestRow, Source, Summary, Worker};
+use muru_dashboard::{Data, MetricsSource, RequestRow, Source, Summary, Worker};
 use muru_edge::Pools;
 use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
+use muru_edge::metrics::{aggregate, pool_samples, render};
 
-use crate::logs::Logs;
+use muru_controller::logs::Logs;
 
 /// How far back the summary looks.
 const WINDOW: Duration = Duration::from_secs(60);
@@ -53,9 +54,20 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
     );
     let listener = muru_dashboard::bind(address).await?;
     let bound = listener.local_addr()?;
+    let pools = Arc::clone(&inputs.pools);
+    let access_log = Arc::clone(&inputs.access_log);
+    let metrics: MetricsSource = Arc::new(move || {
+        let routing = pools.current();
+        let samples = access_log
+            .metrics()
+            .samples()
+            .into_iter()
+            .chain(pool_samples(&routing));
+        render(&aggregate(samples))
+    });
     let source: Source = Arc::new(move || collect(&inputs));
     tokio::spawn(async move {
-        if let Err(error) = muru_dashboard::serve(listener, source).await {
+        if let Err(error) = muru_dashboard::serve(listener, source, metrics).await {
             tracing::warn!(%error, "the dashboard stopped");
         }
     });
@@ -64,10 +76,12 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
 
 fn collect(inputs: &Inputs) -> Data {
     let now = SystemTime::now();
+
     // Rate and errors come from the per-second counters, which are exact
     // at any load. The record ring is bounded, so under load it reaches
     // back less than a minute: the percentiles and the request rows are
     // taken from whatever it covers.
+
     let minute = inputs.access_log.last_minute();
     let records = inputs.access_log.recent(RING_CAPACITY);
     let recent: Vec<&Record> = records
@@ -83,12 +97,14 @@ fn collect(inputs: &Inputs) -> Data {
         if totals.is_empty() {
             return "-".to_owned();
         }
+
         let index = ((totals.len() - 1) as f64 * fraction).round() as usize;
         format_duration(totals[index])
     };
     let workers: Vec<Worker> = inputs
         .pools
         .current()
+        .default_pool()
         .workers()
         .into_iter()
         .map(|worker| Worker {
@@ -132,7 +148,7 @@ fn collect(inputs: &Inputs) -> Data {
     Data {
         app: inputs.app.clone(),
         release: inputs.release.load(Ordering::Relaxed),
-        uptime: uptime(inputs.started.elapsed()),
+        uptime: muru_dashboard::uptime(inputs.started.elapsed()),
         development: inputs.development,
         listen: inputs.listen.to_string(),
         https: inputs.https.map(|address| address.to_string()),
@@ -140,16 +156,5 @@ fn collect(inputs: &Inputs) -> Data {
         workers,
         requests,
         logs: inputs.logs.recent(LOG_LINES),
-    }
-}
-
-fn uptime(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
     }
 }

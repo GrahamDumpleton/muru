@@ -41,6 +41,7 @@ lint: lint-text lint-rust lint-python
 
 lint-text:
     sh scripts/check-no-em-dashes.sh
+    uv run python scripts/check-layout.py $(git ls-files --cached --others --exclude-standard '*.py' '*.rs')
 
 lint-rust:
     cargo fmt --all --check
@@ -76,9 +77,9 @@ conformance: dev
     cargo build -p muructl
     uv run pytest tests/conformance
 
-# Container scenarios (needs a container runtime).
+# Container scenarios and the Autobahn WebSocket suite (needs a container runtime).
 test-docker:
-    uv run pytest tests/integration -m requires_docker
+    uv run pytest tests/integration tests/conformance -m requires_docker
 
 # Linux suites inside the development container.
 test-linux:

@@ -11,6 +11,7 @@ from support import server as support
 
 def fetch(port: int, path: str) -> tuple[int, dict[str, str], bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+
     try:
         connection.request("GET", path)
         response = connection.getresponse()
@@ -25,6 +26,7 @@ def dashboard() -> Iterator[tuple[support.Server, int]]:
     instance = support.start(
         "wsgi_conformance:application", workers=2, args=["--dashboard", f"127.0.0.1:{port}"]
     )
+
     try:
         assert instance.wait_for_log(f"dashboard on http://127.0.0.1:{port}/")
         yield instance, port
@@ -52,11 +54,13 @@ def test_page_shows_workers_requests_and_logs(dashboard: tuple[support.Server, i
 
 def test_fragments_and_assets(dashboard: tuple[support.Server, int]) -> None:
     _server, port = dashboard
+
     for path in ("/fragment/overview", "/fragment/requests", "/fragment/logs"):
         status, headers, body = fetch(port, path)
         assert status == 200, path
         assert headers["content-type"].startswith("text/html")
         assert body
+
     status, headers, body = fetch(port, "/static/htmx.min.js")
     assert status == 200
     assert headers["content-type"] == "text/javascript"
@@ -66,6 +70,7 @@ def test_fragments_and_assets(dashboard: tuple[support.Server, int]) -> None:
 
 def test_dashboard_can_be_off() -> None:
     server = support.start("plain_wsgi:application", workers=1, args=["--dashboard", "off"])
+
     try:
         assert server.get("/").status == 200
         assert "dashboard" not in server.log()
@@ -75,8 +80,25 @@ def test_dashboard_can_be_off() -> None:
 
 def test_dashboard_refuses_non_loopback_addresses() -> None:
     server = support.start("plain_wsgi:application", workers=1, args=["--dashboard", "0.0.0.0:0"])
+
     try:
         assert server.wait_for_log("no dashboard: the dashboard is only served on loopback")
         assert server.get("/").status == 200
     finally:
         server.stop()
+
+
+def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, int]) -> None:
+    server, port = dashboard
+    assert server.get("/response/list").status == 200
+    status, headers, body = fetch(port, "/metrics")
+    assert status == 200
+    assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+    text = body.decode()
+    assert "# TYPE muru_requests_total counter\n" in text
+    assert (
+        'muru_requests_total{app="wsgi-conformance",release="r1",group="default",'
+        'mount="default",status="2xx"} ' in text
+    ), text
+    assert 'muru_slots_total{app="wsgi-conformance",release="r1",group="default"} ' in text, text
+    assert "muru_snapshot_version 0\n" in text, text

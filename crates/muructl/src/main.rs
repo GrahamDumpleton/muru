@@ -7,10 +7,10 @@
 //! command is defined once with clap, which later generates help, man
 //! pages and the CLI reference (section 14.4 and Appendix A).
 
+mod admin;
 mod dashboard;
 mod devcert;
-mod host;
-mod logs;
+mod edge;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -23,9 +23,9 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
 
-use crate::host::{HostProcess, HostSpec};
-use crate::logs::Logs;
 use crate::watch::Watch;
+use muru_controller::host::{HostProcess, HostSpec};
+use muru_controller::logs::Logs;
 
 /// How long a host may take to get its workers listening.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -50,13 +50,100 @@ enum Command {
     /// Run or control the daemon.
     Daemon {
         #[command(subcommand)]
-        command: DaemonCommand,
+        command: admin::DaemonCommand,
+    },
+
+    /// Make sure a daemon is running for this user.
+    Up(admin::DaemonRunArgs),
+
+    /// Create a release from a source directory and move traffic to it.
+    Deploy(Box<admin::DeployArgs>),
+
+    /// Manage applications.
+    App {
+        #[command(subcommand)]
+        command: admin::AppCommand,
+    },
+
+    /// Manage releases.
+    Release {
+        #[command(subcommand)]
+        command: admin::ReleaseCommand,
+    },
+
+    /// Manage virtual hosts.
+    Host {
+        #[command(subcommand)]
+        command: admin::HostCommand,
+    },
+
+    /// Manage routes.
+    Route {
+        #[command(subcommand)]
+        command: admin::RouteCommand,
+    },
+
+    /// Restore traffic to an application's previous release.
+    Rollback {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Take a release out of traffic and stop it.
+    Drain {
+        /// The release, as app@release.
+        release: String,
+
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Show the daemon's status.
+    Status {
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Apply declarative configuration from a file or a directory of files.
+    Apply(Box<admin::ApplyArgs>),
+
+    /// Export, compare or inspect declarative configuration.
+    Config {
+        #[command(subcommand)]
+        command: admin::ConfigCommand,
+    },
+
+    /// Show or follow the daemon's events.
+    Events {
+        /// Keep printing events as they happen.
+        #[arg(long, short)]
+        follow: bool,
+
+        /// Start after this sequence number.
+        #[arg(long, default_value = "0")]
+        after: u64,
+
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Show or follow a release's output or the access log, or reopen
+    /// the log files after an external rotation.
+    Logs(admin::LogsArgs),
+
+    /// Print the node's metrics as Prometheus text.
+    Metrics {
+        #[command(flatten)]
+        socket: admin::SocketArgs,
     },
 
     /// Run an edge process (internal, started by the daemon).
     Edge {
         #[command(subcommand)]
-        command: EdgeCommand,
+        command: edge::EdgeCommand,
     },
 }
 
@@ -95,6 +182,15 @@ struct RunArgs {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Threads for synchronous code called from an ASGI application
+    /// through sync_to_async or asyncio.to_thread (default 8).
+    #[arg(long, value_name = "N")]
+    sync_threads: Option<usize>,
+
+    /// Requests an ASGI worker's event loop takes at once (default 1000).
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
+
     /// Import the application in the host before forking: auto preloads
     /// when the import is fork-safe and imports per worker otherwise, true
     /// fails instead, false imports in each worker (default auto).
@@ -119,7 +215,7 @@ struct RunArgs {
 
     /// Requests at least this slow count as errors for --access-log errors,
     /// for example 500ms or 2s.
-    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    #[arg(long, default_value = "1s", value_parser = muru_config::parse_duration)]
     slow: Duration,
 
     /// Largest request body accepted, for example 100MB or 512KB (KB, MB
@@ -237,6 +333,7 @@ fn parse_bind(text: &str) -> Result<Bind, String> {
             port: Some(address.port()),
         });
     }
+
     text.parse::<IpAddr>()
         .map(|ip| Bind { ip, port: None })
         .map_err(|_| format!("{text:?} is not an address such as 127.0.0.1 or 127.0.0.1:9000"))
@@ -253,6 +350,7 @@ fn parse_port(text: &str) -> Result<Port, String> {
     if text.eq_ignore_ascii_case("auto") {
         return Ok(Port::Auto);
     }
+
     text.parse::<u16>()
         .map(Port::Number)
         .map_err(|_| format!("{text:?} is not a port number or auto"))
@@ -264,17 +362,20 @@ fn parse_port(text: &str) -> Result<Port, String> {
 fn addresses(args: &RunArgs) -> (SocketAddr, SocketAddr) {
     const HTTP: u16 = 8080;
     const HTTPS: u16 = 8443;
+
     let http = match args.port {
         Some(Port::Auto) => 0,
         Some(Port::Number(port)) => port,
         None => args.bind.port.unwrap_or(HTTP),
     };
+
     let https = match args.https_port {
         Some(Port::Auto) => 0,
         Some(Port::Number(port)) => port,
         None if args.port == Some(Port::Auto) => 0,
         None => HTTPS,
     };
+
     (
         SocketAddr::new(args.bind.ip, http),
         SocketAddr::new(args.bind.ip, https),
@@ -287,15 +388,19 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
     let Some(bind) = error.downcast_ref::<muru_edge::BindError>() else {
         return error;
     };
+
     if bind.source.kind() != std::io::ErrorKind::AddrInUse {
         return error;
     }
+
     let (address, port) = (bind.address, bind.address.port());
+
     let flag = if address == https {
         "--https-port"
     } else {
         "--port"
     };
+
     match port_holder(port) {
         Some(holder) => anyhow::anyhow!(
             "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
@@ -316,21 +421,26 @@ fn port_holder(port: u16) -> Option<String> {
         .output()
         .ok()
         .filter(|output| output.status.success());
+
     if let Some(output) = lsof {
         let text = String::from_utf8_lossy(&output.stdout);
         let pid = text.lines().find_map(|line| line.strip_prefix('p'));
         let command = text.lines().find_map(|line| line.strip_prefix('c'));
+
         if let (Some(pid), Some(command)) = (pid, command) {
             return Some(format!("{command} (pid {pid})"));
         }
     }
+
     let ss = std::process::Command::new("ss")
         .args(["-lptnH", &format!("sport = :{port}")])
         .output()
         .ok()
         .filter(|output| output.status.success())?;
     let text = String::from_utf8_lossy(&ss.stdout);
+
     // users:(("python3",pid=1234,fd=5))
+
     let users = text.split("users:((\"").nth(1)?;
     let (command, rest) = users.split_once('"')?;
     let pid = rest.split("pid=").nth(1)?.split(',').next()?;
@@ -343,18 +453,6 @@ enum Link {
     Tcp,
 }
 
-#[derive(Subcommand)]
-enum DaemonCommand {
-    /// Run the daemon in the foreground.
-    Run,
-}
-
-#[derive(Subcommand)]
-enum EdgeCommand {
-    /// Run an edge process.
-    Run,
-}
-
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -362,48 +460,108 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     let cli = Cli::parse();
 
-    let name = match cli.command {
-        Command::Run(args) => {
-            return tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(run(*args));
-        }
-        Command::Daemon {
-            command: DaemonCommand::Run,
-        } => "daemon run",
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    match cli.command {
+        Command::Run(args) => runtime.block_on(run(*args)),
+        Command::Daemon { command } => runtime.block_on(async move {
+            match command {
+                admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
+                admin::DaemonCommand::Start(args) => admin::daemon_start(args).await,
+                admin::DaemonCommand::Stop {
+                    shutdown,
+                    timeout,
+                    socket,
+                } => admin::daemon_stop(socket, shutdown, timeout).await,
+                admin::DaemonCommand::Reload { socket } => admin::daemon_reload(socket).await,
+                admin::DaemonCommand::Status { socket } => admin::daemon_status(socket).await,
+            }
+        }),
+        Command::Up(args) => runtime.block_on(admin::up(args)),
+        Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
+        Command::App { command } => runtime.block_on(async move {
+            match command {
+                admin::AppCommand::List { socket } => admin::app_list(socket).await,
+            }
+        }),
+        Command::Release { command } => runtime.block_on(async move {
+            match command {
+                admin::ReleaseCommand::List { app, socket } => {
+                    admin::release_list(app, socket).await
+                }
+                admin::ReleaseCommand::Wait {
+                    release,
+                    states,
+                    timeout,
+                    socket,
+                } => admin::release_wait(release, states, timeout, socket).await,
+            }
+        }),
+        Command::Host {
+            command: admin::HostCommand::List { socket },
+        } => runtime.block_on(admin::host_list(socket)),
+        Command::Route {
+            command: admin::RouteCommand::List { socket },
+        } => runtime.block_on(admin::route_list(socket)),
+        Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
+        Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
+        Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
+        Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
+        Command::Config { command } => match command {
+            admin::ConfigCommand::Export {
+                app,
+                all_releases,
+                json,
+                socket,
+            } => runtime.block_on(admin::config_export(app, all_releases, json, socket)),
+            admin::ConfigCommand::Diff { file, json, socket } => {
+                exit_with(runtime, admin::config_diff(file, json, socket))
+            }
+        },
+        Command::Events {
+            follow,
+            after,
+            socket,
+        } => runtime.block_on(admin::events(follow, after, socket)),
+        Command::Logs(args) => runtime.block_on(async move {
+            match args.command.clone() {
+                Some(admin::LogsCommand::Reopen { workers, socket }) => {
+                    admin::logs_reopen(workers, socket).await
+                }
+                None => admin::logs(args).await,
+            }
+        }),
+        Command::Metrics { socket } => runtime.block_on(admin::metrics(socket)),
         Command::Edge {
-            command: EdgeCommand::Run,
-        } => "edge run",
-    };
-    anyhow::bail!("muructl {name} is not implemented yet; see docs/project/roadmap.md")
+            command: edge::EdgeCommand::Run(args),
+        } => runtime.block_on(edge::run(*args)),
+    }
 }
 
-/// Parse a duration such as 250ms, 1.5s or 2 (seconds).
-fn parse_duration(text: &str) -> Result<Duration, String> {
-    let text = text.trim();
-    let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
-        (number, 0.001)
-    } else if let Some(number) = text.strip_suffix('s') {
-        (number, 1.0)
-    } else {
-        (text, 1.0)
-    };
-    let value: f64 = number
-        .trim()
-        .parse()
-        .map_err(|_| format!("{text:?} is not a duration such as 500ms or 2s"))?;
-    if value < 0.0 {
-        return Err("a duration cannot be negative".to_owned());
+/// Run a command whose result is an exit code (section 10.4: 0 for no
+/// changes, 2 for changes planned, 1 for errors) and exit with it.
+fn exit_with(
+    runtime: tokio::runtime::Runtime,
+    command: impl std::future::Future<Output = anyhow::Result<i32>>,
+) -> anyhow::Result<()> {
+    let code = runtime.block_on(command)?;
+
+    if code == 0 {
+        return Ok(());
     }
-    Ok(Duration::from_secs_f64(value * scale))
+
+    drop(runtime);
+    std::process::exit(code)
 }
 
 /// Parse NAME=DURATION for --timeout.
-fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
+pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     let (name, duration) = text
         .split_once('=')
         .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example queue=5s"))?;
@@ -421,7 +579,7 @@ fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle or response_idle"
         ));
     }
-    Ok((name.to_owned(), parse_duration(duration)?))
+    Ok((name.to_owned(), muru_config::parse_duration(duration)?))
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -437,6 +595,7 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
         }),
         ..defaults
     };
+
     for (name, duration) in &args.timeouts {
         match name.as_str() {
             "queue" => limits.queue_timeout = *duration,
@@ -447,6 +606,7 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
             _ => {}
         }
     }
+
     limits
 }
 
@@ -459,6 +619,7 @@ fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
         "errors" => Destination::Errors,
         path => Destination::File(PathBuf::from(path)),
     };
+
     muru_edge::access::Config {
         destination,
         slow: args.slow,
@@ -475,20 +636,33 @@ struct Resolved {
     factory: Option<muru_config::FactoryPhase>,
     processes: usize,
     threads: usize,
+    sync_threads: usize,
+    concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
     /// The directory the host runs in.
     project: PathBuf,
     /// The file the table came from, when there was one.
     source: Option<PathBuf>,
+    /// Named worker groups from the table (section 7.1).
+    groups: std::collections::BTreeMap<String, muru_config::Group>,
+    /// Named mounts from the table (section 6.7).
+    mounts: std::collections::BTreeMap<String, muru_config::Mount>,
+    /// Logging defaults from the table (section 11.4).
+    logging: Option<muru_config::Logging>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
 const DEFAULT_PROCESSES: usize = 1;
 const DEFAULT_THREADS: usize = 4;
+/// Defaults for ASGI workers (section 6.6): the sync pool and the loop's
+/// concurrency, the latter the mount default of appendix C.
+const DEFAULT_SYNC_THREADS: usize = 8;
+const DEFAULT_CONCURRENCY: usize = 1000;
 
 fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     let chdir = args.chdir.clone();
+
     let (entrypoint, project) = match args.app.as_deref() {
         Some(app) if Path::new(app).is_dir() => {
             anyhow::ensure!(
@@ -528,13 +702,17 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         }
         None => (None, chdir.unwrap_or_else(|| PathBuf::from("."))),
     };
+
     let (source, table) = match muru_config::load_project(&project)? {
         Some((path, table)) => (Some(path), table),
         None => (None, muru_config::ToolMuru::default()),
     };
+
     // Whether the entrypoint is a factory belongs to the entrypoint: the
     // table's factory settings apply to the table's entrypoint only.
+
     let from_table = entrypoint.is_none();
+
     let entrypoint = match entrypoint.or(table.entrypoint) {
         Some(entrypoint) => entrypoint,
         None => match &source {
@@ -547,6 +725,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             ),
         },
     };
+
     let factory = if args.factory || (from_table && table.factory == Some(true)) {
         Some(
             table
@@ -569,6 +748,14 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .or(table.processes)
             .unwrap_or(DEFAULT_PROCESSES),
         threads: args.threads.or(table.threads).unwrap_or(DEFAULT_THREADS),
+        sync_threads: args
+            .sync_threads
+            .or(table.sync_threads)
+            .unwrap_or(DEFAULT_SYNC_THREADS),
+        concurrency: args
+            .concurrency
+            .or(table.concurrency)
+            .unwrap_or(DEFAULT_CONCURRENCY),
         preload: args
             .preload
             .or(table.preload)
@@ -576,6 +763,9 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         hooks: args.hooks.clone().or(table.hooks),
         project,
         source,
+        groups: table.groups,
+        mounts: table.mounts,
+        logging: table.logging,
     })
 }
 
@@ -584,20 +774,23 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
 fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     use muru_config::{App, Document, Listener, Release};
 
-    let name = app_name(&resolved.entrypoint);
+    let name = app_name(&resolved.entrypoint).replace('_', "-");
     let limits = limits(args);
     let (http, https) = addresses(args);
     let mut listeners = vec![Listener {
         address: http.to_string(),
         tls: false,
     }];
+
     if args.https || args.https_only || args.tls_cert.is_some() {
         listeners.push(Listener {
             address: https.to_string(),
             tls: true,
         });
     }
+
     let release = Release {
+        source: Some(resolved.project.display().to_string()),
         entrypoint: resolved.entrypoint.clone(),
         interface: (resolved.interface != muru_config::Interface::Auto)
             .then_some(resolved.interface),
@@ -610,8 +803,13 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         ),
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
+        sync_threads: Some(resolved.sync_threads),
+        concurrency: Some(resolved.concurrency),
         preload: Some(resolved.preload),
         hooks: resolved.hooks.clone(),
+        groups: resolved.groups.clone(),
+        mounts: resolved.mounts.clone(),
+        logging: resolved.logging.clone(),
     };
     let document = Document {
         listener: listeners,
@@ -631,12 +829,46 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
                 release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
             },
         )]),
+        ..Document::default()
     };
     let text = document.to_toml().context("writing the configuration")?;
     Ok(format!(
-        "# The declarative equivalent of this muructl run, for muructl apply (phase 2).\n\
-         # The release is written as r1; muructl deploy numbers releases itself.\n\n{text}"
+        "# The declarative equivalent of this muructl run, for muructl apply.\n\
+         # The release is written as r1; muructl deploy numbers releases itself.\n\
+         # Listeners and limits belong in the daemon configuration file.\n\n{text}"
     ))
+}
+
+/// A host's named groups as the edge connects them: each group's sockets
+/// with the paths that select it.
+fn group_sockets(
+    host: &HostProcess,
+    groups: &std::collections::BTreeMap<String, muru_config::Group>,
+) -> Vec<muru_edge::routing::GroupSockets> {
+    host.group_sockets
+        .iter()
+        .map(|(name, sockets)| muru_edge::routing::GroupSockets {
+            name: name.clone(),
+            paths: groups
+                .get(name)
+                .map(|group| group.paths.clone())
+                .unwrap_or_default(),
+            sockets: sockets.clone(),
+        })
+        .collect()
+}
+
+/// The named mounts as the edge selects them.
+fn mount_paths(
+    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
+) -> Vec<muru_edge::routing::MountPath> {
+    mounts
+        .iter()
+        .map(|(name, mount)| muru_edge::routing::MountPath {
+            name: name.clone(),
+            path: mount.path.clone(),
+        })
+        .collect()
 }
 
 /// The application's name: the top-level module of its entrypoint, as
@@ -644,6 +876,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
 fn app_name(entrypoint: &str) -> String {
     let module = entrypoint.split(':').next().unwrap_or(entrypoint);
     let top = module.split('.').next().unwrap_or(module);
+
     if top.is_empty() {
         "default".to_owned()
     } else {
@@ -663,6 +896,7 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
     if !(args.https || args.https_only || args.tls_cert.is_some()) {
         return Ok(None);
     }
+
     let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
         (Some(certificate), Some(key)) => {
             let (chain, key) = muru_edge::tls::load_pem_files(certificate, key)?;
@@ -675,6 +909,7 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
             (chain, key, Some(certificate))
         }
     };
+
     Ok(Some(Tls {
         https: muru_edge::Https {
             listen: addresses(args).1,
@@ -700,10 +935,12 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
             venv.is_file().then_some(venv)
         })
         .unwrap_or_else(|| PathBuf::from("python3"));
+
     match (python.parent(), python.file_name()) {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
             // Resolve the directory, not the file: the interpreter is often a
             // symlink into a virtualenv, and following it would lose the venv.
+
             match dir.canonicalize() {
                 Ok(dir) => dir.join(name),
                 Err(_) => python,
@@ -718,6 +955,7 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut resolved = resolve(&args)?;
     let development = !args.allow_public;
+
     if !args.bind.ip.is_loopback() && development {
         anyhow::bail!(
             "muructl run serves loopback addresses only, because it is development mode: error \
@@ -726,21 +964,35 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             args.bind.ip
         );
     }
+
     anyhow::ensure!(resolved.processes >= 1, "--processes must be at least 1");
     anyhow::ensure!(resolved.threads >= 1, "--threads must be at least 1");
+    anyhow::ensure!(
+        resolved.sync_threads >= 1,
+        "--sync-threads must be at least 1"
+    );
+    anyhow::ensure!(
+        resolved.concurrency >= 1,
+        "--concurrency must be at least 1"
+    );
+
     if args.single {
         resolved.processes = 1;
         resolved.threads = 1;
     }
+
     if args.print_config {
         print!("{}", declarative(&args, &resolved)?);
         return Ok(());
     }
+
     if let Some(source) = &resolved.source {
         println!("muru: using [tool.muru] from {}", source.display());
     }
+
     // Certificates are sorted out before anything is started, so a bad
     // --tls-cert or an unwritable cache fails with nothing to clean up.
+
     let tls = tls(&args)?;
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
@@ -752,15 +1004,47 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         factory: resolved.factory,
         processes: resolved.processes,
         threads: resolved.threads,
+        sync_threads: resolved.sync_threads,
+        concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
         chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
+        detach_to: None,
+        groups: resolved
+            .groups
+            .iter()
+            .map(|(name, group)| muru_controller::host::HostGroup {
+                name: name.clone(),
+                processes: group.processes.unwrap_or(resolved.processes),
+                threads: group.threads.unwrap_or(resolved.threads),
+                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
+                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+            })
+            .collect(),
+        mounts: resolved
+            .mounts
+            .iter()
+            .map(|(name, mount)| muru_controller::host::HostMount {
+                name: name.clone(),
+                path: mount.path.clone(),
+                entrypoint: mount.entrypoint.clone(),
+                interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+            })
+            .collect(),
+        logging: resolved
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.python.clone())
+            .unwrap_or_default(),
     };
 
     let logs = Logs::default();
+    let group_tables = resolved.groups.clone();
+    let mount_tables = resolved.mounts.clone();
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
+
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
         current.stop().await;
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -768,10 +1052,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let (http_address, https_address) = addresses(&args);
+
+    let label = app_name(&resolved.entrypoint).replace('_', "-");
+
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
-        sockets: current.sockets.clone(),
-        slots: resolved.threads,
+        app: label.clone(),
+        release: "r1".to_owned(),
+        sockets: current.default_sockets(),
+        groups: group_sockets(&current, &resolved.groups),
+        mounts: mount_paths(&resolved.mounts),
         development,
         access_log,
         limits: limits(&args),
@@ -786,6 +1076,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             return Err(explain_bind_error(error, https_address));
         }
     };
+
     let addresses = match edge.https_addr() {
         Some(https) if args.https_only => {
             format!(
@@ -796,10 +1087,21 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         Some(https) => format!("http://{} and https://{https}", edge.local_addr()),
         None => format!("http://{}", edge.local_addr()),
     };
+
+    // The workers said in HELLO what they are and how much they take at
+    // once, which is also what the edge dispatches by.
+
+    let capacity = match edge.pools().current().default_pool().workers().first() {
+        Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
+        Some(worker) => format!("{} threads", worker.slots),
+        None => format!("{} threads", resolved.threads),
+    };
+
     println!(
-        "muru: serving {} on {addresses} with {} workers of {} threads",
-        resolved.entrypoint, resolved.processes, resolved.threads
+        "muru: serving {} on {addresses} with {} workers of {capacity}",
+        resolved.entrypoint, resolved.processes
     );
+
     if development {
         println!(
             "muru: development mode: error pages show tracebacks, nothing is persisted and only \
@@ -811,6 +1113,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
              supported way to run in production; that is the daemon, which arrives in phase 2"
         );
     }
+
     if let Some(tls) = &tls {
         match (&tls.development, &args.tls_cert) {
             (Some(certificate), _) => println!("{}", certificate.describe()),
@@ -820,12 +1123,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let release_number = Arc::new(AtomicU32::new(1));
+
     let dashboard = match args.dashboard.as_deref() {
         Some("off") => None,
         Some(address) => Some(address.to_owned()),
         None if development => Some("127.0.0.1:8081".to_owned()),
         None => None,
     };
+
     if let Some(address) = dashboard {
         match dashboard::start(
             &address,
@@ -849,6 +1154,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
+
     if args.reload {
         let directories = if args.reload_dir.is_empty() {
             vec![resolved.project.clone()]
@@ -859,6 +1165,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .into_iter()
             .map(|directory| directory.canonicalize().unwrap_or(directory))
             .collect();
+
         let include = if args.reload_include.is_empty() {
             vec!["**/*.py".to_owned()]
         } else {
@@ -882,12 +1189,20 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let pools = edge.pools();
     let mut serving = tokio::spawn(edge.run());
     let mut release = 1;
+
+    // Ctrl-C and SIGTERM both stop the run in order: the host is told to
+    // stop and its workers finish what they are serving.
+
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
             _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = terminate.recv() => break Ok(()),
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
@@ -895,8 +1210,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
                 println!("muru: reloading, {} changed", describe(&paths));
+
                 loop {
                     release += 1;
+
                     let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
@@ -904,17 +1221,28 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             break;
                         }
                     };
+
                     tokio::select! {
                         ready = next.wait_ready(START_TIMEOUT) => match ready {
                             Ok(()) => {
-                                match muru_edge::link::LinkPool::new(&next.sockets, resolved.threads) {
-                                    Ok(pool) => pools.replace(pool),
+                                let connected = muru_edge::routing::AppPools::connect(
+                                    &label,
+                                    &format!("r{release}"),
+                                    &next.default_sockets(),
+                                    &group_sockets(&next, &group_tables),
+                                &mount_paths(&mount_tables),
+                                )
+                                .await;
+
+                                match connected {
+                                    Ok(connected) => pools.replace(connected),
                                     Err(error) => {
                                         println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
                                         next.stop().await;
                                         break;
                                     }
                                 }
+
                                 println!("muru: switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
@@ -930,6 +1258,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         Some(path) = changed.recv() => {
                             // Section 9.8: a release still starting is abandoned
                             // when more changes arrive.
+
                             let mut paths = vec![path];
                             settle(&mut changed, &mut paths).await;
                             println!("muru: {} changed again, restarting the reload", describe(&paths));
@@ -959,6 +1288,7 @@ fn describe(paths: &[PathBuf]) -> String {
         .first()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+
     match paths.len() {
         0 | 1 => first,
         more => format!("{first} and {} more", more - 1),

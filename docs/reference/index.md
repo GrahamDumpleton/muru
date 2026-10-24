@@ -12,7 +12,6 @@ Still to be written, as their features land or their generators are built:
 - CLI (generated from clap); until then `muructl run --help` is complete.
 - Configuration (generated from the muru-config schema, with the JSON Schema download).
 - Admin API (generated from the .proto files, with the JSON gateway paths).
-- ASGI scope extensions.
 - Environment variables.
 - Event types.
 - Metrics.
@@ -22,6 +21,7 @@ Still to be written, as their features land or their generators are built:
 :maxdepth: 1
 
 wsgi-environ
+asgi-scope
 errors
 python-api
 ```

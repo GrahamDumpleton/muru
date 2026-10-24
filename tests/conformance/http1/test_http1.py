@@ -18,14 +18,17 @@ def exchange(server: Server, data: bytes, timeout: float = 5.0) -> bytes:
     with socket.create_connection(("127.0.0.1", server.port), timeout=timeout) as sock:
         sock.sendall(data)
         chunks = []
+
         while True:
             try:
                 chunk = sock.recv(65536)
             except (TimeoutError, ConnectionResetError):
                 break
+
             if not chunk:
                 break
             chunks.append(chunk)
+
         return b"".join(chunks)
 
 
@@ -83,8 +86,10 @@ def test_malformed_requests_never_reach_the_application(
     server.mark_log()
     response = exchange(server, request_bytes)
     status = status_of(response)
+
     # hyper answers 400 (or 431 for an oversized head) and closes, or just
     # closes when it cannot even frame a response.
+
     assert status in (None, 400, 431), response[:200]
     assert b"chunk1-chunk2-chunk3" not in response
     assert b"data=" not in response
@@ -96,6 +101,7 @@ def test_transfer_encoding_wins_over_content_length_and_closes(server: Server) -
     # RFC 9112 section 6.3: Transfer-Encoding overrides Content-Length. hyper
     # applies that and closes the connection afterwards, so the bytes after
     # the chunked body can never be read as a smuggled second request.
+
     response = exchange(
         server,
         b"POST /input/read-all HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
@@ -109,6 +115,7 @@ def test_transfer_encoding_wins_over_content_length_and_closes(server: Server) -
 
 def test_bare_line_feeds_are_tolerated(server: Server) -> None:
     # Like most servers, hyper accepts a bare LF as a line ending.
+
     response = exchange(server, b"GET /environ/has?key=X HTTP/1.1\nHost: t\nConnection: close\n\n")
     assert status_of(response) == 200
     assert response.endswith(b"present=NO;end")
@@ -143,6 +150,7 @@ def test_http10_without_host_is_served(server: Server) -> None:
 def test_http11_without_host_is_tolerated(server: Server) -> None:
     # RFC 9112 asks for 400 here; hyper serves the request, and the
     # application sees no HTTP_HOST. Recorded so a change is noticed.
+
     response = exchange(
         server, b"GET /environ/has?key=HTTP_HOST HTTP/1.1\r\nConnection: close\r\n\r\n"
     )

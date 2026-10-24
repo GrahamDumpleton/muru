@@ -19,6 +19,7 @@ def modules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.syspath_prepend(str(tmp_path))
     before = set(sys.modules)
     yield tmp_path
+
     for name in set(sys.modules) - before:
         module = sys.modules.pop(name)
         cleanup = getattr(module, "cleanup", None)
@@ -35,6 +36,7 @@ def test_thread_count_sees_a_new_thread() -> None:
     release = threading.Event()
     thread = threading.Thread(target=release.wait)
     thread.start()
+
     try:
         assert preload.thread_count() == before + 1
     finally:
@@ -44,11 +46,13 @@ def test_thread_count_sees_a_new_thread() -> None:
 
 def test_child_pids_sees_a_child_process() -> None:
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
     try:
         assert child.pid in preload.child_pids()
     finally:
         child.kill()
         child.wait()
+
     assert child.pid not in preload.child_pids()
 
 
@@ -141,10 +145,13 @@ def test_import_statements_are_attributed(modules: Path) -> None:
         "def cleanup():\n    PAIR[0].close()\n    PAIR[1].close()\n",
     )
     write_module(modules, "via_statement_mod", "import inner_socket_mod\n")
+
     with preload.ImportRecorder() as recorder:
         # The outer module is imported through importlib, the inner one by
         # its import statement, which the wrapped __import__ sees.
+
         recorder.import_module("via_statement_mod")
+
     assert {finding.module for finding in recorder.findings()} == {"inner_socket_mod"}
 
 
@@ -171,6 +178,7 @@ def test_socket_closed_before_the_end_is_not_reported(modules: Path) -> None:
 def test_descriptor_reuse_is_compared_by_identity(modules: Path) -> None:
     # A descriptor number that existed before the import but now refers to
     # a connected socket is a finding, not a survivor of the baseline.
+
     placeholder = os.open(os.devnull, os.O_RDONLY)
     write_module(
         modules,

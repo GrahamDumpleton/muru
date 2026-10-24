@@ -2,13 +2,15 @@
 //! connections kept open (design specification section 5).
 //!
 //! Each connection is served by one task. It reads a REQUEST frame, runs the
-//! request on an application thread, forwards BODY frames to `wsgi.input`
-//! until the request body ends or the edge sends ABORT, and writes the
-//! response as RESPONSE, BODY and END frames, coalescing small chunks as
-//! section 5.4 describes. A CONTINUE frame goes out when the application
-//! first reads a body the client is holding back (section 5.5). When both directions have ended the connection is
-//! idle again and the next REQUEST may follow. The edge closing the
-//! connection cancels the request.
+//! request on an application thread (WSGI) or as a task on the event loop
+//! (ASGI), forwards BODY frames to `wsgi.input` or the application's
+//! `receive()` until the request body ends or the edge sends ABORT, and
+//! writes the response as RESPONSE, BODY and END frames, coalescing small
+//! chunks as section 5.4 describes. A CONTINUE frame goes out when the
+//! application first reads a body the client is holding back (section
+//! 5.5). When both directions have ended the connection is idle again and
+//! the next REQUEST may follow. The edge closing the connection cancels
+//! the request.
 
 use std::io;
 use std::sync::Arc;
@@ -25,11 +27,20 @@ use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
+use crate::asgi;
 use crate::pool::Shared;
 use crate::wsgi::{self, Outgoing};
 
+/// How long the event loop's requests may take to finish on drain, until
+/// drain timeouts arrive with the daemon.
+const DRAIN_WAIT: Duration = Duration::from_secs(30);
+
 /// Errors from the link server.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The largest WebSocket message the worker declares it takes (section
+/// 5.6); the edge closes a socket with 1009 for more.
+const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 
 /// Flush settings from section 5.4, fixed for the spike.
 const COALESCE_MIN_BYTES: usize = 16 * 1024;
@@ -49,6 +60,8 @@ pub struct Lifecycle {
     pub on_exit: Option<Py<PyAny>>,
     /// Runs on SIGUSR1.
     pub on_reopen_logs: Option<Py<PyAny>>,
+    /// A descriptor whose end of file means the host is gone.
+    pub lifeline: Option<i32>,
 }
 
 impl Lifecycle {
@@ -75,10 +88,13 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
     let accepting = Arc::clone(&shared);
     let reopen_logs = lifecycle.on_reopen_logs.as_ref();
+    let lifeline = lifecycle.lifeline;
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
         let mut signals = Signals::new()?;
+        let mut lifeline = Lifeline::new(lifeline)?;
+
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -89,20 +105,116 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                     if stop {
                         break;
                     }
+
                     Lifecycle::call(reopen_logs);
+                }
+                () = lifeline.gone() => {
+                    eprintln!("muru: the host is gone, stopping");
+                    break;
                 }
             }
         }
+
         Ok(())
     });
 
-    // Requests already running finish on their threads while the runtime
-    // still carries their responses; then everything stops.
+    // Requests already running finish on their threads, or on the event
+    // loop, while the runtime still carries their responses; then
+    // everything stops.
+
     Lifecycle::call(lifecycle.on_drain.as_ref());
     shared.pool.shutdown();
+
+    // The pool joins its threads; the loop's requests are waited for here.
+
+    if shared.asgi.is_some() {
+        let deadline = Instant::now() + DRAIN_WAIT;
+
+        while shared.in_flight() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
     served
+}
+
+/// The read end of the host's pipe: readable only at end of file, when
+/// the host and its write end are gone (section 2.4).
+struct Lifeline {
+    fd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+}
+
+impl Lifeline {
+    fn new(fd: Option<i32>) -> io::Result<Self> {
+        let Some(raw) = fd else {
+            return Ok(Self { fd: None });
+        };
+
+        // SAFETY: the descriptor was inherited from the host for this
+        // purpose and nothing else in the worker holds it, so owning and
+        // closing it here is sound.
+
+        let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+
+        // SAFETY: fcntl on a descriptor this process owns, setting a flag.
+
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+
+            if flags >= 0 {
+                libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+
+        // SAFETY: the descriptor is valid and owned by `owned`, which is
+        // neither closed nor replaced while the AsyncFd holds it.
+
+        let fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(owned, tokio::io::Interest::READABLE)?
+        };
+
+        Ok(Self { fd: Some(fd) })
+    }
+
+    /// Resolve when the host is gone; never, without a lifeline.
+    async fn gone(&mut self) {
+        let Some(fd) = &self.fd else {
+            return std::future::pending().await;
+        };
+
+        loop {
+            let Ok(mut guard) = fd.readable().await else {
+                return;
+            };
+            let mut buffer = [0u8; 8];
+
+            // SAFETY: read into a buffer this stack frame owns, on a
+            // descriptor this struct owns.
+
+            let read = unsafe {
+                libc::read(
+                    std::os::fd::AsRawFd::as_raw_fd(fd.get_ref()),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+
+            if read == 0 {
+                return;
+            }
+
+            if read < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                continue;
+            }
+
+            if read < 0 {
+                return;
+            }
+        }
+    }
 }
 
 /// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks
@@ -144,18 +256,41 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
             let Ok(hello) = pb::Hello::decode(hello.payload) else {
                 return;
             };
+
             if !same_major(&hello.protocol_version) {
                 return;
             }
         }
         _ => return,
     }
+
+    // Section 5.1: the edge acts on what HELLO declares. A worker whose
+    // default mount is ASGI runs requests on its loop, one whose default
+    // is WSGI on its threads; a worker with mounts of both kinds declares
+    // both, and the edge sizes it by the default mount's capacity.
+
+    let default_is_asgi = shared
+        .asgi
+        .as_ref()
+        .is_some_and(|asgi| asgi.runner.is_some());
     let hello = pb::Hello {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-        worker_type: "wsgi".to_owned(),
-        slots: u32::try_from(shared.threads).unwrap_or(u32::MAX),
+        worker_type: if default_is_asgi { "asgi" } else { "wsgi" }.to_owned(),
+        slots: if default_is_asgi {
+            0
+        } else {
+            u32::try_from(shared.threads).unwrap_or(u32::MAX)
+        },
+        async_slots: shared
+            .asgi
+            .as_ref()
+            .map(|asgi| u32::try_from(asgi.concurrency).unwrap_or(u32::MAX))
+            .unwrap_or_default(),
+        websockets: shared.asgi.is_some(),
+        max_message_size: MAX_MESSAGE_SIZE,
         ..Default::default()
     };
+
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
         .await
         .is_err()
@@ -163,20 +298,72 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         return;
     }
 
+    let mut early: Option<frame::Frame> = None;
+
     loop {
-        let request = match frame::read(&mut reader).await {
-            Ok(Some(request)) if request.kind == kind::REQUEST => request,
-            _ => return,
+        let request = match early.take() {
+            Some(request) => request,
+            None => match frame::read(&mut reader).await {
+                Ok(Some(request)) if request.kind == kind::REQUEST => request,
+                // An ABORT or CLOSE for a request that had already ended
+                // when the edge sent it: nothing to do.
+                Ok(Some(request)) if request.kind == kind::ABORT || request.kind == kind::CLOSE => {
+                    continue;
+                }
+                _ => return,
+            },
         };
+
         let request_end = request.is_end();
         let Ok(head) = pb::RequestHead::decode(request.payload) else {
             return;
         };
-        if handle_request(&mut reader, &mut writer, head, request_end, &shared)
-            .await
-            .is_err()
-        {
-            return;
+
+        match handle_request(&mut reader, &mut writer, head, request_end, &shared).await {
+            Ok(next) => early = next,
+            Err(_) => return,
+        }
+    }
+}
+
+/// What the request direction brought while the response was in progress.
+enum Interrupt {
+    /// The response completed; nothing more to watch for.
+    Done,
+    /// The edge has no more use for the request: the client has gone.
+    Abort,
+    /// The edge closed the connection.
+    Closed,
+    /// The next request, when the edge saw the response end before this
+    /// side stopped watching.
+    Request(frame::Frame),
+}
+
+/// After the request body has ended, keep watching the request direction
+/// until the response completes, for an ABORT (the client went away) or
+/// the edge closing the connection. Waiting on the buffer rather than a
+/// frame keeps the wait cancel-safe: a frame is only read once its first
+/// bytes are there, and then in full.
+async fn watch_request(reader: &mut Reader, done: &tokio::sync::Notify) -> io::Result<Interrupt> {
+    use tokio::io::AsyncBufReadExt;
+
+    tokio::select! {
+        biased;
+        _ = done.notified() => Ok(Interrupt::Done),
+        buffered = reader.fill_buf() => {
+            if buffered?.is_empty() {
+                return Ok(Interrupt::Closed);
+            }
+
+            match frame::read(reader).await? {
+                None => Ok(Interrupt::Closed),
+                Some(next) if next.kind == kind::ABORT => Ok(Interrupt::Abort),
+                Some(next) if next.kind == kind::REQUEST => Ok(Interrupt::Request(next)),
+                Some(next) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected frame type {} after the request body", next.kind),
+                )),
+            }
         }
     }
 }
@@ -191,17 +378,42 @@ async fn handle_request(
     head: pb::RequestHead,
     request_end: bool,
     shared: &Arc<Shared>,
-) -> io::Result<()> {
+) -> io::Result<Option<frame::Frame>> {
+    // Section 6.7: the head names the mount; an ASGI mount's request
+    // goes to the loop, a WSGI mount's to the thread pool.
+
+    let Some(mount) = shared.mount(&head.mount) else {
+        return Err(io::Error::other(format!(
+            "the edge asked for a mount this worker does not have: {:?}",
+            head.mount
+        )));
+    };
+
+    if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner) {
+        return handle_asgi_request(reader, writer, head, request_end, shared, asgi, runner).await;
+    }
+
+    let app = mount.app;
     let cancelled = Arc::new(AtomicBool::new(false));
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
+    let done = tokio::sync::Notify::new();
     shared.request_started();
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
-        wsgi::run(py, &worker_shared, head, body_rx, out_tx, worker_cancelled);
+        wsgi::run(
+            py,
+            &worker_shared,
+            &app,
+            head,
+            body_rx,
+            out_tx,
+            worker_cancelled,
+        );
         worker_shared.request_finished();
     }));
+
     if !queued {
         shared.request_finished();
         return Err(io::Error::other("the worker is shutting down"));
@@ -209,53 +421,289 @@ async fn handle_request(
 
     let read_side = async {
         let mut body_tx = Some(body_tx);
-        if request_end {
-            return Ok(());
-        }
-        loop {
-            let Some(next) = frame::read(reader).await? else {
-                cancelled.store(true, Ordering::Relaxed);
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the edge closed the connection during the request body",
-                ));
-            };
-            let end = next.is_end();
-            match next.kind {
-                kind::BODY => {
-                    if let Some(tx) = &body_tx
-                        && !next.payload.is_empty()
-                        && tx.send(next.payload).await.is_err()
-                    {
-                        // The application stopped reading; discard the rest.
-                        body_tx = None;
+
+        if !request_end {
+            loop {
+                let Some(next) = frame::read(reader).await? else {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the request body",
+                    ));
+                };
+                let end = next.is_end();
+
+                match next.kind {
+                    kind::BODY => {
+                        if let Some(tx) = &body_tx
+                            && !next.payload.is_empty()
+                            && tx.send(next.payload).await.is_err()
+                        {
+                            // The application stopped reading; discard the rest.
+
+                            body_tx = None;
+                        }
+
+                        if end {
+                            break;
+                        }
                     }
-                    if end {
+                    kind::END => break,
+                    kind::ABORT => {
+                        // The edge has no more use for the request. Whatever
+                        // the application has not read is gone, and its
+                        // iteration stops; the connection stays usable.
+
+                        cancelled.store(true, Ordering::Relaxed);
                         break;
                     }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected frame type {other} in a request body"),
+                        ));
+                    }
                 }
-                kind::END => break,
-                kind::ABORT => {
-                    // The edge has no more use for the request. Whatever the
-                    // application has not read is gone, and its iteration
-                    // stops; the connection stays usable.
+            }
+        }
+
+        drop(body_tx);
+
+        // Section 5.5: a client that goes away while the response is in
+        // progress is an ABORT, which stops the iteration.
+
+        loop {
+            match watch_request(reader, &done).await? {
+                Interrupt::Done => return Ok(None),
+                Interrupt::Request(next) => return Ok(Some(next)),
+                Interrupt::Abort => cancelled.store(true, Ordering::Relaxed),
+                Interrupt::Closed => {
                     cancelled.store(true, Ordering::Relaxed);
-                    break;
-                }
-                other => {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected frame type {other} in a request body"),
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the response",
                     ));
                 }
             }
         }
-        Ok(())
     };
-    let write_side = write_response(out_rx, writer);
+    let write_side = async {
+        let result = write_response(out_rx, writer).await;
+        done.notify_one();
+        result
+    };
+
     let (read_result, write_result) = tokio::join!(read_side, write_side);
-    read_result?;
-    write_result
+    let early = read_result?;
+    write_result?;
+    Ok(early)
+}
+
+/// Run one request as a task on the event loop: body frames become
+/// `http.request` messages for the application's `receive()`, ABORT or the
+/// end of the response becomes `http.disconnect`, and the output goes
+/// through the same coalescing writer as a WSGI response.
+async fn handle_asgi_request(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    head: pb::RequestHead,
+    request_end: bool,
+    shared: &Arc<Shared>,
+    asgi: &asgi::Asgi,
+    runner: Py<PyAny>,
+) -> io::Result<Option<frame::Frame>> {
+    let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
+    let done = tokio::sync::Notify::new();
+
+    // The task starts on the loop now; the channel is how the two sides
+    // of this function reach it.
+
+    shared.request_started();
+
+    let channel = match asgi::start(shared, asgi, &runner, &head, out_tx) {
+        Ok(channel) => channel,
+        Err(error) => {
+            shared.request_finished();
+            return Err(io::Error::other(format!(
+                "the worker is shutting down: {error}"
+            )));
+        }
+    };
+
+    let channel = channel.get();
+
+    if head.scope == pb::Scope::Websocket as i32 {
+        return handle_websocket(reader, writer, out_rx, shared, channel, &done).await;
+    }
+
+    let read_side = async {
+        if request_end {
+            channel.deliver(Bytes::new(), false).await;
+        } else {
+            loop {
+                let Some(next) = frame::read(reader).await? else {
+                    channel.disconnect();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the request body",
+                    ));
+                };
+                let end = next.is_end();
+
+                match next.kind {
+                    kind::BODY => {
+                        if !next.payload.is_empty() || end {
+                            channel.deliver(next.payload, !end).await;
+                        }
+
+                        if end {
+                            break;
+                        }
+                    }
+                    kind::END => {
+                        channel.deliver(Bytes::new(), false).await;
+                        break;
+                    }
+                    kind::ABORT => {
+                        channel.disconnect();
+                        break;
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected frame type {other} in a request body"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Section 5.5: the client going away is http.disconnect.
+
+        loop {
+            match watch_request(reader, &done).await? {
+                Interrupt::Done => return Ok(None),
+                Interrupt::Request(next) => return Ok(Some(next)),
+                Interrupt::Abort => channel.disconnect(),
+                Interrupt::Closed => {
+                    channel.disconnect();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the response",
+                    ));
+                }
+            }
+        }
+    };
+    let write_side = async {
+        let result = write_response(out_rx, writer).await;
+        channel.complete();
+        done.notify_one();
+        result
+    };
+
+    // The response is over: a receive() still waiting gets http.disconnect.
+
+    let (read_result, write_result) = tokio::join!(read_side, write_side);
+    channel.disconnect();
+    shared.request_finished();
+
+    let early = read_result?;
+    write_result?;
+    Ok(early)
+}
+
+/// Run one WebSocket (section 5.6): MESSAGE frames from the edge become
+/// `websocket.receive` messages and its CLOSE `websocket.disconnect`, while
+/// the application's accept, messages and close go out through the writer.
+/// Until the application accepts, the edge may still see the request end
+/// with an ordinary response, which the write side signals as done.
+async fn handle_websocket(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    out_rx: mpsc::Receiver<Outgoing>,
+    shared: &Arc<Shared>,
+    channel: &asgi::Channel,
+    done: &tokio::sync::Notify,
+) -> io::Result<Option<frame::Frame>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let read_side = async {
+        channel.deliver_connect().await;
+
+        loop {
+            // Before the accept, the response ending (a decline) ends the
+            // request; after it, only the edge's CLOSE does.
+
+            let ended = tokio::select! {
+                biased;
+                _ = done.notified(), if !channel.accepted() => None,
+                buffered = reader.fill_buf() => Some(buffered.map(|buffered| buffered.is_empty())),
+            };
+
+            match ended {
+                None => return Ok(None),
+                Some(Ok(false)) => {}
+                Some(Ok(true)) => {
+                    channel.disconnect_with(1006, "the edge closed the connection");
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during a WebSocket",
+                    ));
+                }
+                Some(Err(error)) => {
+                    channel.disconnect_with(1006, "the edge closed the connection");
+                    return Err(error);
+                }
+            }
+
+            let Some(next) = frame::read(reader).await? else {
+                channel.disconnect_with(1006, "the edge closed the connection");
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the edge closed the connection during a WebSocket",
+                ));
+            };
+
+            match next.kind {
+                kind::MESSAGE => {
+                    let text = next.flags & flag::TEXT != 0;
+                    channel.deliver_message(next.payload, text).await;
+                }
+                kind::CLOSE => {
+                    let close = pb::Close::decode(next.payload).unwrap_or_default();
+                    let code = u16::try_from(close.code).unwrap_or(1005);
+                    channel.disconnect_with(code, &close.reason);
+                    return Ok(None);
+                }
+                kind::ABORT => {
+                    channel.disconnect_with(1006, "the client went away");
+                    return Ok(None);
+                }
+                kind::REQUEST => return Ok(Some(next)),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected frame type {other} on a WebSocket"),
+                    ));
+                }
+            }
+        }
+    };
+    let write_side = async {
+        let result = write_response(out_rx, writer).await;
+        channel.complete();
+        done.notify_one();
+        result
+    };
+
+    let (read_result, write_result) = tokio::join!(read_side, write_side);
+    channel.disconnect_with(1006, "the connection ended");
+    shared.request_finished();
+
+    let early = read_result?;
+    write_result?;
+    Ok(early)
 }
 
 /// Turn the application's output into frames, coalescing small chunks.
@@ -270,6 +718,10 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
     let mut immediate = false;
     let mut first_block_sent = false;
 
+    // After a 101 the stream carries WebSocket messages, not a body.
+
+    let mut upgraded = false;
+
     loop {
         let item = match deadline {
             Some(at) => tokio::select! {
@@ -278,15 +730,19 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
             },
             None => Some(rx.recv().await),
         };
+
         // The bridge says when the request is over; the channel closing
         // without that only means the application thread died.
+
         let item = match item {
             Some(Some(Outgoing::Finished)) => Some(None),
             other => other,
         };
+
         match item {
             None => {
                 // The delay expired with data waiting.
+
                 let data = buffer.split().freeze();
                 sent += data.len() as u64;
                 let end = content_length == Some(sent);
@@ -296,18 +752,26 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
             }
             Some(None) => {
                 // The application finished.
+
                 if ended {
                     return Ok(());
                 }
+
+                if upgraded {
+                    return write_close(writer, 1000, "").await;
+                }
+
                 if !buffer.is_empty() {
                     let data = buffer.split().freeze();
                     sent += data.len() as u64;
                     let short = content_length.is_some_and(|length| sent < length);
                     write_body(writer, &mut pending_head, &mut head_written, data, !short).await?;
+
                     if !short {
                         return Ok(());
                     }
                 }
+
                 if let Some(head) = pending_head.take() {
                     if content_length.is_some_and(|length| length > 0) {
                         frame::write(writer, kind::RESPONSE, 0, head).await?;
@@ -316,18 +780,23 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         return frame::write(writer, kind::RESPONSE, flag::END, head).await;
                     }
                 }
+
                 if !head_written {
                     // Nothing at all arrived: the bridge always sends a head, so
                     // this means the application thread died.
+
                     return Ok(());
                 }
+
                 let mut end = pb::End::default();
+
                 if let Some(length) = content_length.filter(|&length| sent < length) {
                     end.error = format!(
                         "the response ended after {sent} of the {length} bytes its Content-Length declared"
                     );
                     eprintln!("muru: {}", end.error);
                 }
+
                 return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
             }
             Some(Some(Outgoing::Head {
@@ -353,9 +822,22 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         .collect(),
                     flush: flush as i32,
                 };
+
+                if status == 101 {
+                    // The WebSocket is accepted: the head goes out now and
+                    // messages follow it.
+
+                    frame::write(writer, kind::RESPONSE, 0, head.encode_to_vec().into()).await?;
+                    head_written = true;
+                    upgraded = true;
+                    continue;
+                }
+
                 pending_head = Some(head.encode_to_vec().into());
+
                 if content_length == Some(0) {
                     // No body will follow; send the head now and finish.
+
                     let head = pending_head.take().unwrap_or_default();
                     frame::write(writer, kind::RESPONSE, flag::END, head).await?;
                     head_written = true;
@@ -366,15 +848,20 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 if ended {
                     continue;
                 }
+
                 // Nothing beyond the declared Content-Length is sent.
+
                 if let Some(length) = content_length {
                     let remaining = length.saturating_sub(sent + buffer.len() as u64);
+
                     if (data.len() as u64) > remaining {
                         data.truncate(usize::try_from(remaining).unwrap_or(usize::MAX));
                     }
                 }
+
                 if immediate || !first_block_sent {
                     first_block_sent = true;
+
                     if !buffer.is_empty() {
                         let buffered = buffer.split().freeze();
                         sent += buffered.len() as u64;
@@ -387,12 +874,14 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         )
                         .await?;
                     }
+
                     sent += data.len() as u64;
                     let end = content_length == Some(sent);
                     write_body(writer, &mut pending_head, &mut head_written, data, end).await?;
                     ended |= end;
                 } else {
                     buffer.extend_from_slice(&data);
+
                     if buffer.len() >= COALESCE_MIN_BYTES {
                         let buffered = buffer.split().freeze();
                         sent += buffered.len() as u64;
@@ -411,8 +900,20 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 // The application is reading the body. The edge may pass
                 // that on as 100 Continue (section 5.5); after the response
                 // has ended it no longer matters.
+
                 if !ended {
                     frame::write(writer, kind::CONTINUE, 0, Bytes::new()).await?;
+                }
+            }
+            Some(Some(Outgoing::Message { data, text })) => {
+                if upgraded {
+                    let flags = if text { flag::TEXT } else { 0 };
+                    frame::write(writer, kind::MESSAGE, flags, data).await?;
+                }
+            }
+            Some(Some(Outgoing::Close { code, reason })) => {
+                if upgraded {
+                    return write_close(writer, code, &reason).await;
                 }
             }
             Some(Some(Outgoing::Abort {
@@ -423,6 +924,12 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 if ended {
                     return Ok(());
                 }
+
+                if upgraded {
+                    eprintln!("muru: {error}");
+                    return write_close(writer, 1011, "internal error").await;
+                }
+
                 if !buffer.is_empty() {
                     let buffered = buffer.split().freeze();
                     write_body(
@@ -434,9 +941,12 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     )
                     .await?;
                 }
-                if let Some(head) = pending_head.take() {
-                    frame::write(writer, kind::RESPONSE, 0, head).await?;
-                }
+
+                // A head the writer was still holding never reached the
+                // edge, so the failure is reported in its place and the
+                // edge answers with its error page.
+
+                pending_head.take();
                 let end = pb::End {
                     error,
                     reason,
@@ -450,6 +960,15 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
     }
 }
 
+/// End a WebSocket from the worker's side (section 5.6).
+async fn write_close(writer: &mut Writer, code: u16, reason: &str) -> io::Result<()> {
+    let close = pb::Close {
+        code: u32::from(code),
+        reason: reason.to_owned(),
+    };
+    frame::write(writer, kind::CLOSE, 0, close.encode_to_vec().into()).await
+}
+
 /// Write a body chunk, with the response head in the same write when it is
 /// still pending, and the END flag when this is the last chunk.
 async fn write_body(
@@ -460,9 +979,11 @@ async fn write_body(
     end: bool,
 ) -> io::Result<()> {
     let flags = if end { flag::END } else { 0 };
+
     match pending_head.take() {
         Some(head) => {
             *head_written = true;
+
             if data.len() <= SMALL_PAYLOAD {
                 let mut buffer =
                     BytesMut::with_capacity(2 * frame::HEADER_LEN + head.len() + data.len());

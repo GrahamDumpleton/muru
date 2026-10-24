@@ -40,6 +40,7 @@ it adds.
 | --- | --- |
 | `muru.request_id` | The request id, a 26-character ULID. The same value is in the `X-Request-ID` response header, the access log line and the error page |
 | `muru.max_body_size` | The body limit in force, in bytes: 100 MB in development, 10 MB with `--allow-public`, or what `--max-body-size` set |
+| `muru.proxy_addr` | Present only when a trusted proxy forwarded the request (see [behind a proxy](../howto/behind-a-proxy.md)): the address of the proxy that connected, while `REMOTE_ADDR` is the client it forwarded |
 | `muru.tls` | Present over HTTPS only: a dictionary with `version` (`TLSv1.3` or `TLSv1.2`), `cipher` (the negotiated suite, for example `TLS13_AES_256_GCM_SHA384`), `server_name` (the name the client asked for, empty when it connected by address) and `alpn` (`h2`, `http/1.1`, or empty when the client offered none) |
 
 ## Rules worth knowing

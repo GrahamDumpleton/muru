@@ -11,6 +11,13 @@ repos:
         language: system
         pass_filenames: false
 
+      - id: code-layout
+        stages: [pre-commit]
+        name: code layout follows the AGENTS.md paragraph rules
+        entry: uv run python scripts/check-layout.py
+        language: system
+        types_or: [python, rust]
+
       - id: commit-message
         name: commit message has no agent attribution
         entry: sh scripts/check-commit-message.sh

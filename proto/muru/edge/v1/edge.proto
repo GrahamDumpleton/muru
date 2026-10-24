@@ -1,0 +1,173 @@
+// Control protocol between the daemon and its edge processes (design
+// specification sections 2.3 and 4.4). The daemon spawns each edge with its
+// listener sockets and pushes routing snapshots over the edge's control
+// socket. Internal; messages change additively within a major version.
+//
+// A snapshot carries the virtual hosts with their certificates, the routes
+// and the worker sockets of each application's serving release (section
+// 4.4). Without hosts, every request goes to the default worker sockets.
+// Traffic policies, upstreams and the rest of section 4.4 are added as
+// their features land.
+
+syntax = "proto3";
+
+package muru.edge.v1;
+
+service EdgeControl {
+  // Replace the routing snapshot. The edge connects to the workers before
+  // it answers, and keeps the last good snapshot if that fails.
+  rpc Apply(Snapshot) returns (Applied);
+  // The edge's pid, listener and snapshot version.
+  rpc GetStatus(EdgeStatusRequest) returns (EdgeStatus);
+  // The edge's metrics as samples (section 11.1), which the daemon
+  // aggregates across edges and serves.
+  rpc GetMetrics(MetricsRequest) returns (MetricsReport);
+  // Recent requests, the last minute's counters and the state of every
+  // worker pool, for the dashboard (section 10.7).
+  rpc GetRecent(RecentRequest) returns (RecentRequests);
+  // Stop accepting and exit once the requests in flight have finished.
+  rpc Stop(StopRequest) returns (Stopped);
+}
+
+message Snapshot {
+  uint64 version = 1;
+  repeated string worker_sockets = 2;   // where requests go when no host is declared
+  repeated Host hosts = 3;
+  repeated Route routes = 4;
+  repeated AppWorkers apps = 5;
+  Proxy proxy = 6;                      // trusted proxies; nothing trusted when absent
+}
+
+// Section 4.7: which peers may speak for the client, and how.
+message Proxy {
+  repeated string trusted = 1;          // addresses, CIDR ranges, loopback, private, unix
+  repeated string headers = 2;          // header types applied from trusted peers
+  bool recursive = 3;
+  bool consume = 4;                     // remove every forwarding header once applied
+}
+
+// A virtual host (section 4.3).
+message Host {
+  string name = 1;
+  repeated string names = 2;            // exact names and *.wildcards, normalised
+  repeated string listeners = 3;        // listener addresses it answers on; all when empty
+  string certificate_pem = 4;           // the chain, when the host has TLS
+  string key_pem = 5;
+  bool https_redirect = 6;              // plain HTTP requests are redirected to HTTPS
+  string canonical = 7;
+  bool use_canonical_name = 8;          // SERVER_NAME is the canonical name
+  bool default = 9;                     // answers requests whose host matches no host
+}
+
+// A route (section 4.5): a path prefix of a host to an application.
+message Route {
+  string host = 1;
+  string path = 2;
+  string app = 3;
+}
+
+// The worker sockets of an application's serving release: the default
+// group's, and each named group's with the paths it serves (section 7.1).
+message AppWorkers {
+  string app = 1;
+  repeated string sockets = 2;
+  repeated Group groups = 3;
+  repeated Mount mounts = 4;            // named mounts of the serving release (section 6.7)
+  string release = 5;                   // the release, for the access log
+}
+
+message Mount {
+  string name = 1;
+  string path = 2;                      // the prefix; the default mount is at /
+}
+
+message Group {
+  string name = 1;
+  repeated string paths = 2;            // prefixes, with an optional trailing *
+  repeated string sockets = 3;
+}
+
+message Applied {
+  uint64 version = 1;
+}
+
+message EdgeStatusRequest {}
+
+message EdgeStatus {
+  uint32 pid = 1;
+  string listen = 2;                    // the first listener
+  uint64 snapshot_version = 3;
+  repeated Listener listeners = 4;
+}
+
+message Listener {
+  string address = 1;
+  bool tls = 2;
+}
+
+message StopRequest {}
+
+message Stopped {}
+
+message MetricsRequest {}
+
+message MetricsReport {
+  repeated Sample samples = 1;
+}
+
+// One metric sample: a family name (with _bucket, _sum or _count for a
+// histogram), its labels in order, and its value.
+message Sample {
+  string name = 1;
+  repeated Label labels = 2;
+  double value = 3;
+}
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+message RecentRequest {
+  uint32 limit = 1;                     // most recent records wanted
+}
+
+message RecentRequests {
+  repeated AccessRecord records = 1;    // oldest first
+  uint64 minute_requests = 2;
+  uint64 minute_errors = 3;
+  uint64 minute_seconds = 4;
+  repeated PoolState pools = 5;
+}
+
+// One access log record (section 11.2).
+message AccessRecord {
+  uint64 started_unix_ms = 1;
+  string request_id = 2;
+  string client = 3;
+  string app = 4;
+  string release = 5;
+  string host = 6;
+  string group = 7;
+  string mount = 8;
+  string method = 9;
+  string target = 10;
+  uint32 status = 11;
+  string reason = 12;
+  uint64 bytes = 13;
+  int32 worker = 14;                    // -1 when no worker served it
+  uint64 queue_us = 15;
+  uint64 application_us = 16;
+  uint64 total_us = 17;
+}
+
+// One worker pool's state.
+message PoolState {
+  string app = 1;
+  string release = 2;
+  string group = 3;
+  uint32 workers = 4;
+  uint32 slots = 5;
+  uint32 busy = 6;
+  uint32 waiting = 7;
+}

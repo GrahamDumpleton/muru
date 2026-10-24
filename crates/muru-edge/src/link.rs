@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context as _;
 use bytes::{Bytes, BytesMut};
 use http::{Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -53,8 +54,8 @@ const DISCARD_DELAY: Duration = Duration::from_secs(2);
 /// exceeded.
 pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 
-type Reader = BufReader<OwnedReadHalf>;
-type Writer = OwnedWriteHalf;
+pub(crate) type Reader = BufReader<OwnedReadHalf>;
+pub(crate) type Writer = OwnedWriteHalf;
 
 /// One idle connection to a worker.
 struct Conn {
@@ -64,6 +65,12 @@ struct Conn {
 
 struct WorkerSlots {
     path: PathBuf,
+    /// What the worker called itself in HELLO (wsgi or asgi), informational.
+    worker_type: String,
+    /// Whether it accepts websocket scopes (section 5.6).
+    websockets: bool,
+    /// Requests the worker takes at once, from its HELLO: its threads for
+    /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
     semaphore: Arc<Semaphore>,
     idle: Mutex<Vec<Conn>>,
@@ -76,7 +83,9 @@ pub struct WorkerStatus {
     pub index: usize,
     /// Its link socket.
     pub path: PathBuf,
-    /// Requests it can handle at once.
+    /// What it called itself in HELLO: wsgi or asgi.
+    pub worker_type: String,
+    /// Requests it can handle at once: threads, or the loop's concurrency.
     pub slots: usize,
     /// Requests it is handling now.
     pub in_flight: usize,
@@ -86,6 +95,18 @@ pub struct WorkerStatus {
 pub struct LinkPool {
     workers: Vec<WorkerSlots>,
     next: AtomicUsize,
+    /// Requests waiting for a slot, for the metrics.
+    waiting: AtomicUsize,
+}
+
+/// One request's place in the queue for a slot, given back when it gets
+/// one or gives up.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A connection taken from the pool for one request.
@@ -93,26 +114,37 @@ struct Lease {
     conn: Conn,
     permit: OwnedSemaphorePermit,
     worker: usize,
+    /// Whether the worker accepts websocket scopes.
+    websockets: bool,
 }
 
 impl LinkPool {
-    /// Create one pool per worker socket, each bounded to `slots` requests.
-    pub fn new(sockets: &[PathBuf], slots: usize) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !sockets.is_empty(),
-            "at least one worker socket is required"
-        );
+    /// Connect once to every worker socket and size its pool from what its
+    /// HELLO declares (section 5.1): the edge acts on the capabilities, not
+    /// on the kind of worker. The first connection stays in the pool.
+    pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
+        let mut workers = Vec::with_capacity(sockets.len());
+
+        for path in sockets {
+            let (conn, hello) = connect(path)
+                .await
+                .with_context(|| format!("connecting to the worker at {}", path.display()))?;
+
+            let slots = capacity(&hello);
+            workers.push(WorkerSlots {
+                path: path.clone(),
+                worker_type: hello.worker_type,
+                websockets: hello.websockets,
+                slots,
+                semaphore: Arc::new(Semaphore::new(slots)),
+                idle: Mutex::new(vec![conn]),
+            });
+        }
+
         Ok(Self {
-            workers: sockets
-                .iter()
-                .map(|path| WorkerSlots {
-                    path: path.clone(),
-                    slots: slots.max(1),
-                    semaphore: Arc::new(Semaphore::new(slots.max(1))),
-                    idle: Mutex::new(Vec::new()),
-                })
-                .collect(),
+            workers,
             next: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
         })
     }
 
@@ -124,40 +156,82 @@ impl LinkPool {
             .map(|(index, worker)| WorkerStatus {
                 index,
                 path: worker.path.clone(),
+                worker_type: worker.worker_type.clone(),
                 slots: worker.slots,
                 in_flight: worker.slots - worker.semaphore.available_permits(),
             })
             .collect()
     }
 
+    /// A pool with no workers at all, for an edge that is up before any
+    /// release is: every request is answered 503 until a pool replaces it.
+    pub fn empty() -> Self {
+        Self {
+            workers: Vec::new(),
+            next: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// Requests waiting for a slot right now.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    /// Whether the pool has any workers.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    /// Requests in flight across every worker.
+    pub fn in_flight(&self) -> usize {
+        self.workers
+            .iter()
+            .map(|worker| worker.slots - worker.semaphore.available_permits())
+            .sum()
+    }
+
     /// Take a connection from the worker with the most free slots, waiting
     /// for one if every worker is busy.
     async fn acquire(&self) -> io::Result<Lease> {
+        if self.workers.is_empty() {
+            return Err(io::Error::other("no release is serving"));
+        }
+
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut best = start;
         let mut best_free = self.workers[start].semaphore.available_permits();
+
         for offset in 1..self.workers.len() {
             let index = (start + offset) % self.workers.len();
             let free = self.workers[index].semaphore.available_permits();
+
             if free > best_free {
                 best = index;
                 best_free = free;
             }
         }
+
         let worker = &self.workers[best];
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let waiting = Waiting(&self.waiting);
         let permit = Arc::clone(&worker.semaphore)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("pool closed"))?;
+        drop(waiting);
         let idle = worker.idle.lock().expect("pool poisoned").pop();
+
         let conn = match idle {
             Some(conn) => conn,
-            None => connect(&worker.path).await?,
+            None => connect(&worker.path).await?.0,
         };
+
         Ok(Lease {
             conn,
             permit,
             worker: best,
+            websockets: worker.websockets,
         })
     }
 
@@ -170,7 +244,19 @@ impl LinkPool {
     }
 }
 
-async fn connect(path: &PathBuf) -> io::Result<Conn> {
+/// How many requests a worker takes at once: on its threads when it has
+/// them, otherwise on its event loop.
+fn capacity(hello: &pb::Hello) -> usize {
+    let declared = if hello.slots > 0 {
+        hello.slots
+    } else {
+        hello.async_slots
+    };
+
+    usize::try_from(declared).unwrap_or(usize::MAX).max(1)
+}
+
+async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     let stream = UnixStream::connect(path).await?;
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::with_capacity(32 * 1024, read_half);
@@ -180,25 +266,25 @@ async fn connect(path: &PathBuf) -> io::Result<Conn> {
         ..Default::default()
     };
     frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into()).await?;
-    match frame::read(&mut reader).await? {
-        Some(reply) if reply.kind == kind::HELLO => {
-            pb::Hello::decode(reply.payload)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        }
+
+    let hello = match frame::read(&mut reader).await? {
+        Some(reply) if reply.kind == kind::HELLO => pb::Hello::decode(reply.payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "the worker did not answer HELLO",
             ));
         }
-    }
-    Ok(Conn { reader, writer })
+    };
+
+    Ok((Conn { reader, writer }, hello))
 }
 
 /// Collects the two halves of a leased connection as each direction
 /// finishes, and returns the connection to the pool when both are back
 /// intact. A half reported as broken closes the connection instead.
-struct Return {
+pub(crate) struct Return {
     pool: Arc<LinkPool>,
     worker: usize,
     state: Mutex<ReturnState>,
@@ -211,6 +297,8 @@ struct Return {
     proceeded: AtomicBool,
     /// Set when the client stopped sending its body for too long.
     client_stalled: AtomicBool,
+    /// Set once the response direction has ended, intact or not.
+    ended: AtomicBool,
 }
 
 struct ReturnState {
@@ -237,6 +325,7 @@ impl Return {
             proceed: Notify::new(),
             proceeded: AtomicBool::new(false),
             client_stalled: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
         })
     }
 
@@ -251,13 +340,27 @@ impl Return {
         self.proceed.notify_one();
     }
 
-    fn give_reader(&self, reader: Option<Reader>) {
+    pub(crate) fn give_reader(&self, reader: Option<Reader>) {
+        self.ended.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().expect("return state poisoned");
         state.reader = reader;
         self.report(&mut state);
     }
 
-    fn give_writer(&self, writer: Option<Writer>) {
+    /// Take the writer back for a WebSocket relay, which holds both halves
+    /// until the socket ends. The earlier report is undone.
+    pub(crate) fn take_writer(&self) -> Option<Writer> {
+        let mut state = self.state.lock().expect("return state poisoned");
+        let writer = state.writer.take();
+
+        if writer.is_some() {
+            state.reported = state.reported.saturating_sub(1);
+        }
+
+        writer
+    }
+
+    pub(crate) fn give_writer(&self, writer: Option<Writer>) {
         let mut state = self.state.lock().expect("return state poisoned");
         state.writer = writer;
         self.report(&mut state);
@@ -265,19 +368,54 @@ impl Return {
 
     fn report(&self, state: &mut ReturnState) {
         state.reported += 1;
+
         if state.reader.is_none() && state.writer.is_none() {
             state.broken = true;
         }
+
         if state.reported < 2 {
             return;
         }
+
         let (reader, writer) = (state.reader.take(), state.writer.take());
+
         if let (Some(reader), Some(writer), false) = (reader, writer, state.broken) {
             self.pool.put_back(self.worker, Conn { reader, writer });
         }
+
         // Release the slot after the connection is back in the pool, so the
         // next request finds it there.
+
         state.permit.take();
+    }
+}
+
+impl Drop for Return {
+    /// Dropped with the response still in progress means the client went
+    /// away before the worker answered. Section 5.5 asks for an ABORT so
+    /// the application learns of it; the connection is then closed rather
+    /// than drained for reuse, which is left for the daemon's edge.
+    fn drop(&mut self) {
+        if self.ended.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Drop runs inside the runtime when a request's task is dropped;
+        // without one there is nothing to write from.
+
+        let writer = self
+            .state
+            .lock()
+            .expect("return state poisoned")
+            .writer
+            .take();
+
+        if let (Some(mut writer), Ok(runtime)) = (writer, tokio::runtime::Handle::try_current()) {
+            runtime.spawn(async move {
+                let payload = pb::Abort::default().encode_to_vec();
+                let _ = frame::write(&mut writer, kind::ABORT, 0, payload.into()).await;
+            });
+        }
     }
 }
 
@@ -285,8 +423,10 @@ impl Return {
 pub struct Context<'a> {
     /// The request identifier (section 4.19).
     pub request_id: &'a str,
-    /// The client's address.
+    /// The client's address: the peer, or what a trusted proxy forwarded.
     pub peer: SocketAddr,
+    /// The peer that connected, when it was a trusted proxy (section 4.7).
+    pub proxy: Option<SocketAddr>,
     /// The listener's address.
     pub local: SocketAddr,
     /// http, or https when the connection is inside TLS.
@@ -299,23 +439,73 @@ pub struct Context<'a> {
     pub access_log: Arc<AccessLog>,
     /// The timeouts in force.
     pub limits: Arc<Limits>,
+    /// The virtual host name the application sees as SERVER_NAME, when a
+    /// host matched (section 4.3).
+    pub server_name: Option<String>,
+    /// The application the request goes to, for the access log; empty
+    /// before routing, or when nothing names it.
+    pub app: String,
+    /// The release, for the access log; empty when nothing names it.
+    pub release: String,
+    /// The worker group, for the access log; empty before routing.
+    pub group: String,
+    /// The routing snapshot's version, for the access log.
+    pub snapshot: u64,
+    /// The host a trusted proxy forwarded, replacing the Host header.
+    pub forwarded_host: Option<String>,
+    /// The port a trusted proxy forwarded, for SERVER_PORT.
+    pub forwarded_port: Option<u16>,
+    /// The path prefix a trusted proxy stripped, for SCRIPT_NAME.
+    pub prefix: Option<String>,
+    /// The mount the request goes to, empty for the default (section 6.7).
+    pub mount: String,
+    /// The mount's path, joined to SCRIPT_NAME.
+    pub mount_path: String,
+}
+
+/// The host the client asked for, without its port, from the Host header
+/// or the request target.
+fn requested_host(parts: &http::request::Parts) -> String {
+    let header = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.host())
+        .unwrap_or("");
+    crate::routing::host_only(header).to_owned()
 }
 
 /// The access log record of a request in progress.
-struct Recording {
+pub(crate) struct Recording {
     log: Arc<AccessLog>,
     record: Record,
     started: Instant,
+    /// Counted as in flight until the recording is dropped.
+    _in_flight: crate::access::InFlight,
 }
 
 impl Recording {
     fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
         Self {
             log: Arc::clone(&context.access_log),
+            _in_flight: context.access_log.begin(&context.app, &context.release),
             record: Record {
                 started: SystemTime::now(),
                 request_id: context.request_id.to_owned(),
                 client: context.peer.ip(),
+                app: context.app.clone(),
+                release: context.release.clone(),
+                host: context
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| requested_host(parts)),
+                group: context.group.clone(),
+                mount: if context.mount.is_empty() {
+                    crate::routing::DEFAULT_GROUP.to_owned()
+                } else {
+                    context.mount.clone()
+                },
+                snapshot: context.snapshot,
                 method: parts.method.as_str().to_owned(),
                 target: parts
                     .uri
@@ -334,7 +524,7 @@ impl Recording {
         }
     }
 
-    fn complete(mut self, status: u16, reason: &str, bytes: u64) {
+    pub(crate) fn complete(mut self, status: u16, reason: &str, bytes: u64) {
         self.record.status = status;
         self.record.reason = reason.to_owned();
         self.record.bytes = bytes;
@@ -346,6 +536,26 @@ impl Recording {
 /// Answer a plain HTTP request with a redirect to the HTTPS listener
 /// (--https-only, section 13.1). 307 keeps the method and is never cached,
 /// so a later run without TLS on the same port is unaffected.
+/// Answer a request the routing tables refuse (421 or 404), recording it
+/// in the access log like any other edge-generated response.
+pub(crate) fn reject(
+    request: http::Request<Incoming>,
+    context: &Context<'_>,
+    problem: Problem,
+) -> Response<ResponseBody> {
+    let (parts, _body) = request.into_parts();
+    let recording = Recording::new(context, &parts);
+    let failing = Failing {
+        request_id: context.request_id,
+        max_body_size: context.limits.max_body_size,
+        negotiation: Negotiation::from_headers(&parts.headers, context.development),
+        version: parts.version,
+        recording: Mutex::new(Some(recording)),
+    };
+
+    failing.respond(problem)
+}
+
 pub(crate) fn redirect_to_https(
     request: http::Request<Incoming>,
     context: &Context<'_>,
@@ -357,12 +567,13 @@ pub(crate) fn redirect_to_https(
         .headers
         .get(http::header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(host_only)
+        .map(crate::routing::host_only)
         .or_else(|| parts.uri.host().map(str::to_owned))
         .unwrap_or_else(|| match to.ip() {
             std::net::IpAddr::V4(ip) => ip.to_string(),
             std::net::IpAddr::V6(ip) => format!("[{ip}]"),
         });
+
     let port = if to.port() == 443 {
         String::new()
     } else {
@@ -375,9 +586,11 @@ pub(crate) fn redirect_to_https(
     let mut response = Response::new(empty);
     *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
     let headers = response.headers_mut();
+
     if let Ok(value) = http::HeaderValue::from_str(&location) {
         headers.insert(http::header::LOCATION, value);
     }
+
     headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(0));
     headers.insert(http::header::SERVER, http::HeaderValue::from_static("muru"));
     recording.complete(StatusCode::TEMPORARY_REDIRECT.as_u16(), "", 0);
@@ -386,29 +599,13 @@ pub(crate) fn redirect_to_https(
 
 /// A Host header value without its port: `shop.localhost:8080` becomes
 /// `shop.localhost` and `[::1]:8080` becomes `[::1]`.
-fn host_only(host: &str) -> String {
-    let host = host.trim();
-    if host.starts_with('[') {
-        return match host.find(']') {
-            Some(end) => host[..=end].to_owned(),
-            None => host.to_owned(),
-        };
-    }
-    match host.rsplit_once(':') {
-        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
-            name.to_owned()
-        }
-        _ => host.to_owned(),
-    }
-}
-
-/// Forward one request to a worker over the framed link.
 pub async fn handle(
     request: http::Request<Incoming>,
     pool: Arc<LinkPool>,
     context: &Context<'_>,
 ) -> Response<ResponseBody> {
-    let (parts, mut body) = request.into_parts();
+    let (mut parts, mut body) = request.into_parts();
+    let upgrade = crate::websocket::detect(&mut parts);
     let mut head = request_head(&parts, context);
     let limits = &context.limits;
     let arrived = Instant::now();
@@ -439,7 +636,9 @@ pub async fn handle(
     // so that the application sees CONTENT_LENGTH and no worker slot is
     // held while it arrives. Polling the body is also what makes hyper
     // send 100 Continue to a client that is waiting for it.
+
     let mut buffered: Option<Bytes> = None;
+
     if !body.is_end_stream() && head.content_length.is_none() {
         match read_body(&mut body, limits.max_body_size).await {
             Ok(data) => {
@@ -462,9 +661,11 @@ pub async fn handle(
             }
         }
     }
+
     let expect_continue = head.expect_continue && !head.body_buffered;
 
     let queued = Instant::now();
+
     let lease = match tokio::time::timeout(limits.queue_timeout, pool.acquire()).await {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
@@ -480,6 +681,7 @@ pub async fn handle(
         }
         Err(_) => {
             // Section 7.6: the queue wait is bounded by queue_timeout.
+
             let mut problem = Problem::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "queue_full",
@@ -490,10 +692,12 @@ pub async fn handle(
             return failing.respond(problem);
         }
     };
+
     let Lease {
         conn,
         permit,
         worker,
+        websockets,
     } = lease;
     let Conn {
         mut reader,
@@ -503,9 +707,19 @@ pub async fn handle(
     recording.record.queue = queued.elapsed();
     let dispatched = Instant::now();
 
-    let end = buffered
-        .as_ref()
-        .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
+    // Section 5.6: a worker that takes websocket scopes gets the upgrade as
+    // one, with no body; any other worker sees an ordinary request.
+
+    let upgrade = upgrade.filter(|_| websockets);
+
+    if upgrade.is_some() {
+        head.scope = pb::Scope::Websocket as i32;
+    }
+
+    let end = upgrade.is_some()
+        || buffered
+            .as_ref()
+            .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
     let flags = if end { flag::END } else { 0 };
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
     if let Err(error) = frame::write(
@@ -522,7 +736,9 @@ pub async fn handle(
     }
 
     let back = Return::new(pool, worker, permit);
+
     match buffered {
+        _ if upgrade.is_some() => back.give_writer(Some(writer)),
         Some(data) if !data.is_empty() => {
             match frame::write(&mut writer, kind::BODY, flag::END, data).await {
                 Ok(()) => back.give_writer(Some(writer)),
@@ -551,6 +767,7 @@ pub async fn handle(
             Err(_) => {
                 // Section 7.6: the deadline cancels the request. Dropping
                 // the connection stops the application's iteration.
+
                 back.give_reader(None);
                 back.abort_request();
                 return failing.respond(Problem::new(
@@ -560,12 +777,14 @@ pub async fn handle(
                 ));
             }
         };
+
         match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
             Ok(Some(next)) if next.kind == kind::RESPONSE => {
                 if back.client_stalled.load(Ordering::Relaxed) {
                     // The client stopped sending its body; what the worker
                     // produced for a partial request is not delivered.
+
                     back.give_reader(None);
                     return failing.close(Problem::new(
                         StatusCode::REQUEST_TIMEOUT,
@@ -573,11 +792,13 @@ pub async fn handle(
                         "The request body stopped arriving.",
                     ));
                 }
+
                 break next;
             }
             Ok(Some(next)) if next.kind == kind::END => {
                 // The application failed before producing a head: the
                 // worker says why, and the connection is still good.
+
                 back.give_reader(Some(reader));
                 back.abort_request();
                 let end = pb::End::decode(next.payload).unwrap_or_default();
@@ -594,20 +815,47 @@ pub async fn handle(
             }
         }
     };
+
     let response_end = response.is_end();
     let Ok(head) = pb::ResponseHead::decode(response.payload) else {
         back.give_reader(None);
         return failing.worker_crashed("The worker sent an invalid response head.");
     };
     let mut recording = failing.recording.lock().expect("recording poisoned").take();
+
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
     }
 
+    // The worker accepted the WebSocket: finish the handshake and relay
+    // messages for the life of the socket on the leased connection. Any
+    // other answer is the response to the upgrade, sent as usual.
+
+    if let Some(upgrade) = upgrade
+        && head.status == 101
+    {
+        let Some(writer) = back.take_writer() else {
+            back.give_reader(None);
+            return failing.worker_crashed("The worker connection was lost.");
+        };
+        let response = crate::websocket::accepted_response(&upgrade, head.headers);
+        tokio::spawn(crate::websocket::relay(crate::websocket::Relay {
+            upgrade,
+            reader,
+            writer,
+            back,
+            recording,
+            limits: Arc::clone(&context.limits),
+        }));
+        return response;
+    }
+
     let mut builder = Response::builder().status(crate::status_code(head.status));
+
     if let Some(headers) = builder.headers_mut() {
         crate::copy_headers(headers, head.headers);
+
         if context.development {
             let host = parts
                 .headers
@@ -617,21 +865,27 @@ pub async fn handle(
             crate::warn_about_hsts(headers, host, parts.uri.path());
         }
     }
+
     if !head.reason.is_empty()
         && let Ok(reason) = hyper::ext::ReasonPhrase::try_from(head.reason.into_bytes())
     {
         builder = builder.extension(reason);
     }
+
     // A client still waiting for 100 Continue may send the body after this
     // response, so the connection cannot be reused (section 4.6).
+
     let close = expect_continue && !back.proceeded.load(Ordering::Relaxed);
+
     let response = if response_end {
         back.give_reader(Some(reader));
         back.abort_request();
+
         if let Some(recording) = recording.take() {
             let status = recording.record.status;
             recording.complete(status, "", 0);
         }
+
         let empty = Empty::<Bytes>::new()
             .map_err(|never| match never {})
             .boxed_unsync();
@@ -649,10 +903,12 @@ pub async fn handle(
         );
         builder.body(UnsyncBoxBody::new(StreamBody::new(stream)))
     };
+
     let response = match response {
         Ok(response) => response,
         Err(_) => return failing.worker_crashed("The worker sent an invalid response head."),
     };
+
     if close {
         close_after(response, failing.version)
     } else {
@@ -674,6 +930,7 @@ struct Failing<'a> {
 impl Failing<'_> {
     fn respond(&self, problem: Problem) -> Response<ResponseBody> {
         let response = errors::respond(&problem, self.request_id, &self.negotiation);
+
         if let Some(recording) = self.recording.lock().expect("recording poisoned").take() {
             let bytes = response
                 .headers()
@@ -682,6 +939,7 @@ impl Failing<'_> {
                 .unwrap_or(0);
             recording.complete(problem.status.as_u16(), problem.reason, bytes);
         }
+
         response
     }
 
@@ -716,14 +974,17 @@ impl Failing<'_> {
         } else {
             capitalise(&end.error)
         };
+
         let mut problem = if end.reason == "app_error" {
             Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "app_error", description)
         } else {
             Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description)
         };
+
         if !end.detail.is_empty() {
             problem.detail = Some(end.detail);
         }
+
         self.respond(problem)
     }
 }
@@ -736,9 +997,11 @@ fn capitalise(sentence: &str) -> String {
         .flat_map(char::to_uppercase)
         .collect();
     out.extend(sentence.chars().skip(1));
+
     if !out.ends_with('.') {
         out.push('.');
     }
+
     out
 }
 
@@ -750,15 +1013,19 @@ enum BodyError {
 /// Read a request body in full, up to the size limit.
 async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
+
     while let Some(next) = body.frame().await {
         let next = next.map_err(BodyError::Read)?;
+
         if let Ok(chunk) = next.into_data() {
             if (data.len() + chunk.len()) as u64 > max_body_size {
                 return Err(BodyError::TooLarge);
             }
+
             data.extend_from_slice(&chunk);
         }
     }
+
     Ok(data.freeze())
 }
 
@@ -793,6 +1060,7 @@ impl Drop for BodyState {
     /// background so the connection can go back to the pool.
     fn drop(&mut self) {
         self.record();
+
         if let Some(mut reader) = self.reader.take() {
             let back = Arc::clone(&self.back);
             tokio::spawn(async move {
@@ -822,6 +1090,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
     loop {
         let idle_timeout = state.idle_timeout;
         let reader = state.reader.as_mut()?;
+
         let next = match tokio::time::timeout(idle_timeout, frame::read(reader)).await {
             Ok(next) => next,
             Err(_) => {
@@ -832,6 +1101,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                 ));
             }
         };
+
         return match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => {
                 state.back.continue_request();
@@ -839,14 +1109,17 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             }
             Ok(Some(next)) if next.kind == kind::BODY => {
                 state.bytes += next.payload.len() as u64;
+
                 if next.is_end() {
                     state.finish(true);
                 }
+
                 Some((Ok(Frame::data(next.payload)), state))
             }
             Ok(Some(next)) if next.kind == kind::END => {
                 let end = pb::End::decode(next.payload).unwrap_or_default();
                 state.finish(true);
+
                 if end.error.is_empty() {
                     None
                 } else {
@@ -888,6 +1161,7 @@ async fn pump_body(
         // off until the worker says the application is reading. If the
         // response ends first the client is never told to send the body,
         // and there is nothing to discard.
+
         tokio::select! {
             _ = back.proceed.notified() => {}
             _ = back.abort.notified() => {
@@ -896,6 +1170,7 @@ async fn pump_body(
             }
         }
     }
+
     loop {
         let next = tokio::select! {
             next = tokio::time::timeout(idle_timeout, body.frame()) => match next {
@@ -904,6 +1179,7 @@ async fn pump_body(
                     // Section 4.6: a client that stops mid-body is treated
                     // as gone; the response path answers with 408 if the
                     // worker has not responded yet.
+
                     back.client_stalled.store(true, Ordering::Relaxed);
                     abort(body, writer, back, false).await;
                     return;
@@ -914,6 +1190,7 @@ async fn pump_body(
                 return;
             }
         };
+
         match next {
             Some(Ok(next)) => {
                 if let Ok(data) = next.into_data()
@@ -929,6 +1206,7 @@ async fn pump_body(
             Some(Err(_)) => {
                 // The client went away mid-body. The worker learns by ABORT
                 // and the connection stays in the pool.
+
                 abort(body, writer, back, true).await;
                 return;
             }
@@ -955,6 +1233,7 @@ async fn pump_body(
 /// response, since the body may yet follow.
 async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_rest: bool) {
     let payload = pb::Abort::default().encode_to_vec();
+
     match frame::write(&mut writer, kind::ABORT, 0, payload.into()).await {
         Ok(()) => back.give_writer(Some(writer)),
         Err(_) => back.give_writer(None),
@@ -963,6 +1242,7 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_re
     // hyper closes the client connection after the response if the body is
     // left unread, so read a bounded amount first. Dropping the body past
     // the limit lets hyper close it.
+
     if discard_rest {
         let _ = tokio::time::timeout(DISCARD_DELAY, discard(body)).await;
     }
@@ -970,26 +1250,14 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_re
 
 async fn discard(mut body: Incoming) {
     let mut seen = 0;
+
     while let Some(Ok(next)) = body.frame().await {
         if let Ok(data) = next.into_data() {
             seen += data.len();
+
             if seen > DISCARD_LIMIT {
                 return;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::host_only;
-
-    #[test]
-    fn host_only_strips_ports_and_keeps_ipv6_brackets() {
-        assert_eq!(host_only("shop.localhost:8080"), "shop.localhost");
-        assert_eq!(host_only("localhost"), "localhost");
-        assert_eq!(host_only("[::1]:8080"), "[::1]");
-        assert_eq!(host_only("[::1]"), "[::1]");
-        assert_eq!(host_only("127.0.0.1:8080 "), "127.0.0.1");
     }
 }

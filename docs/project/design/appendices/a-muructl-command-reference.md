@@ -9,15 +9,15 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-Commands that act on a running system use the admin API (Appendix B). Common flags: --socket or --server to choose the daemon, --json for machine-readable output, --yes to skip confirmation. Releases are addressed as app@release.
+Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output, --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
 
 | Group | Command | What it does | Section |
 | --- | --- | --- | --- |
-| Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --preload, --hooks, --timeout, --max-body-size, --dashboard, --bind, --port, --allow-public, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --print-config | 13.1 |
+| Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --timeout, --max-body-size, --dashboard, --bind, --port, --allow-public, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --print-config | 13.1 |
 | Development | muructl check [PATH or RELEASE] | Load in a throwaway host and validate entrypoints, hooks, mounts and environment | 6.8 |
 | Development | muructl exec RELEASE -- COMMAND | One-off command with the release's interpreter, environment, user and directory | 6.8 |
-| Daemon | muructl daemon run | Run the daemon in the foreground | 13.3 |
-| Daemon | muructl daemon start, stop, restart, status | Background daemon without a service manager | 13.3 |
+| Daemon | muructl daemon run | Run the daemon in the foreground. Flags: --listen, and the location flags --config, --state-dir, --run-dir, --log-dir, --cache-dir and --system (section 13.8) | 13.3 |
+| Daemon | muructl daemon start, stop, restart, status, reload | Background daemon without a service manager. start takes the flags of daemon run; stop takes --shutdown and --timeout; reload re-reads the configuration file | 13.3 |
 | Daemon | muructl daemon reload | Re-read the daemon configuration file (also SIGHUP) | 10.3 |
 | Daemon | muructl daemon upgrade | Re-exec from the installed binary and replace edges | 13.4 |
 | Daemon | muructl daemon backup, restore | Save or load the state store | 13.5 |
@@ -30,7 +30,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
 | Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
-| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy | 9.2 |
+| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
 | Traffic | muructl host create, list, show, delete | Manage virtual hosts | 4.3 |
 | Traffic | muructl route set, list, show, delete | Manage routes and traffic splits | 4.5 |
@@ -44,9 +44,10 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
 | Observability | muructl watch | Live view of applications, releases and workers | 10.7 |
-| Observability | muructl events | Show or follow events with filters | 11.5 |
+| Observability | muructl events | Show or follow events with filters. Flags: --follow, --after | 11.5 |
 | Observability | muructl logs RELEASE | Show or follow logs | 11.2 |
 | Observability | muructl logs reopen [--workers] | Reopen log files after external rotation | 11.3 |
+| Observability | muructl metrics | Print the node's metrics as Prometheus text | 11.1 |
 | Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset | 11.4 |
 | Observability | muructl debug stacks TARGET | Python stacks of every thread with the request each is serving, merged across workers. Flags: --worker | 11.7 |
 | Observability | muructl debug tasks TARGET | asyncio task tree and loop lag of ASGI workers | 11.7 |
