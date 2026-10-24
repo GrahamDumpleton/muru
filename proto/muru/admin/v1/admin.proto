@@ -61,6 +61,11 @@ service Admin {
   // Re-read the daemon's configuration file for what can change while
   // running (section 13.3).
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+
+  // Re-exec the daemon from the installed binary and replace the edge
+  // (section 13.4). The daemon answers, then re-executes; the hosts and
+  // the edge keep serving and the new image takes them over.
+  rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
 }
 
 message GetStatusRequest {}
@@ -205,6 +210,13 @@ message ShutdownRequest {
 }
 
 message ShutdownResponse {}
+
+message UpgradeDaemonRequest {}
+
+message UpgradeDaemonResponse {
+  string executable = 1;            // the binary the daemon re-executes from
+  string version = 2;               // the version that binary reports
+}
 
 // A document as muructl apply reads it: TOML with [app.NAME.release.ID]
 // tables, source paths already absolute.

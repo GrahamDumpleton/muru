@@ -186,6 +186,28 @@ then exits, for taking a node out of service.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
 its workers with it, and the next daemon starts its release again.
+
+## Upgrading
+
+Installing a new version of Muru changes nothing until `muructl daemon
+upgrade`. The daemon then re-executes itself from the installed `muructl`
+(the one its command name finds on the `PATH`, or the path it was started
+with), keeping its process id and its children, and the new version takes
+the hosts and the edge over from their records, exactly as a restarted
+daemon does. It then starts a new edge from its own version on the same
+listening sockets, gives it the routing in force, and tells the old edge
+to stop accepting: that edge finishes the requests in flight, closes its
+idle keep-alive connections (with GOAWAY on HTTP/2) and exits. No
+connection is refused and no request fails in between; WebSocket
+connections still open on the old edge are closed when it exits. The
+command waits until the upgraded daemon answers with its new edge and
+prints the versions and process ids involved. The daemon checks that the
+installed binary runs before it commits, and the `daemon.upgraded` and
+`edge.replaced` events record what happened.
+
+Releases keep the runtime library they started with; a new release picks
+up the installed one. Under systemd the service's main process is
+unchanged by an upgrade, so no unit restart is involved.
 `muructl daemon run` runs it in the foreground, for a service manager or
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the

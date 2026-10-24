@@ -117,5 +117,17 @@ node, every application's releases with their workers and slots, hosts
 and routes, recent requests and events and each serving release's log
 tail, as htmx-refreshed pages and as JSON on the gateway paths, with
 `/metrics` beside them (charts over time, Server-Sent Events, worker
-inspection and mutating actions later). Next from phase 2: worker
-inspection.
+inspection and mutating actions later). The phase's exit criterion has
+its harness: the sustained-load scenarios of `tests/integration/test_load.py`
+keep clients on kept-alive connections through deploys, warm and cold
+rollbacks, drains and daemon restarts, with every request answered 200.
+The daemon upgrade of section 13.4 is in: `muructl daemon upgrade`
+re-executes the daemon from the installed binary, keeping its pid and
+its children, the new image re-adopts the hosts and the edge from their
+records, then starts an edge of its own version on the same listening
+sockets, gives it the snapshot and tells the old edge to stop accepting,
+finish its connections and exit, under load with zero failed requests
+(each edge's sockets are numbered by generation so a replacement never
+collides with the edge it replaces, and a respawned edge is recorded so
+the next daemon re-adopts it). Next from phase 2: hard timeouts and
+memory policy, then worker inspection.

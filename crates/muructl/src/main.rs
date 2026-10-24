@@ -480,6 +480,9 @@ fn main() -> anyhow::Result<()> {
                     socket,
                 } => admin::daemon_stop(socket, shutdown, timeout).await,
                 admin::DaemonCommand::Reload { socket } => admin::daemon_reload(socket).await,
+                admin::DaemonCommand::Upgrade { timeout, socket } => {
+                    admin::daemon_upgrade(socket, timeout).await
+                }
                 admin::DaemonCommand::Status { socket } => admin::daemon_status(socket).await,
             }
         }),

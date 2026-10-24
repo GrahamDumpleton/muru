@@ -72,7 +72,7 @@ is left.
 treats SIGTERM as `muructl daemon stop` without `--shutdown`, that is it
 detaches, leaving the hosts and the edge serving. `RuntimeDirectoryPreserve`
 keeps their sockets in `/run/muru`, and the next daemon finds them there
-and carries on, so a restart or an upgrade of the daemon costs no
+and carries on, so a restart of the daemon costs no
 request. The [daemon guide](daemon.md) says more about detaching and
 re-adoption.
 

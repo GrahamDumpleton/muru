@@ -44,13 +44,24 @@ class Daemon:
 
         muructl = support.muructl_path()
         assert muructl is not None
-        completed = subprocess.run(
-            [str(muructl), *arguments, "--socket", str(self.run_dir / "admin.sock")],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=180,
-        )
+
+        try:
+            completed = subprocess.run(
+                [str(muructl), *arguments, "--socket", str(self.run_dir / "admin.sock")],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired as error:
+            listing = subprocess.run(
+                ["ps", "-ax", "-o", "pid,ppid,stat,command"], capture_output=True, text=True
+            ).stdout
+            ours = [line for line in listing.splitlines() if "muru" in line]
+            raise RuntimeError(
+                f"muructl {' '.join(arguments)} hung for 180 seconds\n"
+                f"--- daemon log tail\n{self.log()[-4000:]}\n--- processes\n" + "\n".join(ours)
+            ) from error
 
         if check and completed.returncode != 0:
             raise RuntimeError(

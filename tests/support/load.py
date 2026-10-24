@@ -5,6 +5,13 @@ Client threads send requests on kept-alive connections, as real clients do,
 for as long as a scenario deploys, rolls back, drains or restarts the daemon
 underneath them, and count what came back: every status, every connection
 error and the slowest request. A scenario then asserts that nothing failed.
+
+A kept-alive connection the server has closed between requests is retried
+once on a new connection, as browsers, curl and most HTTP libraries do
+for an idempotent request (RFC 9112 section 9.6): an edge being replaced
+closes its idle connections, and a request already on the wire at that
+moment is reset. The retries are counted, and a scenario says how many
+it allows.
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ import threading
 import time
 from collections import Counter
 from types import TracebackType
+
+RETRIED = (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected)
 
 
 class Load:
@@ -37,6 +46,7 @@ class Load:
         self.headers = headers or {}
         self.statuses: Counter[int] = Counter()
         self.errors: Counter[str] = Counter()
+        self.retried = 0
         self.slowest = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -106,14 +116,21 @@ class Load:
             if not self.failures
             else ", ".join(f"{count} {what}" for what, count in self.failures.items())
         )
-        return f"{self.total} requests, {outcome}, slowest {slowest:.3f}s"
+        return (
+            f"{self.total} requests, {outcome}, {self.retried} retried on a closed "
+            f"connection, slowest {slowest:.3f}s"
+        )
 
-    def check(self, during: str, at_least: int = 50) -> None:
-        """Assert that every request succeeded and that there were enough of them."""
+    def check(self, during: str, at_least: int = 50, retries_at_most: int = 0) -> None:
+        """Assert that every request succeeded, that there were enough of them,
+        and that no more than `retries_at_most` had to be retried."""
 
         self.stop()
         assert self.total >= at_least, f"only {self.total} requests were made during {during}"
         assert not self.failures, f"failed requests during {during}: {self.summary()}"
+        assert self.retried <= retries_at_most, (
+            f"too many retries during {during}: {self.summary()}"
+        )
 
     def _connect(self) -> http.client.HTTPConnection:
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
@@ -130,6 +147,7 @@ class Load:
 
     def _client(self) -> None:
         connection = self._connect()
+        reused = False
 
         try:
             while not self._stop.is_set():
@@ -140,10 +158,21 @@ class Load:
                     response = connection.getresponse()
                     response.read()
                     self._record(response.status, None, time.monotonic() - started)
+                    reused = True
                 except (OSError, http.client.HTTPException) as error:
-                    self._record(None, type(error).__name__, time.monotonic() - started)
                     connection.close()
                     connection = self._connect()
+
+                    # A reused connection the server closed: once more,
+                    # on the new connection, before it counts as failed.
+
+                    if reused and isinstance(error, RETRIED):
+                        reused = False
+                        self.retried += 1
+                        continue
+
+                    self._record(None, type(error).__name__, time.monotonic() - started)
+                    reused = False
 
                 time.sleep(0.001)
         finally:

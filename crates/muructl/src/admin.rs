@@ -135,6 +135,19 @@ pub enum DaemonCommand {
         socket: SocketArgs,
     },
 
+    /// Re-execute the daemon from the installed muructl and replace the
+    /// edge, without interrupting traffic: hosts and the edge keep
+    /// serving and the new daemon takes them over.
+    Upgrade {
+        /// How long to wait for the upgraded daemon to answer with a
+        /// new edge.
+        #[arg(long, value_name = "DURATION", default_value = "120s", value_parser = muru_config::parse_duration)]
+        timeout: Duration,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
@@ -161,8 +174,31 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<SocketAddr>,
 
+    /// Set by a daemon that re-executed itself for an upgrade: the
+    /// version it ran before.
+    #[arg(long, hide = true, value_name = "VERSION")]
+    upgraded_from: Option<String>,
+
     #[command(flatten)]
     locations: LocationArgs,
+}
+
+/// The arguments a daemon re-executes itself with on an upgrade: its own,
+/// with --upgraded-from naming this version in place of any earlier one.
+fn upgrade_arguments() -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    if let Some(at) = arguments
+        .iter()
+        .position(|argument| argument == "--upgraded-from")
+    {
+        let end = (at + 2).min(arguments.len());
+        arguments.drain(at..end);
+    }
+
+    arguments.push("--upgraded-from".into());
+    arguments.push(env!("CARGO_PKG_VERSION").into());
+    arguments
 }
 
 /// Run the daemon in the foreground.
@@ -210,6 +246,8 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         dashboard,
         sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
+        upgrade_arguments: upgrade_arguments(),
+        upgraded_from: args.upgraded_from.clone(),
     })
     .await
 }
@@ -342,6 +380,72 @@ pub async fn daemon_stop(
     }
 
     anyhow::bail!("the daemon (pid {}) did not exit", status.pid)
+}
+
+/// Re-execute the daemon from the installed binary and wait until it
+/// answers again with the edge replaced.
+pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Result<()> {
+    let path = socket.socket();
+    let mut client = client::connect(&path).await?;
+    let before = client
+        .get_status(pb::GetStatusRequest {})
+        .await?
+        .into_inner();
+    let response = client
+        .upgrade_daemon(pb::UpgradeDaemonRequest {})
+        .await
+        .map_err(|status| anyhow::anyhow!("{}", status.message()))?
+        .into_inner();
+    println!(
+        "muru: daemon (pid {}, version {}) re-executing from {} (version {})",
+        before.pid, before.version, response.executable, response.version
+    );
+
+    // The daemon answers again from the new image with a new start time,
+    // re-adopts the hosts, and then replaces the edge.
+
+    let started = Instant::now();
+    let mut latest = None;
+
+    while started.elapsed() < timeout {
+        let status = match client::connect(&path).await {
+            Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.ok(),
+            Err(_) => None,
+        }
+        .map(|status| status.into_inner());
+
+        if let Some(status) = status {
+            if status.started_unix_ms != before.started_unix_ms
+                && status.edge_pid != 0
+                && status.edge_pid != before.edge_pid
+            {
+                println!(
+                    "muru: daemon upgraded to version {} (pid {}); edge pid {} replaced by pid {}",
+                    status.version, status.pid, before.edge_pid, status.edge_pid
+                );
+                return Ok(());
+            }
+
+            latest = Some(status);
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    match latest {
+        Some(status) if status.started_unix_ms != before.started_unix_ms => anyhow::bail!(
+            "the daemon re-executed (pid {}, version {}) but the edge was not replaced; \
+             see muructl events",
+            status.pid,
+            status.version
+        ),
+        _ => anyhow::bail!(
+            "the daemon (pid {}) did not answer again within {} seconds; see {}",
+            before.pid,
+            timeout.as_secs(),
+            socket.locations.resolve().daemon_log().display()
+        ),
+    }
 }
 
 /// Print the node's metrics as Prometheus text.

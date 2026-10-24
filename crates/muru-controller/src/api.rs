@@ -454,6 +454,26 @@ impl Admin for Service {
         Ok(Response::new(stream))
     }
 
+    async fn upgrade_daemon(
+        &self,
+        _: Request<pb::UpgradeDaemonRequest>,
+    ) -> Result<Response<pb::UpgradeDaemonResponse>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Upgrade { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let upgrade = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::UpgradeDaemonResponse {
+            executable: upgrade.executable.display().to_string(),
+            version: upgrade.version,
+        }))
+    }
+
     async fn shutdown(
         &self,
         request: Request<pb::ShutdownRequest>,

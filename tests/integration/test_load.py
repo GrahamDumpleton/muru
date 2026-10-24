@@ -121,7 +121,7 @@ def test_daemon_restart_under_load(tmp_path: Path) -> None:
     second = None
 
     try:
-        first.deploy("shop", SHOP)
+        first.deploy("shop", SHOP, "--processes", "1")
         pid = pid_of(first)
 
         # The daemon detaches and a new one re-adopts the edge and the

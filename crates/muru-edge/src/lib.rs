@@ -187,6 +187,40 @@ struct Shared {
     redirect_to: Option<SocketAddr>,
     /// The port of the first TLS listener, for hosts that insist on HTTPS.
     https_port: Option<u16>,
+    /// Set once the edge is draining, which stops the accept loops and
+    /// tells every connection to finish.
+    draining: tokio::sync::watch::Sender<bool>,
+    /// Cloned for each connection accepted and dropped when it ends, so
+    /// a drain can wait for the count to come back to one.
+    connections: Arc<()>,
+}
+
+/// Stops an edge accepting and lets its connections finish (section
+/// 13.4): what the daemon asks of an edge it replaces or shuts down.
+#[derive(Clone)]
+pub struct Drainer {
+    shared: Arc<Shared>,
+}
+
+impl Drainer {
+    /// Stop accepting, let the requests in flight finish and close idle
+    /// keep-alive connections (with GOAWAY on HTTP/2), waiting at most
+    /// `grace` for them. Returns whether every connection finished in
+    /// time; connections handed over to WebSockets are not waited for.
+    pub async fn drain(&self, grace: Duration) -> bool {
+        let _ = self.shared.draining.send(true);
+        let deadline = tokio::time::Instant::now() + grace;
+
+        while Arc::strong_count(&self.shared.connections) > 1 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        true
+    }
 }
 
 /// A bound edge, ready to run.
@@ -323,8 +357,17 @@ impl Edge {
                 limits,
                 redirect_to,
                 https_port,
+                draining: tokio::sync::watch::channel(false).0,
+                connections: Arc::new(()),
             }),
         })
+    }
+
+    /// A handle that stops this edge accepting and drains its connections.
+    pub fn drainer(&self) -> Drainer {
+        Drainer {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// The address the first listener is bound to.
@@ -358,7 +401,8 @@ impl Edge {
         Arc::clone(&self.shared.pools)
     }
 
-    /// Accept connections on every listener until one fails.
+    /// Accept connections on every listener until one fails or the edge
+    /// is drained.
     pub async fn run(self) -> anyhow::Result<()> {
         let accepting = self
             .listeners
@@ -372,21 +416,37 @@ impl Edge {
 }
 
 /// Accept connections on one listener, completing the TLS handshake first
-/// when it has an acceptor, and serve each on its own task.
+/// when it has an acceptor, and serve each on its own task, until the
+/// edge drains: the listener is then dropped, and whatever waits in its
+/// backlog is accepted by the process that holds it next.
 async fn accept(
     listener: TcpListener,
     local: SocketAddr,
     acceptor: Option<TlsAcceptor>,
     shared: Arc<Shared>,
 ) -> anyhow::Result<()> {
+    let mut draining = shared.draining.subscribe();
+
     loop {
-        let (stream, peer) = listener.accept().await?;
+        if *draining.borrow() {
+            return Ok(());
+        }
+
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = draining.changed() => return Ok(()),
+        };
         let _ = stream.set_nodelay(true);
         let shared = Arc::clone(&shared);
 
+        // Counted here, before the task starts, so a drain that begins
+        // between the two still waits for this connection.
+
+        let token = Arc::clone(&shared.connections);
+
         match acceptor.clone() {
             None => {
-                tokio::spawn(serve(stream, peer, local, None, shared));
+                tokio::spawn(serve(stream, peer, local, None, shared, token));
             }
             Some(acceptor) => {
                 tokio::spawn(async move {
@@ -402,7 +462,7 @@ async fn accept(
                     match handshake {
                         Ok(Ok(stream)) => {
                             let info = tls::info(stream.get_ref().1);
-                            serve(stream, peer, local, Some(info), shared).await;
+                            serve(stream, peer, local, Some(info), shared, token).await;
                         }
                         Ok(Err(error)) => {
                             tracing::debug!(%peer, %error, "TLS handshake failed");
@@ -415,13 +475,15 @@ async fn accept(
     }
 }
 
-/// Serve one connection, cleartext or already inside TLS.
+/// Serve one connection, cleartext or already inside TLS. The token is
+/// the connection's count towards a drain, held until it ends.
 async fn serve<I>(
     io: I,
     peer: SocketAddr,
     local: SocketAddr,
     tls: Option<pb::TlsInfo>,
     shared: Arc<Shared>,
+    token: Arc<()>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -549,14 +611,34 @@ async fn serve<I>(
     });
 
     // With upgrades, so a 101 hands the connection over for WebSockets.
+    // A drain tells the connection to finish: HTTP/1.1 closes once the
+    // response in flight is done, or at once when idle, and HTTP/2 sends
+    // GOAWAY and lets its streams complete.
 
     let connection = state
         .protocols
         .serve_connection_with_upgrades(TokioIo::new(io), service);
+    let mut connection = std::pin::pin!(connection);
+    let mut draining = state.draining.subscribe();
 
-    if let Err(error) = connection.await {
+    let ended = if *draining.borrow_and_update() {
+        connection.as_mut().graceful_shutdown();
+        connection.await
+    } else {
+        tokio::select! {
+            ended = connection.as_mut() => ended,
+            _ = draining.changed() => {
+                connection.as_mut().graceful_shutdown();
+                connection.await
+            }
+        }
+    };
+
+    if let Err(error) = ended {
         tracing::debug!(%peer, %error, "connection ended with an error");
     }
+
+    drop(token);
 }
 
 /// Headers that describe this connection rather than the request, which

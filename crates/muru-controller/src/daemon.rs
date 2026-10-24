@@ -60,6 +60,21 @@ pub struct Config {
     pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
+    /// The arguments to re-execute the daemon with on an upgrade (section
+    /// 13.4): its own, with the flag that names the version it ran before.
+    pub upgrade_arguments: Vec<std::ffi::OsString>,
+    /// The version this daemon ran before it re-executed itself for an
+    /// upgrade, or none when it started afresh.
+    pub upgraded_from: Option<String>,
+}
+
+/// An upgrade the daemon is about to carry out (section 13.4).
+#[derive(Debug, Clone)]
+pub struct Upgrade {
+    /// The installed binary the daemon re-executes from.
+    pub executable: PathBuf,
+    /// The version that binary reports.
+    pub version: String,
 }
 
 /// A request for the reconciler, answered when it has been carried out.
@@ -134,6 +149,13 @@ pub enum Command {
         /// Where the acknowledgement goes, before the daemon exits.
         done: oneshot::Sender<()>,
     },
+    /// Re-execute the daemon from the installed binary and replace the
+    /// edge (section 13.4).
+    Upgrade {
+        /// Answered with what is about to happen, before the daemon
+        /// re-executes, or why it will not.
+        done: oneshot::Sender<Result<Upgrade, String>>,
+    },
 }
 
 /// What a previous daemon left behind about its edge, for re-adoption
@@ -143,6 +165,8 @@ struct EdgeRecord {
     pid: u32,
     control: PathBuf,
     listener_socket: PathBuf,
+    #[serde(default)]
+    generation: u32,
     #[serde(default)]
     listeners: Vec<ListenerRecord>,
 }
@@ -291,8 +315,6 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // connections wait in the backlog; the edge is up before any release,
     // answering 503 until one serves.
 
-    let control = locations.run.path.join("edge.sock");
-    let listener_socket = locations.run.path.join("edge-listener.sock");
     let edge_log = locations.logs.path.join("edge.log");
 
     let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
@@ -301,6 +323,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             config.executable.clone(),
             record.control,
             record.listener_socket,
+            record.generation,
             record
                 .listeners
                 .iter()
@@ -331,11 +354,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 listeners.push(crate::edges::Listener { socket, tls: *tls });
             }
 
+            let (control, listener_socket) = crate::edges::socket_paths(&locations.run.path, 1);
             EdgeProcess::spawn(EdgeSpec {
-                executable: config.executable,
+                executable: config.executable.clone(),
                 listeners,
                 control,
                 listener_socket,
+                generation: 1,
                 log: edge_log,
                 access_log: config.access_log,
                 limits: config.limits,
@@ -345,21 +370,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     };
 
     let listeners = edge.listeners();
-    write_record(
-        &locations.run.path.join("edge.toml"),
-        &EdgeRecord {
-            pid: edge.pid().unwrap_or(0),
-            control: edge.control().to_path_buf(),
-            listener_socket: edge.listener_socket().to_path_buf(),
-            listeners: listeners
-                .iter()
-                .map(|(address, tls)| ListenerRecord {
-                    address: *address,
-                    tls: *tls,
-                })
-                .collect(),
-        },
-    );
+    write_edge_record(&locations.run.path, &edge);
 
     // The admin API on its socket.
 
@@ -413,23 +424,31 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let (api_stop, api_stopped) = oneshot::channel();
     let api = crate::api::serve(socket.clone(), handle, api_stopped).await?;
     let mut api = tokio::spawn(api);
-    events.emit(
-        "daemon.started",
-        "daemon",
-        "info",
-        &format!(
-            "serving on {}, admin socket {}",
-            listeners
-                .iter()
-                .map(|(address, tls)| format!(
-                    "{}://{address}",
-                    if *tls { "https" } else { "http" }
-                ))
-                .collect::<Vec<_>>()
-                .join(" and "),
-            socket.display()
+    let serving_on = listeners
+        .iter()
+        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
+        .collect::<Vec<_>>()
+        .join(" and ");
+
+    match &config.upgraded_from {
+        Some(before) => events.emit(
+            "daemon.upgraded",
+            "daemon",
+            "info",
+            &format!(
+                "re-executed as version {} (was {before}) from {}, pid {}; serving on {serving_on}",
+                env!("CARGO_PKG_VERSION"),
+                config.executable.display(),
+                std::process::id()
+            ),
         ),
-    );
+        None => events.emit(
+            "daemon.started",
+            "daemon",
+            "info",
+            &format!("serving on {serving_on}, admin socket {}", socket.display()),
+        ),
+    }
 
     let owns_log = writes_to(&locations.daemon_log());
 
@@ -447,14 +466,16 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         owns_log,
     };
     daemon.restore().await;
-    crate::notify::ready(&format!(
-        "serving on {}",
-        listeners
-            .iter()
-            .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
-            .collect::<Vec<_>>()
-            .join(" and ")
-    ));
+
+    // Section 13.4: an upgraded daemon replaces the edge with one from
+    // its own image once the hosts are re-adopted and the snapshot is
+    // whole again.
+
+    if config.upgraded_from.is_some() {
+        daemon.replace_edge().await;
+    }
+
+    crate::notify::ready(&format!("serving on {serving_on}"));
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -462,6 +483,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // SIGHUP reloads the configuration file.
 
     let mut drain_on_exit = true;
+    let mut upgrade_to: Option<Upgrade> = None;
     let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -491,6 +513,17 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                     let _ = done.send(());
                     break Ok(());
                 }
+                Some(Command::Upgrade { done }) => match prepare_upgrade().await {
+                    Ok(upgrade) => {
+                        let _ = done.send(Ok(upgrade.clone()));
+                        upgrade_to = Some(upgrade);
+                        drain_on_exit = false;
+                        break Ok(());
+                    }
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                },
                 Some(command) => daemon.carry_out(command).await,
                 None => break Ok(()),
             },
@@ -507,9 +540,15 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
-    // everything down with it.
+    // everything down with it. For an upgrade (section 13.4) it detaches
+    // the same way and then re-executes itself, so the next daemon is
+    // this process with the installed binary's image.
 
-    crate::notify::stopping();
+    if upgrade_to.is_some() {
+        crate::notify::notify("RELOADING=1\nSTATUS=upgrading");
+    } else {
+        crate::notify::stopping();
+    }
 
     if drain_on_exit {
         daemon.stop_all().await;
@@ -518,7 +557,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         daemon
             .events
             .emit("daemon.stopped", "daemon", "info", "stopped");
-    } else {
+    } else if upgrade_to.is_none() {
         daemon.detach();
         daemon.events.emit(
             "daemon.detached",
@@ -526,6 +565,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             "info",
             "detached; hosts and the edge keep serving",
         );
+    } else {
+        daemon.detach();
     }
 
     // The API answers the Shutdown call that brought the daemon here
@@ -547,7 +588,123 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     let _ = std::fs::remove_file(&socket);
+
+    if let Some(upgrade) = upgrade_to {
+        // exec returns only when it failed; the hosts and the edge are
+        // still serving, so this daemon leaves as a detached one does.
+
+        let error = exec_daemon(&upgrade.executable, &config.upgrade_arguments);
+        daemon.events.emit(
+            "daemon.detached",
+            "daemon",
+            "error",
+            &format!(
+                "re-executing {} failed: {error}; hosts and the edge keep serving",
+                upgrade.executable.display()
+            ),
+        );
+        return Err(anyhow::anyhow!(
+            "re-executing {} failed: {error}",
+            upgrade.executable.display()
+        ));
+    }
+
     outcome
+}
+
+/// Write the edge's record for the next daemon.
+fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
+    write_record(
+        &run_dir.join("edge.toml"),
+        &EdgeRecord {
+            pid: edge.pid().unwrap_or(0),
+            control: edge.control().to_path_buf(),
+            listener_socket: edge.listener_socket().to_path_buf(),
+            generation: edge.generation(),
+            listeners: edge
+                .listeners()
+                .iter()
+                .map(|(address, tls)| ListenerRecord {
+                    address: *address,
+                    tls: *tls,
+                })
+                .collect(),
+        },
+    );
+}
+
+/// Section 13.4: the binary an upgrade re-executes from. The daemon was
+/// started as `muructl` by name or by path, so the installed binary is
+/// the one that name finds on the PATH or that path names now; what the
+/// kernel reports as the running executable may be a replaced file.
+pub fn installed_executable() -> anyhow::Result<PathBuf> {
+    let name = std::env::args_os()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the daemon has no command name"))?;
+    let name = PathBuf::from(name);
+
+    let found = if name.components().count() > 1 {
+        name.is_file().then_some(name)
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(&name))
+                .find(|candidate| candidate.is_file())
+        })
+    };
+
+    match found {
+        Some(path) => Ok(path),
+        None => std::env::current_exe().context("finding the installed executable"),
+    }
+}
+
+/// Check the installed binary runs, and learn its version, before the
+/// daemon commits to re-executing from it.
+async fn prepare_upgrade() -> Result<Upgrade, String> {
+    let executable = installed_executable().map_err(|error| format!("{error:#}"))?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(&executable)
+            .arg("--version")
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("{} did not report its version", executable.display()))?
+    .map_err(|error| format!("{} cannot be run: {error}", executable.display()))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed to report its version: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .to_owned();
+
+    if version.is_empty() {
+        return Err(format!("{} reported no version", executable.display()));
+    }
+
+    Ok(Upgrade {
+        executable,
+        version,
+    })
+}
+
+/// Replace this process's image with the installed binary, keeping the
+/// pid, the children and the environment. Returns only on failure.
+fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    std::process::Command::new(executable)
+        .args(arguments)
+        .exec()
 }
 
 /// The [proxy] table as the snapshot carries it, with the defaults of
@@ -1051,7 +1208,7 @@ impl Daemon {
             Command::Dashboard { done } => {
                 let _ = done.send(self.dashboard_data().await);
             }
-            Command::Shutdown { .. } => {}
+            Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
     }
 
@@ -1657,6 +1814,7 @@ impl Daemon {
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                write_edge_record(&self.locations.run.path, &self.edge);
                 self.events.emit(
                     "edge.restarted",
                     "edge",
@@ -1667,6 +1825,40 @@ impl Daemon {
             Err(error) => {
                 self.events
                     .emit("edge.failed", "edge", "error", &format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Section 13.4: replace the edge with one started from this image on
+    /// the same listeners; the old one finishes its connections and exits.
+    async fn replace_edge(&mut self) {
+        let grace = self.edge.drain_grace();
+
+        match self.edge.replace(grace).await {
+            Ok(old_pid) => {
+                let pid = self.edge.pid().unwrap_or(0);
+                self.info
+                    .edge_pid
+                    .store(pid, std::sync::atomic::Ordering::Relaxed);
+                write_edge_record(&self.locations.run.path, &self.edge);
+                self.events.emit(
+                    "edge.replaced",
+                    "edge",
+                    "info",
+                    &format!(
+                        "edge pid {old_pid} replaced by pid {pid} on the same listeners; the old edge finishes its connections and exits"
+                    ),
+                );
+            }
+            Err(error) => {
+                self.events.emit(
+                    "edge.failed",
+                    "edge",
+                    "error",
+                    &format!(
+                        "the edge could not be replaced: {error:#}; the old edge keeps serving"
+                    ),
+                );
             }
         }
     }

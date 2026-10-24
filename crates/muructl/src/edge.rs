@@ -212,6 +212,8 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         }
     });
 
+    let drainer = edge.drainer();
+    let grace = args.limits().request_deadline;
     let mut serving = tokio::spawn(edge.run());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!("muru: edge serving {listen} (pid {})", std::process::id());
@@ -221,6 +223,22 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         _ = stop_rx.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
     };
+
+    // Section 13.4: told to stop, the edge stops accepting, lets the
+    // requests in flight finish and closes idle connections, then exits.
+    // Whatever waits in a listener's backlog is accepted by the daemon's
+    // next edge, which holds the same sockets.
+
+    if outcome.is_ok() {
+        eprintln!("muru: edge draining (pid {})", std::process::id());
+
+        if !drainer.drain(grace).await {
+            eprintln!(
+                "muru: edge exiting with connections still open after {} seconds",
+                grace.as_secs()
+            );
+        }
+    }
 
     let _ = std::fs::remove_file(&args.control);
 

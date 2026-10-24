@@ -455,11 +455,24 @@ impl HostProcess {
     }
 }
 
-/// Whether a process exists.
+/// Whether a process exists. A child of this process that has exited is
+/// reaped here and reported gone: after an upgrade (section 13.4) the
+/// hosts and the edge are children the previous image started, which
+/// nothing else waits for.
 pub fn alive(pid: u32) -> bool {
-    // SAFETY: kill with signal 0 checks for the process and sends nothing.
+    let mut status = 0;
 
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    // SAFETY: waitpid with WNOHANG on one pid returns at once and reaps
+    // the process only when it is a child of this one that has exited;
+    // kill with signal 0 checks for the process and sends nothing.
+
+    unsafe {
+        if libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) == pid as libc::pid_t {
+            return false;
+        }
+
+        libc::kill(pid as libc::pid_t, 0) == 0
+    }
 }
 
 /// Whether a worker accepts connections on its socket. The edge connects
