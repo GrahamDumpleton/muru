@@ -557,6 +557,7 @@ mod tests {
             max_requests: None,
             max_lifetime_ms: None,
             timeouts: Default::default(),
+            memory: Default::default(),
         }
     }
 

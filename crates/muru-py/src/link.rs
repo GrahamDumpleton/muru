@@ -65,6 +65,18 @@ pub struct Lifecycle {
     /// A descriptor the worker writes a status line to every second
     /// (section 7.6): the host reads it for timeouts and recycling.
     pub report: Option<i32>,
+    /// Runs on SIGUSR2: the host asks for memory to be given back
+    /// (section 7.7).
+    pub on_reclaim: Option<Py<PyAny>>,
+    /// How often the report carries the worker's memory.
+    pub memory_interval: Duration,
+}
+
+/// What a signal asks of the worker.
+enum Asked {
+    Stop,
+    ReopenLogs,
+    Reclaim,
 }
 
 /// How often the worker reports to the host.
@@ -94,8 +106,10 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
     let accepting = Arc::clone(&shared);
     let reopen_logs = lifecycle.on_reopen_logs.as_ref();
+    let reclaim = lifecycle.on_reclaim.as_ref();
     let lifeline = lifecycle.lifeline;
     let report = lifecycle.report;
+    let memory_interval = lifecycle.memory_interval;
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
@@ -106,7 +120,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         // the host informed of what it is doing.
 
         if let Some(fd) = report {
-            tokio::spawn(report_loop(fd, Arc::clone(&accepting)));
+            tokio::spawn(report_loop(fd, Arc::clone(&accepting), memory_interval));
         }
 
         loop {
@@ -115,13 +129,11 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                     let (stream, _) = accepted?;
                     tokio::spawn(serve_connection(stream, Arc::clone(&accepting)));
                 }
-                stop = signals.next() => {
-                    if stop {
-                        break;
-                    }
-
-                    Lifecycle::call(reopen_logs);
-                }
+                asked = signals.next() => match asked {
+                    Asked::Stop => break,
+                    Asked::ReopenLogs => Lifecycle::call(reopen_logs),
+                    Asked::Reclaim => Lifecycle::call(reclaim),
+                },
                 () = lifeline.gone() => {
                     eprintln!("muru: the host is gone, stopping");
                     break;
@@ -232,9 +244,10 @@ impl Lifeline {
 }
 
 /// Write a status line to the report descriptor every second: requests
-/// in flight, the age of the oldest, and requests served. A write that
-/// cannot complete at once (the host is behind) is skipped.
-async fn report_loop(fd: i32, shared: Arc<Shared>) {
+/// in flight, the age of the oldest, and requests served, and every
+/// `memory_interval` the worker's memory too. A write that cannot
+/// complete at once (the host is behind) is skipped.
+async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
     // SAFETY: fcntl on a descriptor inherited for this purpose, setting
     // a flag; the descriptor stays open for the life of the worker.
 
@@ -246,13 +259,28 @@ async fn report_loop(fd: i32, shared: Arc<Shared>) {
         }
     }
 
+    let mut last_measured: Option<Instant> = None;
+
     loop {
-        let line = format!(
-            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{}}}\n",
+        let mut line = format!(
+            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{}",
             shared.in_flight(),
             shared.oldest_ms(),
             shared.total()
         );
+
+        if last_measured.is_none_or(|at| at.elapsed() >= memory_interval) {
+            last_measured = Some(Instant::now());
+
+            if let Some(memory) = crate::memory::measure() {
+                line.push_str(&format!(
+                    ",\"rss\":{},\"pss\":{},\"uss\":{}",
+                    memory.rss, memory.pss, memory.uss
+                ));
+            }
+        }
+
+        line.push_str("}\n");
 
         // SAFETY: write from a buffer this frame owns, on a descriptor
         // the host handed over for reports; a short or failed write is
@@ -267,11 +295,12 @@ async fn report_loop(fd: i32, shared: Arc<Shared>) {
 }
 
 /// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks
-/// it to reopen its logs.
+/// it to reopen its logs, SIGUSR2 to give memory back.
 struct Signals {
     term: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
     usr1: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
 }
 
 impl Signals {
@@ -282,15 +311,17 @@ impl Signals {
             term: signal(SignalKind::terminate())?,
             int: signal(SignalKind::interrupt())?,
             usr1: signal(SignalKind::user_defined1())?,
+            usr2: signal(SignalKind::user_defined2())?,
         })
     }
 
-    /// Wait for a signal: true to stop, false to reopen logs.
-    async fn next(&mut self) -> bool {
+    /// Wait for a signal and say what it asks.
+    async fn next(&mut self) -> Asked {
         tokio::select! {
-            _ = self.term.recv() => true,
-            _ = self.int.recv() => true,
-            _ = self.usr1.recv() => false,
+            _ = self.term.recv() => Asked::Stop,
+            _ = self.int.recv() => Asked::Stop,
+            _ = self.usr1.recv() => Asked::ReopenLogs,
+            _ = self.usr2.recv() => Asked::Reclaim,
         }
     }
 }

@@ -16,6 +16,10 @@ HELLO = b"Hello, world!\n"
 LARGE = b"x" * (1024 * 1024)
 
 LOCAL = threading.local()
+
+# What /grow keeps hold of, so the worker's memory stays up.
+
+GROWN: list[bytes] = []
 REQUEST_MARK: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "request_mark", default=None
 )
@@ -94,6 +98,14 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
             [("Content-Type", "application/octet-stream"), ("Content-Length", str(len(LARGE)))],
         )
         return [LARGE]
+
+    if path == "/grow":
+        GROWN.append(b"x" * (int(query.get("mb", "1")) * 1024 * 1024))
+        body = str(sum(len(chunk) for chunk in GROWN)).encode()
+        start_response(
+            "200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))]
+        )
+        return [body]
 
     if path == "/sleep":
         time.sleep(float(query.get("seconds", "0.1")))

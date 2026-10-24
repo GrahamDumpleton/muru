@@ -581,8 +581,23 @@ pub struct DeployArgs {
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
     timeouts: Vec<(String, Duration)>,
 
+    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
+    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
+    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
+    memory: Vec<(String, String)>,
+
     #[command(flatten)]
     socket: SocketArgs,
+}
+
+/// The last value given for a memory setting.
+fn memory_setting(settings: &[(String, String)], key: &str) -> Option<String> {
+    settings
+        .iter()
+        .rev()
+        .find(|(given, _)| given == key)
+        .map(|(_, value)| value.clone())
 }
 
 /// The last value given for a named timeout, in milliseconds.
@@ -653,6 +668,19 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
+        memory_measure: memory_setting(&args.memory, "measure").unwrap_or_default(),
+        memory_soft_limit: memory_setting(&args.memory, "soft_limit")
+            .and_then(|text| muru_config::parse_size(&text).ok()),
+        memory_soft_for_ms: memory_setting(&args.memory, "soft_for")
+            .and_then(|text| muru_config::parse_duration(&text).ok())
+            .map(|duration| duration.as_millis() as u64),
+        memory_reclaim_first: memory_setting(&args.memory, "reclaim_first")
+            .map(|text| text == "true"),
+        memory_hard_limit: memory_setting(&args.memory, "hard_limit")
+            .and_then(|text| muru_config::parse_size(&text).ok()),
+        memory_check_interval_ms: memory_setting(&args.memory, "check_interval")
+            .and_then(|text| muru_config::parse_duration(&text).ok())
+            .map(|duration| duration.as_millis() as u64),
     };
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 

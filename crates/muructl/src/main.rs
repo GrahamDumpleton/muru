@@ -240,6 +240,12 @@ struct RunArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
 
+    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
+    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
+    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = parse_memory_setting)]
+    memory: Vec<(String, String)>,
+
     /// Address for the read-only dashboard on loopback, or off. On at
     /// 127.0.0.1:8081 by default, off with --allow-public unless given.
     #[arg(long, value_name = "ADDRESS")]
@@ -599,6 +605,111 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
 }
 
+/// Parse KEY=VALUE for --memory, checking the key and the value's form.
+pub(crate) fn parse_memory_setting(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not KEY=VALUE, for example soft_limit=800MB"))?;
+    let (key, value) = (key.trim(), value.trim());
+
+    match key {
+        "measure" => {
+            value
+                .parse::<muru_config::Measure>()
+                .map_err(|error| error.to_string())?;
+        }
+        "soft_limit" | "hard_limit" => {
+            muru_config::parse_size(value)?;
+        }
+        "soft_for" | "check_interval" => {
+            muru_config::parse_duration(value)?;
+        }
+        "reclaim_first" => {
+            if !["true", "false"].contains(&value) {
+                return Err(format!(
+                    "reclaim_first must be true or false, not {value:?}"
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{key:?} is not a memory setting: measure, soft_limit, soft_for, reclaim_first, \
+                 hard_limit or check_interval"
+            ));
+        }
+    }
+
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+/// The memory policy from --memory settings over a project table
+/// (section 7.7), with the defaults of appendix C.
+pub(crate) fn memory_policy(
+    settings: &[(String, String)],
+    table: Option<&muru_config::Memory>,
+) -> anyhow::Result<muru_controller::model::MemoryPolicy> {
+    let mut table = table.cloned().unwrap_or_default();
+
+    for (key, value) in settings {
+        match key.as_str() {
+            "measure" => {
+                table.measure = Some(
+                    value
+                        .parse()
+                        .map_err(|e: muru_config::ParseError| anyhow::anyhow!("{e}"))?,
+                )
+            }
+            "soft_limit" => table.soft_limit = Some(value.clone()),
+            "soft_for" => table.soft_for = Some(value.clone()),
+            "reclaim_first" => table.reclaim_first = Some(value == "true"),
+            "hard_limit" => table.hard_limit = Some(value.clone()),
+            "check_interval" => table.check_interval = Some(value.clone()),
+            _ => {}
+        }
+    }
+
+    let defaults = muru_controller::model::MemoryPolicy::default();
+    let size = |text: &Option<String>, name: &str| -> anyhow::Result<Option<u64>> {
+        text.as_ref()
+            .map(|text| {
+                muru_config::parse_size(text)
+                    .map_err(|error| anyhow::anyhow!("memory.{name}: {error}"))
+            })
+            .transpose()
+    };
+    let duration = |text: &Option<String>, name: &str| -> anyhow::Result<Option<u64>> {
+        text.as_ref()
+            .map(|text| {
+                muru_config::parse_duration(text)
+                    .map(|duration| duration.as_millis() as u64)
+                    .map_err(|error| anyhow::anyhow!("memory.{name}: {error}"))
+            })
+            .transpose()
+    };
+    let policy = muru_controller::model::MemoryPolicy {
+        measure: table.measure.unwrap_or(defaults.measure),
+        soft_limit: size(&table.soft_limit, "soft_limit")?,
+        soft_for_ms: duration(&table.soft_for, "soft_for")?.unwrap_or(defaults.soft_for_ms),
+        reclaim_first: table.reclaim_first.unwrap_or(defaults.reclaim_first),
+        hard_limit: size(&table.hard_limit, "hard_limit")?,
+        check_interval_ms: duration(&table.check_interval, "check_interval")?
+            .unwrap_or(defaults.check_interval_ms),
+    };
+
+    if let (Some(soft), Some(hard)) = (policy.soft_limit, policy.hard_limit) {
+        anyhow::ensure!(
+            hard >= soft,
+            "memory.hard_limit must not be below memory.soft_limit"
+        );
+    }
+
+    anyhow::ensure!(
+        policy.check_interval_ms > 0,
+        "memory.check_interval must be longer than nothing"
+    );
+    Ok(policy)
+}
+
 /// The host's timeouts from --timeout and a project table (section 7.6):
 /// the hard timeout, the grace for a replaced worker's other requests
 /// and the time before a stopping worker is killed.
@@ -712,6 +823,8 @@ struct Resolved {
     max_lifetime: Option<Duration>,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
+    /// The memory table (section 7.7).
+    memory: Option<muru_config::Memory>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -838,6 +951,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             (None, None) => None,
         },
         timeouts: table.timeouts,
+        memory: table.memory,
     })
 }
 
@@ -891,6 +1005,23 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
                 hard_timeout: hard.map(muru_config::format_duration),
                 hard_drain_grace: Some(muru_config::format_duration(grace)),
                 shutdown_timeout: Some(muru_config::format_duration(shutdown)),
+            })
+        },
+        memory: {
+            let policy = memory_policy(&args.memory, resolved.memory.as_ref())?;
+            (policy != muru_controller::model::MemoryPolicy::default()).then(|| {
+                muru_config::Memory {
+                    measure: Some(policy.measure),
+                    soft_limit: policy.soft_limit.map(muru_config::format_size),
+                    soft_for: Some(muru_config::format_duration(Duration::from_millis(
+                        policy.soft_for_ms,
+                    ))),
+                    reclaim_first: Some(policy.reclaim_first),
+                    hard_limit: policy.hard_limit.map(muru_config::format_size),
+                    check_interval: Some(muru_config::format_duration(Duration::from_millis(
+                        policy.check_interval_ms,
+                    ))),
+                }
             })
         },
     };
@@ -1156,6 +1287,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         hard_timeout,
         hard_drain_grace,
         shutdown_timeout,
+        memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
     };
 
     let logs = Logs::default();
@@ -1358,6 +1490,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     muru_controller::host::HostMessage::Event { kind, message, .. } => {
                         println!("muru: {kind}: {message}");
                     }
+                    muru_controller::host::HostMessage::Status { .. } => {}
                 }
             }
             Some(path) = changed.recv() => {

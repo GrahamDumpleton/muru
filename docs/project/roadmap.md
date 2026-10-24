@@ -140,6 +140,15 @@ fresh one on a new socket with no request failed, and a worker whose
 request runs past the hard timeout leaves routing at once, has every
 thread's stack written to the log by faulthandler, is replaced, and is
 stopped after `hard_drain_grace` and killed after `shutdown_timeout`,
-all recorded as `worker.*` events (memory limits, max_surge, per-group
-settings and the request id on records later). Next from phase 2:
-memory policy, then worker inspection.
+all recorded as `worker.*` events. The memory policy of section 7.7 is
+in: each worker measures its USS, PSS and RSS (from smaps_rollup on
+Linux, the task footprint on macOS) at `check_interval` and reports
+them, a worker over the hard limit is replaced at once through the hard
+path, one over the soft limit for `soft_for` is asked to reclaim
+(gc.collect and malloc_trim on SIGUSR2) and recycled if still over, a
+worker index recycled for memory three times in an hour raises
+`memory.leak_suspected`, and each worker's last report is served as
+`muru_worker_memory_bytes`, `muru_worker_requests_total` and
+`muru_worker_requests_in_flight` (max_surge, per-group settings, the
+node budget, allocator settings, per-request deltas and the request id
+on records later). Next from phase 2: worker inspection.

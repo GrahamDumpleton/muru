@@ -128,6 +128,12 @@ message DeployRequest {
   optional uint64 hard_timeout_ms = 19;     // how long a request may run before its worker is replaced (section 7.6)
   optional uint64 hard_drain_grace_ms = 20; // how long a replaced worker gets to finish its other requests
   optional uint64 shutdown_timeout_ms = 21; // how long a worker told to stop gets before it is killed
+  string memory_measure = 22;               // uss, pss or rss (section 7.7); the table's or uss when empty
+  optional uint64 memory_soft_limit = 23;   // bytes; over it for soft_for the worker reclaims, then recycles
+  optional uint64 memory_soft_for_ms = 24;
+  optional bool memory_reclaim_first = 25;
+  optional uint64 memory_hard_limit = 26;   // bytes; over it the worker is replaced at once
+  optional uint64 memory_check_interval_ms = 27;
 }
 
 message ListReleasesRequest {

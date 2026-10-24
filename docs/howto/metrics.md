@@ -3,11 +3,12 @@
 ```{admonition} Status
 :class: note
 
-The daemon serves request counters and histograms, slot and queue gauges
-and the workers ready in the Prometheus text format, on a metrics
-listener and through `muructl metrics`, and a development run serves the
-same from its dashboard. Worker CPU and memory, scaling, connection and
-TLS metrics, and OTLP export are still to come.
+The daemon serves request counters and histograms, slot and queue gauges,
+the workers ready and each worker's requests and memory in the
+Prometheus text format, on a metrics listener and through `muructl
+metrics`, and a development run serves the request figures from its
+dashboard. Worker CPU, scaling, connection and TLS metrics, and OTLP
+export are still to come.
 ```
 
 Muru counts what the edge does with each request and what the daemon
@@ -57,6 +58,9 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_slots_busy` | gauge | app, release, group | slots handling a request |
 | `muru_slots_total` | gauge | app, release, group | slots across the workers: threads, or the event loop's concurrency |
 | `muru_workers_ready` | gauge | app, release, group | workers listening for requests (under the daemon) |
+| `muru_worker_requests_total` | counter | app, release, group, worker | requests a worker has served, as it last reported (under the daemon) |
+| `muru_worker_requests_in_flight` | gauge | app, release, group, worker | requests a worker was serving when it last reported |
+| `muru_worker_memory_bytes` | gauge | app, release, group, worker, measure | a worker's memory as `rss`, `pss` or `uss`, measured every `check_interval` of its [memory policy](memory.md) |
 | `muru_snapshot_version` | gauge | | the routing snapshot in force at the edge, 0 in development mode |
 
 A request answered before any release serves, or refused by the routing

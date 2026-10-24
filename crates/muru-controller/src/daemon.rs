@@ -265,6 +265,8 @@ struct Running {
     retained_until: Option<Instant>,
     /// The host's control connection, once it is up.
     control: Option<HostControl>,
+    /// What the workers last reported, for metrics.
+    status: Vec<crate::host::WorkerStatus>,
 }
 
 /// The daemon's state while it runs.
@@ -1074,6 +1076,48 @@ impl Daemon {
                     workers as f64,
                 ));
             }
+
+            // Sections 7.6 and 7.7: what each worker last reported.
+
+            for worker in &running.status {
+                let index = worker.index.to_string();
+                let labels = [
+                    ("app", app.as_str()),
+                    ("release", id.as_str()),
+                    ("group", worker.group.as_str()),
+                    ("worker", index.as_str()),
+                ];
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_worker_requests_total",
+                    &labels,
+                    worker.requests as f64,
+                ));
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_worker_requests_in_flight",
+                    &labels,
+                    worker.in_flight as f64,
+                ));
+
+                for (measure, bytes) in [
+                    ("rss", worker.rss),
+                    ("pss", worker.pss),
+                    ("uss", worker.uss),
+                ] {
+                    if let Some(bytes) = bytes {
+                        samples.push(muru_edge::metrics::Sample::new(
+                            "muru_worker_memory_bytes",
+                            &[
+                                ("app", app.as_str()),
+                                ("release", id.as_str()),
+                                ("group", worker.group.as_str()),
+                                ("worker", index.as_str()),
+                                ("measure", measure),
+                            ],
+                            bytes as f64,
+                        ));
+                    }
+                }
+            }
         }
 
         muru_edge::metrics::render(&muru_edge::metrics::aggregate(samples))
@@ -1175,6 +1219,7 @@ impl Daemon {
                         groups: record.groups.clone(),
                         retained_until,
                         control: None,
+                        status: Vec::new(),
                     },
                 );
                 self.attach_control(app, id);
@@ -1370,6 +1415,7 @@ impl Daemon {
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
+            memory: spec.memory.clone(),
             groups: spec
                 .groups
                 .iter()
@@ -1448,6 +1494,7 @@ impl Daemon {
                 groups,
                 retained_until: None,
                 control: None,
+                status: Vec::new(),
             },
         );
         self.attach_control(app, id);
@@ -1971,6 +2018,11 @@ impl Daemon {
                     .and_then(|running| running.control.as_ref())
                 {
                     control.acknowledge(version);
+                }
+            }
+            HostMessage::Status { workers } => {
+                if let Some(running) = self.running.get_mut(&key) {
+                    running.status = workers;
                 }
             }
             HostMessage::Event {

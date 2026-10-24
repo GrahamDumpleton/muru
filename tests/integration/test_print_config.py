@@ -80,3 +80,18 @@ def test_recycling_and_host_timeouts_are_written() -> None:
         "hard_drain_grace": "10s",
         "shutdown_timeout": "5s",
     }
+
+
+def test_memory_settings_are_written() -> None:
+    document = print_config(
+        str(PROJECTS / "shop"), "--memory", "soft_limit=800MB", "--memory", "hard_limit=1200MB"
+    )
+    release = document["app"]["shop"]["release"]["r1"]  # type: ignore[index]
+    assert release["memory"] == {
+        "measure": "uss",
+        "soft_limit": "800MB",
+        "soft_for": "120s",
+        "reclaim_first": True,
+        "hard_limit": "1200MB",
+        "check_interval": "5s",
+    }

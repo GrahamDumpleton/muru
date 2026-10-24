@@ -36,6 +36,34 @@ pub enum HostMessage {
         /// What happened.
         message: String,
     },
+    /// What every worker reported last, for metrics and the dashboard.
+    Status {
+        /// One entry per worker.
+        workers: Vec<WorkerStatus>,
+    },
+}
+
+/// What one worker last reported to its host (sections 7.6 and 7.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerStatus {
+    /// The worker's index within the host.
+    pub index: u32,
+    /// Its pid.
+    pub pid: u32,
+    /// Its group.
+    pub group: String,
+    /// Requests served since it started.
+    pub requests: u64,
+    /// Requests in flight.
+    pub in_flight: u64,
+    /// The age of its oldest request, in milliseconds.
+    pub oldest_ms: u64,
+    /// Resident set size in bytes, when measured.
+    pub rss: Option<u64>,
+    /// Proportional set size in bytes, when measured.
+    pub pss: Option<u64>,
+    /// Unique set size in bytes, when measured.
+    pub uss: Option<u64>,
 }
 
 impl HostMessage {
@@ -81,6 +109,27 @@ impl HostMessage {
                 kind: value["kind"].as_str().unwrap_or("worker.event").to_owned(),
                 level: value["level"].as_str().unwrap_or("info").to_owned(),
                 message: value["message"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "status" => Some(Self::Status {
+                workers: value["workers"]
+                    .as_array()
+                    .map(|workers| {
+                        workers
+                            .iter()
+                            .map(|worker| WorkerStatus {
+                                index: worker["index"].as_u64().unwrap_or(0) as u32,
+                                pid: worker["pid"].as_u64().unwrap_or(0) as u32,
+                                group: worker["group"].as_str().unwrap_or("default").to_owned(),
+                                requests: worker["requests"].as_u64().unwrap_or(0),
+                                in_flight: worker["in_flight"].as_u64().unwrap_or(0),
+                                oldest_ms: worker["oldest_ms"].as_u64().unwrap_or(0),
+                                rss: worker["rss"].as_u64(),
+                                pss: worker["pss"].as_u64(),
+                                uss: worker["uss"].as_u64(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
@@ -203,6 +252,8 @@ pub struct HostSpec {
     pub hard_drain_grace: Duration,
     /// How long a worker told to stop gets before it is killed.
     pub shutdown_timeout: Duration,
+    /// The memory policy for the workers (section 7.7).
+    pub memory: crate::model::MemoryPolicy,
 }
 
 /// A named mount, as the host loads it.
@@ -407,6 +458,26 @@ impl HostProcess {
             command
                 .arg("--hard-timeout")
                 .arg(timeout.as_secs_f64().to_string());
+        }
+
+        // Section 7.7: the memory policy.
+
+        command
+            .arg("--memory-measure")
+            .arg(spec.memory.measure.as_str())
+            .arg("--memory-soft-for")
+            .arg((spec.memory.soft_for_ms as f64 / 1000.0).to_string())
+            .arg("--memory-reclaim-first")
+            .arg(spec.memory.reclaim_first.to_string())
+            .arg("--memory-check-interval")
+            .arg((spec.memory.check_interval_ms as f64 / 1000.0).to_string());
+
+        if let Some(bytes) = spec.memory.soft_limit {
+            command.arg("--memory-soft-limit").arg(bytes.to_string());
+        }
+
+        if let Some(bytes) = spec.memory.hard_limit {
+            command.arg("--memory-hard-limit").arg(bytes.to_string());
         }
 
         if let Some(dir) = &spec.chdir {

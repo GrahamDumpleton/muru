@@ -26,9 +26,10 @@ to every worker, whose on_reopen_logs hook handles the application's own
 files.
 
 Each worker reports to the host once a second over a pipe: requests in
-flight, the age of the oldest, and requests served. From those the host
-enforces the hard timeout of section 7.6 and the recycling of section
-7.7: a worker past its limit is replaced by a fresh one on a new socket,
+flight, the age of the oldest, requests served, and at intervals its
+memory. From those the host enforces the hard timeout of section 7.6 and
+the recycling and memory limits of section 7.7: a worker past its limit
+is replaced by a fresh one on a new socket,
 and the supervisor (the daemon, or `muructl run`) learns the new socket
 over the host's control socket, named with --control, so the edge routes
 to it before the old worker is told to stop.
@@ -51,7 +52,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
@@ -67,13 +68,22 @@ SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
 
 # How long a replacement waits for the supervisor to say the edge routes
-# to the new worker before the old one is told to stop regardless.
+# to the new worker before the old one is told to stop regardless, and
+# how long after that word the old worker is left alone, so a request
+# the edge had already dispatched to it by the old routing is served.
 
 ACK_TIMEOUT_SECONDS = 5.0
+ROUTE_SETTLE_SECONDS = 1.0
 
 # How often the supervision loop runs when timeouts or recycling are on.
 
 TICK_SECONDS = 0.5
+
+# Memory recycles of one worker index within this window raise a leak
+# warning, once per window.
+
+LEAK_WINDOW_SECONDS = 3600.0
+LEAK_RECYCLES = 3
 
 # A worker exiting with an error this soon after its fork failed to start.
 
@@ -347,6 +357,24 @@ class Group:
 
 
 @dataclass
+class MemoryPolicy:
+    """The memory limits of section 7.7, in bytes and seconds."""
+
+    measure: str = "uss"
+    soft_limit: int | None = None
+    soft_for: float = 120.0
+    reclaim_first: bool = True
+    hard_limit: int | None = None
+    check_interval: float = 5.0
+
+    @property
+    def active(self) -> bool:
+        """Whether any limit is set."""
+
+        return self.soft_limit is not None or self.hard_limit is not None
+
+
+@dataclass
 class WorkerState:
     """What the host knows about one worker from its reports."""
 
@@ -368,6 +396,13 @@ class WorkerState:
     recycle_after_requests: int | None = None
     recycle_at: float | None = None
     replaced: bool = False
+
+    # Section 7.7: the last memory figures, when the worker went over the
+    # soft limit, and when it was asked to reclaim.
+
+    memory: dict[str, int] = field(default_factory=dict)
+    over_soft_since: float | None = None
+    reclaimed_at: float | None = None
 
 
 @dataclass
@@ -409,6 +444,7 @@ class Host:
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
+        memory: MemoryPolicy | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
@@ -424,6 +460,9 @@ class Host:
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
+        self.memory = memory or MemoryPolicy()
+        self.memory_recycles: dict[int, list[float]] = {}
+        self.leak_warned: dict[int, float] = {}
 
         # Workers are numbered across the groups in the order they are
         # forked: the default group first, then each named group, each
@@ -497,6 +536,7 @@ class Host:
             self.max_requests is not None
             or self.max_lifetime is not None
             or self.hard_timeout is not None
+            or self.memory.active
         )
 
     def socket_path(self, index: int) -> str:
@@ -648,6 +688,16 @@ class Host:
         faulthandler.enable(all_threads=True)
         faulthandler.register(signal.SIGQUIT, all_threads=True, chain=False)
 
+        def reclaim() -> None:
+            """Section 7.7: give memory back when the host asks (SIGUSR2)."""
+
+            collected = gc.collect()
+            trimmed = malloc_trim()
+            log(
+                f"worker {index} reclaimed memory: collected {collected} objects"
+                + (", trimmed the heap" if trimmed else "")
+            )
+
         # The host's handlers and wake-up pipe belong to the host; the native
         # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
 
@@ -778,6 +828,8 @@ class Host:
                 lifeline=lifeline,
                 mounts=served_mounts,
                 report=report,
+                on_reclaim=reclaim,
+                memory_interval_ms=int(self.memory.check_interval * 1000),
                 **asgi_arguments,
             )
         except Exception as error:
@@ -1017,6 +1069,8 @@ class Host:
         if state is None:
             return
 
+        measured = False
+
         for line in data.splitlines():
             try:
                 report = json.loads(line)
@@ -1027,11 +1081,116 @@ class Host:
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
 
+            if "rss" in report:
+                measured = True
+                state.memory = {
+                    key: int(report[key]) for key in ("rss", "pss", "uss") if key in report
+                }
+
         if not state.ready:
             state.ready = True
             self.worker_ready(state)
 
         self.check_requests(state)
+
+        if measured:
+            self.check_memory(state)
+            self.send_status()
+
+    def check_memory(self, state: WorkerState) -> None:
+        """Section 7.7: hold a worker to the memory limits."""
+
+        if state.replaced or state.index in self.replacing or not self.memory.active:
+            return
+
+        value = state.memory.get(self.memory.measure)
+        if value is None:
+            return
+
+        now = time.monotonic()
+        hard = self.memory.hard_limit
+        soft = self.memory.soft_limit
+
+        if hard is not None and value > hard:
+            self.replace(
+                state,
+                f"{self.memory.measure} {format_size(value)} is over the hard limit of "
+                f"{format_size(hard)}",
+                "worker.recycled",
+                hard=True,
+            )
+            return
+
+        if soft is None or value <= soft:
+            state.over_soft_since = None
+            state.reclaimed_at = None
+            return
+
+        if state.over_soft_since is None:
+            state.over_soft_since = now
+            return
+
+        if now - state.over_soft_since < self.memory.soft_for:
+            return
+
+        # Over the soft limit for long enough: reclaim first, then recycle
+        # when the next measurement is still over.
+
+        if self.memory.reclaim_first and state.reclaimed_at is None:
+            state.reclaimed_at = now
+            self.signal(state.pid, signal.SIGUSR2)
+            return
+
+        self.replace(
+            state,
+            f"{self.memory.measure} {format_size(value)} stayed over the soft limit of "
+            f"{format_size(soft)} for {now - state.over_soft_since:.0f} s"
+            + (" after reclaiming" if state.reclaimed_at is not None else ""),
+            "worker.recycled",
+        )
+
+    def note_memory_recycle(self, index: int) -> None:
+        """Warn when one worker index keeps recycling for memory."""
+
+        now = time.monotonic()
+        recent = [
+            at for at in self.memory_recycles.get(index, []) if now - at < LEAK_WINDOW_SECONDS
+        ]
+        recent.append(now)
+        self.memory_recycles[index] = recent
+
+        if (
+            len(recent) >= LEAK_RECYCLES
+            and now - self.leak_warned.get(index, -LEAK_WINDOW_SECONDS) >= LEAK_WINDOW_SECONDS
+        ):
+            self.leak_warned[index] = now
+            self.emit(
+                "memory.leak_suspected",
+                "warning",
+                f"worker {index} was recycled for memory {len(recent)} times in the last hour",
+            )
+
+    def send_status(self) -> None:
+        """Tell the supervisor what every worker last reported."""
+
+        self.send_to_supervisor(
+            {
+                "type": "status",
+                "workers": [
+                    {
+                        "index": state.index,
+                        "pid": state.pid,
+                        "group": self.placement[state.index][0].name,
+                        "requests": state.requests,
+                        "in_flight": state.in_flight,
+                        "oldest_ms": state.oldest_ms,
+                        **state.memory,
+                    }
+                    for state in sorted(self.states.values(), key=lambda state: state.index)
+                    if not state.replaced
+                ],
+            }
+        )
 
     def worker_ready(self, state: WorkerState) -> None:
         """Note that a worker listens; a replacement enters routing and is announced."""
@@ -1087,7 +1246,7 @@ class Host:
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
 
-    def replace(self, state: WorkerState, reason: str, kind: str) -> None:
+    def replace(self, state: WorkerState, reason: str, kind: str, hard: bool = False) -> None:
         """Start replacing a worker with a fresh one on a new socket.
 
         For a hard timeout the old worker leaves routing at once and its
@@ -1113,17 +1272,18 @@ class Host:
         self.generation[index] = self.generation.get(index, 0) + 1
         replacement = Replacement(index, state.pid, reason, kind)
         self.replacing[index] = replacement
-        hard = kind == "worker.timeout_killed"
+        hard = hard or kind == "worker.timeout_killed"
         log(f"worker {index} (pid {state.pid}) {reason}; replacing it")
+
+        if "limit" in reason:
+            self.note_memory_recycle(index)
 
         if hard:
             self.routed[index] = None
             self.announce()
 
-            try:
-                os.kill(state.pid, signal.SIGQUIT)
-            except ProcessLookupError:
-                pass
+            if kind == "worker.timeout_killed":
+                self.signal(state.pid, signal.SIGQUIT)
 
             replacement.terminate_at = time.monotonic() + self.hard_drain_grace
 
@@ -1141,7 +1301,7 @@ class Host:
             waited = now >= (replacement.announced_at or now) + ACK_TIMEOUT_SECONDS
 
             if acknowledged or waited:
-                replacement.terminate_at = now
+                replacement.terminate_at = now + ROUTE_SETTLE_SECONDS
 
         if (
             replacement.terminate_at is not None
@@ -1382,6 +1542,32 @@ class Host:
                 pass
 
 
+def format_size(size: int) -> str:
+    """Write a size in the largest unit that keeps a digit, as 1.5GB or 800MB."""
+
+    value = float(size)
+
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f}{unit}" if unit == "B" or value >= 10 else f"{value:.1f}{unit}"
+
+        value /= 1024
+
+    return f"{size}B"
+
+
+def malloc_trim() -> bool:
+    """Return heap memory to the system on glibc; false where there is no malloc_trim."""
+
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        return bool(libc.malloc_trim(0))
+    except (OSError, AttributeError):
+        return False
+
+
 def describe(status: int) -> str:
     """Describe a waitpid status in words."""
 
@@ -1550,6 +1736,46 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="SECONDS",
         help="how long a worker told to stop gets before it is killed",
     )
+    parser.add_argument(
+        "--memory-measure",
+        choices=("uss", "pss", "rss"),
+        default="uss",
+        help="what the memory limits measure (section 7.7)",
+    )
+    parser.add_argument(
+        "--memory-soft-limit",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="over this for --memory-soft-for, a worker reclaims and then is replaced",
+    )
+    parser.add_argument(
+        "--memory-soft-for",
+        type=float,
+        default=120.0,
+        metavar="SECONDS",
+        help="how long a worker may stay over the soft limit",
+    )
+    parser.add_argument(
+        "--memory-reclaim-first",
+        choices=("true", "false"),
+        default="true",
+        help="collect garbage and trim the heap before replacing over the soft limit",
+    )
+    parser.add_argument(
+        "--memory-hard-limit",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="over this a worker leaves routing at once and is replaced",
+    )
+    parser.add_argument(
+        "--memory-check-interval",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="how often a worker measures its memory",
+    )
     return parser.parse_args(argv)
 
 
@@ -1698,6 +1924,14 @@ def main(argv: list[str] | None = None) -> int:
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
+        memory=MemoryPolicy(
+            measure=args.memory_measure,
+            soft_limit=args.memory_soft_limit,
+            soft_for=args.memory_soft_for,
+            reclaim_first=args.memory_reclaim_first == "true",
+            hard_limit=args.memory_hard_limit,
+            check_interval=args.memory_check_interval,
+        ),
     )
 
     if args.single:

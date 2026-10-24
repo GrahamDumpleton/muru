@@ -20,6 +20,8 @@ def serve(
     lifeline: int | None = None,
     mounts: list[tuple[str, Callable[..., Any], Callable[[Any, Channel], None] | None]] = [],
     report: int | None = None,
+    on_reclaim: Callable[[], Any] | None = None,
+    memory_interval_ms: int = 5000,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 

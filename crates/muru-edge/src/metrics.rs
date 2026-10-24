@@ -129,6 +129,21 @@ pub const FAMILIES: &[Family] = &[
         help: "Workers listening for requests.",
     },
     Family {
+        name: "muru_worker_requests_total",
+        kind: Kind::Counter,
+        help: "Requests a worker has served since it started, as it last reported.",
+    },
+    Family {
+        name: "muru_worker_requests_in_flight",
+        kind: Kind::Gauge,
+        help: "Requests a worker was serving when it last reported.",
+    },
+    Family {
+        name: "muru_worker_memory_bytes",
+        kind: Kind::Gauge,
+        help: "A worker's memory as it last reported it, by measure: rss, pss or uss.",
+    },
+    Family {
         name: "muru_snapshot_version",
         kind: Kind::Gauge,
         help: "The routing snapshot in force at the edge.",

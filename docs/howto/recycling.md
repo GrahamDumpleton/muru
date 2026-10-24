@@ -3,9 +3,9 @@
 ```{admonition} Status
 :class: note
 
-Workers are replaced after a number of requests or a lifetime, and on
-the hard timeout. Memory limits, which recycle through the same path,
-and per-group settings are still to come.
+Workers are replaced after a number of requests or a lifetime, on the
+hard timeout and over the memory limits. Per-group settings and the
+surge limit are still to come.
 ```
 
 A worker process that has served long enough is replaced by a fresh one,
@@ -55,7 +55,8 @@ stop regardless.
 
 A worker whose request runs past the [hard timeout](timeouts.md) takes
 the same path, except that it leaves routing before its replacement is
-ready and its stacks are written to the log first.
+ready and its stacks are written to the log first, and so does a worker
+over its [memory limits](memory.md).
 
 Events record each replacement: `worker.started` and `worker.ready` for
 the new worker, then `worker.recycled` (or `worker.timeout_killed`) with

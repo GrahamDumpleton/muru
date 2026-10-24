@@ -39,6 +39,19 @@ pub enum Preload {
     False,
 }
 
+/// How a worker's memory is measured (section 7.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Measure {
+    /// Unique set size: pages no other process shares, the default,
+    /// since preloaded pages are shared copy-on-write.
+    Uss,
+    /// Proportional set size: shared pages counted in proportion.
+    Pss,
+    /// Resident set size: every resident page.
+    Rss,
+}
+
 /// When a factory entrypoint is called (section 6.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +101,7 @@ macro_rules! words {
 
 words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi" });
 words!(Preload { Auto => "auto", True => "true", False => "false" });
+words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
 
 /// A Python logging level (section 11.4).
@@ -314,6 +328,37 @@ pub struct Release {
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The memory policy for the workers (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+}
+
+/// The `[memory]` table of a release or a `[tool.muru]` table (section
+/// 7.7): the limits a worker's memory is held to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Memory {
+    /// What is measured: uss (the default), pss or rss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<Measure>,
+    /// Over this for soft_for, the worker reclaims and then recycles,
+    /// for example 800MB; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limit: Option<String>,
+    /// How long the worker may stay over the soft limit (default 2m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_for: Option<String>,
+    /// Whether to collect garbage and trim the heap before recycling
+    /// over the soft limit (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_first: Option<bool>,
+    /// Over this the worker leaves routing at once and is replaced,
+    /// for example 1200MB; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit: Option<String>,
+    /// How often memory is measured (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_interval: Option<String>,
 }
 
 /// The `[timeouts]` table of a release or a `[tool.muru]` table (section
@@ -762,6 +807,9 @@ pub struct ToolMuru {
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The memory policy for the workers (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
 }
 
 /// Why a project's configuration could not be read.

@@ -34,8 +34,8 @@ pub enum Action {
         app: String,
         /// The declared release id.
         id: String,
-        /// The resolved spec.
-        spec: ReleaseSpec,
+        /// The resolved spec, boxed to keep the actions small.
+        spec: Box<ReleaseSpec>,
     },
     /// Drain the release if it runs, then drop its record (prune).
     RemoveRelease {
@@ -278,7 +278,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
                 action: Action::Deploy {
                     app: name.to_owned(),
                     id: id.clone(),
-                    spec,
+                    spec: Box::new(spec),
                 },
             }),
         }
@@ -801,6 +801,65 @@ pub fn resolve_spec(
         return Err("max_lifetime must be longer than nothing".to_owned());
     }
 
+    // Section 7.7: the memory policy, the same way.
+
+    let table_memory = table.memory.clone().unwrap_or_default();
+    let size =
+        |given: Option<u64>, text: Option<&String>, name: &str| -> Result<Option<u64>, String> {
+            match (given, text) {
+                (Some(bytes), _) => Ok(Some(bytes)),
+                (None, Some(text)) => muru_config::parse_size(text)
+                    .map(Some)
+                    .map_err(|error| format!("memory.{name}: {error}")),
+                (None, None) => Ok(None),
+            }
+        };
+    let defaults = crate::model::MemoryPolicy::default();
+    let memory = crate::model::MemoryPolicy {
+        measure: match request.memory_measure.as_str() {
+            "" => table_memory.measure.unwrap_or(defaults.measure),
+            given => given
+                .parse()
+                .map_err(|error: muru_config::ParseError| format!("memory.measure: {error}"))?,
+        },
+        soft_limit: size(
+            request.memory_soft_limit,
+            table_memory.soft_limit.as_ref(),
+            "soft_limit",
+        )?,
+        soft_for_ms: duration_ms(
+            request.memory_soft_for_ms,
+            table_memory.soft_for.as_ref(),
+            "memory.soft_for",
+        )?
+        .unwrap_or(defaults.soft_for_ms),
+        reclaim_first: request
+            .memory_reclaim_first
+            .or(table_memory.reclaim_first)
+            .unwrap_or(defaults.reclaim_first),
+        hard_limit: size(
+            request.memory_hard_limit,
+            table_memory.hard_limit.as_ref(),
+            "hard_limit",
+        )?,
+        check_interval_ms: duration_ms(
+            request.memory_check_interval_ms,
+            table_memory.check_interval.as_ref(),
+            "memory.check_interval",
+        )?
+        .unwrap_or(defaults.check_interval_ms),
+    };
+
+    if let (Some(soft), Some(hard)) = (memory.soft_limit, memory.hard_limit)
+        && hard < soft
+    {
+        return Err("memory.hard_limit must not be below memory.soft_limit".to_owned());
+    }
+
+    if memory.check_interval_ms == 0 {
+        return Err("memory.check_interval must be longer than nothing".to_owned());
+    }
+
     if request.max_requests == Some(0)
         || (request.max_requests.is_none() && table.max_requests == Some(0))
     {
@@ -840,6 +899,7 @@ pub fn resolve_spec(
         max_requests: request.max_requests.or(table.max_requests),
         max_lifetime_ms,
         timeouts,
+        memory,
     })
 }
 
@@ -923,7 +983,30 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|t| t.shutdown_timeout.as_ref()),
         ),
+        memory_measure: table
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.measure)
+            .map(|measure| measure.as_str().to_owned())
+            .unwrap_or_default(),
+        memory_soft_limit: size_field(table.memory.as_ref().and_then(|m| m.soft_limit.as_ref())),
+        memory_soft_for_ms: duration_field(table.memory.as_ref().and_then(|m| m.soft_for.as_ref())),
+        memory_reclaim_first: table.memory.as_ref().and_then(|m| m.reclaim_first),
+        memory_hard_limit: size_field(table.memory.as_ref().and_then(|m| m.hard_limit.as_ref())),
+        memory_check_interval_ms: duration_field(
+            table
+                .memory
+                .as_ref()
+                .and_then(|m| m.check_interval.as_ref()),
+        ),
     }
+}
+
+/// A size a table writes, as bytes for a request; one that does not
+/// parse is left out, and the validation of the declared release
+/// reports it.
+fn size_field(text: Option<&String>) -> Option<u64> {
+    text.and_then(|text| muru_config::parse_size(text).ok())
 }
 
 /// A duration a table writes, as milliseconds for a request; one that
@@ -1000,6 +1083,20 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
                 shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.shutdown_timeout_ms,
+                ))),
+            }
+        }),
+        memory: (spec.memory != crate::model::MemoryPolicy::default()).then(|| {
+            muru_config::Memory {
+                measure: Some(spec.memory.measure),
+                soft_limit: spec.memory.soft_limit.map(muru_config::format_size),
+                soft_for: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.memory.soft_for_ms,
+                ))),
+                reclaim_first: Some(spec.memory.reclaim_first),
+                hard_limit: spec.memory.hard_limit.map(muru_config::format_size),
+                check_interval: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.memory.check_interval_ms,
                 ))),
             }
         }),
@@ -1129,8 +1226,31 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_ms(Some(declared.timeouts.shutdown_timeout_ms)),
         describe_ms(Some(recorded.timeouts.shutdown_timeout_ms)),
     );
+    compare(
+        "memory",
+        describe_memory(&declared.memory),
+        describe_memory(&recorded.memory),
+    );
 
     found
+}
+
+/// A memory policy as one phrase, for the report.
+fn describe_memory(memory: &crate::model::MemoryPolicy) -> String {
+    let size = |bytes: Option<u64>| {
+        bytes
+            .map(muru_config::format_size)
+            .unwrap_or_else(|| "off".to_owned())
+    };
+    format!(
+        "{} soft {} for {} (reclaim first {}), hard {}, every {}",
+        memory.measure,
+        size(memory.soft_limit),
+        describe_ms(Some(memory.soft_for_ms)),
+        memory.reclaim_first,
+        size(memory.hard_limit),
+        describe_ms(Some(memory.check_interval_ms)),
+    )
 }
 
 /// A duration in milliseconds as the configuration writes it, or off.

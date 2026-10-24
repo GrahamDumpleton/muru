@@ -176,6 +176,64 @@ pub struct ReleaseSpec {
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default)]
     pub timeouts: WorkerTimeouts,
+    /// The memory policy for the workers (section 7.7).
+    #[serde(default)]
+    pub memory: MemoryPolicy,
+}
+
+/// The memory policy of a release's workers (section 7.7), in bytes and
+/// milliseconds; the defaults are those of appendix C.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPolicy {
+    /// What is measured.
+    #[serde(default = "default_measure")]
+    pub measure: muru_config::Measure,
+    /// Over this for `soft_for_ms`, the worker reclaims and then
+    /// recycles; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limit: Option<u64>,
+    /// How long a worker may stay over the soft limit.
+    #[serde(default = "default_soft_for_ms")]
+    pub soft_for_ms: u64,
+    /// Whether to reclaim before recycling over the soft limit.
+    #[serde(default = "default_true")]
+    pub reclaim_first: bool,
+    /// Over this the worker leaves routing at once and is replaced; off
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit: Option<u64>,
+    /// How often memory is measured.
+    #[serde(default = "default_check_interval_ms")]
+    pub check_interval_ms: u64,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            measure: default_measure(),
+            soft_limit: None,
+            soft_for_ms: default_soft_for_ms(),
+            reclaim_first: true,
+            hard_limit: None,
+            check_interval_ms: default_check_interval_ms(),
+        }
+    }
+}
+
+fn default_measure() -> muru_config::Measure {
+    muru_config::Measure::Uss
+}
+
+fn default_soft_for_ms() -> u64 {
+    120_000
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_check_interval_ms() -> u64 {
+    5_000
 }
 
 /// The timeouts a host enforces on its workers (section 7.6), in

@@ -264,3 +264,26 @@ def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_pa
     differing = apply(daemon, config)
     assert differing.returncode == 1
     assert "max_requests 300, recorded 250" in differing.stdout + differing.stderr
+
+
+def test_a_memory_table_round_trips_through_export(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(
+        release("shop", "r1")
+        + "[app.shop.release.r1.memory]\nmeasure = 'rss'\n"
+        + "hard_limit = '1GB'\nsoft_limit = '800MB'\n"
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    memory = exported["app"]["shop"]["release"]["r1"]["memory"]
+    assert memory == {
+        "measure": "rss",
+        "soft_limit": "800MB",
+        "soft_for": "120s",
+        "reclaim_first": True,
+        "hard_limit": "1GB",
+        "check_interval": "5s",
+    }
+    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0

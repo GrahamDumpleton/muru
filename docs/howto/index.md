@@ -8,7 +8,7 @@ Still to be written, as their features land:
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Uploads and authorised downloads (internal redirects), including upload adapters for Django, Flask and Starlette.
 - Custom error pages and maintenance mode.
-- Scaling, schedules and memory limits (worker recycling by requests and lifetime is covered).
+- Scaling and schedules.
 - Log rotation.
 - Containers and images.
 - uv and Python versions.
@@ -30,6 +30,7 @@ mounts
 https
 timeouts
 recycling
+memory
 logging
 metrics
 events
