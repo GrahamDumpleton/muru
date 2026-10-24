@@ -13,6 +13,8 @@ IMPORT_PID = os.getpid()
 def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:
     import muru
 
+    if environ["PATH_INFO"] == "/print":
+        print("printed by the application", flush=True)
     context = muru.context()
     body = json.dumps(
         {

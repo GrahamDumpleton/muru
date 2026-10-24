@@ -26,10 +26,14 @@ def hooked() -> Iterator[support.Server]:
 
 
 def hook_lines(server: support.Server, name: str) -> list[dict[str, str]]:
+    """The fields of each `HOOK name` line, which workers' lines carry after their tag."""
+
+    marker = f"HOOK {name} "
     lines = []
     for line in server.log().splitlines():
-        if line.startswith(f"HOOK {name} "):
-            lines.append(dict(word.split("=", 1) for word in line.split()[2:]))
+        at = line.find(marker)
+        if at >= 0:
+            lines.append(dict(word.split("=", 1) for word in line[at:].split()[2:]))
     return lines
 
 
@@ -61,6 +65,19 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
     assert info["process_model"] == ("threaded" if gil else "free-threaded")
 
 
+def test_worker_output_is_tagged_with_the_worker(hooked: support.Server) -> None:
+    # Section 11.2: a worker's stderr lines carry its index; its stdout
+    # lines name the stream as well. The host's own lines are untagged.
+    assert hooked.wait_for_log("HOOK post_fork ")
+    log = hooked.log()
+    assert any(line.startswith("muru.worker[0]: HOOK post_fork ") for line in log.splitlines())
+    assert any(line.startswith("muru.worker[1]: HOOK post_fork ") for line in log.splitlines())
+    assert any(line.startswith("HOOK on_load ") for line in log.splitlines())
+    hooked.mark_log()
+    assert hooked.get("/print").status == 200
+    assert hooked.wait_for_log(".stdout: printed by the application")
+
+
 def test_sigusr1_runs_on_reopen_logs(hooked: support.Server) -> None:
     assert hooked.wait_for_log("HOOK on_ready ")
     pid = hooked.worker_pids()[0]
@@ -75,9 +92,9 @@ def test_drain_and_exit_run_on_shutdown(hooked: support.Server) -> None:
     hooked.stop()
     assert len(hook_lines(hooked, "on_drain")) == WORKERS
     assert len(hook_lines(hooked, "on_exit")) == WORKERS
-    for line in hooked.log().splitlines():
-        if line.startswith("HOOK on_drain ") or line.startswith("HOOK on_exit "):
-            assert line.split()[2] != f"pid={hooked.host_pid()}"
+    for name in ("on_drain", "on_exit"):
+        for line in hook_lines(hooked, name):
+            assert line["pid"] != str(hooked.host_pid())
 
 
 def test_unsafe_import_falls_back_to_per_worker_imports() -> None:

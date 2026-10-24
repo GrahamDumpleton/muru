@@ -29,7 +29,7 @@ The dashboard reads the same values from in-memory history. OTLP metric export i
 ## 11.2 Access logs and application logs
 
 - Access logs are structured (JSON by default, or a configurable text format) with request id, host, route, release, group, worker, snapshot version, status and reason, bytes, and timings for queue, application and total, plus internal redirect hops.
-- Worker stdout and stderr are per-worker pipes. The host creates them at fork and passes the read ends to the daemon over the control socket. The log collector tags lines with application, release, group, worker and stream, keeps ring buffers for the CLI and dashboard, and writes sinks. Workers are line-buffered.
+- Worker stdout and stderr are per-worker pipes. The host creates them at fork and passes the read ends to the daemon over the control socket. The log collector tags lines with application, release, group, worker and stream, keeps ring buffers for the CLI and dashboard, and writes sinks. Workers are line-buffered. In development mode there is no collector yet, so the host itself relays the pipes to its standard error, each line tagged with the worker's index and, for stdout, the stream (muru.worker[0]: and muru.worker[0].stdout:).
 - Sinks: terminal (development), journald (default under systemd), files.
 
 ## 11.3 Log rotation

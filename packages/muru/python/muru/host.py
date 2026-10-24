@@ -13,6 +13,10 @@ re-executes itself with per-worker imports. With true such a finding is a
 failure, and with false every worker imports for itself and the check is
 skipped. Hooks come from the module named with --hooks.
 
+Each worker writes to pipes the host created at fork, and the host relays
+every line to its own standard error tagged with the worker's index and
+stream (section 11.2), so output from different workers can be told apart.
+
 One application, a fixed number of workers restarted when they die, and
 shutdown on SIGTERM, SIGINT or when standard input closes, which is how the
 parent `muructl` signals that it has gone away.
@@ -44,6 +48,7 @@ WSGIApplication = Callable[..., Any]
 SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
 PRELOAD_MODES = ("auto", "true", "false")
+READ_SIZE = 65536
 
 
 def log(message: str) -> None:
@@ -116,6 +121,40 @@ class Release:
         return self.hooks
 
 
+@dataclass
+class WorkerOutput:
+    """The read end of one worker's stdout or stderr pipe, relayed line by line."""
+
+    index: int
+    stream: str
+    fd: int
+    pending: bytes = b""
+
+    @property
+    def tag(self) -> str:
+        """The prefix each relayed line carries."""
+
+        suffix = "" if self.stream == "stderr" else f".{self.stream}"
+        return f"muru.worker[{self.index}]{suffix}: "
+
+    def relay(self, data: bytes) -> None:
+        """Write the complete lines in data, keeping any partial line for later."""
+
+        self.pending += data
+        *lines, self.pending = self.pending.split(b"\n")
+        for line in lines:
+            sys.stderr.write(self.tag + line.decode("utf-8", "replace") + "\n")
+        sys.stderr.flush()
+
+    def flush(self) -> None:
+        """Write a final partial line, if any."""
+
+        if self.pending:
+            sys.stderr.write(self.tag + self.pending.decode("utf-8", "replace") + "\n")
+            sys.stderr.flush()
+            self.pending = b""
+
+
 class Host:
     """Preload once, fork workers, and keep them running until told to stop."""
 
@@ -136,6 +175,8 @@ class Host:
         self.stopping = False
         self.restart_after: dict[int, float] = {}
         self.forked_before = False
+        self.selector = selectors.DefaultSelector()
+        self.outputs: dict[int, WorkerOutput] = {}
 
     def socket_path(self, index: int) -> str:
         """Return the Unix socket path, or the TCP address, a worker listens on."""
@@ -158,6 +199,10 @@ class Host:
                 f"forking worker {index} while {threads - 1} other threads are running; "
                 "they do not exist in the worker, so start them from a post_fork hook instead"
             )
+        # Section 11.2: the worker's stdout and stderr are pipes the host
+        # relays with the worker's index, so its lines can be told apart.
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
         # Section 6.2: freeze before every fork so the collector in the
         # worker never touches the objects it inherited.
         gc.freeze()
@@ -165,11 +210,21 @@ class Host:
         if pid == 0:
             status = 1
             try:
+                os.dup2(out_write, 1)
+                os.dup2(err_write, 2)
+                for fd in (out_read, out_write, err_read, err_write, *self.outputs):
+                    os.close(fd)
                 status = self.worker(index)
             except BaseException:
                 traceback.print_exc()
             finally:
                 os._exit(status)
+        os.close(out_write)
+        os.close(err_write)
+        for fd, stream in ((out_read, "stdout"), (err_read, "stderr")):
+            os.set_blocking(fd, False)
+            self.outputs[fd] = WorkerOutput(index, stream, fd)
+            self.selector.register(fd, selectors.EVENT_READ)
         self.workers[pid] = index
         log(f"worker {index} started as pid {pid}")
 
@@ -232,7 +287,7 @@ class Host:
     def run(self) -> int:
         """Supervise the workers until shutdown."""
 
-        selector = selectors.DefaultSelector()
+        selector = self.selector
         wake_read, wake_write = os.pipe()
         os.set_blocking(wake_write, False)
         signal.set_wakeup_fd(wake_write, warn_on_full_buffer=False)
@@ -270,14 +325,40 @@ class Host:
                         self.stopping = True
                         selector.unregister(0)
                         watch_stdin = False
+                elif key.fd in self.outputs:
+                    self.read_output(key.fd)
             self.reap()
             if self.stopping:
                 break
             self.restart_due()
 
         self.terminate_all()
+        for fd in list(self.outputs):
+            self.read_output(fd, until_closed=True)
         signal.set_wakeup_fd(-1)
         return 0
+
+    def read_output(self, fd: int, until_closed: bool = False) -> None:
+        """Relay what a worker has written; close the pipe once it is at end of file."""
+
+        output = self.outputs[fd]
+        while True:
+            try:
+                data = os.read(fd, READ_SIZE)
+            except BlockingIOError:
+                if until_closed:
+                    time.sleep(0.01)
+                    continue
+                return
+            except OSError:
+                data = b""
+            if not data:
+                output.flush()
+                self.selector.unregister(fd)
+                os.close(fd)
+                del self.outputs[fd]
+                return
+            output.relay(data)
 
     def reap(self) -> None:
         """Collect exited workers and schedule their replacement."""
