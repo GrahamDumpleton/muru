@@ -89,4 +89,13 @@ control socket; the daemon adds the workers ready and serves the
 Prometheus text exposition on the `[metrics]` listener or `--metrics` and
 through `muructl metrics`, and a development run serves `/metrics` from
 its dashboard (worker CPU and memory, scaling, edge and TLS metrics and
-OTLP export later). Next from phase 2: the Python logging defaults.
+OTLP export later). The Python logging defaults (section 11.4) are in:
+a `[tool.muru.logging.python]` table or a declared release's
+`logging.python` sets the root level, the platform handler's format
+(`standard`, `json` or a format string), warning capture and named
+loggers' levels, applied by the host before the application is imported
+by replacing `logging.lastResort` so an application's own configuration
+is untouched, published as `MURU_LOG_LEVEL` and `MURU_LOG_FORMAT`, with
+`muru.logging.default_config()` for applications that adopt them (the
+request id on records, daemon-wide defaults and runtime level overrides
+later). Next from phase 2: event webhooks.

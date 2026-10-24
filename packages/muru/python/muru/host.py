@@ -44,6 +44,7 @@ from types import ModuleType
 from typing import Any
 
 from muru import _asgi, preload
+from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
 from muru.hooks import Hooks
@@ -86,6 +87,7 @@ def log(message: str) -> None:
 
 INTERFACES = ("auto", "wsgi", "asgi")
 FACTORY_PHASES = ("worker", "host")
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 def resolve_app(
@@ -934,7 +936,45 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="NAME=PATH=ENTRYPOINT[=INTERFACE]",
         help="a named mount served by another entrypoint at a path (section 6.7)",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=LOG_LEVELS,
+        default=None,
+        help="the root logger's level (section 11.4); Python's WARNING when not given",
+    )
+    parser.add_argument(
+        "--log-format",
+        default=None,
+        metavar="FORMAT",
+        help="standard, json, or a logging format string for loggers without handlers",
+    )
+    parser.add_argument(
+        "--capture-warnings",
+        action="store_true",
+        help="route warnings.warn through the py.warnings logger",
+    )
+    parser.add_argument(
+        "--logger",
+        action="append",
+        default=[],
+        type=parse_logger_level,
+        metavar="NAME=LEVEL",
+        help="a named logger's level",
+    )
     return parser.parse_args(argv)
+
+
+def parse_logger_level(text: str) -> tuple[str, str]:
+    """Parse NAME=LEVEL for --logger."""
+
+    name, separator, level = text.partition("=")
+
+    if not separator or not name or level not in LOG_LEVELS:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not NAME=LEVEL with a level of {', '.join(LOG_LEVELS)}"
+        )
+
+    return name, level
 
 
 def without_preload(argv: list[str]) -> list[str]:
@@ -986,6 +1026,11 @@ def main(argv: list[str] | None = None) -> int:
     except argparse.ArgumentTypeError as error:
         print(f"--mount: {error}", file=sys.stderr)
         return 2
+
+    # Section 11.4: the logging defaults are in place before anything of
+    # the application is imported, and the workers inherit them.
+
+    muru_logging._install(args.log_level, args.log_format, args.capture_warnings, dict(args.logger))
 
     # Section 6.2 step 1: no collections during preload.
 

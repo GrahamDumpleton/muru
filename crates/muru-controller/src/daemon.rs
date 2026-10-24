@@ -69,8 +69,9 @@ pub enum Command {
     Deploy {
         /// The application.
         app: String,
-        /// The spec, resolved by the API from the request and the source.
-        spec: ReleaseSpec,
+        /// The spec, resolved by the API from the request and the source,
+        /// boxed to keep the command small.
+        spec: Box<ReleaseSpec>,
         /// The release id, or none to generate one.
         id: Option<String>,
         /// How long the superseded release stays warm; zero stops it.
@@ -693,7 +694,7 @@ impl Daemon {
                 created,
                 done,
             } => {
-                let outcome = self.deploy(&app, spec, id, retain, created).await;
+                let outcome = self.deploy(&app, *spec, id, retain, created).await;
                 let _ = done.send(outcome);
             }
             Command::Rollback { app, done } => {
@@ -831,6 +832,7 @@ impl Daemon {
             tcp_base_port: None,
             single: false,
             detach_to: Some(self.host_log(app, id)),
+            logging: spec.logging.clone(),
             groups: spec
                 .groups
                 .iter()

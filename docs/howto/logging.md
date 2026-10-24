@@ -6,8 +6,9 @@
 Development mode writes to the terminal, or a file. Under the daemon each
 release and the edge write files in the log directory, `muructl logs`
 shows or follows them, and `muructl logs reopen` works with logrotate.
-Built-in rotation, journald, Python logging defaults and runtime log
-levels are still to come.
+Python's `logging` gets a level and format per release. Built-in
+rotation, journald, the request id on log records and runtime log levels
+are still to come.
 ```
 
 A development run writes two kinds of lines to the terminal: what your
@@ -29,6 +30,49 @@ muru.worker[1].stdout: starting import of catalogue
 Lines from the host itself carry `muru.host[PID]:`, and lines from muructl
 start with `muru:`. Python's `logging` goes to standard error by default
 and so arrives tagged; nothing needs configuring.
+
+## Python logging
+
+Before the application is imported, the host sets the root logger's level
+and replaces `logging.lastResort`, the handler Python falls back on for a
+logger with no handler of its own, with one that writes to standard error
+in the platform format. Nothing else is touched: `basicConfig` and
+`dictConfig` behave exactly as they do without Muru, because the
+last-resort handler is used only where no handler exists.
+
+The settings come from a `[tool.muru.logging.python]` table in
+pyproject.toml or muru.toml, or from the `logging.python` table of a
+declared release, which wins:
+
+```toml
+[tool.muru.logging.python]
+level = "INFO"
+format = "json"
+capture_warnings = true
+loggers = { urllib3 = "WARNING" }
+```
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `level` | `WARNING`, Python's own | the root logger's level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
+| `format` | `standard` | `standard` writes `LEVEL logger: message`; `json` writes one object per record with the time, level, logger, message, application, release, group and worker, and the exception when there is one; anything else is a `logging` format string |
+| `capture_warnings` | `false` | route `warnings.warn` through the `py.warnings` logger |
+| `loggers` | none | levels for named loggers |
+
+A worker's records arrive tagged like the rest of its output, so a
+standard record reads `muru.worker[0]: WARNING demo: warned`. The host
+sets `MURU_LOG_LEVEL` and `MURU_LOG_FORMAT` to what was chosen, and
+`muru.logging.default_config()` returns the same defaults as a
+`dictConfig` dictionary, for an application that configures logging
+itself and wants to start from them:
+
+```python
+import logging.config
+
+import muru
+
+logging.config.dictConfig(muru.logging.default_config())
+```
 
 ## The access log
 

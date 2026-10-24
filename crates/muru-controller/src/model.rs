@@ -164,6 +164,9 @@ pub struct ReleaseSpec {
     /// Named mounts beside the default one at /.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// Python logging defaults (section 11.4).
+    #[serde(default)]
+    pub logging: muru_config::PythonLogging,
 }
 
 /// A release record: its spec, where it is in section 9.1, and why.

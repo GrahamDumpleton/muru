@@ -48,6 +48,8 @@ pub struct HostSpec {
     pub groups: Vec<HostGroup>,
     /// Named mounts beside the default one at / (section 6.7).
     pub mounts: Vec<HostMount>,
+    /// Python logging defaults (section 11.4).
+    pub logging: muru_config::PythonLogging,
 }
 
 /// A named mount, as the host loads it.
@@ -193,6 +195,24 @@ impl HostProcess {
                 "{}={},{},{},{}",
                 group.name, group.processes, group.threads, group.sync_threads, group.concurrency
             ));
+        }
+
+        if let Some(level) = spec.logging.level {
+            command.arg("--log-level").arg(level.as_str());
+        }
+
+        if let Some(format) = &spec.logging.format {
+            command.arg("--log-format").arg(format);
+        }
+
+        if spec.logging.capture_warnings == Some(true) {
+            command.arg("--capture-warnings");
+        }
+
+        for (name, level) in &spec.logging.loggers {
+            command
+                .arg("--logger")
+                .arg(format!("{name}={}", level.as_str()));
         }
 
         let workers = spec.processes

@@ -238,7 +238,13 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         let groups = (!table.groups.is_empty()).then_some(&table.groups);
         let mounts = (!table.mounts.is_empty()).then_some(&table.mounts);
 
-        let spec = match resolve_spec(&request_from(name, table, source), None, groups, mounts) {
+        let spec = match resolve_spec(
+            &request_from(name, table, source),
+            None,
+            groups,
+            mounts,
+            table.logging.as_ref(),
+        ) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -582,6 +588,7 @@ pub fn resolve_spec(
     previous: Option<&ReleaseSpec>,
     groups: Option<&BTreeMap<String, GroupTable>>,
     mounts: Option<&BTreeMap<String, MountTable>>,
+    logging: Option<&muru_config::Logging>,
 ) -> Result<ReleaseSpec, String> {
     let source = Path::new(&request.source);
 
@@ -762,6 +769,10 @@ pub fn resolve_spec(
         factory,
         groups: resolved_groups,
         mounts: resolved_mounts,
+        logging: logging
+            .or(table.logging.as_ref())
+            .and_then(|logging| logging.python.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -874,6 +885,11 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 )
             })
             .collect(),
+        logging: (spec.logging != muru_config::PythonLogging::default()).then(|| {
+            muru_config::Logging {
+                python: Some(spec.logging.clone()),
+            }
+        }),
     }
 }
 
@@ -1034,6 +1050,7 @@ mod tests {
                 python: "/usr/bin/python3".to_owned(),
                 ..Default::default()
             },
+            None,
             None,
             None,
             None,

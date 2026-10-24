@@ -128,7 +128,7 @@ impl Admin for Service {
             .and_then(|app| app.current.or(app.previous))
             .and_then(|id| self.handle.store.release(&request.app, &id).ok())
             .map(|release| release.spec);
-        let spec = config::resolve_spec(&request, previous.as_ref(), None, None)
+        let spec = config::resolve_spec(&request, previous.as_ref(), None, None, None)
             .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -136,7 +136,7 @@ impl Admin for Service {
             .commands
             .send(Command::Deploy {
                 app: request.app.clone(),
-                spec,
+                spec: Box::new(spec),
                 id: (!request.release.is_empty()).then(|| request.release.clone()),
                 retain: request
                     .retain_ms
@@ -641,7 +641,7 @@ impl Service {
             .commands
             .send(Command::Deploy {
                 app: app.to_owned(),
-                spec: spec.clone(),
+                spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
                 retain: crate::daemon::RETENTION,
                 created: created_tx,

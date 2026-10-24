@@ -645,6 +645,8 @@ struct Resolved {
     groups: std::collections::BTreeMap<String, muru_config::Group>,
     /// Named mounts from the table (section 6.7).
     mounts: std::collections::BTreeMap<String, muru_config::Mount>,
+    /// Logging defaults from the table (section 11.4).
+    logging: Option<muru_config::Logging>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -760,6 +762,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         source,
         groups: table.groups,
         mounts: table.mounts,
+        logging: table.logging,
     })
 }
 
@@ -803,6 +806,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         hooks: resolved.hooks.clone(),
         groups: resolved.groups.clone(),
         mounts: resolved.mounts.clone(),
+        logging: resolved.logging.clone(),
     };
     let document = Document {
         listener: listeners,
@@ -1026,6 +1030,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
             })
             .collect(),
+        logging: resolved
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.python.clone())
+            .unwrap_or_default(),
     };
 
     let logs = Logs::default();

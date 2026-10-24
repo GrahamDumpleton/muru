@@ -90,6 +90,30 @@ words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi" });
 words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
 
+/// A Python logging level (section 11.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum LogLevel {
+    /// Everything.
+    Debug,
+    /// Informational messages and above.
+    Info,
+    /// Python's default: warnings and above.
+    Warning,
+    /// Errors and above.
+    Error,
+    /// Only critical messages.
+    Critical,
+}
+
+words!(LogLevel {
+    Debug => "DEBUG",
+    Info => "INFO",
+    Warning => "WARNING",
+    Error => "ERROR",
+    Critical => "CRITICAL",
+});
+
 /// A value that is not one of a setting's accepted words.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{value:?} is not a {setting}: expected one of {}", accepted.join(", "))]
@@ -276,6 +300,39 @@ pub struct Release {
     /// Mounts by name (section 6.7).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mounts: BTreeMap<String, Mount>,
+    /// Logging defaults (section 11.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<Logging>,
+}
+
+/// The `[logging.python]` table (section 11.4): what loggers without
+/// handlers of their own do, set before the application is imported.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonLogging {
+    /// The root logger's level; Python's WARNING when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<LogLevel>,
+    /// The format of the platform handler: standard, json, or a logging
+    /// format string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Whether warnings.warn goes through the py.warnings logger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_warnings: Option<bool>,
+    /// Levels for named loggers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loggers: BTreeMap<String, LogLevel>,
+}
+
+/// The `[logging]` table: the Python logging defaults, with the sinks
+/// and rotation of sections 11.2 and 11.3 to follow.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Logging {
+    /// Python logging defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<PythonLogging>,
 }
 
 /// The `[limits]` table (appendix C): sizes and durations as the
@@ -590,6 +647,9 @@ pub struct ToolMuru {
     /// Mounts by name (section 6.7).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mounts: BTreeMap<String, Mount>,
+    /// Logging defaults (section 11.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<Logging>,
 }
 
 /// Why a project's configuration could not be read.
@@ -809,6 +869,22 @@ mod tests {
         assert!(error.contains("workers"), "{error}");
         let error = parse_pyproject("[tool.muru]\npreload = 'maybe'\n").unwrap_err();
         assert!(error.contains("maybe"), "{error}");
+    }
+
+    #[test]
+    fn logging_defaults_are_a_nested_table() {
+        let table = parse_pyproject(
+            "[tool.muru]\nentrypoint = 'a:b'\n[tool.muru.logging.python]\nlevel = 'INFO'\nformat = 'json'\ncapture_warnings = true\nloggers = { noisy = 'ERROR' }\n",
+        )
+        .unwrap()
+        .unwrap();
+        let python = table.logging.unwrap().python.unwrap();
+        assert_eq!(python.level, Some(LogLevel::Info));
+        assert_eq!(python.format.as_deref(), Some("json"));
+        assert_eq!(python.capture_warnings, Some(true));
+        assert_eq!(python.loggers.get("noisy"), Some(&LogLevel::Error));
+        let error = parse_pyproject("[tool.muru.logging.python]\nlevel = 'loud'\n").unwrap_err();
+        assert!(error.contains("loud"), "{error}");
     }
 
     #[test]

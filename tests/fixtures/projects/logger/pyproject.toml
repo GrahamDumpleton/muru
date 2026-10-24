@@ -1,0 +1,14 @@
+[project]
+name = "logger"
+version = "0.0.0"
+
+[tool.muru]
+entrypoint = "logger.wsgi:application"
+processes = 1
+threads = 2
+
+[tool.muru.logging.python]
+level = "INFO"
+format = "json"
+capture_warnings = true
+loggers = { noisy = "ERROR" }

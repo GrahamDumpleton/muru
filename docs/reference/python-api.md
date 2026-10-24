@@ -4,7 +4,7 @@
 :class: note
 
 This is the runtime library's API as it exists today. The rest of the
-planned API (`muru.loop()`, `muru.asgi`, `muru.uploads`, `muru.logging`,
+planned API (`muru.loop()`, `muru.asgi`, `muru.uploads`,
 `muru.request_id()` and `muru.RequestTimeout`) arrives with the features
 each belongs to; section 6.9 of the design specification lists them.
 ```
@@ -57,6 +57,18 @@ no fork, so `pre_fork` does not run.
 
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
+
+## `muru.logging`
+
+The platform's logging defaults (the [logging guide](../howto/logging.md)
+says how they are set):
+
+| Name | Purpose |
+| --- | --- |
+| `default_config()` | The defaults as a `logging.config.dictConfig` dictionary: the root logger at the level in `MURU_LOG_LEVEL`, with a handler on standard error in the format in `MURU_LOG_FORMAT`. Outside Muru they are `WARNING` and `standard` |
+| `formatter(format)` | The `logging.Formatter` for a format name: `standard`, `json`, or a format string |
+| `JsonFormatter` | The `json` format: one object per record with `time`, `level`, `logger`, `message`, `app`, `release`, `group`, `worker`, and `exception` and `stack` when present |
+| `STANDARD_FORMAT` | The `standard` format string, `%(levelname)s %(name)s: %(message)s` |
 
 ## `muru.__version__`
 

@@ -4,17 +4,19 @@ This package runs inside every Muru host and worker process. It is also safe
 to import outside Muru, where every function returns development defaults, so
 applications can use it unconditionally.
 
-``muru.context()`` says where the code runs; the rest of the API in section
-6.9 of the design specification arrives with the features it belongs to.
+``muru.context()`` says where the code runs and ``muru.logging`` holds the
+platform logging defaults; the rest of the API in section 6.9 of the design
+specification arrives with the features it belongs to.
 """
 
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
+from muru import logging
 from muru._context import Context, context
 
-__all__ = ["Context", "__version__", "context"]
+__all__ = ["Context", "__version__", "context", "logging"]
 
 # The version is written into the wheel metadata by maturin from Cargo.toml.
 # When the package is imported from the source tree without being installed,

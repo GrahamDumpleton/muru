@@ -512,6 +512,7 @@ mod tests {
             factory: None,
             groups: Vec::new(),
             mounts: Vec::new(),
+            logging: Default::default(),
         }
     }
 
