@@ -283,7 +283,9 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
 
     assert scope["type"] == "http"
 
-    path = scope["path"]
+    # Under a mount the path carries root_path, which the routes here ignore.
+
+    path = scope["path"][len(scope.get("root_path", "")) :]
     query = dict(
         part.split("=", 1) for part in scope["query_string"].decode().split("&") if "=" in part
     )

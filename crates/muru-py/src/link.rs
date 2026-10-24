@@ -264,24 +264,31 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         _ => return,
     }
 
-    // Section 5.1: the edge acts on what HELLO declares. A WSGI worker
-    // runs requests on its threads, an ASGI worker on its loop.
+    // Section 5.1: the edge acts on what HELLO declares. A worker whose
+    // default mount is ASGI runs requests on its loop, one whose default
+    // is WSGI on its threads; a worker with mounts of both kinds declares
+    // both, and the edge sizes it by the default mount's capacity.
 
-    let hello = match &shared.asgi {
-        Some(asgi) => pb::Hello {
-            protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-            worker_type: "asgi".to_owned(),
-            async_slots: u32::try_from(asgi.concurrency).unwrap_or(u32::MAX),
-            websockets: true,
-            max_message_size: MAX_MESSAGE_SIZE,
-            ..Default::default()
+    let default_is_asgi = shared
+        .asgi
+        .as_ref()
+        .is_some_and(|asgi| asgi.runner.is_some());
+    let hello = pb::Hello {
+        protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+        worker_type: if default_is_asgi { "asgi" } else { "wsgi" }.to_owned(),
+        slots: if default_is_asgi {
+            0
+        } else {
+            u32::try_from(shared.threads).unwrap_or(u32::MAX)
         },
-        None => pb::Hello {
-            protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-            worker_type: "wsgi".to_owned(),
-            slots: u32::try_from(shared.threads).unwrap_or(u32::MAX),
-            ..Default::default()
-        },
+        async_slots: shared
+            .asgi
+            .as_ref()
+            .map(|asgi| u32::try_from(asgi.concurrency).unwrap_or(u32::MAX))
+            .unwrap_or_default(),
+        websockets: shared.asgi.is_some(),
+        max_message_size: MAX_MESSAGE_SIZE,
+        ..Default::default()
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -372,10 +379,21 @@ async fn handle_request(
     request_end: bool,
     shared: &Arc<Shared>,
 ) -> io::Result<Option<frame::Frame>> {
-    if let Some(asgi) = &shared.asgi {
-        return handle_asgi_request(reader, writer, head, request_end, shared, asgi).await;
+    // Section 6.7: the head names the mount; an ASGI mount's request
+    // goes to the loop, a WSGI mount's to the thread pool.
+
+    let Some(mount) = shared.mount(&head.mount) else {
+        return Err(io::Error::other(format!(
+            "the edge asked for a mount this worker does not have: {:?}",
+            head.mount
+        )));
+    };
+
+    if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner) {
+        return handle_asgi_request(reader, writer, head, request_end, shared, asgi, runner).await;
     }
 
+    let app = mount.app;
     let cancelled = Arc::new(AtomicBool::new(false));
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
@@ -384,7 +402,15 @@ async fn handle_request(
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
-        wsgi::run(py, &worker_shared, head, body_rx, out_tx, worker_cancelled);
+        wsgi::run(
+            py,
+            &worker_shared,
+            &app,
+            head,
+            body_rx,
+            out_tx,
+            worker_cancelled,
+        );
         worker_shared.request_finished();
     }));
 
@@ -484,6 +510,7 @@ async fn handle_asgi_request(
     request_end: bool,
     shared: &Arc<Shared>,
     asgi: &asgi::Asgi,
+    runner: Py<PyAny>,
 ) -> io::Result<Option<frame::Frame>> {
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
@@ -493,7 +520,7 @@ async fn handle_asgi_request(
 
     shared.request_started();
 
-    let channel = match asgi::start(shared, asgi, &head, out_tx) {
+    let channel = match asgi::start(shared, asgi, &runner, &head, out_tx) {
         Ok(channel) => channel,
         Err(error) => {
             shared.request_finished();

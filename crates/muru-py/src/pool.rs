@@ -9,6 +9,7 @@
 //! the thread's context variables, so values set during one request are gone
 //! when the next request runs on the same thread.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -22,10 +23,31 @@ use crate::asgi::Asgi;
 /// A unit of work for an application thread.
 pub type Job = Box<dyn for<'py> FnOnce(Python<'py>) + Send + 'static>;
 
+/// One mount of a release (section 6.7): its application and, for an
+/// ASGI mount, the runner scheduled on the loop for each request.
+pub struct Mount {
+    /// The application callable.
+    pub app: Py<PyAny>,
+    /// The runner, when the mount is ASGI.
+    pub runner: Option<Py<PyAny>>,
+}
+
+impl Mount {
+    /// A new reference to the same mount.
+    pub fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            app: self.app.clone_ref(py),
+            runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
+        }
+    }
+}
+
 /// State shared by every request handled by this worker.
 pub struct Shared {
-    /// The WSGI application callable.
+    /// The default mount's application callable, at /.
     pub app: Py<PyAny>,
+    /// The named mounts (section 6.7), by name.
+    pub mounts: HashMap<String, Mount>,
     /// The `wsgi.errors` stream (sys.stderr at start-up).
     pub errors: Py<PyAny>,
     /// Application threads, which is also the slot count announced in HELLO.
@@ -44,6 +66,7 @@ impl Shared {
     /// Create the shared state for one worker, starting its thread pool.
     pub fn new(
         app: Py<PyAny>,
+        mounts: HashMap<String, Mount>,
         errors: Py<PyAny>,
         threads: usize,
         multiprocess: bool,
@@ -52,6 +75,7 @@ impl Shared {
         let threads = threads.max(1);
         Ok(Self {
             app,
+            mounts,
             errors,
             threads,
             multiprocess,
@@ -60,6 +84,23 @@ impl Shared {
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
         })
+    }
+
+    /// The application a request head names: the default mount for an
+    /// empty name, else the mount of that name.
+    pub fn mount(&self, name: &str) -> Option<Mount> {
+        if name.is_empty() {
+            return Some(Mount {
+                app: Python::attach(|py| self.app.clone_ref(py)),
+                runner: self.asgi.as_ref().and_then(|asgi| {
+                    Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
+                }),
+            });
+        }
+
+        self.mounts
+            .get(name)
+            .map(|mount| Python::attach(|py| mount.clone_ref(py)))
     }
 
     /// Count a request as started.

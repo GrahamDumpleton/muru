@@ -258,6 +258,34 @@ class WorkerOutput:
             self.pending = b""
 
 
+@dataclass
+class Mount:
+    """A named mount (section 6.7): a path served by another entrypoint.
+
+    The mount's application is loaded and realised like the release's own,
+    without hooks of its own, and shares the worker's threads and loop.
+    """
+
+    name: str
+    path: str
+    release: Release
+
+    @classmethod
+    def parse(cls, text: str, context: Context, threads: int) -> Mount:
+        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE]."""
+
+        parts = text.split("=")
+        if len(parts) not in (3, 4) or not parts[0] or not parts[1].startswith("/"):
+            raise argparse.ArgumentTypeError(f"{text!r} is not NAME=PATH=ENTRYPOINT[=INTERFACE]")
+
+        interface = parts[3] if len(parts) == 4 else "auto"
+        if interface not in INTERFACES:
+            raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
+
+        release = Release(parts[2], None, context, threads=threads, interface=interface)
+        return cls(parts[0], parts[1], release)
+
+
 @dataclass(frozen=True)
 class Group:
     """A worker group (section 7.1): its name and sizes.
@@ -305,8 +333,10 @@ class Host:
         concurrency: int = 1000,
         detach: bool = False,
         groups: list[Group] | None = None,
+        mounts: list[Mount] | None = None,
     ) -> None:
         self.release = release
+        self.mounts = mounts or []
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
@@ -453,6 +483,8 @@ class Host:
 
                 started = time.monotonic()
                 hooks = release.load()
+                for mount in self.mounts:
+                    mount.release.load()
                 log(f"worker {index} imported {release.spec} in {elapsed_ms(started)} ms")
                 hooks.call("on_load", context)
                 hooks.call("pre_fork", context)
@@ -469,14 +501,38 @@ class Host:
             if not known and release.resolved is not None:
                 log(f"worker {index} serves {release.spec} as {release.resolved.upper()}")
 
-            # Section 6.6: one event loop per worker, started after the
-            # fork, and lifespan startup before the worker is ready.
+            # Section 6.7: each mount's application is realised like the
+            # release's own; section 6.6: one event loop per worker when
+            # any of them is ASGI, started after the fork, with lifespan
+            # startup for each ASGI application before the worker is ready.
 
-            if release.resolved == "asgi":
+            realised = [
+                (mount.name, mount.release.realise(), mount.release) for mount in self.mounts
+            ]
+            any_asgi = release.resolved == "asgi" or any(
+                mounted.resolved == "asgi" for _, _, mounted in realised
+            )
+
+            if any_asgi:
                 loop = _asgi.Loop(group.sync_threads)
                 loop.start()
+
+            if loop is not None and release.resolved == "asgi":
                 lifespan = _asgi.Lifespan(app, loop, release.spec)
                 lifespan.startup()
+
+            lifespans: list[_asgi.Lifespan] = []
+            served_mounts: list[tuple[str, Any, Any]] = []
+
+            for name, mounted_app, mounted in realised:
+                if loop is not None and mounted.resolved == "asgi":
+                    mounted_lifespan = _asgi.Lifespan(mounted_app, loop, mounted.spec)
+                    mounted_lifespan.startup()
+                    lifespans.append(mounted_lifespan)
+                    runner = _asgi.runner(mounted_app, loop, mounted_lifespan.state)
+                    served_mounts.append((name, mounted_app, runner))
+                else:
+                    served_mounts.append((name, mounted_app, None))
 
             hooks.call("on_ready", context)
         except Exception as error:
@@ -489,24 +545,26 @@ class Host:
         from muru import _native
 
         def on_exit() -> None:
-            """Run lifespan shutdown and the hook, then stop the loop."""
+            """Run lifespan shutdown for every ASGI application and the hook, then stop the loop."""
 
+            for mounted_lifespan in lifespans:
+                mounted_lifespan.shutdown()
             if lifespan is not None:
                 lifespan.shutdown()
             hooks.call_logged("on_exit", context)
             if loop is not None:
                 loop.stop()
 
-        # An ASGI worker hands the extension its loop and the request runner.
+        # A worker with any ASGI application hands the extension its loop,
+        # and the request runner when the default mount is ASGI.
 
         asgi_arguments: dict[str, Any] = {}
 
+        if loop is not None:
+            asgi_arguments = {"event_loop": loop.loop, "concurrency": group.concurrency}
+
         if loop is not None and lifespan is not None:
-            asgi_arguments = {
-                "event_loop": loop.loop,
-                "runner": _asgi.runner(app, loop, lifespan.state),
-                "concurrency": group.concurrency,
-            }
+            asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
 
         try:
             _native.serve(
@@ -519,6 +577,7 @@ class Host:
                 on_exit=on_exit,
                 on_reopen_logs=lambda: hooks.call_logged("on_reopen_logs", context),
                 lifeline=lifeline,
+                mounts=served_mounts,
                 **asgi_arguments,
             )
         except Exception as error:
@@ -799,6 +858,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY",
         help="a named worker group beside the default one (section 7.1)",
     )
+    parser.add_argument(
+        "--mount",
+        action="append",
+        default=[],
+        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE]",
+        help="a named mount served by another entrypoint at a path (section 6.7)",
+    )
     return parser.parse_args(argv)
 
 
@@ -846,6 +912,12 @@ def main(argv: list[str] | None = None) -> int:
         factory_phase=args.factory_phase,
     )
 
+    try:
+        mounts = [Mount.parse(text, context, args.threads) for text in args.mount]
+    except argparse.ArgumentTypeError as error:
+        print(f"--mount: {error}", file=sys.stderr)
+        return 2
+
     # Section 6.2 step 1: no collections during preload.
 
     gc.disable()
@@ -856,6 +928,8 @@ def main(argv: list[str] | None = None) -> int:
         with preload.ImportRecorder() as recorder:
             try:
                 hooks = release.load(recorder)
+                for mount in mounts:
+                    mount.release.load(recorder)
             except Exception as error:
                 log(f"cannot load {args.app}: {error.__class__.__name__}: {error}")
                 return 1
@@ -913,6 +987,7 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.concurrency,
         detach=args.detach,
         groups=args.group,
+        mounts=mounts,
     )
 
     if args.single:

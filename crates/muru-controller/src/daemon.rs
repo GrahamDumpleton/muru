@@ -739,6 +739,16 @@ impl Daemon {
                     concurrency: group.concurrency as usize,
                 })
                 .collect(),
+            mounts: spec
+                .mounts
+                .iter()
+                .map(|mount| crate::host::HostMount {
+                    name: mount.name.clone(),
+                    path: mount.path.clone(),
+                    entrypoint: mount.entrypoint.clone(),
+                    interface: mount.interface,
+                })
+                .collect(),
         };
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let started = Instant::now();
@@ -876,6 +886,21 @@ impl Daemon {
                                 .collect(),
                         })
                         .collect(),
+                    mounts: self
+                        .store
+                        .release(name, id)
+                        .map(|release| {
+                            release
+                                .spec
+                                .mounts
+                                .iter()
+                                .map(|mount| pb::Mount {
+                                    name: mount.name.clone(),
+                                    path: mount.path.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 });
             }
         }

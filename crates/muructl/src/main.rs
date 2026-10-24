@@ -624,6 +624,8 @@ struct Resolved {
     source: Option<PathBuf>,
     /// Named worker groups from the table (section 7.1).
     groups: std::collections::BTreeMap<String, muru_config::Group>,
+    /// Named mounts from the table (section 6.7).
+    mounts: std::collections::BTreeMap<String, muru_config::Mount>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -738,6 +740,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         project,
         source,
         groups: table.groups,
+        mounts: table.mounts,
     })
 }
 
@@ -780,6 +783,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         preload: Some(resolved.preload),
         hooks: resolved.hooks.clone(),
         groups: resolved.groups.clone(),
+        mounts: resolved.mounts.clone(),
     };
     let document = Document {
         listener: listeners,
@@ -824,6 +828,19 @@ fn group_sockets(
                 .map(|group| group.paths.clone())
                 .unwrap_or_default(),
             sockets: sockets.clone(),
+        })
+        .collect()
+}
+
+/// The named mounts as the edge selects them.
+fn mount_paths(
+    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
+) -> Vec<muru_edge::routing::MountPath> {
+    mounts
+        .iter()
+        .map(|(name, mount)| muru_edge::routing::MountPath {
+            name: name.clone(),
+            path: mount.path.clone(),
         })
         .collect()
 }
@@ -980,10 +997,21 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 concurrency: group.concurrency.unwrap_or(resolved.concurrency),
             })
             .collect(),
+        mounts: resolved
+            .mounts
+            .iter()
+            .map(|(name, mount)| muru_controller::host::HostMount {
+                name: name.clone(),
+                path: mount.path.clone(),
+                entrypoint: mount.entrypoint.clone(),
+                interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+            })
+            .collect(),
     };
 
     let logs = Logs::default();
     let group_tables = resolved.groups.clone();
+    let mount_tables = resolved.mounts.clone();
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -998,6 +1026,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         listen: http_address,
         sockets: current.default_sockets(),
         groups: group_sockets(&current, &resolved.groups),
+        mounts: mount_paths(&resolved.mounts),
         development,
         access_log,
         limits: limits(&args),
@@ -1164,6 +1193,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 let connected = muru_edge::routing::AppPools::connect(
                                     &next.default_sockets(),
                                     &group_sockets(&next, &group_tables),
+                                &mount_paths(&mount_tables),
                                 )
                                 .await;
 

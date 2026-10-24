@@ -29,8 +29,9 @@ use crate::wsgi::{self, Outgoing};
 pub struct Asgi {
     /// The worker's asyncio event loop, running on its own thread.
     pub event_loop: Py<PyAny>,
-    /// Called on the loop with (scope, channel) to start a request's task.
-    pub runner: Py<PyAny>,
+    /// Called on the loop with (scope, channel) to start a request's task
+    /// on the default mount, when that mount is ASGI.
+    pub runner: Option<Py<PyAny>>,
     /// Completes a future with a value unless it is already done.
     pub resolver: Py<PyAny>,
     /// How many requests the loop holds at once: the async slots in HELLO.
@@ -963,6 +964,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 pub fn start(
     shared: &Shared,
     asgi: &Asgi,
+    runner: &Py<PyAny>,
     head: &pb::RequestHead,
     tx: mpsc::Sender<Outgoing>,
 ) -> Result<Py<Channel>, String> {
@@ -974,10 +976,7 @@ pub fn start(
 
         asgi.event_loop
             .bind(py)
-            .call_method1(
-                "call_soon_threadsafe",
-                (asgi.runner.bind(py), scope, &channel),
-            )
+            .call_method1("call_soon_threadsafe", (runner.bind(py), scope, &channel))
             .map_err(|error| error.to_string())?;
         Ok(channel.unbind())
     })

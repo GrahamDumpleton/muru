@@ -50,6 +50,8 @@ pub struct Config {
     pub sockets: Vec<PathBuf>,
     /// The named worker groups, with the paths that select them.
     pub groups: Vec<routing::GroupSockets>,
+    /// The named mounts, with the paths that select them.
+    pub mounts: Vec<routing::MountPath>,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
     /// Where the access log goes and what it leaves out.
@@ -238,7 +240,7 @@ impl Edge {
     ) -> anyhow::Result<Self> {
         let pools = Arc::new(Pools {
             current: RwLock::new(Arc::new(routing::Routing::single(
-                routing::AppPools::connect(&config.sockets, &config.groups).await?,
+                routing::AppPools::connect(&config.sockets, &config.groups, &config.mounts).await?,
             ))),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
@@ -443,6 +445,8 @@ async fn serve<I>(
                 access_log: Arc::clone(&shared.access_log),
                 limits: Arc::clone(&shared.limits),
                 server_name: None,
+                mount: String::new(),
+                mount_path: String::new(),
                 forwarded_host: forwarded.host.clone(),
                 forwarded_port: forwarded.port,
                 prefix: forwarded.prefix.clone(),
@@ -470,9 +474,17 @@ async fn serve<I>(
 
             let mut response = match (redirect_to, decision) {
                 (Some(to), _) => link::redirect_to_https(request, &context, to),
-                (None, routing::Decision::Serve { pool, server_name }) => {
+                (
+                    None,
+                    routing::Decision::Serve {
+                        selection,
+                        server_name,
+                    },
+                ) => {
                     context.server_name = server_name;
-                    link::handle(request, pool, &context).await
+                    context.mount = selection.mount;
+                    context.mount_path = selection.script_name;
+                    link::handle(request, selection.pool, &context).await
                 }
                 (None, routing::Decision::Redirect) => link::redirect_to_https(
                     request,
@@ -594,12 +606,19 @@ pub(crate) fn request_head(
     let replaces_host = context.forwarded_host.is_some();
 
     // A prefix the proxy stripped is put back, so SCRIPT_NAME and
-    // PATH_INFO (ASGI root_path and path) come out as the client sent them.
+    // PATH_INFO (ASGI root_path and path) come out as the client sent
+    // them; the mount's path joins it as SCRIPT_NAME (section 6.7).
 
     let raw_path = match &context.prefix {
         Some(prefix) => Bytes::from(format!("{prefix}{}", parts.uri.path())),
         None => Bytes::copy_from_slice(parts.uri.path().as_bytes()),
     };
+
+    let script_name = format!(
+        "{}{}",
+        context.prefix.as_deref().unwrap_or_default(),
+        context.mount_path
+    );
 
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
@@ -607,7 +626,8 @@ pub(crate) fn request_head(
         method: parts.method.as_str().to_owned(),
         scheme: context.scheme.to_owned(),
         raw_path,
-        script_name: context.prefix.clone().unwrap_or_default(),
+        script_name,
+        mount: context.mount.clone(),
         query: parts
             .uri
             .query()

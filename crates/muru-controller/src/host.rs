@@ -46,6 +46,21 @@ pub struct HostSpec {
     pub detach_to: Option<PathBuf>,
     /// Named worker groups beside the default one (section 7.1).
     pub groups: Vec<HostGroup>,
+    /// Named mounts beside the default one at / (section 6.7).
+    pub mounts: Vec<HostMount>,
+}
+
+/// A named mount, as the host loads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMount {
+    /// The mount's name.
+    pub name: String,
+    /// The path prefix.
+    pub path: String,
+    /// The application as module:callable.
+    pub entrypoint: String,
+    /// The interface the entrypoint speaks.
+    pub interface: muru_config::Interface,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -161,6 +176,16 @@ impl HostProcess {
 
         if spec.detach_to.is_some() {
             command.arg("--detach");
+        }
+
+        for mount in &spec.mounts {
+            command.arg("--mount").arg(format!(
+                "{}={}={}={}",
+                mount.name,
+                mount.path,
+                mount.entrypoint,
+                mount.interface.as_str()
+            ));
         }
 
         for group in &spec.groups {

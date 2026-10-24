@@ -10,5 +10,7 @@ sections 6.8 and 13.1):
   ASGI callables for the phase 1 refusal.
 - `grouped/`: a muru.toml declaring worker groups (section 7.1), whose
   application reports the group and worker that served each request.
+- `mounted/`: a muru.toml with a WSGI default entrypoint and ASGI and WSGI
+  mounts (section 6.7), each reporting the paths it saw.
 
 Run one directly with `muructl run tests/fixtures/projects/shop`.

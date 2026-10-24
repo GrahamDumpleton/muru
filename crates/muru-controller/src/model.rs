@@ -100,6 +100,20 @@ impl FromStr for ReleaseState {
     }
 }
 
+/// A mount of a release (section 6.7): a path served by another
+/// entrypoint in the same workers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountSpec {
+    /// The mount's name.
+    pub name: String,
+    /// The path prefix.
+    pub path: String,
+    /// The application as module:callable.
+    pub entrypoint: String,
+    /// The interface, auto when detected.
+    pub interface: Interface,
+}
+
 /// A worker group of a release (section 7.1): its paths and sizes. The
 /// default group is the release's own settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +161,9 @@ pub struct ReleaseSpec {
     /// Named worker groups beside the default one.
     #[serde(default)]
     pub groups: Vec<GroupSpec>,
+    /// Named mounts beside the default one at /.
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
 }
 
 /// A release record: its spec, where it is in section 9.1, and why.

@@ -18,6 +18,7 @@ def serve(
     on_exit: Callable[[], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
     lifeline: int | None = None,
+    mounts: list[tuple[str, Callable[..., Any], Callable[[Any, Channel], None] | None]] = [],
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -29,7 +30,9 @@ def serve(
     before the requests in flight finish, on_exit after they have, and
     on_reopen_logs whenever SIGUSR1 arrives. lifeline is a file descriptor
     whose end of file also stops the server: the read end of a pipe whose
-    write end the host holds, so a worker never outlives its host.
+    write end the host holds, so a worker never outlives its host. mounts
+    are the named mounts as (name, application, runner) tuples, the runner
+    None for a WSGI mount; event_loop is needed when any mount is ASGI.
     """
 
 def resolve_future(future: Any, value: Any) -> None:

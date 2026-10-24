@@ -7,7 +7,6 @@ Still to be written, as their features land:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Running under systemd.
-- Mounts.
 - Uploads and authorised downloads (internal redirects), including upload adapters for Django, Flask and Starlette.
 - Custom error pages and maintenance mode.
 - Scaling, schedules and memory limits.
@@ -28,6 +27,7 @@ daemon
 virtual-hosts
 behind-a-proxy
 worker-groups
+mounts
 https
 timeouts
 logging

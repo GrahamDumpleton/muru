@@ -184,6 +184,22 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// A mount, the `[app.NAME.release.ID.mounts.NAME]` or
+/// `[tool.muru.mounts.NAME]` table (section 6.7): a path served by another
+/// entrypoint in the same workers. The release's own entrypoint is the
+/// default mount at /.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mount {
+    /// The path prefix; the longest wins, on segment boundaries.
+    pub path: String,
+    /// The application as module:callable.
+    pub entrypoint: String,
+    /// The interface, when declared rather than detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<Interface>,
+}
+
 /// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
 /// `[tool.muru.groups.NAME]` table (section 7.1): the paths it serves
 /// and its own sizes. Paths not claimed by a group go to the default
@@ -257,6 +273,9 @@ pub struct Release {
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
+    /// Mounts by name (section 6.7).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mounts: BTreeMap<String, Mount>,
 }
 
 /// The `[limits]` table (appendix C): sizes and durations as the
@@ -550,6 +569,9 @@ pub struct ToolMuru {
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
+    /// Mounts by name (section 6.7).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mounts: BTreeMap<String, Mount>,
 }
 
 /// Why a project's configuration could not be read.

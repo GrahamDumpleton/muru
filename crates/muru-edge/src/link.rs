@@ -426,6 +426,10 @@ pub struct Context<'a> {
     pub forwarded_port: Option<u16>,
     /// The path prefix a trusted proxy stripped, for SCRIPT_NAME.
     pub prefix: Option<String>,
+    /// The mount the request goes to, empty for the default (section 6.7).
+    pub mount: String,
+    /// The mount's path, joined to SCRIPT_NAME.
+    pub mount_path: String,
 }
 
 /// The access log record of a request in progress.

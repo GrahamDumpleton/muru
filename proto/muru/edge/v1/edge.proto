@@ -66,6 +66,12 @@ message AppWorkers {
   string app = 1;
   repeated string sockets = 2;
   repeated Group groups = 3;
+  repeated Mount mounts = 4;            // named mounts of the serving release (section 6.7)
+}
+
+message Mount {
+  string name = 1;
+  string path = 2;                      // the prefix; the default mount is at /
 }
 
 message Group {

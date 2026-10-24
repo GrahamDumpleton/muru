@@ -1,0 +1,1 @@
+Mounts: `[mounts.NAME]` tables in `[tool.muru]` or under a declared release serve other entrypoints at path prefixes from the same workers, any mix of WSGI and ASGI, with the mount's path as `SCRIPT_NAME` or `root_path`.

@@ -794,6 +794,7 @@ fn build_environ<'py>(
 pub fn run(
     py: Python<'_>,
     shared: &Shared,
+    app: &Py<PyAny>,
     head: pb::RequestHead,
     body_rx: mpsc::Receiver<Bytes>,
     tx: mpsc::Sender<Outgoing>,
@@ -813,6 +814,7 @@ pub fn run(
     if let Err(error) = run_app(
         py,
         shared,
+        app,
         &head,
         body_rx,
         announce,
@@ -841,9 +843,11 @@ pub fn run(
     sink.send(py, Outgoing::Finished);
 }
 
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 fn run_app<'py>(
     py: Python<'py>,
     shared: &Shared,
+    app: &Py<PyAny>,
     head: &pb::RequestHead,
     body_rx: mpsc::Receiver<Bytes>,
     announce: Option<mpsc::Sender<Outgoing>>,
@@ -852,7 +856,7 @@ fn run_app<'py>(
 ) -> PyResult<()> {
     let input = Bound::new(py, Input::new(body_rx, announce))?;
     let environ = build_environ(py, shared, head, input)?;
-    let result = shared.app.bind(py).call1((environ, start_response))?;
+    let result = app.bind(py).call1((environ, start_response))?;
     let outcome = iterate(py, &result, start_response.get(), cancelled);
 
     // PEP 3333: close() is called whether or not the iteration completed.

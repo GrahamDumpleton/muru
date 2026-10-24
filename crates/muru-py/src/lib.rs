@@ -40,11 +40,14 @@ fn version() -> &'static str {
 /// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3). `lifeline` is
 /// a descriptor whose end of file also stops the server: the read end of a
 /// pipe the host holds the write end of, so a worker never outlives it.
+/// `mounts` are the named mounts (section 6.7) as (name, application,
+/// runner) tuples, the runner None for a WSGI mount; `event_loop` is
+/// needed when any mount is ASGI, `runner` when the default one is.
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new()))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -58,13 +61,15 @@ fn serve(
     on_exit: Option<Py<PyAny>>,
     on_reopen_logs: Option<Py<PyAny>>,
     lifeline: Option<i32>,
+    mounts: Vec<(String, Py<PyAny>, Option<Py<PyAny>>)>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
-    // The loop and the runner come together, or not at all.
+    // A runner needs the loop; the loop alone serves ASGI mounts beside a
+    // WSGI default.
 
     let asgi = match (event_loop, runner) {
-        (Some(event_loop), Some(runner)) => Some(asgi::Asgi {
+        (Some(event_loop), runner) => Some(asgi::Asgi {
             event_loop,
             runner,
             resolver: wrap_pyfunction!(asgi::resolve_future, py)?
@@ -72,15 +77,25 @@ fn serve(
                 .into_any(),
             concurrency: concurrency.max(1),
         }),
-        (None, None) => None,
-        _ => {
-            return Err(PyTypeError::new_err(
-                "event_loop and runner must be given together",
-            ));
+        (None, Some(_)) => {
+            return Err(PyTypeError::new_err("a runner needs an event_loop"));
         }
+        (None, None) => None,
     };
 
-    let shared = pool::Shared::new(app, errors, threads, multiprocess, asgi)
+    let mut named = std::collections::HashMap::new();
+
+    for (name, app, runner) in mounts {
+        if runner.is_some() && asgi.is_none() {
+            return Err(PyTypeError::new_err(format!(
+                "mount {name:?} is ASGI, so an event_loop is needed"
+            )));
+        }
+
+        named.insert(name, pool::Mount { app, runner });
+    }
+
+    let shared = pool::Shared::new(app, named, errors, threads, multiprocess, asgi)
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let shared = Arc::new(shared);
     let lifecycle = link::Lifecycle {

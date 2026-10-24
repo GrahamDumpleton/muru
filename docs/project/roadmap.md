@@ -66,5 +66,12 @@ or the release's `groups` tables, forked from one host with the group in
 each worker's context and MURU_GROUP, their sockets carried per group in
 the snapshot and chosen at the edge by the most specific path, in
 development mode and under the daemon (scaling modes, per-group timeouts
-and memory policy, match lists and optional groups later). Next from
-phase 2: mounts, then the metrics and logs.
+and memory policy, match lists and optional groups later). Mounts
+(section 6.7) are in: named mounts at path prefixes from
+`[tool.muru.mounts]` or the release's `mounts` tables, any mix of WSGI
+and ASGI loaded in the same workers from one preload, each ASGI
+application with its own lifespan on the worker's one loop, the mount
+chosen at the edge by the longest prefix and named in the request head,
+with its path as SCRIPT_NAME or root_path (per-mount pools, internal
+mounts and the groups `mounts` subset later). Next from phase 2: the
+metrics and logs.

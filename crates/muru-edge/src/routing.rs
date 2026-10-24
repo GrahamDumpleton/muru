@@ -48,11 +48,33 @@ pub struct GroupSockets {
     pub sockets: Vec<std::path::PathBuf>,
 }
 
+/// A named mount of a release, as a snapshot or a development run names it.
+#[derive(Debug, Clone)]
+pub struct MountPath {
+    /// The mount's name, as the request head carries it.
+    pub name: String,
+    /// The path prefix it serves.
+    pub path: String,
+}
+
+/// Where a request goes within an application: the group's pool and the
+/// mount, with the prefix the application sees as SCRIPT_NAME.
+pub struct Selection {
+    /// The workers.
+    pub pool: Arc<LinkPool>,
+    /// The mount's name, empty for the default mount.
+    pub mount: String,
+    /// The mount's path, empty for the default mount.
+    pub script_name: String,
+}
+
 /// An application's connected workers: the default group and the named
-/// groups, each with the paths that select it, most specific first.
+/// groups, each with the paths that select it, most specific first, and
+/// the mounts, longest prefix first.
 pub struct AppPools {
     default: Arc<LinkPool>,
     groups: Vec<(String, Arc<LinkPool>)>,
+    mounts: Vec<MountPath>,
 }
 
 impl AppPools {
@@ -60,6 +82,7 @@ impl AppPools {
     pub async fn connect(
         default: &[std::path::PathBuf],
         groups: &[GroupSockets],
+        mounts: &[MountPath],
     ) -> anyhow::Result<Self> {
         let default = Arc::new(LinkPool::connect(default).await?);
         let mut connected = Vec::new();
@@ -73,29 +96,51 @@ impl AppPools {
         }
 
         connected.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        let mut mounts: Vec<MountPath> = mounts
+            .iter()
+            .map(|mount| MountPath {
+                name: mount.name.clone(),
+                path: group_prefix(&mount.path),
+            })
+            .collect();
+        mounts.sort_by_key(|mount| std::cmp::Reverse(mount.path.len()));
 
         Ok(Self {
             default,
             groups: connected,
+            mounts,
         })
     }
 
-    /// A single pool with no groups.
+    /// A single pool with no groups or mounts.
     pub fn single(pool: LinkPool) -> Self {
         Self {
             default: Arc::new(pool),
             groups: Vec::new(),
+            mounts: Vec::new(),
         }
     }
 
-    /// The pool a path goes to: the most specific group path, else the
-    /// default group.
-    pub fn select(&self, path: &str) -> Arc<LinkPool> {
-        self.groups
+    /// Where a path goes: the most specific group path's pool, else the
+    /// default group's, and the longest mount prefix, else the default
+    /// mount (section 6.7).
+    pub fn select(&self, path: &str) -> Selection {
+        let pool = self
+            .groups
             .iter()
             .find(|(prefix, _)| prefix_matches(prefix, path))
             .map(|(_, pool)| Arc::clone(pool))
-            .unwrap_or_else(|| Arc::clone(&self.default))
+            .unwrap_or_else(|| Arc::clone(&self.default));
+        let mount = self
+            .mounts
+            .iter()
+            .find(|mount| prefix_matches(&mount.path, path));
+
+        Selection {
+            pool,
+            mount: mount.map(|mount| mount.name.clone()).unwrap_or_default(),
+            script_name: mount.map(|mount| mount.path.clone()).unwrap_or_default(),
+        }
     }
 
     /// The default group's pool.
@@ -137,10 +182,11 @@ pub struct Routing {
 
 /// Where a request goes.
 pub enum Decision {
-    /// To this pool, with the name the application sees as SERVER_NAME.
+    /// To this pool and mount, with the name the application sees as
+    /// SERVER_NAME.
     Serve {
-        /// The application's workers.
-        pool: Arc<LinkPool>,
+        /// The group's workers and the mount.
+        selection: Selection,
         /// The matched or canonical host name, when a host matched.
         server_name: Option<String>,
     },
@@ -181,14 +227,17 @@ impl Routing {
             .find(|app| app.sockets == snapshot.worker_sockets);
 
         let default = match default_app {
-            Some(app) => AppPools::connect(&paths(&app.sockets), &groups_of(app)).await?,
+            Some(app) => {
+                AppPools::connect(&paths(&app.sockets), &groups_of(app), &mounts_of(app)).await?
+            }
             None => AppPools::single(LinkPool::connect(&paths(&snapshot.worker_sockets)).await?),
         };
 
         let mut apps = HashMap::new();
 
         for app in &snapshot.apps {
-            let pools = AppPools::connect(&paths(&app.sockets), &groups_of(app)).await?;
+            let pools =
+                AppPools::connect(&paths(&app.sockets), &groups_of(app), &mounts_of(app)).await?;
             apps.insert(app.app.clone(), Arc::new(pools));
         }
 
@@ -299,7 +348,7 @@ impl Routing {
     pub fn select(&self, name: Option<&str>, path: &str, listener: &str, tls: bool) -> Decision {
         if self.hosts.is_empty() {
             return Decision::Serve {
-                pool: self.default.select(path),
+                selection: self.default.select(path),
                 server_name: None,
             };
         }
@@ -320,11 +369,15 @@ impl Routing {
             return Decision::NoRoute;
         };
 
-        let pool = self
+        let selection = self
             .apps
             .get(&route.app)
             .map(|pools| pools.select(path))
-            .unwrap_or_else(|| Arc::new(LinkPool::empty()));
+            .unwrap_or_else(|| Selection {
+                pool: Arc::new(LinkPool::empty()),
+                mount: String::new(),
+                script_name: String::new(),
+            });
 
         // SERVER_NAME is the name the request matched with, or the
         // canonical name when the host says so (section 4.3).
@@ -335,7 +388,10 @@ impl Routing {
             Some(host.server_name.clone())
         };
 
-        Decision::Serve { pool, server_name }
+        Decision::Serve {
+            selection,
+            server_name,
+        }
     }
 
     /// The host a name selects on a listener: exact, wildcard, default.
@@ -364,6 +420,16 @@ impl Routing {
 
 fn paths(sockets: &[String]) -> Vec<std::path::PathBuf> {
     sockets.iter().map(std::path::PathBuf::from).collect()
+}
+
+fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {
+    app.mounts
+        .iter()
+        .map(|mount| MountPath {
+            name: mount.name.clone(),
+            path: mount.path.clone(),
+        })
+        .collect()
 }
 
 fn groups_of(app: &pb::AppWorkers) -> Vec<GroupSockets> {
@@ -543,7 +609,9 @@ mod tests {
         );
 
         match routing.select(Some("shop.example.com"), "/api/users", plain, true) {
-            Decision::Serve { pool, .. } => assert!(pool.is_empty(), "the api app has no workers"),
+            Decision::Serve { selection, .. } => {
+                assert!(selection.pool.is_empty(), "the api app has no workers");
+            }
             _ => panic!("not served"),
         }
 

@@ -511,6 +511,7 @@ mod tests {
             hooks: None,
             factory: None,
             groups: Vec::new(),
+            mounts: Vec::new(),
         }
     }
 

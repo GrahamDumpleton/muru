@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use muru_config::{
-    App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Release as ReleaseTable,
-    Route as RouteTable,
+    App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
+    Release as ReleaseTable, Route as RouteTable,
 };
 use muru_proto::admin::v1 as pb;
 
-use crate::model::{GroupSpec, ReleaseSpec, valid_name};
+use crate::model::{GroupSpec, MountSpec, ReleaseSpec, valid_name};
 use crate::store::{Store, StoreError};
 
 /// What an apply does to one object.
@@ -229,8 +229,9 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         };
 
         let groups = (!table.groups.is_empty()).then_some(&table.groups);
+        let mounts = (!table.mounts.is_empty()).then_some(&table.mounts);
 
-        let spec = match resolve_spec(&request_from(name, table, source), None, groups) {
+        let spec = match resolve_spec(&request_from(name, table, source), None, groups, mounts) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -573,6 +574,7 @@ pub fn resolve_spec(
     request: &pb::DeployRequest,
     previous: Option<&ReleaseSpec>,
     groups: Option<&BTreeMap<String, GroupTable>>,
+    mounts: Option<&BTreeMap<String, MountTable>>,
 ) -> Result<ReleaseSpec, String> {
     let source = Path::new(&request.source);
 
@@ -689,6 +691,44 @@ pub fn resolve_spec(
         });
     }
 
+    // Section 6.7: mounts from the declaration, else the source's own
+    // table; each has a name, a path below / and an entrypoint, and no
+    // two share a path.
+
+    let mut resolved_mounts: Vec<MountSpec> = Vec::new();
+
+    for (name, mount) in mounts.unwrap_or(&table.mounts) {
+        if !crate::model::valid_name(name) {
+            return Err(format!("{name:?} is not a valid mount name"));
+        }
+
+        if !mount.path.starts_with('/') || mount.path == "/" {
+            return Err(format!(
+                "mount {name}: {:?} is not a path below /",
+                mount.path
+            ));
+        }
+
+        if mount.entrypoint.is_empty() || !mount.entrypoint.contains(':') {
+            return Err(format!(
+                "mount {name}: the entrypoint must be module:callable"
+            ));
+        }
+
+        let path = mount.path.trim_end_matches('/').to_owned();
+
+        if resolved_mounts.iter().any(|other| other.path == path) {
+            return Err(format!("mount {name}: another mount has the path {path}"));
+        }
+
+        resolved_mounts.push(MountSpec {
+            name: name.clone(),
+            path,
+            entrypoint: mount.entrypoint.clone(),
+            interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+        });
+    }
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -714,6 +754,7 @@ pub fn resolve_spec(
             .or(table.hooks),
         factory,
         groups: resolved_groups,
+        mounts: resolved_mounts,
     })
 }
 
@@ -812,6 +853,20 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 )
             })
             .collect(),
+        mounts: spec
+            .mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.name.clone(),
+                    MountTable {
+                        path: mount.path.clone(),
+                        entrypoint: mount.entrypoint.clone(),
+                        interface: Some(mount.interface),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -902,6 +957,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_groups(&declared.groups),
         describe_groups(&recorded.groups),
     );
+    compare(
+        "mounts",
+        describe_mounts(&declared.mounts),
+        describe_mounts(&recorded.mounts),
+    );
 
     found
 }
@@ -923,6 +983,19 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
                 group.paths.join(" ")
             )
         })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Mounts as one phrase, for the report.
+fn describe_mounts(mounts: &[MountSpec]) -> String {
+    if mounts.is_empty() {
+        return "none".to_owned();
+    }
+
+    mounts
+        .iter()
+        .map(|mount| format!("{} {} at {}", mount.name, mount.entrypoint, mount.path))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -954,6 +1027,7 @@ mod tests {
                 python: "/usr/bin/python3".to_owned(),
                 ..Default::default()
             },
+            None,
             None,
             None,
         )

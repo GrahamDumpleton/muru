@@ -160,6 +160,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             listen,
             sockets: args.worker_sockets.clone(),
             groups: Vec::new(),
+            mounts: Vec::new(),
             development: false,
             access_log,
             limits: args.limits(),

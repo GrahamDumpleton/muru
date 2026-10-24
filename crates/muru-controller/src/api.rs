@@ -123,7 +123,7 @@ impl Admin for Service {
             .and_then(|app| app.current.or(app.previous))
             .and_then(|id| self.handle.store.release(&request.app, &id).ok())
             .map(|release| release.spec);
-        let spec = config::resolve_spec(&request, previous.as_ref(), None)
+        let spec = config::resolve_spec(&request, previous.as_ref(), None, None)
             .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
