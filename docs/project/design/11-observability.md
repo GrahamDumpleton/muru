@@ -18,7 +18,7 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 | Area | Examples |
 | --- | --- |
 | Requests | muru_requests_total by status class and reason, muru_request_duration_seconds histograms (queue, application, total), muru_requests_in_flight, muru_retries_total |
-| Capacity | muru_queue_depth, muru_queue_wait_seconds, muru_slots_busy, muru_slots_total, muru_websocket_connections |
+| Capacity | muru_queue_depth, muru_queue_wait_seconds, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_websocket_connections, muru_handoffs_total by direction, muru_handoff_queue_wait_seconds |
 | Workers | muru_worker_cpu_ratio, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds, muru_loop_lag_seconds, muru_worker_recycles_total by reason, muru_worker_exits_total |
 | Scaling | muru_scaling_decisions_total, muru_workers_desired, muru_workers_ready, muru_churn_reaps_total |
 | Edge | muru_edge_connections, muru_tls_handshakes_total, muru_snapshot_version, muru_edge_cpu_ratio per thread, muru_upstream_health |

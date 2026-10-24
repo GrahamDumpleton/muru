@@ -144,10 +144,11 @@ and are repeated here so that an agent needs nothing else to start work.
 | `just dev` | Build the extension into the development virtualenv (maturin develop) |
 | `just lint` | rustfmt, clippy, ruff, mypy and the repository text checks |
 | `just test` | Rust unit tests and Python unit tests |
-| `just test-integration` | Integration scenarios that need no Docker or network |
+| `just test-integration` | Integration scenarios that need no Docker or network (builds muructl and the extension first) |
 | `just conformance` | WSGI, ASGI, HTTP and WebSocket conformance suites |
 | `just test-docker` | Container scenarios (needs a container runtime) |
 | `just test-linux` | Linux suites inside the development container |
+| `just bench` | Performance scenarios against other servers (see bench/README.md; Linux for real numbers) |
 | `just docs` | Build the documentation with warnings as errors |
 | `just docs-latex` | Check the LaTeX source for the PDF builds cleanly (the PDF itself is built on Read the Docs) |
 | `just changelog-draft` | Preview the changelog the fragments would produce |

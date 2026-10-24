@@ -1,11 +1,43 @@
 # Benchmarks
 
 Scenarios and scripts for the performance comparisons in section 15.4 of the
-design specification: small and large responses, tiny-chunk streaming, large
-uploads, many idle keep-alive connections, WebSocket echo and mixed mounts,
-against gunicorn (sync and gthread), uvicorn, Granian and mod_wsgi-express in
-three configurations.
+design specification. Phase 0 covers three scenarios, each a WSGI application
+under `apps/`:
 
-Results are stored as JSON under `results/` (ignored by git) and compared
-with the last main-branch results in CI. Run on Linux only for representative
-numbers.
+| Scenario | Application | Measures |
+| --- | --- | --- |
+| hello | `hello.py`, a 14 byte response | per-request overhead |
+| large | `large.py`, one 1 MiB response | bulk transfer and copies |
+| chunks | `chunks.py`, 1000 yields of 16 bytes | per-chunk cost and coalescing |
+
+`run.py` starts each server in turn, warms it up, measures it with
+[oha](https://github.com/hatoo/oha) and stops it. The comparison set is
+gunicorn (sync and gthread), uvicorn (WSGI interface), Granian and
+mod_wsgi-express in three configurations: embedded mode, daemon mode with
+defaults, and daemon mode with reloading disabled and the queue timeout set
+to 0. Servers that are not installed are skipped.
+
+```
+just bench --list                                   # what is installed
+just bench                                          # everything, 10 s each
+just bench --servers muru,gunicorn-gthread --scenarios hello --duration 20s
+```
+
+Muru is run from `target/release/muructl` (`cargo build --release -p muructl`,
+or set `MURUCTL`), with the runtime library built into the interpreter
+running the harness (`just dev`). The Python servers come from the `bench`
+dependency group (`uv sync --group bench`). mod_wsgi-express needs Apache
+httpd with its development files (`brew install httpd` on macOS, `apt install
+apache2-dev` on Debian or Ubuntu) and then `uv pip install mod_wsgi`, which
+builds against them; it is not in the dependency group for that reason.
+
+Results are stored as JSON under `results/` (ignored by git). Run on Linux
+for representative numbers; macOS numbers are useful only relative to each
+other on the same machine.
+
+Servers without keep-alive (gunicorn sync, and uvicorn's WSGI interface)
+open a new connection per request, which exhausts the ephemeral port range
+within seconds on macOS and corrupts the run that follows with connection
+errors. On macOS keep `--connections` at 32 or below and pass `--pause 15`
+so the TIME_WAIT sockets drain between servers; a run reports its success
+rate and error counts, and anything below 1.0 is not a valid measurement.

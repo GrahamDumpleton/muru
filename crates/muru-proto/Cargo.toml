@@ -10,6 +10,15 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [lints]
 workspace = true

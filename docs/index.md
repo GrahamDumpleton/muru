@@ -4,7 +4,7 @@ Muru is a routing edge, control plane and Python runtime for serving WSGI and
 ASGI applications, with zero-downtime releases, traffic management and
 Python-aware process management.
 
-A Rust edge accepts client connections and routes requests over gRPC to
+A Rust edge accepts client connections and routes requests over a private link to
 Python worker processes, which a Rust controller manages as immutable
 releases that can run side by side. A new release, possibly on a different
 Python version, starts beside the old one, and traffic moves when it is

@@ -1,47 +1,40 @@
 // Worker protocol between the edge and Python workers (design specification
-// section 5). This is the draft from the specification; the exact messages
-// are a phase 0 deliverable and change additively within a major version.
+// section 5). Requests travel on the framed link, whose structured payloads
+// are the messages below; the Worker service is the control plane, served
+// from phase 2. Messages change additively within a major version.
 
 syntax = "proto3";
 
 package muru.worker.v1;
 
+// Control plane, over gRPC on the worker's control socket (section 5.9).
 service Worker {
-  // One HTTP request.
-  rpc Handle(stream RequestFrame) returns (stream ResponseFrame);
-  // One WebSocket.
-  rpc Socket(stream SocketFrame) returns (stream SocketFrame);
   // Load, memory, GIL and loop signals.
   rpc Status(StatusRequest) returns (StatusReply);
   // Drain, reopen logs, log levels, stacks, precheck mode.
   rpc Control(ControlRequest) returns (ControlReply);
 }
 
-message RequestFrame {
-  oneof frame {
-    RequestHead head = 1;
-    bytes body = 2;
-    Trailers trailers = 3;
-    Cancel cancel = 4;
-  }
+// Payload of a HELLO frame, exchanged once per connection in both directions
+// (section 5.2). The worker fills in every field; the edge sends only the
+// version.
+message Hello {
+  string protocol_version = 1;
+  string worker_type = 2;           // wsgi or asgi
+  uint32 slots = 3;                 // requests the worker runs at once
+  uint32 async_slots = 4;           // requests the worker holds on its event loop at once
+  bool websockets = 5;              // accepts websocket scopes
+  bool files = 6;                   // accepts FILE frames
+  uint32 max_message_size = 7;      // largest WebSocket message, bytes
 }
 
-message ResponseFrame {
-  oneof frame {
-    ResponseHead head = 1;
-    bytes body = 2;
-    FileHint file = 3;
-    Trailers trailers = 4;
-    InternalRedirect redirect = 5;
-  }
-}
-
+// Payload of a REQUEST frame.
 message RequestHead {
-  string protocol_version = 1;      // for example 1.0
+  string protocol_version = 1;      // worker protocol version, for example 1.0
   string request_id = 2;
   string method = 3;
   string scheme = 4;
-  bytes raw_path = 5;
+  bytes raw_path = 5;               // as received, percent-encoded
   bytes query = 6;
   repeated Header headers = 7;      // ordered raw byte pairs
   Peer client = 8;                  // resolved client
@@ -58,14 +51,20 @@ message RequestHead {
   uint64 max_body_size = 19;
   InternalContext internal = 20;    // REDIRECT_* values, trusted redirect headers, error reason
   map<string, string> host_captures = 21;
-  repeated UploadRef uploads = 22;  // descriptors delivered on the side channel
+  repeated UploadRef uploads = 22;  // descriptors passed with the request head
   bool precheck = 23;
+  string http_version = 24;         // for example HTTP/1.1, for SERVER_PROTOCOL
+  Scope scope = 25;                 // http unless the request is a WebSocket upgrade
 }
 
-// The messages below are placeholders to be completed in phase 0.
+// What a REQUEST frame opens (section 5.6).
+enum Scope {
+  SCOPE_HTTP = 0;
+  SCOPE_WEBSOCKET = 1;
+}
 
 message Header {
-  bytes name = 1;
+  bytes name = 1;                   // lower case
   bytes value = 2;
 }
 
@@ -82,26 +81,55 @@ message UploadRef {
   string ref = 1;
 }
 
+// How the worker should flush response body chunks (section 5.4).
+enum FlushPolicy {
+  FLUSH_POLICY_UNSPECIFIED = 0;     // the worker's configured default
+  FLUSH_POLICY_COALESCE = 1;
+  FLUSH_POLICY_IMMEDIATE = 2;
+}
+
+// Payload of a RESPONSE frame.
 message ResponseHead {
   uint32 status = 1;
-  repeated Header headers = 2;
+  repeated Header headers = 2;      // ordered, as the application gave them
+  FlushPolicy flush = 3;
 }
 
-message FileHint {}
-
-message InternalRedirect {}
-
-message Trailers {
-  repeated Header headers = 1;
+// Payload of an END frame: the end of a body in one direction.
+message End {
+  repeated Header trailers = 1;
+  string error = 2;                 // non-empty when the body is incomplete
 }
 
-message Cancel {}
+// Payload of an ABORT frame, edge to worker: the client has gone, or the
+// response ended before the request body did (section 5.5).
+message Abort {
+  string reason = 1;
+}
 
-message SocketFrame {}
+// Payload of a DETACH frame, worker to edge: the request moved to the
+// other side of the worker, so the edge counts its connection against the
+// other bound (section 6.14).
+message Detach {
+  enum Target {
+    TARGET_LOOP = 0;                // now held on the event loop: async slots
+    TARGET_THREADS = 1;             // now on an application thread: slots
+  }
+  Target target = 1;
+}
 
 message StatusRequest {}
 
-message StatusReply {}
+message StatusReply {
+  string protocol_version = 1;
+  uint32 pid = 2;
+  uint32 in_flight = 3;
+  uint64 requests_total = 4;
+  string python_version = 5;
+  bool free_threaded = 6;
+  bool gc_enabled = 7;
+  uint64 gc_frozen = 8;             // objects in the permanent generation
+}
 
 message ControlRequest {}
 

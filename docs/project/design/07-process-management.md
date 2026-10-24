@@ -98,6 +98,7 @@ threads = 32
 | gil_wait_p95 | worker, Rust extension | time from ready to holding the GIL at Rust to Python transitions |
 | sched_latency, loop_lag | worker | overshoot of a probe timer or event loop timer |
 | service time inflation | edge | p50 against the low-load baseline |
+| handoff_queue_wait_p95 | worker | requests handed from ASGI to WSGI waiting for a thread (section 6.14), answered by more threads or a mount |
 | uss, pss, rss | worker and host | memory, a constraint rather than a trigger |
 
 A diagnosis table combining busy slots, CPU and GIL wait classifies bottlenecks as CPU or GIL bound, I/O bound with exhausted slots, a few heavy requests, idle, or memory bound. It is reported with every decision and suggests tuning (for example more threads for I/O-bound groups) for the next release.

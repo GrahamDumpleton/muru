@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR 0021
 date: 2026-10-23
 ---
 
@@ -58,3 +58,8 @@ can replace gRPC if the phase 0 benchmarks require it.
 
 Specification sections 5.1 to 5.8 and 14.5 (phase 0 exit criteria). Open
 question 1 in section 19.2 records the benchmark threshold still to be agreed.
+
+Superseded by [ADR 0021](0021-framed-worker-link.md) on 2026-10-24: the
+phase 0 benchmarks showed gRPC behind mod_wsgi daemon mode, and the framed
+protocol replaced it on the request link. gRPC remains for the control plane
+and the admin API, as this record intended.

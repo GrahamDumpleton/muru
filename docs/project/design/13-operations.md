@@ -47,7 +47,7 @@ flowchart LR
     E[Edge] --- C[Controller]
     FW[File watcher] -->|change| C
   end
-  E -->|gRPC| W1[Current release workers]
+  E -->|worker link| W1[Current release workers]
   C -->|new release from same path| H2[New host]
   H2 -.-> W2[New workers]
   E -.->|switch after warm-up| W2
