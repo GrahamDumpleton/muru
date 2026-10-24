@@ -54,17 +54,117 @@ and are repeated here so that an agent needs nothing else to start work.
 
 ## Code layout, for Python and Rust alike
 
-- Write function bodies in paragraphs: group the statements that together
-  perform one step, and separate the groups with blank lines. Natural
-  boundaries include setup versus main work versus result, before and after a
-  conditional or loop, and around `with`, `try`, `match` or `unsafe` blocks.
-  Neither cram a body into one block nor put a blank line between every
-  statement.
+Code is read far more often than it is written, so function bodies are laid
+out as paragraphs with vertical space between the steps, never as one dense
+block. The rules below are mechanical on purpose, so that a checker can
+enforce them; when in doubt the blank line goes in.
+
+- A compound statement (`if`, `for`, `while`, `try`, `with`, `match`, `loop`,
+  `unsafe`, or a `let` whose value is a `match` or `if`) that spans more than
+  two lines has a blank line before it, unless it is the first statement of
+  its enclosing block or sits directly below a block comment.
+
+- The first statement after such a block ends (after the dedent in Python,
+  after the closing brace in Rust) has a blank line before it. `else`,
+  `elif`, `except`, `finally`, a closing bracket and a continued method
+  chain are not statements for this purpose.
+
+- A short guard of one or two lines (`if x is None: return`, or an `if let
+  ... else { return }` on two lines) is exempt from both rules, so a run of
+  simple statements and guards may stay together. Do not put a blank line
+  between every statement.
+
+- Setup for a loop or a conditional is a paragraph of its own. The line that
+  computes a deadline, a buffer or a lock goes above a blank line, and the
+  loop below it; a block comment above the pair ties them together.
 
 - Where it helps, start a paragraph with a short comment saying what the step
   does or why it is needed. Prefer one comment per logical block over
   line-by-line commentary, and omit it when the code already says it plainly.
-  Put a blank line between such a block comment and the code below it.
+  A block comment has a blank line below it and, unless it opens a block, a
+  blank line above it.
+
+- Docstrings and doc comments are followed by a blank line before the first
+  line of code.
+
+This is what the rules produce. The dense form is what to avoid:
+
+```python
+    def terminate_all(self) -> None:
+        """Stop every worker: SIGTERM, a grace period, then SIGKILL."""
+        for pid in self.workers:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+        while self.workers and time.monotonic() < deadline:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                self.workers.clear()
+                break
+            if pid == 0:
+                time.sleep(0.05)
+                continue
+            self.workers.pop(pid, None)
+        for pid in list(self.workers):
+            log(f"worker pid {pid} did not stop, killing")
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+        self.workers.clear()
+```
+
+The same function as the rules lay it out, one paragraph per step:
+
+```python
+    def terminate_all(self) -> None:
+        """Stop every worker: SIGTERM, a grace period, then SIGKILL."""
+
+        for pid in self.workers:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        # Reap whatever exits within the grace period.
+
+        deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+
+        while self.workers and time.monotonic() < deadline:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                self.workers.clear()
+                break
+
+            if pid == 0:
+                time.sleep(0.05)
+                continue
+
+            self.workers.pop(pid, None)
+
+        # Whatever is left is killed and reaped.
+
+        for pid in list(self.workers):
+            log(f"worker pid {pid} did not stop, killing")
+
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+
+        self.workers.clear()
+```
+
+The same applies to Rust: a `match` or `for` of more than two lines gets a
+blank line before it and the statement after its closing brace gets one too.
+Code produced through scripts, heredocs or patches is held to the same rules;
+reread every new or changed body as a reader before reporting it.
 
 - In Rust, every public item in a library crate has a doc comment, and every
   `unsafe` block has a `SAFETY:` comment explaining why it is sound. No
