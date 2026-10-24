@@ -100,6 +100,7 @@ jobs:
       - run: uv sync --only-group dev --python ${{ matrix.python }}
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
+      - run: bash packaging/dev/fetch-h2spec.sh
       - run: uv run pytest tests/integration tests/conformance
 
   python:

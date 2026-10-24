@@ -26,7 +26,7 @@ bootstrap:
 
 # Optional extras for the conformance suites (h2spec, Autobahn) and fuzzing.
 bootstrap-conformance:
-    @echo "not yet implemented: fetches h2spec and prepares the Autobahn image (phase 1)"
+    bash packaging/dev/fetch-h2spec.sh
 
 bootstrap-fuzz:
     rustup toolchain install nightly
