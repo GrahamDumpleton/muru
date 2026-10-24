@@ -8,20 +8,19 @@ restores the previous release, and every state change is an event.
 
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 from support import server as support
 from support.daemon import FACTORY, SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
+from support.load import Load
 
 daemon = daemon_fixture
 
@@ -52,45 +51,14 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
     # connections as real clients use (and so the test does not run out
     # of ephemeral ports).
 
-    results: list[int] = []
-    stop = threading.Event()
-
-    def hammer() -> None:
-        connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
-
-        try:
-            while not stop.is_set():
-                try:
-                    connection.request("GET", "/")
-                    response = connection.getresponse()
-                    response.read()
-                    results.append(response.status)
-                except (OSError, http.client.HTTPException):
-                    results.append(0)
-                    connection.close()
-                    connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
-
-                time.sleep(0.001)
-        finally:
-            connection.close()
-
-    threads = [threading.Thread(target=hammer) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-
-    try:
+    with Load(daemon.port) as load:
         assert (
             daemon.deploy("shop", SHOP, "--processes", "2")
             == "muru: release shop@r2 is ready and serving"
         )
         time.sleep(0.5)
-    finally:
-        stop.set()
-        for thread in threads:
-            thread.join()
 
-    assert results, "no requests were made"
-    assert set(results) == {200}, f"statuses seen during the deploy: {sorted(set(results))}"
+    load.check("the deploy")
     assert json.loads(daemon.get("/info").body)["pid"] != pid_before
     assert daemon.releases("shop") == [
         {"release": "shop@r2", "state": "ready", "serving": "yes"},
