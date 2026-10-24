@@ -98,4 +98,11 @@ by replacing `logging.lastResort` so an application's own configuration
 is untouched, published as `MURU_LOG_LEVEL` and `MURU_LOG_FORMAT`, with
 `muru.logging.default_config()` for applications that adopt them (the
 request id on records, daemon-wide defaults and runtime level overrides
-later). Next from phase 2: event webhooks.
+later). Event webhooks (section 11.5) are in: each `[[events.sink]]` of
+the daemon's file receives the events its type patterns and levels let
+through as CloudEvents 1.0 JSON with an HMAC-SHA256 signature, one at a
+time and in order from a cursor in the state store with doubling retries,
+so a receiver outage or a daemon restart loses nothing, with
+`events.sink.failing` and `events.sink.recovered` events about the sink
+itself (OTLP, journald and file sinks, the audit log and sinks managed
+through the API later). Next from phase 2: systemd integration.

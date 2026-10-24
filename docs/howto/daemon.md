@@ -191,4 +191,5 @@ The access log is written as JSON lines to `access.log` in the log
 directory, `muructl logs` shows or follows it and each release's output,
 and `muructl logs reopen` works with logrotate; the [logging
 guide](logging.md) has the details. The events `muructl events` shows are
-kept in the state store.
+kept in the state store, and `[[events.sink]]` entries deliver them to
+webhooks; the [events guide](events.md) has the details.

@@ -335,6 +335,53 @@ pub struct Logging {
     pub python: Option<PythonLogging>,
 }
 
+/// An `[[events.sink]]` entry (section 11.5): a webhook that receives
+/// events as signed CloudEvents requests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventSink {
+    /// The sink's name.
+    pub name: String,
+    /// The kind of sink; only webhook for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SinkKind>,
+    /// Where deliveries go, an http:// or https:// URL.
+    pub url: String,
+    /// The key deliveries are signed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// A file holding the key, instead of `secret`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_file: Option<String>,
+    /// Event types delivered, as patterns such as `release.*`; every
+    /// type when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+    /// Levels delivered (info, notice, warning, error); every level when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<String>,
+}
+
+/// The kind of an event sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SinkKind {
+    /// Signed HTTP deliveries.
+    Webhook,
+}
+
+words!(SinkKind { Webhook => "webhook" });
+
+/// The `[events]` table: the sinks events are pushed to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Events {
+    /// The sinks, each an `[[events.sink]]` entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sink: Vec<EventSink>,
+}
+
 /// The `[limits]` table (appendix C): sizes and durations as the
 /// configuration writes them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +581,9 @@ pub struct Document {
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    /// Event sinks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Events>,
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
@@ -571,6 +621,10 @@ impl Document {
 
         if other.metrics.is_some() {
             self.metrics = other.metrics;
+        }
+
+        if other.events.is_some() {
+            self.events = other.events;
         }
 
         if other.proxy.is_some() {
@@ -885,6 +939,22 @@ mod tests {
         assert_eq!(python.loggers.get("noisy"), Some(&LogLevel::Error));
         let error = parse_pyproject("[tool.muru.logging.python]\nlevel = 'loud'\n").unwrap_err();
         assert!(error.contains("loud"), "{error}");
+    }
+
+    #[test]
+    fn event_sinks_are_an_array_of_tables() {
+        let document = Document::parse(
+            "[[events.sink]]\nname = 'ops'\nurl = 'https://example.com/hook'\nsecret = 's'\ntypes = ['release.*']\nlevels = ['warning', 'error']\n",
+        )
+        .unwrap();
+        let sinks = document.events.unwrap().sink;
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].name, "ops");
+        assert_eq!(sinks[0].types, vec!["release.*".to_owned()]);
+        assert_eq!(sinks[0].levels.len(), 2);
+        let error = Document::parse("[[events.sink]]\nname = 'ops'\nurl = 'x'\nkind = 'pigeon'\n")
+            .unwrap_err();
+        assert!(error.contains("pigeon"), "{error}");
     }
 
     #[test]

@@ -16,13 +16,16 @@ futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+hyper-rustls = { workspace = true }
 hyper-util = { workspace = true }
 libc = { workspace = true }
 muru-config = { workspace = true }
 muru-edge = { workspace = true }
 muru-proto = { workspace = true }
+ring = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

@@ -66,13 +66,17 @@ CREATE TABLE IF NOT EXISTS events (
     level TEXT NOT NULL,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS event_sinks (
+    name TEXT PRIMARY KEY,
+    delivered INTEGER NOT NULL
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The store.
 pub struct Store {
@@ -89,8 +93,9 @@ impl Store {
         connection.execute_batch(SCHEMA)?;
 
         // Version 1 had applications, releases and events; version 2
-        // added hosts and routes, which the CREATE statements above supply
-        // to a version 1 store, so the version only needs recording.
+        // added hosts and routes and version 3 the event sink cursors,
+        // which the CREATE statements above supply to an older store, so
+        // the version only needs recording.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -415,6 +420,42 @@ impl Store {
         })
     }
 
+    /// The sequence of the latest event, or 0 before any.
+    pub fn last_event_sequence(&self) -> Result<u64, StoreError> {
+        self.with(|connection| {
+            let latest: Option<i64> =
+                connection.query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0))?;
+            Ok(latest.unwrap_or(0) as u64)
+        })
+    }
+
+    /// The sequence of the last event a sink delivered, or none for a
+    /// sink the store has not seen.
+    pub fn sink_cursor(&self, name: &str) -> Result<Option<u64>, StoreError> {
+        self.with(|connection| {
+            let delivered: Option<i64> = connection
+                .query_row(
+                    "SELECT delivered FROM event_sinks WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(delivered.map(|delivered| delivered as u64))
+        })
+    }
+
+    /// Record the last event a sink delivered.
+    pub fn set_sink_cursor(&self, name: &str, delivered: u64) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO event_sinks (name, delivered) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET delivered = excluded.delivered",
+                params![name, delivered as i64],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Events after a sequence number, oldest first, up to `limit`.
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>, StoreError> {
         self.with(|connection| {
@@ -537,6 +578,20 @@ mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn sink_cursors_are_kept_by_name() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.sink_cursor("ops").unwrap(), None);
+        assert_eq!(store.last_event_sequence().unwrap(), 0);
+        let event = store
+            .append_event("daemon.started", "daemon", "info", "up")
+            .unwrap();
+        assert_eq!(store.last_event_sequence().unwrap(), event.sequence);
+        store.set_sink_cursor("ops", event.sequence).unwrap();
+        store.set_sink_cursor("ops", event.sequence + 1).unwrap();
+        assert_eq!(store.sink_cursor("ops").unwrap(), Some(event.sequence + 1));
     }
 
     #[test]

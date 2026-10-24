@@ -54,6 +54,8 @@ pub struct Config {
     pub access_log: Option<PathBuf>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
+    /// The webhooks events are delivered to (section 11.5).
+    pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
 }
@@ -230,7 +232,7 @@ struct Daemon {
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // A [proxy] table the edge would refuse is refused here, before
     // anything is bound.
 
@@ -242,6 +244,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     let metrics = config.metrics;
+    let sinks = std::mem::take(&mut config.sinks);
     let locations = config.locations;
 
     for location in [&locations.state, &locations.run, &locations.logs] {
@@ -251,6 +254,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let store = Arc::new(Store::open(&locations.state_store())?);
     let events = Events::new(Arc::clone(&store));
+
+    // Section 11.5: each sink delivers from its own cursor, so nothing
+    // emitted from here on is missed by one.
+
+    let deliveries: Vec<_> = sinks
+        .into_iter()
+        .map(|webhook| {
+            tokio::spawn(crate::sinks::run(
+                webhook,
+                Arc::clone(&store),
+                events.clone(),
+            ))
+        })
+        .collect();
 
     // An edge a previous daemon left running is taken over, with its
     // listener handed back. Otherwise the daemon binds the listener and
@@ -459,6 +476,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     if let Some(scraper) = scraper {
         scraper.abort();
+    }
+
+    for delivery in deliveries {
+        delivery.abort();
     }
 
     let _ = std::fs::remove_file(&socket);

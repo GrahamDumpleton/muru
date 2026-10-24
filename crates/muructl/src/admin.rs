@@ -160,6 +160,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     let limits = limits_from(&document)?;
     let metrics = metrics_from(&document, args.metrics)?;
+    let sinks = sinks_from(&document)?;
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -188,6 +189,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         proxy: document.proxy.clone(),
         access_log,
         metrics,
+        sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
     })
     .await
@@ -1320,6 +1322,30 @@ fn metrics_from(
         })?)),
         None => Ok(None),
     }
+}
+
+/// The event sinks of the configuration file, checked, with their
+/// secrets read.
+fn sinks_from(
+    document: &muru_config::Document,
+) -> anyhow::Result<Vec<muru_controller::sinks::Webhook>> {
+    let mut sinks = Vec::new();
+
+    for sink in document.events.iter().flat_map(|events| &events.sink) {
+        let webhook = muru_controller::sinks::Webhook::from_config(sink)
+            .map_err(|error| anyhow::anyhow!("[[events.sink]]: {error}"))?;
+
+        if sinks
+            .iter()
+            .any(|seen: &muru_controller::sinks::Webhook| seen.name == webhook.name)
+        {
+            anyhow::bail!("[[events.sink]]: two sinks are named {}", webhook.name);
+        }
+
+        sinks.push(webhook);
+    }
+
+    Ok(sinks)
 }
 
 /// The listeners of the configuration file, or plain HTTP on 127.0.0.1:8080.

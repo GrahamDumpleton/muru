@@ -13,7 +13,7 @@ Still to be written, as their features land:
 - Log rotation.
 - Containers and images.
 - uv and Python versions.
-- Event webhooks and OpenTelemetry.
+- OpenTelemetry export.
 - Database migrations during overlapping releases.
 - Upgrading Muru.
 
@@ -32,4 +32,5 @@ https
 timeouts
 logging
 metrics
+events
 ```
