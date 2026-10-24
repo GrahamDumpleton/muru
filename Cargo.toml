@@ -43,6 +43,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "h
 libc = "0.2"
 muru-common = { path = "crates/muru-common" }
 muru-dashboard = { path = "crates/muru-dashboard" }
+muru-config = { path = "crates/muru-config" }
 muru-edge = { path = "crates/muru-edge" }
 muru-proto = { path = "crates/muru-proto" }
 prost = "0.14"
@@ -53,8 +54,10 @@ pyo3 = { version = "0.30", features = ["extension-module"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 time = "0.3"
+toml = "1.1"
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal", "process", "fs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = { version = "0.1", features = ["net"] }

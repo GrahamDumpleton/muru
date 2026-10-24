@@ -228,21 +228,23 @@ def wait_for_port(port: int, process: subprocess.Popen[bytes], timeout: float = 
 
 
 def start(
-    app: str,
-    workers: int = 2,
-    threads: int = 2,
-    chdir: Path = FIXTURES,
+    app: str | None = None,
+    workers: int | None = 2,
+    threads: int | None = 2,
+    chdir: Path | None = FIXTURES,
     args: Sequence[str] = (),
     env: dict[str, str] | None = None,
     https: bool = False,
 ) -> Server:
     """Start muructl for `module:callable`, skipping the test when it cannot run.
 
-    `args` are further `muructl run` options and `env` extra environment
-    variables. With `https`, a free HTTPS port is chosen and passed as
-    --https-port (the caller adds --https, --https-only or --tls-cert). When
-    muructl exits before its workers are ready, the RuntimeError raised
-    carries its output.
+    `app` may also be a project directory, or None to run the project in
+    `chdir`; `workers`, `threads` and `chdir` are left to muructl's own
+    defaults when None. `args` are further `muructl run` options and `env`
+    extra environment variables. With `https`, a free HTTPS port is chosen
+    and passed as --https-port (the caller adds --https, --https-only or
+    --tls-cert). When muructl exits before its workers are ready, the
+    RuntimeError raised carries its output.
     """
 
     muructl = muructl_path()
@@ -254,23 +256,25 @@ def start(
     port = free_port()
     https_port = free_port() if https else None
     https_args = ["--https-port", str(https_port)] if https_port is not None else []
+    options: list[str] = []
+    if workers is not None:
+        options += ["--processes", str(workers)]
+    if threads is not None:
+        options += ["--threads", str(threads)]
+    if chdir is not None:
+        options += ["--chdir", str(chdir)]
     log = Path(tempfile.mkstemp(prefix="muru-test-", suffix=".log")[1])
     with log.open("wb") as handle:
         process = subprocess.Popen(
             [
                 str(muructl),
                 "run",
-                app,
+                *([app] if app is not None else []),
                 "--bind",
                 f"127.0.0.1:{port}",
-                "--workers",
-                str(workers),
-                "--threads",
-                str(threads),
                 "--python",
                 sys.executable,
-                "--chdir",
-                str(chdir),
+                *options,
                 *https_args,
                 *args,
             ],
@@ -278,7 +282,7 @@ def start(
             stderr=subprocess.STDOUT,
             env={**os.environ, **(env or {})},
         )
-    server = Server(port, process, log, workers, threads, https_port)
+    server = Server(port, process, log, workers or 0, threads or 0, https_port)
     try:
         wait_for_port(port, process)
     except RuntimeError as error:

@@ -18,12 +18,16 @@ pub struct HostSpec {
     pub python: PathBuf,
     /// The application as module:callable.
     pub app: String,
+    /// The interface the entrypoint speaks.
+    pub interface: muru_config::Interface,
+    /// Whether the entrypoint is a factory, and when it is called.
+    pub factory: Option<muru_config::FactoryPhase>,
     /// Worker processes to fork.
-    pub workers: usize,
+    pub processes: usize,
     /// Application threads per worker.
     pub threads: usize,
-    /// The preload mode: auto, true or false.
-    pub preload: &'static str,
+    /// The preload mode.
+    pub preload: muru_config::Preload,
     /// The hooks module, if any.
     pub hooks: Option<String>,
     /// The directory to run the host in.
@@ -66,24 +70,32 @@ impl HostProcess {
             .arg(&spec.app)
             .arg("--socket-dir")
             .arg(&run_dir)
-            .arg("--workers")
-            .arg(spec.workers.to_string())
+            .arg("--processes")
+            .arg(spec.processes.to_string())
             .arg("--threads")
             .arg(spec.threads.to_string())
             .arg("--preload")
-            .arg(spec.preload)
+            .arg(spec.preload.as_str())
+            .arg("--interface")
+            .arg(spec.interface.as_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
         }
+        if let Some(phase) = spec.factory {
+            command
+                .arg("--factory")
+                .arg("--factory-phase")
+                .arg(phase.as_str());
+        }
         if spec.single {
             command.arg("--single");
         }
         let base_port = spec
             .tcp_base_port
-            .map(|base| base.wrapping_add((release - 1) as u16 * spec.workers as u16));
+            .map(|base| base.wrapping_add((release - 1) as u16 * spec.processes as u16));
         if let Some(base) = base_port {
             command.arg("--tcp-base-port").arg(base.to_string());
         }
@@ -101,7 +113,7 @@ impl HostProcess {
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(relay(stderr, logs.clone(), true));
         }
-        let sockets = (0..spec.workers)
+        let sockets = (0..spec.processes)
             .map(|index| match base_port {
                 None => run_dir.join(format!("worker-{index}.sock")),
                 Some(base) => {

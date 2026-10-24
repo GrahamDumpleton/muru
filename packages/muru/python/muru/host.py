@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
+import inspect
 import os
 import selectors
 import signal
@@ -47,6 +48,10 @@ WSGIApplication = Callable[..., Any]
 
 SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
+# A worker exiting with an error this soon after its fork failed to start.
+STARTUP_WINDOW_SECONDS = 5.0
+# Consecutive start failures of one worker before the host gives up.
+MAX_START_FAILURES = 3
 PRELOAD_MODES = ("auto", "true", "false")
 READ_SIZE = 65536
 
@@ -57,12 +62,17 @@ def log(message: str) -> None:
     print(f"muru.host[{os.getpid()}]: {message}", file=sys.stderr, flush=True)
 
 
+INTERFACES = ("auto", "wsgi", "asgi")
+FACTORY_PHASES = ("worker", "host")
+
+
 def resolve_app(
     spec: str, import_module: Callable[[str], ModuleType] = importlib.import_module
-) -> WSGIApplication:
+) -> Any:
     """Import ``module:attribute`` and return the callable.
 
-    The attribute defaults to ``application``.
+    The attribute defaults to ``application``. The result is the application
+    itself, or a factory when the release says so.
     """
 
     module_name, _, attribute = spec.partition(":")
@@ -74,8 +84,36 @@ def resolve_app(
         target = getattr(target, part)
     if not callable(target):
         raise TypeError(f"{spec!r} is not callable")
-    app: WSGIApplication = target
-    return app
+    return target
+
+
+def detect_interface(app: Any) -> str:
+    """Return ``asgi`` for a coroutine function or an awaitable ``__call__``, else ``wsgi``."""
+
+    if inspect.iscoroutinefunction(app):
+        return "asgi"
+    call = getattr(app, "__call__", None)  # noqa: B004  (a bound method, not the type's slot)
+    if call is not None and inspect.iscoroutinefunction(call):
+        return "asgi"
+    return "wsgi"
+
+
+def ensure_wsgi(spec: str, app: Any, interface: str) -> WSGIApplication:
+    """Check that the application can be served by the WSGI bridge.
+
+    ASGI arrives in phase 2; until then an ASGI entrypoint, declared or
+    detected, is a clear error rather than a confusing one.
+    """
+
+    detected = detect_interface(app)
+    if interface == "asgi" or (interface == "auto" and detected == "asgi"):
+        how = "declared" if interface == "asgi" else "detected"
+        raise RuntimeError(
+            f"{spec} is an ASGI application ({how}); only WSGI is served in phase 1, "
+            "ASGI arrives in phase 2"
+        )
+    wsgi: WSGIApplication = app
+    return wsgi
 
 
 def app_name(spec: str) -> str:
@@ -101,24 +139,45 @@ class Release:
     spec: str
     hooks_module: str | None
     context: Context
+    interface: str = "auto"
+    factory: bool = False
+    factory_phase: str = "worker"
+    target: Any = None
     app: WSGIApplication | None = None
     hooks: Hooks | None = None
 
     @property
     def preloaded(self) -> bool:
-        """Whether the application was imported in the host."""
+        """Whether the entrypoint was imported in the host."""
 
-        return self.app is not None
+        return self.target is not None
 
     def load(self, recorder: preload.ImportRecorder | None = None) -> Hooks:
-        """Import the hooks module and the application, in that order."""
+        """Import the hooks module and the entrypoint, in that order.
+
+        A factory with factory_phase ``host`` is called here (section 6.8);
+        one with phase ``worker`` waits for `realise` in each worker.
+        """
 
         import_module = recorder.import_module if recorder else importlib.import_module
         if self.hooks_module:
             import_module(self.hooks_module)
         self.hooks = Hooks.load(self.hooks_module)
-        self.app = resolve_app(self.spec, import_module)
+        self.target = resolve_app(self.spec, import_module)
+        if not self.factory:
+            self.app = ensure_wsgi(self.spec, self.target, self.interface)
+        elif self.factory_phase == "host":
+            self.app = ensure_wsgi(self.spec, self.target(), self.interface)
         return self.hooks
+
+    def realise(self) -> WSGIApplication:
+        """Return the application to serve, calling a per-worker factory now."""
+
+        if self.app is None:
+            if self.target is None:
+                raise RuntimeError(f"{self.spec} was not loaded")
+            self.app = ensure_wsgi(self.spec, self.target(), self.interface)
+        return self.app
 
 
 @dataclass
@@ -174,6 +233,9 @@ class Host:
         self.workers: dict[int, int] = {}
         self.stopping = False
         self.restart_after: dict[int, float] = {}
+        self.spawned_at: dict[int, float] = {}
+        self.start_failures: dict[int, int] = {}
+        self.failed = False
         self.forked_before = False
         self.selector = selectors.DefaultSelector()
         self.outputs: dict[int, WorkerOutput] = {}
@@ -226,6 +288,7 @@ class Host:
             self.outputs[fd] = WorkerOutput(index, stream, fd)
             self.selector.register(fd, selectors.EVENT_READ)
         self.workers[pid] = index
+        self.spawned_at[pid] = time.monotonic()
         log(f"worker {index} started as pid {pid}")
 
     def worker(self, index: int) -> int:
@@ -259,13 +322,12 @@ class Host:
                 hooks.call("on_load", context)
                 hooks.call("pre_fork", context)
             hooks.call("post_fork", context)
+            # Section 6.8: a factory is called per worker, after post_fork.
+            app = release.realise()
             hooks.call("on_ready", context)
-        except Exception:
-            log(f"worker {index} failed in a hook")
+        except Exception as error:
+            log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
             traceback.print_exc()
-            return 1
-        app = release.app
-        if app is None:
             return 1
 
         from muru import _native
@@ -336,7 +398,7 @@ class Host:
         for fd in list(self.outputs):
             self.read_output(fd, until_closed=True)
         signal.set_wakeup_fd(-1)
-        return 0
+        return 1 if self.failed else 0
 
     def read_output(self, fd: int, until_closed: bool = False) -> None:
         """Relay what a worker has written; close the pipe once it is at end of file."""
@@ -373,9 +435,26 @@ class Host:
             index = self.workers.pop(pid, None)
             if index is None:
                 continue
-            if not self.stopping:
-                log(f"worker {index} (pid {pid}) exited with {describe(status)}, restarting")
-                self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+            spawned_at = self.spawned_at.pop(pid, 0.0)
+            if self.stopping:
+                continue
+            # A worker that dies at once, again and again, is a release that
+            # cannot start (a failing factory or hook): give up rather than
+            # fork it forever.
+            if status != 0 and time.monotonic() - spawned_at < STARTUP_WINDOW_SECONDS:
+                self.start_failures[index] = self.start_failures.get(index, 0) + 1
+                if self.start_failures[index] >= MAX_START_FAILURES:
+                    log(
+                        f"worker {index} failed {MAX_START_FAILURES} times at start, "
+                        f"last with {describe(status)}; stopping"
+                    )
+                    self.failed = True
+                    self.stopping = True
+                    continue
+            else:
+                self.start_failures[index] = 0
+            log(f"worker {index} (pid {pid}) exited with {describe(status)}, restarting")
+            self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
 
     def restart_due(self) -> None:
         """Start replacements whose delay has passed."""
@@ -443,7 +522,24 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m muru.host", description=__doc__)
     parser.add_argument("--app", required=True, help="application as module:callable")
     parser.add_argument("--socket-dir", required=True, help="directory for the worker sockets")
-    parser.add_argument("--workers", type=int, default=1, help="worker processes to fork")
+    parser.add_argument("--processes", type=int, default=1, help="worker processes to fork")
+    parser.add_argument(
+        "--interface",
+        choices=INTERFACES,
+        default="auto",
+        help="the interface the entrypoint speaks; auto detects it from the callable",
+    )
+    parser.add_argument(
+        "--factory",
+        action="store_true",
+        help="the entrypoint is a factory returning the application (section 6.8)",
+    )
+    parser.add_argument(
+        "--factory-phase",
+        choices=FACTORY_PHASES,
+        default="worker",
+        help="call the factory in each worker after post_fork, or once in the host",
+    )
     parser.add_argument("--threads", type=int, default=4, help="application threads per worker")
     parser.add_argument(
         "--preload",
@@ -494,13 +590,20 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(arguments)
-    if args.workers < 1:
-        print("--workers must be at least 1", file=sys.stderr)
+    if args.processes < 1:
+        print("--processes must be at least 1", file=sys.stderr)
         return 2
 
     context = Context(app=app_name(args.app), process_model=process_model(args.threads))
     set_context(context)
-    release = Release(args.app, args.hooks, context)
+    release = Release(
+        args.app,
+        args.hooks,
+        context,
+        interface=args.interface,
+        factory=args.factory,
+        factory_phase=args.factory_phase,
+    )
 
     # Section 6.2 step 1: no collections during preload.
     gc.disable()
@@ -542,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
             gc.collect()
 
     os.makedirs(args.socket_dir, exist_ok=True)
-    host = Host(release, args.socket_dir, args.workers, args.threads, args.tcp_base_port)
+    host = Host(release, args.socket_dir, args.processes, args.threads, args.tcp_base_port)
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees
         # the application. The hooks run as they would in a worker.

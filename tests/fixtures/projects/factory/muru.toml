@@ -1,0 +1,2 @@
+entrypoint = "factory_site:create_app"
+factory = true

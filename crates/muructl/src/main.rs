@@ -14,7 +14,7 @@ mod logs;
 mod watch;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -62,26 +62,39 @@ enum Command {
 
 #[derive(Args)]
 struct RunArgs {
-    /// The application as module:callable, for example app:application.
-    app: String,
+    /// The application as module:callable, or a project directory (or its
+    /// pyproject.toml or muru.toml) whose [tool.muru] table names it.
+    /// Without it, the project in --chdir or the current directory is used.
+    #[arg(value_name = "ENTRYPOINT or PATH")]
+    app: Option<String>,
+
+    /// The interface the entrypoint speaks: auto (detected from the
+    /// callable), wsgi or asgi.
+    #[arg(long, value_name = "NAME")]
+    interface: Option<muru_config::Interface>,
+
+    /// The entrypoint is a factory, called in each worker after post_fork
+    /// to get the application.
+    #[arg(long)]
+    factory: bool,
 
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
 
-    /// Worker processes forked from the preloaded host.
-    #[arg(long, default_value_t = 2)]
-    workers: usize,
+    /// Worker processes forked from the preloaded host (default 1).
+    #[arg(long)]
+    processes: Option<usize>,
 
-    /// Application threads per worker.
-    #[arg(long, default_value_t = 4)]
-    threads: usize,
+    /// Application threads per worker (default 4).
+    #[arg(long)]
+    threads: Option<usize>,
 
     /// Import the application in the host before forking: auto preloads
     /// when the import is fork-safe and imports per worker otherwise, true
-    /// fails instead, false imports in each worker.
-    #[arg(long, default_value = "auto")]
-    preload: Preload,
+    /// fails instead, false imports in each worker (default auto).
+    #[arg(long, value_name = "MODE")]
+    preload: Option<muru_config::Preload>,
 
     /// Module providing the lifecycle hooks: on_load, pre_fork, post_fork,
     /// on_ready, on_drain, on_exit and on_reopen_logs.
@@ -187,23 +200,6 @@ struct RunArgs {
 enum Link {
     Unix,
     Tcp,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum Preload {
-    Auto,
-    True,
-    False,
-}
-
-impl Preload {
-    fn as_str(self) -> &'static str {
-        match self {
-            Preload::Auto => "auto",
-            Preload::True => "true",
-            Preload::False => "false",
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -318,6 +314,119 @@ fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
     }
 }
 
+/// What `muructl run` runs once the command line and the project's
+/// [tool.muru] table are merged: a flag wins, then the table, then the
+/// defaults of section 13.1.
+struct Resolved {
+    entrypoint: String,
+    interface: muru_config::Interface,
+    factory: Option<muru_config::FactoryPhase>,
+    processes: usize,
+    threads: usize,
+    preload: muru_config::Preload,
+    hooks: Option<String>,
+    /// The directory the host runs in.
+    project: PathBuf,
+    /// The file the table came from, when there was one.
+    source: Option<PathBuf>,
+}
+
+/// Defaults for development runs (section 13.1): one worker with a few threads.
+const DEFAULT_PROCESSES: usize = 1;
+const DEFAULT_THREADS: usize = 4;
+
+fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
+    let chdir = args.chdir.clone();
+    let (entrypoint, project) = match args.app.as_deref() {
+        Some(app) if Path::new(app).is_dir() => {
+            anyhow::ensure!(
+                chdir.is_none(),
+                "give the project as the argument or with --chdir, not both"
+            );
+            (None, PathBuf::from(app))
+        }
+        Some(app)
+            if Path::new(app)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| muru_config::PROJECT_FILES.contains(&name)) =>
+        {
+            let path = Path::new(app);
+            anyhow::ensure!(path.is_file(), "{app} does not exist");
+            anyhow::ensure!(
+                chdir.is_none(),
+                "give the project as the argument or with --chdir, not both"
+            );
+            (
+                None,
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+            )
+        }
+        Some(app) => {
+            anyhow::ensure!(
+                !app.contains('/') && !app.ends_with(".py"),
+                "{app} is neither module:callable nor a project directory"
+            );
+            (
+                Some(app.to_owned()),
+                chdir.unwrap_or_else(|| PathBuf::from(".")),
+            )
+        }
+        None => (None, chdir.unwrap_or_else(|| PathBuf::from("."))),
+    };
+    let (source, table) = match muru_config::load_project(&project)? {
+        Some((path, table)) => (Some(path), table),
+        None => (None, muru_config::ToolMuru::default()),
+    };
+    // Whether the entrypoint is a factory belongs to the entrypoint: the
+    // table's factory settings apply to the table's entrypoint only.
+    let from_table = entrypoint.is_none();
+    let entrypoint = match entrypoint.or(table.entrypoint) {
+        Some(entrypoint) => entrypoint,
+        None => match &source {
+            Some(path) => anyhow::bail!(
+                "{} has no entrypoint in its [tool.muru] table; give one as module:callable",
+                path.display()
+            ),
+            None => anyhow::bail!(
+                "no entrypoint: give module:callable, or a project directory with a [tool.muru] table in its pyproject.toml or muru.toml"
+            ),
+        },
+    };
+    let factory = if args.factory || (from_table && table.factory == Some(true)) {
+        Some(
+            table
+                .factory_phase
+                .filter(|_| from_table)
+                .unwrap_or(muru_config::FactoryPhase::Worker),
+        )
+    } else {
+        None
+    };
+    Ok(Resolved {
+        entrypoint,
+        interface: args
+            .interface
+            .or(table.interface)
+            .unwrap_or(muru_config::Interface::Auto),
+        factory,
+        processes: args
+            .processes
+            .or(table.processes)
+            .unwrap_or(DEFAULT_PROCESSES),
+        threads: args.threads.or(table.threads).unwrap_or(DEFAULT_THREADS),
+        preload: args
+            .preload
+            .or(table.preload)
+            .unwrap_or(muru_config::Preload::Auto),
+        hooks: args.hooks.clone().or(table.hooks),
+        project,
+        source,
+    })
+}
+
 /// How TLS was set up: the listener configuration and, for a development
 /// certificate, where it came from.
 struct Tls {
@@ -352,13 +461,19 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
     }))
 }
 
-/// The interpreter to run the host with. A path is made absolute, because a
-/// virtualenv's interpreter locates its site-packages from its own path.
-fn python_interpreter(explicit: Option<PathBuf>) -> PathBuf {
+/// The interpreter to run the host with (section 13.1): --python, else the
+/// active virtualenv, else the project's own .venv, else python3 on PATH. A
+/// path is made absolute, because a virtualenv's interpreter locates its
+/// site-packages from its own path.
+fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
     let python = explicit
         .or_else(|| {
             std::env::var_os("VIRTUAL_ENV")
                 .map(|venv| PathBuf::from(venv).join("bin").join("python"))
+        })
+        .or_else(|| {
+            let venv = project.join(".venv").join("bin").join("python");
+            venv.is_file().then_some(venv)
         })
         .unwrap_or_else(|| PathBuf::from("python3"));
     match (python.parent(), python.file_name()) {
@@ -376,11 +491,16 @@ fn python_interpreter(explicit: Option<PathBuf>) -> PathBuf {
 
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
-async fn run(mut args: RunArgs) -> anyhow::Result<()> {
-    anyhow::ensure!(args.workers >= 1, "--workers must be at least 1");
+async fn run(args: RunArgs) -> anyhow::Result<()> {
+    let mut resolved = resolve(&args)?;
+    anyhow::ensure!(resolved.processes >= 1, "--processes must be at least 1");
+    anyhow::ensure!(resolved.threads >= 1, "--threads must be at least 1");
     if args.single {
-        args.workers = 1;
-        args.threads = 1;
+        resolved.processes = 1;
+        resolved.threads = 1;
+    }
+    if let Some(source) = &resolved.source {
+        println!("muru: using [tool.muru] from {}", source.display());
     }
     // Certificates are sorted out before anything is started, so a bad
     // --tls-cert or an unwritable cache fails with nothing to clean up.
@@ -389,13 +509,15 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
     let spec = HostSpec {
-        python: python_interpreter(args.python.clone()),
-        app: args.app.clone(),
-        workers: args.workers,
-        threads: args.threads,
-        preload: args.preload.as_str(),
-        hooks: args.hooks.clone(),
-        chdir: args.chdir.clone(),
+        python: python_interpreter(args.python.clone(), &resolved.project),
+        app: resolved.entrypoint.clone(),
+        interface: resolved.interface,
+        factory: resolved.factory,
+        processes: resolved.processes,
+        threads: resolved.threads,
+        preload: resolved.preload,
+        hooks: resolved.hooks.clone(),
+        chdir: Some(resolved.project.clone()),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
     };
@@ -411,7 +533,7 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
     let edge = muru_edge::Edge::bind(muru_edge::Config {
         listen: args.bind,
         sockets: current.sockets.clone(),
-        slots: args.threads,
+        slots: resolved.threads,
         development: true,
         access_log,
         limits: limits(&args),
@@ -430,7 +552,7 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
     };
     println!(
         "muru: serving {} on {addresses} with {} workers of {} threads",
-        args.app, args.workers, args.threads
+        resolved.entrypoint, resolved.processes, resolved.threads
     );
     if let Some(tls) = &tls {
         match (&tls.development, &args.tls_cert) {
@@ -445,7 +567,7 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
         match dashboard::start(
             &args.dashboard,
             dashboard::Inputs {
-                app: args.app.clone(),
+                app: resolved.entrypoint.clone(),
                 listen: edge.local_addr(),
                 https: edge.https_addr(),
                 started: std::time::Instant::now(),
@@ -465,7 +587,7 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
     let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
     if args.reload {
         let directories = if args.reload_dir.is_empty() {
-            vec![args.chdir.clone().unwrap_or_else(|| PathBuf::from("."))]
+            vec![resolved.project.clone()]
         } else {
             args.reload_dir.clone()
         };
@@ -521,7 +643,7 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
                     tokio::select! {
                         ready = next.wait_ready(START_TIMEOUT) => match ready {
                             Ok(()) => {
-                                match muru_edge::link::LinkPool::new(&next.sockets, args.threads) {
+                                match muru_edge::link::LinkPool::new(&next.sockets, resolved.threads) {
                                     Ok(pool) => pools.replace(pool),
                                     Err(error) => {
                                         println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
