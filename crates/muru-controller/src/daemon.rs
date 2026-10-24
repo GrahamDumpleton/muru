@@ -34,6 +34,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// before its workers are stopped anyway (section 9.5 drain_timeout).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a superseded release stays warm (section 9.1), provisional
+/// (section 19.2).
+pub const RETENTION: Duration = Duration::from_secs(30 * 60);
+
 /// What the daemon runs with.
 pub struct Config {
     /// Where everything lives.
@@ -58,6 +62,8 @@ pub enum Command {
         spec: ReleaseSpec,
         /// The release id, or none to generate one.
         id: Option<String>,
+        /// How long the superseded release stays warm; zero stops it.
+        retain: Duration,
         /// Where the release record goes as soon as it exists.
         created: oneshot::Sender<Result<Release, String>>,
         /// Where the outcome goes once the release serves or has failed.
@@ -131,10 +137,12 @@ pub struct Info {
     pub edge_pid: std::sync::atomic::AtomicU32,
 }
 
-/// A running release: its host and the sockets its workers listen on.
+/// A running release: its host and the sockets its workers listen on,
+/// and, once superseded, when its retention ends.
 struct Running {
     host: HostProcess,
     sockets: Vec<PathBuf>,
+    retained_until: Option<Instant>,
 }
 
 /// The daemon's state while it runs.
@@ -271,6 +279,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
+                daemon.expire_retained().await;
             }
         }
     };
@@ -393,8 +402,19 @@ impl Daemon {
         match HostProcess::adopt(record.pid, record.sockets.clone(), run_dir.join("r1"), 1) {
             Ok(host) => {
                 let sockets = host.sockets.clone();
-                self.running
-                    .insert((app.to_owned(), id.to_owned()), Running { host, sockets });
+                let retained_until = matches!(
+                    self.store.release(app, id).map(|release| release.state),
+                    Ok(ReleaseState::Retained)
+                )
+                .then(|| Instant::now() + RETENTION);
+                self.running.insert(
+                    (app.to_owned(), id.to_owned()),
+                    Running {
+                        host,
+                        sockets,
+                        retained_until,
+                    },
+                );
                 self.events.emit(
                     "release.adopted",
                     &format!("{app}@{id}"),
@@ -424,10 +444,11 @@ impl Daemon {
                 app,
                 spec,
                 id,
+                retain,
                 created,
                 done,
             } => {
-                let outcome = self.deploy(&app, spec, id, created).await;
+                let outcome = self.deploy(&app, spec, id, retain, created).await;
                 let _ = done.send(outcome);
             }
             Command::Rollback { app, done } => {
@@ -447,6 +468,7 @@ impl Daemon {
         app: &str,
         spec: ReleaseSpec,
         id: Option<String>,
+        retain: Duration,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
         let record = self.create(app, spec, id);
@@ -479,7 +501,7 @@ impl Daemon {
             .set_app_releases(app, Some(&release.id), previous.as_deref())
             .map_err(|error| error.to_string())?;
         if let Some(previous) = previous.filter(|previous| previous != &release.id) {
-            self.drain(app, &previous).await;
+            self.drain(app, &previous, retain).await;
         }
 
         self.store
@@ -523,7 +545,10 @@ impl Daemon {
             .release(app, id)
             .map_err(|error| error.to_string())?;
         let subject = format!("{app}@{id}");
-        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+        if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
+            // Retained and warm: back to ready without a restart.
+            running.retained_until = None;
+            self.set_state(&release, ReleaseState::Ready, "");
             return Ok(());
         }
 
@@ -576,8 +601,14 @@ impl Daemon {
                 sockets: sockets.clone(),
             },
         );
-        self.running
-            .insert((app.to_owned(), id.to_owned()), Running { host, sockets });
+        self.running.insert(
+            (app.to_owned(), id.to_owned()),
+            Running {
+                host,
+                sockets,
+                retained_until: None,
+            },
+        );
         self.set_state(&release, ReleaseState::Ready, "");
         self.events.emit(
             "release.ready",
@@ -621,22 +652,23 @@ impl Daemon {
     }
 
     /// Section 9.5: with traffic already elsewhere, wait for the release's
-    /// requests in flight to finish, then stop its host.
-    async fn drain(&mut self, app: &str, id: &str) {
+    /// requests in flight to finish, then keep it warm for `retain` (section
+    /// 9.1) or stop its host.
+    async fn drain(&mut self, app: &str, id: &str, retain: Duration) {
         let subject = format!("{app}@{id}");
         let Ok(release) = self.store.release(app, id) else {
             return;
         };
-        let Some(running) = self.running.remove(&(app.to_owned(), id.to_owned())) else {
+        if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
             if release.state.is_running() {
                 self.set_state(&release, ReleaseState::Stopped, "");
             }
             return;
-        };
+        }
 
         // The previous pool is gone from the edge, so what is in flight on
         // these workers is what the edge had already dispatched; a short
-        // wait lets it finish before the host is told to stop.
+        // wait lets it finish.
         self.set_state(
             &release,
             ReleaseState::Draining,
@@ -646,6 +678,50 @@ impl Daemon {
             .emit("release.draining", &subject, "info", "draining");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
+        // One retained release per application: an older one makes way.
+        if !retain.is_zero() {
+            let older: Vec<String> = self
+                .running
+                .iter()
+                .filter(|((other_app, other_id), running)| {
+                    other_app == app && other_id != id && running.retained_until.is_some()
+                })
+                .map(|((_, other_id), _)| other_id.clone())
+                .collect();
+            for other in older {
+                self.stop_release(app, &other, "superseded again").await;
+            }
+            if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
+                running.retained_until = Some(Instant::now() + retain);
+            }
+            let until = crate::model::now_unix_ms() + retain.as_millis() as u64;
+            self.set_state(
+                &release,
+                ReleaseState::Retained,
+                &format!("warm until {}; a rollback to it is instant", clock(until)),
+            );
+            self.events.emit(
+                "release.retained",
+                &subject,
+                "info",
+                &format!("kept warm for {}", muru_config::format_duration(retain)),
+            );
+            return;
+        }
+
+        self.stop_release(app, id, "").await;
+    }
+
+    /// Stop a release's host and record it stopped.
+    async fn stop_release(&mut self, app: &str, id: &str, why: &str) {
+        let subject = format!("{app}@{id}");
+        let Ok(release) = self.store.release(app, id) else {
+            return;
+        };
+        let Some(running) = self.running.remove(&(app.to_owned(), id.to_owned())) else {
+            return;
+        };
+
         self.set_state(&release, ReleaseState::Stopping, "stopping the host");
         let record = running.host.run_dir().join("..").join("host.toml");
         let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
@@ -653,9 +729,25 @@ impl Daemon {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
         }
         let _ = std::fs::remove_file(record);
-        self.set_state(&release, ReleaseState::Stopped, "");
+        self.set_state(&release, ReleaseState::Stopped, why);
         self.events
             .emit("release.stopped", &subject, "info", "stopped");
+    }
+
+    /// Stop the retained releases whose window has passed.
+    async fn expire_retained(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(String, String)> = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.retained_until.is_some_and(|until| until <= now))
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for (app, id) in expired {
+            self.stop_release(&app, &id, "the retention window passed")
+                .await;
+        }
     }
 
     /// Section 9.6: start the previous release again if it is not running,
@@ -679,7 +771,7 @@ impl Daemon {
             &format!("rolled back to {previous}"),
         );
         if let Some(current) = current.filter(|current| current != &previous) {
-            self.drain(app, &current).await;
+            self.drain(app, &current, RETENTION).await;
         }
 
         self.store
@@ -702,7 +794,7 @@ impl Daemon {
             self.events
                 .emit("traffic.switched", app, "notice", "no release serves");
         }
-        self.drain(app, id).await;
+        self.drain(app, id, Duration::ZERO).await;
 
         self.store
             .release(app, id)
@@ -812,4 +904,10 @@ impl Daemon {
             tracing::error!(%error, "recording a release state failed");
         }
     }
+}
+
+/// A wall clock time as HH:MM UTC, for messages.
+fn clock(unix_ms: u64) -> String {
+    let seconds = (unix_ms / 1000) % 86_400;
+    format!("{:02}:{:02} UTC", seconds / 3600, (seconds % 3600) / 60)
 }

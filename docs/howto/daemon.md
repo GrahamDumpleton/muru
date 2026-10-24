@@ -7,8 +7,8 @@ The daemon serves one or more applications on one node, each deployed
 from a source directory with the blue/green strategy, with rollback,
 drains and an event log, through an edge process of its own, and it can
 be stopped and started again without interrupting traffic. What is still
-to come: warm retention of drained releases, virtual hosts and TLS,
-declarative configuration, canaries, and the rest of the roadmap.
+to come: virtual hosts and TLS, declarative configuration, canaries, and
+the rest of the roadmap.
 ```
 
 `muructl run` is for development. For an application that stays up, start
@@ -45,12 +45,18 @@ muructl drain shop@r2
 muructl events --follow
 ```
 
-`rollback` starts the previous release again if it was stopped, moves
-traffic to it when it is ready and drains the one that served. `drain`
-takes a release out of traffic and stops it; draining the serving release
-leaves the application answering 503 until the next deploy. `deploy
---no-wait` returns once the release is recorded, and `release wait` waits
-for a state.
+A release that a deploy replaces is drained and then kept warm, with
+its workers untouched, for a retention window of 30 minutes (`deploy
+--retain` changes it; `--retain 0` stops it as soon as it has drained),
+so `rollback` within the window is instant: traffic moves back to the
+workers that were already serving. After the window, or when another
+deploy supersedes it again, the retained release is stopped. One release
+per application is retained at a time. `rollback` to a release that was
+stopped starts it again first and moves traffic when it is ready; the
+release it replaces is retained in turn. `drain` takes a release out of
+traffic and stops it; draining the serving release leaves the application
+answering 503 until the next deploy. `deploy --no-wait` returns once the
+release is recorded, and `release wait` waits for a state.
 
 A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves

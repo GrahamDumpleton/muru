@@ -43,6 +43,7 @@ strategy, the edge as a process of its own (ADR 0002) on a listener the
 daemon binds and hands down (respawned on the same socket if it dies,
 and handed back over SCM_RIGHTS to a daemon that restarts), and daemon
 detach with re-adoption of the edge and the hosts, so a daemon restart
-never interrupts traffic. Next from phase 2: warm retention of drained
-releases, then virtual hosts, TLS and the declarative configuration
-(apply, export, diff).
+never interrupts traffic, and warm retention of the superseded release
+for an instant rollback (whole, until the host control socket brings the
+warm floor of section 9.1). Next from phase 2: virtual hosts, TLS and the
+declarative configuration (apply, export, diff).

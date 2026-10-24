@@ -93,6 +93,7 @@ message DeployRequest {
   string factory_phase = 13;        // worker or host
   string release = 14;              // a chosen release id, else generated
   bool wait = 15;                   // return once the release serves, or fails
+  optional uint64 retain_ms = 16;   // how long the superseded release stays warm; default 30 minutes, 0 to stop it
 }
 
 message ListReleasesRequest {
@@ -143,6 +144,7 @@ message Release {
   uint64 created_unix_ms = 14;
   uint64 resource_version = 15;
   repeated Worker workers = 16;
+  uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
 }
 
 message Worker {

@@ -240,7 +240,7 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
     assert json.loads(daemon.get("/info").body)["pid"] != pid_before
     assert daemon.releases("shop") == [
         {"release": "shop@r2", "state": "ready", "serving": "yes"},
-        {"release": "shop@r1", "state": "stopped", "serving": ""},
+        {"release": "shop@r1", "state": "retained", "serving": ""},
     ]
 
 
@@ -253,7 +253,7 @@ def test_rollback_restores_the_previous_release(daemon: Daemon) -> None:
     )
     assert daemon.get("/").status == 200
     assert daemon.releases("shop") == [
-        {"release": "shop@second", "state": "stopped", "serving": ""},
+        {"release": "shop@second", "state": "retained", "serving": ""},
         {"release": "shop@r1", "state": "ready", "serving": "yes"},
     ]
     assert "APP                  CURRENT      PREVIOUS" in daemon.muructl("app", "list").stdout
@@ -480,3 +480,48 @@ def test_a_dead_edge_is_started_again_without_refusing_connections(daemon: Daemo
         next(line.split()[2] for line in new_status.splitlines() if line.startswith("edge"))
     )
     assert new_pid != edge_pid
+
+
+def test_superseded_release_is_retained_and_rollback_is_instant(daemon: Daemon) -> None:
+    daemon.deploy("shop", SHOP)
+    first_pid = json.loads(daemon.get("/info").body)["pid"]
+    daemon.deploy("shop", SHOP, "--processes", "1")
+
+    # The first release is warm, with its workers untouched.
+    assert daemon.releases("shop") == [
+        {"release": "shop@r2", "state": "ready", "serving": "yes"},
+        {"release": "shop@r1", "state": "retained", "serving": ""},
+    ]
+    assert "warm until" in daemon.muructl("release", "list", "shop").stdout
+
+    assert (
+        daemon.muructl("rollback", "shop").stdout.strip() == "muru: rolled back to shop@r1 (ready)"
+    )
+    assert json.loads(daemon.get("/info").body)["pid"] == first_pid
+    assert daemon.releases("shop") == [
+        {"release": "shop@r2", "state": "retained", "serving": ""},
+        {"release": "shop@r1", "state": "ready", "serving": "yes"},
+    ]
+
+
+def test_retention_can_be_switched_off_or_shortened(daemon: Daemon) -> None:
+    daemon.deploy("shop", SHOP)
+    daemon.deploy("shop", SHOP, "--retain", "0")
+    assert daemon.releases("shop")[1] == {"release": "shop@r1", "state": "stopped", "serving": ""}
+
+    daemon.deploy("shop", SHOP, "--retain", "1s")
+    assert daemon.releases("shop")[1] == {"release": "shop@r2", "state": "retained", "serving": ""}
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and daemon.releases("shop")[1]["state"] != "stopped":
+        time.sleep(0.2)
+    assert daemon.releases("shop")[1] == {"release": "shop@r2", "state": "stopped", "serving": ""}
+    assert "the retention window passed" in daemon.muructl("release", "list", "shop").stdout
+
+
+def test_only_one_release_is_retained_per_application(daemon: Daemon) -> None:
+    daemon.deploy("shop", SHOP)
+    daemon.deploy("shop", SHOP)
+    daemon.deploy("shop", SHOP)
+
+    assert [row["state"] for row in daemon.releases("shop")] == ["ready", "retained", "stopped"]
+    assert "superseded again" in daemon.muructl("release", "list", "shop").stdout

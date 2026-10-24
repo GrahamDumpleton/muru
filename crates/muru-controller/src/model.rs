@@ -24,6 +24,9 @@ pub enum ReleaseState {
     Ready,
     /// Removed from traffic; requests in flight are finishing.
     Draining,
+    /// Drained and kept warm for the retention window, so a rollback to it
+    /// is instant (section 9.1).
+    Retained,
     /// Hosts and workers are being stopped.
     Stopping,
     /// Stopped, and can be started again (a rollback target).
@@ -34,12 +37,13 @@ pub enum ReleaseState {
 
 impl ReleaseState {
     /// Every state, for parsing.
-    pub const ALL: [ReleaseState; 8] = [
+    pub const ALL: [ReleaseState; 9] = [
         ReleaseState::Pending,
         ReleaseState::Starting,
         ReleaseState::Warming,
         ReleaseState::Ready,
         ReleaseState::Draining,
+        ReleaseState::Retained,
         ReleaseState::Stopping,
         ReleaseState::Stopped,
         ReleaseState::Failed,
@@ -53,6 +57,7 @@ impl ReleaseState {
             ReleaseState::Warming => "warming",
             ReleaseState::Ready => "ready",
             ReleaseState::Draining => "draining",
+            ReleaseState::Retained => "retained",
             ReleaseState::Stopping => "stopping",
             ReleaseState::Stopped => "stopped",
             ReleaseState::Failed => "failed",
@@ -67,6 +72,7 @@ impl ReleaseState {
                 | ReleaseState::Warming
                 | ReleaseState::Ready
                 | ReleaseState::Draining
+                | ReleaseState::Retained
                 | ReleaseState::Stopping
         )
     }

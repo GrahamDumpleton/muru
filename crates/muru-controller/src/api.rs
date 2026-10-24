@@ -109,6 +109,9 @@ impl Admin for Service {
                 app: request.app.clone(),
                 spec,
                 id: (!request.release.is_empty()).then(|| request.release.clone()),
+                retain: request
+                    .retain_ms
+                    .map_or(crate::daemon::RETENTION, Duration::from_millis),
                 created: created_tx,
                 done: done_tx,
             })
@@ -473,6 +476,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         created_unix_ms: release.created_unix_ms,
         resource_version: release.resource_version,
         workers: Vec::new(),
+        retained_until_unix_ms: 0,
     }
 }
 

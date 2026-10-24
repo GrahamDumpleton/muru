@@ -362,6 +362,11 @@ pub struct DeployArgs {
     #[arg(long)]
     no_wait: bool,
 
+    /// How long the release this one replaces stays warm for an instant
+    /// rollback (default 30m; 0 stops it as soon as it has drained).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    retain: Option<Duration>,
+
     #[command(flatten)]
     socket: SocketArgs,
 }
@@ -401,6 +406,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         factory_phase: String::new(),
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
+        retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
     };
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 

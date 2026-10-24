@@ -29,13 +29,16 @@ stateDiagram-v2
   Unhealthy --> Failed : recovery timeout
   Ready --> Draining : removed from traffic
   Draining --> Ready : traffic restored, rollback
-  Draining --> Stopping : in-flight zero or deadline
+  Draining --> Retained : in-flight zero, within the retention window
+  Draining --> Stopping : in-flight zero or deadline, no retention
+  Retained --> Ready : rollback
+  Retained --> Stopping : retention over, superseded again or memory pressure
   Stopping --> Stopped
   Failed --> [*]
   Stopped --> [*]
 ```
 
-Superseded releases stay warm for a retention window (default 30 minutes), so rollback avoids a cold start. Once drained, a retained release scales down to a warm floor: its preloaded host plus retain_workers per required worker group (default 1). Because workers fork from the preloaded host, scaling back up takes seconds at most. If the node goes over its memory budget, retained releases drop to the host alone, and are stopped, oldest first, if that is still not enough. These defaults are provisional and flagged for review (section 19.2). Readiness requires every required worker group, in every variant, to have its minimum ready workers and the release checks of section 9.11 to pass.
+Superseded releases stay warm for a retention window (default 30 minutes, or the deploy's retain setting), so rollback avoids a cold start; one release per application is retained, and a release superseded again is stopped. Once drained, a retained release scales down to a warm floor: its preloaded host plus retain_workers per required worker group (default 1). Because workers fork from the preloaded host, scaling back up takes seconds at most. If the node goes over its memory budget, retained releases drop to the host alone, and are stopped, oldest first, if that is still not enough. These defaults are provisional and flagged for review (section 19.2). Readiness requires every required worker group, in every variant, to have its minimum ready workers and the release checks of section 9.11 to pass.
 
 ## 9.2 Strategies
 
