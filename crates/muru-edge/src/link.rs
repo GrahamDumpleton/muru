@@ -257,12 +257,13 @@ pub async fn handle(
 ) -> Response<ResponseBody> {
     let (parts, mut body) = request.into_parts();
     let mut head = request_head(&parts, request_id, peer, local);
+    let version = parts.version;
 
     if head
         .content_length
         .is_some_and(|length| length > MAX_BODY_SIZE)
     {
-        return too_large();
+        return too_large(version);
     }
 
     // Section 4.6: a body without a declared length is read in full first,
@@ -277,13 +278,16 @@ pub async fn handle(
                 head.body_buffered = true;
                 buffered = Some(data);
             }
-            Err(BodyError::TooLarge) => return too_large(),
+            Err(BodyError::TooLarge) => return too_large(version),
             Err(BodyError::Read(error)) => {
                 tracing::debug!(%error, "reading the request body failed");
-                return close_after(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "the request body could not be read",
-                ));
+                return close_after(
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "the request body could not be read",
+                    ),
+                    version,
+                );
             }
         }
     }
@@ -394,18 +398,21 @@ pub async fn handle(
     let response = response
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid response head"));
     if close {
-        close_after(response)
+        close_after(response, version)
     } else {
         response
     }
 }
 
-fn too_large() -> Response<ResponseBody> {
+fn too_large(version: http::Version) -> Response<ResponseBody> {
     let message = format!(
         "the request body is larger than max_body_size allows ({} bytes)",
         MAX_BODY_SIZE
     );
-    close_after(error_response(StatusCode::PAYLOAD_TOO_LARGE, &message))
+    close_after(
+        error_response(StatusCode::PAYLOAD_TOO_LARGE, &message),
+        version,
+    )
 }
 
 enum BodyError {

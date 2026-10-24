@@ -1,0 +1,1 @@
+The edge serves HTTP/2 over cleartext by prior knowledge on the same listener as HTTP/1.1, with HTTP_HOST taken from the :authority pseudo-header. HTTP/2 over TLS follows with TLS support.

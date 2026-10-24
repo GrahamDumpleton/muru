@@ -1,11 +1,12 @@
 //! The Muru edge: listeners, TLS, virtual hosts, routing, the request pipeline, upstreams, static files and uploads.
 //!
-//! Phase 0 scope: an HTTP/1.1 listener that forwards every request to one
-//! pool of workers over the worker link (design specification section 5).
-//! The request head is sent as a typed frame, the body streams behind it,
-//! and the response streams back; no HTTP is re-serialised between the edge
-//! and the application. Routing, TLS, HTTP/2 and everything else arrive in
-//! phase 1 and later.
+//! Phase 1 scope so far: a listener speaking HTTP/1.1 and HTTP/2 (h2c by
+//! prior knowledge; h2 over TLS arrives with TLS) that forwards every
+//! request to one pool of workers over the worker link (design
+//! specification section 5). The request head is sent as a typed frame, the
+//! body streams behind it, and the response streams back; no HTTP is
+//! re-serialised between the edge and the application. Routing, TLS and
+//! everything else arrive later in phase 1 and beyond.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -15,14 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, HeaderMap, HeaderName, HeaderValue, SERVER,
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, HOST, HeaderMap, HeaderName, HeaderValue,
+    SERVER,
 };
 use http::{Response, StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use muru_proto::worker::v1 as pb;
 use tokio::net::TcpListener;
 
@@ -42,12 +44,16 @@ pub struct Config {
     pub slots: usize,
 }
 
+/// Concurrent streams accepted per HTTP/2 connection (section 4.18).
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
+
 /// A bound edge, ready to run.
 pub struct Edge {
     listener: TcpListener,
     local: SocketAddr,
     pool: Arc<link::LinkPool>,
     next_request_id: Arc<AtomicU64>,
+    protocols: Arc<auto::Builder<TokioExecutor>>,
 }
 
 impl Edge {
@@ -56,11 +62,19 @@ impl Edge {
         let pool = Arc::new(link::LinkPool::new(&config.sockets, config.slots)?);
         let listener = TcpListener::bind(config.listen).await?;
         let local = listener.local_addr()?;
+        // Each connection is served as HTTP/1.1 or, when it opens with the
+        // HTTP/2 preface, as HTTP/2.
+        let mut protocols = auto::Builder::new(TokioExecutor::new());
+        protocols.http1().keep_alive(true);
+        protocols
+            .http2()
+            .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS);
         Ok(Self {
             listener,
             local,
             pool,
             next_request_id: Arc::new(AtomicU64::new(1)),
+            protocols: Arc::new(protocols),
         })
     }
 
@@ -76,6 +90,7 @@ impl Edge {
             let _ = stream.set_nodelay(true);
             let pool = Arc::clone(&self.pool);
             let ids = Arc::clone(&self.next_request_id);
+            let protocols = Arc::clone(&self.protocols);
             let local = self.local;
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
@@ -86,9 +101,7 @@ impl Edge {
                         Ok::<_, Infallible>(response)
                     }
                 });
-                let connection = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(TokioIo::new(stream), service);
+                let connection = protocols.serve_connection(TokioIo::new(stream), service);
                 if let Err(error) = connection.await {
                     tracing::debug!(%peer, %error, "connection ended with an error");
                 }
@@ -148,6 +161,15 @@ pub(crate) fn request_head(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
     let named_in_connection = connection_options(&parts.headers);
+    // HTTP/2 carries the host in :authority rather than a Host header, and
+    // applications expect HTTP_HOST either way.
+    let host = match (parts.headers.get(HOST), parts.uri.authority()) {
+        (None, Some(authority)) => Some(pb::Header {
+            name: Bytes::from_static(b"host"),
+            value: Bytes::copy_from_slice(authority.as_str().as_bytes()),
+        }),
+        _ => None,
+    };
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
         request_id: request_id.to_string(),
@@ -159,19 +181,21 @@ pub(crate) fn request_head(
             .query()
             .map(|query| Bytes::copy_from_slice(query.as_bytes()))
             .unwrap_or_default(),
-        headers: parts
-            .headers
-            .iter()
-            // Section 4.7: a name with an underscore could masquerade as
-            // another header's HTTP_ key, so it never reaches the application,
-            // and neither does anything hop-by-hop.
-            .filter(|(name, _)| {
-                !name.as_str().contains('_') && !is_hop_by_hop(name.as_str(), &named_in_connection)
-            })
-            .map(|(name, value)| pb::Header {
-                name: Bytes::copy_from_slice(name.as_str().as_bytes()),
-                value: Bytes::copy_from_slice(value.as_bytes()),
-            })
+        headers: host
+            .into_iter()
+            .chain(parts.headers.iter().filter_map(|(name, value)| {
+                // Section 4.7: a name with an underscore could masquerade as
+                // another header's HTTP_ key, so it never reaches the
+                // application, and neither does anything hop-by-hop.
+                let name = name.as_str();
+                if name.contains('_') || is_hop_by_hop(name, &named_in_connection) {
+                    return None;
+                }
+                Some(pb::Header {
+                    name: Bytes::copy_from_slice(name.as_bytes()),
+                    value: Bytes::copy_from_slice(value.as_bytes()),
+                })
+            }))
             .collect(),
         client: Some(pb::Peer {
             address: peer.ip().to_string(),
@@ -225,11 +249,17 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response<Resp
     response
 }
 
-/// Mark a response as the last on its connection. hyper closes the
-/// connection once it has been written.
-pub(crate) fn close_after(mut response: Response<ResponseBody>) -> Response<ResponseBody> {
-    response
-        .headers_mut()
-        .insert(CONNECTION, HeaderValue::from_static("close"));
+/// Mark a response as the last on its HTTP/1.1 connection, which hyper
+/// closes once it has been written. An HTTP/2 stream needs nothing: the
+/// connection carries on and an unread body resets only the stream.
+pub(crate) fn close_after(
+    mut response: Response<ResponseBody>,
+    version: Version,
+) -> Response<ResponseBody> {
+    if version <= Version::HTTP_11 {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
     response
 }

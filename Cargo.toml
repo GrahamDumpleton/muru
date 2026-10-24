@@ -35,8 +35,8 @@ futures = "0.3"
 http = "1.3"
 http-body = "1.0"
 http-body-util = "0.1"
-hyper = { version = "1.7", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+hyper = { version = "1.7", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = "0.2"
 muru-common = { path = "crates/muru-common" }
 muru-edge = { path = "crates/muru-edge" }
