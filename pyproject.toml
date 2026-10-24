@@ -19,6 +19,10 @@ dev = [
     "ruff>=0.9",
     "towncrier>=24.8",
 ]
+fixtures = [
+    "django>=5.2",
+    "flask>=3.1",
+]
 bench = [
     "granian>=2.0",
     "gunicorn>=23.0",
@@ -35,7 +39,7 @@ docs = [
 
 [tool.uv]
 package = false
-default-groups = ["dev", "docs"]
+default-groups = ["dev", "docs", "fixtures"]
 
 [tool.ruff]
 line-length = 100

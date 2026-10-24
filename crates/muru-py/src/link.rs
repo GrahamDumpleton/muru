@@ -278,6 +278,12 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
             },
             None => Some(rx.recv().await),
         };
+        // The bridge says when the request is over; the channel closing
+        // without that only means the application thread died.
+        let item = match item {
+            Some(Some(Outgoing::Finished)) => Some(None),
+            other => other,
+        };
         match item {
             None => {
                 // The delay expired with data waiting.
@@ -400,6 +406,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     }
                 }
             }
+            Some(Some(Outgoing::Finished)) => unreachable!("mapped to the end of output above"),
             Some(Some(Outgoing::Continue)) => {
                 // The application is reading the body. The edge may pass
                 // that on as 100 Continue (section 5.5); after the response

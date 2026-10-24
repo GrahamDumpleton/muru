@@ -1,0 +1,1 @@
+A request's end of output is now signalled explicitly by the WSGI bridge. It was inferred from the drop of the start_response object, which Flask and Django keep alive in an exception's reference cycle after an error response, so the worker connection stayed busy until a later garbage collection and the next request on it hung.

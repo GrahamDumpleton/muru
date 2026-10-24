@@ -51,6 +51,12 @@ pub enum Outgoing {
     },
     /// The application has started reading the request body (section 5.5).
     Continue,
+    /// The request is over: the application returned and its iterable was
+    /// closed. Sent explicitly, because the `start_response` object that
+    /// also holds a sender can outlive the request when a framework keeps
+    /// an exception, and with it the frames that reference it, alive
+    /// until a later collection.
+    Finished,
 }
 
 /// Sends output to the coalescing task, detaching from the interpreter only
@@ -683,6 +689,7 @@ pub fn run(
     cancelled: Arc<AtomicBool>,
 ) {
     let announce = head.expect_continue.then(|| tx.clone());
+    let finished = tx.clone();
     let start_response = match Bound::new(py, StartResponse::new(tx)) {
         Ok(start_response) => start_response,
         Err(error) => {
@@ -711,6 +718,8 @@ pub fn run(
             start_response.abort(py, "the application failed after the response started");
         }
     }
+    let sink = Sink { tx: finished };
+    sink.send(py, Outgoing::Finished);
 }
 
 fn run_app<'py>(

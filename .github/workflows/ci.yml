@@ -97,7 +97,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: uv python install ${{ matrix.python }}
-      - run: uv sync --only-group dev --python ${{ matrix.python }}
+      - run: uv sync --only-group dev --only-group fixtures --python ${{ matrix.python }}
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
       - run: bash packaging/dev/fetch-h2spec.sh
