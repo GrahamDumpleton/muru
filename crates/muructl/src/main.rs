@@ -113,6 +113,11 @@ struct RunArgs {
     #[arg(long, default_value = "127.0.0.1:8081")]
     dashboard: String,
 
+    /// One process and one thread, serving without forking, for debuggers.
+    /// Implies --workers 1 --threads 1.
+    #[arg(long)]
+    single: bool,
+
     /// Start a new release when a watched source file changes.
     #[arg(long)]
     reload: bool,
@@ -309,8 +314,12 @@ fn python_interpreter(explicit: Option<PathBuf>) -> PathBuf {
 
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
-async fn run(args: RunArgs) -> anyhow::Result<()> {
+async fn run(mut args: RunArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.workers >= 1, "--workers must be at least 1");
+    if args.single {
+        args.workers = 1;
+        args.threads = 1;
+    }
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
@@ -323,6 +332,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         hooks: args.hooks.clone(),
         chdir: args.chdir.clone(),
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
+        single: args.single,
     };
 
     let logs = Logs::default();

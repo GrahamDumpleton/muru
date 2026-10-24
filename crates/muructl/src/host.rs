@@ -30,6 +30,8 @@ pub struct HostSpec {
     pub chdir: Option<PathBuf>,
     /// Loopback TCP instead of Unix sockets for the link, from this port.
     pub tcp_base_port: Option<u16>,
+    /// Serve in the host process itself, with no fork (section 13.1).
+    pub single: bool,
 }
 
 /// A running host and the sockets its workers listen on.
@@ -75,6 +77,9 @@ impl HostProcess {
             .stderr(Stdio::piped());
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
+        }
+        if spec.single {
+            command.arg("--single");
         }
         let base_port = spec
             .tcp_base_port

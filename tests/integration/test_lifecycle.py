@@ -144,3 +144,25 @@ def test_failing_on_load_hook_stops_the_host(tmp_path: os.PathLike[str]) -> None
         support.start("preload_wsgi:application", args=["--hooks", "hooks_failing_load"])
     assert "the on_load hook failed" in str(excinfo.value)
     assert "load-boom" in str(excinfo.value)
+
+
+def test_single_serves_in_the_host_process_without_forking() -> None:
+    server = support.start(
+        "preload_wsgi:application", workers=3, threads=4, args=["--single", "--hooks", "hooks_log"]
+    )
+    try:
+        assert server.wait_for_log("serving in this process without forking")
+        info = json.loads(server.get("/").body)
+        host = server.host_pid()
+        assert info["pid"] == host
+        assert info["import_pid"] == host
+        assert info["worker_id"] == 0
+        assert info["process_model"] in ("process-per-request", "free-threaded")
+        assert server.worker_pids() == {}
+        # Hooks still run, in this one process; nothing forks, so pre_fork
+        # has no occasion.
+        for name in ("on_load", "post_fork", "on_ready"):
+            assert [line["pid"] for line in hook_lines(server, name)] == [str(host)], name
+        assert hook_lines(server, "pre_fork") == []
+    finally:
+        server.stop()

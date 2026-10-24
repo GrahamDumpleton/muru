@@ -453,6 +453,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--hooks", default=None, help="module providing the lifecycle hooks")
     parser.add_argument(
+        "--single",
+        action="store_true",
+        help="serve in this process with one thread and no fork, for debuggers (section 13.1)",
+    )
+    parser.add_argument(
         "--tcp-base-port",
         type=int,
         default=None,
@@ -538,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
 
     os.makedirs(args.socket_dir, exist_ok=True)
     host = Host(release, args.socket_dir, args.workers, args.threads, args.tcp_base_port)
+    if args.single:
+        # Section 13.1: no fork, so a debugger attached to this process sees
+        # the application. The hooks run as they would in a worker.
+        gc.enable()
+        log("serving in this process without forking (--single)")
+        return host.worker(0)
     return host.run()
 
 
