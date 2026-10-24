@@ -11,7 +11,7 @@ use muru_dashboard::{Data, RequestRow, Source, Summary, Worker};
 use muru_edge::Pools;
 use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
 
-use crate::logs::Logs;
+use muru_controller::logs::Logs;
 
 /// How far back the summary looks.
 const WINDOW: Duration = Duration::from_secs(60);

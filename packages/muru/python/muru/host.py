@@ -267,6 +267,11 @@ class Host:
         self.threads = threads
         self.sync_threads = sync_threads
         self.concurrency = concurrency
+        # Section 2.4: a host's workers must not outlive it. Each worker
+        # inherits the read end of this pipe and stops when it reaches end
+        # of file, which happens only when the host, holding the write
+        # end, is gone.
+        self.lifeline_read, self.lifeline_write = os.pipe()
         self.workers: dict[int, int] = {}
         self.stopping = False
         self.restart_after: dict[int, float] = {}
@@ -313,7 +318,8 @@ class Host:
                 os.dup2(err_write, 2)
                 for fd in (out_read, out_write, err_read, err_write, *self.outputs):
                     os.close(fd)
-                status = self.worker(index)
+                os.close(self.lifeline_write)
+                status = self.worker(index, lifeline=self.lifeline_read)
             except BaseException:
                 traceback.print_exc()
             finally:
@@ -328,8 +334,12 @@ class Host:
         self.spawned_at[pid] = time.monotonic()
         log(f"worker {index} started as pid {pid}")
 
-    def worker(self, index: int) -> int:
-        """Run a worker: enable collection, run the hooks, then serve until the server stops."""
+    def worker(self, index: int, lifeline: int | None = None) -> int:
+        """Run a worker: enable collection, run the hooks, then serve until the server stops.
+
+        `lifeline` is the read end of the host's pipe, which the server
+        watches so the worker stops when the host is gone.
+        """
 
         global _in_worker
         _in_worker = True
@@ -412,6 +422,7 @@ class Host:
                 on_drain=lambda: hooks.call_logged("on_drain", context),
                 on_exit=on_exit,
                 on_reopen_logs=lambda: hooks.call_logged("on_reopen_logs", context),
+                lifeline=lifeline,
                 **asgi_arguments,
             )
         except Exception as error:

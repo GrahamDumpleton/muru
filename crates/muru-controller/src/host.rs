@@ -163,6 +163,11 @@ impl HostProcess {
         self.child.wait().await
     }
 
+    /// Whether the host has exited, without waiting.
+    pub fn try_exited(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
     /// Stop the host: SIGTERM and its stdin closed, then SIGKILL after a
     /// grace period. Its workers finish the requests they are serving.
     pub async fn stop(mut self) {

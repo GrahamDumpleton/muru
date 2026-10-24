@@ -60,6 +60,8 @@ pub struct Lifecycle {
     pub on_exit: Option<Py<PyAny>>,
     /// Runs on SIGUSR1.
     pub on_reopen_logs: Option<Py<PyAny>>,
+    /// A descriptor whose end of file means the host is gone.
+    pub lifeline: Option<i32>,
 }
 
 impl Lifecycle {
@@ -86,10 +88,12 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
     let accepting = Arc::clone(&shared);
     let reopen_logs = lifecycle.on_reopen_logs.as_ref();
+    let lifeline = lifecycle.lifeline;
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
         let mut signals = Signals::new()?;
+        let mut lifeline = Lifeline::new(lifeline)?;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -101,6 +105,10 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                         break;
                     }
                     Lifecycle::call(reopen_logs);
+                }
+                () = lifeline.gone() => {
+                    eprintln!("muru: the host is gone, stopping");
+                    break;
                 }
             }
         }
@@ -124,6 +132,71 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
     served
+}
+
+/// The read end of the host's pipe: readable only at end of file, when
+/// the host and its write end are gone (section 2.4).
+struct Lifeline {
+    fd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+}
+
+impl Lifeline {
+    fn new(fd: Option<i32>) -> io::Result<Self> {
+        let Some(raw) = fd else {
+            return Ok(Self { fd: None });
+        };
+
+        // SAFETY: the descriptor was inherited from the host for this
+        // purpose and nothing else in the worker holds it, so owning and
+        // closing it here is sound.
+        let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+        // SAFETY: fcntl on a descriptor this process owns, setting a flag.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        // SAFETY: the descriptor is valid and owned by `owned`, which is
+        // neither closed nor replaced while the AsyncFd holds it.
+        let fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(owned, tokio::io::Interest::READABLE)?
+        };
+        Ok(Self { fd: Some(fd) })
+    }
+
+    /// Resolve when the host is gone; never, without a lifeline.
+    async fn gone(&mut self) {
+        let Some(fd) = &self.fd else {
+            return std::future::pending().await;
+        };
+
+        loop {
+            let Ok(mut guard) = fd.readable().await else {
+                return;
+            };
+            let mut buffer = [0u8; 8];
+            // SAFETY: read into a buffer this stack frame owns, on a
+            // descriptor this struct owns.
+            let read = unsafe {
+                libc::read(
+                    std::os::fd::AsRawFd::as_raw_fd(fd.get_ref()),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if read == 0 {
+                return;
+            }
+            if read < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                continue;
+            }
+            if read < 0 {
+                return;
+            }
+        }
+    }
 }
 
 /// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks

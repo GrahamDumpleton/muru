@@ -7,10 +7,9 @@
 //! command is defined once with clap, which later generates help, man
 //! pages and the CLI reference (section 14.4 and Appendix A).
 
+mod admin;
 mod dashboard;
 mod devcert;
-mod host;
-mod logs;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -23,9 +22,9 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
 
-use crate::host::{HostProcess, HostSpec};
-use crate::logs::Logs;
 use crate::watch::Watch;
+use muru_controller::host::{HostProcess, HostSpec};
+use muru_controller::logs::Logs;
 
 /// How long a host may take to get its workers listening.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -50,7 +49,63 @@ enum Command {
     /// Run or control the daemon.
     Daemon {
         #[command(subcommand)]
-        command: DaemonCommand,
+        command: admin::DaemonCommand,
+    },
+
+    /// Make sure a daemon is running for this user.
+    Up(admin::DaemonRunArgs),
+
+    /// Create a release from a source directory and move traffic to it.
+    Deploy(Box<admin::DeployArgs>),
+
+    /// Manage applications.
+    App {
+        #[command(subcommand)]
+        command: admin::AppCommand,
+    },
+
+    /// Manage releases.
+    Release {
+        #[command(subcommand)]
+        command: admin::ReleaseCommand,
+    },
+
+    /// Restore traffic to an application's previous release.
+    Rollback {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Take a release out of traffic and stop it.
+    Drain {
+        /// The release, as app@release.
+        release: String,
+
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Show the daemon's status.
+    Status {
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
+    /// Show or follow the daemon's events.
+    Events {
+        /// Keep printing events as they happen.
+        #[arg(long, short)]
+        follow: bool,
+
+        /// Start after this sequence number.
+        #[arg(long, default_value = "0")]
+        after: u64,
+
+        #[command(flatten)]
+        socket: admin::SocketArgs,
     },
 
     /// Run an edge process (internal, started by the daemon).
@@ -353,12 +408,6 @@ enum Link {
 }
 
 #[derive(Subcommand)]
-enum DaemonCommand {
-    /// Run the daemon in the foreground.
-    Run,
-}
-
-#[derive(Subcommand)]
 enum EdgeCommand {
     /// Run an edge process.
     Run,
@@ -371,28 +420,61 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     let cli = Cli::parse();
 
-    let name = match cli.command {
-        Command::Run(args) => {
-            return tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(run(*args));
-        }
-        Command::Daemon {
-            command: DaemonCommand::Run,
-        } => "daemon run",
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    match cli.command {
+        Command::Run(args) => runtime.block_on(run(*args)),
+        Command::Daemon { command } => runtime.block_on(async move {
+            match command {
+                admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
+                admin::DaemonCommand::Start(args) => admin::daemon_start(args).await,
+                admin::DaemonCommand::Stop { shutdown, socket } => {
+                    admin::daemon_stop(socket, shutdown).await
+                }
+                admin::DaemonCommand::Status { socket } => admin::daemon_status(socket).await,
+            }
+        }),
+        Command::Up(args) => runtime.block_on(admin::up(args)),
+        Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
+        Command::App { command } => runtime.block_on(async move {
+            match command {
+                admin::AppCommand::List { socket } => admin::app_list(socket).await,
+            }
+        }),
+        Command::Release { command } => runtime.block_on(async move {
+            match command {
+                admin::ReleaseCommand::List { app, socket } => {
+                    admin::release_list(app, socket).await
+                }
+                admin::ReleaseCommand::Wait {
+                    release,
+                    states,
+                    timeout,
+                    socket,
+                } => admin::release_wait(release, states, timeout, socket).await,
+            }
+        }),
+        Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
+        Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
+        Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
+        Command::Events {
+            follow,
+            after,
+            socket,
+        } => runtime.block_on(admin::events(follow, after, socket)),
         Command::Edge {
             command: EdgeCommand::Run,
-        } => "edge run",
-    };
-    anyhow::bail!("muructl {name} is not implemented yet; see docs/project/roadmap.md")
+        } => anyhow::bail!("muructl edge run is not implemented yet; see docs/project/roadmap.md"),
+    }
 }
 
 /// Parse a duration such as 250ms, 1.5s or 2 (seconds).
-fn parse_duration(text: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
     let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
         (number, 0.001)

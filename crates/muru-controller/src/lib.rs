@@ -1,4 +1,16 @@
-//! The Muru controller: reconciler, state store, admin API and JSON gateway, rollouts, autoscaler, schedules and events.
+//! The Muru controller: the state store, the reconciler that drives
+//! releases toward desired state, the admin API, and the hosts it
+//! supervises (design specification sections 2, 9, 10 and 13).
 //!
-//! This crate is a placeholder created with the project skeleton. See the
-//! design specification (docs/project/design) for what it will contain.
+//! Built as a library so the same code runs embedded in `muructl run` and
+//! in the daemon (ADR 0002).
+
+pub mod api;
+pub mod client;
+pub mod daemon;
+pub mod events;
+pub mod host;
+pub mod locations;
+pub mod logs;
+pub mod model;
+pub mod store;

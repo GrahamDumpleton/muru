@@ -37,11 +37,13 @@ fn version() -> &'static str {
 ///
 /// `on_drain` is called when the stop signal arrives, before the
 /// application threads finish their requests, `on_exit` once they have, and
-/// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3).
+/// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3). `lifeline` is
+/// a descriptor whose end of file also stops the server: the read end of a
+/// pipe the host holds the write end of, so a worker never outlives it.
 // The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -54,6 +56,7 @@ fn serve(
     on_drain: Option<Py<PyAny>>,
     on_exit: Option<Py<PyAny>>,
     on_reopen_logs: Option<Py<PyAny>>,
+    lifeline: Option<i32>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -82,6 +85,7 @@ fn serve(
         on_drain,
         on_exit,
         on_reopen_logs,
+        lifeline,
     };
 
     py.detach(move || link::serve(&socket_path, shared, lifecycle))

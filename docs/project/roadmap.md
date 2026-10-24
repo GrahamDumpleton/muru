@@ -33,5 +33,14 @@ Phase 2 so far has the ASGI bridge: one event loop per worker, lifespan
 with its state, the sync thread pool, concurrency declared to the edge in
 HELLO, WebSockets relayed by the edge with the MESSAGE and CLOSE frames of
 section 5.6 and checked by the Autobahn suite, the ASGI conformance suite,
-and plain ASGI, Starlette, FastAPI and Django ASGI fixtures. Next from
-phase 2: the daemon.
+and plain ASGI, Starlette, FastAPI and Django ASGI fixtures. The daemon's
+first slice is in: the state store (SQLite), the locations of section
+13.8, the admin API of appendix B over the admin socket with the deploy,
+release, rollback, drain, event and status operations, `muructl daemon
+run`, `start`, `stop` and `status`, `up`, `deploy`, `release list` and
+`wait`, `rollback`, `drain`, `events` and `status`, with the edge embedded
+in the daemon process and the blue/green strategy. Next from phase 2:
+separate edge processes with listener handoff (ADR 0002), host
+re-adoption so a daemon restart or detach never interrupts traffic, warm
+retention of drained releases, then virtual hosts, TLS and the declarative
+configuration (apply, export, diff).

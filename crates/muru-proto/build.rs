@@ -14,9 +14,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     tonic_prost_build::configure()
         .bytes(".muru.worker.v1")
         .compile_protos(
-            &["../../proto/muru/worker/v1/worker.proto"],
+            &[
+                "../../proto/muru/worker/v1/worker.proto",
+                "../../proto/muru/admin/v1/admin.proto",
+            ],
             &["../../proto"],
         )?;
     println!("cargo:rerun-if-changed=../../proto/muru/worker/v1/worker.proto");
+    println!("cargo:rerun-if-changed=../../proto/muru/admin/v1/admin.proto");
     Ok(())
 }

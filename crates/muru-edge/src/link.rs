@@ -111,11 +111,6 @@ impl LinkPool {
     /// HELLO declares (section 5.1): the edge acts on the capabilities, not
     /// on the kind of worker. The first connection stays in the pool.
     pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !sockets.is_empty(),
-            "at least one worker socket is required"
-        );
-
         let mut workers = Vec::with_capacity(sockets.len());
         for path in sockets {
             let (conn, hello) = connect(path)
@@ -154,9 +149,34 @@ impl LinkPool {
             .collect()
     }
 
+    /// A pool with no workers at all, for an edge that is up before any
+    /// release is: every request is answered 503 until a pool replaces it.
+    pub fn empty() -> Self {
+        Self {
+            workers: Vec::new(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether the pool has any workers.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    /// Requests in flight across every worker.
+    pub fn in_flight(&self) -> usize {
+        self.workers
+            .iter()
+            .map(|worker| worker.slots - worker.semaphore.available_permits())
+            .sum()
+    }
+
     /// Take a connection from the worker with the most free slots, waiting
     /// for one if every worker is busy.
     async fn acquire(&self) -> io::Result<Lease> {
+        if self.workers.is_empty() {
+            return Err(io::Error::other("no release is serving"));
+        }
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut best = start;
         let mut best_free = self.workers[start].semaphore.available_permits();

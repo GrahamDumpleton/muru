@@ -17,6 +17,7 @@ def serve(
     on_drain: Callable[[], Any] | None = None,
     on_exit: Callable[[], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
+    lifeline: int | None = None,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -26,7 +27,9 @@ def serve(
     scope and channel of each request, and concurrency is how many requests
     the loop takes at once. on_drain runs when the stop signal arrives,
     before the requests in flight finish, on_exit after they have, and
-    on_reopen_logs whenever SIGUSR1 arrives.
+    on_reopen_logs whenever SIGUSR1 arrives. lifeline is a file descriptor
+    whose end of file also stops the server: the read end of a pipe whose
+    write end the host holds, so a worker never outlives its host.
     """
 
 def resolve_future(future: Any, value: Any) -> None:

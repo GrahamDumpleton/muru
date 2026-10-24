@@ -19,8 +19,9 @@ Muru is early in its life. What works today is development mode:
 HTTP/1.1, HTTP/2, HTTPS and WebSockets, forked workers, lifecycle hooks
 and ASGI lifespan, watch reload, an access log and a small dashboard, and
 it has been tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI. The daemon,
-releases and traffic management are still to come.
+FastAPI. The daemon deploys releases from source directories with
+blue/green switches, rollback and drains. Traffic management and the rest
+of the daemon are still to come.
 The [tutorial](tutorials/first-wsgi-app.md) shows what exists, the
 [design specification](project/design/index.md) describes what is being built
 and the [roadmap](project/roadmap.md) describes in what order. Pre-releases

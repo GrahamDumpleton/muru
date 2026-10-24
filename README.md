@@ -26,8 +26,9 @@ WSGI or ASGI application on your machine with HTTP/1.1, HTTP/2, HTTPS and
 WebSockets, forked workers with an import check before the fork, lifecycle
 hooks and ASGI lifespan, watch reload, an access log and a small dashboard,
 tested with plain WSGI and ASGI, Flask, Django, Starlette and FastAPI on
-regular and free-threaded Python. The daemon, releases and traffic management are still
-to come; the
+regular and free-threaded Python. The daemon serves applications deployed from source
+directories with blue/green releases, rollback and drains; traffic
+management and the rest of the daemon are still to come; the
 [roadmap](docs/project/roadmap.md) lists the phases. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
 is the place to start, and the
