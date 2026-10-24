@@ -38,8 +38,17 @@ pub enum Outgoing {
     },
     /// One body chunk.
     Body(Bytes),
-    /// The application failed after the head was sent; end the stream with an error.
-    Abort(String),
+    /// The application failed: before the head, in which case the edge
+    /// renders the error page from the reason and detail (section 4.12),
+    /// or after it, in which case the stream ends with the error.
+    Abort {
+        /// What went wrong, in a sentence.
+        error: String,
+        /// The Appendix C.3 reason, app_error for an exception.
+        reason: String,
+        /// The traceback, for development mode.
+        detail: String,
+    },
     /// The application has started reading the request body (section 5.5).
     Continue,
 }
@@ -131,37 +140,29 @@ impl StartResponse {
     }
 
     /// Reply with a plain 500 when the application failed before any output.
-    fn send_error_response(&self, py: Python<'_>) {
-        let body = b"Internal Server Error\n";
-        {
-            let mut state = self.state.lock().expect("head state poisoned");
-            state.sent = true;
-        }
-        let headers = vec![
-            (
-                b"content-type".to_vec(),
-                b"text/plain; charset=utf-8".to_vec(),
-            ),
-            (
-                b"content-length".to_vec(),
-                body.len().to_string().into_bytes(),
-            ),
-        ];
-        if self.sink.send(
+    /// The application failed before any response head: the edge renders
+    /// the error page, with the traceback in development mode.
+    fn fail(&self, py: Python<'_>, detail: String) {
+        self.state.lock().expect("head state poisoned").sent = true;
+        self.sink.send(
             py,
-            Outgoing::Head {
-                status: 500,
-                reason: "Internal Server Error".to_owned(),
-                headers,
-                flush: pb::FlushPolicy::Unspecified,
+            Outgoing::Abort {
+                error: "the application raised an exception".to_owned(),
+                reason: "app_error".to_owned(),
+                detail,
             },
-        ) {
-            self.sink.send(py, Outgoing::Body(Bytes::from_static(body)));
-        }
+        );
     }
 
     fn abort(&self, py: Python<'_>, message: &str) {
-        self.sink.send(py, Outgoing::Abort(message.to_owned()));
+        self.sink.send(
+            py,
+            Outgoing::Abort {
+                error: message.to_owned(),
+                reason: "app_error".to_owned(),
+                detail: String::new(),
+            },
+        );
     }
 }
 
@@ -705,7 +706,7 @@ pub fn run(
         }
         let start_response = start_response.get();
         if !start_response.head_sent() {
-            start_response.send_error_response(py);
+            start_response.fail(py, describe(py, &error));
         } else if !broken_pipe {
             start_response.abort(py, "the application failed after the response started");
         }
@@ -741,6 +742,18 @@ fn run_app<'py>(
 /// `PyErr::print` is not used because it exits the process for SystemExit,
 /// and an application raising SystemExit is a failed request, not a reason
 /// to stop serving.
+/// Format an exception with its traceback, as the traceback module does.
+fn describe(py: Python<'_>, error: &PyErr) -> String {
+    let formatted = py
+        .import(intern!(py, "traceback"))
+        .and_then(|module| module.call_method1(intern!(py, "format_exception"), (error.value(py),)))
+        .and_then(|lines| lines.extract::<Vec<String>>());
+    match formatted {
+        Ok(lines) => lines.concat(),
+        Err(_) => error.to_string(),
+    }
+}
+
 pub(crate) fn report(py: Python<'_>, error: &PyErr) {
     let printed = py
         .import(intern!(py, "traceback"))

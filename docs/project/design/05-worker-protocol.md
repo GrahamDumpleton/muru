@@ -37,7 +37,7 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | REQUEST | 2 | edge to worker | RequestHead | Opens a request. END flag when there is no body |
 | BODY | 3 | both | bytes | One piece of a request or response body. END flag on the last piece |
 | RESPONSE | 4 | worker to edge | ResponseHead | The final response head. END flag when there is no body. Status 101 accepts a WebSocket |
-| END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete |
+| END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete. Sent in place of RESPONSE when the application failed before producing a head, with the reason and detail the edge's error page shows (section 4.12) |
 | ABORT | 6 | edge to worker | Abort | The edge has no more use for the request: the client has gone, or the response ended before the request body did (section 5.5) |
 | CONTINUE | 7 | worker to edge | empty | The application has started reading the request body, so the edge may send 100 Continue (section 4.6). Sent only when the request head says the client is waiting for it |
 | MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6). Phase 2 |
@@ -56,7 +56,7 @@ The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
 - **ResponseHead:** status, ordered headers, flush policy override.
 
-- **End:** trailers, and an error string when the body is incomplete.
+- **End:** trailers, and an error string when the body is incomplete. In place of a response head: the Appendix C.3 reason (app_error) and a detail string, the traceback, which the edge shows only in development mode.
 
 - **Abort:** a reason, for logs.
 

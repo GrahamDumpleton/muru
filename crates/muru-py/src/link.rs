@@ -408,7 +408,11 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     frame::write(writer, kind::CONTINUE, 0, Bytes::new()).await?;
                 }
             }
-            Some(Some(Outgoing::Abort(message))) => {
+            Some(Some(Outgoing::Abort {
+                error,
+                reason,
+                detail,
+            })) => {
                 if ended {
                     return Ok(());
                 }
@@ -427,7 +431,9 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     frame::write(writer, kind::RESPONSE, 0, head).await?;
                 }
                 let end = pb::End {
-                    error: message,
+                    error,
+                    reason,
+                    detail,
                     ..Default::default()
                 }
                 .encode_to_vec();

@@ -101,6 +101,8 @@ message ResponseHead {
 message End {
   repeated Header trailers = 1;
   string error = 2;                 // non-empty when the body is incomplete
+  string reason = 3;                // Appendix C.3 reason when the worker failed before its response head, for example app_error
+  string detail = 4;                // the traceback or similar, shown by the edge in development mode only
 }
 
 // Payload of an ABORT frame, edge to worker: the client has gone, or the

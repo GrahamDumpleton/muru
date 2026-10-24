@@ -244,6 +244,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         listen: args.bind,
         sockets,
         slots: args.threads,
+        development: true,
     })
     .await?;
     println!(

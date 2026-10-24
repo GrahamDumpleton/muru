@@ -1,0 +1,1 @@
+Error responses the edge generates are content negotiated (HTML, an RFC 9457 problem document or plain text) and name their status, reason and request id; in development mode an application error's page includes the traceback. Every response carries X-Request-ID, a time-ordered identifier that is also muru.request_id in the environ.

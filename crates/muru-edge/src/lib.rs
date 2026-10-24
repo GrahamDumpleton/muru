@@ -12,22 +12,20 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, HOST, HeaderMap, HeaderName, HeaderValue,
-    SERVER,
+    CONNECTION, CONTENT_LENGTH, EXPECT, HOST, HeaderMap, HeaderName, HeaderValue, SERVER,
 };
 use http::{Response, StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use muru_proto::worker::v1 as pb;
 use tokio::net::TcpListener;
 
+pub mod errors;
 pub mod link;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -42,6 +40,8 @@ pub struct Config {
     pub sockets: Vec<PathBuf>,
     /// Requests a worker handles at once, which bounds its connection pool.
     pub slots: usize,
+    /// Development mode: error pages show tracebacks (section 4.12).
+    pub development: bool,
 }
 
 /// Concurrent streams accepted per HTTP/2 connection (section 4.18).
@@ -52,8 +52,9 @@ pub struct Edge {
     listener: TcpListener,
     local: SocketAddr,
     pool: Arc<link::LinkPool>,
-    next_request_id: Arc<AtomicU64>,
+    request_ids: Arc<errors::RequestIds>,
     protocols: Arc<auto::Builder<TokioExecutor>>,
+    development: bool,
 }
 
 impl Edge {
@@ -73,8 +74,9 @@ impl Edge {
             listener,
             local,
             pool,
-            next_request_id: Arc::new(AtomicU64::new(1)),
+            request_ids: Arc::new(errors::RequestIds::new()),
             protocols: Arc::new(protocols),
+            development: config.development,
         })
     }
 
@@ -89,15 +91,24 @@ impl Edge {
             let (stream, peer) = self.listener.accept().await?;
             let _ = stream.set_nodelay(true);
             let pool = Arc::clone(&self.pool);
-            let ids = Arc::clone(&self.next_request_id);
+            let ids = Arc::clone(&self.request_ids);
             let protocols = Arc::clone(&self.protocols);
             let local = self.local;
+            let development = self.development;
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
                     let pool = Arc::clone(&pool);
-                    let request_id = ids.fetch_add(1, Ordering::Relaxed);
+                    let request_id = ids.next();
                     async move {
-                        let response = link::handle(request, pool, request_id, peer, local).await;
+                        let mut response =
+                            link::handle(request, pool, &request_id, peer, local, development)
+                                .await;
+                        // Section 4.19: every response names its request.
+                        if let Ok(value) = HeaderValue::from_str(&request_id) {
+                            response
+                                .headers_mut()
+                                .insert(errors::X_REQUEST_ID.clone(), value);
+                        }
                         Ok::<_, Infallible>(response)
                     }
                 });
@@ -151,7 +162,7 @@ pub(crate) fn expects_continue(parts: &http::request::Parts) -> bool {
 
 pub(crate) fn request_head(
     parts: &http::request::Parts,
-    request_id: u64,
+    request_id: &str,
     peer: SocketAddr,
     local: SocketAddr,
 ) -> pb::RequestHead {
@@ -172,7 +183,7 @@ pub(crate) fn request_head(
     };
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-        request_id: request_id.to_string(),
+        request_id: request_id.to_owned(),
         method: parts.method.as_str().to_owned(),
         scheme: "http".to_owned(),
         raw_path: Bytes::copy_from_slice(parts.uri.path().as_bytes()),
@@ -231,22 +242,6 @@ pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>)
         }
     }
     headers.insert(SERVER, HeaderValue::from_static("muru"));
-}
-
-pub(crate) fn error_response(status: StatusCode, message: &str) -> Response<ResponseBody> {
-    let body = Full::new(Bytes::from(format!("{message}\n")))
-        .map_err(|never: Infallible| match never {})
-        .boxed_unsync();
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-        .headers_mut()
-        .insert(SERVER, HeaderValue::from_static("muru"));
-    response
 }
 
 /// Mark a response as the last on its HTTP/1.1 connection, which hyper

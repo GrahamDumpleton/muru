@@ -37,7 +37,8 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::{BoxError, ResponseBody, close_after, error_response, request_head};
+use crate::errors::{self, Negotiation, Problem};
+use crate::{BoxError, ResponseBody, close_after, request_head};
 
 /// After the response has ended, this much of an unread request body is
 /// read and discarded so the client connection can be kept alive; beyond
@@ -251,19 +252,24 @@ impl Return {
 pub async fn handle(
     request: http::Request<Incoming>,
     pool: Arc<LinkPool>,
-    request_id: u64,
+    request_id: &str,
     peer: SocketAddr,
     local: SocketAddr,
+    development: bool,
 ) -> Response<ResponseBody> {
     let (parts, mut body) = request.into_parts();
     let mut head = request_head(&parts, request_id, peer, local);
-    let version = parts.version;
+    let failing = Failing {
+        request_id,
+        negotiation: Negotiation::from_headers(&parts.headers, development),
+        version: parts.version,
+    };
 
     if head
         .content_length
         .is_some_and(|length| length > MAX_BODY_SIZE)
     {
-        return too_large(version);
+        return failing.too_large();
     }
 
     // Section 4.6: a body without a declared length is read in full first,
@@ -278,16 +284,14 @@ pub async fn handle(
                 head.body_buffered = true;
                 buffered = Some(data);
             }
-            Err(BodyError::TooLarge) => return too_large(version),
+            Err(BodyError::TooLarge) => return failing.too_large(),
             Err(BodyError::Read(error)) => {
                 tracing::debug!(%error, "reading the request body failed");
-                return close_after(
-                    error_response(
-                        StatusCode::BAD_REQUEST,
-                        "the request body could not be read",
-                    ),
-                    version,
-                );
+                return failing.close(Problem::new(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "The request body could not be read.",
+                ));
             }
         }
     }
@@ -297,7 +301,13 @@ pub async fn handle(
         Ok(lease) => lease,
         Err(error) => {
             tracing::warn!(%error, "no worker connection");
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "no worker is available");
+            let mut problem = Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_workers",
+                "No worker is available to handle the request.",
+            );
+            problem.retry_after = Some(1);
+            return failing.respond(problem);
         }
     };
     let Lease {
@@ -324,7 +334,7 @@ pub async fn handle(
     {
         tracing::warn!(%error, "writing the request head failed");
         drop(permit);
-        return error_response(StatusCode::BAD_GATEWAY, "the worker is not available");
+        return failing.worker_crashed("The worker is not available.");
     }
 
     let back = Return::new(pool, worker, permit);
@@ -349,21 +359,29 @@ pub async fn handle(
         match frame::read(&mut reader).await {
             Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
             Ok(Some(next)) if next.kind == kind::RESPONSE => break next,
+            Ok(Some(next)) if next.kind == kind::END => {
+                // The application failed before producing a head: the
+                // worker says why, and the connection is still good.
+                back.give_reader(Some(reader));
+                back.abort_request();
+                let end = pb::End::decode(next.payload).unwrap_or_default();
+                return failing.worker_failed(end);
+            }
             Ok(_) => {
                 back.give_reader(None);
-                return error_response(StatusCode::BAD_GATEWAY, "the worker sent no response head");
+                return failing.worker_crashed("The worker sent no response head.");
             }
             Err(error) => {
                 tracing::warn!(%error, "reading the response head failed");
                 back.give_reader(None);
-                return error_response(StatusCode::BAD_GATEWAY, "the worker failed");
+                return failing.worker_crashed("The worker failed.");
             }
         }
     };
     let response_end = response.is_end();
     let Ok(head) = pb::ResponseHead::decode(response.payload) else {
         back.give_reader(None);
-        return error_response(StatusCode::BAD_GATEWAY, "invalid response head");
+        return failing.worker_crashed("The worker sent an invalid response head.");
     };
 
     let mut builder = Response::builder().status(crate::status_code(head.status));
@@ -395,24 +413,84 @@ pub async fn handle(
         );
         builder.body(UnsyncBoxBody::new(StreamBody::new(stream)))
     };
-    let response = response
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid response head"));
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => return failing.worker_crashed("The worker sent an invalid response head."),
+    };
     if close {
-        close_after(response, version)
+        close_after(response, failing.version)
     } else {
         response
     }
 }
 
-fn too_large(version: http::Version) -> Response<ResponseBody> {
-    let message = format!(
-        "the request body is larger than max_body_size allows ({} bytes)",
-        MAX_BODY_SIZE
-    );
-    close_after(
-        error_response(StatusCode::PAYLOAD_TOO_LARGE, &message),
-        version,
-    )
+/// How this request's failures are answered: with the error pages of
+/// section 4.12, in the client's preferred format.
+struct Failing<'a> {
+    request_id: &'a str,
+    negotiation: Negotiation,
+    version: http::Version,
+}
+
+impl Failing<'_> {
+    fn respond(&self, problem: Problem) -> Response<ResponseBody> {
+        errors::respond(&problem, self.request_id, &self.negotiation)
+    }
+
+    /// Respond and close an HTTP/1.1 connection, whose state is suspect.
+    fn close(&self, problem: Problem) -> Response<ResponseBody> {
+        close_after(self.respond(problem), self.version)
+    }
+
+    fn too_large(&self) -> Response<ResponseBody> {
+        self.close(Problem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            format!(
+                "The request body is larger than max_body_size allows ({MAX_BODY_SIZE} bytes)."
+            ),
+        ))
+    }
+
+    fn worker_crashed(&self, description: &str) -> Response<ResponseBody> {
+        self.respond(Problem::new(
+            StatusCode::BAD_GATEWAY,
+            "worker_crashed",
+            description,
+        ))
+    }
+
+    /// The worker reported a failure instead of a response head.
+    fn worker_failed(&self, end: pb::End) -> Response<ResponseBody> {
+        let description = if end.error.is_empty() {
+            "The worker failed before producing a response.".to_owned()
+        } else {
+            capitalise(&end.error)
+        };
+        let mut problem = if end.reason == "app_error" {
+            Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "app_error", description)
+        } else {
+            Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description)
+        };
+        if !end.detail.is_empty() {
+            problem.detail = Some(end.detail);
+        }
+        self.respond(problem)
+    }
+}
+
+/// Start a sentence with a capital letter and end it with a full stop.
+fn capitalise(sentence: &str) -> String {
+    let mut out: String = sentence
+        .chars()
+        .take(1)
+        .flat_map(char::to_uppercase)
+        .collect();
+    out.extend(sentence.chars().skip(1));
+    if !out.ends_with('.') {
+        out.push('.');
+    }
+    out
 }
 
 enum BodyError {
