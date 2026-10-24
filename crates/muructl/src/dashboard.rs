@@ -64,10 +64,12 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
 
 fn collect(inputs: &Inputs) -> Data {
     let now = SystemTime::now();
+
     // Rate and errors come from the per-second counters, which are exact
     // at any load. The record ring is bounded, so under load it reaches
     // back less than a minute: the percentiles and the request rows are
     // taken from whatever it covers.
+
     let minute = inputs.access_log.last_minute();
     let records = inputs.access_log.recent(RING_CAPACITY);
     let recent: Vec<&Record> = records

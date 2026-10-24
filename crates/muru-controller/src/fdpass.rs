@@ -18,6 +18,7 @@ pub fn send_fd(socket: &UnixStream, fd: RawFd) -> io::Result<()> {
 
     // SAFETY: every pointer refers to a buffer that lives for the call,
     // and the control buffer is aligned and sized for one descriptor.
+
     unsafe {
         let mut message: libc::msghdr = std::mem::zeroed();
         message.msg_iov = &mut iov;
@@ -49,6 +50,7 @@ pub fn recv_fd(socket: &UnixStream) -> io::Result<OwnedFd> {
 
     // SAFETY: as for send_fd; the descriptor read out of the control
     // message is one the kernel has just installed in this process.
+
     unsafe {
         let mut message: libc::msghdr = std::mem::zeroed();
         message.msg_iov = &mut iov;
@@ -86,6 +88,7 @@ struct Control([u8; CONTROL_LEN]);
 /// The control message length for one descriptor.
 fn control_space() -> usize {
     // SAFETY: CMSG_SPACE only computes a size.
+
     unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize }
 }
 
@@ -105,6 +108,7 @@ mod tests {
         drop(reader);
 
         // The received descriptor is the read end of the second pair.
+
         writer.write_all(b"hello").unwrap();
         drop(writer);
         let mut copy = UnixStream::from(received);

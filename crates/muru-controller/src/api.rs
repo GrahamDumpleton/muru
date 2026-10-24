@@ -23,6 +23,7 @@ pub async fn serve(
     // Unix socket paths are limited to about a hundred bytes, which a
     // deep runtime directory can exceed (section 13.8 keeps the defaults
     // short for that reason).
+
     let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).map_err(|error| {
         anyhow::anyhow!(
@@ -119,6 +120,7 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?;
 
         // Without wait, the record is enough; with it, the outcome.
+
         let created = created_rx
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
@@ -276,6 +278,7 @@ impl Admin for Service {
     ) -> Result<Response<EventStream>, Status> {
         // Subscribe first, then read the backlog, so nothing between the
         // two is missed; duplicates are filtered by sequence.
+
         let live = self.handle.events.subscribe();
         let backlog = self
             .handle
@@ -349,6 +352,7 @@ fn resolve_spec(handle: &Handle, request: &pb::DeployRequest) -> Result<ReleaseS
 
     // The entrypoint from the request replaces the table's with its
     // factory settings, as muructl run does (section 13.1).
+
     let (entrypoint, from_table) = if !request.entrypoint.is_empty() {
         (request.entrypoint.clone(), false)
     } else if let Some(entrypoint) = table.entrypoint.clone() {

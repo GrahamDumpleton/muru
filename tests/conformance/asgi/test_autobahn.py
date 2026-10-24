@@ -23,11 +23,13 @@ IMAGE = "crossbario/autobahn-testsuite:latest"
 # Outcomes that are not failures: NON-STRICT is the suite's own leniency,
 # UNIMPLEMENTED and INFORMATIONAL are extension cases the edge does not
 # negotiate.
+
 ACCEPTABLE = {"OK", "NON-STRICT", "UNIMPLEMENTED", "INFORMATIONAL"}
 
 # Cases that echo messages of 4 to 16 MiB, over the 1 MiB limit of section
 # 4.18, which the edge answers with close code 1009 rather than an echo.
 # The cases up to 1 MiB in the same sections run.
+
 OVER_THE_LIMIT = ["9.1.4", "9.1.5", "9.1.6", "9.2.4", "9.2.5", "9.2.6", "9.3.*", "9.4.*"]
 
 pytestmark = pytest.mark.requires_docker
@@ -52,6 +54,7 @@ def test_autobahn(tmp_path: Path) -> None:
 
     # The fixture must listen beyond loopback for the container to reach
     # it on macOS, which --allow-public permits.
+
     instance = support.start(
         "plain_asgi:application",
         workers=1,

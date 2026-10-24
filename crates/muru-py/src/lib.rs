@@ -40,7 +40,9 @@ fn version() -> &'static str {
 /// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3). `lifeline` is
 /// a descriptor whose end of file also stops the server: the read end of a
 /// pipe the host holds the write end of, so a worker never outlives it.
+
 // The arguments are the Python signature, keyword by keyword.
+
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None))]
@@ -61,6 +63,7 @@ fn serve(
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
     // The loop and the runner come together, or not at all.
+
     let asgi = match (event_loop, runner) {
         (Some(event_loop), Some(runner)) => Some(asgi::Asgi {
             event_loop,

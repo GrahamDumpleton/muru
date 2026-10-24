@@ -89,6 +89,7 @@ impl EdgeProcess {
         );
 
         // The listener comes back over the edge's listener socket.
+
         let listener = {
             let socket = std::os::unix::net::UnixStream::connect(&listener_socket)
                 .with_context(|| format!("connecting to {}", listener_socket.display()))?;
@@ -181,6 +182,7 @@ impl EdgeProcess {
 
         // The new edge starts with the last snapshot, so a connection that
         // waited in the backlog is served by the right workers.
+
         self.process = Process::Child(start(&self.spec, &self.snapshot.worker_sockets)?);
         self.wait_ready().await?;
         Ok(true)
@@ -208,6 +210,7 @@ impl EdgeProcess {
                 if crate::host::alive(pid) {
                     // SAFETY: kill(2) with a valid pid and signal has no
                     // memory-safety preconditions.
+
                     unsafe {
                         libc::kill(pid as libc::pid_t, libc::SIGKILL);
                     }
@@ -290,9 +293,12 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     // The listener's descriptor is duplicated onto a fixed number in the
     // child, which also clears close-on-exec for that copy, and the edge
     // gets a session of its own so it outlives a daemon that detaches.
+
     let raw = spec.listener.as_raw_fd();
+
     // SAFETY: dup2 and setsid are async-signal-safe and the closure runs
     // in the child between fork and exec, where it touches nothing else.
+
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(raw, LISTENER_FD) < 0 {

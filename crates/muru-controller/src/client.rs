@@ -19,6 +19,7 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
 
     // The URI is required by the channel but never used: the connector
     // opens the Unix socket whatever it says.
+
     let endpoint = Endpoint::try_from("http://muru.invalid")?;
     let channel = endpoint
         .connect_with_connector(tower::service_fn(move |_: Uri| {

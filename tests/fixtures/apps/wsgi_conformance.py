@@ -557,6 +557,7 @@ def in_unread(environ: Environ, start_response: StartResponse) -> Iterable[bytes
 def in_read_after_response(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     # Write the response first, then read the body: both directions are
     # independent, so this must not deadlock whatever the body size.
+
     write = start_response("200 OK", [("Content-Type", "text/plain")])
     write(b"started-")
     data = environ["wsgi.input"].read()
@@ -604,6 +605,7 @@ def env_all_http(environ: Environ, start_response: StartResponse) -> Iterable[by
 
 def env_path_bytes(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     # PATH_INFO as the latin-1 bytes PEP 3333 says it carries.
+
     raw = environ["PATH_INFO"].encode("latin-1")
     return respond(start_response, b"path=" + raw)
 
@@ -744,6 +746,7 @@ def fw_small_blocks(environ: Environ, start_response: StartResponse) -> Iterable
 
 def fw_wrapped_in_list(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     # Middleware often wraps the iterable; the wrapper must still iterate.
+
     handle = open(FILE_PATH, "rb")
     start_response("200 OK", [("Content-Type", "text/plain")])
     return list(environ["wsgi.file_wrapper"](handle, 8192))

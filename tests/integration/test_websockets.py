@@ -125,6 +125,7 @@ def test_send_after_close_is_an_error_in_the_log(server: support.Server) -> None
 def test_message_over_the_limit_closes_with_1009(server: support.Server) -> None:
     with open_socket(server, "/ws/echo", max_size=None) as socket_:
         # The edge may close while the message is still being sent.
+
         with pytest.raises(ConnectionClosed) as closed:
             socket_.send("x" * (1024 * 1024 + 1))
             socket_.recv()
@@ -141,6 +142,7 @@ def test_client_vanishing_is_a_1006_disconnect(server: support.Server) -> None:
             b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
         )
         assert raw.recv(65536).startswith(b"HTTP/1.1 101")
+
         # Gone without a close frame.
 
     assert server.wait_for_log("websocket disconnected with 1006")

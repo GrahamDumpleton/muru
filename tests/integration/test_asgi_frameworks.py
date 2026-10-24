@@ -126,6 +126,7 @@ def test_application_error_is_a_500(framework: tuple[support.Server, str]) -> No
     if "Django" not in greeting:
         # Starlette's ServerErrorMiddleware re-raises after its own 500,
         # so the traceback reaches the worker's log.
+
         assert server.wait_for_log("boom")
     assert server.get("/").status == 200
 

@@ -55,6 +55,7 @@ def test_thread_locals_belong_to_their_threads(server: support.Server) -> None:
     # Each application thread counts its own requests: the counts seen
     # across many requests must come from at most THREADS distinct threads
     # and climb per thread.
+
     with ThreadPoolExecutor(max_workers=CLIENTS) as pool:
         seen = list(pool.map(lambda _i: json.loads(server.get("/threadlocal").body), range(400)))
     threads = {entry["thread"] for entry in seen}
@@ -65,6 +66,7 @@ def test_thread_locals_belong_to_their_threads(server: support.Server) -> None:
 def test_threads_run_in_parallel(server: support.Server) -> None:
     # 64 requests of 0.1 s on 32 threads take about 0.2 s in parallel and
     # 6.4 s if the threads serialised; the bound leaves room for slow CI.
+
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=CLIENTS) as pool:
         statuses = list(

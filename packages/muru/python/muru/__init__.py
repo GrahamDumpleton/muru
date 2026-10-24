@@ -19,6 +19,7 @@ __all__ = ["Context", "__version__", "context"]
 # The version is written into the wheel metadata by maturin from Cargo.toml.
 # When the package is imported from the source tree without being installed,
 # there is no metadata to read.
+
 try:
     __version__ = version("muru")
 except PackageNotFoundError:

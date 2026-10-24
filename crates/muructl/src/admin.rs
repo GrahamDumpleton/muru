@@ -152,6 +152,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
+
     std::fs::create_dir_all(&locations.logs.path)
         .with_context(|| format!("creating {}", locations.logs.path.display()))?;
     let access_log = Some(locations.logs.path.join("access.log"));
@@ -203,6 +204,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         .with_context(|| format!("opening {}", locations.daemon_log().display()))?;
 
     // Its own session, so it survives this shell and its signals.
+
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.arg("daemon").arg("run");
     if let Some(listen) = args.listen {
@@ -213,8 +215,10 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+
     // SAFETY: setsid is async-signal-safe and the closure runs in the
     // child between fork and exec, where it touches nothing else.
+
     unsafe {
         command.pre_exec(|| {
             libc::setsid();
@@ -262,6 +266,7 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
     // The daemon removes its socket as it exits; a process that has exited
     // but not been reaped would still answer kill(0), so the socket is the
     // signal to wait for.
+
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(90) {
         let answering = match client::connect(&path).await {
@@ -654,6 +659,7 @@ fn explain(status: tonic::Status) -> anyhow::Error {
 
 fn process_alive(pid: u32) -> bool {
     // SAFETY: kill with signal 0 checks for the process and sends nothing.
+
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 

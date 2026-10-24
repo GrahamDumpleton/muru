@@ -137,6 +137,7 @@ def test_thread_locals_survive_across_requests(server: support.Server) -> None:
     # Section 6.5: application threads are long-lived, so a threading.local
     # value set by one request is still there for a later request on the
     # same thread. Six threads serve these requests, so counts must climb.
+
     counts = []
     for _ in range(WORKERS * THREADS * 8):
         counts.append(json.loads(server.get("/threadlocal").body)["count"])
@@ -146,6 +147,7 @@ def test_thread_locals_survive_across_requests(server: support.Server) -> None:
 def test_each_request_gets_a_fresh_context(server: support.Server) -> None:
     # Section 6.5: a context variable set during one request is not visible
     # to the next request on the same thread.
+
     for _ in range(WORKERS * THREADS * 4):
         assert json.loads(server.get("/context").body) == {"inherited": None}
 
@@ -154,6 +156,7 @@ def test_unread_body_keeps_the_connection_alive(server: support.Server) -> None:
     # Section 4.6: a response sent before the request body was read, with
     # the rest of the body under the discard limit, leaves the client
     # connection usable and the worker link connection back in its pool.
+
     payload = b"x" * (512 * 1024)
     with socket.create_connection(("127.0.0.1", server.port), timeout=30) as sock:
         for _ in range(3):
@@ -164,7 +167,9 @@ def test_unread_body_keeps_the_connection_alive(server: support.Server) -> None:
             assert read_response(sock) == b"ignored\n"
         sock.sendall(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
         assert read_response(sock) == b"Hello, world!\n"
+
     # Every slot must still be free: more requests than slots succeed at once.
+
     with ThreadPoolExecutor(max_workers=12) as pool:
         statuses = list(pool.map(lambda _i: server.get("/").status, range(24)))
     assert statuses == [200] * 24

@@ -210,8 +210,10 @@ impl Edge {
             }
             https = Some((listener, bound, TlsAcceptor::from(secure.config)));
         }
+
         // Each connection is served as HTTP/1.1 or, when it opens with the
         // HTTP/2 preface, as HTTP/2.
+
         let limits = Arc::new(config.limits);
         let mut protocols = auto::Builder::new(TokioExecutor::new());
         protocols
@@ -297,6 +299,7 @@ async fn accept(
                 tokio::spawn(async move {
                     // A client that never finishes its handshake is cut off
                     // as one that never finishes its request head would be.
+
                     let handshake = tokio::time::timeout(
                         shared.limits.header_read_timeout,
                         acceptor.accept(stream),
@@ -351,7 +354,9 @@ async fn serve<I>(
                 Some(to) => link::redirect_to_https(request, &context, to),
                 None => link::handle(request, shared.pools.current(), &context).await,
             };
+
             // Section 4.19: every response names its request.
+
             if let Ok(value) = HeaderValue::from_str(&request_id) {
                 response
                     .headers_mut()
@@ -360,7 +365,9 @@ async fn serve<I>(
             Ok::<_, Infallible>(response)
         }
     });
+
     // With upgrades, so a 101 hands the connection over for WebSockets.
+
     let connection = state
         .protocols
         .serve_connection_with_upgrades(TokioIo::new(io), service);
@@ -419,8 +426,10 @@ pub(crate) fn request_head(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
     let named_in_connection = connection_options(&parts.headers);
+
     // HTTP/2 carries the host in :authority rather than a Host header, and
     // applications expect HTTP_HOST either way.
+
     let host = match (parts.headers.get(HOST), parts.uri.authority()) {
         (None, Some(authority)) => Some(pb::Header {
             name: Bytes::from_static(b"host"),
@@ -445,6 +454,7 @@ pub(crate) fn request_head(
                 // Section 4.7: a name with an underscore could masquerade as
                 // another header's HTTP_ key, so it never reaches the
                 // application, and neither does anything hop-by-hop.
+
                 let name = name.as_str();
                 if name.contains('_') || is_hop_by_hop(name, &named_in_connection) {
                     return None;

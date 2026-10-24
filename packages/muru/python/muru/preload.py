@@ -29,6 +29,7 @@ __all__ = ["Finding", "ImportRecorder", "child_pids", "thread_count"]
 
 # Compared through a name rather than sys.platform itself, so that mypy on
 # one platform does not report the other platform's branch as unreachable.
+
 _PLATFORM = sys.platform
 
 
@@ -180,6 +181,7 @@ def open_fds() -> dict[int, Identity]:
             info = os.fstat(fd)
         except OSError:
             # The descriptor used to list the directory, already closed.
+
             continue
         found[fd] = (stat.S_IFMT(info.st_mode), info.st_dev, info.st_ino)
     return found

@@ -128,6 +128,7 @@ def test_chunked_body_is_terminated(server: Server) -> None:
     # CONTENT_LENGTH for chunked bodies. Until the edge buffers, only the
     # PEP 3333 requirement is asserted: the stream is terminated and the
     # body is complete.
+
     request = (
         b"POST /input/content-length-keys HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
         b"Transfer-Encoding: chunked\r\n\r\n"

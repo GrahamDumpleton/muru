@@ -72,6 +72,7 @@ impl Store {
         connection.execute_batch(SCHEMA)?;
 
         // Version 1 is the first schema; later versions migrate from it.
+
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
             .optional()?;

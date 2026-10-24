@@ -65,6 +65,7 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         assert server.get("/").body.decode().split(" from ")[1] != first_pid
 
         # A broken edit leaves the previous release serving and is reported.
+
         server.mark_log()
         time.sleep(1.1)
         (project / "reload_app.py").write_text("def application(:\n")
@@ -72,6 +73,7 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         assert version_seen(server) == "two"
 
         # Fixing it reloads again.
+
         server.mark_log()
         time.sleep(1.1)
         write_app(project, "three")

@@ -156,6 +156,7 @@ impl Channel {
     /// delivered and the caller only drains the link.
     pub async fn deliver(&self, data: Bytes, more: bool) -> bool {
         // Wait for room, unless the response ends first.
+
         let permit = tokio::select! {
             permit = self.permits.acquire() => permit,
             _ = self.complete.notified() => return false,
@@ -168,6 +169,7 @@ impl Channel {
         };
 
         // The permit is returned by receive() when the chunk leaves the queue.
+
         permit.forget();
         self.push(Message::Body { data, more });
         true
@@ -216,6 +218,7 @@ impl Channel {
 
                 // Delivered straight to the waiting receive(), so the chunk
                 // never sits in the queue and its permit comes back now.
+
                 self.permits.add_permits(1);
                 self.wake(waiter, &message);
             }
@@ -235,6 +238,7 @@ impl Channel {
 
             // The loop refusing the call means it is closed: the worker is
             // stopping and the request with it.
+
             if let Err(error) = delivered {
                 tracing::debug!(%error, "waking an ASGI receive() failed");
             }
@@ -258,6 +262,7 @@ impl Channel {
             // The writer is behind. The rest of the items go out from a
             // task once there is room, and the application waits on a
             // future that the task completes when they have.
+
             let future = self.event_loop.bind(py).call_method0("create_future")?;
             let waiter = future.clone().unbind();
             let tx = self.tx.clone();
@@ -322,6 +327,7 @@ impl Channel {
 
                 // The subprotocol and any headers the application chose go
                 // out with the 101.
+
                 let mut headers = match message.get_item("headers")? {
                     Some(headers) if !headers.is_none() => validate_headers(&headers)?,
                     _ => Vec::new(),
@@ -359,6 +365,7 @@ impl Channel {
                 }
 
                 // Exactly one of bytes and text carries the message.
+
                 let bytes = message.get_item("bytes")?.filter(|value| !value.is_none());
                 let text = message.get_item("text")?.filter(|value| !value.is_none());
                 let outgoing = match (bytes, text) {
@@ -412,6 +419,7 @@ impl Channel {
                 state.closed = true;
 
                 // Closing before accepting declines the handshake with 403.
+
                 if !state.accepted {
                     state.head_sent = true;
                     state.body_ended = true;
@@ -438,8 +446,10 @@ impl Channel {
                         "{kind} sent after the WebSocket was accepted"
                     )));
                 }
+
                 // The websocket.http.response extension: an ordinary
                 // response declines the handshake.
+
                 Ok(None)
             }
             _ => Ok(None),
@@ -477,12 +487,14 @@ impl Channel {
     fn receive(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // The application is reading: the client may send the body it is
         // holding back (section 5.5).
+
         if self.announce.swap(false, Ordering::Relaxed) {
             let _ = self.tx.try_send(Outgoing::Continue);
         }
 
         // Complete the future now when a message is already there, else
         // leave it for the link to complete.
+
         let future = self.event_loop.bind(py).call_method0("create_future")?;
         let mut inbox = self.inbox.lock().expect("inbox poisoned");
         if let Some(message) = inbox.queue.pop_front() {
@@ -585,6 +597,7 @@ impl Channel {
 
                 // The last chunk ends the response, whatever the application
                 // does afterwards.
+
                 if !more {
                     state.body_ended = true;
                     items.push(Outgoing::Finished);
@@ -649,6 +662,7 @@ impl Channel {
         }
 
         // An accepted WebSocket ends with 1011; anything else is a 500.
+
         if accepted {
             let _ = self.enqueue(
                 py,
@@ -719,6 +733,7 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
     let mut out = Vec::new();
     for item in headers.try_iter()? {
         // Each header is a two-item iterable of bytes.
+
         let item = item?;
         let mut parts = item.try_iter()?;
         let (Some(name), Some(value), None) = (parts.next(), parts.next(), parts.next()) else {
@@ -736,6 +751,7 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
         let value = value.as_bytes().to_vec();
 
         // The same rules as start_response applies to WSGI headers.
+
         if name.is_empty() {
             return Err(PyValueError::new_err("header name is empty"));
         }
@@ -778,6 +794,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 
     // The request line, as ASGI wants it: the path decoded, the raw path
     // and query as bytes, the mount prefix as root_path.
+
     let version = match head.http_version.as_str() {
         "HTTP/2.0" | "HTTP/2" => "2",
         "HTTP/3.0" | "HTTP/3" => "3",
@@ -805,6 +822,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     // Headers as (name, value) byte pairs, names already lower case. A body
     // the edge buffered has a length even when the client sent none
     // (chunked_body = buffer in section 4.6).
+
     let headers = PyList::empty(py);
     let mut has_length = false;
     let mut subprotocols: Vec<String> = Vec::new();
@@ -839,6 +857,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     }
 
     // The peers, and the state the runner fills from the lifespan.
+
     scope.set_item(
         "client",
         head.client
@@ -855,6 +874,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 
     // Muru's own values live under extensions, with the names of the
     // matching environ keys.
+
     let muru = PyDict::new(py);
     muru.set_item("request_id", &head.request_id)?;
     if head.max_body_size != 0 {
@@ -872,6 +892,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     extensions.set_item("muru", muru)?;
     if websocket {
         // Declining the handshake with a full response (section 5.6).
+
         extensions.set_item("websocket.http.response", PyDict::new(py))?;
     }
     scope.set_item("extensions", extensions)?;

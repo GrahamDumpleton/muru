@@ -132,6 +132,7 @@ def start_daemon(base: Path, run_dir: Path | None = None, port: int | None = Non
     # The runtime directory holds the admin socket, whose path is limited
     # to about a hundred bytes, so it goes under /tmp rather than pytest's
     # deep temporary directory.
+
     run_dir = run_dir or Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
     port = port or support.free_port()
     log_path = base / "daemon.out"
@@ -201,6 +202,7 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
     # Requests keep flowing while the deploy happens, on kept-alive
     # connections as real clients use (and so the test does not run out
     # of ephemeral ports).
+
     results: list[int] = []
     stop = threading.Event()
 
@@ -299,6 +301,7 @@ def test_failed_deploy_keeps_the_previous_release_serving(daemon: Daemon) -> Non
 def test_settings_come_from_the_table_and_flags(daemon: Daemon) -> None:
     # The shop project's pyproject.toml sets processes and threads; the
     # factory project's muru.toml names a factory entrypoint.
+
     daemon.deploy("shop", SHOP)
     assert "2x3" in daemon.muructl("release", "list", "shop").stdout
 
@@ -320,7 +323,9 @@ def test_release_wait_and_no_wait(daemon: Daemon) -> None:
 def test_a_dead_host_is_started_again(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     pid = json.loads(daemon.get("/info").body)["pid"]
+
     # The host writes to its own log; its pid is in the daemon's record.
+
     record = (daemon.run_dir / "apps" / "shop" / "r1" / "host.toml").read_text()
     host_pid = int(
         next(line.split("=")[1] for line in record.splitlines() if line.startswith("pid"))
@@ -374,12 +379,14 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
         edge_pid = edge_pid_of(first)
 
         # The daemon goes; the edge and the host do not.
+
         assert "detached" in first.muructl("daemon", "stop").stdout
         first.process.wait(timeout=30)
         assert first.get("/").status == 200
         assert json.loads(first.get("/info").body)["pid"] == pid
 
         # The next daemon takes them over, with no gap and no new processes.
+
         second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
         assert edge_pid_of(second) == edge_pid
         assert json.loads(second.get("/info").body)["pid"] == pid
@@ -389,6 +396,7 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
         assert "release.adopted" in second.events()
 
         # And deploys keep working through the adopted edge.
+
         assert second.deploy("shop", SHOP) == "muru: release shop@r2 is ready and serving"
         assert json.loads(second.get("/info").body)["pid"] != pid
     finally:
@@ -467,6 +475,7 @@ def test_a_dead_edge_is_started_again_without_refusing_connections(daemon: Daemo
 
     # The daemon holds the listener too, so a connection made while no
     # edge runs waits in the backlog and is served by the new edge.
+
     os.kill(edge_pid, signal.SIGKILL)
     time.sleep(0.2)
     assert daemon.get("/").status == 200
@@ -488,6 +497,7 @@ def test_superseded_release_is_retained_and_rollback_is_instant(daemon: Daemon) 
     daemon.deploy("shop", SHOP, "--processes", "1")
 
     # The first release is warm, with its workers untouched.
+
     assert daemon.releases("shop") == [
         {"release": "shop@r2", "state": "ready", "serving": "yes"},
         {"release": "shop@r1", "state": "retained", "serving": ""},

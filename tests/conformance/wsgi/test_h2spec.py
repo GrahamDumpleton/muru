@@ -16,6 +16,7 @@ from support.server import ROOT, Server
 # input still unread, which the peer then sees as a reset rather than the
 # clean close h2spec waits for. Whether that happens depends on timing, so
 # these cases are allowed to fail. Neither affects a well-behaved client.
+
 ALLOWED_FAILURES = {
     ("http2/3.5", "Sends invalid connection preface"),
     ("http2/7", "Sends a GOAWAY frame with unknown error code"),

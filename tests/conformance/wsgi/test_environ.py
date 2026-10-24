@@ -82,6 +82,7 @@ def test_repeated_headers_are_joined(server: Server) -> None:
 
 def test_underscore_headers_are_dropped(server: Server) -> None:
     # Section 4.7: X_Forwarded_For must not reach HTTP_X_FORWARDED_FOR.
+
     request = (
         b"GET /environ/has?key=HTTP_X_FORWARDED_FOR HTTP/1.1\r\nHost: t\r\n"
         b"Connection: close\r\nX_Forwarded_For: 1.2.3.4\r\n\r\n"

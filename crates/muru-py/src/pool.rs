@@ -134,6 +134,7 @@ fn thread_main(receiver: &Mutex<mpsc::Receiver<Job>>) {
         loop {
             // Wait for work with the interpreter detached. Only one idle
             // thread holds the receiver at a time; the others wait for it.
+
             let next = py.detach(|| receiver.lock().expect("pool receiver poisoned").recv());
 
             match next {
@@ -150,6 +151,7 @@ fn run_in_context(py: Python<'_>, job: Job) {
     // function. PyContext_CopyCurrent returns a new reference or null with an
     // exception set; a successful PyContext_Enter is always paired with
     // PyContext_Exit on the same thread before the reference is released.
+
     unsafe {
         let context = ffi::PyContext_CopyCurrent();
         if context.is_null() {

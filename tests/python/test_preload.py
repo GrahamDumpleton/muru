@@ -144,6 +144,7 @@ def test_import_statements_are_attributed(modules: Path) -> None:
     with preload.ImportRecorder() as recorder:
         # The outer module is imported through importlib, the inner one by
         # its import statement, which the wrapped __import__ sees.
+
         recorder.import_module("via_statement_mod")
     assert {finding.module for finding in recorder.findings()} == {"inner_socket_mod"}
 
@@ -171,6 +172,7 @@ def test_socket_closed_before_the_end_is_not_reported(modules: Path) -> None:
 def test_descriptor_reuse_is_compared_by_identity(modules: Path) -> None:
     # A descriptor number that existed before the import but now refers to
     # a connected socket is a finding, not a survivor of the baseline.
+
     placeholder = os.open(os.devnull, os.O_RDONLY)
     write_module(
         modules,

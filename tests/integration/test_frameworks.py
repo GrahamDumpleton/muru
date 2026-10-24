@@ -125,6 +125,7 @@ def test_application_error_is_a_500(framework: tuple[support.Server, str]) -> No
     if "Flask" in greeting:
         # Flask logs the exception; Django's default logging only does so
         # with DEBUG on, and answers with its own 500 page either way.
+
         assert server.wait_for_log("flask-boom")
     assert server.get("/").status == 200
 

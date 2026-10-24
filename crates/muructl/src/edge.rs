@@ -98,6 +98,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // The listener was bound by the daemon and inherited across exec.
     // SAFETY: the daemon passed this descriptor for the edge to own, and
     // nothing else in this process refers to it.
+
     let listener = unsafe { std::net::TcpListener::from_raw_fd(args.listener_fd) };
     let listen = listener
         .local_addr()
@@ -130,6 +131,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // The control socket, on which the daemon pushes snapshots.
+
     let _ = std::fs::remove_file(&args.control);
     let control = tokio::net::UnixListener::bind(&args.control)
         .with_context(|| format!("binding the control socket {}", args.control.display()))?;
@@ -199,6 +201,7 @@ impl EdgeControl for Control {
 
         // The new pool is connected before it replaces the old one, so a
         // snapshot that cannot be reached leaves the last good one serving.
+
         let pool = muru_edge::link::LinkPool::connect(&sockets)
             .await
             .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;

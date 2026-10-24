@@ -344,10 +344,12 @@ struct PyBytesOwner(Py<PyBytes>);
 impl AsRef<[u8]> for PyBytesOwner {
     fn as_ref(&self) -> &[u8] {
         let object = self.0.as_ptr();
+
         // SAFETY: the object is a bytes object, checked when the owner was
         // created, so these calls cannot fail; it is immutable and kept alive
         // by the reference in `self`, so the buffer stays valid and unchanged
         // for as long as the slice is borrowed.
+
         unsafe {
             let data = pyo3::ffi::PyBytes_AsString(object).cast::<u8>();
             let len = pyo3::ffi::PyBytes_Size(object);
@@ -668,8 +670,10 @@ fn build_environ<'py>(
             None => environ.set_item(key, value)?,
         }
     }
+
     // A body the edge buffered has a length even when the client sent
     // none (chunked_body = buffer in section 4.6).
+
     if let Some(length) = head.content_length
         && environ.get_item(intern!(py, "CONTENT_LENGTH"))?.is_none()
     {
@@ -770,9 +774,11 @@ fn run_app<'py>(
     let environ = build_environ(py, shared, head, input)?;
     let result = shared.app.bind(py).call1((environ, start_response))?;
     let outcome = iterate(py, &result, start_response.get(), cancelled);
+
     // PEP 3333: close() is called whether or not the iteration completed.
     // An error from close() is reported but does not fail a response that
     // has been fully produced.
+
     if let Ok(close) = result.getattr(intern!(py, "close"))
         && let Err(error) = close.call0()
     {

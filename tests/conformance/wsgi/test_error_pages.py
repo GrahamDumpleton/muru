@@ -32,7 +32,9 @@ def test_application_error_page_is_plain_text_by_default(server: Server) -> None
     body = response.body.decode()
     assert body.startswith("500 Internal Server Error\nreason: app_error\nrequest id: ")
     assert f"request id: {response.header('X-Request-ID')}" in body
+
     # Development mode shows the traceback.
+
     assert "RuntimeError: raise-first-boom" in body
 
 

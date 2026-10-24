@@ -105,10 +105,12 @@ impl HostProcess {
                     .open(log)
                     .with_context(|| format!("opening {}", log.display()))?;
                 command.stdout(log.try_clone()?).stderr(log);
+
                 // Its own session, so the daemon's signals and terminal do
                 // not reach it.
                 // SAFETY: setsid is async-signal-safe and the closure runs
                 // in the child between fork and exec.
+
                 unsafe {
                     command.pre_exec(|| {
                         libc::setsid();
@@ -147,7 +149,9 @@ impl HostProcess {
         let mut child = command
             .spawn()
             .with_context(|| format!("starting the host with {}", spec.python.display()))?;
+
         // The host exits when this end of its stdin closes, whatever happens here.
+
         let stdin = child.stdin.take();
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(relay(stdout, logs.clone(), false));
@@ -260,6 +264,7 @@ impl HostProcess {
         if let Some(pid) = self.pid() {
             // SAFETY: kill(2) with a valid pid and signal has no memory-safety
             // preconditions; the pid is a host this daemon started or adopted.
+
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
@@ -281,6 +286,7 @@ impl HostProcess {
                 }
                 if alive(pid) {
                     // SAFETY: as above.
+
                     unsafe {
                         libc::kill(pid as libc::pid_t, libc::SIGKILL);
                     }
@@ -295,6 +301,7 @@ impl HostProcess {
         drop(self.stdin);
         if let Process::Child(mut child) = self.process {
             // The child must not be killed when its handle drops.
+
             let _ = child.try_wait();
             std::mem::forget(child);
         }
@@ -304,6 +311,7 @@ impl HostProcess {
 /// Whether a process exists.
 pub fn alive(pid: u32) -> bool {
     // SAFETY: kill with signal 0 checks for the process and sends nothing.
+
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 

@@ -108,7 +108,9 @@ def test_lifespan_state_is_copied_into_each_scope(server: support.Server) -> Non
     second = json.loads(server.get("/state").body)
 
     assert first["started_in"] == second["started_in"] == details(server)["pid"]
+
     # Each request sees its own copy of the state the lifespan filled.
+
     assert first["counter"] == 1
     assert second["counter"] == 1
 
@@ -169,6 +171,7 @@ def test_each_request_has_its_own_context(server: support.Server) -> None:
 
 def test_concurrency_is_not_bounded_by_threads(server: support.Server) -> None:
     # Many slow requests at once, on one worker with one loop: they overlap.
+
     count = 32
     results: list[int] = []
     started = time.monotonic()

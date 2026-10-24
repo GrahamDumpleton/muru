@@ -60,6 +60,7 @@ def test_no_continue_when_the_application_answers_without_reading(server: Server
     # Section 4.6: the body is never asked for, so it never crosses the
     # link, and because the client may still send it the connection is
     # closed after the response, as Apache does.
+
     with connect(server) as sock:
         sock.sendall(
             b"POST /input/unread HTTP/1.1\r\nHost: t\r\nContent-Length: 11\r\n"
@@ -146,7 +147,9 @@ def test_declared_length_over_the_limit_is_refused_before_reading(server: Server
         sock.sendall(
             b"POST /input/read-all HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\n\r\n" % (LIMIT + 1)
         )
+
         # No body is sent: the answer must come without it.
+
         response = recv_until_closed(sock)
     assert response.startswith(b"HTTP/1.1 413"), response
     assert b"connection: close" in response.lower()
@@ -164,6 +167,7 @@ def test_chunked_body_over_the_limit_is_refused(server: Server) -> None:
     # The edge answers 413 as soon as the limit is passed and closes the
     # connection. A client still sending may see the reset before the
     # response, so either counts, as long as the server is fine afterwards.
+
     piece = b"z" * 65536
     response = b""
     with connect(server, timeout=30) as sock:

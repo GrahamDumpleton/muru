@@ -406,8 +406,10 @@ mod tests {
             exclude: Vec::new(),
         })
         .expect("log");
+
         // Counted in time order, as they arrive: the second a minute before
         // `now` shares a bucket with `now` and is overwritten by it.
+
         let now = log.started + 10;
         log.count(now - 60, 200);
         log.count(now - 59, 500);

@@ -197,8 +197,10 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Full<Bytes>> {
         "text/html; charset=utf-8".parse().expect("static"),
     );
     headers.insert(CACHE_CONTROL, "no-store".parse().expect("static"));
+
     // Section 10.7: a strict content security policy; the only script is
     // the embedded htmx, styles are inline.
+
     headers.insert(
         CONTENT_SECURITY_POLICY,
         "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'"

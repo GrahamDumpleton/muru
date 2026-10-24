@@ -74,7 +74,9 @@ def test_header_read_timeout_closes_the_connection() -> None:
             started = time.monotonic()
             data = sock.recv(65536)
             assert time.monotonic() - started < 5
+
         # hyper closes the connection, with or without a 408 first.
+
         assert data == b"" or data.startswith(b"HTTP/1.1 408")
         assert server.get("/").status == 200
     finally:

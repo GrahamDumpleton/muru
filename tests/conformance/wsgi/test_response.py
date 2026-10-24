@@ -110,7 +110,9 @@ def test_base_exceptions_do_not_kill_the_worker(server: Server, case: str) -> No
     server.mark_log()
     response = server.get(f"{AREA}/{case}")
     assert response.status == 500
+
     # The worker that served it is still serving.
+
     for _ in range(server.workers * 4):
         assert server.get(f"{AREA}/list").status == 200
     assert "restarting" not in server.log_since_mark()
@@ -153,14 +155,18 @@ def test_output_beyond_content_length_is_dropped(
     response = server.get(f"{AREA}/{case}")
     assert response.status == 200
     assert response.body == expected
+
     # And the connection is usable afterwards, so the framing was right.
+
     assert server.get(f"{AREA}/list").status == 200
 
 
 def test_output_short_of_content_length_fails_the_response(server: Server) -> None:
     server.mark_log()
+
     # The connection is closed without a complete response: hyper may have
     # sent the head and part of the body, or nothing at all.
+
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
     try:
         connection.request("GET", f"{AREA}/content-length-under")

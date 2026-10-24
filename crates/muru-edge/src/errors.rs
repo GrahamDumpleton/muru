@@ -298,6 +298,7 @@ impl RequestIds {
             state.last_millis = millis;
         } else {
             // Same millisecond, or the clock stepped back: stay monotonic.
+
             state.random = (state.random + 1) & ((1u128 << 80) - 1);
         }
         let value = (u128::from(state.last_millis) << 80) | state.random;

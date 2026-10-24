@@ -71,7 +71,9 @@ def test_https_request_reaches_the_application_with_tls_details(
     assert tls["version"] in {"TLSv1.3", "TLSv1.2"}
     assert tls["cipher"].startswith("TLS")
     assert tls["server_name"] == "localhost"
+
     # http.client offers no application protocol, so none is negotiated.
+
     assert tls["alpn"] == ""
 
 
@@ -140,6 +142,7 @@ def test_certificate_is_reused_and_can_be_given_explicitly(
     server: support.Server, cache: Path, no_authority: dict[str, str]
 ) -> None:
     # The module's server made the certificate; a second run must reuse it.
+
     before = certificate(cache).read_bytes()
     again = support.start(
         "plain_wsgi:application",

@@ -83,12 +83,15 @@ async def http(scope: Scope, receive: Receive, send: Send) -> None:
     elif path == "/messages":
         messages = await drain(receive)
         await reply(send, 200, json.dumps(messages).encode())
+
         # Only once the response is complete does receive() give the disconnect.
+
         after = await receive()
         print(f"conformance: after response {after['type']}", flush=True)
     elif path == "/state":
         # The state is a shallow copy per request: a key set here is gone
         # by the next request.
+
         seen = scope["state"].get("seen")
         scope["state"]["seen"] = True
         await reply(send, 200, json.dumps({"pid": scope["state"]["pid"], "seen": seen}).encode())
@@ -166,6 +169,7 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
         return
     if path == "/ws/types":
         # Report the type of each message received, then close.
+
         kinds = []
         while True:
             message = await receive()

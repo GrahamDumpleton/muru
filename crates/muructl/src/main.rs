@@ -395,7 +395,9 @@ fn port_holder(port: u16) -> Option<String> {
         .ok()
         .filter(|output| output.status.success())?;
     let text = String::from_utf8_lossy(&ss.stdout);
+
     // users:(("python3",pid=1234,fd=5))
+
     let users = text.split("users:((\"").nth(1)?;
     let (command, rest) = users.split_once('"')?;
     let pid = rest.split("pid=").nth(1)?.split(',').next()?;
@@ -604,8 +606,10 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         Some((path, table)) => (Some(path), table),
         None => (None, muru_config::ToolMuru::default()),
     };
+
     // Whether the entrypoint is a factory belongs to the entrypoint: the
     // table's factory settings apply to the table's entrypoint only.
+
     let from_table = entrypoint.is_none();
     let entrypoint = match entrypoint.or(table.entrypoint) {
         Some(entrypoint) => entrypoint,
@@ -786,6 +790,7 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
             // Resolve the directory, not the file: the interpreter is often a
             // symlink into a virtualenv, and following it would lose the venv.
+
             match dir.canonicalize() {
                 Ok(dir) => dir.join(name),
                 Err(_) => python,
@@ -829,8 +834,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     if let Some(source) = &resolved.source {
         println!("muru: using [tool.muru] from {}", source.display());
     }
+
     // Certificates are sorted out before anything is started, so a bad
     // --tls-cert or an unwritable cache fails with nothing to clean up.
+
     let tls = tls(&args)?;
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
@@ -888,8 +895,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         Some(https) => format!("http://{} and https://{https}", edge.local_addr()),
         None => format!("http://{}", edge.local_addr()),
     };
+
     // The workers said in HELLO what they are and how much they take at
     // once, which is also what the edge dispatches by.
+
     let capacity = match edge.pools().current().workers().first() {
         Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
         Some(worker) => format!("{} threads", worker.slots),
@@ -984,6 +993,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // Ctrl-C and SIGTERM both stop the run in order: the host is told to
     // stop and its workers finish what they are serving.
+
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing the SIGTERM handler")?;
     let outcome = loop {
@@ -1035,6 +1045,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         Some(path) = changed.recv() => {
                             // Section 9.8: a release still starting is abandoned
                             // when more changes arrive.
+
                             let mut paths = vec![path];
                             settle(&mut changed, &mut paths).await;
                             println!("muru: {} changed again, restarting the reload", describe(&paths));

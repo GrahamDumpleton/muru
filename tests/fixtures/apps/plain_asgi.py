@@ -88,6 +88,7 @@ async def scope_report(scope: Scope, receive: Receive, send: Send) -> None:
     body, messages = await read_body(receive)
 
     # Values that JSON can carry, with the byte strings decoded.
+
     details = {
         **info(),
         "scope": {
@@ -197,6 +198,7 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
 
     if path == "/ws/decline":
         # Closing before accepting declines the handshake with 403.
+
         await send({"type": "websocket.close"})
         return
     if path == "/ws/http-decline":
@@ -244,6 +246,7 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
         return
 
     # Echo until the client goes away, then say how it ended on stdout.
+
     while True:
         message = await receive()
         if message["type"] == "websocket.disconnect":
@@ -285,6 +288,7 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
         await respond(send, 200, b"slept\n")
     elif path == "/state":
         # The scope's state is a copy per request: changes stay here.
+
         scope["state"]["counter"] = scope["state"].get("counter", 0) + 1
         await respond(send, 200, json.dumps(scope["state"]).encode(), "application/json")
     elif path == "/context":
@@ -299,6 +303,7 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
         await respond(send, 200, b"x" * size, "application/octet-stream")
     elif path == "/disconnect":
         # Wait for the client to go away, then say so on stdout.
+
         message = await receive()
         while message["type"] != "http.disconnect":
             message = await receive()

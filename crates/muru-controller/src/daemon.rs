@@ -173,6 +173,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // keeps its own copy, so the edge process can be replaced while
     // connections wait in the backlog; the edge is up before any release,
     // answering 503 until one serves.
+
     let control = locations.run.path.join("edge.sock");
     let listener_socket = locations.run.path.join("edge-listener.sock");
     let edge_log = locations.logs.path.join("edge.log");
@@ -222,6 +223,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
 
     // The admin API on its socket.
+
     let (commands, mut inbox) = mpsc::channel::<Command>(16);
     let info = Arc::new(Info {
         locations: locations.clone(),
@@ -261,6 +263,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass.
+
     let mut drain_on_exit = true;
     let outcome = loop {
         tokio::select! {
@@ -287,6 +290,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
     // everything down with it.
+
     if drain_on_exit {
         daemon.stop_all().await;
         daemon.edge.stop().await;
@@ -351,6 +355,7 @@ impl Daemon {
             // A release in a running state is taken over when its host is
             // still there and listening; otherwise it is gone with the
             // previous daemon.
+
             if let Ok(releases) = self.store.releases(Some(&app.name)) {
                 for release in releases.iter().filter(|release| release.state.is_running()) {
                     if self.adopt_host(&release.app, &release.id) {
@@ -491,6 +496,7 @@ impl Daemon {
         self.start(app, &release.id).await?;
 
         // Traffic moves, then the previous release drains.
+
         let previous = self
             .store
             .app(app)
@@ -547,6 +553,7 @@ impl Daemon {
         let subject = format!("{app}@{id}");
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
             // Retained and warm: back to ready without a restart.
+
             running.retained_until = None;
             self.set_state(&release, ReleaseState::Ready, "");
             return Ok(());
@@ -669,6 +676,7 @@ impl Daemon {
         // The previous pool is gone from the edge, so what is in flight on
         // these workers is what the edge had already dispatched; a short
         // wait lets it finish.
+
         self.set_state(
             &release,
             ReleaseState::Draining,
@@ -679,6 +687,7 @@ impl Daemon {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // One retained release per application: an older one makes way.
+
         if !retain.is_zero() {
             let older: Vec<String> = self
                 .running

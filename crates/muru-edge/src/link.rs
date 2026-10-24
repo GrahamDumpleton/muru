@@ -347,8 +347,10 @@ impl Return {
         if let (Some(reader), Some(writer), false) = (reader, writer, state.broken) {
             self.pool.put_back(self.worker, Conn { reader, writer });
         }
+
         // Release the slot after the connection is back in the pool, so the
         // next request finds it there.
+
         state.permit.take();
     }
 }
@@ -365,6 +367,7 @@ impl Drop for Return {
 
         // Drop runs inside the runtime when a request's task is dropped;
         // without one there is nothing to write from.
+
         let writer = self
             .state
             .lock()
@@ -539,6 +542,7 @@ pub async fn handle(
     // so that the application sees CONTENT_LENGTH and no worker slot is
     // held while it arrives. Polling the body is also what makes hyper
     // send 100 Continue to a client that is waiting for it.
+
     let mut buffered: Option<Bytes> = None;
     if !body.is_end_stream() && head.content_length.is_none() {
         match read_body(&mut body, limits.max_body_size).await {
@@ -580,6 +584,7 @@ pub async fn handle(
         }
         Err(_) => {
             // Section 7.6: the queue wait is bounded by queue_timeout.
+
             let mut problem = Problem::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "queue_full",
@@ -606,6 +611,7 @@ pub async fn handle(
 
     // Section 5.6: a worker that takes websocket scopes gets the upgrade as
     // one, with no body; any other worker sees an ordinary request.
+
     let upgrade = upgrade.filter(|_| websockets);
     if upgrade.is_some() {
         head.scope = pb::Scope::Websocket as i32;
@@ -660,6 +666,7 @@ pub async fn handle(
             Err(_) => {
                 // Section 7.6: the deadline cancels the request. Dropping
                 // the connection stops the application's iteration.
+
                 back.give_reader(None);
                 back.abort_request();
                 return failing.respond(Problem::new(
@@ -675,6 +682,7 @@ pub async fn handle(
                 if back.client_stalled.load(Ordering::Relaxed) {
                     // The client stopped sending its body; what the worker
                     // produced for a partial request is not delivered.
+
                     back.give_reader(None);
                     return failing.close(Problem::new(
                         StatusCode::REQUEST_TIMEOUT,
@@ -687,6 +695,7 @@ pub async fn handle(
             Ok(Some(next)) if next.kind == kind::END => {
                 // The application failed before producing a head: the
                 // worker says why, and the connection is still good.
+
                 back.give_reader(Some(reader));
                 back.abort_request();
                 let end = pb::End::decode(next.payload).unwrap_or_default();
@@ -717,6 +726,7 @@ pub async fn handle(
     // The worker accepted the WebSocket: finish the handshake and relay
     // messages for the life of the socket on the leased connection. Any
     // other answer is the response to the upgrade, sent as usual.
+
     if let Some(upgrade) = upgrade
         && head.status == 101
     {
@@ -753,8 +763,10 @@ pub async fn handle(
     {
         builder = builder.extension(reason);
     }
+
     // A client still waiting for 100 Continue may send the body after this
     // response, so the connection cannot be reused (section 4.6).
+
     let close = expect_continue && !back.proceeded.load(Ordering::Relaxed);
     let response = if response_end {
         back.give_reader(Some(reader));
@@ -1019,6 +1031,7 @@ async fn pump_body(
         // off until the worker says the application is reading. If the
         // response ends first the client is never told to send the body,
         // and there is nothing to discard.
+
         tokio::select! {
             _ = back.proceed.notified() => {}
             _ = back.abort.notified() => {
@@ -1035,6 +1048,7 @@ async fn pump_body(
                     // Section 4.6: a client that stops mid-body is treated
                     // as gone; the response path answers with 408 if the
                     // worker has not responded yet.
+
                     back.client_stalled.store(true, Ordering::Relaxed);
                     abort(body, writer, back, false).await;
                     return;
@@ -1060,6 +1074,7 @@ async fn pump_body(
             Some(Err(_)) => {
                 // The client went away mid-body. The worker learns by ABORT
                 // and the connection stays in the pool.
+
                 abort(body, writer, back, true).await;
                 return;
             }
@@ -1094,6 +1109,7 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_re
     // hyper closes the client connection after the response if the body is
     // left unread, so read a bounded amount first. Dropping the body past
     // the limit lets hyper close it.
+
     if discard_rest {
         let _ = tokio::time::timeout(DISCARD_DELAY, discard(body)).await;
     }

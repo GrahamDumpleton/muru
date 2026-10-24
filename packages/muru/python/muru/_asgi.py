@@ -35,6 +35,7 @@ class Loop:
 
         # Section 6.6: sync_to_async and asyncio.to_thread run on a bounded
         # pool of their own, separate from any WSGI threads.
+
         executor = ThreadPoolExecutor(
             max_workers=max(1, sync_threads), thread_name_prefix="muru-sync"
         )
@@ -48,6 +49,7 @@ class Loop:
             self.loop.run_forever()
         finally:
             # Finish what the loop still owns before it closes.
+
             try:
                 self.loop.run_until_complete(self.loop.shutdown_asyncgens())
                 self.loop.run_until_complete(self.loop.shutdown_default_executor())
@@ -99,6 +101,7 @@ class Lifespan:
         self.supported = True
 
         # Created on the loop when startup runs.
+
         self._queue: asyncio.Queue[dict[str, Any]] | None = None
         self._startup: asyncio.Future[str] | None = None
         self._shutdown: asyncio.Future[str] | None = None
@@ -138,6 +141,7 @@ class Lifespan:
             # Raised before answering startup: the application has no
             # lifespan support, which ASGI allows. Raised later, it is a
             # failure like any other.
+
             startup = self._startup
             if startup is None or startup.done():
                 raise
@@ -155,6 +159,7 @@ class Lifespan:
 
         # Ask for startup and wait for the answer, or for the application
         # to give up first.
+
         await self._queue.put({"type": "lifespan.startup"})
         awaited: set[asyncio.Future[Any]] = {self._startup, self._task}
         await asyncio.wait(awaited, return_when=asyncio.FIRST_COMPLETED)
@@ -162,6 +167,7 @@ class Lifespan:
         # An application still running after answering is the usual case.
         # One that has already ended either reported a failure, raised one,
         # or has no lifespan support and simply returned.
+
         if not self._task.done():
             return
         error = self._task.exception()
@@ -178,6 +184,7 @@ class Lifespan:
             return
 
         # Ask for shutdown and give the application a bounded time to finish.
+
         await self._queue.put({"type": "lifespan.shutdown"})
         try:
             await asyncio.wait_for(asyncio.shield(self._task), SHUTDOWN_TIMEOUT)
@@ -228,6 +235,7 @@ def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, An
     async def serve(scope: MutableMapping[str, Any], channel: Any) -> None:
         async def send(message: dict[str, Any]) -> None:
             # The channel only hands back a future when the writer is behind.
+
             waiter = channel.send(message)
             if waiter is not None:
                 await waiter

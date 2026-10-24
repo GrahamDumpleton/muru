@@ -56,6 +56,7 @@ pub(crate) fn detect(parts: &mut http::request::Parts) -> Option<Upgrade> {
 
     // HTTP/2: CONNECT with :protocol = websocket. HTTP/1.1: GET with
     // Upgrade: websocket named in the Connection header and a key.
+
     let http2 = parts.method == http::Method::CONNECT
         && parts
             .extensions
@@ -167,6 +168,7 @@ pub(crate) async fn relay(relay: Relay) {
     } = relay;
 
     // hyper hands the connection over once the 101 (or 200) has gone out.
+
     let upgraded = match upgrade.on_upgrade.await {
         Ok(upgraded) => upgraded,
         Err(error) => {
@@ -193,6 +195,7 @@ pub(crate) async fn relay(relay: Relay) {
     while !closing.complete() {
         // Once a side has begun closing, only the rest of the handshake is
         // awaited, and not for ever.
+
         let wait = if closing.winding_down() {
             limits.response_idle_timeout
         } else {
@@ -210,11 +213,13 @@ pub(crate) async fn relay(relay: Relay) {
         match step {
             Err(_) if closing.winding_down() => {
                 // The other side never finished closing: give up on the link.
+
                 intact = false;
                 break;
             }
             Err(_) => {
                 // Nothing from the client for the idle timeout.
+
                 closing.told_client |= close_client(&mut socket, 1001, "idle").await.is_ok();
                 if !closing.told_worker {
                     closing.told_worker = send_close(&mut writer, 1001, "idle").await.is_ok();
@@ -253,6 +258,7 @@ pub(crate) async fn relay(relay: Relay) {
                     };
                     if !closing.stream_done && socket.send(message).await.is_err() {
                         // The client is gone; the worker learns by CLOSE.
+
                         closing.stream_done = true;
                         if !closing.told_worker {
                             closing.told_worker =
@@ -266,6 +272,7 @@ pub(crate) async fn relay(relay: Relay) {
                     // The application closed: pass it on, answer the worker
                     // with the edge's own CLOSE, and let the client's echo
                     // end its stream.
+
                     let close = pb::Close::decode(next.payload).unwrap_or_default();
                     let code = u16::try_from(close.code).unwrap_or(1000);
                     closing.worker_closed = true;
@@ -297,6 +304,7 @@ pub(crate) async fn relay(relay: Relay) {
 
     // A socket that ended in order leaves the link idle for the next
     // request; one that broke off takes its connection with it.
+
     let intact = intact && closing.complete();
     let _ = socket.close(None).await;
     back.give_writer(intact.then_some(writer));
@@ -317,6 +325,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     // Tell the worker the client has gone, once.
+
     async fn tell_worker(
         writer: &mut Writer,
         closing: &mut Closing,
@@ -354,12 +363,14 @@ where
         }
         Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
             // tungstenite queues the pong itself; flushing sends it now.
+
             let _ = socket.flush().await;
             Ok(0)
         }
         Some(Ok(Message::Close(close))) => {
             // tungstenite queues the reply itself; the stream ends once it
             // has been flushed and read to its end.
+
             let (code, reason) = close
                 .map(|close| (u16::from(close.code), close.reason.to_string()))
                 .unwrap_or((1005, String::new()));
@@ -370,6 +381,7 @@ where
         }
         Some(Err(WsError::Capacity(_))) => {
             // Section 4.18: a message over the limit is 1009.
+
             let _ = close_client(socket, 1009, "message too large").await;
             closing.told_client = true;
             tell_worker(writer, closing, 1009, "message too large").await?;
@@ -377,12 +389,14 @@ where
         }
         Some(Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {
             // Gone without a close frame: 1006 to the application.
+
             closing.stream_done = true;
             tell_worker(writer, closing, 1006, "the client went away").await?;
             Ok(0)
         }
         Some(Err(WsError::Protocol(error))) => {
             // A protocol failure: close with 1002 and end the stream.
+
             let reason = error.to_string();
             let _ = close_client(socket, 1002, &reason).await;
             closing.told_client = true;
@@ -399,6 +413,7 @@ where
         }
         Some(Err(_)) | None => {
             // The stream has ended, in order after a close or not.
+
             closing.stream_done = true;
             tell_worker(writer, closing, 1006, "the client went away").await?;
             Ok(0)

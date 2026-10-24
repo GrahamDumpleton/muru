@@ -101,6 +101,7 @@ impl Locations {
         );
 
         // A configuration directory holds the file; a file is used as is.
+
         let config = if config.path.is_dir() || config.rule == "systemd" {
             Location {
                 path: config.path.join("muru.toml"),
@@ -163,6 +164,7 @@ fn pick(
 
     // systemd lists several directories separated by colons; the first
     // is the unit's own.
+
     if let Some(value) = env::var_os(systemd).filter(|value| !value.is_empty()) {
         let first = value
             .to_string_lossy()
@@ -184,6 +186,7 @@ fn pick(
 
 fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
+
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -225,6 +228,7 @@ fn default_run(mode: Mode) -> PathBuf {
         // Short, for the 104-byte limit on socket paths.
         Mode::User if cfg!(target_os = "macos") => {
             // SAFETY: getuid has no preconditions and cannot fail.
+
             let uid = unsafe { libc::getuid() };
             PathBuf::from(format!("/tmp/muru-{uid}"))
         }
@@ -232,6 +236,7 @@ fn default_run(mode: Mode) -> PathBuf {
             Some(dir) => PathBuf::from(dir).join("muru"),
             None => {
                 // SAFETY: getuid has no preconditions and cannot fail.
+
                 let uid = unsafe { libc::getuid() };
                 PathBuf::from(format!("/tmp/muru-{uid}"))
             }

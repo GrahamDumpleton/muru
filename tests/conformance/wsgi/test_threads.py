@@ -17,6 +17,7 @@ def test_each_native_thread_keeps_one_thread_state(server: Server) -> None:
     # Section 6.5: a thread attaches once, so the native thread and the
     # Python thread state pair up for the life of the worker, and no two
     # native threads ever share a thread state.
+
     slots = server.workers * server.threads
     with ThreadPoolExecutor(max_workers=slots * 2) as pool:
         seen = list(pool.map(lambda _i: identity(server), range(slots * 8)))
@@ -30,6 +31,7 @@ def test_each_native_thread_keeps_one_thread_state(server: Server) -> None:
     assert all(len(threads) == 1 for threads in by_state.values()), by_state
 
     # Every worker used every one of its threads at least once.
+
     per_worker: dict[str, set[str]] = {}
     for pid, native, _tstate in seen:
         per_worker.setdefault(pid, set()).add(native)

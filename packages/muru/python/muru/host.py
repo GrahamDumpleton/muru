@@ -48,9 +48,13 @@ WSGIApplication = Callable[..., Any]
 
 SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
+
 # A worker exiting with an error this soon after its fork failed to start.
+
 STARTUP_WINDOW_SECONDS = 5.0
+
 # Consecutive start failures of one worker before the host gives up.
+
 MAX_START_FAILURES = 3
 PRELOAD_MODES = ("auto", "true", "false")
 READ_SIZE = 65536
@@ -58,6 +62,7 @@ READ_SIZE = 65536
 
 # Set in a worker, whose lines the host relays with the worker's own tag,
 # so the host prefix is for the host alone.
+
 _in_worker = False
 
 
@@ -68,6 +73,7 @@ def log(message: str) -> None:
 
     # The parent that reads this stream may already be gone, and a log line
     # lost then must not stop the host from stopping its workers.
+
     try:
         print(f"{prefix}{message}", file=sys.stderr, flush=True)
     except OSError:
@@ -197,6 +203,7 @@ class Release:
         self.app = app
 
         # The context tells hooks and the application what they run under.
+
         self.context = replace(
             self.context,
             interface=self.resolved,
@@ -269,10 +276,12 @@ class Host:
         self.threads = threads
         self.sync_threads = sync_threads
         self.concurrency = concurrency
+
         # Section 2.4: a host's workers must not outlive it. Each worker
         # inherits the read end of this pipe and stops when it reaches end
         # of file, which happens only when the host, holding the write
         # end, is gone.
+
         self.lifeline_read, self.lifeline_write = os.pipe()
         self.workers: dict[int, int] = {}
         self.stopping = False
@@ -298,6 +307,7 @@ class Host:
             self.forked_before = True
             if self.release.preloaded and self.release.hooks is not None:
                 # Section 6.3: once in the host, before the first fork.
+
                 self.release.hooks.call("pre_fork", self.release.context)
         threads = preload.thread_count()
         if threads > 1:
@@ -305,12 +315,16 @@ class Host:
                 f"forking worker {index} while {threads - 1} other threads are running; "
                 "they do not exist in the worker, so start them from a post_fork hook instead"
             )
+
         # Section 11.2: the worker's stdout and stderr are pipes the host
         # relays with the worker's index, so its lines can be told apart.
+
         out_read, out_write = os.pipe()
         err_read, err_write = os.pipe()
+
         # Section 6.2: freeze before every fork so the collector in the
         # worker never touches the objects it inherited.
+
         gc.freeze()
         pid = os.fork()
         if pid == 0:
@@ -346,8 +360,10 @@ class Host:
         global _in_worker
         _in_worker = True
         gc.enable()
+
         # The host's handlers and wake-up pipe belong to the host; the native
         # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
+
         signal.set_wakeup_fd(-1)
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGCHLD):
             signal.signal(signum, signal.SIG_DFL)
@@ -362,6 +378,7 @@ class Host:
                 hooks = release.hooks or Hooks()
             else:
                 # Per-worker imports: everything the host would have done.
+
                 started = time.monotonic()
                 hooks = release.load()
                 log(f"worker {index} imported {release.spec} in {elapsed_ms(started)} ms")
@@ -371,6 +388,7 @@ class Host:
 
             # Section 6.8: a factory is called per worker, after post_fork,
             # and only then is the interface known for certain.
+
             known = release.resolved is not None
             app = release.realise()
             context = replace(release.context, worker_id=index)
@@ -380,6 +398,7 @@ class Host:
 
             # Section 6.6: one event loop per worker, started after the
             # fork, and lifespan startup before the worker is ready.
+
             if release.resolved == "asgi":
                 loop = _asgi.Loop(self.sync_threads)
                 loop.start()
@@ -406,6 +425,7 @@ class Host:
                 loop.stop()
 
         # An ASGI worker hands the extension its loop and the request runner.
+
         asgi_arguments: dict[str, Any] = {}
         if loop is not None and lifespan is not None:
             asgi_arguments = {
@@ -453,6 +473,7 @@ class Host:
         # Section 13.3: a host under the daemon outlives it, so the daemon
         # can be restarted or upgraded and re-adopt it; one under muructl
         # run stops when its parent's end of stdin closes.
+
         watch_stdin = False
         try:
             if not self.detach and not os.isatty(0):
@@ -527,9 +548,11 @@ class Host:
             spawned_at = self.spawned_at.pop(pid, 0.0)
             if self.stopping:
                 continue
+
             # A worker that dies at once, again and again, is a release that
             # cannot start (a failing factory or hook): give up rather than
             # fork it forever.
+
             if status != 0 and time.monotonic() - spawned_at < STARTUP_WINDOW_SECONDS:
                 self.start_failures[index] = self.start_failures.get(index, 0) + 1
                 if self.start_failures[index] >= MAX_START_FAILURES:
@@ -713,6 +736,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Section 6.2 step 1: no collections during preload.
+
     gc.disable()
     if args.preload != "false":
         started = time.monotonic()
@@ -728,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # A preloaded application has settled its interface by now; a
         # per-worker factory settles it in each worker.
+
         if release.resolved is not None:
             set_context(release.context)
             log(f"{args.app} is served as {release.resolved.upper()}")
@@ -772,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees
         # the application. The hooks run as they would in a worker.
+
         gc.enable()
         log("serving in this process without forking (--single)")
         return host.worker(0)
