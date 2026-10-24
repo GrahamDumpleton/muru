@@ -8,6 +8,7 @@
 //! pages and the CLI reference (section 14.4 and Appendix A).
 
 mod dashboard;
+mod devcert;
 mod host;
 mod logs;
 mod watch;
@@ -112,6 +113,33 @@ struct RunArgs {
     /// Address for the read-only dashboard on loopback, or off.
     #[arg(long, default_value = "127.0.0.1:8081")]
     dashboard: String,
+
+    /// Serve HTTPS as well, on --https-port, with a development certificate
+    /// unless --tls-cert is given.
+    #[arg(long)]
+    https: bool,
+
+    /// Serve HTTPS only: plain HTTP requests are redirected to it.
+    #[arg(long)]
+    https_only: bool,
+
+    /// Port for HTTPS, on the address of --bind.
+    #[arg(long, default_value_t = 8443)]
+    https_port: u16,
+
+    /// Certificate chain to serve, PEM, instead of a development
+    /// certificate. Implies --https.
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// Private key for --tls-cert, PEM.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// Extra name for the development certificate, besides localhost,
+    /// 127.0.0.1 and ::1. Repeatable.
+    #[arg(long = "host", value_name = "NAME")]
+    hosts: Vec<String>,
 
     /// One process and one thread, serving without forking, for debuggers.
     /// Implies --workers 1 --threads 1.
@@ -290,6 +318,40 @@ fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
     }
 }
 
+/// How TLS was set up: the listener configuration and, for a development
+/// certificate, where it came from.
+struct Tls {
+    https: muru_edge::Https,
+    development: Option<devcert::DevCertificate>,
+}
+
+/// The HTTPS listener for --https, --https-only or --tls-cert (section 13.1).
+fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
+    if !(args.https || args.https_only || args.tls_cert.is_some()) {
+        return Ok(None);
+    }
+    let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
+        (Some(certificate), Some(key)) => {
+            let (chain, key) = muru_edge::tls::load_pem_files(certificate, key)?;
+            (chain, key, None)
+        }
+        _ => {
+            let certificate = devcert::obtain(&devcert::cache_dir()?, &args.hosts)?;
+            let (chain, key) =
+                muru_edge::tls::load_pem_files(&certificate.certificate, &certificate.key)?;
+            (chain, key, Some(certificate))
+        }
+    };
+    Ok(Some(Tls {
+        https: muru_edge::Https {
+            listen: SocketAddr::new(args.bind.ip(), args.https_port),
+            config: muru_edge::tls::server_config(chain, key)?,
+            only: args.https_only,
+        },
+        development,
+    }))
+}
+
 /// The interpreter to run the host with. A path is made absolute, because a
 /// virtualenv's interpreter locates its site-packages from its own path.
 fn python_interpreter(explicit: Option<PathBuf>) -> PathBuf {
@@ -320,6 +382,9 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
         args.workers = 1;
         args.threads = 1;
     }
+    // Certificates are sorted out before anything is started, so a bad
+    // --tls-cert or an unwritable cache fails with nothing to clean up.
+    let tls = tls(&args)?;
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
@@ -350,15 +415,30 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
         development: true,
         access_log,
         limits: limits(&args),
+        https: tls.as_ref().map(|tls| tls.https.clone()),
     })
     .await?;
+    let addresses = match edge.https_addr() {
+        Some(https) if args.https_only => {
+            format!(
+                "https://{https} (http://{} redirects to it)",
+                edge.local_addr()
+            )
+        }
+        Some(https) => format!("http://{} and https://{https}", edge.local_addr()),
+        None => format!("http://{}", edge.local_addr()),
+    };
     println!(
-        "muru: serving {} on http://{} with {} workers of {} threads",
-        args.app,
-        edge.local_addr(),
-        args.workers,
-        args.threads
+        "muru: serving {} on {addresses} with {} workers of {} threads",
+        args.app, args.workers, args.threads
     );
+    if let Some(tls) = &tls {
+        match (&tls.development, &args.tls_cert) {
+            (Some(certificate), _) => println!("{}", certificate.describe()),
+            (None, Some(path)) => println!("muru: TLS certificate from {}", path.display()),
+            (None, None) => {}
+        }
+    }
 
     let release_number = Arc::new(AtomicU32::new(1));
     if args.dashboard != "off" {
@@ -367,6 +447,7 @@ async fn run(mut args: RunArgs) -> anyhow::Result<()> {
             dashboard::Inputs {
                 app: args.app.clone(),
                 listen: edge.local_addr(),
+                https: edge.https_addr(),
                 started: std::time::Instant::now(),
                 release: Arc::clone(&release_number),
                 pools: edge.pools(),

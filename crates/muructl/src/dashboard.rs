@@ -26,6 +26,8 @@ pub struct Inputs {
     pub app: String,
     /// Where the application is served.
     pub listen: SocketAddr,
+    /// Where it is served over TLS, when it is.
+    pub https: Option<SocketAddr>,
     /// When the run started.
     pub started: Instant,
     /// The current release number.
@@ -125,6 +127,7 @@ fn collect(inputs: &Inputs) -> Data {
         release: inputs.release.load(Ordering::Relaxed),
         uptime: uptime(inputs.started.elapsed()),
         listen: inputs.listen.to_string(),
+        https: inputs.https.map(|address| address.to_string()),
         summary,
         workers,
         requests,

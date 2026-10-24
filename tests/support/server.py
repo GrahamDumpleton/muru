@@ -6,6 +6,7 @@ import http.client
 import os
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,7 @@ class Server:
     log_path: Path
     workers: int
     threads: int
+    https_port: int | None = None
     _log_offset: int = field(default=0, repr=False)
 
     def request(
@@ -87,6 +89,35 @@ class Server:
         """Make one request on a fresh connection and read the whole response."""
 
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            raw = connection.getresponse()
+            return Response(raw.status, raw.reason, raw.getheaders(), raw.read())
+        finally:
+            connection.close()
+
+    def request_tls(
+        self,
+        method: str,
+        path: str,
+        cafile: Path,
+        server_hostname: str = "localhost",
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Response:
+        """Make one request over HTTPS, trusting `cafile`, and read the whole response.
+
+        The connection goes to 127.0.0.1 while the certificate is checked
+        against `server_hostname`, which is also what the SNI carries.
+        """
+
+        assert self.https_port is not None, "the server was started without --https"
+        context = ssl.create_default_context(cafile=cafile)
+        connection = http.client.HTTPConnection("127.0.0.1", self.https_port, timeout=30)
+        connection.sock = context.wrap_socket(
+            socket.create_connection(("127.0.0.1", self.https_port), timeout=30),
+            server_hostname=server_hostname,
+        )
         try:
             connection.request(method, path, body=body, headers=headers or {})
             raw = connection.getresponse()
@@ -202,11 +233,16 @@ def start(
     threads: int = 2,
     chdir: Path = FIXTURES,
     args: Sequence[str] = (),
+    env: dict[str, str] | None = None,
+    https: bool = False,
 ) -> Server:
     """Start muructl for `module:callable`, skipping the test when it cannot run.
 
-    `args` are further `muructl run` options. When muructl exits before its
-    workers are ready, the RuntimeError raised carries its output.
+    `args` are further `muructl run` options and `env` extra environment
+    variables. With `https`, a free HTTPS port is chosen and passed as
+    --https-port (the caller adds --https, --https-only or --tls-cert). When
+    muructl exits before its workers are ready, the RuntimeError raised
+    carries its output.
     """
 
     muructl = muructl_path()
@@ -216,6 +252,8 @@ def start(
         pytest.skip("the muru extension is not built into this interpreter (just dev)")
 
     port = free_port()
+    https_port = free_port() if https else None
+    https_args = ["--https-port", str(https_port)] if https_port is not None else []
     log = Path(tempfile.mkstemp(prefix="muru-test-", suffix=".log")[1])
     with log.open("wb") as handle:
         process = subprocess.Popen(
@@ -233,12 +271,14 @@ def start(
                 sys.executable,
                 "--chdir",
                 str(chdir),
+                *https_args,
                 *args,
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **(env or {})},
         )
-    server = Server(port, process, log, workers, threads)
+    server = Server(port, process, log, workers, threads, https_port)
     try:
         wait_for_port(port, process)
     except RuntimeError as error:

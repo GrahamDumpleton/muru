@@ -665,6 +665,17 @@ fn build_environ<'py>(
         head.scheme.as_str()
     };
     environ.set_item(intern!(py, "wsgi.url_scheme"), scheme)?;
+    if scheme == "https" {
+        environ.set_item(intern!(py, "HTTPS"), "on")?;
+    }
+    if let Some(tls) = &head.tls {
+        let details = PyDict::new(py);
+        details.set_item(intern!(py, "version"), &tls.version)?;
+        details.set_item(intern!(py, "cipher"), &tls.cipher)?;
+        details.set_item(intern!(py, "server_name"), &tls.server_name)?;
+        details.set_item(intern!(py, "alpn"), &tls.alpn)?;
+        environ.set_item(intern!(py, "muru.tls"), details)?;
+    }
     environ.set_item(intern!(py, "wsgi.input"), input)?;
     environ.set_item(intern!(py, "wsgi.errors"), shared.errors.bind(py))?;
     environ.set_item(intern!(py, "wsgi.multithread"), shared.threads > 1)?;

@@ -21,6 +21,9 @@ behaviour it pins down, request body handling at the edge (buffering, the
 size limit and 100-continue), the host lifecycle (preload modes with the
 import check, hooks and `muru.context()`), HTTP/2 with h2spec, negotiated
 error pages and request identifiers, the access log, the edge timeouts,
-watch reload, tagged worker output, Flask and Django fixtures and the
-minimal read-only dashboard in `muructl run`. Still to come in phase 1:
-TLS in development and the HTTP conformance corpus.
+watch reload, tagged worker output, Flask and Django fixtures, the
+minimal read-only dashboard in `muructl run`, the HTTP/1.1 parsing corpus
+and HTTPS in development with certificates from mkcert or self-signed
+([ADR 0024](adr/0024-ring-tls-provider.md) picks the ring provider).
+Before phase 1 closes, its exit criteria in section 14.5 are checked end to
+end against the fixtures and a real project.

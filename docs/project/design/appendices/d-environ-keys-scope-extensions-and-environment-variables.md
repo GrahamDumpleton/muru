@@ -35,7 +35,7 @@ specification is maintained.
 | muru.uploads | upload references, read through muru.uploads.files() |
 | muru.max_body_size | limit in effect |
 | muru.deadline | absolute request deadline (Unix time, seconds) |
-| muru.tls | dictionary of TLS details (version, cipher, SNI, client certificate when configured) |
+| muru.tls | dictionary of TLS details, present over HTTPS only: version (TLSv1.3 or TLSv1.2), cipher (the negotiated suite), server_name (the SNI, empty when the client sent none) and alpn (the negotiated application protocol, empty when none); client certificate details when configured |
 | muru.client_class | client class assigned by the edge (section 4.14) |
 | muru.mode | site mode such as read-only, usually set by an overlay (sections 4.15 and 9.10) |
 | muru.overlays | names of overlays active for this request's route |

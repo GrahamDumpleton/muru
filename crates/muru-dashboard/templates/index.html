@@ -37,6 +37,7 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
   <span>release r{{ data.release }}</span>
   <span>up {{ data.uptime }}</span>
   <span>http://{{ data.listen }}</span>
+  {% if let Some(https) = data.https %}<span>https://{{ https }}</span>{% endif %}
 </header>
 <main>
   <section id="overview" hx-get="/fragment/overview" hx-trigger="every 2s" hx-swap="innerHTML">

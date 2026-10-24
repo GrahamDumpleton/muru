@@ -35,6 +35,8 @@ pub struct Data {
     pub uptime: String,
     /// The address the application is served on.
     pub listen: String,
+    /// The HTTPS address, when TLS is on.
+    pub https: Option<String>,
     /// Figures for the last minute.
     pub summary: Summary,
     /// One row per worker.

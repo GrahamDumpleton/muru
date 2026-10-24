@@ -74,7 +74,13 @@ message Peer {
   uint32 port = 2;
 }
 
-message TlsInfo {}
+// The TLS connection a request arrived on, absent for cleartext.
+message TlsInfo {
+  string version = 1;               // for example TLSv1.3
+  string cipher = 2;                // negotiated cipher suite, for example TLS13_AES_256_GCM_SHA384
+  string server_name = 3;           // the name the client asked for (SNI), if any
+  string alpn = 4;                  // negotiated application protocol, for example h2
+}
 
 message InternalContext {}
 

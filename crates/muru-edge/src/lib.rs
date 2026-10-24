@@ -1,12 +1,12 @@
 //! The Muru edge: listeners, TLS, virtual hosts, routing, the request pipeline, upstreams, static files and uploads.
 //!
-//! Phase 1 scope so far: a listener speaking HTTP/1.1 and HTTP/2 (h2c by
-//! prior knowledge; h2 over TLS arrives with TLS) that forwards every
-//! request to one pool of workers over the worker link (design
-//! specification section 5). The request head is sent as a typed frame, the
-//! body streams behind it, and the response streams back; no HTTP is
-//! re-serialised between the edge and the application. Routing, TLS and
-//! everything else arrive later in phase 1 and beyond.
+//! Phase 1 scope so far: an HTTP listener and an optional HTTPS listener,
+//! each speaking HTTP/1.1 and HTTP/2 (h2c by prior knowledge, h2 by ALPN
+//! over TLS), forwarding every request to one pool of workers over the
+//! worker link (design specification section 5). The request head is sent
+//! as a typed frame, the body streams behind it, and the response streams
+//! back; no HTTP is re-serialised between the edge and the application.
+//! Routing, virtual hosts and everything else arrive in phase 2 and beyond.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -24,11 +24,14 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use muru_proto::worker::v1 as pb;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 pub mod access;
 pub mod errors;
 pub mod link;
+pub mod tls;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -48,6 +51,19 @@ pub struct Config {
     pub access_log: access::Config,
     /// Timeouts and header limits.
     pub limits: Limits,
+    /// The HTTPS listener, when TLS is on.
+    pub https: Option<Https>,
+}
+
+/// An HTTPS listener next to the HTTP one (section 13.1 in development).
+#[derive(Debug, Clone)]
+pub struct Https {
+    /// Address for the HTTPS listener. Port 0 picks a free port.
+    pub listen: SocketAddr,
+    /// The TLS configuration, from [`tls::server_config`].
+    pub config: Arc<rustls::ServerConfig>,
+    /// Redirect plain HTTP requests here instead of serving them.
+    pub only: bool,
 }
 
 /// The limits and timeouts of sections 4.6 and 7.6, with their defaults.
@@ -107,20 +123,28 @@ impl Pools {
     }
 }
 
-/// A bound edge, ready to run.
-pub struct Edge {
-    listener: TcpListener,
-    local: SocketAddr,
+/// What every connection shares.
+struct Shared {
     pools: Arc<Pools>,
-    request_ids: Arc<errors::RequestIds>,
-    protocols: Arc<auto::Builder<TokioExecutor>>,
+    request_ids: errors::RequestIds,
+    protocols: auto::Builder<TokioExecutor>,
     development: bool,
     access_log: Arc<access::AccessLog>,
     limits: Arc<Limits>,
+    /// Where plain HTTP requests are redirected instead of being served.
+    redirect_to: Option<SocketAddr>,
+}
+
+/// A bound edge, ready to run.
+pub struct Edge {
+    http: TcpListener,
+    local: SocketAddr,
+    https: Option<(TcpListener, SocketAddr, TlsAcceptor)>,
+    shared: Arc<Shared>,
 }
 
 impl Edge {
-    /// Bind the listener and prepare the worker pools.
+    /// Bind the listeners and prepare the worker pools.
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
         let pools = Arc::new(Pools {
             current: RwLock::new(Arc::new(link::LinkPool::new(
@@ -129,8 +153,18 @@ impl Edge {
             )?)),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
-        let listener = TcpListener::bind(config.listen).await?;
-        let local = listener.local_addr()?;
+        let http = TcpListener::bind(config.listen).await?;
+        let local = http.local_addr()?;
+        let mut https = None;
+        let mut redirect_to = None;
+        if let Some(secure) = config.https {
+            let listener = TcpListener::bind(secure.listen).await?;
+            let bound = listener.local_addr()?;
+            if secure.only {
+                redirect_to = Some(bound);
+            }
+            https = Some((listener, bound, TlsAcceptor::from(secure.config)));
+        }
         // Each connection is served as HTTP/1.1 or, when it opens with the
         // HTTP/2 preface, as HTTP/2.
         let limits = Arc::new(config.limits);
@@ -148,75 +182,140 @@ impl Edge {
             .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
             .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX));
         Ok(Self {
-            listener,
+            http,
             local,
-            pools,
-            request_ids: Arc::new(errors::RequestIds::new()),
-            protocols: Arc::new(protocols),
-            development: config.development,
-            access_log,
-            limits,
+            https,
+            shared: Arc::new(Shared {
+                pools,
+                request_ids: errors::RequestIds::new(),
+                protocols,
+                development: config.development,
+                access_log,
+                limits,
+                redirect_to,
+            }),
         })
     }
 
-    /// The address the listener is bound to.
+    /// The address the HTTP listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local
     }
 
+    /// The address the HTTPS listener is bound to, when there is one.
+    pub fn https_addr(&self) -> Option<SocketAddr> {
+        self.https.as_ref().map(|(_, bound, _)| *bound)
+    }
+
     /// The access log, for the dashboard and the CLI.
     pub fn access_log(&self) -> Arc<access::AccessLog> {
-        Arc::clone(&self.access_log)
+        Arc::clone(&self.shared.access_log)
     }
 
     /// The worker pools, for switching releases while running.
     pub fn pools(&self) -> Arc<Pools> {
-        Arc::clone(&self.pools)
+        Arc::clone(&self.shared.pools)
     }
 
     /// Accept connections until an accept error occurs.
     pub async fn run(self) -> anyhow::Result<()> {
-        loop {
-            let (stream, peer) = self.listener.accept().await?;
-            let _ = stream.set_nodelay(true);
-            let pools = Arc::clone(&self.pools);
-            let ids = Arc::clone(&self.request_ids);
-            let protocols = Arc::clone(&self.protocols);
-            let local = self.local;
-            let development = self.development;
-            let access_log = Arc::clone(&self.access_log);
-            let limits = Arc::clone(&self.limits);
-            tokio::spawn(async move {
-                let service = service_fn(move |request| {
-                    let pool = pools.current();
-                    let access_log = Arc::clone(&access_log);
-                    let limits = Arc::clone(&limits);
-                    let request_id = ids.next();
-                    async move {
-                        let context = link::Context {
-                            request_id: &request_id,
-                            peer,
-                            local,
-                            development,
-                            access_log,
-                            limits,
-                        };
-                        let mut response = link::handle(request, pool, &context).await;
-                        // Section 4.19: every response names its request.
-                        if let Ok(value) = HeaderValue::from_str(&request_id) {
-                            response
-                                .headers_mut()
-                                .insert(errors::X_REQUEST_ID.clone(), value);
+        let plain = accept(self.http, self.local, None, Arc::clone(&self.shared));
+        match self.https {
+            Some((listener, bound, acceptor)) => {
+                let secure = accept(listener, bound, Some(acceptor), self.shared);
+                tokio::try_join!(plain, secure).map(|_| ())
+            }
+            None => plain.await,
+        }
+    }
+}
+
+/// Accept connections on one listener, completing the TLS handshake first
+/// when it has an acceptor, and serve each on its own task.
+async fn accept(
+    listener: TcpListener,
+    local: SocketAddr,
+    acceptor: Option<TlsAcceptor>,
+    shared: Arc<Shared>,
+) -> anyhow::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let shared = Arc::clone(&shared);
+        match acceptor.clone() {
+            None => {
+                tokio::spawn(serve(stream, peer, local, None, shared));
+            }
+            Some(acceptor) => {
+                tokio::spawn(async move {
+                    // A client that never finishes its handshake is cut off
+                    // as one that never finishes its request head would be.
+                    let handshake = tokio::time::timeout(
+                        shared.limits.header_read_timeout,
+                        acceptor.accept(stream),
+                    )
+                    .await;
+                    match handshake {
+                        Ok(Ok(stream)) => {
+                            let info = tls::info(stream.get_ref().1);
+                            serve(stream, peer, local, Some(info), shared).await;
                         }
-                        Ok::<_, Infallible>(response)
+                        Ok(Err(error)) => {
+                            tracing::debug!(%peer, %error, "TLS handshake failed");
+                        }
+                        Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
                     }
                 });
-                let connection = protocols.serve_connection(TokioIo::new(stream), service);
-                if let Err(error) = connection.await {
-                    tracing::debug!(%peer, %error, "connection ended with an error");
-                }
-            });
+            }
         }
+    }
+}
+
+/// Serve one connection, cleartext or already inside TLS.
+async fn serve<I>(
+    io: I,
+    peer: SocketAddr,
+    local: SocketAddr,
+    tls: Option<pb::TlsInfo>,
+    shared: Arc<Shared>,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let tls = tls.map(Arc::new);
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let redirect_to = shared.redirect_to.filter(|_| tls.is_none());
+    let state = Arc::clone(&shared);
+    let service = service_fn(move |request| {
+        let shared = Arc::clone(&shared);
+        let tls = tls.clone();
+        let request_id = shared.request_ids.next();
+        async move {
+            let context = link::Context {
+                request_id: &request_id,
+                peer,
+                local,
+                scheme,
+                tls: tls.as_deref(),
+                development: shared.development,
+                access_log: Arc::clone(&shared.access_log),
+                limits: Arc::clone(&shared.limits),
+            };
+            let mut response = match redirect_to {
+                Some(to) => link::redirect_to_https(request, &context, to),
+                None => link::handle(request, shared.pools.current(), &context).await,
+            };
+            // Section 4.19: every response names its request.
+            if let Ok(value) = HeaderValue::from_str(&request_id) {
+                response
+                    .headers_mut()
+                    .insert(errors::X_REQUEST_ID.clone(), value);
+            }
+            Ok::<_, Infallible>(response)
+        }
+    });
+    let connection = state.protocols.serve_connection(TokioIo::new(io), service);
+    if let Err(error) = connection.await {
+        tracing::debug!(%peer, %error, "connection ended with an error");
     }
 }
 
@@ -261,10 +360,9 @@ pub(crate) fn expects_continue(parts: &http::request::Parts) -> bool {
 
 pub(crate) fn request_head(
     parts: &http::request::Parts,
-    request_id: &str,
-    peer: SocketAddr,
-    local: SocketAddr,
+    context: &link::Context<'_>,
 ) -> pb::RequestHead {
+    let (peer, local) = (context.peer, context.local);
     let content_length = parts
         .headers
         .get(CONTENT_LENGTH)
@@ -282,9 +380,9 @@ pub(crate) fn request_head(
     };
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-        request_id: request_id.to_owned(),
+        request_id: context.request_id.to_owned(),
         method: parts.method.as_str().to_owned(),
-        scheme: "http".to_owned(),
+        scheme: context.scheme.to_owned(),
         raw_path: Bytes::copy_from_slice(parts.uri.path().as_bytes()),
         query: parts
             .uri
@@ -315,6 +413,7 @@ pub(crate) fn request_head(
             address: local.ip().to_string(),
             port: u32::from(local.port()),
         }),
+        tls: context.tls.cloned(),
         content_length,
         http_version: format!("{:?}", parts.version),
         expect_continue: expects_continue(parts) && content_length != Some(0),

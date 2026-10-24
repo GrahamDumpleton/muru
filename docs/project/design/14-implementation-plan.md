@@ -56,7 +56,7 @@ muru/
 | Area | Choice |
 | --- | --- |
 | Async runtime and HTTP | tokio, hyper 1.x with hyper-util, h2, tower |
-| TLS | rustls with tokio-rustls, ring or aws-lc-rs provider, rustls-acme later |
+| TLS | rustls with tokio-rustls on the ring provider (ADR 0024), rcgen for development certificates, rustls-acme later |
 | Worker link | own framing with prost messages (section 5) |
 | gRPC (control plane and admin API) | tonic and prost |
 | Snapshots and shared state | arc-swap, memfd-backed shared memory for edge load tables |

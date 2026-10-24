@@ -51,7 +51,7 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
                 "environ": {
                     key: value
                     for key, value in environ.items()
-                    if isinstance(value, (str, int, bool, tuple))
+                    if isinstance(value, (str, int, bool, tuple, dict))
                 },
             }
         ).encode()

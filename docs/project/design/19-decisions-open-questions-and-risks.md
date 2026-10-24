@@ -39,6 +39,7 @@ specification is maintained.
 | Free-threading | Supported from phase 1 with the WSGI bridge, with the extension designed for it from the outset (section 6.11) |
 | Runtime wheels | Version-specific wheels for every supported CPython, regular and free-threaded. No abi3 |
 | gRPC mounts and authentication sub-requests | In initial scope, phase 3 (sections 6.13 and 4.16) |
+| TLS cryptography | rustls, tokio-rustls and rcgen on the ring provider in every crate; aws-lc-rs banned by cargo-deny so cmake never becomes a prerequisite (ADR 0024) |
 
 ## 19.2 Open questions
 

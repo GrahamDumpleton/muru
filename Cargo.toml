@@ -48,8 +48,15 @@ muru-proto = { path = "crates/muru-proto" }
 prost = "0.14"
 protoc-bin-vendored = "3"
 pyo3 = { version = "0.30", features = ["extension-module"] }
+# TLS runs on the ring provider everywhere (ADR 0024): no aws-lc-rs, so no
+# cmake. Keep every rustls-family crate on the same provider features.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 thiserror = "2"
+time = "0.3"
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal", "process", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "channel", "router"] }
 tonic-prost = "0.14"
@@ -57,6 +64,7 @@ tonic-prost-build = "0.14"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x509-parser = "0.18"
 
 [workspace.lints.rust]
 missing_docs = "warn"
