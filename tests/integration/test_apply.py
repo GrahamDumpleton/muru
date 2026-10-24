@@ -240,3 +240,27 @@ def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Pa
     warned = apply(daemon, config)
     assert warned.returncode == 0, warned.stdout + warned.stderr
     assert "warning: [[listener]] entries belong in the daemon configuration file" in warned.stdout
+
+
+def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(
+        release("shop", "r1", max_requests=250, max_lifetime="1h")
+        + "[app.shop.release.r1.timeouts]\nhard_timeout = '30s'\n"
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    written = exported["app"]["shop"]["release"]["r1"]
+    assert written["max_requests"] == 250
+    assert written["max_lifetime"] == "3600s"
+    assert written["timeouts"]["hard_timeout"] == "30s"
+    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+
+    # A declared release that differs on these is immutable like any other.
+
+    config.write_text(release("shop", "r1", max_requests=300))
+    differing = apply(daemon, config)
+    assert differing.returncode == 1
+    assert "max_requests 300, recorded 250" in differing.stdout + differing.stderr

@@ -554,6 +554,9 @@ mod tests {
             groups: Vec::new(),
             mounts: Vec::new(),
             logging: Default::default(),
+            max_requests: None,
+            max_lifetime_ms: None,
+            timeouts: Default::default(),
         }
     }
 

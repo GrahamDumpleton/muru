@@ -567,8 +567,47 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     retain: Option<Duration>,
 
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    max_lifetime: Option<Duration>,
+
+    /// A host timeout as NAME=DURATION: hard (replace a worker whose
+    /// request runs this long; off), hard_drain_grace (10s) or
+    /// shutdown (5s). Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
+    timeouts: Vec<(String, Duration)>,
+
     #[command(flatten)]
     socket: SocketArgs,
+}
+
+/// The last value given for a named timeout, in milliseconds.
+fn timeout_ms(timeouts: &[(String, Duration)], name: &str) -> Option<u64> {
+    timeouts
+        .iter()
+        .rev()
+        .find(|(given, _)| given == name)
+        .map(|(_, duration)| duration.as_millis() as u64)
+}
+
+/// Parse NAME=DURATION for deploy --timeout.
+fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
+    let (name, duration) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example hard=60s"))?;
+    let name = name.trim();
+
+    if !["hard", "hard_drain_grace", "shutdown"].contains(&name) {
+        return Err(format!(
+            "{name:?} is not a host timeout name: hard, hard_drain_grace or shutdown"
+        ));
+    }
+
+    Ok((name.to_owned(), muru_config::parse_duration(duration)?))
 }
 
 /// Deploy a release.
@@ -607,6 +646,13 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
+        max_requests: args.max_requests,
+        max_lifetime_ms: args
+            .max_lifetime
+            .map(|lifetime| lifetime.as_millis() as u64),
+        hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
+        hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
+        shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
     };
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 

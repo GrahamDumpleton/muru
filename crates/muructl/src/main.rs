@@ -225,10 +225,20 @@ struct RunArgs {
     max_body_size: Option<u64>,
 
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
-    /// header_read (30s), body_idle (60s) or response_idle (60s).
-    /// Repeatable.
+    /// header_read (30s), body_idle (60s) or response_idle (60s) at the
+    /// edge; hard (off), hard_drain_grace (10s) or shutdown (5s) in the
+    /// host, which replaces a worker whose request runs past the hard
+    /// timeout. Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
+
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    max_lifetime: Option<Duration>,
 
     /// Address for the read-only dashboard on loopback, or off. On at
     /// 127.0.0.1:8081 by default, off with --allow-public unless given.
@@ -575,14 +585,57 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "header_read",
         "body_idle",
         "response_idle",
+        "hard",
+        "hard_drain_grace",
+        "shutdown",
     ]
     .contains(&name)
     {
         return Err(format!(
-            "{name:?} is not a timeout name: queue, deadline, header_read, body_idle or response_idle"
+            "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
+             response_idle, hard, hard_drain_grace or shutdown"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
+}
+
+/// The host's timeouts from --timeout and a project table (section 7.6):
+/// the hard timeout, the grace for a replaced worker's other requests
+/// and the time before a stopping worker is killed.
+pub(crate) fn worker_timeouts(
+    timeouts: &[(String, Duration)],
+    table: Option<&muru_config::Timeouts>,
+) -> anyhow::Result<(Option<Duration>, Duration, Duration)> {
+    let parse = |text: &Option<String>, name: &str| -> anyhow::Result<Option<Duration>> {
+        match text {
+            Some(text) => muru_config::parse_duration(text)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("[tool.muru.timeouts] {name}: {error}")),
+            None => Ok(None),
+        }
+    };
+    let mut hard = table.map_or(Ok(None), |table| parse(&table.hard_timeout, "hard_timeout"))?;
+    let mut grace = table
+        .map_or(Ok(None), |table| {
+            parse(&table.hard_drain_grace, "hard_drain_grace")
+        })?
+        .unwrap_or(Duration::from_secs(10));
+    let mut shutdown = table
+        .map_or(Ok(None), |table| {
+            parse(&table.shutdown_timeout, "shutdown_timeout")
+        })?
+        .unwrap_or(Duration::from_secs(5));
+
+    for (name, duration) in timeouts {
+        match name.as_str() {
+            "hard" => hard = Some(*duration),
+            "hard_drain_grace" => grace = *duration,
+            "shutdown" => shutdown = *duration,
+            _ => {}
+        }
+    }
+
+    Ok((hard, grace, shutdown))
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -653,6 +706,12 @@ struct Resolved {
     mounts: std::collections::BTreeMap<String, muru_config::Mount>,
     /// Logging defaults from the table (section 11.4).
     logging: Option<muru_config::Logging>,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7).
+    max_lifetime: Option<Duration>,
+    /// The host's timeouts from the table (section 7.6).
+    timeouts: Option<muru_config::Timeouts>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -769,6 +828,16 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         groups: table.groups,
         mounts: table.mounts,
         logging: table.logging,
+        max_requests: args.max_requests.or(table.max_requests),
+        max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
+            (Some(lifetime), _) => Some(lifetime),
+            (None, Some(text)) => Some(
+                muru_config::parse_duration(text)
+                    .map_err(|error| anyhow::anyhow!("[tool.muru] max_lifetime: {error}"))?,
+            ),
+            (None, None) => None,
+        },
+        timeouts: table.timeouts,
     })
 }
 
@@ -813,6 +882,17 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         groups: resolved.groups.clone(),
         mounts: resolved.mounts.clone(),
         logging: resolved.logging.clone(),
+        max_requests: resolved.max_requests,
+        max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
+        timeouts: {
+            let (hard, grace, shutdown) =
+                worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+            (hard.is_some() || resolved.timeouts.is_some()).then(|| muru_config::Timeouts {
+                hard_timeout: hard.map(muru_config::format_duration),
+                hard_drain_grace: Some(muru_config::format_duration(grace)),
+                shutdown_timeout: Some(muru_config::format_duration(shutdown)),
+            })
+        },
     };
     let document = Document {
         listener: listeners,
@@ -848,7 +928,16 @@ fn group_sockets(
     host: &HostProcess,
     groups: &std::collections::BTreeMap<String, muru_config::Group>,
 ) -> Vec<muru_edge::routing::GroupSockets> {
-    host.group_sockets
+    group_sockets_from(&host.group_sockets, groups)
+}
+
+/// Named groups' sockets, as the host announced them, with the paths
+/// each group serves from the project table.
+fn group_sockets_from(
+    announced: &[(String, Vec<PathBuf>)],
+    groups: &std::collections::BTreeMap<String, muru_config::Group>,
+) -> Vec<muru_edge::routing::GroupSockets> {
+    announced
         .iter()
         .map(|(name, sockets)| muru_edge::routing::GroupSockets {
             name: name.clone(),
@@ -859,6 +948,25 @@ fn group_sockets(
             sockets: sockets.clone(),
         })
         .collect()
+}
+
+/// Connect to a host's control socket for the run (section 5.9), or,
+/// when the host has none, a receiver that never yields.
+async fn host_control(
+    host: &HostProcess,
+) -> (
+    Option<muru_controller::host::HostControl>,
+    tokio::sync::mpsc::Receiver<muru_controller::host::HostMessage>,
+) {
+    match muru_controller::host::HostControl::connect(&host.control_path()).await {
+        Ok((control, messages)) => (Some(control), messages),
+        Err(error) => {
+            println!("muru: no control connection to the host: {error:#}");
+            let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+            std::mem::forget(_sender);
+            (None, receiver)
+        }
+    }
 }
 
 /// The named mounts as the edge selects them.
@@ -1000,6 +1108,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
+    let (hard_timeout, hard_drain_grace, shutdown_timeout) =
+        worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
@@ -1041,6 +1151,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .as_ref()
             .and_then(|logging| logging.python.clone())
             .unwrap_or_default(),
+        max_requests: resolved.max_requests,
+        max_lifetime: resolved.max_lifetime,
+        hard_timeout,
+        hard_drain_grace,
+        shutdown_timeout,
     };
 
     let logs = Logs::default();
@@ -1053,6 +1168,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&run_dir);
         return Err(error);
     }
+
+    let (mut control, mut host_messages) = host_control(&current).await;
 
     let (http_address, https_address) = addresses(&args);
 
@@ -1209,6 +1326,40 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
+            Some(message) = host_messages.recv() => {
+                // Sections 7.6 and 7.7: the host replaced a worker, so
+                // the edge routes to the new socket, and the host hears
+                // that it does before it stops the old one.
+
+                match message {
+                    muru_controller::host::HostMessage::Workers { version, sockets, groups } => {
+                        let connected = muru_edge::routing::AppPools::connect(
+                            &label,
+                            &format!("r{}", current.release),
+                            &sockets,
+                            &group_sockets_from(&groups, &group_tables),
+                            &mount_paths(&mount_tables),
+                        )
+                        .await;
+
+                        match connected {
+                            Ok(connected) => {
+                                pools.replace(connected);
+
+                                if let Some(control) = &control {
+                                    control.acknowledge(version);
+                                }
+                            }
+                            Err(error) => {
+                                println!("muru: the workers could not be reconnected: {error:#}");
+                            }
+                        }
+                    }
+                    muru_controller::host::HostMessage::Event { kind, message, .. } => {
+                        println!("muru: {kind}: {message}");
+                    }
+                }
+            }
             Some(path) = changed.recv() => {
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
@@ -1250,6 +1401,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop());
+                                (control, host_messages) = host_control(&current).await;
                                 break;
                             }
                             Err(error) => {

@@ -62,7 +62,13 @@ pub struct Lifecycle {
     pub on_reopen_logs: Option<Py<PyAny>>,
     /// A descriptor whose end of file means the host is gone.
     pub lifeline: Option<i32>,
+    /// A descriptor the worker writes a status line to every second
+    /// (section 7.6): the host reads it for timeouts and recycling.
+    pub report: Option<i32>,
 }
+
+/// How often the worker reports to the host.
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Lifecycle {
     /// Call a hook with the interpreter attached, reporting any exception.
@@ -89,11 +95,19 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     let accepting = Arc::clone(&shared);
     let reopen_logs = lifecycle.on_reopen_logs.as_ref();
     let lifeline = lifecycle.lifeline;
+    let report = lifecycle.report;
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
         let mut signals = Signals::new()?;
         let mut lifeline = Lifeline::new(lifeline)?;
+
+        // The first report says the worker is listening; the rest keep
+        // the host informed of what it is doing.
+
+        if let Some(fd) = report {
+            tokio::spawn(report_loop(fd, Arc::clone(&accepting)));
+        }
 
         loop {
             tokio::select! {
@@ -214,6 +228,41 @@ impl Lifeline {
                 return;
             }
         }
+    }
+}
+
+/// Write a status line to the report descriptor every second: requests
+/// in flight, the age of the oldest, and requests served. A write that
+/// cannot complete at once (the host is behind) is skipped.
+async fn report_loop(fd: i32, shared: Arc<Shared>) {
+    // SAFETY: fcntl on a descriptor inherited for this purpose, setting
+    // a flag; the descriptor stays open for the life of the worker.
+
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    loop {
+        let line = format!(
+            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{}}}\n",
+            shared.in_flight(),
+            shared.oldest_ms(),
+            shared.total()
+        );
+
+        // SAFETY: write from a buffer this frame owns, on a descriptor
+        // the host handed over for reports; a short or failed write is
+        // ignored, since the next report replaces it.
+
+        unsafe {
+            libc::write(fd, line.as_ptr().cast(), line.len());
+        }
+
+        tokio::time::sleep(REPORT_INTERVAL).await;
     }
 }
 
@@ -398,7 +447,7 @@ async fn handle_request(
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
-    shared.request_started();
+    let request_id = shared.request_started();
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
@@ -411,11 +460,11 @@ async fn handle_request(
             out_tx,
             worker_cancelled,
         );
-        worker_shared.request_finished();
+        worker_shared.request_finished(request_id);
     }));
 
     if !queued {
-        shared.request_finished();
+        shared.request_finished(request_id);
         return Err(io::Error::other("the worker is shutting down"));
     }
 
@@ -518,12 +567,12 @@ async fn handle_asgi_request(
     // The task starts on the loop now; the channel is how the two sides
     // of this function reach it.
 
-    shared.request_started();
+    let request_id = shared.request_started();
 
     let channel = match asgi::start(shared, asgi, &runner, &head, out_tx) {
         Ok(channel) => channel,
         Err(error) => {
-            shared.request_finished();
+            shared.request_finished(request_id);
             return Err(io::Error::other(format!(
                 "the worker is shutting down: {error}"
             )));
@@ -533,7 +582,7 @@ async fn handle_asgi_request(
     let channel = channel.get();
 
     if head.scope == pb::Scope::Websocket as i32 {
-        return handle_websocket(reader, writer, out_rx, shared, channel, &done).await;
+        return handle_websocket(reader, writer, out_rx, shared, channel, &done, request_id).await;
     }
 
     let read_side = async {
@@ -606,7 +655,7 @@ async fn handle_asgi_request(
 
     let (read_result, write_result) = tokio::join!(read_side, write_side);
     channel.disconnect();
-    shared.request_finished();
+    shared.request_finished(request_id);
 
     let early = read_result?;
     write_result?;
@@ -625,6 +674,7 @@ async fn handle_websocket(
     shared: &Arc<Shared>,
     channel: &asgi::Channel,
     done: &tokio::sync::Notify,
+    request_id: u64,
 ) -> io::Result<Option<frame::Frame>> {
     use tokio::io::AsyncBufReadExt;
 
@@ -699,7 +749,7 @@ async fn handle_websocket(
 
     let (read_result, write_result) = tokio::join!(read_side, write_side);
     channel.disconnect_with(1006, "the connection ended");
-    shared.request_finished();
+    shared.request_finished(request_id);
 
     let early = read_result?;
     write_result?;

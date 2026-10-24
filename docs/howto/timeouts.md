@@ -3,9 +3,9 @@
 ```{admonition} Status
 :class: note
 
-Development mode. The soft and hard timeouts that act on the application
-itself (section 7.6 of the design specification) arrive in phases 2 and 3;
-today's timeouts are the edge's.
+The edge's timeouts and the hard timeout, which replaces a worker whose
+request runs too long. The soft timeout, which interrupts the request
+itself, and the loop stall timeout are still to come.
 ```
 
 Every timeout has a name, a default, and a response the client sees when
@@ -33,7 +33,47 @@ request, so the right value is the slowest legitimate one plus margin.
 The deadline is also passed to the application: `muru.deadline` in the
 environ is planned, and in phase 3 a soft timeout can interrupt the
 application thread itself. Until then a request past its deadline keeps
-running in the worker after the client has been answered.
+running in the worker after the client has been answered, which is what
+the hard timeout is for.
+
+## The hard timeout
+
+The host watches its workers, each of which reports once a second how
+long its oldest request has been running. A request past the hard
+timeout is treated as stuck: the worker is taken out of routing at once,
+every thread's stack is written to the log (with `faulthandler`, which
+needs no cooperation from the stuck thread), a fresh worker is forked on
+a new socket and the edge routes to it as soon as it listens. The stuck
+worker gets `hard_drain_grace` to finish its other requests, is then told
+to stop, and is killed `shutdown_timeout` later if it has not. The stuck
+request's client is answered by the edge when its connection to the
+worker closes, and a `worker.timeout_killed` event records what happened.
+
+| Name | Default | Measured | When it fires |
+| --- | --- | --- | --- |
+| `hard` | off | from the request reaching the worker | the worker is replaced |
+| `hard_drain_grace` | 10s | from the worker leaving routing | the worker is told to stop |
+| `shutdown` | 5s | from the worker being told to stop | the worker is killed |
+
+```
+muructl run app:application --timeout hard=60s
+muructl deploy shop /srv/shop --timeout hard=60s --timeout hard_drain_grace=5s
+```
+
+In a project's `[tool.muru]` table or a declared release they are the
+`timeouts` table, written as durations:
+
+```toml
+[tool.muru.timeouts]
+hard_timeout = "60s"
+hard_drain_grace = "10s"
+shutdown_timeout = "5s"
+```
+
+Set the hard timeout above the edge's `deadline`, so that a slow request
+is answered 504 by the edge first and only a request that never returns
+costs a worker. The [worker recycling guide](recycling.md) describes the
+replacement itself, which is the same path a recycled worker takes.
 
 The body size limit is a limit rather than a timeout, but lives beside
 them: `--max-body-size 100MB` (the development default; 10 MB with

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use muru_config::{
     App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
@@ -757,6 +758,55 @@ pub fn resolve_spec(
         });
     }
 
+    // Section 7.6 and 7.7: the host's own timeouts and recycling, from
+    // the request, else the table, else the defaults of appendix C.
+
+    let table_timeouts = table.timeouts.clone().unwrap_or_default();
+    let duration_ms =
+        |given: Option<u64>, text: Option<&String>, name: &str| -> Result<Option<u64>, String> {
+            match (given, text) {
+                (Some(ms), _) => Ok(Some(ms)),
+                (None, Some(text)) => muru_config::parse_duration(text)
+                    .map(|duration| Some(duration.as_millis() as u64))
+                    .map_err(|error| format!("{name}: {error}")),
+                (None, None) => Ok(None),
+            }
+        };
+    let max_lifetime_ms = duration_ms(
+        request.max_lifetime_ms,
+        table.max_lifetime.as_ref(),
+        "max_lifetime",
+    )?;
+    let timeouts = crate::model::WorkerTimeouts {
+        hard_timeout_ms: duration_ms(
+            request.hard_timeout_ms,
+            table_timeouts.hard_timeout.as_ref(),
+            "hard_timeout",
+        )?,
+        hard_drain_grace_ms: duration_ms(
+            request.hard_drain_grace_ms,
+            table_timeouts.hard_drain_grace.as_ref(),
+            "hard_drain_grace",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().hard_drain_grace_ms),
+        shutdown_timeout_ms: duration_ms(
+            request.shutdown_timeout_ms,
+            table_timeouts.shutdown_timeout.as_ref(),
+            "shutdown_timeout",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
+    };
+
+    if max_lifetime_ms == Some(0) {
+        return Err("max_lifetime must be longer than nothing".to_owned());
+    }
+
+    if request.max_requests == Some(0)
+        || (request.max_requests.is_none() && table.max_requests == Some(0))
+    {
+        return Err("max_requests must be at least 1".to_owned());
+    }
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -787,6 +837,9 @@ pub fn resolve_spec(
             .or(table.logging.as_ref())
             .and_then(|logging| logging.python.clone())
             .unwrap_or_default(),
+        max_requests: request.max_requests.or(table.max_requests),
+        max_lifetime_ms,
+        timeouts,
     })
 }
 
@@ -850,7 +903,35 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         release: String::new(),
         wait: true,
         retain_ms: None,
+        max_requests: table.max_requests,
+        max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
+        hard_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.hard_timeout.as_ref()),
+        ),
+        hard_drain_grace_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.hard_drain_grace.as_ref()),
+        ),
+        shutdown_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.shutdown_timeout.as_ref()),
+        ),
     }
+}
+
+/// A duration a table writes, as milliseconds for a request; one that
+/// does not parse is left out, and the validation of the declared
+/// release reports it.
+fn duration_field(text: Option<&String>) -> Option<u64> {
+    text.and_then(|text| muru_config::parse_duration(text).ok())
+        .map(|duration| duration.as_millis() as u64)
 }
 
 /// A recorded spec as the table that declares it, every key written so
@@ -902,6 +983,24 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         logging: (spec.logging != muru_config::PythonLogging::default()).then(|| {
             muru_config::Logging {
                 python: Some(spec.logging.clone()),
+            }
+        }),
+        max_requests: spec.max_requests,
+        max_lifetime: spec
+            .max_lifetime_ms
+            .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+        timeouts: (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
+            muru_config::Timeouts {
+                hard_timeout: spec
+                    .timeouts
+                    .hard_timeout_ms
+                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                hard_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.hard_drain_grace_ms,
+                ))),
+                shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.shutdown_timeout_ms,
+                ))),
             }
         }),
     }
@@ -999,8 +1098,47 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_mounts(&declared.mounts),
         describe_mounts(&recorded.mounts),
     );
+    compare(
+        "max_requests",
+        declared
+            .max_requests
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "off".to_owned()),
+        recorded
+            .max_requests
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "off".to_owned()),
+    );
+    compare(
+        "max_lifetime",
+        describe_ms(declared.max_lifetime_ms),
+        describe_ms(recorded.max_lifetime_ms),
+    );
+    compare(
+        "hard_timeout",
+        describe_ms(declared.timeouts.hard_timeout_ms),
+        describe_ms(recorded.timeouts.hard_timeout_ms),
+    );
+    compare(
+        "hard_drain_grace",
+        describe_ms(Some(declared.timeouts.hard_drain_grace_ms)),
+        describe_ms(Some(recorded.timeouts.hard_drain_grace_ms)),
+    );
+    compare(
+        "shutdown_timeout",
+        describe_ms(Some(declared.timeouts.shutdown_timeout_ms)),
+        describe_ms(Some(recorded.timeouts.shutdown_timeout_ms)),
+    );
 
     found
+}
+
+/// A duration in milliseconds as the configuration writes it, or off.
+fn describe_ms(ms: Option<u64>) -> String {
+    match ms {
+        Some(ms) => muru_config::format_duration(Duration::from_millis(ms)),
+        None => "off".to_owned(),
+    }
 }
 
 /// Groups as one phrase, for the report.

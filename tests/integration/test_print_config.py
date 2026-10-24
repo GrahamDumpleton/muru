@@ -60,3 +60,23 @@ def test_a_factory_entrypoint_keeps_its_factory_settings() -> None:
     assert release["factory_phase"] == "worker"
     assert release["interface"] == "wsgi"
     assert release["processes"] == 1
+
+
+def test_recycling_and_host_timeouts_are_written() -> None:
+    document = print_config(
+        str(PROJECTS / "shop"),
+        "--max-requests",
+        "500",
+        "--max-lifetime",
+        "2h",
+        "--timeout",
+        "hard=45s",
+    )
+    release = document["app"]["shop"]["release"]["r1"]  # type: ignore[index]
+    assert release["max_requests"] == 500
+    assert release["max_lifetime"] == "7200s"
+    assert release["timeouts"] == {
+        "hard_timeout": "45s",
+        "hard_drain_grace": "10s",
+        "shutdown_timeout": "5s",
+    }

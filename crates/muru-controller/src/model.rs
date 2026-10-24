@@ -167,6 +167,49 @@ pub struct ReleaseSpec {
     /// Python logging defaults (section 11.4).
     #[serde(default)]
     pub logging: muru_config::PythonLogging,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime_ms: Option<u64>,
+    /// The timeouts the host enforces on its workers (section 7.6).
+    #[serde(default)]
+    pub timeouts: WorkerTimeouts,
+}
+
+/// The timeouts a host enforces on its workers (section 7.6), in
+/// milliseconds; the defaults are those of appendix C.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerTimeouts {
+    /// How long a request may run before its worker is replaced; off
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout_ms: Option<u64>,
+    /// How long a replaced worker gets to finish its other requests.
+    #[serde(default = "default_hard_drain_grace_ms")]
+    pub hard_drain_grace_ms: u64,
+    /// How long a worker told to stop gets before it is killed.
+    #[serde(default = "default_shutdown_timeout_ms")]
+    pub shutdown_timeout_ms: u64,
+}
+
+impl Default for WorkerTimeouts {
+    fn default() -> Self {
+        Self {
+            hard_timeout_ms: None,
+            hard_drain_grace_ms: default_hard_drain_grace_ms(),
+            shutdown_timeout_ms: default_shutdown_timeout_ms(),
+        }
+    }
+}
+
+fn default_hard_drain_grace_ms() -> u64 {
+    10_000
+}
+
+fn default_shutdown_timeout_ms() -> u64 {
+    5_000
 }
 
 /// A release record: its spec, where it is in section 9.1, and why.

@@ -24,17 +24,29 @@ writes to the file named with --log-file: SIGUSR1 opens it again by name
 after an external rotation (section 11.3), and SIGUSR2 passes SIGUSR1 on
 to every worker, whose on_reopen_logs hook handles the application's own
 files.
+
+Each worker reports to the host once a second over a pipe: requests in
+flight, the age of the oldest, and requests served. From those the host
+enforces the hard timeout of section 7.6 and the recycling of section
+7.7: a worker past its limit is replaced by a fresh one on a new socket,
+and the supervisor (the daemon, or `muructl run`) learns the new socket
+over the host's control socket, named with --control, so the edge routes
+to it before the old worker is told to stop.
 """
 
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import gc
 import importlib
 import inspect
+import json
 import os
+import random
 import selectors
 import signal
+import socket
 import sys
 import time
 import traceback
@@ -53,6 +65,15 @@ WSGIApplication = Callable[..., Any]
 
 SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
+
+# How long a replacement waits for the supervisor to say the edge routes
+# to the new worker before the old one is told to stop regardless.
+
+ACK_TIMEOUT_SECONDS = 5.0
+
+# How often the supervision loop runs when timeouts or recycling are on.
+
+TICK_SECONDS = 0.5
 
 # A worker exiting with an error this soon after its fork failed to start.
 
@@ -325,6 +346,47 @@ class Group:
         return cls(name, processes, threads, sync_threads, concurrency)
 
 
+@dataclass
+class WorkerState:
+    """What the host knows about one worker from its reports."""
+
+    index: int
+    pid: int
+    generation: int
+    path: str
+    started_at: float
+    report_fd: int
+    requests: int = 0
+    in_flight: int = 0
+    oldest_ms: int = 0
+    ready: bool = False
+
+    # The request count and the time at which this worker is recycled,
+    # jittered so workers do not all go at once, and whether it is the
+    # old one of a replacement.
+
+    recycle_after_requests: int | None = None
+    recycle_at: float | None = None
+    replaced: bool = False
+
+
+@dataclass
+class Replacement:
+    """A worker being replaced by a fresh one (sections 7.6 and 7.7)."""
+
+    index: int
+    old_pid: int
+    reason: str
+    kind: str  # worker.recycled or worker.timeout_killed
+    new_pid: int | None = None
+    announced: int | None = None
+    announced_at: float | None = None
+    terminate_at: float | None = None
+    terminated: bool = False
+    kill_at: float | None = None
+    killed: bool = False
+
+
 class Host:
     """Preload once, fork workers, and keep them running until told to stop."""
 
@@ -341,6 +403,12 @@ class Host:
         groups: list[Group] | None = None,
         mounts: list[Mount] | None = None,
         log_file: str | None = None,
+        control: str | None = None,
+        max_requests: int | None = None,
+        max_lifetime: float | None = None,
+        hard_timeout: float | None = None,
+        hard_drain_grace: float = 10.0,
+        shutdown_timeout: float = 5.0,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
@@ -351,6 +419,11 @@ class Host:
         self.threads = threads
         self.sync_threads = sync_threads
         self.concurrency = concurrency
+        self.max_requests = max_requests
+        self.max_lifetime = max_lifetime
+        self.hard_timeout = hard_timeout
+        self.hard_drain_grace = hard_drain_grace
+        self.shutdown_timeout = shutdown_timeout
 
         # Workers are numbered across the groups in the order they are
         # forked: the default group first, then each named group, each
@@ -381,24 +454,77 @@ class Host:
         self.selector = selectors.DefaultSelector()
         self.outputs: dict[int, WorkerOutput] = {}
 
+        # Sections 7.6 and 7.7: each worker's state from its reports, the
+        # generation of each index's socket (a replacement takes the
+        # next), the socket the edge should route each index to (None
+        # while a worker is out of routing), and the replacements under
+        # way.
+
+        self.states: dict[int, WorkerState] = {}
+        self.reports: dict[int, int] = {}
+        self.generation: dict[int, int] = {}
+        self.routed: dict[int, str | None] = {}
+        self.replacing: dict[int, Replacement] = {}
+
+        # Section 5.9: the control socket the supervisor connects to, on
+        # which the host announces its worker sockets as they change and
+        # the supervisor acknowledges each announcement once the edge
+        # routes by it.
+
+        self.control_path = control
+        self.control_listener: socket.socket | None = None
+        self.supervisor: socket.socket | None = None
+        self.supervisor_buffer = b""
+        self.version = 0
+        self.acked = 0
+
+        if control is not None:
+            try:
+                os.unlink(control)
+            except OSError:
+                pass
+
+            self.control_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.control_listener.bind(control)
+            self.control_listener.listen(2)
+            self.control_listener.setblocking(False)
+
+    @property
+    def policies(self) -> bool:
+        """Whether any timeout or recycling policy is on."""
+
+        return (
+            self.max_requests is not None
+            or self.max_lifetime is not None
+            or self.hard_timeout is not None
+        )
+
     def socket_path(self, index: int) -> str:
         """Return the Unix socket path, or the TCP address, a worker listens on.
 
         A named group's sockets carry its name, so the daemon can tell
-        them apart; the default group's are numbered plainly.
+        them apart; the default group's are numbered plainly. A
+        replacement's socket carries its generation, so it never collides
+        with the socket of the worker it replaces.
         """
 
         if self.tcp_base_port is not None:
             return f"127.0.0.1:{self.tcp_base_port + index}"
 
         group, within = self.placement[index]
+        generation = self.generation.get(index, 0)
+        suffix = f"-g{generation}" if generation else ""
         if group.name == "default":
-            return os.path.join(self.socket_dir, f"worker-{within}.sock")
+            return os.path.join(self.socket_dir, f"worker-{within}{suffix}.sock")
 
-        return os.path.join(self.socket_dir, f"worker-{group.name}-{within}.sock")
+        return os.path.join(self.socket_dir, f"worker-{group.name}-{within}{suffix}.sock")
 
-    def spawn(self, index: int) -> None:
-        """Fork one worker. The parent returns at once; the child never returns."""
+    def spawn(self, index: int, replacing: bool = False) -> int:
+        """Fork one worker and return its pid. The child never returns.
+
+        A worker that is not a replacement is routed to at once; a
+        replacement enters routing when its first report arrives.
+        """
 
         if not self.forked_before:
             self.forked_before = True
@@ -422,6 +548,12 @@ class Host:
         out_read, out_write = os.pipe()
         err_read, err_write = os.pipe()
 
+        # Sections 7.6 and 7.7: the worker reports to the host on a pipe
+        # of its own.
+
+        report_read, report_write = os.pipe()
+        path = self.socket_path(index)
+
         # Section 6.2: freeze before every fork so the collector in the
         # worker never touches the objects it inherited.
 
@@ -434,10 +566,22 @@ class Host:
             try:
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
-                for fd in (out_read, out_write, err_read, err_write, *self.outputs):
+                inherited = (
+                    out_read,
+                    out_write,
+                    err_read,
+                    err_write,
+                    report_read,
+                    *self.outputs,
+                    *self.reports,
+                )
+                for fd in inherited:
                     os.close(fd)
                 os.close(self.lifeline_write)
-                status = self.worker(index, lifeline=self.lifeline_read)
+                self.close_control()
+                status = self.worker(
+                    index, lifeline=self.lifeline_read, report=report_write, path=path
+                )
             except BaseException:
                 traceback.print_exc()
             finally:
@@ -445,26 +589,64 @@ class Host:
 
         os.close(out_write)
         os.close(err_write)
+        os.close(report_write)
 
         for fd, stream in ((out_read, "stdout"), (err_read, "stderr")):
             os.set_blocking(fd, False)
             self.outputs[fd] = WorkerOutput(index, stream, fd)
             self.selector.register(fd, selectors.EVENT_READ)
 
-        self.workers[pid] = index
-        self.spawned_at[pid] = time.monotonic()
-        log(f"worker {index} started as pid {pid}")
+        os.set_blocking(report_read, False)
+        self.reports[report_read] = pid
+        self.selector.register(report_read, selectors.EVENT_READ)
 
-    def worker(self, index: int, lifeline: int | None = None) -> int:
+        now = time.monotonic()
+        state = WorkerState(index, pid, self.generation.get(index, 0), path, now, report_read)
+
+        if self.max_requests is not None:
+            state.recycle_after_requests = self.max_requests + random.randint(
+                0, self.max_requests // 10
+            )
+
+        if self.max_lifetime is not None:
+            state.recycle_at = now + self.max_lifetime * random.uniform(1.0, 1.1)
+
+        self.states[pid] = state
+        self.workers[pid] = index
+        self.spawned_at[pid] = now
+
+        if not replacing:
+            self.routed[index] = path
+
+        self.emit("worker.started", "info", f"worker {index} started as pid {pid}")
+        return pid
+
+    def worker(
+        self,
+        index: int,
+        lifeline: int | None = None,
+        report: int | None = None,
+        path: str | None = None,
+    ) -> int:
         """Run a worker: enable collection, run the hooks, then serve until the server stops.
 
         `lifeline` is the read end of the host's pipe, which the server
-        watches so the worker stops when the host is gone.
+        watches so the worker stops when the host is gone; `report` the
+        write end of the pipe its status lines go to; `path` the socket
+        to serve on, else the index's current one.
         """
 
         global _in_worker
         _in_worker = True
         gc.enable()
+
+        # Section 11.7: faulthandler is on in every worker, and SIGQUIT
+        # writes every thread's stack to the worker's standard error (the
+        # host relays it into the log), which the host uses before it
+        # stops a worker past the hard timeout, since no GIL is needed.
+
+        faulthandler.enable(all_threads=True)
+        faulthandler.register(signal.SIGQUIT, all_threads=True, chain=False)
 
         # The host's handlers and wake-up pipe belong to the host; the native
         # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
@@ -585,7 +767,7 @@ class Host:
 
         try:
             _native.serve(
-                self.socket_path(index),
+                path or self.socket_path(index),
                 app,
                 group.threads if loop is None else 1,
                 # Section 6.5: False only for a single-process development run.
@@ -595,6 +777,7 @@ class Host:
                 on_reopen_logs=lambda: hooks.call_logged("on_reopen_logs", context),
                 lifeline=lifeline,
                 mounts=served_mounts,
+                report=report,
                 **asgi_arguments,
             )
         except Exception as error:
@@ -642,11 +825,21 @@ class Host:
         except OSError:
             pass
 
+        if self.control_listener is not None:
+            selector.register(self.control_listener, selectors.EVENT_READ)
+
         for index in range(self.worker_count):
             self.spawn(index)
 
+        self.announce()
+
         while True:
-            timeout = 0.1 if self.restart_after else None
+            if self.restart_after:
+                timeout: float | None = 0.1
+            elif self.policies or self.replacing:
+                timeout = TICK_SECONDS
+            else:
+                timeout = None
 
             for key, _events in selector.select(timeout):
                 if key.fd == wake_read:
@@ -660,18 +853,321 @@ class Host:
                         watch_stdin = False
                 elif key.fd in self.outputs:
                     self.read_output(key.fd)
+                elif key.fd in self.reports:
+                    self.read_report(key.fd)
+                elif self.control_listener is not None and key.fileobj is self.control_listener:
+                    self.accept_supervisor()
+                elif self.supervisor is not None and key.fileobj is self.supervisor:
+                    self.read_supervisor()
 
             self.reap()
             self.reopen_if_requested()
             if self.stopping:
                 break
             self.restart_due()
+            self.tick()
 
         self.terminate_all()
         for fd in list(self.outputs):
             self.read_output(fd, until_closed=True)
         signal.set_wakeup_fd(-1)
         return 1 if self.failed else 0
+
+    # Section 5.9: the control connection to the supervisor.
+
+    def accept_supervisor(self) -> None:
+        """Take a new supervisor connection and tell it the worker sockets.
+
+        A new connection replaces any earlier one.
+        """
+
+        assert self.control_listener is not None
+
+        try:
+            connection, _ = self.control_listener.accept()
+        except OSError:
+            return
+
+        self.drop_supervisor()
+        connection.setblocking(False)
+        self.supervisor = connection
+        self.supervisor_buffer = b""
+        self.selector.register(connection, selectors.EVENT_READ)
+        self.send_to_supervisor(self.workers_message())
+
+    def drop_supervisor(self) -> None:
+        """Close the supervisor connection, if there is one."""
+
+        if self.supervisor is None:
+            return
+
+        try:
+            self.selector.unregister(self.supervisor)
+        except (KeyError, ValueError):
+            pass
+
+        self.supervisor.close()
+        self.supervisor = None
+
+    def close_control(self) -> None:
+        """Close the control sockets, in a worker after fork."""
+
+        if self.control_listener is not None:
+            self.control_listener.close()
+
+        if self.supervisor is not None:
+            self.supervisor.close()
+
+    def read_supervisor(self) -> None:
+        """Read the supervisor's acknowledgements."""
+
+        assert self.supervisor is not None
+
+        try:
+            data = self.supervisor.recv(READ_SIZE)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if not data:
+            self.drop_supervisor()
+            return
+
+        self.supervisor_buffer += data
+
+        while b"\n" in self.supervisor_buffer:
+            line, _, self.supervisor_buffer = self.supervisor_buffer.partition(b"\n")
+
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+
+            if message.get("type") == "applied":
+                self.acked = max(self.acked, int(message.get("version", 0)))
+
+    def send_to_supervisor(self, message: dict[str, Any]) -> None:
+        """Send one message as a JSON line, dropping the connection if that fails."""
+
+        if self.supervisor is None:
+            return
+
+        try:
+            self.supervisor.sendall(json.dumps(message).encode() + b"\n")
+        except OSError:
+            self.drop_supervisor()
+
+    def workers_message(self) -> dict[str, Any]:
+        """Build the announcement of the sockets the edge should route to, by group."""
+
+        by_group: dict[str, list[str]] = {}
+
+        for index, (placed, _within) in enumerate(self.placement):
+            path = self.routed.get(index)
+
+            if path is not None:
+                by_group.setdefault(placed.name, []).append(path)
+
+        return {
+            "type": "workers",
+            "version": self.version,
+            "sockets": by_group.get("default", []),
+            "groups": [
+                {"name": group.name, "sockets": by_group.get(group.name, [])}
+                for group in self.groups
+                if group.name != "default"
+            ],
+        }
+
+    def announce(self) -> int:
+        """Tell the supervisor the worker sockets changed; return the version."""
+
+        self.version += 1
+        self.send_to_supervisor(self.workers_message())
+        return self.version
+
+    def emit(self, kind: str, level: str, message: str) -> None:
+        """Log a worker event and pass it to the supervisor."""
+
+        log(message)
+        self.send_to_supervisor({"type": "event", "kind": kind, "level": level, "message": message})
+
+    # Sections 7.6 and 7.7: reports, policies and replacements.
+
+    def read_report(self, fd: int) -> None:
+        """Take a worker's status lines; close the pipe at end of file."""
+
+        pid = self.reports[fd]
+        state = self.states.get(pid)
+
+        try:
+            data = os.read(fd, READ_SIZE)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if not data:
+            self.selector.unregister(fd)
+            os.close(fd)
+            del self.reports[fd]
+            return
+
+        if state is None:
+            return
+
+        for line in data.splitlines():
+            try:
+                report = json.loads(line)
+            except ValueError:
+                continue
+
+            state.requests = int(report.get("requests", state.requests))
+            state.in_flight = int(report.get("in_flight", state.in_flight))
+            state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
+
+        if not state.ready:
+            state.ready = True
+            self.worker_ready(state)
+
+        self.check_requests(state)
+
+    def worker_ready(self, state: WorkerState) -> None:
+        """Note that a worker listens; a replacement enters routing and is announced."""
+
+        self.emit("worker.ready", "info", f"worker {state.index} (pid {state.pid}) is ready")
+        self.start_failures[state.index] = 0
+        replacement = self.replacing.get(state.index)
+
+        if replacement is not None and replacement.new_pid == state.pid:
+            self.routed[state.index] = state.path
+            replacement.announced = self.announce()
+            replacement.announced_at = time.monotonic()
+
+    def check_requests(self, state: WorkerState) -> None:
+        """Replace a worker that has served its share of requests."""
+
+        if state.replaced or state.index in self.replacing:
+            return
+
+        if (
+            state.recycle_after_requests is not None
+            and state.requests >= state.recycle_after_requests
+        ):
+            self.replace(
+                state,
+                f"served {state.requests} requests (max_requests {self.max_requests})",
+                "worker.recycled",
+            )
+
+    def tick(self) -> None:
+        """Apply the lifetime and hard timeout policies and advance replacements."""
+
+        now = time.monotonic()
+
+        for state in list(self.states.values()):
+            if state.replaced or state.index in self.replacing or not state.ready:
+                continue
+
+            if self.hard_timeout is not None and state.oldest_ms > self.hard_timeout * 1000:
+                self.replace(
+                    state,
+                    f"a request has run for {state.oldest_ms / 1000:.1f} s, past the hard "
+                    f"timeout of {self.hard_timeout:g} s",
+                    "worker.timeout_killed",
+                )
+            elif state.recycle_at is not None and now >= state.recycle_at:
+                self.replace(
+                    state,
+                    f"lived {now - state.started_at:.0f} s (max_lifetime {self.max_lifetime:g} s)",
+                    "worker.recycled",
+                )
+
+        for replacement in list(self.replacing.values()):
+            self.advance(replacement, now)
+
+    def replace(self, state: WorkerState, reason: str, kind: str) -> None:
+        """Start replacing a worker with a fresh one on a new socket.
+
+        For a hard timeout the old worker leaves routing at once and its
+        stacks are recorded.
+        """
+
+        if self.control_listener is None:
+            if not getattr(self, "_warned_no_control", False):
+                self._warned_no_control = True
+                log("no control socket, so workers cannot be replaced; the policy is ignored")
+
+            return
+
+        index = state.index
+
+        # A replacement that keeps failing to start is not tried again;
+        # the worker it was to replace keeps serving.
+
+        if self.start_failures.get(index, 0) >= MAX_START_FAILURES:
+            return
+
+        state.replaced = True
+        self.generation[index] = self.generation.get(index, 0) + 1
+        replacement = Replacement(index, state.pid, reason, kind)
+        self.replacing[index] = replacement
+        hard = kind == "worker.timeout_killed"
+        log(f"worker {index} (pid {state.pid}) {reason}; replacing it")
+
+        if hard:
+            self.routed[index] = None
+            self.announce()
+
+            try:
+                os.kill(state.pid, signal.SIGQUIT)
+            except ProcessLookupError:
+                pass
+
+            replacement.terminate_at = time.monotonic() + self.hard_drain_grace
+
+        replacement.new_pid = self.spawn(index, replacing=True)
+
+    def advance(self, replacement: Replacement, now: float) -> None:
+        """Move a replacement along.
+
+        Once the edge routes to the new worker (or the wait for that word
+        is up), the old one is told to stop, and killed if it does not.
+        """
+
+        if replacement.announced is not None and replacement.terminate_at is None:
+            acknowledged = self.acked >= replacement.announced
+            waited = now >= (replacement.announced_at or now) + ACK_TIMEOUT_SECONDS
+
+            if acknowledged or waited:
+                replacement.terminate_at = now
+
+        if (
+            replacement.terminate_at is not None
+            and not replacement.terminated
+            and now >= replacement.terminate_at
+        ):
+            replacement.terminated = True
+            replacement.kill_at = now + self.shutdown_timeout
+            self.signal(replacement.old_pid, signal.SIGTERM)
+
+        if (
+            replacement.kill_at is not None
+            and not replacement.killed
+            and now >= replacement.kill_at
+        ):
+            replacement.killed = True
+            log(f"worker {replacement.index} (pid {replacement.old_pid}) did not stop, killing")
+            self.signal(replacement.old_pid, signal.SIGKILL)
+
+    def signal(self, pid: int, signum: int) -> None:
+        """Send a signal to a worker that may already be gone."""
+
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
 
     def reopen_if_requested(self) -> None:
         """Carry out what SIGUSR1 and SIGUSR2 asked for, outside the handlers."""
@@ -753,8 +1249,43 @@ class Host:
             if index is None:
                 continue
             spawned_at = self.spawned_at.pop(pid, 0.0)
+            self.states.pop(pid, None)
             if self.stopping:
                 continue
+
+            # The old worker of a replacement is done with: its event
+            # says why it went, and nothing restarts it.
+
+            replacement = self.replacing.get(index)
+
+            if replacement is not None and replacement.old_pid == pid:
+                del self.replacing[index]
+                level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
+                self.emit(
+                    replacement.kind,
+                    level,
+                    f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
+                    f"{replacement.reason}",
+                )
+                continue
+
+            # A replacement that died before it took over leaves the old
+            # worker serving; it is tried again as a restart would be.
+
+            if replacement is not None and replacement.new_pid == pid:
+                del self.replacing[index]
+                old = self.states.get(replacement.old_pid)
+
+                if replacement.announced is None and old is not None:
+                    old.replaced = False
+                    self.start_failures[index] = self.start_failures.get(index, 0) + 1
+                    self.emit(
+                        "worker.exited",
+                        "error",
+                        f"worker {index} replacement (pid {pid}) exited with "
+                        f"{describe(status)} before it was ready; pid {old.pid} keeps serving",
+                    )
+                    continue
 
             # A worker that dies at once, again and again, is a release that
             # cannot start (a failing factory or hook): give up rather than
@@ -774,7 +1305,11 @@ class Host:
             else:
                 self.start_failures[index] = 0
 
-            log(f"worker {index} (pid {pid}) exited with {describe(status)}, restarting")
+            self.emit(
+                "worker.exited",
+                "warning",
+                f"worker {index} (pid {pid}) exited with {describe(status)}, restarting",
+            )
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
 
     def restart_due(self) -> None:
@@ -827,11 +1362,24 @@ class Host:
         self.workers.clear()
 
         if self.tcp_base_port is None:
-            for index in range(self.worker_count):
+            paths = {self.socket_path(index) for index in range(self.worker_count)}
+            paths.update(state.path for state in self.states.values())
+
+            for path in paths:
                 try:
-                    os.unlink(self.socket_path(index))
+                    os.unlink(path)
                 except OSError:
                     pass
+
+        self.drop_supervisor()
+
+        if self.control_listener is not None:
+            self.control_listener.close()
+
+            try:
+                os.unlink(self.control_path or "")
+            except OSError:
+                pass
 
 
 def describe(status: int) -> str:
@@ -960,6 +1508,47 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=parse_logger_level,
         metavar="NAME=LEVEL",
         help="a named logger's level",
+    )
+    parser.add_argument(
+        "--control",
+        default=None,
+        metavar="PATH",
+        help="the Unix socket the supervisor connects to for worker sockets and events",
+    )
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        metavar="N",
+        help="replace a worker after this many requests, with jitter (section 7.7)",
+    )
+    parser.add_argument(
+        "--max-lifetime",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="replace a worker after this long, with jitter (section 7.7)",
+    )
+    parser.add_argument(
+        "--hard-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="replace a worker whose request has run this long (section 7.6)",
+    )
+    parser.add_argument(
+        "--hard-drain-grace",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long a replaced worker gets to finish its other requests",
+    )
+    parser.add_argument(
+        "--shutdown-timeout",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="how long a worker told to stop gets before it is killed",
     )
     return parser.parse_args(argv)
 
@@ -1103,6 +1692,12 @@ def main(argv: list[str] | None = None) -> int:
         groups=args.group,
         mounts=mounts,
         log_file=args.log_file,
+        control=args.control,
+        max_requests=args.max_requests,
+        max_lifetime=args.max_lifetime,
+        hard_timeout=args.hard_timeout,
+        hard_drain_grace=args.hard_drain_grace,
+        shutdown_timeout=args.shutdown_timeout,
     )
 
     if args.single:

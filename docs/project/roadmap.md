@@ -129,5 +129,17 @@ sockets, gives it the snapshot and tells the old edge to stop accepting,
 finish its connections and exit, under load with zero failed requests
 (each edge's sockets are numbered by generation so a replacement never
 collides with the edge it replaces, and a respawned edge is recorded so
-the next daemon re-adopts it). Next from phase 2: hard timeouts and
+the next daemon re-adopts it). Worker replacement (sections 7.6 and 7.7)
+has its first slice: each worker reports to its host once a second over
+a pipe (requests served, in flight and the age of the oldest), the host
+serves a control socket on which it announces its worker sockets as they
+change and receives the supervisor's acknowledgement, and the daemon and
+`muructl run` re-point the edge from those announcements, so a worker
+past `max_requests` or `max_lifetime` (both with jitter) is replaced by a
+fresh one on a new socket with no request failed, and a worker whose
+request runs past the hard timeout leaves routing at once, has every
+thread's stack written to the log by faulthandler, is replaced, and is
+stopped after `hard_drain_grace` and killed after `shutdown_timeout`,
+all recorded as `worker.*` events (memory limits, max_surge, per-group
+settings and the request id on records later). Next from phase 2:
 memory policy, then worker inspection.

@@ -7,10 +7,152 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc;
 
 use crate::logs::Logs;
+
+/// What a host says over its control connection (section 5.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostMessage {
+    /// The sockets the edge should route to now: the default group's,
+    /// and each named group's. Acknowledged by version once the edge
+    /// routes by them.
+    Workers {
+        /// The announcement's number, which the acknowledgement names.
+        version: u64,
+        /// The default group's sockets.
+        sockets: Vec<PathBuf>,
+        /// Each named group's sockets.
+        groups: Vec<(String, Vec<PathBuf>)>,
+    },
+    /// An event about a worker, for the event log.
+    Event {
+        /// The event type, such as worker.recycled.
+        kind: String,
+        /// The level: info, warning or error.
+        level: String,
+        /// What happened.
+        message: String,
+    },
+}
+
+impl HostMessage {
+    /// Parse one line of the control connection, or none for a line
+    /// this version does not know.
+    fn parse(line: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let strings = |key: &str| -> Vec<PathBuf> {
+            value[key]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        match value["type"].as_str()? {
+            "workers" => Some(Self::Workers {
+                version: value["version"].as_u64().unwrap_or(0),
+                sockets: strings("sockets"),
+                groups: value["groups"]
+                    .as_array()
+                    .map(|groups| {
+                        groups
+                            .iter()
+                            .filter_map(|group| {
+                                let name = group["name"].as_str()?.to_owned();
+                                let sockets = group["sockets"]
+                                    .as_array()?
+                                    .iter()
+                                    .filter_map(|item| item.as_str().map(PathBuf::from))
+                                    .collect();
+                                Some((name, sockets))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+            "event" => Some(Self::Event {
+                kind: value["kind"].as_str().unwrap_or("worker.event").to_owned(),
+                level: value["level"].as_str().unwrap_or("info").to_owned(),
+                message: value["message"].as_str().unwrap_or_default().to_owned(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The supervisor's side of a host's control connection: what the host
+/// sends arrives on the receiver, and acknowledgements go back.
+pub struct HostControl {
+    outgoing: mpsc::UnboundedSender<String>,
+}
+
+impl HostControl {
+    /// Connect to a host's control socket, trying for a few seconds
+    /// while the host binds it, and deliver what it sends to the
+    /// receiver until the connection ends.
+    pub async fn connect(path: &Path) -> anyhow::Result<(Self, mpsc::Receiver<HostMessage>)> {
+        let started = Instant::now();
+
+        let stream = loop {
+            match tokio::net::UnixStream::connect(path).await {
+                Ok(stream) => break stream,
+                Err(error) if started.elapsed() < Duration::from_secs(5) => {
+                    tracing::debug!(%error, path = %path.display(), "the host control socket is not up yet");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("connecting to {}", path.display()));
+                }
+            }
+        };
+
+        let (read_half, mut write_half) = stream.into_split();
+        let (incoming_tx, incoming_rx) = mpsc::channel(32);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(read_half).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(message) = HostMessage::parse(&line)
+                    && incoming_tx.send(message).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(line) = outgoing_rx.recv().await {
+                if write_half.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((
+            Self {
+                outgoing: outgoing_tx,
+            },
+            incoming_rx,
+        ))
+    }
+
+    /// Tell the host the edge routes by the sockets it announced at
+    /// this version.
+    pub fn acknowledge(&self, version: u64) {
+        let _ = self
+            .outgoing
+            .send(format!("{{\"type\":\"applied\",\"version\":{version}}}\n"));
+    }
+}
 
 /// What every host of a run is started with.
 pub struct HostSpec {
@@ -50,6 +192,17 @@ pub struct HostSpec {
     pub mounts: Vec<HostMount>,
     /// Python logging defaults (section 11.4).
     pub logging: muru_config::PythonLogging,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7).
+    pub max_lifetime: Option<Duration>,
+    /// How long a request may run before its worker is replaced (section
+    /// 7.6); off when absent.
+    pub hard_timeout: Option<Duration>,
+    /// How long a replaced worker gets to finish its other requests.
+    pub hard_drain_grace: Duration,
+    /// How long a worker told to stop gets before it is killed.
+    pub shutdown_timeout: Duration,
 }
 
 /// A named mount, as the host loads it.
@@ -229,6 +382,33 @@ impl HostProcess {
             command.arg("--tcp-base-port").arg(base.to_string());
         }
 
+        // Section 7.6 and 7.7: the host enforces these on its workers and
+        // tells this process about replacements over its control socket.
+
+        command
+            .arg("--control")
+            .arg(run_dir.join("control.sock"))
+            .arg("--hard-drain-grace")
+            .arg(spec.hard_drain_grace.as_secs_f64().to_string())
+            .arg("--shutdown-timeout")
+            .arg(spec.shutdown_timeout.as_secs_f64().to_string());
+
+        if let Some(count) = spec.max_requests {
+            command.arg("--max-requests").arg(count.to_string());
+        }
+
+        if let Some(lifetime) = spec.max_lifetime {
+            command
+                .arg("--max-lifetime")
+                .arg(lifetime.as_secs_f64().to_string());
+        }
+
+        if let Some(timeout) = spec.hard_timeout {
+            command
+                .arg("--hard-timeout")
+                .arg(timeout.as_secs_f64().to_string());
+        }
+
         if let Some(dir) = &spec.chdir {
             command.current_dir(dir);
         }
@@ -348,6 +528,12 @@ impl HostProcess {
     /// The release run directory.
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
+    }
+
+    /// Where the host serves its control connection (section 5.9): the
+    /// worker sockets as they change, and events about its workers.
+    pub fn control_path(&self) -> PathBuf {
+        self.run_dir.join("control.sock")
     }
 
     /// Wait until every worker listens, or the host exits or the time is up.

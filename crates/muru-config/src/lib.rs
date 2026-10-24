@@ -303,6 +303,37 @@ pub struct Release {
     /// Logging defaults (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
+    /// Requests a worker serves before it is replaced (section 7.7),
+    /// with jitter; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7), for
+    /// example 1h, with jitter; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<String>,
+    /// The timeouts the host enforces on its workers (section 7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<Timeouts>,
+}
+
+/// The `[timeouts]` table of a release or a `[tool.muru]` table (section
+/// 7.6): the timeouts the host enforces on its workers. The edge's own
+/// timeouts are the daemon's `[limits]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Timeouts {
+    /// How long a request may run in a worker before the worker is
+    /// replaced, for example 60s; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout: Option<String>,
+    /// How long a worker being replaced is given to finish its other
+    /// requests before it is told to stop (default 10s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_drain_grace: Option<String>,
+    /// How long a worker told to stop is given before it is killed
+    /// (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -722,6 +753,15 @@ pub struct ToolMuru {
     /// Logging defaults (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<String>,
+    /// The timeouts the host enforces on its workers (section 7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<Timeouts>,
 }
 
 /// Why a project's configuration could not be read.

@@ -43,11 +43,13 @@ fn version() -> &'static str {
 /// `mounts` are the named mounts (section 6.7) as (name, application,
 /// runner) tuples, the runner None for a WSGI mount; `event_loop` is
 /// needed when any mount is ASGI, `runner` when the default one is.
+/// `report` is a descriptor the worker writes a status line to every
+/// second, for the host's timeouts and recycling (sections 7.6 and 7.7).
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new()))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -62,6 +64,7 @@ fn serve(
     on_reopen_logs: Option<Py<PyAny>>,
     lifeline: Option<i32>,
     mounts: Vec<(String, Py<PyAny>, Option<Py<PyAny>>)>,
+    report: Option<i32>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -103,6 +106,7 @@ fn serve(
         on_exit,
         on_reopen_logs,
         lifeline,
+        report,
     };
 
     py.detach(move || link::serve(&socket_path, shared, lifecycle))

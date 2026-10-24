@@ -19,6 +19,7 @@ def serve(
     on_reopen_logs: Callable[[], Any] | None = None,
     lifeline: int | None = None,
     mounts: list[tuple[str, Callable[..., Any], Callable[[Any, Channel], None] | None]] = [],
+    report: int | None = None,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 

@@ -123,6 +123,11 @@ message DeployRequest {
   string release = 14;              // a chosen release id, else generated
   bool wait = 15;                   // return once the release serves, or fails
   optional uint64 retain_ms = 16;   // how long the superseded release stays warm; default 30 minutes, 0 to stop it
+  optional uint64 max_requests = 17;        // requests a worker serves before it is replaced (section 7.7)
+  optional uint64 max_lifetime_ms = 18;     // how long a worker lives before it is replaced
+  optional uint64 hard_timeout_ms = 19;     // how long a request may run before its worker is replaced (section 7.6)
+  optional uint64 hard_drain_grace_ms = 20; // how long a replaced worker gets to finish its other requests
+  optional uint64 shutdown_timeout_ms = 21; // how long a worker told to stop gets before it is killed
 }
 
 message ListReleasesRequest {

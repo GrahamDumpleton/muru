@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -60,6 +61,10 @@ pub struct Shared {
     pub pool: Pool,
     in_flight: AtomicU32,
     total: AtomicU64,
+    next_id: AtomicU64,
+    /// When each request in flight started, by id, for the host's hard
+    /// timeout (section 7.6).
+    active: Mutex<HashMap<u64, Instant>>,
 }
 
 impl Shared {
@@ -83,6 +88,8 @@ impl Shared {
             pool: Pool::start(threads)?,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
+            next_id: AtomicU64::new(1),
+            active: Mutex::new(HashMap::new()),
         })
     }
 
@@ -103,20 +110,48 @@ impl Shared {
             .map(|mount| Python::attach(|py| mount.clone_ref(py)))
     }
 
-    /// Count a request as started.
-    pub fn request_started(&self) {
+    /// Count a request as started, returning its id for when it finishes.
+    pub fn request_started(&self) -> u64 {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .insert(id, Instant::now());
+        id
     }
 
     /// Count a request as finished.
-    pub fn request_finished(&self) {
+    pub fn request_finished(&self, id: u64) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .remove(&id);
     }
 
     /// Requests started and not yet finished.
     pub fn in_flight(&self) -> u32 {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Requests started since the worker began.
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// How long the longest-running request in flight has been running,
+    /// in milliseconds; zero with none in flight.
+    pub fn oldest_ms(&self) -> u64 {
+        let now = Instant::now();
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+            .map(|started| now.saturating_duration_since(*started).as_millis() as u64)
+            .max()
+            .unwrap_or(0)
     }
 }
 

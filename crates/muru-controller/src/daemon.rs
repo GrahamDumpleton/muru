@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
+use crate::host::{HostControl, HostMessage};
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
@@ -156,6 +157,24 @@ pub enum Command {
         /// re-executes, or why it will not.
         done: oneshot::Sender<Result<Upgrade, String>>,
     },
+    /// A host's control connection is up (section 5.9).
+    HostAttached {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The connection, for acknowledgements.
+        control: HostControl,
+    },
+    /// A host said something over its control connection.
+    HostMessage {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// What it said.
+        message: HostMessage,
+    },
 }
 
 /// What a previous daemon left behind about its edge, for re-adoption
@@ -244,6 +263,8 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// The host's control connection, once it is up.
+    control: Option<HostControl>,
 }
 
 /// The daemon's state while it runs.
@@ -266,6 +287,9 @@ struct Daemon {
     /// Whether this process writes to the daemon log file, as a daemon
     /// started in the background does, so a reopen applies to it too.
     owns_log: bool,
+    /// Where the hosts' control messages are sent, into the same inbox
+    /// as the commands.
+    commands: mpsc::Sender<Command>,
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -374,7 +398,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     // The admin API on its socket.
 
-    let (commands, mut inbox) = mpsc::channel::<Command>(16);
+    let (commands, mut inbox) = mpsc::channel::<Command>(64);
+    let handle_commands = commands.clone();
     let info = Arc::new(Info {
         locations: locations.clone(),
         listeners: listeners.clone(),
@@ -464,6 +489,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         serving: HashMap::new(),
         default_app: None,
         owns_log,
+        commands: handle_commands,
     };
     daemon.restore().await;
 
@@ -1148,8 +1174,10 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        control: None,
                     },
                 );
+                self.attach_control(app, id);
                 self.events.emit(
                     "release.adopted",
                     &format!("{app}@{id}"),
@@ -1207,6 +1235,14 @@ impl Daemon {
             }
             Command::Dashboard { done } => {
                 let _ = done.send(self.dashboard_data().await);
+            }
+            Command::HostAttached { app, id, control } => {
+                if let Some(running) = self.running.get_mut(&(app, id)) {
+                    running.control = Some(control);
+                }
+            }
+            Command::HostMessage { app, id, message } => {
+                self.host_message(&app, &id, message).await;
             }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
@@ -1329,6 +1365,11 @@ impl Daemon {
             single: false,
             detach_to: Some(self.host_log(app, id)),
             logging: spec.logging.clone(),
+            max_requests: spec.max_requests,
+            max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
+            hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
+            hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
+            shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
             groups: spec
                 .groups
                 .iter()
@@ -1406,8 +1447,10 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                control: None,
             },
         );
+        self.attach_control(app, id);
         self.set_state(&release, ReleaseState::Ready, "");
         self.events.emit(
             "release.ready",
@@ -1825,6 +1868,125 @@ impl Daemon {
             Err(error) => {
                 self.events
                     .emit("edge.failed", "edge", "error", &format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Section 5.9: connect to a running host's control socket in the
+    /// background and feed what it says into the daemon's inbox.
+    fn attach_control(&self, app: &str, id: &str) {
+        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+            return;
+        };
+        let path = running.host.control_path();
+        let commands = self.commands.clone();
+        let (app, id) = (app.to_owned(), id.to_owned());
+
+        tokio::spawn(async move {
+            let (control, mut messages) = match HostControl::connect(&path).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    tracing::info!(%error, "release {app}@{id}: no host control connection");
+                    return;
+                }
+            };
+
+            if commands
+                .send(Command::HostAttached {
+                    app: app.clone(),
+                    id: id.clone(),
+                    control,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            while let Some(message) = messages.recv().await {
+                let sent = commands
+                    .send(Command::HostMessage {
+                        app: app.clone(),
+                        id: id.clone(),
+                        message,
+                    })
+                    .await;
+
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Act on what a host said: new worker sockets go into the record
+    /// and, when the release serves, into the next snapshot, and are
+    /// acknowledged; events are recorded under the release.
+    async fn host_message(&mut self, app: &str, id: &str, message: HostMessage) {
+        let key = (app.to_owned(), id.to_owned());
+
+        match message {
+            HostMessage::Workers {
+                version,
+                sockets,
+                groups,
+            } => {
+                let Some(running) = self.running.get_mut(&key) else {
+                    return;
+                };
+                running.sockets = sockets;
+
+                for (name, group_sockets) in groups {
+                    if let Some(group) = running.groups.iter_mut().find(|group| group.name == name)
+                    {
+                        group.sockets = group_sockets;
+                    }
+                }
+
+                let mut all = running.sockets.clone();
+
+                for group in &running.groups {
+                    all.extend(group.sockets.iter().cloned());
+                }
+
+                write_record(
+                    &running.host.run_dir().join("..").join("host.toml"),
+                    &HostRecord {
+                        pid: running.host.pid().unwrap_or(0),
+                        sockets: all,
+                        groups: running.groups.clone(),
+                    },
+                );
+
+                if self.serving.get(app) == Some(&id.to_owned())
+                    && let Err(error) = self.push_snapshot().await
+                {
+                    tracing::error!(%error, "pushing the snapshot after a worker change failed");
+                    return;
+                }
+
+                if let Some(control) = self
+                    .running
+                    .get(&key)
+                    .and_then(|running| running.control.as_ref())
+                {
+                    control.acknowledge(version);
+                }
+            }
+            HostMessage::Event {
+                kind,
+                level,
+                message,
+            } => {
+                let level = match level.as_str() {
+                    "error" => "error",
+                    "warning" => "warning",
+                    "notice" => "notice",
+                    _ => "info",
+                };
+
+                self.events
+                    .emit(&kind, &format!("{app}@{id}"), level, &message);
             }
         }
     }
