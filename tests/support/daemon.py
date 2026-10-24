@@ -74,15 +74,17 @@ class Daemon:
         port: int | None = None,
         cafile: Path | None = None,
         server_hostname: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> support.Response:
         """One request, with a Host header and, given a CA file, over TLS.
 
         The TLS connection carries `server_hostname` (else `host`) as SNI
-        and the certificate is checked against it.
+        and the certificate is checked against it. `headers` are sent as
+        given, beside the Host header.
         """
 
         port = port or self.port
-        headers = {"Host": host} if host else {}
+        headers = {**(headers or {}), **({"Host": host} if host else {})}
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
 
         if cafile is not None:
@@ -159,13 +161,15 @@ def start_daemon(
     run_dir: Path | None = None,
     port: int | None = None,
     listeners: list[tuple[int, bool]] | None = None,
+    config_extra: str = "",
 ) -> Daemon:
     """Start a daemon in the foreground with directories under `base`.
 
     With `listeners`, pairs of port and whether it carries TLS, the daemon
-    reads them from a configuration file written under `base`; otherwise
-    it serves plain HTTP on `port`. A second daemon over the same
-    `run_dir` and listeners re-adopts what the first left running.
+    reads them from a configuration file written under `base`, and
+    `config_extra` is appended to that file (the `[proxy]` table, say);
+    otherwise it serves plain HTTP on `port`. A second daemon over the
+    same `run_dir` and listeners re-adopts what the first left running.
     """
 
     muructl = support.muructl_path()
@@ -180,11 +184,12 @@ def start_daemon(
 
     run_dir = run_dir or Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
 
-    if listeners is None:
+    if listeners is None and not config_extra:
         port = port or support.free_port()
         listeners = [(port, False)]
         where = ["--listen", f"127.0.0.1:{port}"]
     else:
+        listeners = listeners or [(port or support.free_port(), False)]
         port = listeners[0][0]
         config = base / "muru.toml"
         config.write_text(
@@ -192,6 +197,7 @@ def start_daemon(
                 f"[[listener]]\naddress = '127.0.0.1:{port}'\n" + ("tls = true\n" if tls else "")
                 for port, tls in listeners
             )
+            + config_extra
         )
         where = ["--config", str(config)]
 

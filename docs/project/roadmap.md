@@ -54,6 +54,11 @@ hosts and TLS are in: several listeners handed to the edge, hosts with
 exact and single-label wildcard names and a default host (421
 otherwise), path-prefix routes to applications, certificates carried in
 the snapshot and chosen by SNI, HTTPS redirects, and SERVER_NAME from
-the matched name (regular expression names, host-level settings and
-trusted proxies later). Next from phase 2: trusted proxies, worker
-groups and mounts, and the metrics and logs.
+the matched name (regular expression names and host-level settings
+later). Trusted proxies follow section 4.7: a `[proxy]` table in the
+daemon's file, nothing trusted by default, forwarding headers removed
+from untrusted peers, the configured types applied from trusted ones
+with recursive chain resolution, and the resolved client, scheme, host,
+port and prefix carried to the worker as typed fields with the original
+peer as `muru.proxy_addr`. Next from phase 2: worker groups and mounts,
+and the metrics and logs.

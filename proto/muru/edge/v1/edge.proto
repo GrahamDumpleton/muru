@@ -29,6 +29,15 @@ message Snapshot {
   repeated Host hosts = 3;
   repeated Route routes = 4;
   repeated AppWorkers apps = 5;
+  Proxy proxy = 6;                      // trusted proxies; nothing trusted when absent
+}
+
+// Section 4.7: which peers may speak for the client, and how.
+message Proxy {
+  repeated string trusted = 1;          // addresses, CIDR ranges, loopback, private, unix
+  repeated string headers = 2;          // header types applied from trusted peers
+  bool recursive = 3;
+  bool consume = 4;                     // remove every forwarding header once applied
 }
 
 // A virtual host (section 4.3).

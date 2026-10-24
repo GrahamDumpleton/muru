@@ -930,6 +930,10 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         muru.set_item("max_body_size", head.max_body_size)?;
     }
 
+    if let Some(proxy) = &head.proxy {
+        muru.set_item("proxy_addr", &proxy.address)?;
+    }
+
     if let Some(tls) = &head.tls {
         let details = PyDict::new(py);
         details.set_item("version", &tls.version)?;

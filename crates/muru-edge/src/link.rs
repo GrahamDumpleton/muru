@@ -401,8 +401,10 @@ impl Drop for Return {
 pub struct Context<'a> {
     /// The request identifier (section 4.19).
     pub request_id: &'a str,
-    /// The client's address.
+    /// The client's address: the peer, or what a trusted proxy forwarded.
     pub peer: SocketAddr,
+    /// The peer that connected, when it was a trusted proxy (section 4.7).
+    pub proxy: Option<SocketAddr>,
     /// The listener's address.
     pub local: SocketAddr,
     /// http, or https when the connection is inside TLS.
@@ -418,6 +420,12 @@ pub struct Context<'a> {
     /// The virtual host name the application sees as SERVER_NAME, when a
     /// host matched (section 4.3).
     pub server_name: Option<String>,
+    /// The host a trusted proxy forwarded, replacing the Host header.
+    pub forwarded_host: Option<String>,
+    /// The port a trusted proxy forwarded, for SERVER_PORT.
+    pub forwarded_port: Option<u16>,
+    /// The path prefix a trusted proxy stripped, for SCRIPT_NAME.
+    pub prefix: Option<String>,
 }
 
 /// The access log record of a request in progress.

@@ -43,6 +43,7 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | `request_id` | The request identifier, also in `X-Request-ID` and the access log |
 | `max_body_size` | The body size limit in force, in bytes |
 | `tls` | Over HTTPS only: a dictionary with `version`, `cipher`, `server_name` and `alpn` |
+| `proxy_addr` | Only when a trusted proxy forwarded the request: the address of the proxy that connected, while `client` is the client it forwarded |
 
 A `websocket` scope also advertises `websocket.http.response`, so the
 application may decline the handshake with a response of its own. No

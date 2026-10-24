@@ -48,6 +48,8 @@ pub struct Config {
     pub listeners: Vec<(SocketAddr, bool)>,
     /// Timeouts and limits for the edge.
     pub limits: muru_edge::Limits,
+    /// Trusted proxies and the headers taken from them (section 4.7).
+    pub proxy: Option<muru_config::Proxy>,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
     /// The executable to spawn edges from, normally the daemon's own.
@@ -169,6 +171,8 @@ struct Daemon {
     edge: EdgeProcess,
     info: Arc<Info>,
     logs: Logs,
+    /// The [proxy] table of the configuration file, for every snapshot.
+    proxy: Option<pb::Proxy>,
     running: HashMap<(String, String), Running>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
@@ -182,6 +186,16 @@ struct Daemon {
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    // A [proxy] table the edge would refuse is refused here, before
+    // anything is bound.
+
+    let proxy = config.proxy.as_ref().map(proxy_message);
+
+    if let Some(proxy) = &proxy {
+        muru_edge::proxy::Trust::from_snapshot(proxy)
+            .map_err(|error| anyhow::anyhow!("[proxy]: {error}"))?;
+    }
+
     let locations = config.locations;
 
     for location in [&locations.state, &locations.run, &locations.logs] {
@@ -311,6 +325,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         edge,
         info,
         logs: Logs::default(),
+        proxy,
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
@@ -366,6 +381,27 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_file(&socket);
     outcome
+}
+
+/// The [proxy] table as the snapshot carries it, with the defaults of
+/// section 4.7 filled in: the four common header types, recursive
+/// resolution, and the configured headers kept.
+fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
+    let headers = if proxy.headers.is_empty() {
+        muru_config::DEFAULT_PROXY_HEADERS
+            .iter()
+            .map(|header| (*header).to_owned())
+            .collect()
+    } else {
+        proxy.headers.clone()
+    };
+
+    pb::Proxy {
+        trusted: proxy.trusted.clone(),
+        headers,
+        recursive: proxy.recursive.unwrap_or(true),
+        consume: proxy.forwarded_headers == Some(muru_config::ForwardedHeaders::Consume),
+    }
 }
 
 /// A host's certificate chain and key as PEM text, for the snapshot.
@@ -835,6 +871,7 @@ impl Daemon {
             hosts,
             routes,
             apps,
+            proxy: self.proxy.clone(),
         }
     }
 

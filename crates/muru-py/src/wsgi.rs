@@ -780,6 +780,13 @@ fn build_environ<'py>(
         environ.set_item(intern!(py, "muru.max_body_size"), head.max_body_size)?;
     }
 
+    // Section 4.7: behind a trusted proxy, REMOTE_ADDR is the resolved
+    // client and the peer that actually connected is kept beside it.
+
+    if let Some(proxy) = &head.proxy {
+        environ.set_item(intern!(py, "muru.proxy_addr"), &proxy.address)?;
+    }
+
     Ok(environ)
 }
 

@@ -32,6 +32,7 @@ use tokio_rustls::TlsAcceptor;
 pub mod access;
 pub mod errors;
 pub mod link;
+pub mod proxy;
 pub mod routing;
 pub mod tls;
 pub mod websocket;
@@ -407,15 +408,32 @@ async fn serve<I>(
     let redirect_to = shared.redirect_to.filter(|_| tls.is_none());
     let state = Arc::clone(&shared);
     let listener = local.to_string();
-    let service = service_fn(move |request: http::Request<Incoming>| {
+    let service = service_fn(move |mut request: http::Request<Incoming>| {
         let shared = Arc::clone(&shared);
         let tls = tls.clone();
         let listener = listener.clone();
         let request_id = shared.request_ids.next();
         async move {
+            // Section 4.7: forwarding headers from a trusted proxy say who
+            // the client is and how it connected; from anyone else they
+            // are removed.
+
+            let routing = shared.pools.current();
+            let forwarded = routing.trust().resolve(&peer, request.headers_mut());
+
+            let scheme: &'static str = match forwarded.scheme.as_deref() {
+                Some("https") => "https",
+                Some("http") => "http",
+                _ => scheme,
+            };
+
+            let secure = tls.is_some() || scheme == "https";
+            let redirect_to = redirect_to.filter(|_| !secure);
+
             let mut context = link::Context {
                 request_id: &request_id,
-                peer,
+                peer: forwarded.client.unwrap_or(peer),
+                proxy: forwarded.client.map(|_| peer),
                 local,
                 scheme,
                 tls: tls.as_deref(),
@@ -423,6 +441,9 @@ async fn serve<I>(
                 access_log: Arc::clone(&shared.access_log),
                 limits: Arc::clone(&shared.limits),
                 server_name: None,
+                forwarded_host: forwarded.host.clone(),
+                forwarded_port: forwarded.port,
+                prefix: forwarded.prefix.clone(),
             };
 
             // Sections 4.3 and 4.5: the host the client asked for and the
@@ -430,17 +451,19 @@ async fn serve<I>(
             // TLS listener there is nowhere to redirect to, so a host's
             // https_redirect is ignored.
 
-            let host = request
-                .headers()
-                .get(HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-                .or_else(|| request.uri().host().map(str::to_owned));
-            let decision = shared.pools.current().select(
+            let host = forwarded.host.clone().or_else(|| {
+                request
+                    .headers()
+                    .get(HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .or_else(|| request.uri().host().map(str::to_owned))
+            });
+            let decision = routing.select(
                 host.as_deref(),
                 request.uri().path(),
                 &listener,
-                tls.is_some() || shared.https_port.is_none(),
+                secure || shared.https_port.is_none(),
             );
 
             let mut response = match (redirect_to, decision) {
@@ -549,14 +572,31 @@ pub(crate) fn request_head(
     let named_in_connection = connection_options(&parts.headers);
 
     // HTTP/2 carries the host in :authority rather than a Host header, and
-    // applications expect HTTP_HOST either way.
+    // applications expect HTTP_HOST either way; a host forwarded by a
+    // trusted proxy replaces what the proxy itself asked for.
 
-    let host = match (parts.headers.get(HOST), parts.uri.authority()) {
-        (None, Some(authority)) => Some(pb::Header {
-            name: Bytes::from_static(b"host"),
-            value: Bytes::copy_from_slice(authority.as_str().as_bytes()),
-        }),
+    let forwarded_host = context
+        .forwarded_host
+        .as_deref()
+        .map(|host| Bytes::copy_from_slice(host.as_bytes()));
+
+    let authority = match (parts.headers.get(HOST), parts.uri.authority()) {
+        (None, Some(authority)) => Some(Bytes::copy_from_slice(authority.as_str().as_bytes())),
         _ => None,
+    };
+
+    let host = forwarded_host.or(authority).map(|value| pb::Header {
+        name: Bytes::from_static(b"host"),
+        value,
+    });
+    let replaces_host = context.forwarded_host.is_some();
+
+    // A prefix the proxy stripped is put back, so SCRIPT_NAME and
+    // PATH_INFO (ASGI root_path and path) come out as the client sent them.
+
+    let raw_path = match &context.prefix {
+        Some(prefix) => Bytes::from(format!("{prefix}{}", parts.uri.path())),
+        None => Bytes::copy_from_slice(parts.uri.path().as_bytes()),
     };
 
     pb::RequestHead {
@@ -564,7 +604,8 @@ pub(crate) fn request_head(
         request_id: context.request_id.to_owned(),
         method: parts.method.as_str().to_owned(),
         scheme: context.scheme.to_owned(),
-        raw_path: Bytes::copy_from_slice(parts.uri.path().as_bytes()),
+        raw_path,
+        script_name: context.prefix.clone().unwrap_or_default(),
         query: parts
             .uri
             .query()
@@ -583,6 +624,10 @@ pub(crate) fn request_head(
                     return None;
                 }
 
+                if replaces_host && name == "host" {
+                    return None;
+                }
+
                 Some(pb::Header {
                     name: Bytes::copy_from_slice(name.as_bytes()),
                     value: Bytes::copy_from_slice(value.as_bytes()),
@@ -595,7 +640,11 @@ pub(crate) fn request_head(
         }),
         server: Some(pb::Peer {
             address: local.ip().to_string(),
-            port: u32::from(local.port()),
+            port: u32::from(context.forwarded_port.unwrap_or_else(|| local.port())),
+        }),
+        proxy: context.proxy.map(|proxy| pb::Peer {
+            address: proxy.ip().to_string(),
+            port: u32::from(proxy.port()),
         }),
         tls: context.tls.cloned(),
         content_length,

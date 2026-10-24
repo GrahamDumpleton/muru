@@ -14,6 +14,7 @@ use std::sync::Arc;
 use muru_proto::edge::v1 as pb;
 
 use crate::link::LinkPool;
+use crate::proxy::Trust;
 
 /// What the snapshot says about one virtual host.
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ struct Route {
 /// The compiled routing tables of one snapshot.
 pub struct Routing {
     version: u64,
+    trust: Trust,
     default: Arc<LinkPool>,
     apps: HashMap<String, Arc<LinkPool>>,
     hosts: Vec<Host>,
@@ -68,6 +70,7 @@ impl Routing {
     pub fn single(pool: LinkPool) -> Self {
         Self {
             version: 0,
+            trust: Trust::default(),
             default: Arc::new(pool),
             apps: HashMap::new(),
             hosts: Vec::new(),
@@ -92,8 +95,14 @@ impl Routing {
         // Exact names go in a map; wildcards keep their suffix, longest
         // first, so *.shop.example.com beats *.example.com.
 
+        let trust = match &snapshot.proxy {
+            Some(proxy) => Trust::from_snapshot(proxy).map_err(|error| anyhow::anyhow!(error))?,
+            None => Trust::default(),
+        };
+
         let mut routing = Self {
             version: snapshot.version,
+            trust,
             default: Arc::new(default),
             apps,
             hosts: Vec::new(),
@@ -167,6 +176,11 @@ impl Routing {
     /// The snapshot's version.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Which peers may speak for the client (section 4.7).
+    pub fn trust(&self) -> &Trust {
+        &self.trust
     }
 
     /// Whether any virtual host is declared.
@@ -350,6 +364,7 @@ mod tests {
                 },
             ],
             apps: Vec::new(),
+            proxy: None,
         }
     }
 

@@ -24,6 +24,8 @@ muructl deploy shop /srv/shop
 The daemon serves HTTP on 127.0.0.1:8080 unless its configuration file
 names listeners (see [virtual hosts and TLS](virtual-hosts.md)) or
 `--listen` says otherwise, answering 503 until a release is ready. The
+same file names the proxies to trust (see
+[behind a proxy](behind-a-proxy.md)). The
 first deploy creates the application and its first release; each later
 deploy creates the next release, starts it beside the one that serves,
 moves traffic to it once every worker is ready, and then drains and stops

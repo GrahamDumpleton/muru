@@ -275,6 +275,63 @@ pub struct Listener {
     pub tls: bool,
 }
 
+/// How forwarding headers are left after they have been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardedHeaders {
+    /// The configured headers stay for the application, other forwarding
+    /// headers are removed.
+    Keep,
+    /// Every forwarding header is removed; the application sees only the
+    /// resolved values.
+    Consume,
+}
+
+words!(ForwardedHeaders { Keep => "keep", Consume => "consume" });
+
+/// The `[proxy]` table (section 4.7): which peers are trusted to speak
+/// for the client, and through which headers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proxy {
+    /// Addresses, CIDR ranges, or the words loopback, private and unix.
+    /// Nothing is trusted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted: Vec<String>,
+    /// The header types applied from trusted peers: forwarded,
+    /// x-forwarded-for, x-forwarded-proto, x-forwarded-host,
+    /// x-forwarded-port, x-forwarded-prefix and x-real-ip. The first four
+    /// when omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
+    /// Walk a chain of addresses from the right past trusted proxies to
+    /// the first untrusted one, rather than take the rightmost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
+    /// What becomes of the forwarding headers once applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_headers: Option<ForwardedHeaders>,
+}
+
+/// The header types applied when `[proxy]` names none.
+pub const DEFAULT_PROXY_HEADERS: [&str; 4] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+];
+
+/// Every header type `[proxy]` accepts.
+pub const PROXY_HEADERS: [&str; 7] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    "x-real-ip",
+];
+
 /// A virtual host, the `[host.NAME]` table (section 4.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -356,6 +413,9 @@ pub struct Document {
     /// Limits in force everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Limits>,
+    /// Trusted proxies and the headers taken from them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<Proxy>,
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
@@ -389,6 +449,10 @@ impl Document {
 
         if other.limits.is_some() {
             self.limits = other.limits;
+        }
+
+        if other.proxy.is_some() {
+            self.proxy = other.proxy;
         }
 
         for (name, host) in other.host {

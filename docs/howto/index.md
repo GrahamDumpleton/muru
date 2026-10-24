@@ -7,7 +7,6 @@ Still to be written, as their features land:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Running under systemd.
-- Behind a load balancer or CDN (trusted proxies).
 - Worker groups and mounts.
 - Uploads and authorised downloads (internal redirects), including upload adapters for Django, Flask and Starlette.
 - Custom error pages and maintenance mode.
@@ -27,6 +26,7 @@ asgi
 starlette-and-fastapi
 daemon
 virtual-hosts
+behind-a-proxy
 https
 timeouts
 logging

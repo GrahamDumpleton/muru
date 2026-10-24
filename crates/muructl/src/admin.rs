@@ -178,6 +178,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         locations,
         listeners,
         limits,
+        proxy: document.proxy.clone(),
         access_log,
         executable: std::env::current_exe().context("finding the muructl executable")?,
     })
