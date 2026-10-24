@@ -57,6 +57,10 @@ service Admin {
 
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
+
+  // Re-read the daemon's configuration file for what can change while
+  // running (section 13.3).
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
 }
 
 message GetStatusRequest {}
@@ -301,4 +305,10 @@ message GetMetricsRequest {}
 
 message MetricsText {
   string text = 1;                  // the Prometheus text exposition
+}
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {
+  string message = 1;               // what was reloaded
 }

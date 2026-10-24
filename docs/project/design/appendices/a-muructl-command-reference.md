@@ -17,7 +17,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Development | muructl check [PATH or RELEASE] | Load in a throwaway host and validate entrypoints, hooks, mounts and environment | 6.8 |
 | Development | muructl exec RELEASE -- COMMAND | One-off command with the release's interpreter, environment, user and directory | 6.8 |
 | Daemon | muructl daemon run | Run the daemon in the foreground. Flags: --listen, and the location flags --config, --state-dir, --run-dir, --log-dir, --cache-dir and --system (section 13.8) | 13.3 |
-| Daemon | muructl daemon start, stop, restart, status | Background daemon without a service manager. start takes the flags of daemon run; stop takes --shutdown | 13.3 |
+| Daemon | muructl daemon start, stop, restart, status, reload | Background daemon without a service manager. start takes the flags of daemon run; stop takes --shutdown and --timeout; reload re-reads the configuration file | 13.3 |
 | Daemon | muructl daemon reload | Re-read the daemon configuration file (also SIGHUP) | 10.3 |
 | Daemon | muructl daemon upgrade | Re-exec from the installed binary and replace edges | 13.4 |
 | Daemon | muructl daemon backup, restore | Save or load the state store | 13.5 |

@@ -104,6 +104,12 @@ pub enum Command {
         /// Where the acknowledgement goes.
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// Re-read the configuration file for what can change while running
+    /// (section 13.3).
+    Reload {
+        /// Answered with what was reloaded, or why it was refused.
+        done: oneshot::Sender<Result<String, String>>,
+    },
     /// Reopen every log file after an external rotation (section 11.3):
     /// the daemon's own, the edge's access log and each host's, and with
     /// `workers` the application's own files through on_reopen_logs.
@@ -415,17 +421,43 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         owns_log,
     };
     daemon.restore().await;
+    crate::notify::ready(&format!(
+        "serving on {}",
+        listeners
+            .iter()
+            .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    ));
 
     // Commands are carried out one at a time; a host dying in between is
-    // noticed by the next pass.
+    // noticed by the next pass. SIGTERM and SIGINT detach, as a service
+    // manager's stop or a terminal's interrupt should (section 13.3), and
+    // SIGHUP reloads the configuration file.
 
     let mut drain_on_exit = true;
     let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let outcome = loop {
         tokio::select! {
             _ = reopen.recv() => {
                 daemon.reopen_logs(false);
+            }
+            _ = hangup.recv() => {
+                if let Err(error) = daemon.reload().await {
+                    tracing::warn!(%error, "reloading the configuration failed");
+                }
+            }
+            _ = terminate.recv() => {
+                drain_on_exit = false;
+                break Ok(());
+            }
+            _ = interrupt.recv() => {
+                drain_on_exit = false;
+                break Ok(());
             }
             command = inbox.recv() => match command {
                 Some(Command::Shutdown { drain, done }) => {
@@ -450,6 +482,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
     // everything down with it.
+
+    crate::notify::stopping();
 
     if drain_on_exit {
         daemon.stop_all().await;
@@ -547,6 +581,49 @@ fn command_mentions(pid: u32, path: &Path) -> bool {
 }
 
 impl Daemon {
+    /// Section 13.3: re-read the configuration file for what can change
+    /// while running, which is the [proxy] table; listeners, limits, the
+    /// metrics listener and the event sinks are read at start.
+    async fn reload(&mut self) -> Result<String, String> {
+        let path = self.locations.config.path.clone();
+
+        let document = match std::fs::read_to_string(&path) {
+            Ok(text) => muru_config::Document::parse(&text)
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                muru_config::Document::default()
+            }
+            Err(error) => return Err(format!("reading {}: {error}", path.display())),
+        };
+
+        let proxy = document.proxy.as_ref().map(proxy_message);
+
+        if let Some(proxy) = &proxy {
+            muru_edge::proxy::Trust::from_snapshot(proxy)
+                .map_err(|error| format!("[proxy]: {error}"))?;
+        }
+
+        let changed = proxy != self.proxy;
+        self.proxy = proxy;
+
+        if changed {
+            self.push_snapshot().await?;
+        }
+
+        let message = format!(
+            "reloaded {}: the [proxy] table {}; listeners, limits, metrics and event sinks are read at start",
+            path.display(),
+            if changed {
+                "changed and the edge has it"
+            } else {
+                "is unchanged"
+            }
+        );
+        self.events
+            .emit("config.reloaded", "daemon", "info", &message);
+        Ok(message)
+    }
+
     /// The node's metrics: the edge's samples with the daemon's own
     /// gauges added, as the Prometheus text exposition.
     async fn metrics(&self) -> String {
@@ -726,6 +803,9 @@ impl Daemon {
             }
             Command::Reconfigure { done } => {
                 let _ = done.send(self.push_snapshot().await);
+            }
+            Command::Reload { done } => {
+                let _ = done.send(self.reload().await);
             }
             Command::ReopenLogs { workers, done } => {
                 let _ = done.send(self.reopen_logs(workers));

@@ -105,4 +105,10 @@ time and in order from a cursor in the state store with doubling retries,
 so a receiver outage or a daemon restart loses nothing, with
 `events.sink.failing` and `events.sink.recovered` events about the sink
 itself (OTLP, journald and file sinks, the audit log and sinks managed
-through the API later). Next from phase 2: systemd integration.
+through the API later). systemd integration (section 13.3) is in: the
+shipped unit runs `muructl daemon run --system` as Type=notify, the
+daemon reports readiness and stopping with sd_notify, SIGTERM and SIGINT
+detach as `daemon stop` does, SIGHUP and `muructl daemon reload` re-read
+the `[proxy]` table, and `daemon stop --timeout` bounds the wait
+(reloading listeners, limits and sinks, journald and socket activation
+later). Next from phase 2: the full read-only dashboard.

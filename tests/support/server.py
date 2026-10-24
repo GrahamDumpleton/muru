@@ -318,6 +318,9 @@ def start(
 
     try:
         wait_for_port(port, process)
+
+        if https_port is not None:
+            wait_for_port(https_port, process)
     except RuntimeError as error:
         server.stop()
         raise RuntimeError(f"{error}\n{server.log()}") from error

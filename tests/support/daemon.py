@@ -9,6 +9,7 @@ what the first left running.
 from __future__ import annotations
 
 import http.client
+import os
 import socket
 import ssl
 import subprocess
@@ -163,6 +164,7 @@ def start_daemon(
     listeners: list[tuple[int, bool]] | None = None,
     config_extra: str = "",
     arguments: list[str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> Daemon:
     """Start a daemon in the foreground with directories under `base`.
 
@@ -170,7 +172,7 @@ def start_daemon(
     reads them from a configuration file written under `base`, and
     `config_extra` is appended to that file (the `[proxy]` table, say);
     otherwise it serves plain HTTP on `port`. `arguments` are passed to
-    `muructl daemon run` as given. A second daemon over the
+    `muructl daemon run` as given, and `env` is added to its environment. A second daemon over the
     same `run_dir` and listeners re-adopts what the first left running.
     """
 
@@ -222,6 +224,7 @@ def start_daemon(
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **(env or {})},
         )
 
     daemon = Daemon(process, port, base, run_dir, log_path, listeners)

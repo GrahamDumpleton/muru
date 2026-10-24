@@ -377,6 +377,23 @@ impl Admin for Service {
         Ok(Response::new(pb::MetricsText { text }))
     }
 
+    async fn reload_config(
+        &self,
+        _: Request<pb::ReloadConfigRequest>,
+    ) -> Result<Response<pb::ReloadConfigResponse>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Reload { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let message = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::ReloadConfigResponse { message }))
+    }
+
     async fn list_events(
         &self,
         request: Request<pb::ListEventsRequest>,

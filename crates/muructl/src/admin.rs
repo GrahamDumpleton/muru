@@ -120,6 +120,17 @@ pub enum DaemonCommand {
         #[arg(long)]
         shutdown: bool,
 
+        /// How long to wait for the daemon to exit.
+        #[arg(long, value_name = "DURATION", default_value = "90s", value_parser = muru_config::parse_duration)]
+        timeout: Duration,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Re-read the daemon's configuration file for what can change while
+    /// it runs: the [proxy] table.
+    Reload {
         #[command(flatten)]
         socket: SocketArgs,
     },
@@ -275,7 +286,11 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 }
 
 /// Stop the daemon through its API and wait for its process to go.
-pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<()> {
+pub async fn daemon_stop(
+    socket: SocketArgs,
+    shutdown: bool,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let path = socket.socket();
     let mut client = client::connect(&path).await?;
     let status = client
@@ -296,7 +311,7 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
 
     let started = Instant::now();
 
-    while started.elapsed() < Duration::from_secs(90) {
+    while started.elapsed() < timeout {
         let answering = match client::connect(&path).await {
             Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.is_ok(),
             Err(_) => false,
@@ -326,6 +341,18 @@ pub async fn metrics(socket: SocketArgs) -> anyhow::Result<()> {
         .into_inner()
         .text;
     print!("{text}");
+    Ok(())
+}
+
+/// Re-read the daemon's configuration file.
+pub async fn daemon_reload(socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let response = client
+        .reload_config(pb::ReloadConfigRequest {})
+        .await
+        .map_err(|status| anyhow::anyhow!("{}", status.message()))?
+        .into_inner();
+    println!("muru: {}", response.message);
     Ok(())
 }
 

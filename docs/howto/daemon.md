@@ -183,9 +183,15 @@ stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
-its workers with it, and the next daemon starts its release again. `muructl daemon run` runs it in the foreground, for a service
-manager or a terminal. Commands find the daemon through its admin socket:
-`--socket` or `MURU_SOCKET`, else the socket in the runtime directory.
+its workers with it, and the next daemon starts its release again.
+`muructl daemon run` runs it in the foreground, for a service manager or
+a terminal; SIGTERM or an interrupt detaches it the same way, and
+`muructl daemon stop --timeout` bounds how long the command waits for the
+daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
+configuration file for the `[proxy]` table. The [systemd
+guide](systemd.md) has the unit and what it does. Commands find the
+daemon through its admin socket: `--socket` or `MURU_SOCKET`, else the
+socket in the runtime directory.
 
 The access log is written as JSON lines to `access.log` in the log
 directory, `muructl logs` shows or follows it and each release's output,

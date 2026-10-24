@@ -245,21 +245,11 @@ impl Edge {
         config: Config,
         mut listeners: Vec<(TcpListener, Option<TlsAcceptor>)>,
     ) -> anyhow::Result<Self> {
-        let pools = Arc::new(Pools {
-            current: RwLock::new(Arc::new(routing::Routing::single(
-                routing::AppPools::connect(
-                    &config.app,
-                    &config.release,
-                    &config.sockets,
-                    &config.groups,
-                    &config.mounts,
-                )
-                .await?,
-            ))),
-        });
-        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let local = listeners[0].0.local_addr()?;
         let mut redirect_to = None;
+
+        // Every listener is bound before the workers are connected, so a
+        // client that finds one port open finds them all open.
 
         if let Some(secure) = config.https {
             let listener = TcpListener::bind(secure.listen)
@@ -275,6 +265,20 @@ impl Edge {
 
             listeners.push((listener, Some(TlsAcceptor::from(secure.config))));
         }
+
+        let pools = Arc::new(Pools {
+            current: RwLock::new(Arc::new(routing::Routing::single(
+                routing::AppPools::connect(
+                    &config.app,
+                    &config.release,
+                    &config.sockets,
+                    &config.groups,
+                    &config.mounts,
+                )
+                .await?,
+            ))),
+        });
+        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
 
         let mut bound = Vec::with_capacity(listeners.len());
 

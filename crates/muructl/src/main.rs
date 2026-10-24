@@ -474,9 +474,12 @@ fn main() -> anyhow::Result<()> {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
                 admin::DaemonCommand::Start(args) => admin::daemon_start(args).await,
-                admin::DaemonCommand::Stop { shutdown, socket } => {
-                    admin::daemon_stop(socket, shutdown).await
-                }
+                admin::DaemonCommand::Stop {
+                    shutdown,
+                    timeout,
+                    socket,
+                } => admin::daemon_stop(socket, shutdown, timeout).await,
+                admin::DaemonCommand::Reload { socket } => admin::daemon_reload(socket).await,
                 admin::DaemonCommand::Status { socket } => admin::daemon_status(socket).await,
             }
         }),
