@@ -8,7 +8,6 @@ covers the same ground in more detail, for contributors.
 Still to be written:
 
 - Releases and traffic policies.
-- Preload and fork safety.
 - How scaling decides.
 - Security model.
 - Comparison with mod_wsgi, gunicorn, uvicorn and Granian.
@@ -19,4 +18,5 @@ Still to be written:
 architecture
 worker-protocol
 process-models
+preload
 ```
