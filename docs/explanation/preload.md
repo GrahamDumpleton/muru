@@ -17,9 +17,8 @@ much, and how Muru notices before it bites.
 A worker that imports the application itself spends seconds on imports and
 holds its own copy of every module. Forking from a host that has already
 imported everything gives each worker those modules for the price of a
-fork, shared through copy-on-write memory, which is why replacing a worker
-is cheap and why many workers do not cost many times the memory. mod_wsgi,
-gunicorn with `--preload` and uWSGI all work this way for the same reason.
+fork, shared through copy-on-write memory. Replacing a worker is therefore
+cheap, and many workers do not cost many times the memory.
 
 The catch is the fork itself. A fork copies memory but not the things that
 live outside it: a socket is a kernel object shared by both processes, a
@@ -27,9 +26,8 @@ thread exists only in the process that started it, and a child process has
 one parent. An import that opened a database connection, started a
 background thread or launched a helper process leaves the workers with a
 connection two processes think they own, a thread that silently does not
-exist, or a child nobody reaps. These bugs are intermittent and show up in
-production, which is why the usual advice is "do not do that at import
-time" and why it keeps happening anyway.
+exist, or a child nobody reaps. These bugs are intermittent, and they show
+up in production rather than on the first request.
 
 ## The import check
 

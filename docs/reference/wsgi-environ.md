@@ -49,12 +49,12 @@ it adds.
   request is not visible to the next request on the same thread.
   Thread-locals do persist, because the application threads live for the
   whole worker: a `threading.local` database connection set up by one
-  request is there for later requests on that thread, as under mod_wsgi.
+  request is there for later requests on that thread.
 - **start_response is checked.** A status that is not three digits, a
   space and a reason, headers that are not a list of `(str, str)` tuples,
   names or values with control characters, or a second call without
-  `exc_info` all raise, with the same exceptions mod_wsgi raises. The reason
-  phrase reaches HTTP/1.1 clients.
+  `exc_info` all raise (`ValueError` for a bad value, `TypeError` for a
+  wrong type). The reason phrase reaches HTTP/1.1 clients.
 - **Content-Length is enforced.** Output beyond a declared length is
   dropped; a body that ends short of it fails the response and closes the
   connection, with a line in the log.
