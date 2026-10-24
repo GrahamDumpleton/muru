@@ -22,6 +22,8 @@ const LOG_LINES: usize = 200;
 
 /// What the dashboard reads from.
 pub struct Inputs {
+    /// Whether this is a development run (section 13.1).
+    pub development: bool,
     /// The application name.
     pub app: String,
     /// Where the application is served.
@@ -131,6 +133,7 @@ fn collect(inputs: &Inputs) -> Data {
         app: inputs.app.clone(),
         release: inputs.release.load(Ordering::Relaxed),
         uptime: uptime(inputs.started.elapsed()),
+        development: inputs.development,
         listen: inputs.listen.to_string(),
         https: inputs.https.map(|address| address.to_string()),
         summary,

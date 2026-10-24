@@ -33,6 +33,8 @@ pub struct Data {
     pub release: u32,
     /// How long the run has been up, already formatted.
     pub uptime: String,
+    /// Whether this is a development run, which the header says.
+    pub development: bool,
     /// The address the application is served on.
     pub listen: String,
     /// The HTTPS address, when TLS is on.

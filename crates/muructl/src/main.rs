@@ -123,9 +123,10 @@ struct RunArgs {
     slow: Duration,
 
     /// Largest request body accepted, for example 100MB or 512KB (KB, MB
-    /// and GB are powers of 1024). Development runs default to 100MB.
-    #[arg(long, default_value = "100MB", value_name = "SIZE", value_parser = muru_config::parse_size)]
-    max_body_size: u64,
+    /// and GB are powers of 1024). Development runs default to 100MB, and
+    /// 10MB with --allow-public.
+    #[arg(long, value_name = "SIZE", value_parser = muru_config::parse_size)]
+    max_body_size: Option<u64>,
 
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s) or response_idle (60s).
@@ -133,9 +134,17 @@ struct RunArgs {
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
-    /// Address for the read-only dashboard on loopback, or off.
-    #[arg(long, default_value = "127.0.0.1:8081")]
-    dashboard: String,
+    /// Address for the read-only dashboard on loopback, or off. On at
+    /// 127.0.0.1:8081 by default, off with --allow-public unless given.
+    #[arg(long, value_name = "ADDRESS")]
+    dashboard: Option<String>,
+
+    /// Serve an address other than loopback. Development behaviours are
+    /// then off (no tracebacks in error pages, the 10MB body limit, no
+    /// dashboard unless asked for), but this is still not the supported
+    /// way to run in production, which is the daemon's job.
+    #[arg(long)]
+    allow_public: bool,
 
     /// Serve HTTPS as well, on --https-port, with a development certificate
     /// unless --tls-cert is given.
@@ -172,7 +181,7 @@ struct RunArgs {
     print_config: bool,
 
     /// One process and one thread, serving without forking, for debuggers.
-    /// Implies --workers 1 --threads 1.
+    /// Implies --processes 1 --threads 1.
     #[arg(long)]
     single: bool,
 
@@ -195,7 +204,8 @@ struct RunArgs {
     reload_exclude: Vec<String>,
 
     /// Python interpreter with the muru runtime library installed.
-    /// Defaults to the active virtualenv's interpreter, else python3 on PATH.
+    /// Defaults to the active virtualenv's interpreter, else the project's
+    /// .venv, else python3 on PATH.
     #[arg(long)]
     python: Option<PathBuf>,
 
@@ -414,10 +424,18 @@ fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     Ok((name.to_owned(), parse_duration(duration)?))
 }
 
+/// Largest request body in development (section 13.1, ADR 0008).
+const DEVELOPMENT_MAX_BODY_SIZE: u64 = 100 * 1024 * 1024;
+
 fn limits(args: &RunArgs) -> muru_edge::Limits {
+    let defaults = muru_edge::Limits::default();
     let mut limits = muru_edge::Limits {
-        max_body_size: args.max_body_size,
-        ..muru_edge::Limits::default()
+        max_body_size: args.max_body_size.unwrap_or(if args.allow_public {
+            defaults.max_body_size
+        } else {
+            DEVELOPMENT_MAX_BODY_SIZE
+        }),
+        ..defaults
     };
     for (name, duration) in &args.timeouts {
         match name.as_str() {
@@ -699,6 +717,15 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut resolved = resolve(&args)?;
+    let development = !args.allow_public;
+    if !args.bind.ip.is_loopback() && development {
+        anyhow::bail!(
+            "muructl run serves loopback addresses only, because it is development mode: error \
+             pages show tracebacks and nothing is persisted. --allow-public serves {} with those \
+             behaviours off, but production is the daemon's job (section 13.3, phase 2)",
+            args.bind.ip
+        );
+    }
     anyhow::ensure!(resolved.processes >= 1, "--processes must be at least 1");
     anyhow::ensure!(resolved.threads >= 1, "--threads must be at least 1");
     if args.single {
@@ -745,7 +772,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         listen: http_address,
         sockets: current.sockets.clone(),
         slots: resolved.threads,
-        development: true,
+        development,
         access_log,
         limits: limits(&args),
         https: tls.as_ref().map(|tls| tls.https.clone()),
@@ -773,6 +800,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         "muru: serving {} on {addresses} with {} workers of {} threads",
         resolved.entrypoint, resolved.processes, resolved.threads
     );
+    if development {
+        println!(
+            "muru: development mode: error pages show tracebacks, nothing is persisted and only \
+             loopback is served; production runs under the daemon, which arrives in phase 2"
+        );
+    } else {
+        println!(
+            "muru: --allow-public: development behaviours are off, but muructl run is not the \
+             supported way to run in production; that is the daemon, which arrives in phase 2"
+        );
+    }
     if let Some(tls) = &tls {
         match (&tls.development, &args.tls_cert) {
             (Some(certificate), _) => println!("{}", certificate.describe()),
@@ -782,10 +820,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let release_number = Arc::new(AtomicU32::new(1));
-    if args.dashboard != "off" {
+    let dashboard = match args.dashboard.as_deref() {
+        Some("off") => None,
+        Some(address) => Some(address.to_owned()),
+        None if development => Some("127.0.0.1:8081".to_owned()),
+        None => None,
+    };
+    if let Some(address) = dashboard {
         match dashboard::start(
-            &args.dashboard,
+            &address,
             dashboard::Inputs {
+                development,
                 app: resolved.entrypoint.clone(),
                 listen: edge.local_addr(),
                 https: edge.https_addr(),

@@ -35,6 +35,7 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
   <h1>Muru</h1>
   <span>{{ data.app }}</span>
   <span>release r{{ data.release }}</span>
+  {% if data.development %}<span>development mode</span>{% endif %}
   <span>up {{ data.uptime }}</span>
   <span>http://{{ data.listen }}</span>
   {% if let Some(https) = data.https %}<span>https://{{ https }}</span>{% endif %}

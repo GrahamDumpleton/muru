@@ -56,10 +56,16 @@ PRELOAD_MODES = ("auto", "true", "false")
 READ_SIZE = 65536
 
 
+# Set in a worker, whose lines the host relays with the worker's own tag,
+# so the host prefix is for the host alone.
+_in_worker = False
+
+
 def log(message: str) -> None:
     """Write one line to standard error, prefixed so it can be told from application output."""
 
-    print(f"muru.host[{os.getpid()}]: {message}", file=sys.stderr, flush=True)
+    prefix = "" if _in_worker else f"muru.host[{os.getpid()}]: "
+    print(f"{prefix}{message}", file=sys.stderr, flush=True)
 
 
 INTERFACES = ("auto", "wsgi", "asgi")
@@ -294,6 +300,8 @@ class Host:
     def worker(self, index: int) -> int:
         """Run a worker: enable collection, run the hooks, then serve until the server stops."""
 
+        global _in_worker
+        _in_worker = True
         gc.enable()
         # The host's handlers and wake-up pipe belong to the host; the native
         # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
