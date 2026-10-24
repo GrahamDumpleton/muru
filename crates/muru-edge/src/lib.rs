@@ -14,8 +14,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, SERVER};
-use http::{Response, StatusCode};
+use http::header::{
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, HeaderMap, HeaderName, HeaderValue, SERVER,
+};
+use http::{Response, StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -95,6 +97,45 @@ impl Edge {
     }
 }
 
+/// Headers that describe this connection rather than the request, which
+/// never reach the application (section 4.7). Those named by a Connection
+/// header are removed as well.
+const HOP_BY_HOP: [&str; 7] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+fn is_hop_by_hop(name: &str, named_in_connection: &[String]) -> bool {
+    HOP_BY_HOP.contains(&name) || named_in_connection.iter().any(|named| named == name)
+}
+
+/// The headers a Connection header lists as hop-by-hop, lower-cased.
+fn connection_options(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|option| option.trim().to_ascii_lowercase())
+        .filter(|option| !option.is_empty())
+        .collect()
+}
+
+/// Whether the client waits for 100 Continue before sending the body.
+/// hyper ignores the expectation on HTTP/1.0, so the edge does too.
+pub(crate) fn expects_continue(parts: &http::request::Parts) -> bool {
+    parts.version > Version::HTTP_10
+        && parts
+            .headers
+            .get(EXPECT)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"))
+}
+
 pub(crate) fn request_head(
     parts: &http::request::Parts,
     request_id: u64,
@@ -106,6 +147,7 @@ pub(crate) fn request_head(
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
+    let named_in_connection = connection_options(&parts.headers);
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
         request_id: request_id.to_string(),
@@ -121,8 +163,11 @@ pub(crate) fn request_head(
             .headers
             .iter()
             // Section 4.7: a name with an underscore could masquerade as
-            // another header's HTTP_ key, so it never reaches the application.
-            .filter(|(name, _)| !name.as_str().contains('_'))
+            // another header's HTTP_ key, so it never reaches the application,
+            // and neither does anything hop-by-hop.
+            .filter(|(name, _)| {
+                !name.as_str().contains('_') && !is_hop_by_hop(name.as_str(), &named_in_connection)
+            })
             .map(|(name, value)| pb::Header {
                 name: Bytes::copy_from_slice(name.as_str().as_bytes()),
                 value: Bytes::copy_from_slice(value.as_bytes()),
@@ -138,6 +183,7 @@ pub(crate) fn request_head(
         }),
         content_length,
         http_version: format!("{:?}", parts.version),
+        expect_continue: expects_continue(parts) && content_length != Some(0),
         ..Default::default()
     }
 }
@@ -163,7 +209,7 @@ pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>)
     headers.insert(SERVER, HeaderValue::from_static("muru"));
 }
 
-pub(crate) fn error_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response<ResponseBody> {
     let body = Full::new(Bytes::from(format!("{message}\n")))
         .map_err(|never: Infallible| match never {})
         .boxed_unsync();
@@ -176,5 +222,14 @@ pub(crate) fn error_response(status: StatusCode, message: &'static str) -> Respo
     response
         .headers_mut()
         .insert(SERVER, HeaderValue::from_static("muru"));
+    response
+}
+
+/// Mark a response as the last on its connection. hyper closes the
+/// connection once it has been written.
+pub(crate) fn close_after(mut response: Response<ResponseBody>) -> Response<ResponseBody> {
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
     response
 }

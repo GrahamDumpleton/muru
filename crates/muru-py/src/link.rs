@@ -5,7 +5,8 @@
 //! request on an application thread, forwards BODY frames to `wsgi.input`
 //! until the request body ends or the edge sends ABORT, and writes the
 //! response as RESPONSE, BODY and END frames, coalescing small chunks as
-//! section 5.4 describes. When both directions have ended the connection is
+//! section 5.4 describes. A CONTINUE frame goes out when the application
+//! first reads a body the client is holding back (section 5.5). When both directions have ended the connection is
 //! idle again and the next REQUEST may follow. The edge closing the
 //! connection cancels the request.
 
@@ -355,6 +356,14 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     } else if deadline.is_none() {
                         deadline = Some(Instant::now() + COALESCE_MAX_DELAY);
                     }
+                }
+            }
+            Some(Some(Outgoing::Continue)) => {
+                // The application is reading the body. The edge may pass
+                // that on as 100 Continue (section 5.5); after the response
+                // has ended it no longer matters.
+                if !ended {
+                    frame::write(writer, kind::CONTINUE, 0, Bytes::new()).await?;
                 }
             }
             Some(Some(Outgoing::Abort(message))) => {

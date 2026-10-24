@@ -30,8 +30,12 @@ pub mod kind {
     /// The edge has no more use for the request: the client has gone, or
     /// the response ended first (protobuf `Abort`), edge to worker.
     pub const ABORT: u8 = 6;
-    // Kinds 7 and up are reserved for CONTINUE, MESSAGE, CLOSE,
-    // INFORMATIONAL, FILE and DETACH (design specification section 5.2).
+    /// The application has started reading the request body, so the edge
+    /// may tell a client waiting on Expect: 100-continue to send it
+    /// (empty payload), worker to edge.
+    pub const CONTINUE: u8 = 7;
+    // Kinds 8 and up are reserved for MESSAGE, CLOSE, INFORMATIONAL, FILE
+    // and DETACH (design specification section 5.2).
 }
 
 /// Frame flags.

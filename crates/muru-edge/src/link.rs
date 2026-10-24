@@ -10,15 +10,21 @@
 //! has been sent, or the client goes away, the edge sends ABORT instead of
 //! the rest of the body, so the connection is reusable at once. A connection
 //! that fails is dropped and replaced on the next use.
+//!
+//! Bodies with a declared length stream through; a body without one is
+//! read in full before a connection is taken, so the application sees
+//! CONTENT_LENGTH (section 4.6). A client waiting on Expect: 100-continue
+//! is told to send a streamed body only once the worker's CONTINUE frame
+//! says the application is reading it.
 
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
@@ -31,13 +37,19 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::{BoxError, ResponseBody, error_response, request_head};
+use crate::{BoxError, ResponseBody, close_after, error_response, request_head};
 
 /// After the response has ended, this much of an unread request body is
 /// read and discarded so the client connection can be kept alive; beyond
 /// it, or after the delay, the connection is closed instead (section 4.6).
 const DISCARD_LIMIT: usize = 1024 * 1024;
 const DISCARD_DELAY: Duration = Duration::from_secs(2);
+
+/// The largest request body accepted (max_body_size in section 4.6, with
+/// the same default as mod_wsgi-express). A declared length beyond it is
+/// refused before anything is read; an undeclared one as soon as it is
+/// exceeded.
+pub const MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 
 type Reader = BufReader<OwnedReadHalf>;
 type Writer = OwnedWriteHalf;
@@ -162,6 +174,10 @@ struct Return {
     /// Signalled when the request direction should stop: the response has
     /// ended, or failed.
     abort: Notify,
+    /// Signalled when the worker has sent CONTINUE: the application is
+    /// reading the body, so a waiting client may be told to send it.
+    proceed: Notify,
+    proceeded: AtomicBool,
 }
 
 struct ReturnState {
@@ -185,12 +201,20 @@ impl Return {
                 permit: Some(permit),
             }),
             abort: Notify::new(),
+            proceed: Notify::new(),
+            proceeded: AtomicBool::new(false),
         })
     }
 
     /// Tell the body pump, if it is still running, to send ABORT and stop.
     fn abort_request(&self) {
         self.abort.notify_one();
+    }
+
+    /// Tell the body pump, if it is waiting, that the application is reading.
+    fn continue_request(&self) {
+        self.proceeded.store(true, Ordering::Relaxed);
+        self.proceed.notify_one();
     }
 
     fn give_reader(&self, reader: Option<Reader>) {
@@ -231,8 +255,39 @@ pub async fn handle(
     peer: SocketAddr,
     local: SocketAddr,
 ) -> Response<ResponseBody> {
-    let (parts, body) = request.into_parts();
-    let head = request_head(&parts, request_id, peer, local);
+    let (parts, mut body) = request.into_parts();
+    let mut head = request_head(&parts, request_id, peer, local);
+
+    if head
+        .content_length
+        .is_some_and(|length| length > MAX_BODY_SIZE)
+    {
+        return too_large();
+    }
+
+    // Section 4.6: a body without a declared length is read in full first,
+    // so that the application sees CONTENT_LENGTH and no worker slot is
+    // held while it arrives. Polling the body is also what makes hyper
+    // send 100 Continue to a client that is waiting for it.
+    let mut buffered: Option<Bytes> = None;
+    if !body.is_end_stream() && head.content_length.is_none() {
+        match read_body(&mut body).await {
+            Ok(data) => {
+                head.content_length = Some(data.len() as u64);
+                head.body_buffered = true;
+                buffered = Some(data);
+            }
+            Err(BodyError::TooLarge) => return too_large(),
+            Err(BodyError::Read(error)) => {
+                tracing::debug!(%error, "reading the request body failed");
+                return close_after(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "the request body could not be read",
+                ));
+            }
+        }
+    }
+    let expect_continue = head.expect_continue && !head.body_buffered;
 
     let lease = match pool.acquire().await {
         Ok(lease) => lease,
@@ -251,7 +306,9 @@ pub async fn handle(
         mut writer,
     } = conn;
 
-    let end = body.is_end_stream();
+    let end = buffered
+        .as_ref()
+        .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
     let flags = if end { flag::END } else { 0 };
     if let Err(error) = frame::write(
         &mut writer,
@@ -267,22 +324,36 @@ pub async fn handle(
     }
 
     let back = Return::new(pool, worker, permit);
-    if end {
-        back.give_writer(Some(writer));
-    } else {
-        tokio::spawn(pump_body(body, writer, Arc::clone(&back)));
+    match buffered {
+        Some(data) if !data.is_empty() => {
+            match frame::write(&mut writer, kind::BODY, flag::END, data).await {
+                Ok(()) => back.give_writer(Some(writer)),
+                Err(error) => {
+                    tracing::warn!(%error, "writing the request body failed");
+                    back.give_writer(None);
+                }
+            }
+        }
+        Some(_) => back.give_writer(Some(writer)),
+        None if end => back.give_writer(Some(writer)),
+        None => {
+            tokio::spawn(pump_body(body, writer, Arc::clone(&back), expect_continue));
+        }
     }
 
-    let response = match frame::read(&mut reader).await {
-        Ok(Some(response)) if response.kind == kind::RESPONSE => response,
-        Ok(_) => {
-            back.give_reader(None);
-            return error_response(StatusCode::BAD_GATEWAY, "the worker sent no response head");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "reading the response head failed");
-            back.give_reader(None);
-            return error_response(StatusCode::BAD_GATEWAY, "the worker failed");
+    let response = loop {
+        match frame::read(&mut reader).await {
+            Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
+            Ok(Some(next)) if next.kind == kind::RESPONSE => break next,
+            Ok(_) => {
+                back.give_reader(None);
+                return error_response(StatusCode::BAD_GATEWAY, "the worker sent no response head");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "reading the response head failed");
+                back.give_reader(None);
+                return error_response(StatusCode::BAD_GATEWAY, "the worker failed");
+            }
         }
     };
     let response_end = response.is_end();
@@ -300,25 +371,61 @@ pub async fn handle(
     {
         builder = builder.extension(reason);
     }
-    if response_end {
+    // A client still waiting for 100 Continue may send the body after this
+    // response, so the connection cannot be reused (section 4.6).
+    let close = expect_continue && !back.proceeded.load(Ordering::Relaxed);
+    let response = if response_end {
         back.give_reader(Some(reader));
+        back.abort_request();
         let empty = Empty::<Bytes>::new()
             .map_err(|never| match never {})
             .boxed_unsync();
-        return builder
-            .body(empty)
-            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid response head"));
+        builder.body(empty)
+    } else {
+        let stream = futures::stream::unfold(
+            BodyState {
+                reader: Some(reader),
+                back,
+            },
+            next_chunk,
+        );
+        builder.body(UnsyncBoxBody::new(StreamBody::new(stream)))
+    };
+    let response = response
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid response head"));
+    if close {
+        close_after(response)
+    } else {
+        response
     }
-    let stream = futures::stream::unfold(
-        BodyState {
-            reader: Some(reader),
-            back,
-        },
-        next_chunk,
+}
+
+fn too_large() -> Response<ResponseBody> {
+    let message = format!(
+        "the request body is larger than max_body_size allows ({} bytes)",
+        MAX_BODY_SIZE
     );
-    builder
-        .body(UnsyncBoxBody::new(StreamBody::new(stream)))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid response head"))
+    close_after(error_response(StatusCode::PAYLOAD_TOO_LARGE, &message))
+}
+
+enum BodyError {
+    TooLarge,
+    Read(hyper::Error),
+}
+
+/// Read a request body in full, up to the size limit.
+async fn read_body(body: &mut Incoming) -> Result<Bytes, BodyError> {
+    let mut data = BytesMut::new();
+    while let Some(next) = body.frame().await {
+        let next = next.map_err(BodyError::Read)?;
+        if let Ok(chunk) = next.into_data() {
+            if (data.len() + chunk.len()) as u64 > MAX_BODY_SIZE {
+                return Err(BodyError::TooLarge);
+            }
+            data.extend_from_slice(&chunk);
+        }
+    }
+    Ok(data.freeze())
 }
 
 /// The response body in flight: the read half until the body ends.
@@ -345,7 +452,9 @@ impl Drop for BodyState {
             tokio::spawn(async move {
                 loop {
                     match frame::read(&mut reader).await {
-                        Ok(Some(next)) if next.kind == kind::BODY && !next.is_end() => {}
+                        Ok(Some(next))
+                            if next.kind == kind::CONTINUE
+                                || (next.kind == kind::BODY && !next.is_end()) => {}
                         Ok(Some(next)) if next.kind == kind::BODY || next.kind == kind::END => {
                             back.give_reader(Some(reader));
                             back.abort_request();
@@ -364,51 +473,70 @@ impl Drop for BodyState {
 }
 
 async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxError>, BodyState)> {
-    let reader = state.reader.as_mut()?;
-    match frame::read(reader).await {
-        Ok(Some(next)) if next.kind == kind::BODY => {
-            if next.is_end() {
+    loop {
+        let reader = state.reader.as_mut()?;
+        return match frame::read(reader).await {
+            Ok(Some(next)) if next.kind == kind::CONTINUE => {
+                state.back.continue_request();
+                continue;
+            }
+            Ok(Some(next)) if next.kind == kind::BODY => {
+                if next.is_end() {
+                    state.finish(true);
+                }
+                Some((Ok(Frame::data(next.payload)), state))
+            }
+            Ok(Some(next)) if next.kind == kind::END => {
+                let end = pb::End::decode(next.payload).unwrap_or_default();
                 state.finish(true);
+                if end.error.is_empty() {
+                    None
+                } else {
+                    Some((Err(BoxError::from(end.error)), state))
+                }
             }
-            Some((Ok(Frame::data(next.payload)), state))
-        }
-        Ok(Some(next)) if next.kind == kind::END => {
-            let end = pb::End::decode(next.payload).unwrap_or_default();
-            state.finish(true);
-            if end.error.is_empty() {
-                None
-            } else {
-                Some((Err(BoxError::from(end.error)), state))
+            Ok(Some(next)) => {
+                state.finish(false);
+                let error = format!("unexpected frame type {} in a response body", next.kind);
+                Some((Err(BoxError::from(error)), state))
             }
-        }
-        Ok(Some(next)) => {
-            state.finish(false);
-            let error = format!("unexpected frame type {} in a response body", next.kind);
-            Some((Err(BoxError::from(error)), state))
-        }
-        Ok(None) => {
-            state.finish(false);
-            Some((
-                Err(BoxError::from("the worker closed the connection")),
-                state,
-            ))
-        }
-        Err(error) => {
-            state.finish(false);
-            Some((Err(BoxError::from(error)), state))
-        }
+            Ok(None) => {
+                state.finish(false);
+                Some((
+                    Err(BoxError::from("the worker closed the connection")),
+                    state,
+                ))
+            }
+            Err(error) => {
+                state.finish(false);
+                Some((Err(BoxError::from(error)), state))
+            }
+        };
     }
 }
 
 /// Send the request body as BODY frames, then END. If the response ends
 /// first, or the client goes away, send ABORT instead and discard what
 /// remains of the body.
-async fn pump_body(mut body: Incoming, mut writer: Writer, back: Arc<Return>) {
+async fn pump_body(mut body: Incoming, mut writer: Writer, back: Arc<Return>, expect: bool) {
+    if expect {
+        // hyper sends 100 Continue when the body is first polled, so hold
+        // off until the worker says the application is reading. If the
+        // response ends first the client is never told to send the body,
+        // and there is nothing to discard.
+        tokio::select! {
+            _ = back.proceed.notified() => {}
+            _ = back.abort.notified() => {
+                abort(body, writer, back, false).await;
+                return;
+            }
+        }
+    }
     loop {
         let next = tokio::select! {
             next = body.frame() => next,
             _ = back.abort.notified() => {
-                abort(body, writer, back).await;
+                abort(body, writer, back, true).await;
                 return;
             }
         };
@@ -427,7 +555,7 @@ async fn pump_body(mut body: Incoming, mut writer: Writer, back: Arc<Return>) {
             Some(Err(_)) => {
                 // The client went away mid-body. The worker learns by ABORT
                 // and the connection stays in the pool.
-                abort(body, writer, back).await;
+                abort(body, writer, back, true).await;
                 return;
             }
             None => break,
@@ -445,10 +573,13 @@ async fn pump_body(mut body: Incoming, mut writer: Writer, back: Arc<Return>) {
     back.give_writer(Some(writer));
 }
 
-/// End the request direction with ABORT, return the writer, and discard
-/// what the client still sends within the limits, so that its connection
-/// can be kept alive when the body was small.
-async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>) {
+/// End the request direction with ABORT and return the writer. When the
+/// client may be sending the body, discard what it still sends within the
+/// limits, so that its connection can be kept alive when the body was
+/// small. A client still waiting for 100 Continue has sent nothing; its
+/// body is left unread and hyper closes the connection after the
+/// response, since the body may yet follow.
+async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_rest: bool) {
     let payload = pb::Abort::default().encode_to_vec();
     match frame::write(&mut writer, kind::ABORT, 0, payload.into()).await {
         Ok(()) => back.give_writer(Some(writer)),
@@ -458,7 +589,9 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>) {
     // hyper closes the client connection after the response if the body is
     // left unread, so read a bounded amount first. Dropping the body past
     // the limit lets hyper close it.
-    let _ = tokio::time::timeout(DISCARD_DELAY, discard(body)).await;
+    if discard_rest {
+        let _ = tokio::time::timeout(DISCARD_DELAY, discard(body)).await;
+    }
 }
 
 async fn discard(mut body: Incoming) {

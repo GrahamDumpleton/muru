@@ -55,6 +55,7 @@ message RequestHead {
   bool precheck = 23;
   string http_version = 24;         // for example HTTP/1.1, for SERVER_PROTOCOL
   Scope scope = 25;                 // http unless the request is a WebSocket upgrade
+  bool expect_continue = 26;        // the client waits for 100 Continue before sending the body (section 5.5)
 }
 
 // What a REQUEST frame opens (section 5.6).

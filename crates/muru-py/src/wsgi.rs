@@ -40,6 +40,8 @@ pub enum Outgoing {
     Body(Bytes),
     /// The application failed after the head was sent; end the stream with an error.
     Abort(String),
+    /// The application has started reading the request body (section 5.5).
+    Continue,
 }
 
 /// Sends output to the coalescing task, detaching from the interpreter only
@@ -387,6 +389,9 @@ struct InputState {
     rx: mpsc::Receiver<Bytes>,
     pending: Bytes,
     eof: bool,
+    /// Where to announce the first read, when the client is waiting for
+    /// 100 Continue before it sends the body (section 5.5).
+    announce: Option<mpsc::Sender<Outgoing>>,
 }
 
 impl InputState {
@@ -397,6 +402,13 @@ impl InputState {
         }
         if self.eof {
             return false;
+        }
+        if let Some(tx) = self.announce.take()
+            && let Err(TrySendError::Full(item)) = tx.try_send(Outgoing::Continue)
+        {
+            py.detach(|| {
+                let _ = tx.blocking_send(item);
+            });
         }
         let next = match self.rx.try_recv() {
             Ok(data) => Some(data),
@@ -461,12 +473,13 @@ pub struct Input {
 }
 
 impl Input {
-    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+    fn new(rx: mpsc::Receiver<Bytes>, announce: Option<mpsc::Sender<Outgoing>>) -> Self {
         Self {
             state: Mutex::new(InputState {
                 rx,
                 pending: Bytes::new(),
                 eof: false,
+                announce,
             }),
         }
     }
@@ -631,6 +644,13 @@ fn build_environ<'py>(
             None => environ.set_item(key, value)?,
         }
     }
+    // A body the edge buffered has a length even when the client sent
+    // none (chunked_body = buffer in section 4.6).
+    if let Some(length) = head.content_length
+        && environ.get_item(intern!(py, "CONTENT_LENGTH"))?.is_none()
+    {
+        environ.set_item(intern!(py, "CONTENT_LENGTH"), length.to_string())?;
+    }
     environ.set_item(intern!(py, "wsgi.version"), (1, 0))?;
     let scheme = if head.scheme.is_empty() {
         "http"
@@ -661,6 +681,7 @@ pub fn run(
     tx: mpsc::Sender<Outgoing>,
     cancelled: Arc<AtomicBool>,
 ) {
+    let announce = head.expect_continue.then(|| tx.clone());
     let start_response = match Bound::new(py, StartResponse::new(tx)) {
         Ok(start_response) => start_response,
         Err(error) => {
@@ -669,7 +690,15 @@ pub fn run(
         }
     };
 
-    if let Err(error) = run_app(py, shared, &head, body_rx, &start_response, &cancelled) {
+    if let Err(error) = run_app(
+        py,
+        shared,
+        &head,
+        body_rx,
+        announce,
+        &start_response,
+        &cancelled,
+    ) {
         let broken_pipe = error.is_instance_of::<PyBrokenPipeError>(py);
         if !broken_pipe {
             report(py, &error);
@@ -688,10 +717,11 @@ fn run_app<'py>(
     shared: &Shared,
     head: &pb::RequestHead,
     body_rx: mpsc::Receiver<Bytes>,
+    announce: Option<mpsc::Sender<Outgoing>>,
     start_response: &Bound<'py, StartResponse>,
     cancelled: &AtomicBool,
 ) -> PyResult<()> {
-    let input = Bound::new(py, Input::new(body_rx))?;
+    let input = Bound::new(py, Input::new(body_rx, announce))?;
     let environ = build_environ(py, shared, head, input)?;
     let result = shared.app.bind(py).call1((environ, start_response))?;
     let outcome = iterate(py, &result, start_response.get(), cancelled);
