@@ -188,11 +188,81 @@ MISBEHAVING = (
 )
 
 
+async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
+    """The WebSocket routes: echo, subprotocols, declines, closes and errors."""
+
+    path = scope["path"]
+    message = await receive()
+    assert message["type"] == "websocket.connect"
+
+    if path == "/ws/decline":
+        # Closing before accepting declines the handshake with 403.
+        await send({"type": "websocket.close"})
+        return
+    if path == "/ws/http-decline":
+        body = b"no socket for you\n"
+        await send(
+            {
+                "type": "websocket.http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"text/plain"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "websocket.http.response.body", "body": body})
+        return
+    if path == "/ws/return":
+        return
+
+    subprotocol = scope["subprotocols"][0] if scope["subprotocols"] else None
+    await send(
+        {"type": "websocket.accept", "subprotocol": subprotocol, "headers": [(b"x-ws", b"yes")]}
+    )
+
+    if path == "/ws/scope":
+        report = {
+            key: value.decode("latin-1") if isinstance(value, bytes) else value
+            for key, value in scope.items()
+            if key not in ("headers", "state", "extensions")
+        }
+        report["headers"] = [[name.decode(), value.decode()] for name, value in scope["headers"]]
+        report["extensions"] = sorted(scope["extensions"])
+        report["state"] = scope["state"]
+        await send({"type": "websocket.send", "text": json.dumps(report)})
+        await send({"type": "websocket.close"})
+        return
+    if path == "/ws/close-code":
+        await send({"type": "websocket.close", "code": 4001, "reason": "custom"})
+        return
+    if path == "/ws/error":
+        raise RuntimeError("deliberate failure on the socket")
+    if path == "/ws/send-after-close":
+        await send({"type": "websocket.close"})
+        await send({"type": "websocket.send", "text": "late"})
+        return
+
+    # Echo until the client goes away, then say how it ended on stdout.
+    while True:
+        message = await receive()
+        if message["type"] == "websocket.disconnect":
+            print(f"websocket disconnected with {message['code']}", flush=True)
+            return
+        if message.get("text") is not None:
+            await send({"type": "websocket.send", "text": message["text"]})
+        else:
+            await send({"type": "websocket.send", "bytes": message["bytes"]})
+
+
 async def application(scope: Scope, receive: Receive, send: Send) -> None:
     """Route by path; see each helper for what the routes do."""
 
     if scope["type"] == "lifespan":
         await lifespan(scope, receive, send)
+        return
+    if scope["type"] == "websocket":
+        await websocket(scope, receive, send)
         return
     assert scope["type"] == "http"
 

@@ -54,8 +54,8 @@ const DISCARD_DELAY: Duration = Duration::from_secs(2);
 /// exceeded.
 pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 
-type Reader = BufReader<OwnedReadHalf>;
-type Writer = OwnedWriteHalf;
+pub(crate) type Reader = BufReader<OwnedReadHalf>;
+pub(crate) type Writer = OwnedWriteHalf;
 
 /// One idle connection to a worker.
 struct Conn {
@@ -67,6 +67,8 @@ struct WorkerSlots {
     path: PathBuf,
     /// What the worker called itself in HELLO (wsgi or asgi), informational.
     worker_type: String,
+    /// Whether it accepts websocket scopes (section 5.6).
+    websockets: bool,
     /// Requests the worker takes at once, from its HELLO: its threads for
     /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
@@ -100,6 +102,8 @@ struct Lease {
     conn: Conn,
     permit: OwnedSemaphorePermit,
     worker: usize,
+    /// Whether the worker accepts websocket scopes.
+    websockets: bool,
 }
 
 impl LinkPool {
@@ -122,6 +126,7 @@ impl LinkPool {
             workers.push(WorkerSlots {
                 path: path.clone(),
                 worker_type: hello.worker_type,
+                websockets: hello.websockets,
                 slots,
                 semaphore: Arc::new(Semaphore::new(slots)),
                 idle: Mutex::new(vec![conn]),
@@ -177,6 +182,7 @@ impl LinkPool {
             conn,
             permit,
             worker: best,
+            websockets: worker.websockets,
         })
     }
 
@@ -228,7 +234,7 @@ async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
 /// Collects the two halves of a leased connection as each direction
 /// finishes, and returns the connection to the pool when both are back
 /// intact. A half reported as broken closes the connection instead.
-struct Return {
+pub(crate) struct Return {
     pool: Arc<LinkPool>,
     worker: usize,
     state: Mutex<ReturnState>,
@@ -284,14 +290,26 @@ impl Return {
         self.proceed.notify_one();
     }
 
-    fn give_reader(&self, reader: Option<Reader>) {
+    pub(crate) fn give_reader(&self, reader: Option<Reader>) {
         self.ended.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().expect("return state poisoned");
         state.reader = reader;
         self.report(&mut state);
     }
 
-    fn give_writer(&self, writer: Option<Writer>) {
+    /// Take the writer back for a WebSocket relay, which holds both halves
+    /// until the socket ends. The earlier report is undone.
+    pub(crate) fn take_writer(&self) -> Option<Writer> {
+        let mut state = self.state.lock().expect("return state poisoned");
+        let writer = state.writer.take();
+        if writer.is_some() {
+            state.reported = state.reported.saturating_sub(1);
+        }
+
+        writer
+    }
+
+    pub(crate) fn give_writer(&self, writer: Option<Writer>) {
         let mut state = self.state.lock().expect("return state poisoned");
         state.writer = writer;
         self.report(&mut state);
@@ -363,7 +381,7 @@ pub struct Context<'a> {
 }
 
 /// The access log record of a request in progress.
-struct Recording {
+pub(crate) struct Recording {
     log: Arc<AccessLog>,
     record: Record,
     started: Instant,
@@ -395,7 +413,7 @@ impl Recording {
         }
     }
 
-    fn complete(mut self, status: u16, reason: &str, bytes: u64) {
+    pub(crate) fn complete(mut self, status: u16, reason: &str, bytes: u64) {
         self.record.status = status;
         self.record.reason = reason.to_owned();
         self.record.bytes = bytes;
@@ -469,7 +487,8 @@ pub async fn handle(
     pool: Arc<LinkPool>,
     context: &Context<'_>,
 ) -> Response<ResponseBody> {
-    let (parts, mut body) = request.into_parts();
+    let (mut parts, mut body) = request.into_parts();
+    let upgrade = crate::websocket::detect(&mut parts);
     let mut head = request_head(&parts, context);
     let limits = &context.limits;
     let arrived = Instant::now();
@@ -555,6 +574,7 @@ pub async fn handle(
         conn,
         permit,
         worker,
+        websockets,
     } = lease;
     let Conn {
         mut reader,
@@ -564,9 +584,16 @@ pub async fn handle(
     recording.record.queue = queued.elapsed();
     let dispatched = Instant::now();
 
-    let end = buffered
-        .as_ref()
-        .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
+    // Section 5.6: a worker that takes websocket scopes gets the upgrade as
+    // one, with no body; any other worker sees an ordinary request.
+    let upgrade = upgrade.filter(|_| websockets);
+    if upgrade.is_some() {
+        head.scope = pb::Scope::Websocket as i32;
+    }
+    let end = upgrade.is_some()
+        || buffered
+            .as_ref()
+            .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
     let flags = if end { flag::END } else { 0 };
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
     if let Err(error) = frame::write(
@@ -584,6 +611,7 @@ pub async fn handle(
 
     let back = Return::new(pool, worker, permit);
     match buffered {
+        _ if upgrade.is_some() => back.give_writer(Some(writer)),
         Some(data) if !data.is_empty() => {
             match frame::write(&mut writer, kind::BODY, flag::END, data).await {
                 Ok(()) => back.give_writer(Some(writer)),
@@ -664,6 +692,28 @@ pub async fn handle(
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
+    }
+
+    // The worker accepted the WebSocket: finish the handshake and relay
+    // messages for the life of the socket on the leased connection. Any
+    // other answer is the response to the upgrade, sent as usual.
+    if let Some(upgrade) = upgrade
+        && head.status == 101
+    {
+        let Some(writer) = back.take_writer() else {
+            back.give_reader(None);
+            return failing.worker_crashed("The worker connection was lost.");
+        };
+        let response = crate::websocket::accepted_response(&upgrade, head.headers);
+        tokio::spawn(crate::websocket::relay(crate::websocket::Relay {
+            upgrade,
+            reader,
+            writer,
+            back,
+            recording,
+            limits: Arc::clone(&context.limits),
+        }));
+        return response;
     }
 
     let mut builder = Response::builder().status(crate::status_code(head.status));

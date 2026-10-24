@@ -111,6 +111,14 @@ message End {
   string detail = 4;                // the traceback or similar, shown by the edge in development mode only
 }
 
+// Payload of a CLOSE frame in either direction: the end of a WebSocket
+// (section 5.6). Edge to worker it is websocket.disconnect; worker to edge
+// it is the application closing.
+message Close {
+  uint32 code = 1;                  // a WebSocket close code, 1000 when none was given
+  string reason = 2;
+}
+
 // Payload of an ABORT frame, edge to worker: the client has gone, or the
 // response ended before the request body did (section 5.5).
 message Abort {

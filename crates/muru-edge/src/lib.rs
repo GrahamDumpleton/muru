@@ -32,6 +32,7 @@ pub mod access;
 pub mod errors;
 pub mod link;
 pub mod tls;
+pub mod websocket;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -86,6 +87,13 @@ pub struct Limits {
     pub body_idle_timeout: Duration,
     /// How long a worker may pause mid-response before it is cut off.
     pub response_idle_timeout: Duration,
+    /// Largest WebSocket message accepted from a client, else close 1009
+    /// (websocket.max_message_size in section 4.18).
+    pub websocket_max_message_size: usize,
+    /// How often an idle WebSocket client is pinged.
+    pub websocket_ping_interval: Duration,
+    /// How long a WebSocket may stay silent before it is closed with 1001.
+    pub websocket_idle_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -99,6 +107,9 @@ impl Default for Limits {
             request_deadline: Duration::from_secs(300),
             body_idle_timeout: Duration::from_secs(60),
             response_idle_timeout: Duration::from_secs(60),
+            websocket_max_message_size: 1024 * 1024,
+            websocket_ping_interval: Duration::from_secs(30),
+            websocket_idle_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -201,7 +212,9 @@ impl Edge {
             .http2()
             .timer(TokioTimer::new())
             .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
-            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX));
+            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX))
+            // RFC 8441: WebSockets over HTTP/2 arrive as extended CONNECT.
+            .enable_connect_protocol();
         Ok(Self {
             http,
             local,
@@ -334,7 +347,10 @@ async fn serve<I>(
             Ok::<_, Infallible>(response)
         }
     });
-    let connection = state.protocols.serve_connection(TokioIo::new(io), service);
+    // With upgrades, so a 101 hands the connection over for WebSockets.
+    let connection = state
+        .protocols
+        .serve_connection_with_upgrades(TokioIo::new(io), service);
     if let Err(error) = connection.await {
         tracing::debug!(%peer, %error, "connection ended with an error");
     }

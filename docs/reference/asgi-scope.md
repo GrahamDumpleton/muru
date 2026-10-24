@@ -3,8 +3,8 @@
 ```{admonition} Status
 :class: note
 
-These are the keys development mode sets today, for `http` scopes. The
-`websocket` scope, the `tls` extension and the keys that arrive with
+These are the keys development mode sets today, for `http` and
+`websocket` scopes. The `tls` extension and the keys that arrive with
 mounts, virtual hosts and the daemon are listed in
 [appendix D](../project/design/appendices/d-environ-keys-scope-extensions-and-environment-variables.md)
 of the design specification.
@@ -18,11 +18,11 @@ Muru fills them and what it adds.
 
 | Key | Value |
 | --- | --- |
-| `type` | `http` |
+| `type` | `http`, or `websocket` for an upgrade |
 | `asgi` | `{"version": "3.0", "spec_version": "2.4"}` |
 | `http_version` | `1.0`, `1.1` or `2`, the client's protocol |
-| `method` | The request method |
-| `scheme` | `http` or `https` |
+| `method` | The request method (`http` scopes only) |
+| `scheme` | `http` or `https`; `ws` or `wss` on a `websocket` scope |
 | `path` | The request path, percent-decoded, including `root_path` |
 | `raw_path` | The path as received, bytes, still encoded |
 | `query_string` | The query string, bytes, still encoded |
@@ -31,6 +31,7 @@ Muru fills them and what it adds.
 | `client` | `(address, port)` of the client |
 | `server` | `(address, port)` of the listener |
 | `state` | A copy, per request, of the dictionary the application filled during lifespan startup |
+| `subprotocols` | On a `websocket` scope: the subprotocols the client offered, in order |
 
 ## Muru's keys
 
@@ -43,7 +44,9 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | `max_body_size` | The body size limit in force, in bytes |
 | `tls` | Over HTTPS only: a dictionary with `version`, `cipher`, `server_name` and `alpn` |
 
-No other extension is advertised yet. Sending `http.response.trailers`,
+A `websocket` scope also advertises `websocket.http.response`, so the
+application may decline the handshake with a response of its own. No
+other extension is advertised yet. Sending `http.response.trailers`,
 `http.response.pathsend` or `http.response.zerocopysend` raises
 `RuntimeError`, as it would under any server that does not announce them.
 
@@ -56,3 +59,10 @@ and `headers` (an iterable of `(name, value)` byte pairs, with the same
 rules as WSGI headers: no spaces or control characters in names, no CR or
 LF in values, a numeric `Content-Length`), and `http.response.body` with
 `body` and `more_body`.
+
+On a `websocket` scope, `receive()` returns `websocket.connect`, then
+`websocket.receive` messages with `text` or `bytes`, then
+`websocket.disconnect` with the close `code` and `reason`. `send()` takes
+`websocket.accept` (`subprotocol`, `headers`), `websocket.send` (`text` or
+`bytes`), `websocket.close` (`code`, `reason`) and, before accepting,
+`websocket.http.response.start` and `websocket.http.response.body`.

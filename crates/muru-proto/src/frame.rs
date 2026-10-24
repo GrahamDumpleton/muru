@@ -34,8 +34,14 @@ pub mod kind {
     /// may tell a client waiting on Expect: 100-continue to send it
     /// (empty payload), worker to edge.
     pub const CONTINUE: u8 = 7;
-    // Kinds 8 and up are reserved for MESSAGE, CLOSE, INFORMATIONAL, FILE
-    // and DETACH (design specification section 5.2).
+    /// One whole WebSocket message, raw bytes, in either direction; the
+    /// TEXT flag says which kind (section 5.6).
+    pub const MESSAGE: u8 = 8;
+    /// Closes a WebSocket with a code and reason (protobuf `Close`), in
+    /// either direction; each side sends exactly one (section 5.6).
+    pub const CLOSE: u8 = 9;
+    // Kinds 10 and up are reserved for INFORMATIONAL, FILE and DETACH
+    // (design specification section 5.2).
 }
 
 /// Frame flags.
@@ -43,6 +49,9 @@ pub mod flag {
     /// Set on a REQUEST, RESPONSE or BODY frame that is the last frame of its
     /// direction, so no END frame follows.
     pub const END: u8 = 0x01;
+    /// Set on a MESSAGE frame that carries a text message rather than a
+    /// binary one.
+    pub const TEXT: u8 = 0x02;
 }
 
 /// A decoded frame.

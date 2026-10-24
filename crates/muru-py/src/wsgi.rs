@@ -51,6 +51,20 @@ pub enum Outgoing {
     },
     /// The application has started reading the request body (section 5.5).
     Continue,
+    /// One whole WebSocket message, after a 101 head (section 5.6).
+    Message {
+        /// The message.
+        data: Bytes,
+        /// Text rather than binary.
+        text: bool,
+    },
+    /// The application closes the WebSocket (section 5.6).
+    Close {
+        /// The close code.
+        code: u16,
+        /// The reason, possibly empty.
+        reason: String,
+    },
     /// The request is over: the application returned and its iterable was
     /// closed. Sent explicitly, because the `start_response` object that
     /// also holds a sender can outlive the request when a framework keeps

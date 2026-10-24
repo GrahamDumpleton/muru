@@ -22,11 +22,11 @@ rollback are policy changes, not restarts. The same model runs from
 ## Status
 
 Muru is early in its life. Development mode works: `muructl run` serves a
-WSGI or ASGI application on your machine with HTTP/1.1, HTTP/2 and HTTPS,
-forked workers with an import check before the fork, lifecycle hooks and
-ASGI lifespan, watch reload, an access log and a small dashboard, tested
-with plain WSGI and ASGI, Flask and Django on regular and free-threaded
-Python. WebSockets, the daemon, releases and traffic management are still
+WSGI or ASGI application on your machine with HTTP/1.1, HTTP/2, HTTPS and
+WebSockets, forked workers with an import check before the fork, lifecycle
+hooks and ASGI lifespan, watch reload, an access log and a small dashboard,
+tested with plain WSGI and ASGI, Flask and Django on regular and
+free-threaded Python. The daemon, releases and traffic management are still
 to come; the
 [roadmap](docs/project/roadmap.md) lists the phases. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)

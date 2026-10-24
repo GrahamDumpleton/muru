@@ -3,9 +3,10 @@
 ```{admonition} Status
 :class: note
 
-Development mode serves ASGI over HTTP. WebSockets, response trailers and
-the `pathsend` and `zerocopysend` file extensions are not served yet; a
-WebSocket upgrade reaches the application as an ordinary `http` scope.
+Development mode serves ASGI over HTTP and WebSockets. Response trailers
+and the `pathsend` and `zerocopysend` file extensions are not served yet.
+WebSockets over HTTP/2 (extended CONNECT) are accepted but not yet covered
+by the test suite.
 ```
 
 Point `muructl run` at the ASGI callable, exactly as for WSGI:
@@ -78,6 +79,31 @@ the edge ends the response short. A declared `Content-Length` is enforced:
 output beyond it is dropped, and a body that ends short of it is reported
 in the log. Returning from the application without completing a response
 is a 500 too.
+
+## WebSockets
+
+A WebSocket upgrade reaches the application as a `websocket` scope, with
+`websocket.connect` as the first message from `receive()`. Send
+`websocket.accept`, with a `subprotocol` and `headers` if you like, and
+the edge completes the handshake; from then on each `websocket.receive`
+carries one whole message as `text` or `bytes`, and each `websocket.send`
+goes out as one. The edge owns the wire protocol: pings, pongs, masking
+and fragments never reach the application.
+
+Closing works in both directions. `websocket.close` with a `code` and
+`reason` closes the client's socket with them; a client that closes, or
+goes away, shows up as `websocket.disconnect` with its `code` (1006 for a
+client that vanished without closing). Returning from the application
+closes an open socket with 1000, and an exception closes it with 1011.
+Sending `websocket.close` before accepting declines the handshake with
+403, as does returning without accepting; to decline with a response of
+your own, send `websocket.http.response.start` and
+`websocket.http.response.body` instead.
+
+A message larger than 1 MiB closes the socket with 1009. The edge pings a
+client that has been quiet for 30 seconds and closes a socket that stays
+silent for five minutes with 1001. Open sockets count against the worker's
+`--concurrency`, not against any thread count.
 
 ## Frameworks
 

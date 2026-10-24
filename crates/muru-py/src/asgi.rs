@@ -41,8 +41,13 @@ pub struct Asgi {
 enum Message {
     /// A chunk of the request body, the last when `more` is false.
     Body { data: Bytes, more: bool },
-    /// The client went away, or the response is complete.
-    Disconnect,
+    /// The WebSocket handshake has arrived (section 5.6).
+    Connect,
+    /// One WebSocket message from the client.
+    Received { data: Bytes, text: bool },
+    /// The client went away, or the response is complete. On a WebSocket
+    /// the close code and reason say how it ended.
+    Disconnect { code: u16, reason: String },
 }
 
 /// Messages waiting for the application, and the application waiting for
@@ -53,6 +58,8 @@ struct Inbox {
     waiter: Option<Py<PyAny>>,
     /// No more body will arrive: every later `receive()` gets a disconnect.
     closed: bool,
+    /// How a WebSocket ended, for the disconnect message.
+    close: (u16, String),
 }
 
 /// What the application has sent so far.
@@ -60,6 +67,10 @@ struct Inbox {
 struct SendState {
     head_sent: bool,
     body_ended: bool,
+    /// The WebSocket is accepted: a 101 went out.
+    accepted: bool,
+    /// The application has closed the WebSocket.
+    closed: bool,
 }
 
 /// Body chunks held for the application before the link stops reading.
@@ -81,15 +92,25 @@ pub struct Channel {
     completed: AtomicBool,
     /// The client is waiting for 100 Continue until the application reads.
     announce: AtomicBool,
+    /// The request is a WebSocket upgrade (section 5.6).
+    websocket: bool,
+    /// Mirrors `SendState.accepted`, for the link's read side.
+    accepted: AtomicBool,
 }
 
 impl Channel {
-    fn new(py: Python<'_>, asgi: &Asgi, tx: mpsc::Sender<Outgoing>, expect_continue: bool) -> Self {
+    fn new(
+        py: Python<'_>,
+        asgi: &Asgi,
+        tx: mpsc::Sender<Outgoing>,
+        head: &pb::RequestHead,
+    ) -> Self {
         Self {
             inbox: Mutex::new(Inbox {
                 queue: VecDeque::new(),
                 waiter: None,
                 closed: false,
+                close: (1005, String::new()),
             }),
             state: Mutex::new(SendState::default()),
             tx,
@@ -99,8 +120,34 @@ impl Channel {
             permits: Arc::new(tokio::sync::Semaphore::new(INBOX_CAPACITY)),
             complete: tokio::sync::Notify::new(),
             completed: AtomicBool::new(false),
-            announce: AtomicBool::new(expect_continue),
+            announce: AtomicBool::new(head.expect_continue),
+            websocket: head.scope == pb::Scope::Websocket as i32,
+            accepted: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the application has accepted the WebSocket.
+    pub fn accepted(&self) -> bool {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Hand the WebSocket's connect event to the application.
+    pub async fn deliver_connect(&self) {
+        self.deliver_message_inner(Message::Connect).await;
+    }
+
+    /// Hand one WebSocket message from the client to the application.
+    pub async fn deliver_message(&self, data: Bytes, text: bool) {
+        self.deliver_message_inner(Message::Received { data, text })
+            .await;
+    }
+
+    async fn deliver_message_inner(&self, message: Message) {
+        let Ok(permit) = self.permits.acquire().await else {
+            return;
+        };
+        permit.forget();
+        self.push(message);
     }
 
     /// Hand a body chunk to the application, waiting for room in the inbox.
@@ -129,16 +176,28 @@ impl Channel {
     /// The client has gone, or the response is complete: the next
     /// `receive()` and every one after it gets `http.disconnect`.
     pub fn disconnect(&self) {
+        self.disconnect_with(1005, "");
+    }
+
+    /// The WebSocket has ended with a close code: the next `receive()` and
+    /// every one after it gets `websocket.disconnect`.
+    pub fn disconnect_with(&self, code: u16, reason: &str) {
         let mut inbox = self.inbox.lock().expect("inbox poisoned");
         if inbox.closed {
             return;
         }
         inbox.closed = true;
+        inbox.close = (code, reason.to_owned());
 
         if let Some(waiter) = inbox.waiter.take() {
             drop(inbox);
-            self.wake(waiter, &Message::Disconnect);
+            self.wake(waiter, &self.disconnect_message());
         }
+    }
+
+    fn disconnect_message(&self) -> Message {
+        let (code, reason) = self.inbox.lock().expect("inbox poisoned").close.clone();
+        Message::Disconnect { code, reason }
     }
 
     /// The response is over: release the link from holding body chunks.
@@ -167,7 +226,7 @@ impl Channel {
     /// Complete a waiting future on the loop's thread.
     fn wake(&self, waiter: Py<PyAny>, message: &Message) {
         Python::attach(|py| {
-            let delivered = message_dict(py, message).and_then(|value| {
+            let delivered = message_dict(py, message, self.websocket).and_then(|value| {
                 self.event_loop.bind(py).call_method1(
                     "call_soon_threadsafe",
                     (self.resolver.bind(py), waiter.bind(py), value),
@@ -243,6 +302,173 @@ impl Channel {
     }
 }
 
+impl Channel {
+    /// Handle the websocket.* messages. Returns None for a message that is
+    /// not one of them, which the http handling then takes.
+    fn send_websocket(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        message: &Bound<'_, PyDict>,
+        state: &mut SendState,
+    ) -> PyResult<Option<Option<Py<PyAny>>>> {
+        match kind {
+            "websocket.accept" => {
+                if state.accepted || state.closed || state.head_sent {
+                    return Err(PyRuntimeError::new_err(
+                        "websocket.accept sent after the WebSocket was accepted or closed",
+                    ));
+                }
+
+                // The subprotocol and any headers the application chose go
+                // out with the 101.
+                let mut headers = match message.get_item("headers")? {
+                    Some(headers) if !headers.is_none() => validate_headers(&headers)?,
+                    _ => Vec::new(),
+                };
+                if let Some(subprotocol) = message.get_item("subprotocol")?
+                    && !subprotocol.is_none()
+                {
+                    let subprotocol = subprotocol.extract::<String>().map_err(|_| {
+                        PyTypeError::new_err("websocket.accept subprotocol must be a str")
+                    })?;
+                    headers.push((b"sec-websocket-protocol".to_vec(), subprotocol.into_bytes()));
+                }
+
+                state.accepted = true;
+                state.head_sent = true;
+                self.accepted.store(true, Ordering::Relaxed);
+                let head = Outgoing::Head {
+                    status: 101,
+                    reason: String::new(),
+                    headers,
+                    flush: pb::FlushPolicy::Immediate,
+                };
+                Ok(Some(self.enqueue(py, vec![head])?))
+            }
+            "websocket.send" => {
+                if !state.accepted {
+                    return Err(PyRuntimeError::new_err(
+                        "websocket.send sent before websocket.accept",
+                    ));
+                }
+                if state.closed {
+                    return Err(PyRuntimeError::new_err(
+                        "websocket.send sent after the WebSocket was closed",
+                    ));
+                }
+
+                // Exactly one of bytes and text carries the message.
+                let bytes = message.get_item("bytes")?.filter(|value| !value.is_none());
+                let text = message.get_item("text")?.filter(|value| !value.is_none());
+                let outgoing = match (bytes, text) {
+                    (Some(bytes), None) => {
+                        let Ok(bytes) = bytes.cast::<PyBytes>() else {
+                            return Err(PyTypeError::new_err("websocket.send bytes must be bytes"));
+                        };
+                        Outgoing::Message {
+                            data: wsgi::bytes_from_py(bytes),
+                            text: false,
+                        }
+                    }
+                    (None, Some(text)) => {
+                        let text = text.extract::<String>().map_err(|_| {
+                            PyTypeError::new_err("websocket.send text must be a str")
+                        })?;
+                        Outgoing::Message {
+                            data: Bytes::from(text),
+                            text: true,
+                        }
+                    }
+                    _ => {
+                        return Err(PyValueError::new_err(
+                            "websocket.send needs exactly one of bytes and text",
+                        ));
+                    }
+                };
+                Ok(Some(self.enqueue(py, vec![outgoing])?))
+            }
+            "websocket.close" => {
+                if state.closed || state.body_ended {
+                    return Err(PyRuntimeError::new_err(
+                        "websocket.close sent after the WebSocket was closed",
+                    ));
+                }
+
+                let code = match message.get_item("code")? {
+                    Some(code) if !code.is_none() => code
+                        .extract::<u16>()
+                        .map_err(|_| PyTypeError::new_err("websocket.close code must be an int"))?,
+                    _ => 1000,
+                };
+                let reason = match message.get_item("reason")? {
+                    Some(reason) if !reason.is_none() => {
+                        reason.extract::<String>().map_err(|_| {
+                            PyTypeError::new_err("websocket.close reason must be a str")
+                        })?
+                    }
+                    _ => String::new(),
+                };
+                state.closed = true;
+
+                // Closing before accepting declines the handshake with 403.
+                if !state.accepted {
+                    state.head_sent = true;
+                    state.body_ended = true;
+                    return Ok(Some(self.enqueue(
+                        py,
+                        vec![
+                            Outgoing::Head {
+                                status: 403,
+                                reason: String::new(),
+                                headers: vec![(b"content-length".to_vec(), b"0".to_vec())],
+                                flush: pb::FlushPolicy::Unspecified,
+                            },
+                            Outgoing::Finished,
+                        ],
+                    )?));
+                }
+                Ok(Some(
+                    self.enqueue(py, vec![Outgoing::Close { code, reason }])?,
+                ))
+            }
+            "websocket.http.response.start" | "websocket.http.response.body" => {
+                if state.accepted {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} sent after the WebSocket was accepted"
+                    )));
+                }
+                // The websocket.http.response extension: an ordinary
+                // response declines the handshake.
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Answer the upgrade with an empty response of this status.
+    fn decline(&self, py: Python<'_>, status: u32) {
+        let mut state = self.state.lock().expect("send state poisoned");
+        state.head_sent = true;
+        state.body_ended = true;
+        state.closed = true;
+        drop(state);
+
+        let _ = self.enqueue(
+            py,
+            vec![
+                Outgoing::Head {
+                    status,
+                    reason: String::new(),
+                    headers: vec![(b"content-length".to_vec(), b"0".to_vec())],
+                    flush: pb::FlushPolicy::Unspecified,
+                },
+                Outgoing::Finished,
+            ],
+        );
+    }
+}
+
 #[pymethods]
 impl Channel {
     /// Return a future for the next event: `http.request` with a body
@@ -262,10 +488,12 @@ impl Channel {
         if let Some(message) = inbox.queue.pop_front() {
             drop(inbox);
             self.permits.add_permits(1);
-            future.call_method1("set_result", (message_dict(py, &message)?,))?;
+            future.call_method1("set_result", (message_dict(py, &message, self.websocket)?,))?;
         } else if inbox.closed {
+            let (code, reason) = inbox.close.clone();
             drop(inbox);
-            future.call_method1("set_result", (message_dict(py, &Message::Disconnect)?,))?;
+            let message = Message::Disconnect { code, reason };
+            future.call_method1("set_result", (message_dict(py, &message, self.websocket)?,))?;
         } else {
             inbox.waiter = Some(future.clone().unbind());
         }
@@ -283,6 +511,12 @@ impl Channel {
             .map_err(|_| PyTypeError::new_err("ASGI message type must be a str"))?;
 
         let mut state = self.state.lock().expect("send state poisoned");
+        if self.websocket
+            && let Some(result) = self.send_websocket(py, &kind, message, &mut state)?
+        {
+            return Ok(result);
+        }
+        let kind = kind.strip_prefix("websocket.").unwrap_or(&kind).to_owned();
         match kind.as_str() {
             "http.response.start" => {
                 if state.head_sent {
@@ -370,13 +604,29 @@ impl Channel {
     }
 
     /// Record that the application returned. A response that never
-    /// started, or never finished, is an error the edge reports.
+    /// started, or never finished, is an error the edge reports; a
+    /// WebSocket left open is closed, and one never accepted is declined.
     fn finish(&self, py: Python<'_>) {
         let state = self.state.lock().expect("send state poisoned");
         let (head_sent, body_ended) = (state.head_sent, state.body_ended);
+        let (accepted, closed) = (state.accepted, state.closed);
         drop(state);
 
-        if body_ended {
+        if body_ended || closed {
+            return;
+        }
+        if accepted {
+            let _ = self.enqueue(
+                py,
+                vec![Outgoing::Close {
+                    code: 1000,
+                    reason: String::new(),
+                }],
+            );
+            return;
+        }
+        if self.websocket && !head_sent {
+            self.decline(py, 403);
             return;
         }
         let error = if head_sent {
@@ -391,11 +641,24 @@ impl Channel {
     /// formatted traceback, shown by the edge in development mode when no
     /// output had reached it.
     fn fail(&self, py: Python<'_>, detail: String) {
-        let body_ended = self.state.lock().expect("send state poisoned").body_ended;
-        if body_ended {
+        let state = self.state.lock().expect("send state poisoned");
+        let (body_ended, accepted, closed) = (state.body_ended, state.accepted, state.closed);
+        drop(state);
+        if body_ended || closed {
             return;
         }
 
+        // An accepted WebSocket ends with 1011; anything else is a 500.
+        if accepted {
+            let _ = self.enqueue(
+                py,
+                vec![Outgoing::Close {
+                    code: 1011,
+                    reason: "internal error".to_owned(),
+                }],
+            );
+            return;
+        }
         self.abort(py, "the application raised an exception", detail);
     }
 }
@@ -412,7 +675,11 @@ pub fn resolve_future(future: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> Py
 }
 
 /// Build the dictionary the application receives for a message.
-fn message_dict<'py>(py: Python<'py>, message: &Message) -> PyResult<Bound<'py, PyDict>> {
+fn message_dict<'py>(
+    py: Python<'py>,
+    message: &Message,
+    websocket: bool,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     match message {
         Message::Body { data, more } => {
@@ -420,7 +687,25 @@ fn message_dict<'py>(py: Python<'py>, message: &Message) -> PyResult<Bound<'py, 
             dict.set_item("body", PyBytes::new(py, data))?;
             dict.set_item("more_body", *more)?;
         }
-        Message::Disconnect => {
+        Message::Connect => {
+            dict.set_item("type", "websocket.connect")?;
+        }
+        Message::Received { data, text } => {
+            dict.set_item("type", "websocket.receive")?;
+            if *text {
+                dict.set_item("text", String::from_utf8_lossy(data).as_ref())?;
+                dict.set_item("bytes", py.None())?;
+            } else {
+                dict.set_item("bytes", PyBytes::new(py, data))?;
+                dict.set_item("text", py.None())?;
+            }
+        }
+        Message::Disconnect { code, reason } if websocket => {
+            dict.set_item("type", "websocket.disconnect")?;
+            dict.set_item("code", *code)?;
+            dict.set_item("reason", reason)?;
+        }
+        Message::Disconnect { .. } => {
             dict.set_item("type", "http.disconnect")?;
         }
     }
@@ -483,8 +768,9 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
 
 /// Build the http scope (Appendix D.2) from the request head.
 fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'py, PyDict>> {
+    let websocket = head.scope == pb::Scope::Websocket as i32;
     let scope = PyDict::new(py);
-    scope.set_item("type", "http")?;
+    scope.set_item("type", if websocket { "websocket" } else { "http" })?;
     let asgi = PyDict::new(py);
     asgi.set_item("version", "3.0")?;
     asgi.set_item("spec_version", "2.4")?;
@@ -498,13 +784,17 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         .filter(|version| !version.is_empty())
         .unwrap_or("1.1");
     scope.set_item("http_version", version)?;
-    scope.set_item("method", &head.method)?;
     let scheme = if head.scheme.is_empty() {
         "http"
     } else {
         head.scheme.as_str()
     };
-    scope.set_item("scheme", scheme)?;
+    if websocket {
+        scope.set_item("scheme", if scheme == "https" { "wss" } else { "ws" })?;
+    } else {
+        scope.set_item("method", &head.method)?;
+        scope.set_item("scheme", scheme)?;
+    }
     let path = wsgi::percent_decode(&head.raw_path);
     scope.set_item("path", String::from_utf8_lossy(&path).as_ref())?;
     scope.set_item("raw_path", PyBytes::new(py, &head.raw_path))?;
@@ -516,8 +806,13 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     // (chunked_body = buffer in section 4.6).
     let headers = PyList::empty(py);
     let mut has_length = false;
+    let mut subprotocols: Vec<String> = Vec::new();
     for header in &head.headers {
         has_length |= header.name.eq_ignore_ascii_case(b"content-length");
+        if header.name.eq_ignore_ascii_case(b"sec-websocket-protocol") {
+            let offered = String::from_utf8_lossy(&header.value);
+            subprotocols.extend(offered.split(',').map(|name| name.trim().to_owned()));
+        }
         headers.append(PyTuple::new(
             py,
             [
@@ -538,6 +833,9 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         )?)?;
     }
     scope.set_item("headers", headers)?;
+    if websocket {
+        scope.set_item("subprotocols", subprotocols)?;
+    }
 
     // The peers, and the state the runner fills from the lifespan.
     scope.set_item(
@@ -571,6 +869,10 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     }
     let extensions = PyDict::new(py);
     extensions.set_item("muru", muru)?;
+    if websocket {
+        // Declining the handshake with a full response (section 5.6).
+        extensions.set_item("websocket.http.response", PyDict::new(py))?;
+    }
     scope.set_item("extensions", extensions)?;
 
     Ok(scope)
@@ -587,8 +889,8 @@ pub fn start(
 ) -> Result<Py<Channel>, String> {
     let _ = shared;
     Python::attach(|py| {
-        let channel = Bound::new(py, Channel::new(py, asgi, tx, head.expect_continue))
-            .map_err(|error| error.to_string())?;
+        let channel =
+            Bound::new(py, Channel::new(py, asgi, tx, head)).map_err(|error| error.to_string())?;
         let scope = build_scope(py, head).map_err(|error| error.to_string())?;
 
         asgi.event_loop
