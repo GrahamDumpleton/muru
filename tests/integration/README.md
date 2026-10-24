@@ -19,6 +19,9 @@ design specification and are added as the features they cover land:
   changes, keeping the previous one when the new import fails, and ignoring
   files outside the patterns.
 
+- `test_limits.py`: the queue, deadline, body idle and header read
+  timeouts, shortened with `--timeout`.
+
 Run with `just test-integration`. Scenarios that need Docker, network, root or
 a long time carry markers and are skipped by default. Helpers for starting
 muructl and talking to it are in `tests/support`.

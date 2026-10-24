@@ -39,7 +39,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::access::{AccessLog, Record};
 use crate::errors::{self, Negotiation, Problem};
-use crate::{BoxError, ResponseBody, close_after, request_head};
+use crate::{BoxError, Limits, ResponseBody, close_after, request_head};
 
 /// After the response has ended, this much of an unread request body is
 /// read and discarded so the client connection can be kept alive; beyond
@@ -180,6 +180,8 @@ struct Return {
     /// reading the body, so a waiting client may be told to send it.
     proceed: Notify,
     proceeded: AtomicBool,
+    /// Set when the client stopped sending its body for too long.
+    client_stalled: AtomicBool,
 }
 
 struct ReturnState {
@@ -205,6 +207,7 @@ impl Return {
             abort: Notify::new(),
             proceed: Notify::new(),
             proceeded: AtomicBool::new(false),
+            client_stalled: AtomicBool::new(false),
         })
     }
 
@@ -261,6 +264,8 @@ pub struct Context<'a> {
     pub development: bool,
     /// Where the request's record goes once it is complete.
     pub access_log: Arc<AccessLog>,
+    /// The timeouts in force.
+    pub limits: Arc<Limits>,
 }
 
 /// The access log record of a request in progress.
@@ -313,6 +318,13 @@ pub async fn handle(
 ) -> Response<ResponseBody> {
     let (parts, mut body) = request.into_parts();
     let mut head = request_head(&parts, context.request_id, context.peer, context.local);
+    let limits = &context.limits;
+    let arrived = Instant::now();
+    let deadline = arrived + limits.request_deadline;
+    head.deadline_unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+        .saturating_add(limits.request_deadline.as_millis() as u64);
     let mut recording = Recording::new(context, &parts);
     let failing = Failing {
         request_id: context.request_id,
@@ -359,14 +371,25 @@ pub async fn handle(
     let expect_continue = head.expect_continue && !head.body_buffered;
 
     let queued = Instant::now();
-    let lease = match pool.acquire().await {
-        Ok(lease) => lease,
-        Err(error) => {
+    let lease = match tokio::time::timeout(limits.queue_timeout, pool.acquire()).await {
+        Ok(Ok(lease)) => lease,
+        Ok(Err(error)) => {
             tracing::warn!(%error, "no worker connection");
             let mut problem = Problem::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_workers",
                 "No worker is available to handle the request.",
+            );
+            problem.retry_after = Some(1);
+            *failing.recording.lock().expect("recording poisoned") = Some(recording);
+            return failing.respond(problem);
+        }
+        Err(_) => {
+            // Section 7.6: the queue wait is bounded by queue_timeout.
+            let mut problem = Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue_full",
+                "Every worker stayed busy for the whole queue timeout.",
             );
             problem.retry_after = Some(1);
             *failing.recording.lock().expect("recording poisoned") = Some(recording);
@@ -418,14 +441,46 @@ pub async fn handle(
         Some(_) => back.give_writer(Some(writer)),
         None if end => back.give_writer(Some(writer)),
         None => {
-            tokio::spawn(pump_body(body, writer, Arc::clone(&back), expect_continue));
+            tokio::spawn(pump_body(
+                body,
+                writer,
+                Arc::clone(&back),
+                expect_continue,
+                limits.body_idle_timeout,
+            ));
         }
     }
 
     let response = loop {
-        match frame::read(&mut reader).await {
+        let next = match tokio::time::timeout_at(deadline.into(), frame::read(&mut reader)).await {
+            Ok(next) => next,
+            Err(_) => {
+                // Section 7.6: the deadline cancels the request. Dropping
+                // the connection stops the application's iteration.
+                back.give_reader(None);
+                back.abort_request();
+                return failing.respond(Problem::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "deadline",
+                    "The application did not respond within the request deadline.",
+                ));
+            }
+        };
+        match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
-            Ok(Some(next)) if next.kind == kind::RESPONSE => break next,
+            Ok(Some(next)) if next.kind == kind::RESPONSE => {
+                if back.client_stalled.load(Ordering::Relaxed) {
+                    // The client stopped sending its body; what the worker
+                    // produced for a partial request is not delivered.
+                    back.give_reader(None);
+                    return failing.close(Problem::new(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "client_timeout",
+                        "The request body stopped arriving.",
+                    ));
+                }
+                break next;
+            }
             Ok(Some(next)) if next.kind == kind::END => {
                 // The application failed before producing a head: the
                 // worker says why, and the connection is still good.
@@ -486,6 +541,7 @@ pub async fn handle(
                 back,
                 recording,
                 bytes: 0,
+                idle_timeout: limits.response_idle_timeout,
             },
             next_chunk,
         );
@@ -608,6 +664,7 @@ struct BodyState {
     back: Arc<Return>,
     recording: Option<Recording>,
     bytes: u64,
+    idle_timeout: Duration,
 }
 
 impl BodyState {
@@ -659,8 +716,19 @@ impl Drop for BodyState {
 
 async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxError>, BodyState)> {
     loop {
+        let idle_timeout = state.idle_timeout;
         let reader = state.reader.as_mut()?;
-        return match frame::read(reader).await {
+        let next = match tokio::time::timeout(idle_timeout, frame::read(reader)).await {
+            Ok(next) => next,
+            Err(_) => {
+                state.finish(false);
+                return Some((
+                    Err(BoxError::from("the worker stopped sending the response")),
+                    state,
+                ));
+            }
+        };
+        return match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => {
                 state.back.continue_request();
                 continue;
@@ -704,7 +772,13 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
 /// Send the request body as BODY frames, then END. If the response ends
 /// first, or the client goes away, send ABORT instead and discard what
 /// remains of the body.
-async fn pump_body(mut body: Incoming, mut writer: Writer, back: Arc<Return>, expect: bool) {
+async fn pump_body(
+    mut body: Incoming,
+    mut writer: Writer,
+    back: Arc<Return>,
+    expect: bool,
+    idle_timeout: Duration,
+) {
     if expect {
         // hyper sends 100 Continue when the body is first polled, so hold
         // off until the worker says the application is reading. If the
@@ -720,7 +794,17 @@ async fn pump_body(mut body: Incoming, mut writer: Writer, back: Arc<Return>, ex
     }
     loop {
         let next = tokio::select! {
-            next = body.frame() => next,
+            next = tokio::time::timeout(idle_timeout, body.frame()) => match next {
+                Ok(next) => next,
+                Err(_) => {
+                    // Section 4.6: a client that stops mid-body is treated
+                    // as gone; the response path answers with 408 if the
+                    // worker has not responded yet.
+                    back.client_stalled.store(true, Ordering::Relaxed);
+                    abort(body, writer, back, false).await;
+                    return;
+                }
+            },
             _ = back.abort.notified() => {
                 abort(body, writer, back, true).await;
                 return;

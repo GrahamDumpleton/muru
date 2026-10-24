@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{
@@ -20,7 +21,7 @@ use http::header::{
 use http::{Response, StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use muru_proto::worker::v1 as pb;
 use tokio::net::TcpListener;
@@ -45,6 +46,42 @@ pub struct Config {
     pub development: bool,
     /// Where the access log goes and what it leaves out.
     pub access_log: access::Config,
+    /// Timeouts and header limits.
+    pub limits: Limits,
+}
+
+/// The limits and timeouts of sections 4.6 and 7.6, with their defaults.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// Largest request head accepted, else 431.
+    pub max_header_bytes: usize,
+    /// Most headers accepted in a request, else 431.
+    pub max_headers: usize,
+    /// How long a client may take to send a complete request head.
+    pub header_read_timeout: Duration,
+    /// How long a request may wait for a worker, else 503 queue_full.
+    pub queue_timeout: Duration,
+    /// How long a request may take to produce its response head, else 504.
+    pub request_deadline: Duration,
+    /// How long a client may pause while sending a streamed body before the
+    /// request is abandoned (408 if no response has started).
+    pub body_idle_timeout: Duration,
+    /// How long a worker may pause mid-response before it is cut off.
+    pub response_idle_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_header_bytes: 64 * 1024,
+            max_headers: 100,
+            header_read_timeout: Duration::from_secs(30),
+            queue_timeout: Duration::from_secs(5),
+            request_deadline: Duration::from_secs(300),
+            body_idle_timeout: Duration::from_secs(60),
+            response_idle_timeout: Duration::from_secs(60),
+        }
+    }
 }
 
 /// Concurrent streams accepted per HTTP/2 connection (section 4.18).
@@ -79,6 +116,7 @@ pub struct Edge {
     protocols: Arc<auto::Builder<TokioExecutor>>,
     development: bool,
     access_log: Arc<access::AccessLog>,
+    limits: Arc<Limits>,
 }
 
 impl Edge {
@@ -95,11 +133,20 @@ impl Edge {
         let local = listener.local_addr()?;
         // Each connection is served as HTTP/1.1 or, when it opens with the
         // HTTP/2 preface, as HTTP/2.
+        let limits = Arc::new(config.limits);
         let mut protocols = auto::Builder::new(TokioExecutor::new());
-        protocols.http1().keep_alive(true);
+        protocols
+            .http1()
+            .timer(TokioTimer::new())
+            .keep_alive(true)
+            .max_headers(limits.max_headers)
+            .max_buf_size(limits.max_header_bytes.max(8192))
+            .header_read_timeout(limits.header_read_timeout);
         protocols
             .http2()
-            .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS);
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
+            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX));
         Ok(Self {
             listener,
             local,
@@ -108,6 +155,7 @@ impl Edge {
             protocols: Arc::new(protocols),
             development: config.development,
             access_log,
+            limits,
         })
     }
 
@@ -137,10 +185,12 @@ impl Edge {
             let local = self.local;
             let development = self.development;
             let access_log = Arc::clone(&self.access_log);
+            let limits = Arc::clone(&self.limits);
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
                     let pool = pools.current();
                     let access_log = Arc::clone(&access_log);
+                    let limits = Arc::clone(&limits);
                     let request_id = ids.next();
                     async move {
                         let context = link::Context {
@@ -149,6 +199,7 @@ impl Edge {
                             local,
                             development,
                             access_log,
+                            limits,
                         };
                         let mut response = link::handle(request, pool, &context).await;
                         // Section 4.19: every response names its request.

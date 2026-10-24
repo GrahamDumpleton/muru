@@ -98,6 +98,12 @@ struct RunArgs {
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     slow: Duration,
 
+    /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
+    /// header_read (30s), body_idle (60s) or response_idle (60s).
+    /// Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
+    timeouts: Vec<(String, Duration)>,
+
     /// Start a new release when a watched source file changes.
     #[arg(long)]
     reload: bool,
@@ -217,6 +223,43 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(value * scale))
 }
 
+/// Parse NAME=DURATION for --timeout.
+fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
+    let (name, duration) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example queue=5s"))?;
+    let name = name.trim();
+    if ![
+        "queue",
+        "deadline",
+        "header_read",
+        "body_idle",
+        "response_idle",
+    ]
+    .contains(&name)
+    {
+        return Err(format!(
+            "{name:?} is not a timeout name: queue, deadline, header_read, body_idle or response_idle"
+        ));
+    }
+    Ok((name.to_owned(), parse_duration(duration)?))
+}
+
+fn limits(args: &RunArgs) -> muru_edge::Limits {
+    let mut limits = muru_edge::Limits::default();
+    for (name, duration) in &args.timeouts {
+        match name.as_str() {
+            "queue" => limits.queue_timeout = *duration,
+            "deadline" => limits.request_deadline = *duration,
+            "header_read" => limits.header_read_timeout = *duration,
+            "body_idle" => limits.body_idle_timeout = *duration,
+            "response_idle" => limits.response_idle_timeout = *duration,
+            _ => {}
+        }
+    }
+    limits
+}
+
 fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
     use muru_edge::access::Destination;
 
@@ -286,6 +329,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         slots: args.threads,
         development: true,
         access_log,
+        limits: limits(&args),
     })
     .await?;
     println!(
