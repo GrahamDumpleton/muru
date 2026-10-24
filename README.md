@@ -42,18 +42,17 @@ muructl run app:application      # http://127.0.0.1:8080
 
 ## What it will do
 
-- Serve WSGI and ASGI applications without Apache httpd or nginx, with
+- Serve WSGI and ASGI applications with no separate web server in front:
   HTTP/1.1, HTTP/2, TLS, virtual hosts, static files, uploads and internal
-  redirects handled by the edge.
+  redirects are handled by the edge.
 
 - Deploy without downtime: immutable releases, draining, blue/green,
   canaries with gates, deterministic bucketing, sticky sessions, previews and
   rollback.
 
-- Manage Python processes the way mod_wsgi daemon mode and gunicorn do, and
-  more: preload before fork with hooks, worker groups per path,
-  free-threaded builds, memory policies, soft and hard timeouts, and
-  Python-aware scaling.
+- Manage Python processes: preload before fork with an import check and
+  hooks, worker groups per path, free-threaded builds, memory policies, soft
+  and hard timeouts, and Python-aware scaling.
 
 - Mix WSGI and ASGI in one process: mounts by path, and a WSGI view can
   hand a request to an ASGI application on the event loop, which is how a

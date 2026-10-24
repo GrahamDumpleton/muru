@@ -49,8 +49,7 @@ Python threads with stable identities, so:
 
 - **Thread-local storage survives across requests.** A database connection,
   a parser, or any cache kept in a `threading.local` is reused by every
-  request that lands on that thread, as it is under mod_wsgi. Servers that
-  create a thread per request cannot offer this.
+  request that lands on that thread.
 
 - **The number of threads is the number of requests a worker runs at
   once.** It is also the pool size the edge keeps for the worker, so

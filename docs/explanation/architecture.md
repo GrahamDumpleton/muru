@@ -100,32 +100,21 @@ zero-downtime deploys, canaries and instant rollback routing changes rather
 than restarts. The [releases page](../project/design/09-releases-and-traffic-management.md)
 of the design covers them.
 
-## What the extra hop costs, and why it rarely matters
+## What the hop between edge and worker costs
 
-A server that runs the application inside the process that talks to clients
-avoids one hop. Muru's edge and worker model pays for that hop with one more
-copy of every byte and some tens of microseconds of work per request,
-measured on the worker link with both processes on the same machine.
+Every request crosses from the edge process to a worker process over the
+worker link. That costs one more copy of each byte and some tens of
+microseconds of work per request, measured with both processes on the same
+machine. The link moves several gigabytes per second on a single core, and
+responses that are files are sent by the edge from the file rather than
+through the worker.
 
-In practice that cost disappears behind two larger numbers:
-
-- **Application time.** A Python view that touches a database or renders a
-  template costs milliseconds. The hop is a small fraction of a percent of
-  that. Only an application that does almost nothing per request can see the
-  difference, and such applications are rare outside benchmarks.
-
-- **Network capacity.** The link between edge and worker moves several
-  gigabytes per second on a single core. A large response is limited by the
-  network between the server and its clients long before it is limited by
-  the hop, and large responses that are files bypass the worker entirely
-  because the edge sends them from the file.
-
-What the hop buys is everything the process boundary makes possible: an
-edge that keeps serving while the application is replaced, several versions
-of an application running at once, workers that can be recycled, limited and
+The process boundary is what makes the rest of Muru possible: an edge that
+keeps serving while the application is replaced, several versions of an
+application running at once, workers that are recycled, limited and
 restarted without touching the edge, a different Python version per
-release, and a client-facing process that cannot be stalled by a slow
-request in Python.
+release, and a client-facing process that a slow request in Python cannot
+stall.
 
 ## Further reading
 
