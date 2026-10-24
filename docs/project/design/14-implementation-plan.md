@@ -24,12 +24,12 @@ muru/
     muructl/                 binary: CLI, subcommand dispatch, development mode
     muru-common/             names, ids, errors, durations and sizes, shared types
     muru-config/             schema types, TOML parsing, validation, precedence merge, JSON Schema output
-    muru-proto/              generated tonic and prost code
+    muru-proto/              frame codec of the worker link, generated prost and tonic code
     muru-edge/               edge library: listeners, TLS, hosts, routing, pipeline, upstreams, static, uploads
     muru-controller/         reconciler, state store, admin API and JSON gateway, rollouts, autoscaler, schedules, events
     muru-supervisor/         spawning hosts, users, cgroups, containers, descriptor passing, log collector
     muru-dashboard/          embedded dashboard assets and handlers
-    muru-py/                 PyO3 extension (muru._native): worker gRPC server, bridges, watchdog, side channel
+    muru-py/                 PyO3 extension (muru._native): worker link, application thread pool, bridges, control server, watchdog
     muru-testkit/            test harness: spawn daemon, fake workers, HTTP clients, fixtures
   packages/
     muructl/pyproject.toml   maturin, bindings = bin
@@ -57,7 +57,8 @@ muru/
 | --- | --- |
 | Async runtime and HTTP | tokio, hyper 1.x with hyper-util, h2, tower |
 | TLS | rustls with tokio-rustls, ring or aws-lc-rs provider, rustls-acme later |
-| gRPC | tonic and prost |
+| Worker link | own framing with prost messages (section 5) |
+| gRPC (control plane and admin API) | tonic and prost |
 | Snapshots and shared state | arc-swap, memfd-backed shared memory for edge load tables |
 | CLI and configuration | clap (with generated help and man pages), serde, toml, schemars for JSON Schema |
 | State store | rusqlite with bundled SQLite |
@@ -157,7 +158,7 @@ The repository's AGENTS.md (with CLAUDE.md pointing to it) carries the following
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
-| 0. Spike | Worker protocol drafts, PyO3 extension with tonic started after fork, minimal WSGI bridge, benchmark harness | Hello world, large body and tiny-chunk benchmarks within agreed overhead of gunicorn, uvicorn, Granian and the three mod_wsgi-express configurations, or a decision to replace gRPC with a framed protocol. Fork safety of the extension demonstrated |
+| 0. Spike | Worker protocol drafts, PyO3 extension started after fork, minimal WSGI bridge, benchmark harness | Hello world, large body and tiny-chunk benchmarks within agreed overhead of gunicorn, uvicorn, Granian and the three mod_wsgi-express configurations, or a decision to replace gRPC with a framed protocol. Fork safety of the extension demonstrated. Outcome: the framed link was adopted (ADR 0021) |
 | 1. Single application server | muructl run, edge with HTTP/1.1 and HTTP/2, routing for one application, host, preload, hooks, workers, process models, WSGI bridge complete with free-threaded support, limits and buffering, built-in error pages, watch reload, terminal logs, minimal read-only dashboard in muructl run | WSGI and HTTP conformance suites pass on regular and free-threaded builds. Plain WSGI, Django and Flask fixtures pass their tests through Muru. Replaces gunicorn for one application in development |
 | 2. Daemon and live operations | ASGI bridge with HTTP, lifespan and WebSockets (with ASGI conformance, Starlette and FastAPI fixtures), daemon, state store, admin API and JSON gateway, CLI, releases, blue/green, drain, rollback, snapshots, virtual hosts, static TLS, trusted proxies, response compression, connection limits, request identifiers, secrets, per-application users, static files and file hints, worker groups, mounts, hard timeouts, memory policy, metrics, access logs, log collector and rotation, Python logging defaults, events with pull and webhooks, configuration apply, export and diff, systemd integration, full read-only dashboard | Deploys and rollbacks under sustained load with zero failed requests. Daemon and edge restarts and upgrades with zero failed requests |
 | 3. Traffic and scaling | Canary with gates, bucketing, stickiness, previews, autoscaler (spare and target), churn controls, schedules, soft timeouts, internal redirects and routes, custom error pages and override, maintenance mode, uploads, HTTP upstreams, managed HTTP server releases with profiles for gunicorn, uvicorn, Granian, mod_wsgi-express and generic servers, overlays with schedule, manual and external triggers, authentication sub-requests, gRPC service mounts with health, reflection and gRPC-Web, client classification, rate limits, method restrictions and site modes | Automated canary with rollback on a failing gate. Scaling scenarios meet stability targets without churn. gRPC interoperability tests pass for all four call types through h2, h2c and gRPC-Web. Cutover demonstration: an existing gunicorn deployment runs unchanged as a managed HTTP release, then is canaried to native workers and removed, with zero failed requests |

@@ -11,7 +11,7 @@ Muru is a routing edge, control plane and Python runtime for serving WSGI and
 ASGI applications, with zero-downtime releases, traffic management and
 Python-aware process management.
 
-A Rust edge accepts client connections and routes requests over gRPC to
+A Rust edge accepts client connections and routes requests over a private link to
 Python worker processes, which a Rust controller manages as immutable
 releases that can run side by side. A new release, possibly on a different
 Python version, starts beside the old one, and traffic moves when it is
@@ -39,9 +39,15 @@ spike that benchmarks the edge-to-worker protocol.
   rollback.
 
 - Manage Python processes the way mod_wsgi daemon mode and gunicorn do, and
-  more: preload before fork with hooks, worker groups per path, mixed WSGI
-  and ASGI mounts in one process, free-threaded builds, memory policies,
-  soft and hard timeouts, and Python-aware scaling.
+  more: preload before fork with hooks, worker groups per path,
+  free-threaded builds, memory policies, soft and hard timeouts, and
+  Python-aware scaling.
+
+- Mix WSGI and ASGI in one process: mounts by path, and a WSGI view can
+  hand a request to an ASGI application on the event loop, which is how a
+  WSGI application takes WebSockets, or an ASGI application can hand one to
+  a WSGI callable on the thread pool, without either side changing
+  framework.
 
 - Reconfigure live through an API and CLI, with declarative files that
   export and apply round-trip, plus metrics, structured logs, an event

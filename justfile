@@ -22,7 +22,7 @@ bootstrap:
     uv sync
     uv run pre-commit install
     uv run pre-commit install --hook-type commit-msg
-    @echo "bootstrap complete; run 'just dev' to build the extension once crates/muru-py exists"
+    just dev
 
 # Optional extras for the conformance suites (h2spec, Autobahn) and fuzzing.
 bootstrap-conformance:
@@ -32,9 +32,9 @@ bootstrap-fuzz:
     rustup toolchain install nightly
     just _cargo-tool cargo-fuzz
 
-# Build the extension into the development virtualenv.
+# Build the extension into the development virtualenv. Run again after `uv sync`, which removes it.
 dev:
-    uv run maturin develop --manifest-path packages/muru/pyproject.toml
+    cd packages/muru && uv run --project ../.. maturin develop
 
 # Formatting, lints, types and repository text checks.
 lint: lint-text lint-rust lint-python
@@ -66,8 +66,9 @@ test-rust:
 test-python:
     uv run pytest
 
-# Integration scenarios that need no Docker or network.
-test-integration:
+# Integration scenarios that need no Docker or network (builds muructl and the extension first).
+test-integration: dev
+    cargo build -p muructl
     uv run pytest tests/integration
 
 # WSGI, ASGI, HTTP and WebSocket conformance suites.
@@ -87,8 +88,8 @@ fuzz target:
     cargo +nightly fuzz run {{target}}
 
 # Performance scenarios (Linux only for representative numbers).
-bench:
-    @echo "not yet implemented: see bench/README.md"
+bench *args:
+    uv run --group bench python bench/run.py {{args}}
 
 # Build the documentation with warnings as errors.
 docs:
@@ -119,8 +120,13 @@ docs-open: docs
 vm-up:
     limactl start --name muru packaging/dev/lima.yaml
 
-vm-test:
-    @echo "not yet implemented: syncs the source into the VM and runs the suites over SSH"
+# Copy the source into the VM, build there, and run the unit and integration suites.
+vm-test *args:
+    limactl shell muru -- bash -lc "bash '{{justfile_directory()}}/packaging/dev/vm-run.sh' '{{justfile_directory()}}' test {{args}}"
+
+# Copy the source into the VM, build there, and run the benchmarks (see bench/README.md).
+vm-bench *args:
+    limactl shell muru -- bash -lc "bash '{{justfile_directory()}}/packaging/dev/vm-run.sh' '{{justfile_directory()}}' bench {{args}}"
 
 vm-shell:
     limactl shell muru

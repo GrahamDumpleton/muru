@@ -37,7 +37,7 @@ flowchart LR
     H2[Host] -. fork .-> W3[Worker]
     H2 -. fork .-> W4[Worker]
   end
-  EDGE -->|gRPC over Unix sockets| W1
+  EDGE -->|worker link over Unix sockets| W1
   EDGE --> W2
   EDGE --> W3
   EDGE --> W4
@@ -54,9 +54,9 @@ flowchart LR
 
 ## 2.2 Data path and control path
 
-- **Data path:** client, edge, worker, application. Requests travel as typed gRPC streams between edge and worker. No HTTP is re-serialised on this hop.
+- **Data path:** client, edge, worker, application. Requests travel as typed frames on the worker link (section 5), one request per pooled connection. No HTTP is re-serialised on this hop.
 - **Control path:** operator or automation, admin API, controller, then routing snapshots to the edge and lifecycle commands to hosts.
-- **Side channels:** per-worker Unix socket channels pass file descriptors (file hints, uploads), and per-worker pipes carry stdout and stderr to the log collector.
+- **Side channels:** file descriptors (file hints, uploads) travel on the worker link with the frames that refer to them (section 5.7). Per-worker pipes carry stdout and stderr to the log collector, and a per-worker gRPC control socket carries status and control (section 5.9).
 
 ## 2.3 Process topology
 
@@ -69,8 +69,8 @@ flowchart TB
   D == listener sockets via SCM_RIGHTS ==> E2
   D -->|spawns as application user, or via container API| H[Host per release]
   H -->|fork| W[Workers]
-  E1 -- gRPC per worker socket --- W
-  E2 -- gRPC per worker socket --- W
+  E1 -- worker link per worker socket --- W
+  E2 -- worker link per worker socket --- W
   E1 --- SHM[(Shared load table)]
   E2 --- SHM
 ```

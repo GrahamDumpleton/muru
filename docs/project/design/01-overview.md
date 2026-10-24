@@ -9,7 +9,7 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-Muru serves Python WSGI and ASGI applications without Apache httpd or nginx, and without the restart-to-deploy model of servers like gunicorn. A Rust edge accepts client connections and routes requests over gRPC to Python worker processes, which a Rust controller manages as immutable releases that can run side by side.
+Muru serves Python WSGI and ASGI applications without Apache httpd or nginx, and without the restart-to-deploy model of servers like gunicorn. A Rust edge accepts client connections and routes requests over a private link to Python worker processes, which a Rust controller manages as immutable releases that can run side by side.
 
 ## 1.1 Problem
 
@@ -19,7 +19,8 @@ Python web applications are usually deployed in one of two ways. A general web s
 
 - Zero-downtime deploys: a new release, possibly on a different Python version, starts beside the old one, and traffic moves when it is ready.
 - Draining, blue/green, weighted canary, A/B testing with deterministic bucketing, sticky sessions, preview releases and instant rollback.
-- Process and thread models comparable to mod_wsgi daemon mode and gunicorn, including preload before fork with post-fork hooks, worker groups per path, and mixed WSGI and ASGI mounts in one process.
+- Process and thread models comparable to mod_wsgi daemon mode and gunicorn, including preload before fork with post-fork hooks and worker groups per path.
+- WSGI and ASGI in one process: mounts by path, and requests handed across in code, so a WSGI view can hand a request to an ASGI application on the event loop, which gives WSGI applications WebSockets, and an ASGI application can hand one to a WSGI callable on the thread pool (sections 6.7 and 6.14).
 - Python-aware elastic scaling, memory policies and request timeouts.
 - Live reconfiguration through an API and CLI, with declarative files that export and apply round-trip.
 - One command for development, the same model up to a large monolith in production.

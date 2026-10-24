@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --exclude muru-py
 
@@ -76,6 +76,31 @@ jobs:
       - run: uv python install ${{ matrix.python }}
       - run: echo "PYO3_PYTHON=$(uv python find ${{ matrix.python }})" >> "$GITHUB_ENV"
       - run: cargo clippy -p muru-py --all-targets -- -D warnings
+
+  integration:
+    # muructl run end to end: preload, fork, the worker link and the WSGI bridge,
+    # on a regular and a free-threaded interpreter (phase 0 exit criteria).
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.15", "3.15t"]
+        include:
+          - os: macos-latest
+            python: "3.15"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --only-group dev --python ${{ matrix.python }}
+      - run: cd packages/muru && uv run --project ../.. maturin develop
+      - run: cargo build -p muructl
+      - run: uv run pytest tests/integration
 
   python:
     runs-on: ${{ matrix.os }}
@@ -113,7 +138,7 @@ jobs:
   ci-ok:
     # One check for branch rules to require, so the job list and matrices can
     # change without the rules going stale. Fails if any job did not succeed.
-    needs: [lint, rust, msrv, extension, python, docs]
+    needs: [lint, rust, msrv, extension, integration, python, docs]
     if: always()
     runs-on: ubuntu-latest
     steps:
