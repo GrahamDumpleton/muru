@@ -41,11 +41,11 @@ something else's. Each time I looked at it, it was too big a mountain to
 climb for one person: an HTTP edge, a control plane, a process manager and
 a runtime library, all of which have to be right.
 
-Two things have changed. I am retired now, so I have the time to pursue it.
-And AI coding tools have taken away the hard slog of writing the code,
-which leaves me free to spend that time on what I actually wanted to do:
-the design and architecture of the system, and the features I always felt
-a hosting system for Python needed and could never give it.
+Two things have changed. I am semi-retired now, so I have the time to
+pursue it. And AI coding tools have taken away the hard slog of writing
+the code, which leaves me free to spend that time on what I actually
+wanted to do: the design and architecture of the system, and the features
+I always felt a hosting system for Python needed and could never give it.
 Much of that design comes straight from what maintaining mod_wsgi taught
 me: daemon process groups, request timeouts, preloading before the fork,
 partitioning an application across worker groups, and the trade-offs

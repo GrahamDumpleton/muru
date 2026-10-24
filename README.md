@@ -66,18 +66,25 @@ muructl run app:application      # http://127.0.0.1:8080
 
 ## Install
 
-Pre-releases of the 0.1.0 line are on PyPI to claim the names and exercise
-the release pipeline; they do not serve requests yet. `uv tool install
-muructl` installs the command line, and the daemon will install the `muru`
-runtime library for each interpreter it manages. The first version that
-works is 0.1.0.
+Install the command line once with `uv tool install muructl` and add the
+`muru` runtime library to each application's environment with `uv add
+muru`. Both are pre-releases of the 0.1.0 line, so `pip install --pre` is
+needed where pip is used instead of uv. Pre-built wheels cover Linux and
+macOS on CPython 3.11 to 3.15, including the free-threaded builds.
 
 ## Five-minute start
+
+Today, in development:
+
+```
+muructl run app:application --reload     # HTTP on 8080, restarts on change
+muructl run --https                      # HTTPS on 8443 with a local certificate
+muructl run . --port auto                # the project's [tool.muru] table, free ports
+```
 
 Planned:
 
 ```
-muructl run app:application --reload     # development, HTTP on 8080
 muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
 muructl apply -f config/                 # several applications, virtual hosts, TLS
 muructl rollout canary shop@r43          # canary with gates and rollback
