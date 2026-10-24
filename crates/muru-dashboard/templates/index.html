@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muru: {{ data.app }}</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }
+header { padding: 1rem 1.5rem; background: #102a43; color: #d9e2ec; display: flex; gap: 1.5rem; align-items: baseline; flex-wrap: wrap; }
+header h1 { font-size: 1.1rem; margin: 0; color: #fff; }
+header span { opacity: 0.8; }
+main { max-width: 72rem; margin: 0 auto; padding: 1rem 1.5rem 3rem; display: grid; gap: 1.25rem; }
+section { background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; padding: 1rem 1.25rem; overflow: auto; }
+h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #627d98; margin: 0 0 0.75rem; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #e4ebf2; white-space: nowrap; }
+th { color: #627d98; font-weight: 600; }
+td.num, th.num { text-align: right; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.75rem; }
+.tile { border: 1px solid #d9e2ec; border-radius: 6px; padding: 0.6rem 0.8rem; }
+.tile .label { font-size: 0.75rem; color: #627d98; text-transform: uppercase; letter-spacing: 0.04em; }
+.tile .value { font-size: 1.4rem; font-weight: 600; }
+pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; word-break: break-all; max-height: 24rem; overflow: auto; }
+.status-2 { color: #0f6b3a; } .status-3 { color: #946200; } .status-4, .status-5 { color: #b42318; }
+@media (prefers-color-scheme: dark) {
+  body { color: #d9e2ec; background: #0b1623; }
+  section, .tile { background: #112233; border-color: #243b53; }
+  th, td { border-color: #243b53; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Muru</h1>
+  <span>{{ data.app }}</span>
+  <span>release r{{ data.release }}</span>
+  <span>up {{ data.uptime }}</span>
+  <span>http://{{ data.listen }}</span>
+</header>
+<main>
+  <section id="overview" hx-get="/fragment/overview" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "overview.html" %}
+  </section>
+  <section id="requests" hx-get="/fragment/requests" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "requests.html" %}
+  </section>
+  <section id="logs" hx-get="/fragment/logs" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "logs.html" %}
+  </section>
+</main>
+<script src="/static/htmx.min.js"></script>
+</body>
+</html>

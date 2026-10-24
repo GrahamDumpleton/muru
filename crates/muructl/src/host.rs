@@ -7,7 +7,10 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+
+use crate::logs::Logs;
 
 /// What every host of a run is started with.
 pub struct HostSpec {
@@ -42,7 +45,14 @@ pub struct HostProcess {
 
 impl HostProcess {
     /// Start the host for release number `release` under the run directory.
-    pub fn start(spec: &HostSpec, run_dir: &Path, release: u32) -> anyhow::Result<Self> {
+    /// Its output is relayed to this process's own streams and kept in
+    /// `logs` for the dashboard.
+    pub fn start(
+        spec: &HostSpec,
+        run_dir: &Path,
+        release: u32,
+        logs: &Logs,
+    ) -> anyhow::Result<Self> {
         let run_dir = run_dir.join(format!("r{release}"));
         std::fs::create_dir_all(&run_dir)
             .with_context(|| format!("creating {}", run_dir.display()))?;
@@ -60,7 +70,9 @@ impl HostProcess {
             .arg(spec.threads.to_string())
             .arg("--preload")
             .arg(spec.preload)
-            .stdin(Stdio::piped());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
         }
@@ -78,6 +90,12 @@ impl HostProcess {
             .with_context(|| format!("starting the host with {}", spec.python.display()))?;
         // The host exits when this end of its stdin closes, whatever happens here.
         let stdin = child.stdin.take();
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(relay(stdout, logs.clone(), false));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(relay(stderr, logs.clone(), true));
+        }
         let sockets = (0..spec.workers)
             .map(|index| match base_port {
                 None => run_dir.join(format!("worker-{index}.sock")),
@@ -147,5 +165,19 @@ fn listening(socket: &Path) -> bool {
             std::net::TcpStream::connect(address).is_ok()
         }
         _ => socket.exists(),
+    }
+}
+
+/// Copy a host stream to the matching stream of this process, line by
+/// line, keeping each line for the dashboard.
+async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if to_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+        logs.push(line);
     }
 }

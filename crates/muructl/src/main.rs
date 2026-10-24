@@ -7,11 +7,15 @@
 //! command is defined once with clap, which later generates help, man
 //! pages and the CLI reference (section 14.4 and Appendix A).
 
+mod dashboard;
 mod host;
+mod logs;
 mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -19,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
 
 use crate::host::{HostProcess, HostSpec};
+use crate::logs::Logs;
 use crate::watch::Watch;
 
 /// How long a host may take to get its workers listening.
@@ -103,6 +108,10 @@ struct RunArgs {
     /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
+
+    /// Address for the read-only dashboard on loopback, or off.
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    dashboard: String,
 
     /// Start a new release when a watched source file changes.
     #[arg(long)]
@@ -316,7 +325,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
     };
 
-    let mut current = HostProcess::start(&spec, &run_dir, 1)?;
+    let logs = Logs::default();
+    let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
         current.stop().await;
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -339,6 +349,27 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         args.workers,
         args.threads
     );
+
+    let release_number = Arc::new(AtomicU32::new(1));
+    if args.dashboard != "off" {
+        match dashboard::start(
+            &args.dashboard,
+            dashboard::Inputs {
+                app: args.app.clone(),
+                listen: edge.local_addr(),
+                started: std::time::Instant::now(),
+                release: Arc::clone(&release_number),
+                pools: edge.pools(),
+                access_log: edge.access_log(),
+                logs: logs.clone(),
+            },
+        )
+        .await
+        {
+            Ok(address) => println!("muru: dashboard on http://{address}/"),
+            Err(error) => println!("muru: no dashboard: {error:#}"),
+        }
+    }
 
     let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
     if args.reload {
@@ -389,7 +420,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 println!("muru: reloading, {} changed", describe(&paths));
                 loop {
                     release += 1;
-                    let mut next = match HostProcess::start(&spec, &run_dir, release) {
+                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
                             println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
@@ -408,6 +439,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 println!("muru: switched to release r{release}");
+                                release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop());
                                 break;

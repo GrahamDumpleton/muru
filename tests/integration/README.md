@@ -25,6 +25,9 @@ design specification and are added as the features they cover land:
 - `test_frameworks.py`: the Flask and Django fixtures, each exercised the
   way its own test client would be, over HTTP.
 
+- `test_dashboard.py`: the read-only dashboard on loopback, its fragments
+  and the embedded htmx.
+
 Run with `just test-integration`. Scenarios that need Docker, network, root or
 a long time carry markers and are skipped by default. Helpers for starting
 muructl and talking to it are in `tests/support`.

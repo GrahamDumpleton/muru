@@ -19,6 +19,7 @@ clap = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
 libc = { workspace = true }
+muru-dashboard = { workspace = true }
 muru-edge = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

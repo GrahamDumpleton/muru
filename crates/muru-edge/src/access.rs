@@ -196,15 +196,15 @@ fn text_line(record: &Record) -> String {
         record.status,
         record.method,
         record.target,
-        bytes(record.bytes),
-        duration(record.total)
+        format_bytes(record.bytes),
+        format_duration(record.total)
     );
     if record.worker.is_some() {
         let _ = write!(
             line,
             " queue={} app={}",
-            duration(record.queue),
-            duration(record.application)
+            format_duration(record.queue),
+            format_duration(record.application)
         );
     }
     if !record.reason.is_empty() {
@@ -247,7 +247,8 @@ fn millis_f64(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn duration(duration: Duration) -> String {
+/// Format a duration briefly: 0.9ms, 42ms, 1.50s.
+pub fn format_duration(duration: Duration) -> String {
     let millis = millis_f64(duration);
     if millis >= 1000.0 {
         format!("{:.2}s", millis / 1000.0)
@@ -258,7 +259,8 @@ fn duration(duration: Duration) -> String {
     }
 }
 
-fn bytes(count: u64) -> String {
+/// Format a byte count briefly: 512B, 20kB, 30.0MB.
+pub fn format_bytes(count: u64) -> String {
     if count >= 10 * 1024 * 1024 {
         format!("{:.1}MB", count as f64 / (1024.0 * 1024.0))
     } else if count >= 10 * 1024 {
@@ -269,7 +271,7 @@ fn bytes(count: u64) -> String {
 }
 
 /// The UTC date as YYYY-MM-DD, then hours, minutes, seconds and milliseconds.
-fn civil(time: SystemTime) -> (String, u64, u64, u64, u64) {
+pub fn civil(time: SystemTime) -> (String, u64, u64, u64, u64) {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = since_epoch.as_secs();
     let millis = u64::from(since_epoch.subsec_millis());
@@ -344,12 +346,12 @@ mod tests {
 
     #[test]
     fn units() {
-        assert_eq!(duration(Duration::from_micros(870)), "0.9ms");
-        assert_eq!(duration(Duration::from_millis(42)), "42ms");
-        assert_eq!(duration(Duration::from_millis(1500)), "1.50s");
-        assert_eq!(bytes(512), "512B");
-        assert_eq!(bytes(20 * 1024), "20kB");
-        assert_eq!(bytes(30 * 1024 * 1024), "30.0MB");
+        assert_eq!(format_duration(Duration::from_micros(870)), "0.9ms");
+        assert_eq!(format_duration(Duration::from_millis(42)), "42ms");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1.50s");
+        assert_eq!(format_bytes(512), "512B");
+        assert_eq!(format_bytes(20 * 1024), "20kB");
+        assert_eq!(format_bytes(30 * 1024 * 1024), "30.0MB");
     }
 
     #[test]

@@ -29,6 +29,7 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+askama = "0.14"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
@@ -41,6 +42,7 @@ ignore = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = "0.2"
 muru-common = { path = "crates/muru-common" }
+muru-dashboard = { path = "crates/muru-dashboard" }
 muru-edge = { path = "crates/muru-edge" }
 muru-proto = { path = "crates/muru-proto" }
 prost = "0.14"

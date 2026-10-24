@@ -20,7 +20,7 @@ has the WSGI conformance suite (`just conformance`) and the bridge
 behaviour it pins down, request body handling at the edge (buffering, the
 size limit and 100-continue), the host lifecycle (preload modes with the
 import check, hooks and `muru.context()`), HTTP/2 with h2spec, negotiated
-error pages and request identifiers, the access log, and watch reload in
-`muructl run`. Still to come in phase 1: TLS in development, the
-remaining limits and timeouts, tagged worker output, and the minimal
-dashboard.
+error pages and request identifiers, the access log, the edge timeouts,
+watch reload, tagged worker output, Flask and Django fixtures and the
+minimal read-only dashboard in `muructl run`. Still to come in phase 1:
+TLS in development and the HTTP conformance corpus.

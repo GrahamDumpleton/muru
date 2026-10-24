@@ -13,7 +13,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 
 | Group | Command | What it does | Section |
 | --- | --- | --- | --- |
-| Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --preload, --hooks, --timeout, --bind, --port, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --print-config | 13.1 |
+| Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --preload, --hooks, --timeout, --dashboard, --bind, --port, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --print-config | 13.1 |
 | Development | muructl check [PATH or RELEASE] | Load in a throwaway host and validate entrypoints, hooks, mounts and environment | 6.8 |
 | Development | muructl exec RELEASE -- COMMAND | One-off command with the release's interpreter, environment, user and directory | 6.8 |
 | Daemon | muructl daemon run | Run the daemon in the foreground | 13.3 |

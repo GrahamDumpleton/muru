@@ -64,8 +64,22 @@ struct Conn {
 
 struct WorkerSlots {
     path: PathBuf,
+    slots: usize,
     semaphore: Arc<Semaphore>,
     idle: Mutex<Vec<Conn>>,
+}
+
+/// What a worker's pool looks like right now.
+#[derive(Debug, Clone)]
+pub struct WorkerStatus {
+    /// The worker's index.
+    pub index: usize,
+    /// Its link socket.
+    pub path: PathBuf,
+    /// Requests it can handle at once.
+    pub slots: usize,
+    /// Requests it is handling now.
+    pub in_flight: usize,
 }
 
 /// Connection pools for a set of workers.
@@ -93,12 +107,27 @@ impl LinkPool {
                 .iter()
                 .map(|path| WorkerSlots {
                     path: path.clone(),
+                    slots: slots.max(1),
                     semaphore: Arc::new(Semaphore::new(slots.max(1))),
                     idle: Mutex::new(Vec::new()),
                 })
                 .collect(),
             next: AtomicUsize::new(0),
         })
+    }
+
+    /// The state of every worker's pool, for the dashboard.
+    pub fn workers(&self) -> Vec<WorkerStatus> {
+        self.workers
+            .iter()
+            .enumerate()
+            .map(|(index, worker)| WorkerStatus {
+                index,
+                path: worker.path.clone(),
+                slots: worker.slots,
+                in_flight: worker.slots - worker.semaphore.available_permits(),
+            })
+            .collect()
     }
 
     /// Take a connection from the worker with the most free slots, waiting
