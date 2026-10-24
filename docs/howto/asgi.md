@@ -107,15 +107,8 @@ silent for five minutes with 1001. Open sockets count against the worker's
 
 ## Frameworks
 
-Starlette, FastAPI and Django's ASGI handler run unchanged:
-
-```
-muructl run myproject.asgi:application
-muructl run main:app
-```
-
-Django's synchronous views run on the sync thread pool, so give it as many
-`--sync-threads` as you would give threads to a WSGI deployment.
+Starlette, FastAPI and Django's ASGI handler run unchanged; the
+[Starlette and FastAPI](starlette-and-fastapi.md) page has the details.
 
 ## What the scope contains
 

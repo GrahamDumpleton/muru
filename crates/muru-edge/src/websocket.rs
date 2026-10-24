@@ -125,17 +125,37 @@ pub(crate) struct Relay {
     pub limits: Arc<Limits>,
 }
 
-/// The two CLOSE frames of a socket, one per side.
+/// Where the socket stands on its way to its end.
 #[derive(Default)]
 struct Closing {
-    client: bool,
-    worker: bool,
+    /// The client's stream has ended: its close frame was read and the
+    /// reply flushed, or it went away.
+    stream_done: bool,
+    /// The worker's CLOSE has arrived.
+    worker_closed: bool,
+    /// A CLOSE has been sent to the worker.
+    told_worker: bool,
+    /// A close frame has been sent to the client.
+    told_client: bool,
+}
+
+impl Closing {
+    /// Both sides have closed in order: the link connection can be reused.
+    fn complete(&self) -> bool {
+        self.stream_done && self.worker_closed && self.told_worker
+    }
+
+    /// One side has begun closing, so the other is waited for, not for ever.
+    fn winding_down(&self) -> bool {
+        self.stream_done || self.worker_closed || self.told_worker || self.told_client
+    }
 }
 
 /// Run one WebSocket to its end: messages from the client become MESSAGE
 /// frames and the worker's MESSAGE frames go to the client, until each
-/// side has sent its CLOSE. The link connection goes back to the pool when
-/// both have, and is dropped when either side broke off instead.
+/// side has sent its CLOSE and the client's stream has ended. The link
+/// connection goes back to the pool when both closed in order, and is
+/// dropped when either side broke off instead.
 pub(crate) async fn relay(relay: Relay) {
     let Relay {
         upgrade,
@@ -170,102 +190,53 @@ pub(crate) async fn relay(relay: Relay) {
     let mut last_activity = Instant::now();
     let mut ping = tokio::time::interval(limits.websocket_ping_interval);
     ping.tick().await;
-    loop {
-        // Once a side has closed, only the other side's CLOSE is awaited,
-        // and not for ever.
-        let wait = if closing.client || closing.worker {
+    while !closing.complete() {
+        // Once a side has begun closing, only the rest of the handshake is
+        // awaited, and not for ever.
+        let wait = if closing.winding_down() {
             limits.response_idle_timeout
         } else {
             limits.websocket_idle_timeout
         };
         let step = tokio::time::timeout(wait, async {
             tokio::select! {
-                incoming = socket.next(), if !closing.client => Step::Client(incoming),
-                next = frame::read(&mut reader), if !closing.worker => Step::Worker(next),
+                incoming = socket.next(), if !closing.stream_done => Step::Client(incoming),
+                next = frame::read(&mut reader), if !closing.worker_closed => Step::Worker(next),
                 _ = ping.tick() => Step::Ping,
             }
         })
         .await;
 
         match step {
-            Err(_) if closing.client || closing.worker => {
-                // The other side never sent its CLOSE: give up on the link.
+            Err(_) if closing.winding_down() => {
+                // The other side never finished closing: give up on the link.
                 intact = false;
                 break;
             }
             Err(_) => {
                 // Nothing from the client for the idle timeout.
-                let _ = close_client(&mut socket, 1001, "idle").await;
-                let _ = send_close(&mut writer, 1001, "idle").await;
-                closing.client = true;
+                closing.told_client |= close_client(&mut socket, 1001, "idle").await.is_ok();
+                if !closing.told_worker {
+                    closing.told_worker = send_close(&mut writer, 1001, "idle").await.is_ok();
+                }
                 last_activity = Instant::now();
             }
             Ok(Step::Ping) => {
                 if last_activity.elapsed() >= limits.websocket_ping_interval
+                    && !closing.winding_down()
                     && socket.send(Message::Ping(Bytes::new())).await.is_err()
                 {
-                    intact = false;
-                    break;
+                    closing.stream_done = true;
                 }
             }
             Ok(Step::Client(incoming)) => {
                 last_activity = Instant::now();
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        bytes += text.len() as u64;
-                        let payload = Bytes::from(text.as_str().to_owned());
-                        if frame::write(&mut writer, kind::MESSAGE, flag::TEXT, payload)
-                            .await
-                            .is_err()
-                        {
-                            intact = false;
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Binary(data))) => {
-                        bytes += data.len() as u64;
-                        if frame::write(&mut writer, kind::MESSAGE, 0, data)
-                            .await
-                            .is_err()
-                        {
-                            intact = false;
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Frame(_))) => {}
-                    Some(Ok(Message::Close(close))) => {
-                        // tungstenite echoes the close frame itself.
-                        let (code, reason) = close
-                            .map(|close| (u16::from(close.code), close.reason.to_string()))
-                            .unwrap_or((1005, String::new()));
-                        if send_close(&mut writer, code, &reason).await.is_err() {
-                            intact = false;
-                            break;
-                        }
-                        closing.client = true;
-                    }
-                    Some(Err(WsError::Capacity(_))) => {
-                        // Section 4.18: a message over the limit is 1009.
-                        let _ = close_client(&mut socket, 1009, "message too large").await;
-                        let _ = send_close(&mut writer, 1009, "message too large").await;
-                        closing.client = true;
-                    }
-                    Some(Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {
-                        // Gone without a close frame: 1006 to the application.
-                        let _ = send_close(&mut writer, 1006, "the client went away").await;
-                        closing.client = true;
-                    }
-                    Some(Err(WsError::Protocol(error))) => {
-                        let reason = error.to_string();
-                        let _ = close_client(&mut socket, 1002, &reason).await;
-                        let _ = send_close(&mut writer, 1002, &reason).await;
-                        closing.client = true;
-                    }
-                    Some(Err(_)) | None => {
-                        // The client went away without closing.
-                        let _ = send_close(&mut writer, 1006, "the client went away").await;
-                        closing.client = true;
+                let outcome = client_step(incoming, &mut socket, &mut writer, &mut closing).await;
+                match outcome {
+                    Ok(relayed) => bytes += relayed,
+                    Err(()) => {
+                        intact = false;
+                        break;
                     }
                 }
             }
@@ -280,23 +251,34 @@ pub(crate) async fn relay(relay: Relay) {
                     } else {
                         Message::Binary(next.payload)
                     };
-                    if socket.send(message).await.is_err() {
+                    if !closing.stream_done && socket.send(message).await.is_err() {
                         // The client is gone; the worker learns by CLOSE.
-                        let _ = send_close(&mut writer, 1006, "the client went away").await;
-                        closing.client = true;
+                        closing.stream_done = true;
+                        if !closing.told_worker {
+                            closing.told_worker =
+                                send_close(&mut writer, 1006, "the client went away")
+                                    .await
+                                    .is_ok();
+                        }
                     }
                 }
                 Ok(Some(next)) if next.kind == kind::CLOSE => {
+                    // The application closed: pass it on, answer the worker
+                    // with the edge's own CLOSE, and let the client's echo
+                    // end its stream.
                     let close = pb::Close::decode(next.payload).unwrap_or_default();
-                    closing.worker = true;
-                    if !closing.client {
-                        let code = u16::try_from(close.code).unwrap_or(1000);
+                    let code = u16::try_from(close.code).unwrap_or(1000);
+                    closing.worker_closed = true;
+                    if !closing.told_client && !closing.stream_done {
+                        closing.told_client = true;
                         let _ = close_client(&mut socket, code, &close.reason).await;
+                    }
+                    if !closing.told_worker {
                         if send_close(&mut writer, code, &close.reason).await.is_err() {
                             intact = false;
                             break;
                         }
-                        closing.client = true;
+                        closing.told_worker = true;
                     }
                 }
                 Ok(Some(next)) => {
@@ -311,18 +293,117 @@ pub(crate) async fn relay(relay: Relay) {
                 }
             },
         }
-
-        if closing.client && closing.worker {
-            break;
-        }
     }
 
     // A socket that ended in order leaves the link idle for the next
     // request; one that broke off takes its connection with it.
+    let intact = intact && closing.complete();
     let _ = socket.close(None).await;
     back.give_writer(intact.then_some(writer));
     back.give_reader(intact.then_some(reader));
     finish(recording, bytes);
+}
+
+/// Handle one item from the client's stream: a message to relay, a close
+/// frame, a protocol failure or the end of the stream. Returns the bytes
+/// relayed, or Err when the link writer failed.
+async fn client_step<S>(
+    incoming: Option<Result<Message, WsError>>,
+    socket: &mut WebSocketStream<S>,
+    writer: &mut Writer,
+    closing: &mut Closing,
+) -> Result<u64, ()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Tell the worker the client has gone, once.
+    async fn tell_worker(
+        writer: &mut Writer,
+        closing: &mut Closing,
+        code: u16,
+        reason: &str,
+    ) -> Result<(), ()> {
+        if closing.told_worker {
+            return Ok(());
+        }
+        closing.told_worker = true;
+        send_close(writer, code, reason).await.map_err(|_| ())
+    }
+
+    match incoming {
+        Some(Ok(Message::Text(text))) => {
+            let payload = Bytes::from(text.as_str().to_owned());
+            let size = payload.len() as u64;
+            if closing.told_worker {
+                return Ok(0);
+            }
+            frame::write(writer, kind::MESSAGE, flag::TEXT, payload)
+                .await
+                .map_err(|_| ())?;
+            Ok(size)
+        }
+        Some(Ok(Message::Binary(data))) => {
+            let size = data.len() as u64;
+            if closing.told_worker {
+                return Ok(0);
+            }
+            frame::write(writer, kind::MESSAGE, 0, data)
+                .await
+                .map_err(|_| ())?;
+            Ok(size)
+        }
+        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
+            // tungstenite queues the pong itself; flushing sends it now.
+            let _ = socket.flush().await;
+            Ok(0)
+        }
+        Some(Ok(Message::Close(close))) => {
+            // tungstenite queues the reply itself; the stream ends once it
+            // has been flushed and read to its end.
+            let (code, reason) = close
+                .map(|close| (u16::from(close.code), close.reason.to_string()))
+                .unwrap_or((1005, String::new()));
+            let _ = socket.flush().await;
+            closing.told_client = true;
+            tell_worker(writer, closing, code, &reason).await?;
+            Ok(0)
+        }
+        Some(Err(WsError::Capacity(_))) => {
+            // Section 4.18: a message over the limit is 1009.
+            let _ = close_client(socket, 1009, "message too large").await;
+            closing.told_client = true;
+            tell_worker(writer, closing, 1009, "message too large").await?;
+            Ok(0)
+        }
+        Some(Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {
+            // Gone without a close frame: 1006 to the application.
+            closing.stream_done = true;
+            tell_worker(writer, closing, 1006, "the client went away").await?;
+            Ok(0)
+        }
+        Some(Err(WsError::Protocol(error))) => {
+            // A protocol failure: close with 1002 and end the stream.
+            let reason = error.to_string();
+            let _ = close_client(socket, 1002, &reason).await;
+            closing.told_client = true;
+            closing.stream_done = true;
+            tell_worker(writer, closing, 1002, &reason).await?;
+            Ok(0)
+        }
+        Some(Err(WsError::Utf8(_))) => {
+            let _ = close_client(socket, 1007, "invalid UTF-8").await;
+            closing.told_client = true;
+            closing.stream_done = true;
+            tell_worker(writer, closing, 1007, "invalid UTF-8").await?;
+            Ok(0)
+        }
+        Some(Err(_)) | None => {
+            // The stream has ended, in order after a close or not.
+            closing.stream_done = true;
+            tell_worker(writer, closing, 1006, "the client went away").await?;
+            Ok(0)
+        }
+    }
 }
 
 enum Step {

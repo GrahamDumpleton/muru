@@ -5,7 +5,6 @@ are written as each capability lands.
 
 Still to be written, as their features land:
 
-- FastAPI and Starlette.
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Running under systemd.
 - Virtual hosts and TLS in production.
@@ -27,6 +26,7 @@ Still to be written, as their features land:
 
 flask-and-django
 asgi
+starlette-and-fastapi
 https
 timeouts
 logging

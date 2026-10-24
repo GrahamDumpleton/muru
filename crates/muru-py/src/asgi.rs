@@ -778,11 +778,12 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 
     // The request line, as ASGI wants it: the path decoded, the raw path
     // and query as bytes, the mount prefix as root_path.
-    let version = head
-        .http_version
-        .strip_prefix("HTTP/")
-        .filter(|version| !version.is_empty())
-        .unwrap_or("1.1");
+    let version = match head.http_version.as_str() {
+        "HTTP/2.0" | "HTTP/2" => "2",
+        "HTTP/3.0" | "HTTP/3" => "3",
+        "HTTP/1.0" => "1.0",
+        _ => "1.1",
+    };
     scope.set_item("http_version", version)?;
     let scheme = if head.scheme.is_empty() {
         "http"

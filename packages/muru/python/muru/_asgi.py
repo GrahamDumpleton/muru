@@ -157,18 +157,21 @@ class Lifespan:
         # to give up first.
         await self._queue.put({"type": "lifespan.startup"})
         awaited: set[asyncio.Future[Any]] = {self._startup, self._task}
-        done, _ = await asyncio.wait(awaited, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait(awaited, return_when=asyncio.FIRST_COMPLETED)
 
-        if self._task in done and not self._startup.done():
-            # The task ended without answering and without an exception.
-            self.supported = False
+        # An application still running after answering is the usual case.
+        # One that has already ended either reported a failure, raised one,
+        # or has no lifespan support and simply returned.
+        if not self._task.done():
             return
-        if self._task.done() and self._task.exception() is not None:
-            raise LifespanFailed(f"{self.name} failed during lifespan startup")
-        message = self._startup.result()
-        if self._task.done():
-            # A startup.failed answer ends the task with LifespanFailed.
+        error = self._task.exception()
+        if isinstance(error, LifespanFailed):
+            message = self._startup.result() if self._startup.done() else ""
             raise LifespanFailed(message or f"{self.name} reported lifespan.startup.failed")
+        if error is not None:
+            raise LifespanFailed(f"{self.name} failed during lifespan startup: {error}")
+        if not self._startup.done():
+            self.supported = False
 
     async def _stop(self) -> None:
         if self._task is None or self._task.done() or self._queue is None or self._shutdown is None:

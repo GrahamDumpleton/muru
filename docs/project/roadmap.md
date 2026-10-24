@@ -32,6 +32,6 @@ free-threaded build. Sanitizer builds are a future idea (section 20.10).
 Phase 2 so far has the ASGI bridge: one event loop per worker, lifespan
 with its state, the sync thread pool, concurrency declared to the edge in
 HELLO, WebSockets relayed by the edge with the MESSAGE and CLOSE frames of
-section 5.6, and a plain ASGI fixture. Next from phase 2: the Autobahn
-suite, the ASGI conformance suite with Starlette and FastAPI fixtures, then
-the daemon.
+section 5.6 and checked by the Autobahn suite, the ASGI conformance suite,
+and plain ASGI, Starlette, FastAPI and Django ASGI fixtures. Next from
+phase 2: the daemon.

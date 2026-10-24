@@ -184,12 +184,15 @@ impl HostProcess {
     }
 }
 
+/// Whether a worker accepts connections on its socket. The edge connects
+/// to every worker as soon as the host is ready, so this connects too: a
+/// Unix socket file exists from bind, a moment before listen.
 fn listening(socket: &Path) -> bool {
     match socket.to_str() {
         Some(address) if address.starts_with("127.0.0.1:") => {
             std::net::TcpStream::connect(address).is_ok()
         }
-        _ => socket.exists(),
+        _ => std::os::unix::net::UnixStream::connect(socket).is_ok(),
     }
 }
 

@@ -247,6 +247,7 @@ def start(
     args: Sequence[str] = (),
     env: dict[str, str] | None = None,
     https: bool = False,
+    host: str = "127.0.0.1",
 ) -> Server:
     """Start muructl for `module:callable`, skipping the test when it cannot run.
 
@@ -255,7 +256,9 @@ def start(
     defaults when None. `args` are further `muructl run` options and `env`
     extra environment variables. With `https`, a free HTTPS port is chosen
     and passed as --https-port (the caller adds --https, --https-only or
-    --tls-cert). When muructl exits before its workers are ready, the
+    --tls-cert). `host` is the address to bind, which is loopback unless a
+    test needs the server reachable from a container (with --allow-public
+    in `args`). When muructl exits before its workers are ready, the
     RuntimeError raised carries its output.
     """
 
@@ -283,7 +286,7 @@ def start(
                 "run",
                 *([app] if app is not None else []),
                 "--bind",
-                f"127.0.0.1:{port}",
+                f"{host}:{port}",
                 "--python",
                 sys.executable,
                 *options,
