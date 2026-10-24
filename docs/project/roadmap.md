@@ -60,5 +60,11 @@ daemon's file, nothing trusted by default, forwarding headers removed
 from untrusted peers, the configured types applied from trusted ones
 with recursive chain resolution, and the resolved client, scheme, host,
 port and prefix carried to the worker as typed fields with the original
-peer as `muru.proxy_addr`. Next from phase 2: worker groups and mounts,
-and the metrics and logs.
+peer as `muru.proxy_addr`. Worker groups (section 7.1) are in: named
+groups with their own process and thread counts from `[tool.muru.groups]`
+or the release's `groups` tables, forked from one host with the group in
+each worker's context and MURU_GROUP, their sockets carried per group in
+the snapshot and chosen at the edge by the most specific path, in
+development mode and under the daemon (scaling modes, per-group timeouts
+and memory policy, match lists and optional groups later). Next from
+phase 2: mounts, then the metrics and logs.

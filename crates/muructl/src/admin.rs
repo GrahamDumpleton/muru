@@ -268,9 +268,13 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
-    client
+
+    // The daemon may close the connection as it exits; whether it did
+    // exit is checked below either way.
+
+    let _ = client
         .shutdown(pb::ShutdownRequest { drain: shutdown })
-        .await?;
+        .await;
 
     // The daemon removes its socket as it exits; a process that has exited
     // but not been reaped would still answer kill(0), so the socket is the

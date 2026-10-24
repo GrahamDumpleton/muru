@@ -1,0 +1,12 @@
+entrypoint = "grouped:application"
+processes = 1
+threads = 2
+
+[groups.reports]
+paths = ["/reports/*"]
+processes = 2
+threads = 1
+
+[groups.status]
+paths = ["/api/status"]
+threads = 8

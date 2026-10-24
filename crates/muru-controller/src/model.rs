@@ -100,6 +100,24 @@ impl FromStr for ReleaseState {
     }
 }
 
+/// A worker group of a release (section 7.1): its paths and sizes. The
+/// default group is the release's own settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSpec {
+    /// The group's name.
+    pub name: String,
+    /// Path prefixes it serves, with an optional trailing `*`.
+    pub paths: Vec<String>,
+    /// Worker processes.
+    pub processes: u32,
+    /// Application threads per worker.
+    pub threads: u32,
+    /// Threads for synchronous code called from an ASGI application.
+    pub sync_threads: u32,
+    /// Requests an ASGI worker's event loop takes at once.
+    pub concurrency: u32,
+}
+
 /// What a release runs: its source and the settings fixed at creation
 /// (ADR 0003). Scale is the one thing that changes live, later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +144,9 @@ pub struct ReleaseSpec {
     pub hooks: Option<String>,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
+    /// Named worker groups beside the default one.
+    #[serde(default)]
+    pub groups: Vec<GroupSpec>,
 }
 
 /// A release record: its spec, where it is in section 9.1, and why.

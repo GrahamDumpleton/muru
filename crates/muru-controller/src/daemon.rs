@@ -128,6 +128,17 @@ struct ListenerRecord {
 struct HostRecord {
     pid: u32,
     sockets: Vec<PathBuf>,
+    #[serde(default)]
+    groups: Vec<GroupRecord>,
+}
+
+/// A named worker group's sockets and paths, for re-adoption and the
+/// snapshot.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct GroupRecord {
+    name: String,
+    paths: Vec<String>,
+    sockets: Vec<PathBuf>,
 }
 
 /// What the API needs to talk to a running daemon.
@@ -159,7 +170,10 @@ pub struct Info {
 /// and, once superseded, when its retention ends.
 struct Running {
     host: HostProcess,
+    /// The default group's sockets.
     sockets: Vec<PathBuf>,
+    /// The named groups' sockets and paths.
+    groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
 }
 
@@ -298,7 +312,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         info: Arc::clone(&info),
     };
     let socket = locations.admin_socket();
-    let api = crate::api::serve(socket.clone(), handle).await?;
+    let (api_stop, api_stopped) = oneshot::channel();
+    let api = crate::api::serve(socket.clone(), handle, api_stopped).await?;
     let mut api = tokio::spawn(api);
     events.emit(
         "daemon.started",
@@ -379,6 +394,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             "detached; hosts and the edge keep serving",
         );
     }
+
+    // The API answers the Shutdown call that brought the daemon here
+    // before the socket goes.
+
+    let _ = api_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut api).await;
     let _ = std::fs::remove_file(&socket);
     outcome
 }
@@ -511,9 +532,22 @@ impl Daemon {
             return false;
         }
 
-        match HostProcess::adopt(record.pid, record.sockets.clone(), run_dir.join("r1"), 1) {
+        let group_sockets = record
+            .groups
+            .iter()
+            .map(|group| (group.name.clone(), group.sockets.clone()))
+            .collect();
+        let adopted = HostProcess::adopt(
+            record.pid,
+            record.sockets.clone(),
+            group_sockets,
+            run_dir.join("r1"),
+            1,
+        );
+
+        match adopted {
             Ok(host) => {
-                let sockets = host.sockets.clone();
+                let sockets = host.default_sockets();
                 let retained_until = matches!(
                     self.store.release(app, id).map(|release| release.state),
                     Ok(ReleaseState::Retained)
@@ -524,6 +558,7 @@ impl Daemon {
                     Running {
                         host,
                         sockets,
+                        groups: record.groups.clone(),
                         retained_until,
                     },
                 );
@@ -693,6 +728,17 @@ impl Daemon {
             tcp_base_port: None,
             single: false,
             detach_to: Some(self.host_log(app, id)),
+            groups: spec
+                .groups
+                .iter()
+                .map(|group| crate::host::HostGroup {
+                    name: group.name.clone(),
+                    processes: group.processes as usize,
+                    threads: group.threads as usize,
+                    sync_threads: group.sync_threads as usize,
+                    concurrency: group.concurrency as usize,
+                })
+                .collect(),
         };
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let started = Instant::now();
@@ -719,12 +765,27 @@ impl Daemon {
             return Err(message);
         }
 
-        let sockets = host.sockets.clone();
+        let sockets = host.default_sockets();
+        let groups: Vec<GroupRecord> = host
+            .group_sockets
+            .iter()
+            .map(|(name, sockets)| GroupRecord {
+                name: name.clone(),
+                paths: spec
+                    .groups
+                    .iter()
+                    .find(|group| &group.name == name)
+                    .map(|group| group.paths.clone())
+                    .unwrap_or_default(),
+                sockets: sockets.clone(),
+            })
+            .collect();
         write_record(
             &run_dir.join("host.toml"),
             &HostRecord {
                 pid: host.pid().unwrap_or(0),
-                sockets: sockets.clone(),
+                sockets: host.sockets.clone(),
+                groups: groups.clone(),
             },
         );
         self.running.insert(
@@ -732,6 +793,7 @@ impl Daemon {
             Running {
                 host,
                 sockets,
+                groups,
                 retained_until: None,
             },
         );
@@ -742,7 +804,7 @@ impl Daemon {
             "info",
             &format!(
                 "{} workers ready in {:.1} s",
-                spec.processes,
+                spec.processes + spec.groups.iter().map(|group| group.processes).sum::<u32>(),
                 started.elapsed().as_secs_f64()
             ),
         );
@@ -800,6 +862,19 @@ impl Daemon {
                         .sockets
                         .iter()
                         .map(|socket| socket.display().to_string())
+                        .collect(),
+                    groups: running
+                        .groups
+                        .iter()
+                        .map(|group| pb::Group {
+                            name: group.name.clone(),
+                            paths: group.paths.clone(),
+                            sockets: group
+                                .sockets
+                                .iter()
+                                .map(|socket| socket.display().to_string())
+                                .collect(),
+                        })
                         .collect(),
                 });
             }

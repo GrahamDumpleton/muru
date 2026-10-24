@@ -19,6 +19,8 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
             "pid": os.getpid(),
             "threads": threading.active_count(),
             "app": context().app,
+            "group": context().group,
+            "worker": context().worker_id,
             "hooks_loaded": os.environ.get("SHOP_HOOKS_LOADED", ""),
             "path": environ["PATH_INFO"],
         }

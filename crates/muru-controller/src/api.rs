@@ -20,6 +20,7 @@ use crate::model::{Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
 pub async fn serve(
     socket: PathBuf,
     handle: Handle,
+    shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
     // Unix socket paths are limited to about a hundred bytes, which a
     // deep runtime directory can exceed (section 13.8 keeps the defaults
@@ -36,10 +37,16 @@ pub async fn serve(
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let service = AdminServer::new(Service { handle });
 
+    // The server stops taking connections when told and finishes the
+    // responses in flight, so the answer to a Shutdown call is flushed
+    // before the daemon exits.
+
     Ok(async move {
         tonic::transport::Server::builder()
             .add_service(service)
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, async move {
+                let _ = shutdown.await;
+            })
             .await
             .map_err(anyhow::Error::from)
     })
@@ -116,8 +123,8 @@ impl Admin for Service {
             .and_then(|app| app.current.or(app.previous))
             .and_then(|id| self.handle.store.release(&request.app, &id).ok())
             .map(|release| release.spec);
-        let spec =
-            config::resolve_spec(&request, previous.as_ref()).map_err(Status::invalid_argument)?;
+        let spec = config::resolve_spec(&request, previous.as_ref(), None)
+            .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle

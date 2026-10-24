@@ -44,14 +44,34 @@ pub struct HostSpec {
     /// file instead of pipes, so a daemon can re-adopt the host after it
     /// restarts (section 13.3). None relays the output to this process.
     pub detach_to: Option<PathBuf>,
+    /// Named worker groups beside the default one (section 7.1).
+    pub groups: Vec<HostGroup>,
+}
+
+/// A named worker group's sizes, as the host forks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGroup {
+    /// The group's name.
+    pub name: String,
+    /// Worker processes.
+    pub processes: usize,
+    /// Application threads per worker.
+    pub threads: usize,
+    /// Threads for synchronous code called from an ASGI application.
+    pub sync_threads: usize,
+    /// Requests an ASGI worker's event loop takes at once.
+    pub concurrency: usize,
 }
 
 /// A running host and the sockets its workers listen on.
 pub struct HostProcess {
     process: Process,
     stdin: Option<ChildStdin>,
-    /// The worker link sockets (paths, or addresses for the TCP link).
+    /// Every worker link socket (paths, or addresses for the TCP link):
+    /// the default group's first, then each named group's.
     pub sockets: Vec<PathBuf>,
+    /// The sockets of each named group, in the order of the spec.
+    pub group_sockets: Vec<(String, Vec<PathBuf>)>,
     run_dir: PathBuf,
     /// The release number within this run, from 1.
     pub release: u32,
@@ -143,9 +163,22 @@ impl HostProcess {
             command.arg("--detach");
         }
 
+        for group in &spec.groups {
+            command.arg("--group").arg(format!(
+                "{}={},{},{},{}",
+                group.name, group.processes, group.threads, group.sync_threads, group.concurrency
+            ));
+        }
+
+        let workers = spec.processes
+            + spec
+                .groups
+                .iter()
+                .map(|group| group.processes)
+                .sum::<usize>();
         let base_port = spec
             .tcp_base_port
-            .map(|base| base.wrapping_add((release - 1) as u16 * spec.processes as u16));
+            .map(|base| base.wrapping_add((release - 1) as u16 * workers as u16));
 
         if let Some(base) = base_port {
             command.arg("--tcp-base-port").arg(base.to_string());
@@ -171,19 +204,41 @@ impl HostProcess {
             tokio::spawn(relay(stderr, logs.clone(), true));
         }
 
-        let sockets = (0..spec.processes)
-            .map(|index| match base_port {
+        // Sockets are numbered across every group in the order the host
+        // forks them: the default group first, then each named group.
+
+        let socket = |group: Option<&str>, index: usize, position: usize| match base_port {
+            None => match group {
                 None => run_dir.join(format!("worker-{index}.sock")),
-                Some(base) => {
-                    let port = base.wrapping_add(u16::try_from(index).unwrap_or(0));
-                    PathBuf::from(format!("127.0.0.1:{port}"))
-                }
-            })
+                Some(name) => run_dir.join(format!("worker-{name}-{index}.sock")),
+            },
+            Some(base) => {
+                let port = base.wrapping_add(u16::try_from(position).unwrap_or(0));
+                PathBuf::from(format!("127.0.0.1:{port}"))
+            }
+        };
+        let mut sockets: Vec<PathBuf> = (0..spec.processes)
+            .map(|index| socket(None, index, index))
             .collect();
+        let mut group_sockets = Vec::new();
+
+        for group in &spec.groups {
+            let mut these = Vec::new();
+
+            for index in 0..group.processes {
+                let path = socket(Some(&group.name), index, sockets.len());
+                sockets.push(path.clone());
+                these.push(path);
+            }
+
+            group_sockets.push((group.name.clone(), these));
+        }
+
         Ok(Self {
             process: Process::Child(child),
             stdin,
             sockets,
+            group_sockets,
             run_dir,
             release,
         })
@@ -195,6 +250,7 @@ impl HostProcess {
     pub fn adopt(
         pid: u32,
         sockets: Vec<PathBuf>,
+        group_sockets: Vec<(String, Vec<PathBuf>)>,
         run_dir: PathBuf,
         release: u32,
     ) -> anyhow::Result<Self> {
@@ -208,9 +264,21 @@ impl HostProcess {
             process: Process::Adopted(pid),
             stdin: None,
             sockets,
+            group_sockets,
             run_dir,
             release,
         })
+    }
+
+    /// The default group's sockets: those of no named group.
+    pub fn default_sockets(&self) -> Vec<PathBuf> {
+        let named: usize = self
+            .group_sockets
+            .iter()
+            .map(|(_, sockets)| sockets.len())
+            .sum();
+
+        self.sockets[..self.sockets.len() - named].to_vec()
     }
 
     /// The host's pid.

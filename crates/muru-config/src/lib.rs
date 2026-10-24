@@ -184,6 +184,31 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
+/// `[tool.muru.groups.NAME]` table (section 7.1): the paths it serves
+/// and its own sizes. Paths not claimed by a group go to the default
+/// group, which is the release's own settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Group {
+    /// Path prefixes, with an optional trailing `*`; the most specific
+    /// match across all groups wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Worker processes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<usize>,
+    /// Application threads per worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<usize>,
+    /// Threads for synchronous code called from an ASGI application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_threads: Option<usize>,
+    /// Requests an ASGI worker's event loop takes at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+}
+
 /// A release definition, the `[app.NAME.release.ID]` table (appendix C):
 /// the keys a deploy takes. `muructl run --print-config` writes one so a
 /// laptop setup can become a declared release, and `muructl apply` reads
@@ -229,6 +254,9 @@ pub struct Release {
     /// The hooks module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
+    /// Worker groups by name (section 7.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, Group>,
 }
 
 /// The `[limits]` table (appendix C): sizes and durations as the
@@ -519,6 +547,9 @@ pub struct ToolMuru {
     /// The Python requirement, for example "3.13" or ">=3.12".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<String>,
+    /// Worker groups by name (section 7.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, Group>,
 }
 
 /// Why a project's configuration could not be read.

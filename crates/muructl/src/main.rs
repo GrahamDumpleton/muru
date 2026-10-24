@@ -622,6 +622,8 @@ struct Resolved {
     project: PathBuf,
     /// The file the table came from, when there was one.
     source: Option<PathBuf>,
+    /// Named worker groups from the table (section 7.1).
+    groups: std::collections::BTreeMap<String, muru_config::Group>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -735,6 +737,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         hooks: args.hooks.clone().or(table.hooks),
         project,
         source,
+        groups: table.groups,
     })
 }
 
@@ -776,6 +779,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         concurrency: Some(resolved.concurrency),
         preload: Some(resolved.preload),
         hooks: resolved.hooks.clone(),
+        groups: resolved.groups.clone(),
     };
     let document = Document {
         listener: listeners,
@@ -803,6 +807,25 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
          # The release is written as r1; muructl deploy numbers releases itself.\n\
          # Listeners and limits belong in the daemon configuration file.\n\n{text}"
     ))
+}
+
+/// A host's named groups as the edge connects them: each group's sockets
+/// with the paths that select it.
+fn group_sockets(
+    host: &HostProcess,
+    groups: &std::collections::BTreeMap<String, muru_config::Group>,
+) -> Vec<muru_edge::routing::GroupSockets> {
+    host.group_sockets
+        .iter()
+        .map(|(name, sockets)| muru_edge::routing::GroupSockets {
+            name: name.clone(),
+            paths: groups
+                .get(name)
+                .map(|group| group.paths.clone())
+                .unwrap_or_default(),
+            sockets: sockets.clone(),
+        })
+        .collect()
 }
 
 /// The application's name: the top-level module of its entrypoint, as
@@ -946,9 +969,21 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
         single: args.single,
         detach_to: None,
+        groups: resolved
+            .groups
+            .iter()
+            .map(|(name, group)| muru_controller::host::HostGroup {
+                name: name.clone(),
+                processes: group.processes.unwrap_or(resolved.processes),
+                threads: group.threads.unwrap_or(resolved.threads),
+                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
+                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+            })
+            .collect(),
     };
 
     let logs = Logs::default();
+    let group_tables = resolved.groups.clone();
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -961,7 +996,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
-        sockets: current.sockets.clone(),
+        sockets: current.default_sockets(),
+        groups: group_sockets(&current, &resolved.groups),
         development,
         access_log,
         limits: limits(&args),
@@ -1125,8 +1161,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     tokio::select! {
                         ready = next.wait_ready(START_TIMEOUT) => match ready {
                             Ok(()) => {
-                                match muru_edge::link::LinkPool::connect(&next.sockets).await {
-                                    Ok(pool) => pools.replace(pool),
+                                let connected = muru_edge::routing::AppPools::connect(
+                                    &next.default_sockets(),
+                                    &group_sockets(&next, &group_tables),
+                                )
+                                .await;
+
+                                match connected {
+                                    Ok(connected) => pools.replace(connected),
                                     Err(error) => {
                                         println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
                                         next.stop().await;

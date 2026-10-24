@@ -510,6 +510,7 @@ mod tests {
             preload: Preload::Auto,
             hooks: None,
             factory: None,
+            groups: Vec::new(),
         }
     }
 

@@ -45,9 +45,11 @@ pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 pub struct Config {
     /// Address for the HTTP listener. Port 0 picks a free port.
     pub listen: SocketAddr,
-    /// Unix socket paths of the workers. Each worker's HELLO says how many
-    /// requests it takes at once.
+    /// Unix socket paths of the default group's workers. Each worker's
+    /// HELLO says how many requests it takes at once.
     pub sockets: Vec<PathBuf>,
+    /// The named worker groups, with the paths that select them.
+    pub groups: Vec<routing::GroupSockets>,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
     /// Where the access log goes and what it leaves out.
@@ -133,10 +135,10 @@ impl Pools {
         Arc::clone(&self.current.read().expect("pools poisoned"))
     }
 
-    /// Send new requests to another set of workers, with no hosts.
-    /// Requests in flight finish on the pool they started with.
-    pub fn replace(&self, pool: link::LinkPool) {
-        self.apply(routing::Routing::single(pool));
+    /// Send new requests to another application's workers, with no
+    /// hosts. Requests in flight finish on the pool they started with.
+    pub fn replace(&self, pools: routing::AppPools) {
+        self.apply(routing::Routing::single(pools));
     }
 
     /// Switch to the tables of a new snapshot.
@@ -236,7 +238,7 @@ impl Edge {
     ) -> anyhow::Result<Self> {
         let pools = Arc::new(Pools {
             current: RwLock::new(Arc::new(routing::Routing::single(
-                link::LinkPool::connect(&config.sockets).await?,
+                routing::AppPools::connect(&config.sockets, &config.groups).await?,
             ))),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);

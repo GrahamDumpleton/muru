@@ -8,5 +8,7 @@ sections 6.8 and 13.1):
   the entrypoint, the hooks module and the process and thread counts.
 - `factory/`: a muru.toml at the top level with a factory entrypoint, plus
   ASGI callables for the phase 1 refusal.
+- `grouped/`: a muru.toml declaring worker groups (section 7.1), whose
+  application reports the group and worker that served each request.
 
 Run one directly with `muructl run tests/fixtures/projects/shop`.

@@ -258,6 +258,39 @@ class WorkerOutput:
             self.pending = b""
 
 
+@dataclass(frozen=True)
+class Group:
+    """A worker group (section 7.1): its name and sizes.
+
+    The default group, named "default", carries the release's own
+    settings; named groups follow it in the order given.
+    """
+
+    name: str
+    processes: int
+    threads: int
+    sync_threads: int
+    concurrency: int
+
+    @classmethod
+    def parse(cls, text: str) -> Group:
+        """Parse NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY."""
+
+        name, _, sizes = text.partition("=")
+
+        try:
+            processes, threads, sync_threads, concurrency = (int(part) for part in sizes.split(","))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{text!r} is not NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY"
+            ) from None
+
+        if not name or name == "default" or processes < 1:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a valid worker group")
+
+        return cls(name, processes, threads, sync_threads, concurrency)
+
+
 class Host:
     """Preload once, fork workers, and keep them running until told to stop."""
 
@@ -271,15 +304,26 @@ class Host:
         sync_threads: int = 8,
         concurrency: int = 1000,
         detach: bool = False,
+        groups: list[Group] | None = None,
     ) -> None:
         self.release = release
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
-        self.worker_count = workers
         self.threads = threads
         self.sync_threads = sync_threads
         self.concurrency = concurrency
+
+        # Workers are numbered across the groups in the order they are
+        # forked: the default group first, then each named group, each
+        # worker knowing its group and its index within it.
+
+        self.groups = [Group("default", workers, threads, sync_threads, concurrency)]
+        self.groups.extend(groups or [])
+        self.placement: list[tuple[Group, int]] = [
+            (group, index) for group in self.groups for index in range(group.processes)
+        ]
+        self.worker_count = len(self.placement)
 
         # Section 2.4: a host's workers must not outlive it. Each worker
         # inherits the read end of this pipe and stops when it reaches end
@@ -298,11 +342,20 @@ class Host:
         self.outputs: dict[int, WorkerOutput] = {}
 
     def socket_path(self, index: int) -> str:
-        """Return the Unix socket path, or the TCP address, a worker listens on."""
+        """Return the Unix socket path, or the TCP address, a worker listens on.
+
+        A named group's sockets carry its name, so the daemon can tell
+        them apart; the default group's are numbered plainly.
+        """
 
         if self.tcp_base_port is not None:
             return f"127.0.0.1:{self.tcp_base_port + index}"
-        return os.path.join(self.socket_dir, f"worker-{index}.sock")
+
+        group, within = self.placement[index]
+        if group.name == "default":
+            return os.path.join(self.socket_dir, f"worker-{within}.sock")
+
+        return os.path.join(self.socket_dir, f"worker-{group.name}-{within}.sock")
 
     def spawn(self, index: int) -> None:
         """Fork one worker. The parent returns at once; the child never returns."""
@@ -379,8 +432,14 @@ class Host:
         signal.set_wakeup_fd(-1)
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGCHLD):
             signal.signal(signum, signal.SIG_DFL)
+
+        # Section 7.1: MURU_GROUP and the context identify the group after
+        # the fork, and the group's sizes are the worker's.
+
+        group, within = self.placement[index]
+        os.environ["MURU_GROUP"] = group.name
         release = self.release
-        context = replace(release.context, worker_id=index)
+        context = replace(release.context, worker_id=within, group=group.name)
         set_context(context)
 
         loop: _asgi.Loop | None = None
@@ -405,7 +464,7 @@ class Host:
 
             known = release.resolved is not None
             app = release.realise()
-            context = replace(release.context, worker_id=index)
+            context = replace(release.context, worker_id=within, group=group.name)
             set_context(context)
             if not known and release.resolved is not None:
                 log(f"worker {index} serves {release.spec} as {release.resolved.upper()}")
@@ -414,7 +473,7 @@ class Host:
             # fork, and lifespan startup before the worker is ready.
 
             if release.resolved == "asgi":
-                loop = _asgi.Loop(self.sync_threads)
+                loop = _asgi.Loop(group.sync_threads)
                 loop.start()
                 lifespan = _asgi.Lifespan(app, loop, release.spec)
                 lifespan.startup()
@@ -446,14 +505,14 @@ class Host:
             asgi_arguments = {
                 "event_loop": loop.loop,
                 "runner": _asgi.runner(app, loop, lifespan.state),
-                "concurrency": self.concurrency,
+                "concurrency": group.concurrency,
             }
 
         try:
             _native.serve(
                 self.socket_path(index),
                 app,
-                self.threads if loop is None else 1,
+                group.threads if loop is None else 1,
                 # Section 6.5: False only for a single-process development run.
                 multiprocess=self.worker_count > 1,
                 on_drain=lambda: hooks.call_logged("on_drain", context),
@@ -732,6 +791,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="keep running when the parent goes away, for a daemon that re-adopts hosts",
     )
+    parser.add_argument(
+        "--group",
+        action="append",
+        default=[],
+        type=Group.parse,
+        metavar="NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY",
+        help="a named worker group beside the default one (section 7.1)",
+    )
     return parser.parse_args(argv)
 
 
@@ -845,6 +912,7 @@ def main(argv: list[str] | None = None) -> int:
         sync_threads=args.sync_threads,
         concurrency=args.concurrency,
         detach=args.detach,
+        groups=args.group,
     )
 
     if args.single:

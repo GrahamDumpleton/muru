@@ -1,12 +1,14 @@
 //! Virtual hosts and routes (design specification sections 4.3 to 4.5):
 //! the tables a snapshot compiles into, consulted once per request.
 //!
-//! Without any host the edge is a single pool, as in development mode:
-//! every request goes to the default workers. With hosts, a request's
-//! host name selects the virtual host (exact name, then the wildcard with
-//! the longest suffix, then the listener's default host, else 421), the
+//! Without any host the edge serves one application, as in development
+//! mode: every request goes to its workers. With hosts, a request's host
+//! name selects the virtual host (exact name, then the wildcard with the
+//! longest suffix, then the listener's default host, else 421), the
 //! longest route prefix selects the application, and the application's
-//! serving release takes the request.
+//! serving release takes the request. Within a release, the most specific
+//! worker group path selects the group's workers, else the default
+//! group's (section 7.1).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,12 +36,98 @@ struct Route {
     app: String,
 }
 
+/// The worker sockets of one group of a release, as a snapshot or a
+/// development run names them.
+#[derive(Debug, Clone)]
+pub struct GroupSockets {
+    /// The group's name.
+    pub name: String,
+    /// The paths it serves: prefixes, with an optional trailing `*`.
+    pub paths: Vec<String>,
+    /// Its workers.
+    pub sockets: Vec<std::path::PathBuf>,
+}
+
+/// An application's connected workers: the default group and the named
+/// groups, each with the paths that select it, most specific first.
+pub struct AppPools {
+    default: Arc<LinkPool>,
+    groups: Vec<(String, Arc<LinkPool>)>,
+}
+
+impl AppPools {
+    /// Connect the default workers and each group's.
+    pub async fn connect(
+        default: &[std::path::PathBuf],
+        groups: &[GroupSockets],
+    ) -> anyhow::Result<Self> {
+        let default = Arc::new(LinkPool::connect(default).await?);
+        let mut connected = Vec::new();
+
+        for group in groups {
+            let pool = Arc::new(LinkPool::connect(&group.sockets).await?);
+
+            for path in &group.paths {
+                connected.push((group_prefix(path), Arc::clone(&pool)));
+            }
+        }
+
+        connected.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+
+        Ok(Self {
+            default,
+            groups: connected,
+        })
+    }
+
+    /// A single pool with no groups.
+    pub fn single(pool: LinkPool) -> Self {
+        Self {
+            default: Arc::new(pool),
+            groups: Vec::new(),
+        }
+    }
+
+    /// The pool a path goes to: the most specific group path, else the
+    /// default group.
+    pub fn select(&self, path: &str) -> Arc<LinkPool> {
+        self.groups
+            .iter()
+            .find(|(prefix, _)| prefix_matches(prefix, path))
+            .map(|(_, pool)| Arc::clone(pool))
+            .unwrap_or_else(|| Arc::clone(&self.default))
+    }
+
+    /// The default group's pool.
+    pub fn default_pool(&self) -> Arc<LinkPool> {
+        Arc::clone(&self.default)
+    }
+}
+
+/// A group path as a route-style prefix: a trailing `*` means anything
+/// below, which is what a prefix already means.
+fn group_prefix(path: &str) -> String {
+    let trimmed = path.trim_end_matches('*');
+
+    let trimmed = if trimmed.len() > 1 {
+        trimmed.trim_end_matches('/')
+    } else {
+        trimmed
+    };
+
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// The compiled routing tables of one snapshot.
 pub struct Routing {
     version: u64,
     trust: Trust,
-    default: Arc<LinkPool>,
-    apps: HashMap<String, Arc<LinkPool>>,
+    default: Arc<AppPools>,
+    apps: HashMap<String, Arc<AppPools>>,
     hosts: Vec<Host>,
     exact: HashMap<String, usize>,
     wildcards: Vec<(String, usize)>,
@@ -65,13 +153,13 @@ pub enum Decision {
 }
 
 impl Routing {
-    /// A single pool and nothing else: development mode, or a daemon with
-    /// no host declared.
-    pub fn single(pool: LinkPool) -> Self {
+    /// One application and nothing else: development mode, or a daemon
+    /// with no host declared.
+    pub fn single(pools: AppPools) -> Self {
         Self {
             version: 0,
             trust: Trust::default(),
-            default: Arc::new(pool),
+            default: Arc::new(pools),
             apps: HashMap::new(),
             hosts: Vec::new(),
             exact: HashMap::new(),
@@ -84,12 +172,24 @@ impl Routing {
     /// Compile a snapshot, connecting to every worker it names first, so
     /// a snapshot that cannot be reached is refused whole.
     pub async fn from_snapshot(snapshot: &pb::Snapshot) -> anyhow::Result<Self> {
-        let default = LinkPool::connect(&paths(&snapshot.worker_sockets)).await?;
+        // The default workers are one application's, found by its sockets
+        // so its groups come along; without one, a plain pool.
+
+        let default_app = snapshot
+            .apps
+            .iter()
+            .find(|app| app.sockets == snapshot.worker_sockets);
+
+        let default = match default_app {
+            Some(app) => AppPools::connect(&paths(&app.sockets), &groups_of(app)).await?,
+            None => AppPools::single(LinkPool::connect(&paths(&snapshot.worker_sockets)).await?),
+        };
+
         let mut apps = HashMap::new();
 
         for app in &snapshot.apps {
-            let pool = LinkPool::connect(&paths(&app.sockets)).await?;
-            apps.insert(app.app.clone(), Arc::new(pool));
+            let pools = AppPools::connect(&paths(&app.sockets), &groups_of(app)).await?;
+            apps.insert(app.app.clone(), Arc::new(pools));
         }
 
         // Exact names go in a map; wildcards keep their suffix, longest
@@ -188,10 +288,10 @@ impl Routing {
         !self.hosts.is_empty()
     }
 
-    /// The default pool: every request without hosts, and what the
+    /// The default application's default pool, which is what the
     /// dashboard counts.
     pub fn default_pool(&self) -> Arc<LinkPool> {
-        Arc::clone(&self.default)
+        self.default.default_pool()
     }
 
     /// Where a request goes, from the host the client asked for, the
@@ -199,7 +299,7 @@ impl Routing {
     pub fn select(&self, name: Option<&str>, path: &str, listener: &str, tls: bool) -> Decision {
         if self.hosts.is_empty() {
             return Decision::Serve {
-                pool: Arc::clone(&self.default),
+                pool: self.default.select(path),
                 server_name: None,
             };
         }
@@ -223,7 +323,7 @@ impl Routing {
         let pool = self
             .apps
             .get(&route.app)
-            .cloned()
+            .map(|pools| pools.select(path))
             .unwrap_or_else(|| Arc::new(LinkPool::empty()));
 
         // SERVER_NAME is the name the request matched with, or the
@@ -264,6 +364,17 @@ impl Routing {
 
 fn paths(sockets: &[String]) -> Vec<std::path::PathBuf> {
     sockets.iter().map(std::path::PathBuf::from).collect()
+}
+
+fn groups_of(app: &pb::AppWorkers) -> Vec<GroupSockets> {
+    app.groups
+        .iter()
+        .map(|group| GroupSockets {
+            name: group.name.clone(),
+            paths: group.paths.clone(),
+            sockets: paths(&group.sockets),
+        })
+        .collect()
 }
 
 /// A host name as the tables hold it: lower case, no port, no trailing dot.
@@ -445,12 +556,20 @@ mod tests {
 
     #[test]
     fn without_hosts_everything_is_served() {
-        let routing = Routing::single(LinkPool::empty());
+        let routing = Routing::single(AppPools::single(LinkPool::empty()));
         assert!(!routing.has_hosts());
         assert!(matches!(
             routing.select(Some("whatever"), "/", "127.0.0.1:1", false),
             Decision::Serve { .. }
         ));
+    }
+
+    #[test]
+    fn group_paths_become_prefixes() {
+        assert_eq!(group_prefix("/reports/*"), "/reports");
+        assert_eq!(group_prefix("/api/status"), "/api/status");
+        assert_eq!(group_prefix("/*"), "/");
+        assert_eq!(group_prefix("*"), "/");
     }
 
     #[test]

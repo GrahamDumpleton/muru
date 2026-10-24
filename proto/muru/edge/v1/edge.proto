@@ -60,10 +60,18 @@ message Route {
   string app = 3;
 }
 
-// The worker sockets of an application's serving release.
+// The worker sockets of an application's serving release: the default
+// group's, and each named group's with the paths it serves (section 7.1).
 message AppWorkers {
   string app = 1;
   repeated string sockets = 2;
+  repeated Group groups = 3;
+}
+
+message Group {
+  string name = 1;
+  repeated string paths = 2;            // prefixes, with an optional trailing *
+  repeated string sockets = 3;
 }
 
 message Applied {

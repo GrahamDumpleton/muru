@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use muru_config::{
-    App as AppTable, Document, Host as VirtualHost, Release as ReleaseTable, Route as RouteTable,
+    App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Release as ReleaseTable,
+    Route as RouteTable,
 };
 use muru_proto::admin::v1 as pb;
 
-use crate::model::{ReleaseSpec, valid_name};
+use crate::model::{GroupSpec, ReleaseSpec, valid_name};
 use crate::store::{Store, StoreError};
 
 /// What an apply does to one object.
@@ -227,7 +228,9 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             continue;
         };
 
-        let spec = match resolve_spec(&request_from(name, table, source), None) {
+        let groups = (!table.groups.is_empty()).then_some(&table.groups);
+
+        let spec = match resolve_spec(&request_from(name, table, source), None, groups) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -569,6 +572,7 @@ fn describe_host(host: &VirtualHost) -> String {
 pub fn resolve_spec(
     request: &pb::DeployRequest,
     previous: Option<&ReleaseSpec>,
+    groups: Option<&BTreeMap<String, GroupTable>>,
 ) -> Result<ReleaseSpec, String> {
     let source = Path::new(&request.source);
 
@@ -631,6 +635,60 @@ pub fn resolve_spec(
         }
     };
 
+    // Section 7.1: groups from the declaration, else the source's own
+    // table; each takes its sizes from the release's where it is silent.
+
+    let processes = request
+        .processes
+        .or(table.processes.map(|value| value as u32))
+        .or(previous.map(|previous| previous.processes))
+        .unwrap_or(1);
+    let threads = request
+        .threads
+        .or(table.threads.map(|value| value as u32))
+        .or(previous.map(|previous| previous.threads))
+        .unwrap_or(4);
+    let sync_threads = request
+        .sync_threads
+        .or(table.sync_threads.map(|value| value as u32))
+        .unwrap_or(8);
+    let concurrency = request
+        .concurrency
+        .or(table.concurrency.map(|value| value as u32))
+        .unwrap_or(1000);
+    let mut resolved_groups = Vec::new();
+
+    for (name, group) in groups.unwrap_or(&table.groups) {
+        if !crate::model::valid_name(name) || name == "default" {
+            return Err(format!("{name:?} is not a valid worker group name"));
+        }
+
+        if group.paths.is_empty() {
+            return Err(format!("worker group {name} has no paths"));
+        }
+
+        if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
+            return Err(format!(
+                "worker group {name}: {path:?} does not start with /"
+            ));
+        }
+
+        if group.processes == Some(0) {
+            return Err(format!("worker group {name} has no processes"));
+        }
+
+        resolved_groups.push(GroupSpec {
+            name: name.clone(),
+            paths: group.paths.clone(),
+            processes: group.processes.map_or(processes, |value| value as u32),
+            threads: group.threads.map_or(threads, |value| value as u32),
+            sync_threads: group
+                .sync_threads
+                .map_or(sync_threads, |value| value as u32),
+            concurrency: group.concurrency.map_or(concurrency, |value| value as u32),
+        });
+    }
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -641,24 +699,10 @@ pub fn resolve_spec(
                 .map_err(|error: muru_config::ParseError| error.to_string())?,
         },
         python,
-        processes: request
-            .processes
-            .or(table.processes.map(|value| value as u32))
-            .or(previous.map(|previous| previous.processes))
-            .unwrap_or(1),
-        threads: request
-            .threads
-            .or(table.threads.map(|value| value as u32))
-            .or(previous.map(|previous| previous.threads))
-            .unwrap_or(4),
-        sync_threads: request
-            .sync_threads
-            .or(table.sync_threads.map(|value| value as u32))
-            .unwrap_or(8),
-        concurrency: request
-            .concurrency
-            .or(table.concurrency.map(|value| value as u32))
-            .unwrap_or(1000),
+        processes,
+        threads,
+        sync_threads,
+        concurrency,
         preload: match request.preload.as_str() {
             "" => table.preload.unwrap_or(muru_config::Preload::Auto),
             given => given
@@ -669,6 +713,7 @@ pub fn resolve_spec(
             .then(|| request.hooks.clone())
             .or(table.hooks),
         factory,
+        groups: resolved_groups,
     })
 }
 
@@ -751,6 +796,22 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         concurrency: Some(spec.concurrency as usize),
         preload: Some(spec.preload),
         hooks: spec.hooks.clone(),
+        groups: spec
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.name.clone(),
+                    GroupTable {
+                        paths: group.paths.clone(),
+                        processes: Some(group.processes as usize),
+                        threads: Some(group.threads as usize),
+                        sync_threads: Some(group.sync_threads as usize),
+                        concurrency: Some(group.concurrency as usize),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -836,8 +897,34 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
             .map(|phase| phase.to_string())
             .unwrap_or_default(),
     );
+    compare(
+        "groups",
+        describe_groups(&declared.groups),
+        describe_groups(&recorded.groups),
+    );
 
     found
+}
+
+/// Groups as one phrase, for the report.
+fn describe_groups(groups: &[GroupSpec]) -> String {
+    if groups.is_empty() {
+        return "none".to_owned();
+    }
+
+    groups
+        .iter()
+        .map(|group| {
+            format!(
+                "{} {}x{} on {}",
+                group.name,
+                group.processes,
+                group.threads,
+                group.paths.join(" ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Generated ids in numeric order (r2 before r10), then any other id.
@@ -867,6 +954,7 @@ mod tests {
                 python: "/usr/bin/python3".to_owned(),
                 ..Default::default()
             },
+            None,
             None,
         )
         .unwrap();
