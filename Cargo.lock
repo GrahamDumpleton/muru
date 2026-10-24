@@ -871,6 +871,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",

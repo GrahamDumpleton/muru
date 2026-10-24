@@ -13,7 +13,7 @@ mod host;
 mod logs;
 mod watch;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -78,9 +78,14 @@ struct RunArgs {
     #[arg(long)]
     factory: bool,
 
-    /// Address to listen on.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    bind: SocketAddr,
+    /// Address to listen on, as IP or IP:PORT.
+    #[arg(long, default_value = "127.0.0.1", value_parser = parse_bind)]
+    bind: Bind,
+
+    /// Port for HTTP (default 8080), or auto to pick free ports and print
+    /// them.
+    #[arg(long, value_parser = parse_port)]
+    port: Option<Port>,
 
     /// Worker processes forked from the preloaded host (default 1).
     #[arg(long)]
@@ -136,9 +141,10 @@ struct RunArgs {
     #[arg(long)]
     https_only: bool,
 
-    /// Port for HTTPS, on the address of --bind.
-    #[arg(long, default_value_t = 8443)]
-    https_port: u16,
+    /// Port for HTTPS, on the address of --bind (default 8443, or auto
+    /// when --port is auto).
+    #[arg(long, value_parser = parse_port)]
+    https_port: Option<Port>,
 
     /// Certificate chain to serve, PEM, instead of a development
     /// certificate. Implies --https.
@@ -194,6 +200,120 @@ struct RunArgs {
     /// First loopback port for the tcp link; each worker takes the next one.
     #[arg(long, default_value_t = 9100)]
     tcp_base_port: u16,
+}
+
+/// The --bind value: an address with or without a port.
+#[derive(Debug, Clone, Copy)]
+struct Bind {
+    ip: IpAddr,
+    port: Option<u16>,
+}
+
+fn parse_bind(text: &str) -> Result<Bind, String> {
+    if let Ok(address) = text.parse::<SocketAddr>() {
+        return Ok(Bind {
+            ip: address.ip(),
+            port: Some(address.port()),
+        });
+    }
+    text.parse::<IpAddr>()
+        .map(|ip| Bind { ip, port: None })
+        .map_err(|_| format!("{text:?} is not an address such as 127.0.0.1 or 127.0.0.1:9000"))
+}
+
+/// A port setting: a number, or auto for a free one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Port {
+    Auto,
+    Number(u16),
+}
+
+fn parse_port(text: &str) -> Result<Port, String> {
+    if text.eq_ignore_ascii_case("auto") {
+        return Ok(Port::Auto);
+    }
+    text.parse::<u16>()
+        .map(Port::Number)
+        .map_err(|_| format!("{text:?} is not a port number or auto"))
+}
+
+/// The HTTP and HTTPS addresses to bind (section 13.1): --port wins over a
+/// port in --bind, then 8080; --https-port, else auto when --port is auto,
+/// else 8443. Port 0 asks the system for a free one.
+fn addresses(args: &RunArgs) -> (SocketAddr, SocketAddr) {
+    const HTTP: u16 = 8080;
+    const HTTPS: u16 = 8443;
+    let http = match args.port {
+        Some(Port::Auto) => 0,
+        Some(Port::Number(port)) => port,
+        None => args.bind.port.unwrap_or(HTTP),
+    };
+    let https = match args.https_port {
+        Some(Port::Auto) => 0,
+        Some(Port::Number(port)) => port,
+        None if args.port == Some(Port::Auto) => 0,
+        None => HTTPS,
+    };
+    (
+        SocketAddr::new(args.bind.ip, http),
+        SocketAddr::new(args.bind.ip, https),
+    )
+}
+
+/// Turn a failure to bind into advice: which port, who holds it when that
+/// can be found out, and what to do.
+fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error {
+    let Some(bind) = error.downcast_ref::<muru_edge::BindError>() else {
+        return error;
+    };
+    if bind.source.kind() != std::io::ErrorKind::AddrInUse {
+        return error;
+    }
+    let (address, port) = (bind.address, bind.address.port());
+    let flag = if address == https {
+        "--https-port"
+    } else {
+        "--port"
+    };
+    match port_holder(port) {
+        Some(holder) => anyhow::anyhow!(
+            "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
+            address.ip()
+        ),
+        None => anyhow::anyhow!(
+            "port {port} on {} is in use; choose another with {flag} ({flag} auto picks a free one)",
+            address.ip()
+        ),
+    }
+}
+
+/// The process listening on a TCP port, as "command (pid N)", found with
+/// lsof or ss when either is installed.
+fn port_holder(port: u16) -> Option<String> {
+    let lsof = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    if let Some(output) = lsof {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let pid = text.lines().find_map(|line| line.strip_prefix('p'));
+        let command = text.lines().find_map(|line| line.strip_prefix('c'));
+        if let (Some(pid), Some(command)) = (pid, command) {
+            return Some(format!("{command} (pid {pid})"));
+        }
+    }
+    let ss = std::process::Command::new("ss")
+        .args(["-lptnH", &format!("sport = :{port}")])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8_lossy(&ss.stdout);
+    // users:(("python3",pid=1234,fd=5))
+    let users = text.split("users:((\"").nth(1)?;
+    let (command, rest) = users.split_once('"')?;
+    let pid = rest.split("pid=").nth(1)?.split(',').next()?;
+    Some(format!("{command} (pid {pid})"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -453,7 +573,7 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
     };
     Ok(Some(Tls {
         https: muru_edge::Https {
-            listen: SocketAddr::new(args.bind.ip(), args.https_port),
+            listen: addresses(args).1,
             config: muru_edge::tls::server_config(chain, key)?,
             only: args.https_only,
         },
@@ -530,8 +650,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         return Err(error);
     }
 
-    let edge = muru_edge::Edge::bind(muru_edge::Config {
-        listen: args.bind,
+    let (http_address, https_address) = addresses(&args);
+    let edge = match muru_edge::Edge::bind(muru_edge::Config {
+        listen: http_address,
         sockets: current.sockets.clone(),
         slots: resolved.threads,
         development: true,
@@ -539,7 +660,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         limits: limits(&args),
         https: tls.as_ref().map(|tls| tls.https.clone()),
     })
-    .await?;
+    .await
+    {
+        Ok(edge) => edge,
+        Err(error) => {
+            current.stop().await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(explain_bind_error(error, https_address));
+        }
+    };
     let addresses = match edge.https_addr() {
         Some(https) if args.https_only => {
             format!(

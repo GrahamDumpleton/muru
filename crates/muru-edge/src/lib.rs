@@ -123,6 +123,17 @@ impl Pools {
     }
 }
 
+/// A listener could not be bound, most often because the port is in use.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot listen on {address}: {source}")]
+pub struct BindError {
+    /// The address that could not be bound.
+    pub address: SocketAddr,
+    /// What the operating system said.
+    #[source]
+    pub source: std::io::Error,
+}
+
 /// What every connection shares.
 struct Shared {
     pools: Arc<Pools>,
@@ -153,12 +164,22 @@ impl Edge {
             )?)),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
-        let http = TcpListener::bind(config.listen).await?;
+        let http = TcpListener::bind(config.listen)
+            .await
+            .map_err(|source| BindError {
+                address: config.listen,
+                source,
+            })?;
         let local = http.local_addr()?;
         let mut https = None;
         let mut redirect_to = None;
         if let Some(secure) = config.https {
-            let listener = TcpListener::bind(secure.listen).await?;
+            let listener = TcpListener::bind(secure.listen)
+                .await
+                .map_err(|source| BindError {
+                    address: secure.listen,
+                    source,
+                })?;
             let bound = listener.local_addr()?;
             if secure.only {
                 redirect_to = Some(bound);

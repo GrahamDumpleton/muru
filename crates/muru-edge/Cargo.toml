@@ -21,6 +21,7 @@ muru-proto = { workspace = true }
 prost = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
