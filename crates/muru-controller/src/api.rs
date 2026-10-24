@@ -141,9 +141,11 @@ impl Admin for Service {
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::invalid_argument)?;
+
         if !request.wait {
             return Ok(Response::new(release_message(created, &self.handle)));
         }
+
         let release = done_rx
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
@@ -189,15 +191,18 @@ impl Admin for Service {
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
         let mut states = Vec::new();
+
         for name in &request.states {
             states.push(
                 name.parse::<ReleaseState>()
                     .map_err(Status::invalid_argument)?,
             );
         }
+
         if states.is_empty() {
             states = vec![ReleaseState::Ready, ReleaseState::Failed];
         }
+
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(if request.timeout_ms == 0 {
                 300_000
@@ -211,15 +216,18 @@ impl Admin for Service {
                 .store
                 .release(&request.app, &request.release)
                 .map_err(not_found)?;
+
             if states.contains(&release.state) {
                 return Ok(Response::new(release_message(release, &self.handle)));
             }
+
             if tokio::time::Instant::now() >= deadline {
                 return Err(Status::deadline_exceeded(format!(
                     "{}@{} is {} after the timeout",
                     request.app, request.release, release.state
                 )));
             }
+
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -271,6 +279,7 @@ impl Admin for Service {
         request: Request<pb::ListEventsRequest>,
     ) -> Result<Response<pb::ListEventsResponse>, Status> {
         let request = request.into_inner();
+
         let limit = if request.limit == 0 {
             100
         } else {
@@ -384,12 +393,15 @@ impl Admin for Service {
         request: Request<pb::ApplyConfigRequest>,
     ) -> Result<Response<pb::ConfigReport>, Status> {
         let request = request.into_inner();
+
         let document = match muru_config::Document::parse(&request.document) {
             Ok(document) => document,
             Err(error) => return Ok(Response::new(parse_failure(error))),
         };
+
         let plan = config::plan(&self.handle.store, &document, request.prune);
         let mut report = report_message(&plan);
+
         if !plan.errors.is_empty() || request.dry_run {
             return Ok(Response::new(report));
         }
@@ -398,12 +410,15 @@ impl Admin for Service {
         // into the report; a failure does not stop the rest.
 
         let mut failures = 0;
+
         for (change, message) in plan.changes.iter().zip(report.changes.iter_mut()) {
             message.outcome = self.carry_out(change).await;
+
             if message.outcome.starts_with("failed") {
                 failures += 1;
             }
         }
+
         report.applied = true;
 
         // Hosts and routes reach the edge with the next snapshot.
@@ -476,6 +491,7 @@ impl Service {
     /// starting with "failed" is counted as a failure.
     async fn carry_out(&self, change: &Change) -> String {
         let store = &self.handle.store;
+
         let outcome = match &change.action {
             Action::CreateApp { app } => store
                 .ensure_app(app)
@@ -558,6 +574,7 @@ impl Service {
             .is_ok_and(|release| release.state.is_running());
 
         let mut outcome = "removed";
+
         if running {
             let (done_tx, done_rx) = oneshot::channel();
             self.handle

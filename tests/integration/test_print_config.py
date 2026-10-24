@@ -15,10 +15,12 @@ PROJECTS = support.ROOT / "tests" / "fixtures" / "projects"
 
 def print_config(*args: str) -> dict[str, object]:
     muructl = support.muructl_path()
+
     if muructl is None:
         import pytest
 
         pytest.skip("muructl is not built")
+
     completed = subprocess.run(
         [str(muructl), "run", *args, "--print-config", "--python", sys.executable],
         capture_output=True,

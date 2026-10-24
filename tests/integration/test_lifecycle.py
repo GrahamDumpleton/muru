@@ -19,6 +19,7 @@ def hooked() -> Iterator[support.Server]:
     instance = support.start(
         "preload_wsgi:application", workers=WORKERS, args=["--hooks", "hooks_log"]
     )
+
     try:
         yield instance
     finally:
@@ -30,10 +31,12 @@ def hook_lines(server: support.Server, name: str) -> list[dict[str, str]]:
 
     marker = f"HOOK {name} "
     lines = []
+
     for line in server.log().splitlines():
         at = line.find(marker)
         if at >= 0:
             lines.append(dict(word.split("=", 1) for word in line[at:].split()[2:]))
+
     return lines
 
 
@@ -95,6 +98,7 @@ def test_drain_and_exit_run_on_shutdown(hooked: support.Server) -> None:
     hooked.stop()
     assert len(hook_lines(hooked, "on_drain")) == WORKERS
     assert len(hook_lines(hooked, "on_exit")) == WORKERS
+
     for name in ("on_drain", "on_exit"):
         for line in hook_lines(hooked, name):
             assert line["pid"] != str(hooked.host_pid())
@@ -104,6 +108,7 @@ def test_unsafe_import_falls_back_to_per_worker_imports() -> None:
     server = support.start(
         "unsafe_import_wsgi:application", workers=WORKERS, args=["--hooks", "hooks_log"]
     )
+
     try:
         log = server.log()
         assert "preload: the import of unsafe_import_wsgi left a connected socket" in log
@@ -137,6 +142,7 @@ def test_preload_true_fails_on_an_unsafe_import() -> None:
 
 def test_preload_false_imports_in_each_worker() -> None:
     server = support.start("preload_wsgi:application", workers=WORKERS, args=["--preload", "false"])
+
     try:
         assert "preloaded" not in server.log()
         assert import_pids(server, WORKERS * 8) == set(server.worker_pids().values())
@@ -155,6 +161,7 @@ def test_single_serves_in_the_host_process_without_forking() -> None:
     server = support.start(
         "preload_wsgi:application", workers=3, threads=4, args=["--single", "--hooks", "hooks_log"]
     )
+
     try:
         assert server.wait_for_log("serving in this process without forking")
         info = json.loads(server.get("/").body)

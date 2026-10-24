@@ -94,6 +94,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         let listener = UnixListener::bind(socket_path)?;
         let mut signals = Signals::new()?;
         let mut lifeline = Lifeline::new(lifeline)?;
+
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -104,6 +105,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                     if stop {
                         break;
                     }
+
                     Lifecycle::call(reopen_logs);
                 }
                 () = lifeline.gone() => {
@@ -112,6 +114,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                 }
             }
         }
+
         Ok(())
     });
 
@@ -126,6 +129,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
     if shared.asgi.is_some() {
         let deadline = Instant::now() + DRAIN_WAIT;
+
         while shared.in_flight() > 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -158,6 +162,7 @@ impl Lifeline {
 
         unsafe {
             let flags = libc::fcntl(raw, libc::F_GETFL);
+
             if flags >= 0 {
                 libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
@@ -169,6 +174,7 @@ impl Lifeline {
         let fd = unsafe {
             tokio::io::unix::AsyncFd::register_with_interest(owned, tokio::io::Interest::READABLE)?
         };
+
         Ok(Self { fd: Some(fd) })
     }
 
@@ -194,13 +200,16 @@ impl Lifeline {
                     buffer.len(),
                 )
             };
+
             if read == 0 {
                 return;
             }
+
             if read < 0 && std::io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
                 guard.clear_ready();
                 continue;
             }
+
             if read < 0 {
                 return;
             }
@@ -247,6 +256,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
             let Ok(hello) = pb::Hello::decode(hello.payload) else {
                 return;
             };
+
             if !same_major(&hello.protocol_version) {
                 return;
             }
@@ -273,6 +283,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
             ..Default::default()
         },
     };
+
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
         .await
         .is_err()
@@ -281,6 +292,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
     }
 
     let mut early: Option<frame::Frame> = None;
+
     loop {
         let request = match early.take() {
             Some(request) => request,
@@ -294,6 +306,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
                 _ => return,
             },
         };
+
         let request_end = request.is_end();
         let Ok(head) = pb::RequestHead::decode(request.payload) else {
             return;
@@ -374,6 +387,7 @@ async fn handle_request(
         wsgi::run(py, &worker_shared, head, body_rx, out_tx, worker_cancelled);
         worker_shared.request_finished();
     }));
+
     if !queued {
         shared.request_finished();
         return Err(io::Error::other("the worker is shutting down"));
@@ -381,6 +395,7 @@ async fn handle_request(
 
     let read_side = async {
         let mut body_tx = Some(body_tx);
+
         if !request_end {
             loop {
                 let Some(next) = frame::read(reader).await? else {
@@ -391,6 +406,7 @@ async fn handle_request(
                     ));
                 };
                 let end = next.is_end();
+
                 match next.kind {
                     kind::BODY => {
                         if let Some(tx) = &body_tx
@@ -401,6 +417,7 @@ async fn handle_request(
 
                             body_tx = None;
                         }
+
                         if end {
                             break;
                         }
@@ -423,6 +440,7 @@ async fn handle_request(
                 }
             }
         }
+
         drop(body_tx);
 
         // Section 5.5: a client that goes away while the response is in
@@ -474,6 +492,7 @@ async fn handle_asgi_request(
     // of this function reach it.
 
     shared.request_started();
+
     let channel = match asgi::start(shared, asgi, &head, out_tx) {
         Ok(channel) => channel,
         Err(error) => {
@@ -483,7 +502,9 @@ async fn handle_asgi_request(
             )));
         }
     };
+
     let channel = channel.get();
+
     if head.scope == pb::Scope::Websocket as i32 {
         return handle_websocket(reader, writer, out_rx, shared, channel, &done).await;
     }
@@ -501,11 +522,13 @@ async fn handle_asgi_request(
                     ));
                 };
                 let end = next.is_end();
+
                 match next.kind {
                     kind::BODY => {
                         if !next.payload.is_empty() || end {
                             channel.deliver(next.payload, !end).await;
                         }
+
                         if end {
                             break;
                         }
@@ -580,6 +603,7 @@ async fn handle_websocket(
 
     let read_side = async {
         channel.deliver_connect().await;
+
         loop {
             // Before the accept, the response ending (a decline) ends the
             // request; after it, only the edge's CLOSE does.
@@ -589,6 +613,7 @@ async fn handle_websocket(
                 _ = done.notified(), if !channel.accepted() => None,
                 buffered = reader.fill_buf() => Some(buffered.map(|buffered| buffered.is_empty())),
             };
+
             match ended {
                 None => return Ok(None),
                 Some(Ok(false)) => {}
@@ -612,6 +637,7 @@ async fn handle_websocket(
                     "the edge closed the connection during a WebSocket",
                 ));
             };
+
             match next.kind {
                 kind::MESSAGE => {
                     let text = next.flags & flag::TEXT != 0;
@@ -685,6 +711,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
             Some(Some(Outgoing::Finished)) => Some(None),
             other => other,
         };
+
         match item {
             None => {
                 // The delay expired with data waiting.
@@ -702,18 +729,22 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 if ended {
                     return Ok(());
                 }
+
                 if upgraded {
                     return write_close(writer, 1000, "").await;
                 }
+
                 if !buffer.is_empty() {
                     let data = buffer.split().freeze();
                     sent += data.len() as u64;
                     let short = content_length.is_some_and(|length| sent < length);
                     write_body(writer, &mut pending_head, &mut head_written, data, !short).await?;
+
                     if !short {
                         return Ok(());
                     }
                 }
+
                 if let Some(head) = pending_head.take() {
                     if content_length.is_some_and(|length| length > 0) {
                         frame::write(writer, kind::RESPONSE, 0, head).await?;
@@ -722,19 +753,23 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         return frame::write(writer, kind::RESPONSE, flag::END, head).await;
                     }
                 }
+
                 if !head_written {
                     // Nothing at all arrived: the bridge always sends a head, so
                     // this means the application thread died.
 
                     return Ok(());
                 }
+
                 let mut end = pb::End::default();
+
                 if let Some(length) = content_length.filter(|&length| sent < length) {
                     end.error = format!(
                         "the response ended after {sent} of the {length} bytes its Content-Length declared"
                     );
                     eprintln!("muru: {}", end.error);
                 }
+
                 return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
             }
             Some(Some(Outgoing::Head {
@@ -760,6 +795,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         .collect(),
                     flush: flush as i32,
                 };
+
                 if status == 101 {
                     // The WebSocket is accepted: the head goes out now and
                     // messages follow it.
@@ -769,7 +805,9 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     upgraded = true;
                     continue;
                 }
+
                 pending_head = Some(head.encode_to_vec().into());
+
                 if content_length == Some(0) {
                     // No body will follow; send the head now and finish.
 
@@ -788,12 +826,15 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
 
                 if let Some(length) = content_length {
                     let remaining = length.saturating_sub(sent + buffer.len() as u64);
+
                     if (data.len() as u64) > remaining {
                         data.truncate(usize::try_from(remaining).unwrap_or(usize::MAX));
                     }
                 }
+
                 if immediate || !first_block_sent {
                     first_block_sent = true;
+
                     if !buffer.is_empty() {
                         let buffered = buffer.split().freeze();
                         sent += buffered.len() as u64;
@@ -806,12 +847,14 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         )
                         .await?;
                     }
+
                     sent += data.len() as u64;
                     let end = content_length == Some(sent);
                     write_body(writer, &mut pending_head, &mut head_written, data, end).await?;
                     ended |= end;
                 } else {
                     buffer.extend_from_slice(&data);
+
                     if buffer.len() >= COALESCE_MIN_BYTES {
                         let buffered = buffer.split().freeze();
                         sent += buffered.len() as u64;
@@ -854,10 +897,12 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 if ended {
                     return Ok(());
                 }
+
                 if upgraded {
                     eprintln!("muru: {error}");
                     return write_close(writer, 1011, "internal error").await;
                 }
+
                 if !buffer.is_empty() {
                     let buffered = buffer.split().freeze();
                     write_body(
@@ -907,9 +952,11 @@ async fn write_body(
     end: bool,
 ) -> io::Result<()> {
     let flags = if end { flag::END } else { 0 };
+
     match pending_head.take() {
         Some(head) => {
             *head_written = true;
+
             if data.len() <= SMALL_PAYLOAD {
                 let mut buffer =
                     BytesMut::with_capacity(2 * frame::HEADER_LEN + head.len() + data.len());

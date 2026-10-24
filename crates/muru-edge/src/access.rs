@@ -141,6 +141,7 @@ impl AccessLog {
             )),
             _ => None,
         };
+
         Ok(Self {
             config,
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
@@ -155,17 +156,21 @@ impl AccessLog {
         if self.shows(&record) {
             self.write(&record);
         }
+
         self.count(unix_seconds(SystemTime::now()), record.status);
         let mut ring = self.ring.lock().expect("access log ring poisoned");
+
         if ring.len() == RING_CAPACITY {
             ring.pop_front();
         }
+
         ring.push_back(record);
     }
 
     fn count(&self, second: u64, status: u16) {
         let mut minute = self.minute.lock().expect("access log counters poisoned");
         let bucket = &mut minute[(second % MINUTE as u64) as usize];
+
         if bucket.second != second {
             *bucket = Bucket {
                 second,
@@ -173,7 +178,9 @@ impl AccessLog {
                 errors: 0,
             };
         }
+
         bucket.requests += 1;
+
         if status >= 500 {
             bucket.errors += 1;
         }
@@ -215,6 +222,7 @@ impl AccessLog {
             }
             _ => {}
         }
+
         let path = record.path();
         !self
             .config
@@ -228,6 +236,7 @@ impl AccessLog {
             Some(file) => {
                 let line = json_line(record);
                 let mut file = file.lock().expect("access log file poisoned");
+
                 if file.write_all(line.as_bytes()).is_err() {
                     // Section 11.2: a stalled log never holds up requests.
                 }
@@ -272,6 +281,7 @@ fn text_line(record: &Record) -> String {
         format_bytes(record.bytes),
         format_duration(record.total)
     );
+
     if record.worker.is_some() {
         let _ = write!(
             line,
@@ -280,12 +290,15 @@ fn text_line(record: &Record) -> String {
             format_duration(record.application)
         );
     }
+
     if !record.reason.is_empty() {
         let _ = write!(line, " reason={}", record.reason);
     }
+
     if let Some(worker) = record.worker {
         let _ = write!(line, " worker={worker}");
     }
+
     let _ = writeln!(line, " id={}", record.request_id);
     line
 }
@@ -323,6 +336,7 @@ fn millis_f64(duration: Duration) -> f64 {
 /// Format a duration briefly: 0.9ms, 42ms, 1.50s.
 pub fn format_duration(duration: Duration) -> String {
     let millis = millis_f64(duration);
+
     if millis >= 1000.0 {
         format!("{:.2}s", millis / 1000.0)
     } else if millis >= 10.0 {
@@ -377,6 +391,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
+
     for character in text.chars() {
         match character {
             '"' => out.push_str("\\\""),
@@ -390,6 +405,7 @@ fn json_string(text: &str) -> String {
             other => out.push(other),
         }
     }
+
     out.push('"');
     out
 }

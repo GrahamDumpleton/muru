@@ -39,6 +39,7 @@ async def reply(
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
         ]
+
     await send({"type": "http.response.start", "status": status, "headers": headers})
     await send({"type": "http.response.body", "body": body})
 
@@ -47,6 +48,7 @@ async def drain(receive: Receive) -> list[dict[str, Any]]:
     """Read every http.request message and return them with their bodies decoded."""
 
     messages = []
+
     while True:
         message = await receive()
         messages.append(
@@ -103,10 +105,12 @@ async def http(scope: Scope, receive: Receive, send: Send) -> None:
                 "headers": [(b"content-type", b"text/plain")],
             }
         )
+
         for index in range(3):
             await send(
                 {"type": "http.response.body", "body": f"{index}".encode(), "more_body": True}
             )
+
         await send({"type": "http.response.body", "body": b""})
     elif path == "/over-length":
         await reply(send, 200, b"12345", [(b"content-length", b"3")])
@@ -154,29 +158,37 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
     if path == "/ws/send-before-accept":
         await send({"type": "websocket.send", "text": "early"})
         return
+
     if path == "/ws/accept-twice":
         await send({"type": "websocket.accept"})
         await send({"type": "websocket.accept"})
         return
+
     if path == "/ws/close-reason":
         await send({"type": "websocket.accept"})
         await send({"type": "websocket.close", "code": 4042, "reason": "because"})
         return
 
     await send({"type": "websocket.accept"})
+
     if path == "/ws/both":
         await send({"type": "websocket.send", "text": "a", "bytes": b"b"})
         return
+
     if path == "/ws/types":
         # Report the type of each message received, then close.
 
         kinds = []
+
         while True:
             message = await receive()
+
             if message["type"] == "websocket.disconnect":
                 kinds.append(f"disconnect:{message['code']}:{message['reason']}")
                 break
+
             kinds.append("text" if message.get("text") is not None else "bytes")
+
             if message.get("text") == "done" or message.get("bytes") == b"done":
                 await send({"type": "websocket.send", "text": json.dumps(kinds)})
                 await send({"type": "websocket.close"})

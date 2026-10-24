@@ -122,11 +122,14 @@ async def websocket_echo(socket: WebSocket) -> None:
 
     offered = socket.scope["subprotocols"]
     await socket.accept(subprotocol=offered[0] if offered else None)
+
     while True:
         message = await socket.receive()
+
         if message["type"] == "websocket.disconnect":
             print(f"fastapi socket closed with {message['code']}", flush=True)
             return
+
         if message.get("text") is not None:
             await socket.send_text(message["text"])
         else:

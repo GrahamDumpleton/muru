@@ -29,6 +29,7 @@ def test_connect_is_the_first_message(server: Server) -> None:
 
 def test_message_types_and_close_sequence(server: Server) -> None:
     server.mark_log()
+
     with open_socket(server, "/ws/types") as socket_:
         socket_.send("one")
         socket_.send(b"two")
@@ -83,6 +84,7 @@ def test_invalid_send_after_accept_closes_with_1011(
     server: Server, path: str, message: str
 ) -> None:
     server.mark_log()
+
     with open_socket(server, path) as socket_:
         with pytest.raises(ConnectionClosed) as closed:
             socket_.recv()

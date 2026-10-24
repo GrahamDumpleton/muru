@@ -207,6 +207,7 @@ mod tests {
         for state in ReleaseState::ALL {
             assert_eq!(state.as_str().parse::<ReleaseState>(), Ok(state));
         }
+
         assert!("running".parse::<ReleaseState>().is_err());
     }
 

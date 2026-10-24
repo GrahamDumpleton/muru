@@ -36,6 +36,7 @@ pub fn send_fd(socket: &UnixStream, fd: RawFd) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+
     Ok(())
 }
 
@@ -59,9 +60,11 @@ pub fn recv_fd(socket: &UnixStream) -> io::Result<OwnedFd> {
         message.msg_controllen = control_space() as _;
 
         let received = libc::recvmsg(socket.as_raw_fd(), &mut message, 0);
+
         if received < 0 {
             return Err(io::Error::last_os_error());
         }
+
         let header = libc::CMSG_FIRSTHDR(&message);
         if header.is_null()
             || (*header).cmsg_level != libc::SOL_SOCKET
@@ -71,9 +74,11 @@ pub fn recv_fd(socket: &UnixStream) -> io::Result<OwnedFd> {
         }
         let mut fd: RawFd = -1;
         std::ptr::copy_nonoverlapping(libc::CMSG_DATA(header).cast::<RawFd>(), &mut fd, 1);
+
         if fd < 0 {
             return Err(io::Error::other("an invalid descriptor was sent"));
         }
+
         Ok(OwnedFd::from_raw_fd(fd))
     }
 }

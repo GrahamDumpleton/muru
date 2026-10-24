@@ -17,6 +17,7 @@ def server() -> Iterator[Server]:
         # No dashboard: its default port would clash with the servers of other suites.
         args=["--dashboard", "off"],
     )
+
     try:
         yield instance
     finally:

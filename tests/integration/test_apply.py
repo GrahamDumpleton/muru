@@ -32,6 +32,7 @@ def release(app: str, release_id: str, source: Path | str = SHOP, **settings: ob
         f"source = '{source}'",
         f"python = '{sys.executable}'",
     ]
+
     for key, value in settings.items():
         written = f"'{value}'" if isinstance(value, str) else value
         lines.append(f"{key} = {written}")

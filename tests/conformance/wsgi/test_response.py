@@ -168,12 +168,14 @@ def test_output_short_of_content_length_fails_the_response(server: Server) -> No
     # sent the head and part of the body, or nothing at all.
 
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
+
     try:
         connection.request("GET", f"{AREA}/content-length-under")
         with pytest.raises((http.client.IncompleteRead, http.client.RemoteDisconnected)):
             connection.getresponse().read()
     finally:
         connection.close()
+
     assert server.wait_for_log("Content-Length")
 
 

@@ -127,9 +127,11 @@ impl Resolver {
     /// Replace the certificates with those of a new snapshot.
     pub fn replace(&self, hosts: Vec<HostCertificate>) {
         let mut table = Table::default();
+
         for host in hosts {
             for name in &host.names {
                 let name = crate::routing::normalise(name);
+
                 match name.strip_prefix("*.") {
                     Some(suffix) => table
                         .wildcards
@@ -139,10 +141,12 @@ impl Resolver {
                     }
                 }
             }
+
             if host.default || table.default.is_none() {
                 table.default = Some(host.key);
             }
         }
+
         table
             .wildcards
             .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -174,8 +178,10 @@ impl ResolvesServerCert for Resolver {
         if let Some(key) = table.exact.get(&name) {
             return Some(Arc::clone(key));
         }
+
         for (suffix, key) in &table.wildcards {
             let label = name.strip_suffix(suffix.as_str());
+
             if label.is_some_and(|label| !label.is_empty() && !label.contains('.')) {
                 return Some(Arc::clone(key));
             }

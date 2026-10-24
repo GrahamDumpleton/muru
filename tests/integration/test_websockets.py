@@ -21,6 +21,7 @@ from websockets.sync.client import ClientConnection, connect
 @pytest.fixture(scope="module")
 def server() -> Iterator[support.Server]:
     instance = support.start("plain_asgi:application", workers=1, threads=None)
+
     try:
         yield instance
     finally:
@@ -62,6 +63,7 @@ def test_scope_and_accept_headers(server: support.Server) -> None:
 
 def test_client_close_code_reaches_the_application(server: support.Server) -> None:
     server.mark_log()
+
     with open_socket(server, "/ws/echo") as socket_:
         socket_.send("one")
         assert socket_.recv() == "one"
@@ -104,6 +106,7 @@ def test_decline_with_a_full_response(server: support.Server) -> None:
 
 def test_exception_after_accept_closes_with_1011(server: support.Server) -> None:
     server.mark_log()
+
     with open_socket(server, "/ws/error") as socket_:
         with pytest.raises(ConnectionClosed) as closed:
             socket_.recv()
@@ -115,6 +118,7 @@ def test_exception_after_accept_closes_with_1011(server: support.Server) -> None
 
 def test_send_after_close_is_an_error_in_the_log(server: support.Server) -> None:
     server.mark_log()
+
     with open_socket(server, "/ws/send-after-close") as socket_:
         with pytest.raises(ConnectionClosed):
             socket_.recv()
@@ -136,6 +140,7 @@ def test_message_over_the_limit_closes_with_1009(server: support.Server) -> None
 
 def test_client_vanishing_is_a_1006_disconnect(server: support.Server) -> None:
     server.mark_log()
+
     with socket.create_connection(("127.0.0.1", server.port), timeout=5) as raw:
         raw.sendall(
             b"GET /ws/echo HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
@@ -158,6 +163,7 @@ def test_http_requests_still_work_on_the_same_worker(server: support.Server) -> 
 
 def test_upgrade_to_a_wsgi_application_is_an_ordinary_request() -> None:
     instance = support.start("plain_wsgi:application", workers=1)
+
     try:
         with socket.create_connection(("127.0.0.1", instance.port), timeout=5) as raw:
             raw.sendall(

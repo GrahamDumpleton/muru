@@ -133,11 +133,13 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
 /// that divides it exactly, else bytes.
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+
     for (scale, unit) in UNITS {
         if bytes != 0 && bytes.is_multiple_of(scale) {
             return format!("{}{unit}", bytes / scale);
         }
     }
+
     bytes.to_string()
 }
 
@@ -145,6 +147,7 @@ pub fn format_size(bytes: u64) -> String {
 /// configuration and the command line write them.
 pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     let text = text.trim();
+
     let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
         (number, 0.001)
     } else if let Some(number) = text.strip_suffix('h') {
@@ -161,9 +164,11 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
         .trim()
         .parse()
         .map_err(|_| format!("{text:?} is not a duration, for example 250ms, 1.5s or 2m"))?;
+
     if value < 0.0 || !value.is_finite() {
         return Err(format!("{text:?} is not a duration"));
     }
+
     Ok(std::time::Duration::from_secs_f64(value * scale))
 }
 
@@ -171,6 +176,7 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
 /// as `5s`, otherwise milliseconds as `250ms`.
 pub fn format_duration(duration: Duration) -> String {
     let millis = duration.as_millis();
+
     if millis != 0 && millis.is_multiple_of(1000) {
         format!("{}s", millis / 1000)
     } else {
@@ -380,6 +386,7 @@ impl Document {
     pub fn merge(&mut self, other: Document) -> Result<(), String> {
         self.listener.extend(other.listener);
         self.route.extend(other.route);
+
         if other.limits.is_some() {
             self.limits = other.limits;
         }
@@ -388,15 +395,18 @@ impl Document {
             if self.host.contains_key(&name) {
                 return Err(format!("host {name} is declared twice"));
             }
+
             self.host.insert(name, host);
         }
 
         for (name, app) in other.app {
             let entry = self.app.entry(name.clone()).or_default();
+
             for (id, release) in app.release {
                 if entry.release.contains_key(&id) {
                     return Err(format!("release {name}@{id} is declared twice"));
                 }
+
                 entry.release.insert(id, release);
             }
         }
@@ -478,11 +488,13 @@ pub const PROJECT_FILES: [&str; 2] = ["muru.toml", "pyproject.toml"];
 pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectError> {
     for name in PROJECT_FILES {
         let path = dir.join(name);
+
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(source) => return Err(ProjectError::Read { path, source }),
         };
+
         let table = if name == "muru.toml" {
             Some(
                 parse_muru_toml(&text).map_err(|message| ProjectError::Invalid {
@@ -496,10 +508,12 @@ pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectEr
                 message,
             })?
         };
+
         if let Some(table) = table {
             return Ok(Some((path, table)));
         }
     }
+
     Ok(None)
 }
 
@@ -533,6 +547,7 @@ mod tests {
         for word in Preload::ALL {
             assert_eq!(word.parse::<Preload>().unwrap().as_str(), *word);
         }
+
         assert_eq!("asgi".parse::<Interface>(), Ok(Interface::Asgi));
         let error = "maybe".parse::<Preload>().unwrap_err();
         assert_eq!(

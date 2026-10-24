@@ -57,6 +57,7 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
 
     def hammer() -> None:
         connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
+
         try:
             while not stop.is_set():
                 try:
@@ -68,6 +69,7 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
                     results.append(0)
                     connection.close()
                     connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
+
                 time.sleep(0.001)
         finally:
             connection.close()
@@ -75,6 +77,7 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
     threads = [threading.Thread(target=hammer) for _ in range(4)]
     for thread in threads:
         thread.start()
+
     try:
         assert (
             daemon.deploy("shop", SHOP, "--processes", "2")
@@ -182,10 +185,12 @@ def test_a_dead_host_is_started_again(daemon: Daemon) -> None:
     os.kill(host_pid, signal.SIGKILL)
 
     deadline = time.monotonic() + 30
+
     while time.monotonic() < deadline:
         if "release.restarting" in daemon.events() and daemon.get("/").status == 200:
             break
         time.sleep(0.2)
+
     assert daemon.get("/").status == 200
     assert json.loads(daemon.get("/info").body)["pid"] != pid
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
@@ -193,6 +198,7 @@ def test_a_dead_host_is_started_again(daemon: Daemon) -> None:
 
 def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> None:
     first = start_daemon(tmp_path)
+
     try:
         first.deploy("shop", SHOP)
         assert first.get("/").status == 200
@@ -200,6 +206,7 @@ def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> No
         first.stop(shutdown=True)
 
     second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
     try:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and second.get("/").status != 200:
@@ -222,6 +229,7 @@ def edge_pid_of(daemon: Daemon) -> int:
 def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path) -> None:
     first = start_daemon(tmp_path)
     second = None
+
     try:
         first.deploy("shop", SHOP)
         pid = json.loads(first.get("/info").body)["pid"]
@@ -281,6 +289,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         check=False,
         timeout=60,
     )
+
     try:
         assert started.returncode == 0, started.stdout + started.stderr
         assert "daemon started" in started.stdout
@@ -304,6 +313,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             check=False,
             timeout=120,
         )
+
     assert "daemon stopped" in stopped.stdout, stopped.stdout + stopped.stderr
     assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()

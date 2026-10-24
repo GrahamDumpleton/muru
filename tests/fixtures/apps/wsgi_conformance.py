@@ -39,9 +39,11 @@ def application(environ: Environ, start_response: StartResponse) -> Iterable[byt
     case = segments[1] if len(segments) > 1 else ""
     handlers = AREAS.get(area)
     handler = handlers.get(case) if handlers else None
+
     if handler is None:
         start_response("404 Not Found", [("Content-Type", "text/plain")])
         return [b"unknown test path\n"]
+
     return handler(environ, start_response)
 
 
@@ -83,12 +85,14 @@ def sr_non_tuple_exc_info(environ: Environ, start_response: StartResponse) -> It
         start_response("200 OK", [("Content-Type", "text/plain")], "not-a-tuple")
     except (TypeError, RuntimeError) as error:
         return error_body(start_response, error)
+
     return respond(start_response, b"no-error-raised")
 
 
 def sr_exc_info_after_headers(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     write = start_response("200 OK", [("Content-Type", "text/plain")])
     write(b"headers-sent-")
+
     try:
         raise RuntimeError("intentional-exc-info")
     except RuntimeError:
@@ -99,11 +103,13 @@ def sr_exc_info_after_headers(environ: Environ, start_response: StartResponse) -
         except RuntimeError as error:
             write(f"reraised:{error}".encode())
             return []
+
     return [b"not-reraised"]
 
 
 def sr_exc_info_before_headers(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     start_response("200 OK", [("Content-Type", "text/plain"), ("X-Before", "first")])
+
     try:
         raise RuntimeError("before-headers-sent")
     except RuntimeError:
@@ -112,6 +118,7 @@ def sr_exc_info_before_headers(environ: Environ, start_response: StartResponse) 
             [("Content-Type", "text/plain"), ("X-After", "second")],
             sys.exc_info(),
         )
+
     return [b"second-headers-win"]
 
 
@@ -124,11 +131,13 @@ def sr_double_before_output(environ: Environ, start_response: StartResponse) -> 
 def sr_double_after_output(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     write = start_response("200 OK", [("Content-Type", "text/plain")])
     write(b"pre-")
+
     try:
         start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
     except RuntimeError as error:
         write(f"err:{error}".encode())
         return []
+
     return [b"no-error-raised"]
 
 
@@ -145,10 +154,12 @@ INVALID_STATUS = {
 
 def sr_invalid_status(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     status = INVALID_STATUS[query(environ)["case"]]
+
     try:
         start_response(status, [("Content-Type", "text/plain")])
     except (ValueError, TypeError) as error:
         return error_body(start_response, error)
+
     return respond(start_response, b"no-error-raised")
 
 
@@ -169,10 +180,12 @@ INVALID_HEADER: dict[str, list[Any]] = {
 
 def sr_invalid_header(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     extra = INVALID_HEADER[query(environ)["case"]]
+
     try:
         start_response("200 OK", [("Content-Type", "text/plain"), *extra])
     except (ValueError, TypeError, UnicodeEncodeError) as error:
         return error_body(start_response, error)
+
     return respond(start_response, b"no-error-raised")
 
 
@@ -185,10 +198,12 @@ INVALID_HEADERS_TYPE: dict[str, Any] = {
 
 def sr_invalid_headers_type(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     headers = INVALID_HEADERS_TYPE[query(environ)["case"]]
+
     try:
         start_response("200 OK", headers)
     except TypeError as error:
         return error_body(start_response, error)
+
     return respond(start_response, b"no-error-raised")
 
 
@@ -464,11 +479,13 @@ def in_read_sized(environ: Environ, start_response: StartResponse) -> Iterable[b
 def in_read_chunks(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     stream = environ["wsgi.input"]
     chunks = []
+
     while True:
         chunk = stream.read(7)
         if not chunk:
             break
         chunks.append(chunk)
+
     return respond(start_response, b"chunks=%d,data=%s" % (len(chunks), b"".join(chunks)))
 
 
@@ -498,11 +515,13 @@ def in_read_more_than_body(environ: Environ, start_response: StartResponse) -> I
 def in_readline(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
     stream = environ["wsgi.input"]
     lines = []
+
     while True:
         line = stream.readline()
         if not line:
             break
         lines.append(line.rstrip(b"\n"))
+
     return respond(start_response, b"count=%d,lines=%s" % (len(lines), b"|".join(lines)))
 
 
@@ -541,12 +560,14 @@ def in_digest(environ: Environ, start_response: StartResponse) -> Iterable[bytes
     stream = environ["wsgi.input"]
     digest = hashlib.sha256()
     total = 0
+
     while True:
         chunk = stream.read(8192)
         if not chunk:
             break
         digest.update(chunk)
         total += len(chunk)
+
     return respond(start_response, b"len=%d sha256=%s" % (total, digest.hexdigest().encode()))
 
 

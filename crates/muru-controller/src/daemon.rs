@@ -183,10 +183,12 @@ struct Daemon {
 /// they arrive.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let locations = config.locations;
+
     for location in [&locations.state, &locations.run, &locations.logs] {
         std::fs::create_dir_all(&location.path)
             .with_context(|| format!("creating {}", location.path.display()))?;
     }
+
     let store = Arc::new(Store::open(&locations.state_store())?);
     let events = Events::new(Arc::clone(&store));
 
@@ -199,6 +201,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let control = locations.run.path.join("edge.sock");
     let listener_socket = locations.run.path.join("edge-listener.sock");
     let edge_log = locations.logs.path.join("edge.log");
+
     let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
         Some(record) => EdgeProcess::adopt(
             record.pid,
@@ -219,6 +222,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .ok(),
         None => None,
     };
+
     let edge = match adopted {
         Some(edge) => {
             tracing::info!(pid = edge.pid().unwrap_or(0), "re-adopted the edge");
@@ -227,11 +231,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         None => {
             anyhow::ensure!(!config.listeners.is_empty(), "no listener to serve on");
             let mut listeners = Vec::new();
+
             for (address, tls) in &config.listeners {
                 let socket = std::net::TcpListener::bind(address)
                     .with_context(|| format!("cannot listen on {address}"))?;
                 listeners.push(crate::edges::Listener { socket, tls: *tls });
             }
+
             EdgeProcess::spawn(EdgeSpec {
                 executable: config.executable,
                 listeners,
@@ -244,6 +250,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .await?
         }
     };
+
     let listeners = edge.listeners();
     write_record(
         &locations.run.path.join("edge.toml"),
@@ -314,6 +321,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // noticed by the next pass.
 
     let mut drain_on_exit = true;
+
     let outcome = loop {
         tokio::select! {
             command = inbox.recv() => match command {
@@ -380,6 +388,7 @@ fn write_record<T: serde::Serialize>(path: &Path, record: &T) {
     let written = toml::to_string(record)
         .map_err(std::io::Error::other)
         .and_then(|text| std::fs::write(path, text));
+
     if let Err(error) = written {
         tracing::error!(%error, path = %path.display(), "writing a record failed");
     }
@@ -391,6 +400,7 @@ fn command_mentions(pid: u32, path: &Path) -> bool {
     let output = std::process::Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output();
+
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
         Err(_) => false,
@@ -419,6 +429,7 @@ impl Daemon {
                     if self.adopt_host(&release.app, &release.id) {
                         continue;
                     }
+
                     let _ = self.store.set_release_state(
                         &release.app,
                         &release.id,
@@ -438,6 +449,7 @@ impl Daemon {
                 self.switch_to(&app.name, &current).await;
                 continue;
             }
+
             match self.start(&app.name, &current).await {
                 Ok(()) => self.switch_to(&app.name, &current).await,
                 Err(error) => {
@@ -458,6 +470,7 @@ impl Daemon {
         let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
             return false;
         };
+
         if !command_mentions(record.pid, &run_dir) {
             return false;
         }
@@ -496,6 +509,7 @@ impl Daemon {
     /// Leave every host and the edge running, for the next daemon.
     fn detach(&mut self) {
         let running = std::mem::take(&mut self.running);
+
         for (_, running) in running {
             running.host.release();
         }
@@ -538,6 +552,7 @@ impl Daemon {
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
         let record = self.create(app, spec, id);
+
         let release = match record {
             Ok(release) => release,
             Err(error) => {
@@ -545,6 +560,7 @@ impl Daemon {
                 return Err(error);
             }
         };
+
         let _ = created.send(Ok(release.clone()));
         let subject = format!("{app}@{}", release.id);
         self.events.emit(
@@ -567,6 +583,7 @@ impl Daemon {
         self.store
             .set_app_releases(app, Some(&release.id), previous.as_deref())
             .map_err(|error| error.to_string())?;
+
         if let Some(previous) = previous.filter(|previous| previous != &release.id) {
             self.drain(app, &previous, retain).await;
         }
@@ -583,6 +600,7 @@ impl Daemon {
                 "{app:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters"
             ));
         }
+
         self.store
             .ensure_app(app)
             .map_err(|error| error.to_string())?;
@@ -595,6 +613,7 @@ impl Daemon {
                 .next_release_id(app)
                 .map_err(|error| error.to_string())?,
         };
+
         if self.store.release(app, &id).is_ok() {
             return Err(format!("release {app}@{id} already exists"));
         }
@@ -612,6 +631,7 @@ impl Daemon {
             .release(app, id)
             .map_err(|error| error.to_string())?;
         let subject = format!("{app}@{id}");
+
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
             // Retained and warm: back to ready without a restart.
 
@@ -640,6 +660,7 @@ impl Daemon {
         };
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let started = Instant::now();
+
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
             Err(error) => {
@@ -652,6 +673,7 @@ impl Daemon {
         };
 
         self.set_state(&release, ReleaseState::Warming, "waiting for the workers");
+
         if let Err(error) = host.wait_ready(START_TIMEOUT).await {
             let message = format!("{error:#}");
             host.stop().await;
@@ -696,12 +718,14 @@ impl Daemon {
     /// declared.
     async fn switch_to(&mut self, app: &str, id: &str) {
         let subject = format!("{app}@{id}");
+
         if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
             return;
         }
 
         self.serving.insert(app.to_owned(), id.to_owned());
         self.default_app = Some(app.to_owned());
+
         match self.push_snapshot().await {
             Ok(()) => {
                 self.events.emit(
@@ -731,6 +755,7 @@ impl Daemon {
         let mut apps = Vec::new();
         let mut serving: Vec<(&String, &String)> = self.serving.iter().collect();
         serving.sort();
+
         for (name, id) in serving {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 apps.push(pb::AppWorkers {
@@ -743,6 +768,7 @@ impl Daemon {
                 });
             }
         }
+
         if self
             .default_app
             .as_ref()
@@ -758,6 +784,7 @@ impl Daemon {
         let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
 
         let mut hosts = Vec::new();
+
         for (name, host) in self.store.hosts().unwrap_or_default() {
             let (certificate_pem, key_pem) = match &host.tls {
                 Some(tls) => {
@@ -776,6 +803,7 @@ impl Daemon {
                 }
                 None => (String::new(), String::new()),
             };
+
             hosts.push(pb::Host {
                 name,
                 names: host.names,
@@ -788,6 +816,7 @@ impl Daemon {
                 default: host.default,
             });
         }
+
         let routes = self
             .store
             .routes()
@@ -826,10 +855,12 @@ impl Daemon {
         let Ok(release) = self.store.release(app, id) else {
             return;
         };
+
         if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
             if release.state.is_running() {
                 self.set_state(&release, ReleaseState::Stopped, "");
             }
+
             return;
         }
 
@@ -857,12 +888,15 @@ impl Daemon {
                 })
                 .map(|((_, other_id), _)| other_id.clone())
                 .collect();
+
             for other in older {
                 self.stop_release(app, &other, "superseded again").await;
             }
+
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
                 running.retained_until = Some(Instant::now() + retain);
             }
+
             let until = crate::model::now_unix_ms() + retain.as_millis() as u64;
             self.set_state(
                 &release,
@@ -894,9 +928,11 @@ impl Daemon {
         self.set_state(&release, ReleaseState::Stopping, "stopping the host");
         let record = running.host.run_dir().join("..").join("host.toml");
         let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
+
         if stopped.is_err() {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
         }
+
         let _ = std::fs::remove_file(record);
         self.set_state(&release, ReleaseState::Stopped, why);
         self.events
@@ -939,6 +975,7 @@ impl Daemon {
             "notice",
             &format!("rolled back to {previous}"),
         );
+
         if let Some(current) = current.filter(|current| current != &previous) {
             self.drain(app, &current, RETENTION).await;
         }
@@ -963,6 +1000,7 @@ impl Daemon {
             self.events
                 .emit("traffic.switched", app, "notice", "no release serves");
         }
+
         self.drain(app, id, Duration::ZERO).await;
 
         self.store
@@ -974,6 +1012,7 @@ impl Daemon {
     /// serves is started again once.
     async fn check_hosts(&mut self) {
         let mut exited = Vec::new();
+
         for (key, running) in &mut self.running {
             if let Ok(Some(how)) = running.host.try_exited() {
                 exited.push((key.clone(), how));
@@ -984,9 +1023,11 @@ impl Daemon {
             self.running.remove(&(app.clone(), id.clone()));
             let subject = format!("{app}@{id}");
             let message = format!("the host {how}");
+
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Failed, &message);
             }
+
             self.events
                 .emit("release.failed", &subject, "error", &message);
 
@@ -997,6 +1038,7 @@ impl Daemon {
                 .and_then(|record| record.current)
                 .as_deref()
                 == Some(id.as_str());
+
             if serving {
                 self.clear_traffic(&app).await;
                 self.events.emit(
@@ -1005,6 +1047,7 @@ impl Daemon {
                     "warning",
                     "starting the release again",
                 );
+
                 if self.start(&app, &id).await.is_ok() {
                     self.switch_to(&app, &id).await;
                 }
@@ -1016,6 +1059,7 @@ impl Daemon {
     /// release has just been unset or is being restarted.
     async fn clear_traffic(&mut self, app: &str) {
         self.serving.remove(app);
+
         if let Err(error) = self.push_snapshot().await {
             tracing::error!(%error, "pushing the snapshot failed");
         }
@@ -1049,14 +1093,18 @@ impl Daemon {
     async fn stop_all(&mut self) {
         let running = std::mem::take(&mut self.running);
         self.serving.clear();
+
         if let Err(error) = self.push_snapshot().await {
             tracing::error!(%error, "pushing the empty snapshot failed");
         }
+
         for ((app, id), running) in running {
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopping, "the daemon is stopping");
             }
+
             let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
+
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
             }

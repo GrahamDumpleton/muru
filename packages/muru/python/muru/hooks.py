@@ -51,6 +51,7 @@ class Hooks:
             return cls()
         module = importlib.import_module(name)
         functions: dict[str, Hook] = {}
+
         for hook in HOOKS:
             function = getattr(module, hook, None)
             if function is None:
@@ -58,6 +59,7 @@ class Hooks:
             if not callable(function):
                 raise TypeError(f"{name}.{hook} is not callable")
             functions[hook] = function
+
         return cls(functions, name)
 
     def has(self, hook: str) -> bool:
@@ -85,4 +87,5 @@ class Hooks:
             traceback.print_exc()
             sys.stderr.flush()
             return False
+
         return True

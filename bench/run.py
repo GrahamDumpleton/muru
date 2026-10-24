@@ -59,6 +59,7 @@ class Server:
         app = f"{module}:application"
         address = f"127.0.0.1:{port}"
         python = sys.executable
+
         if self.name == "muru":
             return [
                 str(muructl_path()),
@@ -75,6 +76,7 @@ class Server:
                 "--chdir",
                 str(APPS),
             ]
+
         if self.name == "gunicorn-sync":
             return [
                 python,
@@ -90,6 +92,7 @@ class Server:
                 "warning",
                 app,
             ]
+
         if self.name == "gunicorn-gthread":
             return [
                 python,
@@ -109,6 +112,7 @@ class Server:
                 "warning",
                 app,
             ]
+
         if self.name == "uvicorn":
             return [
                 python,
@@ -128,6 +132,7 @@ class Server:
                 "warning",
                 app,
             ]
+
         if self.name == "granian":
             return [
                 python,
@@ -147,6 +152,7 @@ class Server:
                 "warning",
                 app,
             ]
+
         if self.name.startswith("mod_wsgi"):
             command = [
                 "mod_wsgi-express",
@@ -171,11 +177,14 @@ class Server:
                 "--threads",
                 str(threads),
             ]
+
             if self.name == "mod_wsgi-embedded":
                 command += ["--embedded-mode"]
             elif self.name == "mod_wsgi-daemon-tuned":
                 command += ["--disable-reloading", "--queue-timeout", "0"]
+
             return command
+
         raise ValueError(self.name)
 
 
@@ -194,12 +203,14 @@ SERVERS = [
 def is_available(server: Server) -> bool:
     if server.available == "muructl":
         return muructl_path().is_file()
+
     if server.available.startswith("python:"):
         module = server.available.split(":", 1)[1]
         probe = subprocess.run(
             [sys.executable, "-c", f"import {module}"], capture_output=True, check=False
         )
         return probe.returncode == 0
+
     return shutil.which(server.available) is not None
 
 
@@ -211,20 +222,24 @@ def free_port() -> int:
 
 def wait_for_port(port: int, process: subprocess.Popen[bytes], timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
+
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"server exited early with {process.returncode}")
+
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.05)
+
     raise RuntimeError("server did not start listening in time")
 
 
 def stop(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.send_signal(signal.SIGINT)
+
         try:
             process.wait(timeout=20)
         except subprocess.TimeoutExpired:
@@ -298,7 +313,9 @@ def main(argv: list[str] | None = None) -> int:
         for server in SERVERS:
             state = "available" if is_available(server) else "missing"
             print(f"{server.name:24} {state}")
+
         return 0
+
     if shutil.which("oha") is None:
         print("oha is required: brew install oha, or cargo install oha", file=sys.stderr)
         return 2
@@ -316,16 +333,20 @@ def main(argv: list[str] | None = None) -> int:
         "runs": [],
     }
     scratch = Path(tempfile.mkdtemp(prefix="muru-bench-"))
+
     for scenario in args.scenarios.split(","):
         module, path = SCENARIOS[scenario]
+
         for server in wanted:
             if not is_available(server):
                 print(f"skip {server.name}: not installed", file=sys.stderr)
                 continue
+
             port = free_port()
             command = server.command(module, port, args.workers, args.threads, scratch)
             print(f"=== {scenario} on {server.name}", file=sys.stderr)
             process = subprocess.Popen(command, cwd=APPS, stdout=subprocess.DEVNULL)
+
             try:
                 wait_for_port(port, process)
                 url = f"http://127.0.0.1:{port}{path}"
@@ -342,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 stop(process)
                 time.sleep(args.pause)
+
             run = {"scenario": scenario, "server": server.name, **summarise(report)}
             results["runs"].append(run)
             print(
@@ -349,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"p99 {run['p99_ms']:.2f} ms  success {run['success_rate']:.3f}",
                 file=sys.stderr,
             )
+
     shutil.rmtree(scratch, ignore_errors=True)
 
     RESULTS.mkdir(exist_ok=True)
@@ -364,6 +387,7 @@ def print_table(results: dict[str, Any]) -> None:
         f"{'scenario':8} {'server':24} {'req/s':>10} {'relative':>9} {'p50 ms':>8} {'p99 ms':>8}"
     )
     print(header)
+
     for scenario in SCENARIOS:
         runs = [
             run for run in results["runs"] if run["scenario"] == scenario and "error" not in run
@@ -371,6 +395,7 @@ def print_table(results: dict[str, Any]) -> None:
         if not runs:
             continue
         best = max(run["requests_per_second"] for run in runs)
+
         for run in sorted(runs, key=lambda run: -run["requests_per_second"]):
             relative = run["requests_per_second"] / best if best else 0
             print(

@@ -35,6 +35,7 @@ impl Events {
                     "warning" => tracing::warn!(%subject, "{message}"),
                     _ => tracing::info!(%subject, "{message}"),
                 }
+
                 let _ = self.sender.send(event);
             }
             Err(error) => tracing::error!(%error, "recording an event failed"),

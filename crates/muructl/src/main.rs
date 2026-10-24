@@ -323,6 +323,7 @@ fn parse_bind(text: &str) -> Result<Bind, String> {
             port: Some(address.port()),
         });
     }
+
     text.parse::<IpAddr>()
         .map(|ip| Bind { ip, port: None })
         .map_err(|_| format!("{text:?} is not an address such as 127.0.0.1 or 127.0.0.1:9000"))
@@ -339,6 +340,7 @@ fn parse_port(text: &str) -> Result<Port, String> {
     if text.eq_ignore_ascii_case("auto") {
         return Ok(Port::Auto);
     }
+
     text.parse::<u16>()
         .map(Port::Number)
         .map_err(|_| format!("{text:?} is not a port number or auto"))
@@ -350,17 +352,20 @@ fn parse_port(text: &str) -> Result<Port, String> {
 fn addresses(args: &RunArgs) -> (SocketAddr, SocketAddr) {
     const HTTP: u16 = 8080;
     const HTTPS: u16 = 8443;
+
     let http = match args.port {
         Some(Port::Auto) => 0,
         Some(Port::Number(port)) => port,
         None => args.bind.port.unwrap_or(HTTP),
     };
+
     let https = match args.https_port {
         Some(Port::Auto) => 0,
         Some(Port::Number(port)) => port,
         None if args.port == Some(Port::Auto) => 0,
         None => HTTPS,
     };
+
     (
         SocketAddr::new(args.bind.ip, http),
         SocketAddr::new(args.bind.ip, https),
@@ -373,15 +378,19 @@ fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error 
     let Some(bind) = error.downcast_ref::<muru_edge::BindError>() else {
         return error;
     };
+
     if bind.source.kind() != std::io::ErrorKind::AddrInUse {
         return error;
     }
+
     let (address, port) = (bind.address, bind.address.port());
+
     let flag = if address == https {
         "--https-port"
     } else {
         "--port"
     };
+
     match port_holder(port) {
         Some(holder) => anyhow::anyhow!(
             "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
@@ -402,14 +411,17 @@ fn port_holder(port: u16) -> Option<String> {
         .output()
         .ok()
         .filter(|output| output.status.success());
+
     if let Some(output) = lsof {
         let text = String::from_utf8_lossy(&output.stdout);
         let pid = text.lines().find_map(|line| line.strip_prefix('p'));
         let command = text.lines().find_map(|line| line.strip_prefix('c'));
+
         if let (Some(pid), Some(command)) = (pid, command) {
             return Some(format!("{command} (pid {pid})"));
         }
     }
+
     let ss = std::process::Command::new("ss")
         .args(["-lptnH", &format!("sport = :{port}")])
         .output()
@@ -445,6 +457,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
     match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
         Command::Daemon { command } => runtime.block_on(async move {
@@ -516,6 +529,7 @@ fn exit_with(
     command: impl std::future::Future<Output = anyhow::Result<i32>>,
 ) -> anyhow::Result<()> {
     let code = runtime.block_on(command)?;
+
     if code == 0 {
         return Ok(());
     }
@@ -559,6 +573,7 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
         }),
         ..defaults
     };
+
     for (name, duration) in &args.timeouts {
         match name.as_str() {
             "queue" => limits.queue_timeout = *duration,
@@ -569,6 +584,7 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
             _ => {}
         }
     }
+
     limits
 }
 
@@ -581,6 +597,7 @@ fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
         "errors" => Destination::Errors,
         path => Destination::File(PathBuf::from(path)),
     };
+
     muru_edge::access::Config {
         destination,
         slow: args.slow,
@@ -617,6 +634,7 @@ const DEFAULT_CONCURRENCY: usize = 1000;
 
 fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     let chdir = args.chdir.clone();
+
     let (entrypoint, project) = match args.app.as_deref() {
         Some(app) if Path::new(app).is_dir() => {
             anyhow::ensure!(
@@ -656,6 +674,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         }
         None => (None, chdir.unwrap_or_else(|| PathBuf::from("."))),
     };
+
     let (source, table) = match muru_config::load_project(&project)? {
         Some((path, table)) => (Some(path), table),
         None => (None, muru_config::ToolMuru::default()),
@@ -665,6 +684,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     // table's factory settings apply to the table's entrypoint only.
 
     let from_table = entrypoint.is_none();
+
     let entrypoint = match entrypoint.or(table.entrypoint) {
         Some(entrypoint) => entrypoint,
         None => match &source {
@@ -677,6 +697,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             ),
         },
     };
+
     let factory = if args.factory || (from_table && table.factory == Some(true)) {
         Some(
             table
@@ -729,12 +750,14 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         address: http.to_string(),
         tls: false,
     }];
+
     if args.https || args.https_only || args.tls_cert.is_some() {
         listeners.push(Listener {
             address: https.to_string(),
             tls: true,
         });
     }
+
     let release = Release {
         source: Some(resolved.project.display().to_string()),
         entrypoint: resolved.entrypoint.clone(),
@@ -787,6 +810,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
 fn app_name(entrypoint: &str) -> String {
     let module = entrypoint.split(':').next().unwrap_or(entrypoint);
     let top = module.split('.').next().unwrap_or(module);
+
     if top.is_empty() {
         "default".to_owned()
     } else {
@@ -806,6 +830,7 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
     if !(args.https || args.https_only || args.tls_cert.is_some()) {
         return Ok(None);
     }
+
     let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
         (Some(certificate), Some(key)) => {
             let (chain, key) = muru_edge::tls::load_pem_files(certificate, key)?;
@@ -818,6 +843,7 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
             (chain, key, Some(certificate))
         }
     };
+
     Ok(Some(Tls {
         https: muru_edge::Https {
             listen: addresses(args).1,
@@ -843,6 +869,7 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
             venv.is_file().then_some(venv)
         })
         .unwrap_or_else(|| PathBuf::from("python3"));
+
     match (python.parent(), python.file_name()) {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
             // Resolve the directory, not the file: the interpreter is often a
@@ -862,6 +889,7 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut resolved = resolve(&args)?;
     let development = !args.allow_public;
+
     if !args.bind.ip.is_loopback() && development {
         anyhow::bail!(
             "muructl run serves loopback addresses only, because it is development mode: error \
@@ -870,6 +898,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             args.bind.ip
         );
     }
+
     anyhow::ensure!(resolved.processes >= 1, "--processes must be at least 1");
     anyhow::ensure!(resolved.threads >= 1, "--threads must be at least 1");
     anyhow::ensure!(
@@ -880,14 +909,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         resolved.concurrency >= 1,
         "--concurrency must be at least 1"
     );
+
     if args.single {
         resolved.processes = 1;
         resolved.threads = 1;
     }
+
     if args.print_config {
         print!("{}", declarative(&args, &resolved)?);
         return Ok(());
     }
+
     if let Some(source) = &resolved.source {
         println!("muru: using [tool.muru] from {}", source.display());
     }
@@ -918,6 +950,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let logs = Logs::default();
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
+
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
         current.stop().await;
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -925,6 +958,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let (http_address, https_address) = addresses(&args);
+
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
         sockets: current.sockets.clone(),
@@ -942,6 +976,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             return Err(explain_bind_error(error, https_address));
         }
     };
+
     let addresses = match edge.https_addr() {
         Some(https) if args.https_only => {
             format!(
@@ -961,10 +996,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         Some(worker) => format!("{} threads", worker.slots),
         None => format!("{} threads", resolved.threads),
     };
+
     println!(
         "muru: serving {} on {addresses} with {} workers of {capacity}",
         resolved.entrypoint, resolved.processes
     );
+
     if development {
         println!(
             "muru: development mode: error pages show tracebacks, nothing is persisted and only \
@@ -976,6 +1013,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
              supported way to run in production; that is the daemon, which arrives in phase 2"
         );
     }
+
     if let Some(tls) = &tls {
         match (&tls.development, &args.tls_cert) {
             (Some(certificate), _) => println!("{}", certificate.describe()),
@@ -985,12 +1023,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let release_number = Arc::new(AtomicU32::new(1));
+
     let dashboard = match args.dashboard.as_deref() {
         Some("off") => None,
         Some(address) => Some(address.to_owned()),
         None if development => Some("127.0.0.1:8081".to_owned()),
         None => None,
     };
+
     if let Some(address) = dashboard {
         match dashboard::start(
             &address,
@@ -1014,6 +1054,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
+
     if args.reload {
         let directories = if args.reload_dir.is_empty() {
             vec![resolved.project.clone()]
@@ -1024,6 +1065,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .into_iter()
             .map(|directory| directory.canonicalize().unwrap_or(directory))
             .collect();
+
         let include = if args.reload_include.is_empty() {
             vec!["**/*.py".to_owned()]
         } else {
@@ -1053,6 +1095,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing the SIGTERM handler")?;
+
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
@@ -1067,8 +1110,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
                 println!("muru: reloading, {} changed", describe(&paths));
+
                 loop {
                     release += 1;
+
                     let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
@@ -1076,6 +1121,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             break;
                         }
                     };
+
                     tokio::select! {
                         ready = next.wait_ready(START_TIMEOUT) => match ready {
                             Ok(()) => {
@@ -1087,6 +1133,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                         break;
                                     }
                                 }
+
                                 println!("muru: switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
@@ -1132,6 +1179,7 @@ fn describe(paths: &[PathBuf]) -> String {
         .first()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+
     match paths.len() {
         0 | 1 => first,
         more => format!("{first} and {} more", more - 1),

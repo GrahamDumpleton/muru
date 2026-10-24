@@ -110,12 +110,14 @@ impl EdgeProcess {
         let socket = std::os::unix::net::UnixStream::connect(&listener_socket)
             .with_context(|| format!("connecting to {}", listener_socket.display()))?;
         let mut listeners = Vec::new();
+
         while let Ok(fd) = crate::fdpass::recv_fd(&socket) {
             listeners.push(Listener {
                 socket: std::net::TcpListener::from(fd),
                 tls: tls.get(listeners.len()).copied().unwrap_or(false),
             });
         }
+
         anyhow::ensure!(!listeners.is_empty(), "the edge handed no listener back");
 
         Ok(Self {
@@ -225,6 +227,7 @@ impl EdgeProcess {
         }
 
         let grace = Duration::from_secs(10);
+
         match &mut self.process {
             Process::Child(child) => {
                 if tokio::time::timeout(grace, child.wait()).await.is_err() {
@@ -234,9 +237,11 @@ impl EdgeProcess {
             Process::Adopted(pid) => {
                 let pid = *pid;
                 let started = Instant::now();
+
                 while crate::host::alive(pid) && started.elapsed() < grace {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+
                 if crate::host::alive(pid) {
                     // SAFETY: kill(2) with a valid pid and signal has no
                     // memory-safety preconditions.
@@ -247,12 +252,14 @@ impl EdgeProcess {
                 }
             }
         }
+
         let _ = std::fs::remove_file(&self.spec.control);
         let _ = std::fs::remove_file(&self.spec.listener_socket);
     }
 
     async fn wait_ready(&mut self) -> anyhow::Result<()> {
         let started = Instant::now();
+
         while started.elapsed() < Duration::from_secs(30) {
             if self.exited()? {
                 anyhow::bail!(
@@ -260,6 +267,7 @@ impl EdgeProcess {
                     self.spec.log.display()
                 );
             }
+
             if let Ok(mut client) = connect(&self.spec.control).await
                 && client.get_status(pb::EdgeStatusRequest {}).await.is_ok()
             {
@@ -267,6 +275,7 @@ impl EdgeProcess {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+
         anyhow::bail!(
             "the edge did not answer on {} within 30 seconds",
             self.spec.control.display()
@@ -285,6 +294,7 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .with_context(|| format!("opening {}", spec.log.display()))?;
     let mut command = Command::new(&spec.executable);
     command.arg("edge").arg("run");
+
     for (index, listener) in spec.listeners.iter().enumerate() {
         let fd = LISTENER_FD + index as i32;
         command.arg("--listener").arg(if listener.tls {
@@ -293,6 +303,7 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
             fd.to_string()
         });
     }
+
     command
         .arg("--control")
         .arg(&spec.control)
@@ -315,12 +326,15 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
             .arg("--timeout")
             .arg(format!("{name}={}ms", duration.as_millis()));
     }
+
     if let Some(path) = &spec.access_log {
         command.arg("--access-log").arg(path);
     }
+
     for socket in worker_sockets {
         command.arg("--worker-socket").arg(socket);
     }
+
     command
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -337,9 +351,11 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         "at most {MAX_LISTENERS} listeners can be handed to an edge"
     );
     let mut raw = [-1i32; MAX_LISTENERS];
+
     for (slot, listener) in raw.iter_mut().zip(&spec.listeners) {
         *slot = listener.socket.as_raw_fd();
     }
+
     let count = spec.listeners.len();
 
     // SAFETY: dup2, fcntl, close and setsid are async-signal-safe and the
@@ -349,19 +365,25 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     unsafe {
         command.pre_exec(move || {
             let mut sources = [-1i32; MAX_LISTENERS];
+
             for index in 0..count {
                 let raised = libc::fcntl(raw[index], libc::F_DUPFD, LISTENER_FD + count as i32);
+
                 if raised < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+
                 sources[index] = raised;
             }
+
             for (index, source) in sources.iter().enumerate().take(count) {
                 if libc::dup2(*source, LISTENER_FD + index as i32) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+
                 libc::close(*source);
             }
+
             libc::setsid();
             Ok(())
         });
@@ -373,6 +395,7 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
 /// Connect to an edge's control socket.
 async fn connect(control: &Path) -> anyhow::Result<EdgeControlClient<Channel>> {
     let control = control.to_path_buf();
+
     if !control.exists() {
         anyhow::bail!(
             "the edge control socket {} does not exist",

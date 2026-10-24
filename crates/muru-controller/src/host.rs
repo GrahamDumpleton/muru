@@ -97,6 +97,7 @@ impl HostProcess {
             .arg("--interface")
             .arg(spec.interface.as_str())
             .stdin(Stdio::piped());
+
         match &spec.detach_to {
             Some(log) => {
                 let log = std::fs::OpenOptions::new()
@@ -122,30 +123,38 @@ impl HostProcess {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
+
         if let Some(hooks) = &spec.hooks {
             command.arg("--hooks").arg(hooks);
         }
+
         if let Some(phase) = spec.factory {
             command
                 .arg("--factory")
                 .arg("--factory-phase")
                 .arg(phase.as_str());
         }
+
         if spec.single {
             command.arg("--single");
         }
+
         if spec.detach_to.is_some() {
             command.arg("--detach");
         }
+
         let base_port = spec
             .tcp_base_port
             .map(|base| base.wrapping_add((release - 1) as u16 * spec.processes as u16));
+
         if let Some(base) = base_port {
             command.arg("--tcp-base-port").arg(base.to_string());
         }
+
         if let Some(dir) = &spec.chdir {
             command.current_dir(dir);
         }
+
         let mut child = command
             .spawn()
             .with_context(|| format!("starting the host with {}", spec.python.display()))?;
@@ -153,12 +162,15 @@ impl HostProcess {
         // The host exits when this end of its stdin closes, whatever happens here.
 
         let stdin = child.stdin.take();
+
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(relay(stdout, logs.clone(), false));
         }
+
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(relay(stderr, logs.clone(), true));
         }
+
         let sockets = (0..spec.processes)
             .map(|index| match base_port {
                 None => run_dir.join(format!("worker-{index}.sock")),
@@ -217,13 +229,16 @@ impl HostProcess {
     /// Wait until every worker listens, or the host exits or the time is up.
     pub async fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let started = Instant::now();
+
         loop {
             if self.sockets.iter().all(|socket| listening(socket)) {
                 return Ok(());
             }
+
             if let Some(status) = self.try_exited()? {
                 anyhow::bail!("the host {status} before its workers were ready");
             }
+
             anyhow::ensure!(
                 started.elapsed() < timeout,
                 "the workers did not start within {} seconds",
@@ -239,9 +254,11 @@ impl HostProcess {
             Process::Child(child) => child.wait().await,
             Process::Adopted(pid) => {
                 let pid = *pid;
+
                 while alive(pid) {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
+
                 Ok(ExitStatus::default())
             }
         }
@@ -269,9 +286,11 @@ impl HostProcess {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
         }
+
         drop(self.stdin.take());
 
         let grace = Duration::from_secs(10);
+
         match &mut self.process {
             Process::Child(child) => {
                 if tokio::time::timeout(grace, child.wait()).await.is_err() {
@@ -281,9 +300,11 @@ impl HostProcess {
             Process::Adopted(pid) => {
                 let pid = *pid;
                 let started = Instant::now();
+
                 while alive(pid) && started.elapsed() < grace {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+
                 if alive(pid) {
                     // SAFETY: as above.
 
@@ -293,12 +314,14 @@ impl HostProcess {
                 }
             }
         }
+
         let _ = std::fs::remove_dir_all(&self.run_dir);
     }
 
     /// Leave the host running and forget it, for a daemon that detaches.
     pub fn release(self) {
         drop(self.stdin);
+
         if let Process::Child(mut child) = self.process {
             // The child must not be killed when its handle drops.
 
@@ -331,6 +354,7 @@ fn listening(socket: &Path) -> bool {
 /// line, keeping each line for the dashboard.
 async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
     let mut lines = BufReader::new(stream).lines();
+
     while let Ok(Some(line)) = lines.next_line().await {
         if to_stderr {
             eprintln!("{line}");

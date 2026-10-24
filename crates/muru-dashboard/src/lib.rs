@@ -162,6 +162,7 @@ fn respond(request: &Request<Incoming>, source: &Source) -> Response<Full<Bytes>
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
+
     match request.uri().path() {
         "/static/htmx.min.js" => {
             let mut response = Response::new(Full::new(Bytes::from_static(HTMX)));
@@ -190,6 +191,7 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Full<Bytes>> {
             return plain(StatusCode::INTERNAL_SERVER_ERROR, "rendering failed\n");
         }
     };
+
     let mut response = Response::new(Full::new(Bytes::from(body)));
     let headers = response.headers_mut();
     headers.insert(

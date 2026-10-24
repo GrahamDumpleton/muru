@@ -62,6 +62,7 @@ def test_autobahn(tmp_path: Path) -> None:
         args=["--dashboard", "off", "--allow-public"],
         host="0.0.0.0",
     )
+
     try:
         config = tmp_path / "fuzzingclient.json"
         config.write_text(

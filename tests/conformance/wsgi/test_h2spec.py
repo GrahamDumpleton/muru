@@ -80,8 +80,10 @@ def parse_report(text: str) -> tuple[set[tuple[str, str]], int]:
 
     failed = set()
     total = 0
+
     for match in CASE.finditer(text):
         total += 1
         if "<failure" in match.group(3) or "<error" in match.group(3):
             failed.add((match.group(1), match.group(2)))
+
     return failed, total

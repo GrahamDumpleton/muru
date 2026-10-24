@@ -24,6 +24,7 @@ ROUNDS = 25
 @pytest.fixture(scope="module")
 def server() -> Iterator[support.Server]:
     instance = support.start("plain_wsgi:application", workers=1, threads=THREADS)
+
     try:
         yield instance
     finally:
@@ -33,6 +34,7 @@ def server() -> Iterator[support.Server]:
 def test_mixed_load_is_served_correctly(server: support.Server) -> None:
     def client(index: int) -> list[str]:
         problems = []
+
         for round_number in range(ROUNDS):
             payload = f"client {index} round {round_number}".encode() * 50
             echoed = server.post("/echo", payload)
@@ -44,6 +46,7 @@ def test_mixed_load_is_served_correctly(server: support.Server) -> None:
             local = json.loads(server.get("/threadlocal").body)
             if local["count"] < 1:
                 problems.append(f"thread-local count {local}")
+
         return problems
 
     with ThreadPoolExecutor(max_workers=CLIENTS) as pool:
@@ -68,10 +71,12 @@ def test_threads_run_in_parallel(server: support.Server) -> None:
     # 6.4 s if the threads serialised; the bound leaves room for slow CI.
 
     started = time.monotonic()
+
     with ThreadPoolExecutor(max_workers=CLIENTS) as pool:
         statuses = list(
             pool.map(lambda _i: server.get("/sleep?seconds=0.1").status, range(CLIENTS))
         )
+
     elapsed = time.monotonic() - started
     assert statuses == [200] * CLIENTS
     assert elapsed < 2.0, f"{elapsed:.2f}s for {CLIENTS} parallel sleeps"

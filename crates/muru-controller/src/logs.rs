@@ -17,9 +17,11 @@ impl Logs {
     /// Keep a line, dropping the oldest when full.
     pub fn push(&self, line: String) {
         let mut lines = self.lines.lock().expect("logs poisoned");
+
         if lines.len() == CAPACITY {
             lines.pop_front();
         }
+
         lines.push_back(line);
     }
 

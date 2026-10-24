@@ -18,14 +18,17 @@ def exchange(server: Server, data: bytes, timeout: float = 5.0) -> bytes:
     with socket.create_connection(("127.0.0.1", server.port), timeout=timeout) as sock:
         sock.sendall(data)
         chunks = []
+
         while True:
             try:
                 chunk = sock.recv(65536)
             except (TimeoutError, ConnectionResetError):
                 break
+
             if not chunk:
                 break
             chunks.append(chunk)
+
         return b"".join(chunks)
 
 

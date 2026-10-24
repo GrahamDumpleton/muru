@@ -23,6 +23,7 @@ from support import server as support
 @pytest.fixture(scope="module")
 def server() -> Iterator[support.Server]:
     instance = support.start("plain_asgi:application", workers=1, threads=None)
+
     try:
         yield instance
     finally:
@@ -52,6 +53,7 @@ def read_until_failure(server: support.Server, path: str) -> None:
     """Read a response that the server cuts short, raising as http.client does."""
 
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
+
     try:
         connection.request("GET", path)
         raw = connection.getresponse()
@@ -128,6 +130,7 @@ def test_request_body_arrives_as_messages(server: support.Server) -> None:
 
 def test_chunked_request_body_is_buffered_with_a_length(server: support.Server) -> None:
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
+
     try:
         connection.putrequest("POST", "/info")
         connection.putheader("Transfer-Encoding", "chunked")
@@ -250,6 +253,7 @@ def test_system_exit_does_not_end_the_worker(server: support.Server) -> None:
 
 def test_client_disconnect_is_delivered(server: support.Server) -> None:
     server.mark_log()
+
     with socket.create_connection(("127.0.0.1", server.port), timeout=5) as sock:
         sock.sendall(b"GET /disconnect HTTP/1.1\r\nHost: x\r\n\r\n")
         time.sleep(0.2)
@@ -267,6 +271,7 @@ def test_receive_after_response_gets_disconnect(server: support.Server) -> None:
 
 def test_lifespan_shutdown_runs_on_stop() -> None:
     instance = support.start("plain_asgi:application", workers=1, threads=None)
+
     try:
         assert instance.get("/").status == 200
     finally:

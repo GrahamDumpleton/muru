@@ -29,6 +29,7 @@ DJANGO = ("django_site.asgi:application", "Hello from Django\n")
 def framework(request: pytest.FixtureRequest) -> Iterator[tuple[support.Server, str]]:
     app, greeting = request.param
     instance = support.start(app, workers=2, threads=None)
+
     try:
         yield instance, greeting
     finally:
@@ -93,6 +94,7 @@ def test_cookies_or_session(framework: tuple[support.Server, str]) -> None:
     assert cookie
 
     second = server.get(path, headers={"Cookie": cookie.split(";", 1)[0]})
+
     if "Django" in greeting:
         assert json.loads(first.body) == {"count": 1}
         assert json.loads(second.body) == {"count": 2}
@@ -123,11 +125,13 @@ def test_application_error_is_a_500(framework: tuple[support.Server, str]) -> No
     response = server.get("/error")
 
     assert response.status == 500
+
     if "Django" not in greeting:
         # Starlette's ServerErrorMiddleware re-raises after its own 500,
         # so the traceback reaches the worker's log.
 
         assert server.wait_for_log("boom")
+
     assert server.get("/").status == 200
 
 
@@ -166,6 +170,7 @@ def test_websocket_echo(framework: tuple[support.Server, str]) -> None:
         pytest.skip("Django's ASGI handler serves HTTP only")
 
     server.mark_log()
+
     with connect(
         f"ws://127.0.0.1:{server.port}/ws", subprotocols=["chat"], open_timeout=10
     ) as socket_:  # type: ignore[arg-type]
@@ -182,6 +187,7 @@ def test_websocket_echo(framework: tuple[support.Server, str]) -> None:
 def test_keep_alive_across_requests(framework: tuple[support.Server, str]) -> None:
     server, greeting = framework
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
+
     try:
         for _ in range(10):
             connection.request("GET", "/")
@@ -194,6 +200,7 @@ def test_keep_alive_across_requests(framework: tuple[support.Server, str]) -> No
 
 def test_fastapi_sync_route_runs_on_a_thread() -> None:
     instance = support.start("fastapi_app:application", workers=1, threads=None)
+
     try:
         body = json.loads(instance.get("/sync-thread").body)
     finally:

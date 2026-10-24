@@ -28,6 +28,7 @@ def read_record(path: Path) -> dict[str, str]:
 
     meta: dict[str, str] = {}
     match = FRONT_MATTER.match(text)
+
     if match:
         for line in match.group(1).splitlines():
             key, _, value = line.partition(":")
@@ -62,11 +63,13 @@ class AdrList(SphinxDirective):
             return self.parse_text_to_nodes("No decision records yet.")
 
         lines = ["| Number | Title | Status | Date |", "| --- | --- | --- | --- |"]
+
         for record in records:
             lines.append(
                 f"| {record['number']} | [{record['title']}]({record['file']}) "
                 f"| {record['status']} | {record['date']} |"
             )
+
         return self.parse_text_to_nodes("\n".join(lines))
 
 

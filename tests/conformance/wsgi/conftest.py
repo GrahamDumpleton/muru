@@ -20,6 +20,7 @@ def server() -> Iterator[Server]:
         # The suite pins the 10 MB default of ADR 0008; development runs use 100 MB.
         args=["--max-body-size", "10MB", "--dashboard", "off"],
     )
+
     try:
         yield instance
     finally:

@@ -42,6 +42,7 @@ def server(cache: Path, no_authority: dict[str, str]) -> Iterator[support.Server
         env={"MURU_CACHE_DIR": str(cache), **no_authority},
         https=True,
     )
+
     try:
         yield instance
     finally:
@@ -150,11 +151,13 @@ def test_certificate_is_reused_and_can_be_given_explicitly(
         env={"MURU_CACHE_DIR": str(cache), **no_authority},
         https=True,
     )
+
     try:
         assert again.request_tls("GET", "/", certificate(cache)).status == 200
         assert "(reused, " in again.log()
     finally:
         again.stop()
+
     assert certificate(cache).read_bytes() == before
 
     explicit = support.start(
@@ -168,6 +171,7 @@ def test_certificate_is_reused_and_can_be_given_explicitly(
         env={"MURU_CACHE_DIR": str(cache), **no_authority},
         https=True,
     )
+
     try:
         assert explicit.request_tls("GET", "/", certificate(cache)).status == 200
         assert f"muru: TLS certificate from {certificate(cache)}" in explicit.log()
@@ -182,6 +186,7 @@ def test_https_only_redirects_plain_http(cache: Path, no_authority: dict[str, st
         env={"MURU_CACHE_DIR": str(cache), **no_authority},
         https=True,
     )
+
     try:
         response = instance.get("/a/b?x=1&y=2", headers={"Host": f"localhost:{instance.port}"})
         assert response.status == 307
@@ -217,6 +222,7 @@ def test_mkcert_authority_issues_the_certificate(tmp_path: Path) -> None:
         env={"MURU_CACHE_DIR": str(tmp_path), "CAROOT": str(root)},
         https=True,
     )
+
     try:
         response = instance.request_tls("GET", "/", root / "rootCA.pem")
         assert response.status == 200

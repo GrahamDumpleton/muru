@@ -161,9 +161,11 @@ impl Channel {
             permit = self.permits.acquire() => permit,
             _ = self.complete.notified() => return false,
         };
+
         if self.completed.load(Ordering::Relaxed) {
             return false;
         }
+
         let Ok(permit) = permit else {
             return false;
         };
@@ -185,9 +187,11 @@ impl Channel {
     /// every one after it gets `websocket.disconnect`.
     pub fn disconnect_with(&self, code: u16, reason: &str) {
         let mut inbox = self.inbox.lock().expect("inbox poisoned");
+
         if inbox.closed {
             return;
         }
+
         inbox.closed = true;
         inbox.close = (code, reason.to_owned());
 
@@ -212,6 +216,7 @@ impl Channel {
     /// Queue a message, or hand it straight to a waiting `receive()`.
     fn push(&self, message: Message) {
         let mut inbox = self.inbox.lock().expect("inbox poisoned");
+
         match inbox.waiter.take() {
             Some(waiter) => {
                 drop(inbox);
@@ -252,6 +257,7 @@ impl Channel {
     /// and the output is dropped.
     fn enqueue(&self, py: Python<'_>, items: Vec<Outgoing>) -> PyResult<Option<Py<PyAny>>> {
         let mut items = items.into_iter();
+
         while let Some(item) = items.next() {
             let item = match self.tx.try_send(item) {
                 Ok(()) => continue,
@@ -281,6 +287,7 @@ impl Channel {
                         "call_soon_threadsafe",
                         (resolver.bind(py), waiter.bind(py), py.None()),
                     );
+
                     if let Err(error) = woken {
                         tracing::debug!(%error, "waking an ASGI send() failed");
                     }
@@ -332,6 +339,7 @@ impl Channel {
                     Some(headers) if !headers.is_none() => validate_headers(&headers)?,
                     _ => Vec::new(),
                 };
+
                 if let Some(subprotocol) = message.get_item("subprotocol")?
                     && !subprotocol.is_none()
                 {
@@ -358,6 +366,7 @@ impl Channel {
                         "websocket.send sent before websocket.accept",
                     ));
                 }
+
                 if state.closed {
                     return Err(PyRuntimeError::new_err(
                         "websocket.send sent after the WebSocket was closed",
@@ -368,6 +377,7 @@ impl Channel {
 
                 let bytes = message.get_item("bytes")?.filter(|value| !value.is_none());
                 let text = message.get_item("text")?.filter(|value| !value.is_none());
+
                 let outgoing = match (bytes, text) {
                     (Some(bytes), None) => {
                         let Ok(bytes) = bytes.cast::<PyBytes>() else {
@@ -393,6 +403,7 @@ impl Channel {
                         ));
                     }
                 };
+
                 Ok(Some(self.enqueue(py, vec![outgoing])?))
             }
             "websocket.close" => {
@@ -408,6 +419,7 @@ impl Channel {
                         .map_err(|_| PyTypeError::new_err("websocket.close code must be an int"))?,
                     _ => 1000,
                 };
+
                 let reason = match message.get_item("reason")? {
                     Some(reason) if !reason.is_none() => {
                         reason.extract::<String>().map_err(|_| {
@@ -416,6 +428,7 @@ impl Channel {
                     }
                     _ => String::new(),
                 };
+
                 state.closed = true;
 
                 // Closing before accepting declines the handshake with 403.
@@ -436,6 +449,7 @@ impl Channel {
                         ],
                     )?));
                 }
+
                 Ok(Some(
                     self.enqueue(py, vec![Outgoing::Close { code, reason }])?,
                 ))
@@ -497,6 +511,7 @@ impl Channel {
 
         let future = self.event_loop.bind(py).call_method0("create_future")?;
         let mut inbox = self.inbox.lock().expect("inbox poisoned");
+
         if let Some(message) = inbox.queue.pop_front() {
             drop(inbox);
             self.permits.add_permits(1);
@@ -529,6 +544,7 @@ impl Channel {
             return Ok(result);
         }
         let kind = kind.strip_prefix("websocket.").unwrap_or(&kind).to_owned();
+
         match kind.as_str() {
             "http.response.start" => {
                 if state.head_sent {
@@ -544,11 +560,13 @@ impl Channel {
                     .map_err(|_| {
                         PyTypeError::new_err("http.response.start status must be an int")
                     })?;
+
                 if !(100..600).contains(&status) {
                     return Err(PyValueError::new_err(format!(
                         "invalid HTTP status {status}"
                     )));
                 }
+
                 let headers = match message.get_item("headers")? {
                     Some(headers) => validate_headers(&headers)?,
                     None => Vec::new(),
@@ -573,6 +591,7 @@ impl Channel {
                         "http.response.body sent before http.response.start",
                     ));
                 }
+
                 if state.body_ended {
                     return Err(PyRuntimeError::new_err(
                         "http.response.body sent after the response was completed",
@@ -583,13 +602,16 @@ impl Channel {
                     Some(more) => more.is_truthy()?,
                     None => false,
                 };
+
                 let mut items = Vec::with_capacity(2);
+
                 if let Some(body) = message.get_item("body")? {
                     let Ok(body) = body.cast::<PyBytes>() else {
                         return Err(PyTypeError::new_err(
                             "http.response.body body must be bytes",
                         ));
                     };
+
                     if !body.as_bytes().is_empty() {
                         items.push(Outgoing::Body(wsgi::bytes_from_py(body)));
                     }
@@ -602,6 +624,7 @@ impl Channel {
                     state.body_ended = true;
                     items.push(Outgoing::Finished);
                 }
+
                 drop(state);
                 self.enqueue(py, items)
             }
@@ -628,6 +651,7 @@ impl Channel {
         if body_ended || closed {
             return;
         }
+
         if accepted {
             let _ = self.enqueue(
                 py,
@@ -638,10 +662,12 @@ impl Channel {
             );
             return;
         }
+
         if self.websocket && !head_sent {
             self.decline(py, 403);
             return;
         }
+
         let error = if head_sent {
             "the application returned before completing the response"
         } else {
@@ -657,6 +683,7 @@ impl Channel {
         let state = self.state.lock().expect("send state poisoned");
         let (body_ended, accepted, closed) = (state.body_ended, state.accepted, state.closed);
         drop(state);
+
         if body_ended || closed {
             return;
         }
@@ -673,6 +700,7 @@ impl Channel {
             );
             return;
         }
+
         self.abort(py, "the application raised an exception", detail);
     }
 }
@@ -695,6 +723,7 @@ fn message_dict<'py>(
     websocket: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+
     match message {
         Message::Body { data, more } => {
             dict.set_item("type", "http.request")?;
@@ -706,6 +735,7 @@ fn message_dict<'py>(
         }
         Message::Received { data, text } => {
             dict.set_item("type", "websocket.receive")?;
+
             if *text {
                 dict.set_item("text", String::from_utf8_lossy(data).as_ref())?;
                 dict.set_item("bytes", py.None())?;
@@ -731,6 +761,7 @@ fn message_dict<'py>(
 /// pairs with token names and values free of CR and LF.
 fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut out = Vec::new();
+
     for item in headers.try_iter()? {
         // Each header is a two-item iterable of bytes.
 
@@ -755,20 +786,24 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
         if name.is_empty() {
             return Err(PyValueError::new_err("header name is empty"));
         }
+
         if name.iter().any(|&byte| byte <= b' ' || byte == 0x7f) {
             return Err(PyValueError::new_err(format!(
                 "header name contains a space or control character: {:?}",
                 String::from_utf8_lossy(&name)
             )));
         }
+
         if value.contains(&b'\r') || value.contains(&b'\n') {
             return Err(PyValueError::new_err(format!(
                 "header value contains a carriage return or line feed: {:?}",
                 String::from_utf8_lossy(&value)
             )));
         }
+
         if name.eq_ignore_ascii_case(b"content-length") {
             let text = std::str::from_utf8(&value).unwrap_or("");
+
             if text.trim().parse::<u64>().is_err() {
                 return Err(PyValueError::new_err(format!(
                     "invalid Content-Length header value {text:?}"
@@ -801,12 +836,15 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         "HTTP/1.0" => "1.0",
         _ => "1.1",
     };
+
     scope.set_item("http_version", version)?;
+
     let scheme = if head.scheme.is_empty() {
         "http"
     } else {
         head.scheme.as_str()
     };
+
     if websocket {
         scope.set_item("scheme", if scheme == "https" { "wss" } else { "ws" })?;
     } else {
@@ -826,12 +864,15 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     let headers = PyList::empty(py);
     let mut has_length = false;
     let mut subprotocols: Vec<String> = Vec::new();
+
     for header in &head.headers {
         has_length |= header.name.eq_ignore_ascii_case(b"content-length");
+
         if header.name.eq_ignore_ascii_case(b"sec-websocket-protocol") {
             let offered = String::from_utf8_lossy(&header.value);
             subprotocols.extend(offered.split(',').map(|name| name.trim().to_owned()));
         }
+
         headers.append(PyTuple::new(
             py,
             [
@@ -840,6 +881,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
             ],
         )?)?;
     }
+
     if let Some(length) = head.content_length
         && !has_length
     {
@@ -852,6 +894,7 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         )?)?;
     }
     scope.set_item("headers", headers)?;
+
     if websocket {
         scope.set_item("subprotocols", subprotocols)?;
     }
@@ -882,9 +925,11 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 
     let muru = PyDict::new(py);
     muru.set_item("request_id", &head.request_id)?;
+
     if head.max_body_size != 0 {
         muru.set_item("max_body_size", head.max_body_size)?;
     }
+
     if let Some(tls) = &head.tls {
         let details = PyDict::new(py);
         details.set_item("version", &tls.version)?;
@@ -893,13 +938,16 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         details.set_item("alpn", &tls.alpn)?;
         muru.set_item("tls", details)?;
     }
+
     let extensions = PyDict::new(py);
     extensions.set_item("muru", muru)?;
+
     if websocket {
         // Declining the handshake with a full response (section 5.6).
 
         extensions.set_item("websocket.http.response", PyDict::new(py))?;
     }
+
     scope.set_item("extensions", extensions)?;
 
     Ok(scope)

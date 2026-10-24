@@ -155,6 +155,7 @@ fn pick(
             rule: "option",
         };
     }
+
     if let Some(path) = env::var_os(variable).filter(|value| !value.is_empty()) {
         return Location {
             path: PathBuf::from(path),

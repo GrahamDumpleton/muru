@@ -24,9 +24,11 @@ def test_each_native_thread_keeps_one_thread_state(server: Server) -> None:
 
     by_thread: dict[tuple[str, str], set[str]] = {}
     by_state: dict[tuple[str, str], set[str]] = {}
+
     for pid, native, tstate in seen:
         by_thread.setdefault((pid, native), set()).add(tstate)
         by_state.setdefault((pid, tstate), set()).add(native)
+
     assert all(len(states) == 1 for states in by_thread.values()), by_thread
     assert all(len(threads) == 1 for threads in by_state.values()), by_state
 

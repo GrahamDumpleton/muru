@@ -21,6 +21,7 @@ DJANGO = ("django_site.wsgi:application", "Hello from Django\n")
 def framework(request: pytest.FixtureRequest) -> Iterator[tuple[support.Server, str]]:
     app, greeting = request.param
     instance = support.start(app, workers=2, threads=2)
+
     try:
         yield instance, greeting
     finally:
@@ -30,9 +31,11 @@ def framework(request: pytest.FixtureRequest) -> Iterator[tuple[support.Server, 
 def multipart(fields: dict[str, str], files: dict[str, tuple[str, bytes]]) -> tuple[bytes, str]:
     boundary = uuid.uuid4().hex
     parts = []
+
     for name, value in fields.items():
         head = f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
         parts.append(f"{head}{value}\r\n".encode())
+
     for name, (filename, data) in files.items():
         parts.append(
             f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; '
@@ -40,6 +43,7 @@ def multipart(fields: dict[str, str], files: dict[str, tuple[str, bytes]]) -> tu
             + data
             + b"\r\n"
         )
+
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
@@ -95,6 +99,7 @@ def test_cookies_or_session(framework: tuple[support.Server, str]) -> None:
     cookie = first.header("Set-Cookie")
     assert cookie
     second = server.get(path, headers={"Cookie": cookie.split(";", 1)[0]})
+
     if "Flask" in greeting:
         assert json.loads(first.body) == {"seen": None}
         assert json.loads(second.body) == {"seen": "yes"}
@@ -122,11 +127,13 @@ def test_application_error_is_a_500(framework: tuple[support.Server, str]) -> No
     server.mark_log()
     response = server.get("/error")
     assert response.status == 500
+
     if "Flask" in greeting:
         # Flask logs the exception; Django's default logging only does so
         # with DEBUG on, and answers with its own 500 page either way.
 
         assert server.wait_for_log("flask-boom")
+
     assert server.get("/").status == 200
 
 
@@ -147,6 +154,7 @@ def test_send_file(framework: tuple[support.Server, str]) -> None:
 def test_keep_alive_across_requests(framework: tuple[support.Server, str]) -> None:
     server, greeting = framework
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=30)
+
     try:
         for _ in range(10):
             connection.request("GET", "/")

@@ -90,10 +90,12 @@ def test_streams_multiplex_on_one_connection(server: Server) -> None:
         "-w",
         "%{http_version} %{response_code} %{num_connects}\n",
     ]
+
     for path in paths:
         # One --output per URL, or curl prints the later bodies to stdout.
 
         command.extend(["-o", "/dev/null", url(server, path)])
+
     completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
     assert completed.returncode == 0, completed.stderr
     results = [line.split() for line in completed.stdout.splitlines()]

@@ -93,8 +93,10 @@ def test_invalid_send_is_a_500_before_output(server: Server, path: str, message:
 def test_invalid_body_type_after_start_fails_the_response(server: Server) -> None:
     server.mark_log()
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+
     try:
         connection.request("GET", "/bad-body-type")
+
         with pytest.raises(
             (http.client.IncompleteRead, ConnectionError, http.client.HTTPException)
         ):
@@ -111,8 +113,10 @@ def test_invalid_body_type_after_start_fails_the_response(server: Server) -> Non
 def test_trailers_are_refused_as_not_advertised(server: Server) -> None:
     server.mark_log()
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+
     try:
         connection.request("GET", "/trailers")
+
         with pytest.raises(
             (http.client.IncompleteRead, ConnectionError, http.client.HTTPException)
         ):

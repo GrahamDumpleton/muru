@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::set_var("PROTOC", &protoc);
         std::env::set_var("PROTOC_INCLUDE", &include);
     }
+
     tonic_prost_build::configure()
         .bytes(".muru.worker.v1")
         .compile_protos(

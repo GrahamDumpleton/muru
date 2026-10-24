@@ -10,5 +10,6 @@ async def application(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await receive()
         await send({"type": "lifespan.startup.failed", "message": "no database"})
         return
+
     await send({"type": "http.response.start", "status": 200, "headers": []})
     await send({"type": "http.response.body", "body": b"never"})

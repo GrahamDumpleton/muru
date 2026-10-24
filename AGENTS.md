@@ -165,6 +165,9 @@ The same applies to Rust: a `match` or `for` of more than two lines gets a
 blank line before it and the statement after its closing brace gets one too.
 Code produced through scripts, heredocs or patches is held to the same rules;
 reread every new or changed body as a reader before reporting it.
+`scripts/check-layout.py` enforces the rules on Python and Rust files, runs
+from `just lint` and the pre-commit hook, and inserts the missing blank lines
+with `--fix`; the formatters keep what it inserts.
 
 - In Rust, every public item in a library crate has a doc comment, and every
   `unsafe` block has a `SAFETY:` comment explaining why it is sound. No

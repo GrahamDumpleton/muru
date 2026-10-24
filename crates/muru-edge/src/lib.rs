@@ -212,6 +212,7 @@ impl Edge {
         );
         let tls_config = tls::server_config_with_resolver(resolver)?;
         let mut listeners = Vec::new();
+
         for inherited in inherited {
             inherited.listener.set_nonblocking(true)?;
             let listener = TcpListener::from_std(inherited.listener)?;
@@ -240,6 +241,7 @@ impl Edge {
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let local = listeners[0].0.local_addr()?;
         let mut redirect_to = None;
+
         if let Some(secure) = config.https {
             let listener = TcpListener::bind(secure.listen)
                 .await
@@ -247,17 +249,21 @@ impl Edge {
                     address: secure.listen,
                     source,
                 })?;
+
             if secure.only {
                 redirect_to = Some(listener.local_addr()?);
             }
+
             listeners.push((listener, Some(TlsAcceptor::from(secure.config))));
         }
 
         let mut bound = Vec::with_capacity(listeners.len());
+
         for (listener, acceptor) in listeners {
             let address = listener.local_addr()?;
             bound.push((listener, address, acceptor));
         }
+
         let https_port = bound
             .iter()
             .find(|(_, _, acceptor)| acceptor.is_some())
@@ -354,6 +360,7 @@ async fn accept(
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let shared = Arc::clone(&shared);
+
         match acceptor.clone() {
             None => {
                 tokio::spawn(serve(stream, peer, local, None, shared));
@@ -368,6 +375,7 @@ async fn accept(
                         acceptor.accept(stream),
                     )
                     .await;
+
                     match handshake {
                         Ok(Ok(stream)) => {
                             let info = tls::info(stream.get_ref().1);
@@ -434,6 +442,7 @@ async fn serve<I>(
                 &listener,
                 tls.is_some() || shared.https_port.is_none(),
             );
+
             let mut response = match (redirect_to, decision) {
                 (Some(to), _) => link::redirect_to_https(request, &context, to),
                 (None, routing::Decision::Serve { pool, server_name }) => {
@@ -472,6 +481,7 @@ async fn serve<I>(
                     .headers_mut()
                     .insert(errors::X_REQUEST_ID.clone(), value);
             }
+
             Ok::<_, Infallible>(response)
         }
     });
@@ -481,6 +491,7 @@ async fn serve<I>(
     let connection = state
         .protocols
         .serve_connection_with_upgrades(TokioIo::new(io), service);
+
     if let Err(error) = connection.await {
         tracing::debug!(%peer, %error, "connection ended with an error");
     }
@@ -547,6 +558,7 @@ pub(crate) fn request_head(
         }),
         _ => None,
     };
+
     pb::RequestHead {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
         request_id: context.request_id.to_owned(),
@@ -566,9 +578,11 @@ pub(crate) fn request_head(
                 // application, and neither does anything hop-by-hop.
 
                 let name = name.as_str();
+
                 if name.contains('_') || is_hop_by_hop(name, &named_in_connection) {
                     return None;
                 }
+
                 Some(pb::Header {
                     name: Bytes::copy_from_slice(name.as_bytes()),
                     value: Bytes::copy_from_slice(value.as_bytes()),
@@ -610,6 +624,7 @@ pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>)
             headers.append(name, value);
         }
     }
+
     headers.insert(SERVER, HeaderValue::from_static("muru"));
 }
 
@@ -642,5 +657,6 @@ pub(crate) fn close_after(
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
     }
+
     response
 }

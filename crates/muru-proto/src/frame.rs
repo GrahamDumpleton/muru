@@ -111,18 +111,22 @@ pub async fn write<W: AsyncWrite + Unpin>(
 /// Read one frame. Returns `None` on a clean end of stream at a frame boundary.
 pub async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Frame>> {
     let mut header = [0u8; HEADER_LEN];
+
     match reader.read_exact(&mut header).await {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
+
     let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+
     if len > MAX_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("frame payload of {len} bytes exceeds the limit"),
         ));
     }
+
     let mut payload = BytesMut::zeroed(len);
     reader.read_exact(&mut payload).await?;
     Ok(Some(Frame {

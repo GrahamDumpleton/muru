@@ -73,6 +73,7 @@ impl LocationArgs {
                 arguments.push(path.display().to_string());
             }
         }
+
         if self.system {
             arguments.push("--system".to_owned());
         }
@@ -145,10 +146,12 @@ pub struct DaemonRunArgs {
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve();
     let document = read_config(&locations.config.path)?;
+
     let listeners = match args.listen {
         Some(listen) => vec![(listen, false)],
         None => listeners_from(&document)?,
     };
+
     let limits = limits_from(&document)?;
 
     // The edge writes the access log to a file in the log directory as
@@ -208,9 +211,11 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.arg("daemon").arg("run");
+
     if let Some(listen) = args.listen {
         command.arg("--listen").arg(listen.to_string());
     }
+
     command.args(args.locations.as_arguments());
     command
         .stdin(std::process::Stdio::null())
@@ -226,10 +231,12 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
             Ok(())
         });
     }
+
     let child = command.spawn().context("starting the daemon")?;
     std::fs::write(locations.pid_file(), child.id().to_string())?;
 
     let started = Instant::now();
+
     while started.elapsed() < Duration::from_secs(30) {
         if let Ok(mut client) = client::connect(&socket).await
             && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
@@ -269,11 +276,13 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
     // signal to wait for.
 
     let started = Instant::now();
+
     while started.elapsed() < Duration::from_secs(90) {
         let answering = match client::connect(&path).await {
             Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.is_ok(),
             Err(_) => false,
         };
+
         if !answering && (!path.exists() || !process_alive(status.pid)) {
             if shutdown {
                 println!("muru: daemon stopped; releases drained and stopped");
@@ -282,8 +291,10 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
             }
             return Ok(());
         }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
     anyhow::bail!("the daemon (pid {}) did not exit", status.pid)
 }
 
@@ -456,7 +467,9 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
         println!("no applications");
         return Ok(());
     }
+
     println!("{:<20} {:<12} {:<12}", "APP", "CURRENT", "PREVIOUS");
+
     for app in apps {
         println!(
             "{:<20} {:<12} {:<12}",
@@ -465,6 +478,7 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             or_dash(&app.previous_release)
         );
     }
+
     Ok(())
 }
 
@@ -491,9 +505,12 @@ pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
         println!("no virtual hosts");
         return Ok(());
     }
+
     println!("{:<16} {:<8} {:<10} NAMES", "HOST", "TLS", "LISTENERS");
+
     for host in hosts {
         let mut names = host.names.join(", ");
+
         if host.default {
             names.push_str(if names.is_empty() {
                 "(default)"
@@ -501,6 +518,7 @@ pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
                 " (default)"
             });
         }
+
         println!(
             "{:<16} {:<8} {:<10} {names}",
             host.name,
@@ -512,6 +530,7 @@ pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
             }
         );
     }
+
     Ok(())
 }
 
@@ -538,10 +557,13 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
         println!("no routes");
         return Ok(());
     }
+
     println!("{:<16} {:<24} APP", "HOST", "PATH");
+
     for route in routes {
         println!("{:<16} {:<24} {}", route.host, route.path, route.app);
     }
+
     Ok(())
 }
 
@@ -590,10 +612,12 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
         println!("no releases");
         return Ok(());
     }
+
     println!(
         "{:<24} {:<10} {:<8} {:<10} SOURCE",
         "RELEASE", "STATE", "SERVING", "WORKERS"
     );
+
     for release in releases {
         println!(
             "{:<24} {:<10} {:<8} {:<10} {}",
@@ -603,10 +627,12 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
             format!("{}x{}", release.processes, release.threads),
             release.source
         );
+
         if !release.message.is_empty() {
             println!("{:<24} {}", "", release.message);
         }
     }
+
     Ok(())
 }
 
@@ -634,9 +660,11 @@ pub async fn release_wait(
         "muru: release {}@{} is {}",
         release.app, release.id, release.state
     );
+
     if !release.message.is_empty() {
         println!("muru: {}", release.message);
     }
+
     Ok(())
 }
 
@@ -821,6 +849,7 @@ pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyho
 /// directory.
 fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
     let mut files = Vec::new();
+
     if path.is_dir() {
         for entry in
             std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
@@ -834,6 +863,7 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
             }
         }
         files.sort();
+
         if files.is_empty() {
             anyhow::bail!("{} holds no .toml files", path.display());
         }
@@ -842,6 +872,7 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
     }
 
     let mut document = muru_config::Document::default();
+
     for file in files {
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
@@ -862,6 +893,7 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
                 path.to_owned()
             }
         };
+
         for app in parsed.app.values_mut() {
             for release in app.release.values_mut() {
                 if let Some(source) = &release.source {
@@ -869,6 +901,7 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
                 }
             }
         }
+
         for host in parsed.host.values_mut() {
             if let Some(tls) = &mut host.tls {
                 tls.certificate = absolute(&tls.certificate);
@@ -888,6 +921,7 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
 fn print_report(report: &pb::ConfigReport, dry_run: bool) {
     if !report.errors.is_empty() {
         println!("muru: nothing applied; the configuration has errors:");
+
         for error in &report.errors {
             println!("  {error}");
         }
@@ -908,6 +942,7 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
                 "plan"
             }
         );
+
         for change in &report.changes {
             let what = if report.applied {
                 change.outcome.as_str()
@@ -916,6 +951,7 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
             };
             println!("  {:<15} {:<24} {what}", change.action, change.subject);
         }
+
         if report.unchanged > 0 {
             println!(
                 "  {} object{} as declared",
@@ -936,6 +972,7 @@ fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
     if !report.errors.is_empty() {
         return 1;
     }
+
     if report.applied {
         let failed = report
             .changes
@@ -943,6 +980,7 @@ fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
             .any(|change| change.outcome.starts_with("failed"));
         return if failed { 1 } else { 0 };
     }
+
     if planning && !report.changes.is_empty() {
         return 2;
     }
@@ -992,9 +1030,11 @@ pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Res
             .await?
             .into_inner()
             .events;
+
         for event in events {
             println!("{}", format_event(&event));
         }
+
         return Ok(());
     }
 
@@ -1002,9 +1042,11 @@ pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Res
         .watch_events(pb::WatchEventsRequest { after })
         .await?
         .into_inner();
+
     while let Some(event) = stream.next().await {
         println!("{}", format_event(&event?));
     }
+
     Ok(())
 }
 
@@ -1052,6 +1094,7 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
     if !path.is_file() {
         return Ok(muru_config::Document::default());
     }
+
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
@@ -1064,6 +1107,7 @@ fn listeners_from(document: &muru_config::Document) -> anyhow::Result<Vec<(Socke
     }
 
     let mut listeners = Vec::new();
+
     for listener in &document.listener {
         let address = listener
             .address
@@ -1071,6 +1115,7 @@ fn listeners_from(document: &muru_config::Document) -> anyhow::Result<Vec<(Socke
             .with_context(|| format!("listener address {:?}", listener.address))?;
         listeners.push((address, listener.tls));
     }
+
     Ok(listeners)
 }
 
@@ -1084,13 +1129,16 @@ fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Li
     if let Some(size) = &table.max_body_size {
         limits.max_body_size = muru_config::parse_size(size).map_err(anyhow::Error::msg)?;
     }
+
     if let Some(size) = &table.max_header_bytes {
         limits.max_header_bytes =
             usize::try_from(muru_config::parse_size(size).map_err(anyhow::Error::msg)?)?;
     }
+
     if let Some(count) = table.max_headers {
         limits.max_headers = count;
     }
+
     for (value, field) in [
         (&table.header_read_timeout, &mut limits.header_read_timeout),
         (&table.queue_timeout, &mut limits.queue_timeout),

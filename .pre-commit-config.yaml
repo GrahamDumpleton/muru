@@ -11,10 +11,10 @@ repos:
         language: system
         pass_filenames: false
 
-      - id: comment-spacing
+      - id: code-layout
         stages: [pre-commit]
-        name: block comments have blank lines around them
-        entry: uv run python scripts/check-comment-spacing.py
+        name: code layout follows the AGENTS.md paragraph rules
+        entry: uv run python scripts/check-layout.py
         language: system
         types_or: [python, rust]
 

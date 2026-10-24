@@ -56,6 +56,7 @@ def test_content_type_and_length_use_bare_keys(server: Server) -> None:
     assert text(response) == "value=application/x-custom"
     response = server.post(f"{AREA}/get?key=CONTENT_LENGTH", b"payload", headers)
     assert text(response) == "value=7"
+
     for key in ("HTTP_CONTENT_TYPE", "HTTP_CONTENT_LENGTH"):
         response = server.post(f"{AREA}/has?key={key}", b"payload", headers)
         assert text(response) == "present=NO"

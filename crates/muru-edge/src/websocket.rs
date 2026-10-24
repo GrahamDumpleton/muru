@@ -50,6 +50,7 @@ pub(crate) fn detect(parts: &mut http::request::Parts) -> Option<Upgrade> {
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
     };
+
     if header(http::header::SEC_WEBSOCKET_VERSION) != Some("13") {
         return None;
     }
@@ -70,6 +71,7 @@ pub(crate) fn detect(parts: &mut http::request::Parts) -> Option<Upgrade> {
                 .any(|option| option.trim().eq_ignore_ascii_case("upgrade"))
         });
     let key = header(http::header::SEC_WEBSOCKET_KEY).map(str::to_owned);
+
     if !(http2 || (http1 && key.is_some())) {
         return None;
     }
@@ -95,13 +97,16 @@ pub(crate) fn accepted_response(
         StatusCode::SWITCHING_PROTOCOLS
     };
     let mut builder = Response::builder().status(status);
+
     if let Some(headers) = builder.headers_mut() {
         crate::copy_headers(headers, worker_headers);
+
         if let Some(key) = &upgrade.key {
             let accept =
                 tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
             headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
             headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+
             if let Ok(value) = HeaderValue::from_str(&accept) {
                 headers.insert(SEC_WEBSOCKET_ACCEPT, value);
             }
@@ -180,6 +185,7 @@ pub(crate) async fn relay(relay: Relay) {
             return;
         }
     };
+
     let config = WebSocketConfig::default()
         .max_message_size(Some(limits.websocket_max_message_size))
         .max_frame_size(Some(limits.websocket_max_message_size));
@@ -192,6 +198,7 @@ pub(crate) async fn relay(relay: Relay) {
     let mut last_activity = Instant::now();
     let mut ping = tokio::time::interval(limits.websocket_ping_interval);
     ping.tick().await;
+
     while !closing.complete() {
         // Once a side has begun closing, only the rest of the handshake is
         // awaited, and not for ever.
@@ -221,9 +228,11 @@ pub(crate) async fn relay(relay: Relay) {
                 // Nothing from the client for the idle timeout.
 
                 closing.told_client |= close_client(&mut socket, 1001, "idle").await.is_ok();
+
                 if !closing.told_worker {
                     closing.told_worker = send_close(&mut writer, 1001, "idle").await.is_ok();
                 }
+
                 last_activity = Instant::now();
             }
             Ok(Step::Ping) => {
@@ -237,6 +246,7 @@ pub(crate) async fn relay(relay: Relay) {
             Ok(Step::Client(incoming)) => {
                 last_activity = Instant::now();
                 let outcome = client_step(incoming, &mut socket, &mut writer, &mut closing).await;
+
                 match outcome {
                     Ok(relayed) => bytes += relayed,
                     Err(()) => {
@@ -248,6 +258,7 @@ pub(crate) async fn relay(relay: Relay) {
             Ok(Step::Worker(next)) => match next {
                 Ok(Some(next)) if next.kind == kind::MESSAGE => {
                     bytes += next.payload.len() as u64;
+
                     let message = if next.flags & flag::TEXT != 0 {
                         match std::str::from_utf8(&next.payload) {
                             Ok(text) => Message::Text(text.into()),
@@ -256,10 +267,12 @@ pub(crate) async fn relay(relay: Relay) {
                     } else {
                         Message::Binary(next.payload)
                     };
+
                     if !closing.stream_done && socket.send(message).await.is_err() {
                         // The client is gone; the worker learns by CLOSE.
 
                         closing.stream_done = true;
+
                         if !closing.told_worker {
                             closing.told_worker =
                                 send_close(&mut writer, 1006, "the client went away")
@@ -276,15 +289,18 @@ pub(crate) async fn relay(relay: Relay) {
                     let close = pb::Close::decode(next.payload).unwrap_or_default();
                     let code = u16::try_from(close.code).unwrap_or(1000);
                     closing.worker_closed = true;
+
                     if !closing.told_client && !closing.stream_done {
                         closing.told_client = true;
                         let _ = close_client(&mut socket, code, &close.reason).await;
                     }
+
                     if !closing.told_worker {
                         if send_close(&mut writer, code, &close.reason).await.is_err() {
                             intact = false;
                             break;
                         }
+
                         closing.told_worker = true;
                     }
                 }
@@ -335,6 +351,7 @@ where
         if closing.told_worker {
             return Ok(());
         }
+
         closing.told_worker = true;
         send_close(writer, code, reason).await.map_err(|_| ())
     }
@@ -343,9 +360,11 @@ where
         Some(Ok(Message::Text(text))) => {
             let payload = Bytes::from(text.as_str().to_owned());
             let size = payload.len() as u64;
+
             if closing.told_worker {
                 return Ok(0);
             }
+
             frame::write(writer, kind::MESSAGE, flag::TEXT, payload)
                 .await
                 .map_err(|_| ())?;
@@ -353,9 +372,11 @@ where
         }
         Some(Ok(Message::Binary(data))) => {
             let size = data.len() as u64;
+
             if closing.told_worker {
                 return Ok(0);
             }
+
             frame::write(writer, kind::MESSAGE, 0, data)
                 .await
                 .map_err(|_| ())?;

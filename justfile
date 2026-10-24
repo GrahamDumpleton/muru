@@ -41,7 +41,7 @@ lint: lint-text lint-rust lint-python
 
 lint-text:
     sh scripts/check-no-em-dashes.sh
-    uv run python scripts/check-comment-spacing.py $(git ls-files '*.py' '*.rs')
+    uv run python scripts/check-layout.py $(git ls-files '*.py' '*.rs')
 
 lint-rust:
     cargo fmt --all --check

@@ -70,12 +70,15 @@ pub struct EdgeRunArgs {
 impl EdgeRunArgs {
     fn limits(&self) -> muru_edge::Limits {
         let mut limits = muru_edge::Limits::default();
+
         if let Some(size) = self.max_body_size {
             limits.max_body_size = size;
         }
+
         if let Some(size) = self.max_header_bytes {
             limits.max_header_bytes = size;
         }
+
         if let Some(count) = self.max_headers {
             limits.max_headers = count;
         }
@@ -90,6 +93,7 @@ impl EdgeRunArgs {
                 _ => {}
             }
         }
+
         limits
     }
 }
@@ -101,6 +105,7 @@ fn parse_listener(text: &str) -> Result<(i32, bool), String> {
         Some((_, other)) => return Err(format!("{other:?} is not tls")),
         None => (text, false),
     };
+
     let fd: i32 = fd
         .parse()
         .map_err(|_| format!("{text:?} is not a file descriptor number"))?;
@@ -113,6 +118,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // The listeners were bound by the daemon and inherited across exec.
 
     let mut inherited = Vec::new();
+
     for (fd, tls) in &args.listeners {
         // SAFETY: the daemon passed this descriptor for the edge to own,
         // and nothing else in this process refers to it.
@@ -126,6 +132,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             tls: *tls,
         });
     }
+
     let listen = inherited[0].listener.local_addr()?;
 
     let handing_back = match &args.listener_socket {
@@ -138,6 +145,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         }
         None => None,
     };
+
     let access_log = muru_edge::access::Config {
         destination: match args.access_log.as_str() {
             "off" => muru_edge::access::Destination::Off,
@@ -196,9 +204,11 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     };
 
     let _ = std::fs::remove_file(&args.control);
+
     if let Some(path) = &args.listener_socket {
         let _ = std::fs::remove_file(path);
     }
+
     drop(handing_back);
     outcome
 }
@@ -246,10 +256,12 @@ impl EdgeControl for Control {
             .await
             .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
         let mut certificates = Vec::new();
+
         for host in &snapshot.hosts {
             if host.certificate_pem.is_empty() {
                 continue;
             }
+
             let (chain, key) = muru_edge::tls::parse_pem(&host.certificate_pem, &host.key_pem)
                 .map_err(|error| {
                     Status::failed_precondition(format!("host {}: {error:#}", host.name))

@@ -83,6 +83,7 @@ impl Routing {
     pub async fn from_snapshot(snapshot: &pb::Snapshot) -> anyhow::Result<Self> {
         let default = LinkPool::connect(&paths(&snapshot.worker_sockets)).await?;
         let mut apps = HashMap::new();
+
         for app in &snapshot.apps {
             let pool = LinkPool::connect(&paths(&app.sockets)).await?;
             apps.insert(app.app.clone(), Arc::new(pool));
@@ -101,10 +102,13 @@ impl Routing {
             default_host: None,
             routes: Vec::new(),
         };
+
         for host in &snapshot.hosts {
             let index = routing.hosts.len();
+
             for name in &host.names {
                 let name = normalise(name);
+
                 match name.strip_prefix("*.") {
                     Some(suffix) => routing.wildcards.push((format!(".{suffix}"), index)),
                     None => {
@@ -112,6 +116,7 @@ impl Routing {
                     }
                 }
             }
+
             if host.default && routing.default_host.is_none() {
                 routing.default_host = Some(index);
             }
@@ -129,6 +134,7 @@ impl Routing {
             });
             routing.routes.push(Vec::new());
         }
+
         routing
             .wildcards
             .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -141,6 +147,7 @@ impl Routing {
             .enumerate()
             .map(|(index, host)| (host.name.as_str(), index))
             .collect();
+
         for route in &snapshot.routes {
             if let Some(&index) = by_name.get(route.host.as_str()) {
                 routing.routes[index].push(Route {
@@ -149,6 +156,7 @@ impl Routing {
                 });
             }
         }
+
         for routes in &mut routing.routes {
             routes.sort_by_key(|route| std::cmp::Reverse(route.path.len()));
         }
@@ -186,6 +194,7 @@ impl Routing {
             return Decision::Misdirected;
         };
         let host = &self.hosts[index];
+
         if host.https_redirect && !tls {
             return Decision::Redirect;
         }
@@ -196,6 +205,7 @@ impl Routing {
         else {
             return Decision::NoRoute;
         };
+
         let pool = self
             .apps
             .get(&route.app)
@@ -226,6 +236,7 @@ impl Routing {
             if let Some(index) = self.exact.get(name).filter(|index| answers(index)) {
                 return Some(*index);
             }
+
             for (suffix, index) in &self.wildcards {
                 if wildcard_matches(suffix, name) && answers(index) {
                     return Some(*index);
@@ -244,6 +255,7 @@ fn paths(sockets: &[String]) -> Vec<std::path::PathBuf> {
 /// A host name as the tables hold it: lower case, no port, no trailing dot.
 pub fn normalise(host: &str) -> String {
     let mut name = host_only(host).to_ascii_lowercase();
+
     while name.ends_with('.') {
         name.pop();
     }
@@ -255,6 +267,7 @@ pub fn normalise(host: &str) -> String {
 /// an IPv6 address are kept.
 pub(crate) fn host_only(host: &str) -> String {
     let host = host.trim();
+
     if host.starts_with('[') {
         return match host.find(']') {
             Some(end) => host[..=end].to_owned(),
@@ -284,6 +297,7 @@ fn prefix_matches(prefix: &str, path: &str) -> bool {
     if prefix == "/" || prefix == path {
         return true;
     }
+
     let prefix = prefix.trim_end_matches('/');
 
     path.strip_prefix(prefix)
@@ -401,10 +415,12 @@ mod tests {
             serves(routing.select(Some("shop.example.com"), "/", plain, false)),
             Some("redirect".to_owned())
         );
+
         match routing.select(Some("shop.example.com"), "/api/users", plain, true) {
             Decision::Serve { pool, .. } => assert!(pool.is_empty(), "the api app has no workers"),
             _ => panic!("not served"),
         }
+
         assert!(prefix_matches("/api", "/api"));
         assert!(prefix_matches("/api", "/api/users"));
         assert!(!prefix_matches("/api", "/apiary"));

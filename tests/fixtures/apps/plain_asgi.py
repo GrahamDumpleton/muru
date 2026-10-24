@@ -39,6 +39,7 @@ async def read_body(receive: Receive) -> tuple[bytes, int]:
 
     chunks = []
     messages = 0
+
     while True:
         message = await receive()
         messages += 1
@@ -129,6 +130,7 @@ async def stream(query: dict[str, str], send: Send) -> None:
         await send({"type": "http.response.body", "body": chunk, "more_body": True})
         if delay:
             await asyncio.sleep(delay)
+
     await send({"type": "http.response.body", "body": b""})
 
 
@@ -137,6 +139,7 @@ async def misbehave(path: str, send: Send) -> None:
 
     if path == "/error":
         raise RuntimeError("deliberate failure before the response")
+
     if path == "/error-after-start":
         await send(
             {
@@ -147,8 +150,10 @@ async def misbehave(path: str, send: Send) -> None:
         )
         await send({"type": "http.response.body", "body": b"partial", "more_body": True})
         raise RuntimeError("deliberate failure after the response started")
+
     if path == "/no-response":
         return
+
     if path == "/body-before-start":
         await send({"type": "http.response.body", "body": b"x"})
     elif path == "/double-start":
@@ -201,6 +206,7 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
 
         await send({"type": "websocket.close"})
         return
+
     if path == "/ws/http-decline":
         body = b"no socket for you\n"
         await send(
@@ -215,6 +221,7 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
         )
         await send({"type": "websocket.http.response.body", "body": body})
         return
+
     if path == "/ws/return":
         return
 
@@ -235,11 +242,14 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
         await send({"type": "websocket.send", "text": json.dumps(report)})
         await send({"type": "websocket.close"})
         return
+
     if path == "/ws/close-code":
         await send({"type": "websocket.close", "code": 4001, "reason": "custom"})
         return
+
     if path == "/ws/error":
         raise RuntimeError("deliberate failure on the socket")
+
     if path == "/ws/send-after-close":
         await send({"type": "websocket.close"})
         await send({"type": "websocket.send", "text": "late"})
@@ -249,9 +259,11 @@ async def websocket(scope: Scope, receive: Receive, send: Send) -> None:
 
     while True:
         message = await receive()
+
         if message["type"] == "websocket.disconnect":
             print(f"websocket disconnected with {message['code']}", flush=True)
             return
+
         if message.get("text") is not None:
             await send({"type": "websocket.send", "text": message["text"]})
         else:
@@ -264,9 +276,11 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
     if scope["type"] == "lifespan":
         await lifespan(scope, receive, send)
         return
+
     if scope["type"] == "websocket":
         await websocket(scope, receive, send)
         return
+
     assert scope["type"] == "http"
 
     path = scope["path"]

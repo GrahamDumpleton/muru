@@ -35,6 +35,7 @@ def extension_available() -> bool:
         from muru import _native  # noqa: F401
     except ImportError:
         return False
+
     return True
 
 
@@ -101,6 +102,7 @@ class Server:
         """Make one request on a fresh connection and read the whole response."""
 
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+
         try:
             connection.request(method, path, body=body, headers=headers or {})
             raw = connection.getresponse()
@@ -130,6 +132,7 @@ class Server:
             socket.create_connection(("127.0.0.1", self.https_port), timeout=30),
             server_hostname=server_hostname,
         )
+
         try:
             connection.request(method, path, body=body, headers=headers or {})
             raw = connection.getresponse()
@@ -157,14 +160,17 @@ class Server:
         with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as sock:
             sock.sendall(data)
             chunks = []
+
             while True:
                 try:
                     chunk = sock.recv(65536)
                 except TimeoutError:
                     break
+
                 if not chunk:
                     break
                 chunks.append(chunk)
+
             return b"".join(chunks)
 
     def log(self) -> str:
@@ -188,20 +194,24 @@ class Server:
         """Wait until the log written since `mark_log` contains text."""
 
         deadline = time.monotonic() + timeout
+
         while time.monotonic() < deadline:
             if text in self.log_since_mark():
                 return True
             time.sleep(0.02)
+
         return False
 
     def worker_pids(self) -> dict[int, int]:
         """Return the current pid of each worker index, from the host's log."""
 
         pids: dict[int, int] = {}
+
         for line in self.log().splitlines():
             if "started as pid" in line:
                 words = line.split()
                 pids[int(words[words.index("worker") + 1])] = int(words[-1])
+
         return pids
 
     def host_pid(self) -> int:
@@ -210,6 +220,7 @@ class Server:
         for line in self.log().splitlines():
             if line.startswith("muru.host["):
                 return int(line[len("muru.host[") : line.index("]")])
+
         raise AssertionError("the host has not logged anything")
 
     def stop(self) -> None:
@@ -217,6 +228,7 @@ class Server:
 
         if self.process.poll() is None:
             self.process.send_signal(signal.SIGINT)
+
             try:
                 self.process.wait(timeout=20)
             except subprocess.TimeoutExpired:
@@ -228,14 +240,17 @@ def wait_for_port(port: int, process: subprocess.Popen[bytes], timeout: float = 
     """Wait until something accepts connections on the port."""
 
     deadline = time.monotonic() + timeout
+
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"muructl exited early with {process.returncode}")
+
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.05)
+
     raise RuntimeError("muructl did not start listening in time")
 
 
@@ -279,6 +294,7 @@ def start(
     if chdir is not None:
         options += ["--chdir", str(chdir)]
     log = Path(tempfile.mkstemp(prefix="muru-test-", suffix=".log")[1])
+
     with log.open("wb") as handle:
         process = subprocess.Popen(
             [
@@ -297,12 +313,15 @@ def start(
             stderr=subprocess.STDOUT,
             env={**os.environ, **(env or {})},
         )
+
     server = Server(port, process, log, workers or 0, threads or 0, https_port)
+
     try:
         wait_for_port(port, process)
     except RuntimeError as error:
         server.stop()
         raise RuntimeError(f"{error}\n{server.log()}") from error
+
     return server
 
 

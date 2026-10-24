@@ -127,6 +127,7 @@ def daemon(tmp_path: Path) -> Iterator[Daemon]:
 
     plain, secure = support.free_port(), support.free_port()
     instance = start_daemon(tmp_path, listeners=[(plain, False), (secure, True)])
+
     try:
         yield instance
     finally:
@@ -354,6 +355,7 @@ app = "shop"
     refused = apply(daemon, config)
     assert refused.returncode == 1
     errors = refused.stdout
+
     for expected in [
         'host shop: "bad/name" is not a host name',
         "host shop: ",
@@ -368,12 +370,14 @@ app = "shop"
         "route shop / is declared twice",
     ]:
         assert expected in errors, f"{expected!r} missing from:\n{errors}"
+
     assert daemon.muructl("host", "list").stdout.strip() == "no virtual hosts"
     assert daemon.releases() == []
 
 
 def test_https_redirect_without_a_tls_listener_serves_the_request(tmp_path: Path) -> None:
     plain = start_daemon(tmp_path)
+
     try:
         config = tmp_path / "hosts.toml"
         config.write_text(
@@ -397,6 +401,7 @@ app = "shop"
 def test_a_restarted_daemon_takes_both_listeners_back(tmp_path: Path) -> None:
     plain, secure = support.free_port(), support.free_port()
     first = start_daemon(tmp_path, listeners=[(plain, False), (secure, True)])
+
     try:
         cert, key = certificate(tmp_path, "echo", "echo.test")
         assert apply(first, hosts_file(tmp_path, cert, key)).returncode == 0
@@ -406,6 +411,7 @@ def test_a_restarted_daemon_takes_both_listeners_back(tmp_path: Path) -> None:
         second = start_daemon(
             tmp_path, run_dir=first.run_dir, listeners=[(plain, False), (secure, True)]
         )
+
         try:
             assert "re-adopted the edge" in second.log()
             status = second.muructl("status").stdout

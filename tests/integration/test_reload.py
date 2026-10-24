@@ -33,10 +33,12 @@ def version_seen(server: support.Server) -> str:
 
 def wait_for_version(server: support.Server, version: str, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
+
     while time.monotonic() < deadline:
         if version_seen(server) == version:
             return
         time.sleep(0.1)
+
     raise AssertionError(f"version {version!r} did not appear; log:\n{server.log()}")
 
 
@@ -51,6 +53,7 @@ def project(tmp_path: Path) -> Path:
 
 def test_source_changes_start_a_new_release(project: Path) -> None:
     server = support.start("reload_app:application", workers=1, chdir=project, args=["--reload"])
+
     try:
         assert server.wait_for_log("watching")
         assert version_seen(server) == "one"
@@ -90,6 +93,7 @@ def test_files_outside_the_patterns_do_not_reload(project: Path) -> None:
         chdir=project,
         args=["--reload", "--reload-exclude", "unrelated.py"],
     )
+
     try:
         assert server.wait_for_log("watching")
         server.mark_log()
@@ -105,6 +109,7 @@ def test_files_outside_the_patterns_do_not_reload(project: Path) -> None:
 
 def test_reload_is_off_by_default(project: Path) -> None:
     server = support.start("reload_app:application", workers=1, chdir=project)
+
     try:
         assert "watching" not in server.log()
         server.mark_log()

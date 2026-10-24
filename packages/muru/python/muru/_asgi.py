@@ -171,9 +171,11 @@ class Lifespan:
         if not self._task.done():
             return
         error = self._task.exception()
+
         if isinstance(error, LifespanFailed):
             message = self._startup.result() if self._startup.done() else ""
             raise LifespanFailed(message or f"{self.name} reported lifespan.startup.failed")
+
         if error is not None:
             raise LifespanFailed(f"{self.name} failed during lifespan startup: {error}")
         if not self._startup.done():
@@ -186,6 +188,7 @@ class Lifespan:
         # Ask for shutdown and give the application a bounded time to finish.
 
         await self._queue.put({"type": "lifespan.shutdown"})
+
         try:
             await asyncio.wait_for(asyncio.shield(self._task), SHUTDOWN_TIMEOUT)
         except TimeoutError:

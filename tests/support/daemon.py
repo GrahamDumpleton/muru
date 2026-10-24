@@ -50,10 +50,12 @@ class Daemon:
             check=False,
             timeout=180,
         )
+
         if check and completed.returncode != 0:
             raise RuntimeError(
                 f"muructl {' '.join(arguments)} failed:\n{completed.stdout}{completed.stderr}"
             )
+
         return completed
 
     def deploy(self, app: str, source: Path, *arguments: str) -> str:
@@ -82,12 +84,14 @@ class Daemon:
         port = port or self.port
         headers = {"Host": host} if host else {}
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+
         if cafile is not None:
             context = ssl.create_default_context(cafile=cafile)
             connection.sock = context.wrap_socket(
                 socket.create_connection(("127.0.0.1", port), timeout=30),
                 server_hostname=server_hostname or host or "localhost",
             )
+
         try:
             connection.request("GET", path, headers=headers)
             raw = connection.getresponse()
@@ -106,6 +110,7 @@ class Daemon:
 
         lines = self.muructl("release", "list", *([app] if app else [])).stdout.splitlines()
         rows = []
+
         for line in lines[1:]:
             parts = line.split()
             if not parts or "@" not in parts[0]:
@@ -117,6 +122,7 @@ class Daemon:
                     "serving": "yes" if "yes" in parts[2:3] else "",
                 }
             )
+
         return rows
 
     def events(self) -> list[str]:
@@ -135,11 +141,13 @@ class Daemon:
         if self.process.poll() is None:
             arguments = ["daemon", "stop", "--shutdown"] if shutdown else ["daemon", "stop"]
             completed = self.muructl(*arguments, check=False)
+
             try:
                 self.process.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+
             if completed.returncode != 0:
                 raise RuntimeError(
                     f"muructl daemon stop failed: {completed.stdout}{completed.stderr}"
@@ -171,6 +179,7 @@ def start_daemon(
     # deep temporary directory.
 
     run_dir = run_dir or Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+
     if listeners is None:
         port = port or support.free_port()
         listeners = [(port, False)]
@@ -185,7 +194,9 @@ def start_daemon(
             )
         )
         where = ["--config", str(config)]
+
     log_path = base / "daemon.out"
+
     with log_path.open("ab") as handle:
         process = subprocess.Popen(
             [
@@ -203,17 +214,22 @@ def start_daemon(
             stdout=handle,
             stderr=subprocess.STDOUT,
         )
+
     daemon = Daemon(process, port, base, run_dir, log_path, listeners)
 
     deadline = time.monotonic() + 30
+
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"the daemon exited early:\n{daemon.log()}")
+
         if (run_dir / "admin.sock").exists() and daemon.muructl(
             "status", check=False
         ).returncode == 0:
             return daemon
+
         time.sleep(0.1)
+
     raise RuntimeError(f"the daemon did not answer:\n{daemon.log()}")
 
 
@@ -222,6 +238,7 @@ def daemon(tmp_path: Path) -> Iterator[Daemon]:
     """A daemon that is shut down, releases and all, when the test ends."""
 
     instance = start_daemon(tmp_path)
+
     try:
         yield instance
     finally:

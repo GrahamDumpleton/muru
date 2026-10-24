@@ -20,6 +20,7 @@ def replace_diagrams(app: Sphinx, doctree: nodes.document, docname: str) -> None
 
     if app.builder.format == "html":
         return
+
     for node in list(doctree.findall(mermaid)):
         code = node["code"]
         literal = nodes.literal_block(code, code)

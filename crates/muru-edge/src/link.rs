@@ -112,6 +112,7 @@ impl LinkPool {
     /// on the kind of worker. The first connection stays in the pool.
     pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
         let mut workers = Vec::with_capacity(sockets.len());
+
         for path in sockets {
             let (conn, hello) = connect(path)
                 .await
@@ -177,27 +178,33 @@ impl LinkPool {
         if self.workers.is_empty() {
             return Err(io::Error::other("no release is serving"));
         }
+
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut best = start;
         let mut best_free = self.workers[start].semaphore.available_permits();
+
         for offset in 1..self.workers.len() {
             let index = (start + offset) % self.workers.len();
             let free = self.workers[index].semaphore.available_permits();
+
             if free > best_free {
                 best = index;
                 best_free = free;
             }
         }
+
         let worker = &self.workers[best];
         let permit = Arc::clone(&worker.semaphore)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("pool closed"))?;
         let idle = worker.idle.lock().expect("pool poisoned").pop();
+
         let conn = match idle {
             Some(conn) => conn,
             None => connect(&worker.path).await?.0,
         };
+
         Ok(Lease {
             conn,
             permit,
@@ -237,6 +244,7 @@ async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
         ..Default::default()
     };
     frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into()).await?;
+
     let hello = match frame::read(&mut reader).await? {
         Some(reply) if reply.kind == kind::HELLO => pb::Hello::decode(reply.payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
@@ -322,6 +330,7 @@ impl Return {
     pub(crate) fn take_writer(&self) -> Option<Writer> {
         let mut state = self.state.lock().expect("return state poisoned");
         let writer = state.writer.take();
+
         if writer.is_some() {
             state.reported = state.reported.saturating_sub(1);
         }
@@ -337,13 +346,17 @@ impl Return {
 
     fn report(&self, state: &mut ReturnState) {
         state.reported += 1;
+
         if state.reader.is_none() && state.writer.is_none() {
             state.broken = true;
         }
+
         if state.reported < 2 {
             return;
         }
+
         let (reader, writer) = (state.reader.take(), state.writer.take());
+
         if let (Some(reader), Some(writer), false) = (reader, writer, state.broken) {
             self.pool.put_back(self.worker, Conn { reader, writer });
         }
@@ -374,6 +387,7 @@ impl Drop for Return {
             .expect("return state poisoned")
             .writer
             .take();
+
         if let (Some(mut writer), Ok(runtime)) = (writer, tokio::runtime::Handle::try_current()) {
             runtime.spawn(async move {
                 let payload = pb::Abort::default().encode_to_vec();
@@ -488,6 +502,7 @@ pub(crate) fn redirect_to_https(
             std::net::IpAddr::V4(ip) => ip.to_string(),
             std::net::IpAddr::V6(ip) => format!("[{ip}]"),
         });
+
     let port = if to.port() == 443 {
         String::new()
     } else {
@@ -500,9 +515,11 @@ pub(crate) fn redirect_to_https(
     let mut response = Response::new(empty);
     *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
     let headers = response.headers_mut();
+
     if let Ok(value) = http::HeaderValue::from_str(&location) {
         headers.insert(http::header::LOCATION, value);
     }
+
     headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(0));
     headers.insert(http::header::SERVER, http::HeaderValue::from_static("muru"));
     recording.complete(StatusCode::TEMPORARY_REDIRECT.as_u16(), "", 0);
@@ -550,6 +567,7 @@ pub async fn handle(
     // send 100 Continue to a client that is waiting for it.
 
     let mut buffered: Option<Bytes> = None;
+
     if !body.is_end_stream() && head.content_length.is_none() {
         match read_body(&mut body, limits.max_body_size).await {
             Ok(data) => {
@@ -572,9 +590,11 @@ pub async fn handle(
             }
         }
     }
+
     let expect_continue = head.expect_continue && !head.body_buffered;
 
     let queued = Instant::now();
+
     let lease = match tokio::time::timeout(limits.queue_timeout, pool.acquire()).await {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
@@ -601,6 +621,7 @@ pub async fn handle(
             return failing.respond(problem);
         }
     };
+
     let Lease {
         conn,
         permit,
@@ -619,9 +640,11 @@ pub async fn handle(
     // one, with no body; any other worker sees an ordinary request.
 
     let upgrade = upgrade.filter(|_| websockets);
+
     if upgrade.is_some() {
         head.scope = pb::Scope::Websocket as i32;
     }
+
     let end = upgrade.is_some()
         || buffered
             .as_ref()
@@ -642,6 +665,7 @@ pub async fn handle(
     }
 
     let back = Return::new(pool, worker, permit);
+
     match buffered {
         _ if upgrade.is_some() => back.give_writer(Some(writer)),
         Some(data) if !data.is_empty() => {
@@ -682,6 +706,7 @@ pub async fn handle(
                 ));
             }
         };
+
         match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
             Ok(Some(next)) if next.kind == kind::RESPONSE => {
@@ -696,6 +721,7 @@ pub async fn handle(
                         "The request body stopped arriving.",
                     ));
                 }
+
                 break next;
             }
             Ok(Some(next)) if next.kind == kind::END => {
@@ -718,12 +744,14 @@ pub async fn handle(
             }
         }
     };
+
     let response_end = response.is_end();
     let Ok(head) = pb::ResponseHead::decode(response.payload) else {
         back.give_reader(None);
         return failing.worker_crashed("The worker sent an invalid response head.");
     };
     let mut recording = failing.recording.lock().expect("recording poisoned").take();
+
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
@@ -753,8 +781,10 @@ pub async fn handle(
     }
 
     let mut builder = Response::builder().status(crate::status_code(head.status));
+
     if let Some(headers) = builder.headers_mut() {
         crate::copy_headers(headers, head.headers);
+
         if context.development {
             let host = parts
                 .headers
@@ -764,6 +794,7 @@ pub async fn handle(
             crate::warn_about_hsts(headers, host, parts.uri.path());
         }
     }
+
     if !head.reason.is_empty()
         && let Ok(reason) = hyper::ext::ReasonPhrase::try_from(head.reason.into_bytes())
     {
@@ -774,13 +805,16 @@ pub async fn handle(
     // response, so the connection cannot be reused (section 4.6).
 
     let close = expect_continue && !back.proceeded.load(Ordering::Relaxed);
+
     let response = if response_end {
         back.give_reader(Some(reader));
         back.abort_request();
+
         if let Some(recording) = recording.take() {
             let status = recording.record.status;
             recording.complete(status, "", 0);
         }
+
         let empty = Empty::<Bytes>::new()
             .map_err(|never| match never {})
             .boxed_unsync();
@@ -798,10 +832,12 @@ pub async fn handle(
         );
         builder.body(UnsyncBoxBody::new(StreamBody::new(stream)))
     };
+
     let response = match response {
         Ok(response) => response,
         Err(_) => return failing.worker_crashed("The worker sent an invalid response head."),
     };
+
     if close {
         close_after(response, failing.version)
     } else {
@@ -823,6 +859,7 @@ struct Failing<'a> {
 impl Failing<'_> {
     fn respond(&self, problem: Problem) -> Response<ResponseBody> {
         let response = errors::respond(&problem, self.request_id, &self.negotiation);
+
         if let Some(recording) = self.recording.lock().expect("recording poisoned").take() {
             let bytes = response
                 .headers()
@@ -831,6 +868,7 @@ impl Failing<'_> {
                 .unwrap_or(0);
             recording.complete(problem.status.as_u16(), problem.reason, bytes);
         }
+
         response
     }
 
@@ -865,14 +903,17 @@ impl Failing<'_> {
         } else {
             capitalise(&end.error)
         };
+
         let mut problem = if end.reason == "app_error" {
             Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "app_error", description)
         } else {
             Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description)
         };
+
         if !end.detail.is_empty() {
             problem.detail = Some(end.detail);
         }
+
         self.respond(problem)
     }
 }
@@ -885,9 +926,11 @@ fn capitalise(sentence: &str) -> String {
         .flat_map(char::to_uppercase)
         .collect();
     out.extend(sentence.chars().skip(1));
+
     if !out.ends_with('.') {
         out.push('.');
     }
+
     out
 }
 
@@ -899,15 +942,19 @@ enum BodyError {
 /// Read a request body in full, up to the size limit.
 async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
+
     while let Some(next) = body.frame().await {
         let next = next.map_err(BodyError::Read)?;
+
         if let Ok(chunk) = next.into_data() {
             if (data.len() + chunk.len()) as u64 > max_body_size {
                 return Err(BodyError::TooLarge);
             }
+
             data.extend_from_slice(&chunk);
         }
     }
+
     Ok(data.freeze())
 }
 
@@ -942,6 +989,7 @@ impl Drop for BodyState {
     /// background so the connection can go back to the pool.
     fn drop(&mut self) {
         self.record();
+
         if let Some(mut reader) = self.reader.take() {
             let back = Arc::clone(&self.back);
             tokio::spawn(async move {
@@ -971,6 +1019,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
     loop {
         let idle_timeout = state.idle_timeout;
         let reader = state.reader.as_mut()?;
+
         let next = match tokio::time::timeout(idle_timeout, frame::read(reader)).await {
             Ok(next) => next,
             Err(_) => {
@@ -981,6 +1030,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                 ));
             }
         };
+
         return match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => {
                 state.back.continue_request();
@@ -988,14 +1038,17 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             }
             Ok(Some(next)) if next.kind == kind::BODY => {
                 state.bytes += next.payload.len() as u64;
+
                 if next.is_end() {
                     state.finish(true);
                 }
+
                 Some((Ok(Frame::data(next.payload)), state))
             }
             Ok(Some(next)) if next.kind == kind::END => {
                 let end = pb::End::decode(next.payload).unwrap_or_default();
                 state.finish(true);
+
                 if end.error.is_empty() {
                     None
                 } else {
@@ -1046,6 +1099,7 @@ async fn pump_body(
             }
         }
     }
+
     loop {
         let next = tokio::select! {
             next = tokio::time::timeout(idle_timeout, body.frame()) => match next {
@@ -1065,6 +1119,7 @@ async fn pump_body(
                 return;
             }
         };
+
         match next {
             Some(Ok(next)) => {
                 if let Ok(data) = next.into_data()
@@ -1107,6 +1162,7 @@ async fn pump_body(
 /// response, since the body may yet follow.
 async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_rest: bool) {
     let payload = pb::Abort::default().encode_to_vec();
+
     match frame::write(&mut writer, kind::ABORT, 0, payload.into()).await {
         Ok(()) => back.give_writer(Some(writer)),
         Err(_) => back.give_writer(None),
@@ -1123,9 +1179,11 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_re
 
 async fn discard(mut body: Incoming) {
     let mut seen = 0;
+
     while let Some(Ok(next)) = body.frame().await {
         if let Ok(data) = next.into_data() {
             seen += data.len();
+
             if seen > DISCARD_LIMIT {
                 return;
             }

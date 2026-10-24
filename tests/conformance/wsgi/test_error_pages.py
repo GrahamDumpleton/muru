@@ -68,11 +68,13 @@ def test_edge_generated_error_is_negotiated_too(server: Server) -> None:
             b"Content-Length: 99999999999\r\n\r\n"
         )
         data = b""
+
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
             data += chunk
+
     head, _, body = data.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.1 413")
     assert b"content-type: application/problem+json" in head.lower()

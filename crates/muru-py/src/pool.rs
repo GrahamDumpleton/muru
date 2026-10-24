@@ -92,6 +92,7 @@ impl Pool {
         let receiver = Arc::new(Mutex::new(receiver));
 
         let mut handles = Vec::with_capacity(threads);
+
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
             let handle = std::thread::Builder::new()
@@ -110,6 +111,7 @@ impl Pool {
     /// shutting down.
     pub fn spawn(&self, job: Job) -> bool {
         let sender = self.sender.lock().expect("pool sender poisoned");
+
         match sender.as_ref() {
             Some(sender) => sender.send(job).is_ok(),
             None => false,
@@ -122,6 +124,7 @@ impl Pool {
     pub fn shutdown(&self) {
         self.sender.lock().expect("pool sender poisoned").take();
         let handles = std::mem::take(&mut *self.handles.lock().expect("pool handles poisoned"));
+
         for handle in handles {
             let _ = handle.join();
         }
@@ -154,11 +157,13 @@ fn run_in_context(py: Python<'_>, job: Job) {
 
     unsafe {
         let context = ffi::PyContext_CopyCurrent();
+
         if context.is_null() {
             report_error(py, "copying the context");
             job(py);
             return;
         }
+
         if ffi::PyContext_Enter(context) != 0 {
             report_error(py, "entering the context");
             ffi::Py_DECREF(context);
@@ -171,6 +176,7 @@ fn run_in_context(py: Python<'_>, job: Job) {
         if ffi::PyContext_Exit(context) != 0 {
             report_error(py, "leaving the context");
         }
+
         ffi::Py_DECREF(context);
     }
 }

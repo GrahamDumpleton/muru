@@ -161,6 +161,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
                 .to_owned(),
         );
     }
+
     if document.limits.is_some() {
         plan.warnings.push(
             "the [limits] table belongs in the daemon configuration file and was not applied"
@@ -171,6 +172,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
     }
+
     plan_hosts(store, document, &mut plan);
     plan_routes(store, document, &mut plan);
 
@@ -189,6 +191,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         ));
         return;
     }
+
     if store.app(name).is_err() {
         plan.changes.push(Change {
             action: Action::CreateApp {
@@ -203,17 +206,20 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
     // release, so a file means the same thing wherever it is applied.
 
     let mut deploys = Vec::new();
+
     for (id, table) in &app.release {
         if !valid_name(id) {
             plan.errors
                 .push(format!("{name}@{id}: {id:?} is not a valid release id"));
             continue;
         }
+
         let Some(source) = &table.source else {
             plan.errors
                 .push(format!("{name}@{id} has no source directory"));
             continue;
         };
+
         let spec = match resolve_spec(&request_from(name, table, source), None) {
             Ok(spec) => spec,
             Err(error) => {
@@ -261,17 +267,20 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
                 .push(format!("host {name:?} is not a valid name"));
             continue;
         }
+
         let mut valid = true;
 
         for declared in &host.names {
             let normalised = muru_edge::routing::normalise(declared);
             let label = normalised.strip_prefix("*.").unwrap_or(&normalised);
+
             if label.is_empty() || label.contains('*') || label.contains('/') {
                 plan.errors
                     .push(format!("host {name}: {declared:?} is not a host name"));
                 valid = false;
                 continue;
             }
+
             if let Some(other) = seen_names.insert(normalised.clone(), name.clone())
                 && other != *name
             {
@@ -281,29 +290,35 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
                 valid = false;
             }
         }
+
         if host.names.is_empty() && !host.default {
             plan.errors
                 .push(format!("host {name} has no names and is not the default"));
             valid = false;
         }
+
         if host.use_canonical_name && host.canonical.is_none() {
             plan.errors.push(format!(
                 "host {name}: use_canonical_name needs a canonical name"
             ));
             valid = false;
         }
+
         if host.default {
             defaults += 1;
         }
+
         if let Some(tls) = &host.tls {
             let loaded =
                 muru_edge::tls::load_pem_files(Path::new(&tls.certificate), Path::new(&tls.key))
                     .and_then(|(chain, key)| muru_edge::tls::certified_key(chain, key));
+
             if let Err(error) = loaded {
                 plan.errors.push(format!("host {name}: {error:#}"));
                 valid = false;
             }
         }
+
         if !valid {
             continue;
         }
@@ -352,6 +367,7 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
     for route in &document.route {
         let key = (route.host.clone(), route.path.clone());
         let mut valid = true;
+
         if !route.path.starts_with('/') {
             plan.errors.push(format!(
                 "route {} {}: the path must start with /",
@@ -359,6 +375,7 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             ));
             valid = false;
         }
+
         if !document.host.contains_key(&route.host) && !stored_hosts.contains(&route.host) {
             plan.errors.push(format!(
                 "route {} {}: no host named {}",
@@ -366,6 +383,7 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             ));
             valid = false;
         }
+
         if !document.app.contains_key(&route.app) && !stored_apps.contains(&route.app) {
             plan.errors.push(format!(
                 "route {} {}: no application named {}",
@@ -373,6 +391,7 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             ));
             valid = false;
         }
+
         if seen.contains(&key) {
             plan.errors.push(format!(
                 "route {} {} is declared twice",
@@ -380,7 +399,9 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             ));
             valid = false;
         }
+
         seen.push(key.clone());
+
         if !valid {
             continue;
         }
@@ -406,6 +427,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
             .route
             .iter()
             .any(|candidate| candidate.host == route.host && candidate.path == route.path);
+
         if !declared {
             plan.changes.push(Change {
                 action: Action::RemoveRoute {
@@ -416,6 +438,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
             });
         }
     }
+
     for (name, _) in store.hosts().unwrap_or_default() {
         if !document.host.contains_key(&name) {
             plan.changes.push(Change {
@@ -428,6 +451,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
     let Ok(apps) = store.apps() else {
         return;
     };
+
     for app in apps {
         let declared = document.app.get(&app.name);
         let Ok(releases) = store.releases(Some(&app.name)) else {
@@ -436,6 +460,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
 
         for release in releases {
             let kept = declared.is_some_and(|table| table.release.contains_key(&release.id));
+
             if !kept {
                 plan.changes.push(Change {
                     action: Action::RemoveRelease {
@@ -446,6 +471,7 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
                 });
             }
         }
+
         if declared.is_none() {
             plan.changes.push(Change {
                 action: Action::RemoveApp {
@@ -469,6 +495,7 @@ pub fn export(
         Some(name) => vec![store.app(name)?],
         None => store.apps()?,
     };
+
     let mut document = Document::default();
 
     for app in apps {
@@ -478,10 +505,12 @@ pub fn export(
 
         for release in releases {
             let serves = app.current.as_deref() == Some(release.id.as_str());
+
             if all_releases || serves {
                 table.release.insert(release.id, table_from(&release.spec));
             }
         }
+
         document.app.insert(app.name, table);
     }
 
@@ -490,13 +519,16 @@ pub fn export(
 
     let routes = store.routes()?;
     let hosts = store.hosts()?;
+
     for route in routes {
         if app.is_none_or(|name| route.app == name) {
             document.route.push(route);
         }
     }
+
     for (name, host) in hosts {
         let routed = document.route.iter().any(|route| route.host == name);
+
         if app.is_none() || routed {
             document.host.insert(name, host);
         }
@@ -512,9 +544,11 @@ fn describe_host(host: &VirtualHost) -> String {
     } else {
         host.names.join(", ")
     }];
+
     if host.tls.is_some() {
         parts.push("with TLS".to_owned());
     }
+
     if host.default {
         parts.push("default".to_owned());
     }
@@ -530,9 +564,11 @@ pub fn resolve_spec(
     previous: Option<&ReleaseSpec>,
 ) -> Result<ReleaseSpec, String> {
     let source = Path::new(&request.source);
+
     if !source.is_dir() {
         return Err(format!("{} is not a directory", source.display()));
     }
+
     let source = source
         .canonicalize()
         .map_err(|error| format!("{}: {error}", request.source))?;
@@ -556,6 +592,7 @@ pub fn resolve_spec(
             source.display()
         ));
     };
+
     let factory = match (request.factory, from_table) {
         (Some(true), _) => Some(parse_or(
             &request.factory_phase,
@@ -577,6 +614,7 @@ pub fn resolve_spec(
         PathBuf::from(&request.python)
     } else {
         let venv = source.join(".venv").join("bin").join("python");
+
         if venv.is_file() {
             venv
         } else if let Some(previous) = previous {
@@ -635,6 +673,7 @@ pub fn hostname() -> String {
     // frame owns, and returns non-zero rather than overrunning it.
 
     let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+
     if result != 0 {
         return String::new();
     }

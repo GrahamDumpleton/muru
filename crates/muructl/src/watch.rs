@@ -50,20 +50,24 @@ impl Watch {
     /// disappeared, until the receiver is dropped.
     pub async fn run(self, interval: Duration, changes: mpsc::Sender<PathBuf>) {
         let mut previous = self.snapshot();
+
         loop {
             tokio::time::sleep(interval).await;
             let current = self.snapshot();
+
             for path in changed(&previous, &current) {
                 if changes.send(path).await.is_err() {
                     return;
                 }
             }
+
             previous = current;
         }
     }
 
     fn snapshot(&self) -> Snapshot {
         let mut files = Snapshot::new();
+
         for directory in &self.directories {
             let walker = WalkBuilder::new(directory)
                 .hidden(true)
@@ -72,30 +76,38 @@ impl Watch {
                 .git_exclude(true)
                 .filter_entry(|entry| !skipped(entry))
                 .build();
+
             for entry in walker.flatten() {
                 let Ok(metadata) = entry.metadata() else {
                     continue;
                 };
+
                 if !metadata.is_file() {
                     continue;
                 }
+
                 let relative = entry.path().strip_prefix(directory).unwrap_or(entry.path());
+
                 if !self.include.is_match(relative) || self.exclude.is_match(relative) {
                     continue;
                 }
+
                 let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 files.insert(entry.path().to_path_buf(), (modified, metadata.len()));
             }
         }
+
         files
     }
 }
 
 fn globs(patterns: &[String]) -> anyhow::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
+
     for pattern in patterns {
         builder.add(Glob::new(pattern).with_context(|| format!("invalid pattern {pattern:?}"))?);
     }
+
     Ok(builder.build()?)
 }
 
@@ -103,6 +115,7 @@ fn skipped(entry: &DirEntry) -> bool {
     if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
         return false;
     }
+
     let name = entry.file_name().to_string_lossy();
     SKIPPED_DIRECTORIES.contains(&name.as_ref()) || is_virtualenv(entry.path())
 }

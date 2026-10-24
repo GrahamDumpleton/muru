@@ -95,6 +95,7 @@ impl Store {
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
             .optional()?;
+
         match version {
             None => {
                 connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
@@ -278,10 +279,12 @@ impl Store {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             let mut hosts = Vec::new();
+
             for row in rows {
                 let (name, encoded) = row?;
                 hosts.push((name, decode(&encoded)?));
             }
+
             Ok(hosts)
         })
     }
@@ -317,9 +320,11 @@ impl Store {
                 connection.prepare("SELECT spec FROM routes ORDER BY host, path")?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             let mut routes = Vec::new();
+
             for row in rows {
                 routes.push(decode(&row?)?);
             }
+
             Ok(routes)
         })
     }

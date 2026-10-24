@@ -55,6 +55,7 @@ async def form(request: Request) -> Response:
     async with request.form() as fields:
         files = sorted(name for name, value in fields.multi_items() if hasattr(value, "filename"))
         plain = {name: value for name, value in fields.multi_items() if isinstance(value, str)}
+
     return JSONResponse({"fields": plain, "files": files})
 
 
@@ -63,6 +64,7 @@ async def upload(request: Request) -> Response:
         received = fields["file"]
         data = await received.read()  # type: ignore[union-attr]
         name = received.filename  # type: ignore[union-attr]
+
     return JSONResponse({"name": name, "size": len(data), "sha": hashlib.sha256(data).hexdigest()})
 
 
@@ -107,12 +109,15 @@ async def websocket_echo(socket: WebSocket) -> None:
     await socket.accept(
         subprotocol=socket.scope["subprotocols"][0] if socket.scope["subprotocols"] else None
     )
+
     try:
         while True:
             message = await socket.receive()
+
             if message["type"] == "websocket.disconnect":
                 print(f"starlette socket closed with {message['code']}", flush=True)
                 return
+
             if message.get("text") is not None:
                 await socket.send_text(message["text"])
             else:

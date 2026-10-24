@@ -133,6 +133,7 @@ def resolve_interface(spec: str, app: Any, interface: str) -> str:
             f"{spec} is declared WSGI but is a coroutine function; declare it as asgi or "
             "leave the interface to be detected"
         )
+
     return interface
 
 
@@ -190,10 +191,12 @@ class Release:
             import_module(self.hooks_module)
         self.hooks = Hooks.load(self.hooks_module)
         self.target = resolve_app(self.spec, import_module)
+
         if not self.factory:
             self.accept(self.target)
         elif self.factory_phase == "host":
             self.accept(self.target())
+
         return self.hooks
 
     def accept(self, app: Any) -> None:
@@ -217,6 +220,7 @@ class Release:
             if self.target is None:
                 raise RuntimeError(f"{self.spec} was not loaded")
             self.accept(self.target())
+
         return self.app
 
 
@@ -305,11 +309,14 @@ class Host:
 
         if not self.forked_before:
             self.forked_before = True
+
             if self.release.preloaded and self.release.hooks is not None:
                 # Section 6.3: once in the host, before the first fork.
 
                 self.release.hooks.call("pre_fork", self.release.context)
+
         threads = preload.thread_count()
+
         if threads > 1:
             log(
                 f"forking worker {index} while {threads - 1} other threads are running; "
@@ -327,8 +334,10 @@ class Host:
 
         gc.freeze()
         pid = os.fork()
+
         if pid == 0:
             status = 1
+
             try:
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
@@ -340,12 +349,15 @@ class Host:
                 traceback.print_exc()
             finally:
                 os._exit(status)
+
         os.close(out_write)
         os.close(err_write)
+
         for fd, stream in ((out_read, "stdout"), (err_read, "stderr")):
             os.set_blocking(fd, False)
             self.outputs[fd] = WorkerOutput(index, stream, fd)
             self.selector.register(fd, selectors.EVENT_READ)
+
         self.workers[pid] = index
         self.spawned_at[pid] = time.monotonic()
         log(f"worker {index} started as pid {pid}")
@@ -373,6 +385,7 @@ class Host:
 
         loop: _asgi.Loop | None = None
         lifespan: _asgi.Lifespan | None = None
+
         try:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
@@ -384,6 +397,7 @@ class Host:
                 log(f"worker {index} imported {release.spec} in {elapsed_ms(started)} ms")
                 hooks.call("on_load", context)
                 hooks.call("pre_fork", context)
+
             hooks.call("post_fork", context)
 
             # Section 6.8: a factory is called per worker, after post_fork,
@@ -427,6 +441,7 @@ class Host:
         # An ASGI worker hands the extension its loop and the request runner.
 
         asgi_arguments: dict[str, Any] = {}
+
         if loop is not None and lifespan is not None:
             asgi_arguments = {
                 "event_loop": loop.loop,
@@ -450,6 +465,7 @@ class Host:
         except Exception as error:
             log(f"worker {index} failed: {error}")
             return 1
+
         return 0
 
     def run(self) -> int:
@@ -475,6 +491,7 @@ class Host:
         # run stops when its parent's end of stdin closes.
 
         watch_stdin = False
+
         try:
             if not self.detach and not os.isatty(0):
                 selector.register(0, selectors.EVENT_READ)
@@ -487,6 +504,7 @@ class Host:
 
         while True:
             timeout = 0.1 if self.restart_after else None
+
             for key, _events in selector.select(timeout):
                 if key.fd == wake_read:
                     os.read(wake_read, 4096)
@@ -499,6 +517,7 @@ class Host:
                         watch_stdin = False
                 elif key.fd in self.outputs:
                     self.read_output(key.fd)
+
             self.reap()
             if self.stopping:
                 break
@@ -514,6 +533,7 @@ class Host:
         """Relay what a worker has written; close the pipe once it is at end of file."""
 
         output = self.outputs[fd]
+
         while True:
             try:
                 data = os.read(fd, READ_SIZE)
@@ -521,15 +541,18 @@ class Host:
                 if until_closed:
                     time.sleep(0.01)
                     continue
+
                 return
             except OSError:
                 data = b""
+
             if not data:
                 output.flush()
                 self.selector.unregister(fd)
                 os.close(fd)
                 del self.outputs[fd]
                 return
+
             output.relay(data)
 
     def reap(self) -> None:
@@ -540,6 +563,7 @@ class Host:
                 pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 return
+
             if pid == 0:
                 return
             index = self.workers.pop(pid, None)
@@ -555,6 +579,7 @@ class Host:
 
             if status != 0 and time.monotonic() - spawned_at < STARTUP_WINDOW_SECONDS:
                 self.start_failures[index] = self.start_failures.get(index, 0) + 1
+
                 if self.start_failures[index] >= MAX_START_FAILURES:
                     log(
                         f"worker {index} failed {MAX_START_FAILURES} times at start, "
@@ -565,6 +590,7 @@ class Host:
                     continue
             else:
                 self.start_failures[index] = 0
+
             log(f"worker {index} (pid {pid}) exited with {describe(status)}, restarting")
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
 
@@ -572,6 +598,7 @@ class Host:
         """Start replacements whose delay has passed."""
 
         now = time.monotonic()
+
         for index, when in list(self.restart_after.items()):
             if when <= now:
                 del self.restart_after[index]
@@ -585,25 +612,37 @@ class Host:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+        # Reap whatever exits within the grace period.
+
         deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+
         while self.workers and time.monotonic() < deadline:
             try:
                 pid, _status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 self.workers.clear()
                 break
+
             if pid == 0:
                 time.sleep(0.05)
                 continue
+
             self.workers.pop(pid, None)
+
+        # Whatever is left is killed and reaped.
+
         for pid in list(self.workers):
             log(f"worker pid {pid} did not stop, killing")
+
             try:
                 os.kill(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
             except (ProcessLookupError, ChildProcessError):
                 pass
+
         self.workers.clear()
+
         if self.tcp_base_port is None:
             for index in range(self.worker_count):
                 try:
@@ -701,16 +740,20 @@ def without_preload(argv: list[str]) -> list[str]:
 
     kept: list[str] = []
     skip = False
+
     for argument in argv:
         if skip:
             skip = False
             continue
+
         if argument == "--preload":
             skip = True
             continue
+
         if argument.startswith("--preload="):
             continue
         kept.append(argument)
+
     return kept
 
 
@@ -719,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(arguments)
+
     if args.processes < 1:
         print("--processes must be at least 1", file=sys.stderr)
         return 2
@@ -738,16 +782,20 @@ def main(argv: list[str] | None = None) -> int:
     # Section 6.2 step 1: no collections during preload.
 
     gc.disable()
+
     if args.preload != "false":
         started = time.monotonic()
+
         with preload.ImportRecorder() as recorder:
             try:
                 hooks = release.load(recorder)
             except Exception as error:
                 log(f"cannot load {args.app}: {error.__class__.__name__}: {error}")
                 return 1
+
             if not hooks.call_logged("on_load", context):
                 return 1
+
         log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
 
         # A preloaded application has settled its interface by now; a
@@ -758,12 +806,15 @@ def main(argv: list[str] | None = None) -> int:
             log(f"{args.app} is served as {release.resolved.upper()}")
 
         findings = recorder.findings()
+
         if findings:
             for finding in findings:
                 log(f"preload: {finding.describe()}; {finding.advice}")
+
             if args.preload == "true":
                 log("preload is true, so the import check failing stops the release")
                 return 1
+
             log(
                 "preload: falling back to per-worker imports, which costs slower worker "
                 "replacement and no shared memory; set preload to false to silence this"
@@ -780,6 +831,7 @@ def main(argv: list[str] | None = None) -> int:
                     "false",
                 ],
             )
+
         if args.preload_gc_collect:
             gc.collect()
 
@@ -794,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.concurrency,
         detach=args.detach,
     )
+
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees
         # the application. The hooks run as they would in a worker.
@@ -801,6 +854,7 @@ def main(argv: list[str] | None = None) -> int:
         gc.enable()
         log("serving in this process without forking (--single)")
         return host.worker(0)
+
     return host.run()
 
 

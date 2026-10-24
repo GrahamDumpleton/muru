@@ -10,6 +10,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 /// Connect to the daemon's admin socket.
 pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
     let socket: PathBuf = socket.to_path_buf();
+
     if !socket.exists() {
         anyhow::bail!(
             "no daemon is running: {} does not exist (muructl daemon start, or muructl up)",

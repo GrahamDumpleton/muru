@@ -10,6 +10,7 @@ def test_shutdown_is_sent_on_stop() -> None:
     instance = support.start(
         "asgi_conformance:application", workers=1, threads=None, args=["--dashboard", "off"]
     )
+
     try:
         assert instance.get("/state").status == 200
     finally:
@@ -35,6 +36,7 @@ def test_application_without_lifespan_is_served() -> None:
     instance = support.start(
         "asgi_no_lifespan:application", workers=1, threads=None, args=["--dashboard", "off"]
     )
+
     try:
         assert instance.get("/").body == b"ok"
     finally:

@@ -16,6 +16,7 @@ def server() -> Iterator[support.Server]:
         threads=2,
         args=["--dashboard", "off", "--max-body-size", "10MB"],
     )
+
     try:
         yield instance
     finally:

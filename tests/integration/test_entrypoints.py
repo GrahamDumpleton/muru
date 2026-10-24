@@ -33,6 +33,7 @@ def start_project(*args: str, chdir: Path | None = None) -> support.Server:
 
 def test_project_directory_supplies_the_entrypoint_and_settings() -> None:
     server = start_project(str(PROJECTS / "shop"))
+
     try:
         data = info(server)
         assert data["app"] == "shop"
@@ -46,11 +47,14 @@ def test_project_directory_supplies_the_entrypoint_and_settings() -> None:
 
 def test_project_file_and_current_directory_work_too() -> None:
     server = start_project(str(PROJECTS / "shop" / "pyproject.toml"))
+
     try:
         assert info(server)["app"] == "shop"
     finally:
         server.stop()
+
     server = start_project(chdir=PROJECTS / "shop")
+
     try:
         assert info(server)["app"] == "shop"
     finally:
@@ -59,6 +63,7 @@ def test_project_file_and_current_directory_work_too() -> None:
 
 def test_flags_override_the_table() -> None:
     server = start_project(str(PROJECTS / "shop"), "--processes", "1", "--threads", "2")
+
     try:
         assert "with 1 workers of 2 threads" in server.log()
     finally:
@@ -67,14 +72,18 @@ def test_flags_override_the_table() -> None:
 
 def test_factory_is_called_in_each_worker_by_default() -> None:
     server = start_project(str(PROJECTS / "factory"), "--processes", "2")
+
     try:
         seen = {}
+
         for _ in range(20):
             data = info(server)
             seen[data["serving"]] = data
             if len(seen) == 2:
                 break
+
         assert len(seen) == 2, "both workers answered"
+
         for pid, data in seen.items():
             assert data["created_in"] == pid, "each worker called the factory itself"
             assert data["calls"] == 1, "once per worker"
@@ -90,6 +99,7 @@ def test_factory_phase_host_calls_it_once_before_forking(tmp_path: Path) -> None
         'entrypoint = "factory_site:create_app"\nfactory = true\nfactory_phase = "host"\n'
     )
     server = start_project(str(project), "--processes", "2")
+
     try:
         data = info(server)
         assert data["created_in"] == server.host_pid()
@@ -102,6 +112,7 @@ def test_factory_flag_on_the_command_line() -> None:
     server = support.start(
         "factory_site:create_app", chdir=PROJECTS / "factory", args=["--factory"]
     )
+
     try:
         assert info(server)["created_in"] != server.host_pid()
     finally:
@@ -118,6 +129,7 @@ def test_factory_flag_on_the_command_line() -> None:
 )
 def test_asgi_entrypoints_are_served_on_the_event_loop(entrypoint: str, args: list[str]) -> None:
     server = support.start(entrypoint, chdir=PROJECTS / "factory", args=args)
+
     try:
         response = server.get("/")
         assert response.status == 200
@@ -132,6 +144,7 @@ def test_a_coroutine_declared_wsgi_is_refused() -> None:
         support.start(
             "factory_site:asgi_app", chdir=PROJECTS / "factory", args=["--interface", "wsgi"]
         )
+
     assert "is declared WSGI but is a coroutine function" in str(failure.value)
 
 

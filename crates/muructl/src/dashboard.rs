@@ -85,6 +85,7 @@ fn collect(inputs: &Inputs) -> Data {
         if totals.is_empty() {
             return "-".to_owned();
         }
+
         let index = ((totals.len() - 1) as f64 * fraction).round() as usize;
         format_duration(totals[index])
     };
@@ -148,6 +149,7 @@ fn collect(inputs: &Inputs) -> Data {
 
 fn uptime(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
+
     if seconds >= 3600 {
         format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
     } else if seconds >= 60 {

@@ -57,6 +57,7 @@ impl DevCertificate {
     pub fn describe(&self) -> String {
         let names = self.names.join(", ");
         let state = if self.reused { "reused" } else { "created" };
+
         match &self.authority {
             Authority::Mkcert(root) => format!(
                 "muru: certificate for {names} issued by the mkcert authority in {} ({state}, {})",
@@ -78,11 +79,14 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = env_path("MURU_CACHE_DIR") {
         return Ok(dir);
     }
+
     let home = env_path("HOME")
         .context("HOME is not set, so the cache directory is unknown; set MURU_CACHE_DIR")?;
+
     if cfg!(target_os = "macos") {
         return Ok(home.join("Library").join("Caches").join("muru"));
     }
+
     Ok(env_path("XDG_CACHE_HOME")
         .unwrap_or_else(|| home.join(".cache"))
         .join("muru"))
@@ -95,18 +99,22 @@ pub fn mkcert_root() -> Option<PathBuf> {
     if let Some(root) = env_path("CAROOT") {
         return has_authority(&root).then_some(root);
     }
+
     if let Ok(output) = Command::new("mkcert").arg("-CAROOT").output()
         && output.status.success()
     {
         let printed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
         if !printed.is_empty() {
             let root = PathBuf::from(printed);
+
             if has_authority(&root) {
                 return Some(root);
             }
         }
     }
     let home = env_path("HOME")?;
+
     let default = if cfg!(target_os = "macos") {
         home.join("Library")
             .join("Application Support")
@@ -145,6 +153,7 @@ fn obtain_from(
     let dir = cache.join("certs");
     let certificate = dir.join(CERTIFICATE_FILE);
     let key = dir.join(KEY_FILE);
+
     if let Some(existing) = usable(&certificate, &key, &names, &authority) {
         return Ok(DevCertificate {
             certificate,
@@ -154,6 +163,7 @@ fn obtain_from(
             reused: true,
         });
     }
+
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let (certificate_pem, key_pem) = generate(&names, &authority)?;
     write_private(&key, key_pem.as_bytes())?;
@@ -174,6 +184,7 @@ fn names(extra: &[String]) -> anyhow::Result<Vec<String>> {
         .iter()
         .map(|name| (*name).to_owned())
         .collect();
+
     for name in extra {
         let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
         anyhow::ensure!(!name.is_empty(), "--host needs a host name");
@@ -187,10 +198,12 @@ fn names(extra: &[String]) -> anyhow::Result<Vec<String>> {
                 }),
             "--host {name:?} is not a host name or address"
         );
+
         if !names.contains(&name) {
             names.push(name);
         }
     }
+
     Ok(names)
 }
 
@@ -209,9 +222,11 @@ fn usable(
     let cert = parsed.parse_x509().ok()?;
     let not_after =
         OffsetDateTime::from_unix_timestamp(cert.validity().not_after.timestamp()).ok()?;
+
     if not_after - OffsetDateTime::now_utc() < RENEW_BEFORE {
         return None;
     }
+
     let covered: Vec<String> = cert
         .subject_alternative_name()
         .ok()??
@@ -232,9 +247,11 @@ fn usable(
             _ => None,
         })
         .collect();
+
     if !names.iter().all(|name| covered.contains(name)) {
         return None;
     }
+
     let signed_by_current = match authority {
         Authority::SelfSigned => cert.issuer().as_raw() == cert.subject().as_raw(),
         Authority::Mkcert(root) => {
@@ -244,6 +261,7 @@ fn usable(
             cert.issuer().as_raw() == ca.subject().as_raw()
         }
     };
+
     signed_by_current.then_some(covered)
 }
 
@@ -263,6 +281,7 @@ fn generate(names: &[String], authority: &Authority) -> anyhow::Result<(String, 
     params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
     let certificate = match authority {
         Authority::SelfSigned => params
             .self_signed(&key)
@@ -284,6 +303,7 @@ fn generate(names: &[String], authority: &Authority) -> anyhow::Result<(String, 
                 .context("signing the certificate with the mkcert authority")?
         }
     };
+
     Ok((certificate.pem(), key.serialize_pem()))
 }
 
