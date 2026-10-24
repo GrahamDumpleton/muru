@@ -35,3 +35,7 @@ build/
 # Local tooling
 /.env
 /.envrc
+
+# Built extension modules in the source tree (maturin develop)
+*.so
+*.pyd

@@ -22,7 +22,7 @@ Two distributions are published to PyPI from one tag, with the same version numb
 | Base images (GHCR) | ghcr.io/grahamdumpleton/muru-python:VERSION-pyX.Y variants (slim, free-threaded, distroless), signed with cosign keyless signatures | linux/amd64 and linux/arm64 |
 | Documentation | Built by Read the Docs for each tag |  |
 
-The source repository is github.com/GrahamDumpleton/muru, and images are published to the GitHub Container Registry under the same account (registry paths are lowercase). The PyPI names muru and muructl were confirmed unclaimed on 23 October 2026 and should be registered with placeholder releases before the first public announcement. The runtime library has no Python dependencies, which is what allows the daemon to install it by unpacking a wheel (section 8.3).
+The source repository is github.com/GrahamDumpleton/muru, and images are published to the GitHub Container Registry under the same account (registry paths are lowercase). The PyPI names muru and muructl are registered, with the 0.1.0 pre-releases. The runtime library has no Python dependencies, which is what allows the daemon to install it by unpacking a wheel (section 8.3).
 
 ## 17.2 Versioning
 

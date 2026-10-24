@@ -39,6 +39,10 @@ project by rustup, cargo and uv at versions pinned in the repository.
 | uv | `brew install uv` | the installer at astral.sh/uv |
 | just | `brew install just` | `apt install just`, or `cargo install just` |
 
+Nothing else is needed to build: TLS uses rustls on the ring provider, which
+the C compiler builds, so there is no OpenSSL or cmake to install
+(ADR 0024).
+
 Then:
 
 ```

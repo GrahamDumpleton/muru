@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
+
 import muru
-from muru import host
 
 
 def test_version_is_a_string() -> None:
     assert isinstance(muru.__version__, str)
 
 
-def test_host_main_is_not_implemented_yet() -> None:
-    assert host.main([]) == 2
+def test_native_extension_reports_the_same_version() -> None:
+    pytest.importorskip("muru._native")
+    from muru import _native
+
+    assert _native.version().replace("-alpha.", "a").replace("-beta.", "b") == muru.__version__ or (
+        muru.__version__ == "0+unknown"
+    )

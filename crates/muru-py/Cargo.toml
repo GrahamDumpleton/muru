@@ -1,6 +1,6 @@
 [package]
 name = "muru-py"
-description = "The muru._native extension: worker gRPC server, WSGI and ASGI bridges, watchdog and descriptor side channel."
+description = "The muru._native extension: the worker side of the edge-to-worker link, WSGI and ASGI bridges, the application thread pool and the native watchdog."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,7 +14,12 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
+bytes = { workspace = true }
+muru-proto = { workspace = true }
+prost = { workspace = true }
 pyo3 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

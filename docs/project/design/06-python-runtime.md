@@ -9,7 +9,7 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-The runtime library (the muru package) runs inside every host and worker. Its Rust extension (PyO3) contains the gRPC server, the WSGI and ASGI bridges, the descriptor side channel and the native watchdog. The Python part contains the host control loop, hooks, configuration loading and the public Python API.
+The runtime library (the muru package) runs inside every host and worker. Its Rust extension (PyO3) contains the worker side of the link (section 5), the application thread pool, the WSGI and ASGI bridges, the control plane server and the native watchdog. The Python part contains the host control loop, hooks, configuration loading and the public Python API.
 
 ## 6.1 Host and worker lifecycle
 
@@ -25,7 +25,7 @@ sequenceDiagram
   H-->>D: loaded
   D->>H: desired workers per group
   H->>W: fork
-  W->>W: post_fork hooks, start Rust runtime, gRPC server and side channel
+  W->>W: post_fork hooks, start Rust runtime, application threads, link and control sockets
   W->>W: ASGI lifespan startup, factories, on_ready
   W-->>D: ready, with socket paths and protocol versions
   D->>D: add endpoint to next snapshot
@@ -37,7 +37,7 @@ The host never serves requests, so its memory stays clean and shared copy-on-wri
 
 | Value | Behaviour |
 | --- | --- |
-| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen |
+| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead: it re-executes itself without preload, so nothing the import left behind reaches a worker. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen. The on_load hook has run once in the host by then, and runs again in each worker |
 | true | Preload, and treat any finding of the import check as a release failure during warm-up. For applications whose imports are known to be fork-safe, so that a regression is caught instead of silently costing the preload benefits |
 | false | Import in each worker. The check is skipped |
 
@@ -66,12 +66,14 @@ Hooks live in a module named by the hooks setting. Each receives a context objec
 | Hook | Runs in | Typical use |
 | --- | --- | --- |
 | on_load | host, after import | validate configuration, warm fork-safe caches |
-| pre_fork | host | close sockets and files that must not be shared |
-| post_fork | worker | reopen database connections, reseed, start background threads |
-| on_ready | worker | final warm-up |
-| on_drain | worker | stop background work, flush |
-| on_exit | worker | clean up |
-| on_reopen_logs | worker | reopen application-owned log files |
+| pre_fork | host, once before the first fork | close sockets and files that must not be shared |
+| post_fork | worker, after fork | reopen database connections, reseed, start background threads |
+| on_ready | worker, before its sockets are announced | final warm-up |
+| on_drain | worker, when told to stop, before requests in flight finish | stop background work, flush |
+| on_exit | worker, after the application threads have stopped | clean up |
+| on_reopen_logs | worker, on SIGUSR1 | reopen application-owned log files |
+
+An exception from on_load, pre_fork, post_fork or on_ready fails the host or the worker it runs in; one from on_drain, on_exit or on_reopen_logs is logged. Before every fork the host checks that it is still single-threaded and logs a warning naming the thread count otherwise, since threads do not exist in the child.
 
 ## 6.4 Process and threading models
 
@@ -87,17 +89,22 @@ Processes belong to worker groups (section 7.1). Threads belong to WSGI thread p
 
 ## 6.5 WSGI bridge
 
-- A bounded request queue in Rust. Python threads call next_request(), which blocks with the GIL released.
+- **A fixed pool of long-lived application threads** ([ADR 0022](../adr/0022-fixed-application-thread-pool.md)). The threads are created when the worker starts, kept for its whole life, and each attaches to the interpreter once, so it has a stable Python thread state: threading.local values set by one request are there for later requests on the same thread, as under mod_wsgi, and per-thread resources such as database connections are reused. Requests are handed to idle threads from a queue in Rust; a thread waiting for work is detached from the interpreter. Threads are never created per request and never retired while the worker runs.
+- **A fresh context per request.** Each request runs inside a copy of the thread's contextvars context (PyContext_CopyCurrent, entered before the application is called and exited after close()), so a context variable set during one request is not visible to the next request on the same thread. Thread-locals persist across requests; context variables do not.
 - The environ is built in Rust (Appendix D lists every key). wsgi.input is Rust-backed: read, readline and iteration pull body frames with the GIL released, and always return an empty value at the end of the body.
 - wsgi.input_terminated is always True. With chunked_body = 'buffer' (the default) CONTENT_LENGTH is also set, so frameworks that only read CONTENT_LENGTH work. With 'stream' it is absent.
 - wsgi.multiprocess is True for any daemon-managed release, because releases overlap during deploys, recycles and scaling. It is False only for single-process development runs. wsgi.multithread is True when the pool serving the mount has more than one thread. Both can be forced per release. wsgi.run_once is False.
-- Response iteration pushes chunks into a bounded channel. wsgi.file_wrapper(filelike, block_size) returns a Muru wrapper that is also an ordinary iterable. When the application returns that wrapper itself as the response iterable and filelike.fileno() is a regular file, the bridge passes a duplicate descriptor to the edge as a file hint, starting at the file's current position and covering Content-Length bytes if that header is set, otherwise to the end of the file. If there is no fileno(), the file is not a regular file, or middleware has wrapped the iterable so the bridge cannot see the wrapper, it falls back to iterating read(block_size) chunks, as PEP 3333 requires. The worker closes its own descriptor once it is passed. close() is always called on the iterable, including after client disconnects.
+- Response iteration pushes chunks into a bounded channel. wsgi.file_wrapper(filelike, block_size) returns a Muru wrapper that is also an ordinary iterable. When the application returns that wrapper itself as the response iterable and filelike.fileno() is a regular file, the bridge passes a duplicate descriptor to the edge on a FILE frame (section 5.7), starting at the file's current position and covering Content-Length bytes if that header is set, otherwise to the end of the file. If there is no fileno(), the file is not a regular file, or middleware has wrapped the iterable so the bridge cannot see the wrapper, it falls back to iterating read(block_size) chunks, as PEP 3333 requires. The worker closes its own descriptor once it is passed. close() is always called on the iterable, including after client disconnects.
 - The edge, not the application, handles 100 Continue (section 4.6).
+- **start_response validation**, following mod_wsgi. The status must be three digits, a space and a reason phrase without control characters (ValueError otherwise, TypeError when not a str); the reason phrase reaches HTTP/1.1 clients. Headers must be a list (TypeError) of (str, str) tuples (TypeError for other items or types, ValueError for a tuple of the wrong length); names must be non-empty tokens without spaces or control characters and values must not contain CR or LF (ValueError); both are latin-1 encoded, so other characters raise UnicodeEncodeError; a Content-Length that is not a non-negative integer is a ValueError. exc_info must be None or a 3-tuple (TypeError). A second call before any output has been sent replaces the first, with or without exc_info, as mod_wsgi allows; after output has started, exc_info is re-raised and a call without it is a RuntimeError.
+- **End of output.** The bridge tells the link explicitly when a request is over, after close() has run, rather than inferring it from the lifetime of the start_response object: frameworks keep exceptions, and so the frames that reference that object, alive in reference cycles until a later collection, which would otherwise hold the worker connection open.
+- **Response iteration rules.** Items must be bytes (TypeError, which is a 500 before output and a truncated response after). A declared Content-Length is enforced: output beyond it is dropped, and a body that ends short of it fails the response with the connection closed and a line in the log. close() is always called; an exception from close() is logged and does not fail a response that was fully produced. SystemExit and KeyboardInterrupt from the application are a 500 and a logged traceback like any other exception, never the end of the worker.
+- **Conformance suite.** tests/conformance/wsgi pins each of these rules, one test module per area, with cases taken from the mod_wsgi integration tests (section 15.1).
 
 ## 6.6 ASGI bridge
 
-- One event loop thread per worker (uvloop when installed and enabled), started after fork. Rust delivers events with call_soon_threadsafe, batched where possible. receive() and send() are awaitables completed from Rust.
-- Supported: ASGI 3.0 HTTP and WebSocket, lifespan per worker (startup must succeed before readiness), the HTTP trailers extension, and the file extensions http.response.pathsend and http.response.zerocopysend, advertised in scope['extensions']. For pathsend the worker opens the path with the application's permissions; for zerocopysend it uses the given file, offset and count. Either way a duplicate descriptor goes to the edge as a file hint, so frameworks such as Starlette (whose FileResponse uses pathsend when the server supports it) get zero-copy file serving without Muru-specific code. Scope extensions are listed in Appendix D.
+- One event loop thread per worker (uvloop when installed and enabled), started after fork. Rust delivers events with call_soon_threadsafe, batched where possible. receive() and send() are awaitables completed from Rust. Each connection's coroutine runs in its own context, as asyncio tasks do.
+- Supported: ASGI 3.0 HTTP and WebSocket, lifespan per worker (startup must succeed before readiness; the same mechanism serves applications registered with muru.asgi.register, section 6.14), the HTTP trailers extension, and the file extensions http.response.pathsend and http.response.zerocopysend, advertised in scope['extensions']. For pathsend the worker opens the path with the application's permissions; for zerocopysend it uses the given file, offset and count. Either way a duplicate descriptor goes to the edge on a FILE frame (section 5.7), so frameworks such as Starlette (whose FileResponse uses pathsend when the server supports it) get zero-copy file serving without Muru-specific code. Scope extensions are listed in Appendix D.
 - A bounded thread pool, separate from WSGI threads, serves sync_to_async and asyncio.to_thread.
 
 ## 6.7 Mounts
@@ -125,7 +132,7 @@ internal = false
 ```
 
 - WSGI mounts share the worker's thread pool unless given their own pool (fixed, or a reserved minimum that borrows from the shared pool). The edge tracks slots and queues per pool.
-- All ASGI mounts share the worker's event loop. WSGI code reaches it with muru.loop() and call_soon_threadsafe or run_coroutine_threadsafe.
+- All ASGI mounts share the worker's event loop. WSGI code reaches it with muru.loop() and call_soon_threadsafe or run_coroutine_threadsafe. Mounts are the static way to mix the two interfaces; when the choice is made in code per request, section 6.14 hands a request across in either direction.
 - Each mount receives SCRIPT_NAME or root_path for its prefix. Mount paths follow the matching rules of worker groups (prefix, most specific wins, duplicates rejected).
 - Mounts share one interpreter. Two independent applications relying on process-wide globals need separate releases. Isolated sub-interpreter mounts are a future idea.
 - CPU-heavy WSGI requests can delay the event loop on GIL builds. Loop lag is measured, and the remedy is moving the mount to its own worker group.
@@ -153,11 +160,14 @@ The daemon starts hosts itself and imports applications as modules, so applicati
 | --- | --- |
 | muru.context() | Current app, release, group, worker id, interface, process model. Returns development defaults outside Muru |
 | muru.loop() | The worker's event loop, for WSGI code handing work to ASGI mounts |
+| muru.asgi.register(app) | Run an ASGI application's lifespan in this worker, from a post_fork hook (section 6.14) |
+| muru.asgi.websocket | Handler, Socket and ConnectionClosed: the WebSocket adapter, an ordinary ASGI application (section 6.14) |
 | muru.is_internal(environ or scope) | Whether the request arrived by internal redirect |
 | muru.uploads.files(environ or scope) | Offloaded uploads for the current request, with muru.uploads.get(environ or scope, ref) for a single ref (section 4.11) |
 | muru.logging.default_config() | dictConfig dictionary matching the platform logging defaults |
 | muru.request_id() | Current request id, from a context variable |
 | muru.RequestTimeout | BaseException subclass raised by the soft timeout |
+| breakpoint() | The runtime library's breakpoint hook waits for muructl debug attach (section 11.7); outside Muru it is the ordinary pdb |
 | muru.host | Host entry point module (python -m muru.host). Internal |
 
 The API is typed (shipped with stub files) and every function is safe to call outside Muru.
@@ -190,13 +200,13 @@ Free-threaded CPython builds (3.14t and later) are supported from phase 1, toget
 - worker_cpu is normalised by the number of cores a worker may use. gil_wait is not reported on free-threaded builds. Lock contention measured in the bridge, scheduler latency and queue wait replace it as saturation signals.
 - Preload and fork work the same way. The garbage collection sequence of section 6.2 is verified on free-threaded builds in the phase 0 spike.
 
-**Testing:** the WSGI bridge, conformance suites and integration tests run on 3.14t from phase 1, including a stress test with many threads in one process, and ThreadSanitizer builds of the extension run nightly.
+**Testing:** the WSGI bridge, conformance suites and integration tests run on 3.14t from phase 1, including a stress test with many threads in one process. Sanitizer builds of the extension are a future idea (section 20.10).
 
 Running free-threaded and regular builds for the same application at once uses release variants (section 7.1): one variant per interpreter build, each with its own groups and paths.
 
 ## 6.12 Interpreters within a worker
 
-Each worker initially runs one Python interpreter. To keep sub-interpreters possible later (section 20.3) without a rewrite, the extension must not assume one interpreter per worker: request queues, thread pools, the event loop, per-mount state, hooks and the descriptor side channel's dispatch are all keyed by an interpreter handle, and the main interpreter is simply the first. Configuration already separates the levels involved: variants choose the interpreter build and environment, groups choose the process model, and mounts can later request isolation.
+Each worker initially runs one Python interpreter. To keep sub-interpreters possible later (section 20.3) without a rewrite, the extension must not assume one interpreter per worker: request queues, thread pools, the event loop, per-mount state, hooks and descriptor dispatch are all keyed by an interpreter handle, and the main interpreter is simply the first. Configuration already separates the levels involved: variants choose the interpreter build and environment, groups choose the process model, and mounts can later request isolation.
 
 ## 6.13 gRPC service mounts
 
@@ -245,3 +255,46 @@ reflection = true
 - Authentication sub-requests (section 4.16), rate limits and client classes apply to gRPC routes as to any other.
 
 **Scope limits:** servicers written for grpclib or betterproto are not supported initially. grpcio availability for free-threaded builds is to be confirmed; on builds where it cannot be installed, gRPC mounts are unavailable.
+
+## 6.14 Handing requests between WSGI and ASGI
+
+A worker that serves both interfaces has application threads and an event loop. Mounts (section 6.7) choose between them by path at the edge. When the choice is made in code, per request, the bridge can hand a request from one side to the other, in either direction, with the link unchanged ([ADR 0023](../adr/0023-wsgi-asgi-handoff.md)). This is how a WSGI application takes WebSockets: the edge owns the wire protocol and the link carries whole messages (section 5.6), so a WSGI view hands the upgrade to an ASGI application, and the worker provides one for the common case.
+
+**WSGI to ASGI: the `muru.wsgi_to_asgi` environ key.** Present only when the worker has an event loop to hand to; its absence is the feature test. The object has:
+
+- `scope`: the ASGI scope the application will receive, built from the request head and mutable until handoff. `scope["state"]` is where the WSGI code puts values for the application, as ASGI servers and middleware do.
+- `is_websocket`: whether the request is a WebSocket upgrade, which is `scope["type"] == "websocket"`.
+- `handoff(app)`: continue this request as `app` on the event loop. Allowed until a response head has left the worker, which only a prior write() can cause; raises afterwards. Returns at once with an empty response iterable, so a WSGI callable hands off and returns in one statement: `return bridge.handoff(app)`. The object is also a WSGI callable that returns itself, which lets a Flask view return it as well; a Django view returns an empty HttpResponse instead.
+- `handed_off`: whether handoff() succeeded, for middleware.
+
+After a handoff the bridge ignores the status, headers and write() output the WSGI code goes on to produce, closes the returned iterable without consuming it, and continues the request on the loop; a debug log line notes a non-empty iterable discarded this way. A view in Flask or Django can therefore hand off and return an empty response with no framework support. start_response called with exc_info after a handoff, or an exception leaving the application after one, is logged and the request is failed as an ASGI error would be. The request's contextvars context is copied into the task. Whatever the WSGI code has not read of the request body is what the application receives. Declining a WebSocket is ordinary WSGI: respond with any status and the edge sends it as the answer to the upgrade. The thread returns to the pool when the WSGI callable returns.
+
+```python
+from muru.asgi import websocket
+
+def application(environ, start_response):
+    bridge = environ.get("muru.wsgi_to_asgi")
+    if bridge is None or not bridge.is_websocket:
+        start_response("426 Upgrade Required", [("Content-Type", "text/plain")])
+        return [b"websocket required\n"]
+
+    bridge.scope["state"]["user"] = current_user(environ)
+    return bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
+```
+
+**ASGI to WSGI: `scope["extensions"]["muru"]["asgi_to_wsgi"]`.** Present on http scopes only, since WSGI has nothing to receive a WebSocket. `handoff(app)` is allowed until the coroutine has sent anything; it returns None, so `return bridge.handoff(app)` is the whole statement, and the coroutine must not touch receive or send again. The bridge builds the native environ from the request head, streams what the coroutine has not consumed of the body through wsgi.input, runs the callable on the application thread pool inside a copy of the coroutine's context, and exposes `scope["state"]` as `environ["muru.state"]`. `handed_off` reports whether it happened.
+
+```python
+async def app(scope, receive, send):
+    if scope["type"] == "http" and scope["path"].startswith("/legacy/"):
+        return scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy_wsgi_app)
+    ...
+```
+
+**Accounting.** A request arrives counted against the worker's slots (threads) or async slots (loop) according to where the edge dispatched it. When it is handed across, the worker sends DETACH on the link (section 5.2) and the edge moves the connection to the other count. In the ASGI to WSGI direction no thread was reserved, so if every thread is busy the request waits in a bounded queue inside the worker, limited by its deadline, and is answered 503 with reason queue_full on expiry. The edge's thread count for that worker may then be over by one, and it dispatches no new thread-bound requests there until a thread frees, so the queue never grows past the number of such handoffs made while every thread was busy. Queue waits inside the worker are a metric (section 11.1) and a scaling signal (section 7.3); when the routing is static, a mount is cheaper than a handoff, because the edge dispatches straight to the right side.
+
+**Lifespan.** ASGI applications reached only by handoff never receive a lifespan scope on their own. An application that needs startup and shutdown is registered from a post_fork hook with `muru.asgi.register(app)`, which runs its lifespan on the worker's loop, blocks the hook with the interpreter released until startup completes, fails the worker during warm-up on `lifespan.startup.failed`, sends shutdown on drain after in-flight requests finish, and copies the lifespan state into the scope of every request handed to it. The same implementation runs the lifespan of ASGI mounts (section 6.6). Handing off to an unregistered application that implements lifespan logs one warning naming it; nothing is started lazily. The WebSocket adapter, Channels consumers and plain ASGI callables have no lifespan and need no registration. Lifespan is not run in the host: it is one call that lives for the process and must not cross a fork.
+
+**The WebSocket adapter.** `muru.asgi.websocket.Handler(handler, subprotocol=None, headers=None, executor=None)` is an ordinary ASGI application. It accepts the socket and calls `handler.on_connect(ws)`, `handler.on_receive(ws, message)` for each message (str for text, bytes for binary) and `handler.on_disconnect(ws, code, reason)`, each on an application thread, one at a time per socket and in order, every call inside one contextvars context created at accept, so values set in on_connect are visible in later calls whichever thread runs them. Different sockets run concurrently. The `Socket` passed to the callbacks has `send(data)`, usable from any thread and blocking with the interpreter released only when the client is slow, `close(code=1000, reason="")`, and `subprotocol`; `send` raises `ConnectionClosed` once the peer has gone. An exception from a callback closes the socket with 1011. A handler must not block waiting for a message on its own socket, since the next message is not delivered until the current call returns. Under Muru the executor defaults to the worker's thread pool; under any other ASGI server it defaults to a thread pool of its own, and the adapter runs unchanged, so it can also be mounted directly from Starlette or called from a Channels router. Applications that already have a Channels consumer or a Starlette endpoint hand those off instead and never see the adapter. Broadcast is the application's concern: it keeps its own registry of sockets and calls send() on them. On worker drain every socket is closed with 1001.
+
+**What is not provided.** A form that holds the WSGI thread for the life of a socket was considered and not offered (ADR 0023); the adapter gives the same programming model without the thread. Generic sync_to_async and async_to_sync helpers are asgiref's (section 20.9).

@@ -1,10 +1,38 @@
 //! The `muructl` binary: CLI, subcommand dispatch and development mode.
 //!
-//! Placeholder created with the project skeleton. Every command is defined
-//! once with clap, which later generates help, man pages and the CLI
-//! reference (design specification section 14.4 and Appendix A).
+//! `muructl run` starts a Python host that preloads one WSGI application
+//! and forks workers, then serves HTTP in front of them (design
+//! specification sections 6.1 and 13.1). With --reload, a changed source
+//! file starts a new release behind the same edge (section 9.8). Every
+//! command is defined once with clap, which later generates help, man
+//! pages and the CLI reference (section 14.4 and Appendix A).
 
-use clap::{Parser, Subcommand};
+mod dashboard;
+mod devcert;
+mod host;
+mod logs;
+mod watch;
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use anyhow::Context;
+use clap::{Args, Parser, Subcommand};
+use tokio::sync::mpsc;
+
+use crate::host::{HostProcess, HostSpec};
+use crate::logs::Logs;
+use crate::watch::Watch;
+
+/// How long a host may take to get its workers listening.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the watcher looks for changes.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// How long changes must have stopped before a reload starts.
+const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Routing edge, control plane and Python runtime for WSGI and ASGI applications.
 #[derive(Parser)]
@@ -17,7 +45,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run an application with an embedded controller and edge (development mode).
-    Run,
+    Run(Box<RunArgs>),
 
     /// Run or control the daemon.
     Daemon {
@@ -30,6 +58,289 @@ enum Command {
         #[command(subcommand)]
         command: EdgeCommand,
     },
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// The application as module:callable, or a project directory (or its
+    /// pyproject.toml or muru.toml) whose [tool.muru] table names it.
+    /// Without it, the project in --chdir or the current directory is used.
+    #[arg(value_name = "ENTRYPOINT or PATH")]
+    app: Option<String>,
+
+    /// The interface the entrypoint speaks: auto (detected from the
+    /// callable), wsgi or asgi.
+    #[arg(long, value_name = "NAME")]
+    interface: Option<muru_config::Interface>,
+
+    /// The entrypoint is a factory, called in each worker after post_fork
+    /// to get the application.
+    #[arg(long)]
+    factory: bool,
+
+    /// Address to listen on, as IP or IP:PORT.
+    #[arg(long, default_value = "127.0.0.1", value_parser = parse_bind)]
+    bind: Bind,
+
+    /// Port for HTTP (default 8080), or auto to pick free ports and print
+    /// them.
+    #[arg(long, value_parser = parse_port)]
+    port: Option<Port>,
+
+    /// Worker processes forked from the preloaded host (default 1).
+    #[arg(long)]
+    processes: Option<usize>,
+
+    /// Application threads per worker (default 4).
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Import the application in the host before forking: auto preloads
+    /// when the import is fork-safe and imports per worker otherwise, true
+    /// fails instead, false imports in each worker (default auto).
+    #[arg(long, value_name = "MODE")]
+    preload: Option<muru_config::Preload>,
+
+    /// Module providing the lifecycle hooks: on_load, pre_fork, post_fork,
+    /// on_ready, on_drain, on_exit and on_reopen_logs.
+    #[arg(long)]
+    hooks: Option<String>,
+
+    /// Where access log lines go: terminal, off, errors (4xx and 5xx
+    /// responses and requests slower than --slow) or a file path, which
+    /// receives JSON lines.
+    #[arg(long, default_value = "terminal")]
+    access_log: String,
+
+    /// Hide requests whose path matches the pattern from the access log
+    /// (`*` matches anything, `?` one character). Repeatable.
+    #[arg(long = "access-log-exclude", value_name = "PATTERN")]
+    access_log_exclude: Vec<String>,
+
+    /// Requests at least this slow count as errors for --access-log errors,
+    /// for example 500ms or 2s.
+    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    slow: Duration,
+
+    /// Largest request body accepted, for example 100MB or 512KB (KB, MB
+    /// and GB are powers of 1024). Development runs default to 100MB, and
+    /// 10MB with --allow-public.
+    #[arg(long, value_name = "SIZE", value_parser = muru_config::parse_size)]
+    max_body_size: Option<u64>,
+
+    /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
+    /// header_read (30s), body_idle (60s) or response_idle (60s).
+    /// Repeatable.
+    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
+    timeouts: Vec<(String, Duration)>,
+
+    /// Address for the read-only dashboard on loopback, or off. On at
+    /// 127.0.0.1:8081 by default, off with --allow-public unless given.
+    #[arg(long, value_name = "ADDRESS")]
+    dashboard: Option<String>,
+
+    /// Serve an address other than loopback. Development behaviours are
+    /// then off (no tracebacks in error pages, the 10MB body limit, no
+    /// dashboard unless asked for), but this is still not the supported
+    /// way to run in production, which is the daemon's job.
+    #[arg(long)]
+    allow_public: bool,
+
+    /// Serve HTTPS as well, on --https-port, with a development certificate
+    /// unless --tls-cert is given.
+    #[arg(long)]
+    https: bool,
+
+    /// Serve HTTPS only: plain HTTP requests are redirected to it.
+    #[arg(long)]
+    https_only: bool,
+
+    /// Port for HTTPS, on the address of --bind (default 8443, or auto
+    /// when --port is auto).
+    #[arg(long, value_parser = parse_port)]
+    https_port: Option<Port>,
+
+    /// Certificate chain to serve, PEM, instead of a development
+    /// certificate. Implies --https.
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// Private key for --tls-cert, PEM.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// Extra name for the development certificate, besides localhost,
+    /// 127.0.0.1 and ::1. Repeatable.
+    #[arg(long = "host", value_name = "NAME")]
+    hosts: Vec<String>,
+
+    /// Write the equivalent declarative configuration (appendix C) to
+    /// standard output instead of running: the path from a development
+    /// run to a long-running setup.
+    #[arg(long)]
+    print_config: bool,
+
+    /// One process and one thread, serving without forking, for debuggers.
+    /// Implies --processes 1 --threads 1.
+    #[arg(long)]
+    single: bool,
+
+    /// Start a new release when a watched source file changes.
+    #[arg(long)]
+    reload: bool,
+
+    /// Directory to watch for changes; defaults to --chdir or the current
+    /// directory. Repeatable.
+    #[arg(long = "reload-dir", value_name = "DIR")]
+    reload_dir: Vec<PathBuf>,
+
+    /// Files that count as source, relative to a watched directory.
+    /// Repeatable; the default is `**/*.py`.
+    #[arg(long = "reload-include", value_name = "GLOB")]
+    reload_include: Vec<String>,
+
+    /// Files that never trigger a reload. Repeatable.
+    #[arg(long = "reload-exclude", value_name = "GLOB")]
+    reload_exclude: Vec<String>,
+
+    /// Python interpreter with the muru runtime library installed.
+    /// Defaults to the active virtualenv's interpreter, else the project's
+    /// .venv, else python3 on PATH.
+    #[arg(long)]
+    python: Option<PathBuf>,
+
+    /// Directory to run the host in, added to the module search path.
+    #[arg(long)]
+    chdir: Option<PathBuf>,
+
+    /// Edge-to-worker link: unix (sockets in a run directory) or tcp
+    /// (loopback ports from --tcp-base-port), the latter for experiments.
+    #[arg(long, default_value = "unix")]
+    link: Link,
+
+    /// First loopback port for the tcp link; each worker takes the next one.
+    #[arg(long, default_value_t = 9100)]
+    tcp_base_port: u16,
+}
+
+/// The --bind value: an address with or without a port.
+#[derive(Debug, Clone, Copy)]
+struct Bind {
+    ip: IpAddr,
+    port: Option<u16>,
+}
+
+fn parse_bind(text: &str) -> Result<Bind, String> {
+    if let Ok(address) = text.parse::<SocketAddr>() {
+        return Ok(Bind {
+            ip: address.ip(),
+            port: Some(address.port()),
+        });
+    }
+    text.parse::<IpAddr>()
+        .map(|ip| Bind { ip, port: None })
+        .map_err(|_| format!("{text:?} is not an address such as 127.0.0.1 or 127.0.0.1:9000"))
+}
+
+/// A port setting: a number, or auto for a free one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Port {
+    Auto,
+    Number(u16),
+}
+
+fn parse_port(text: &str) -> Result<Port, String> {
+    if text.eq_ignore_ascii_case("auto") {
+        return Ok(Port::Auto);
+    }
+    text.parse::<u16>()
+        .map(Port::Number)
+        .map_err(|_| format!("{text:?} is not a port number or auto"))
+}
+
+/// The HTTP and HTTPS addresses to bind (section 13.1): --port wins over a
+/// port in --bind, then 8080; --https-port, else auto when --port is auto,
+/// else 8443. Port 0 asks the system for a free one.
+fn addresses(args: &RunArgs) -> (SocketAddr, SocketAddr) {
+    const HTTP: u16 = 8080;
+    const HTTPS: u16 = 8443;
+    let http = match args.port {
+        Some(Port::Auto) => 0,
+        Some(Port::Number(port)) => port,
+        None => args.bind.port.unwrap_or(HTTP),
+    };
+    let https = match args.https_port {
+        Some(Port::Auto) => 0,
+        Some(Port::Number(port)) => port,
+        None if args.port == Some(Port::Auto) => 0,
+        None => HTTPS,
+    };
+    (
+        SocketAddr::new(args.bind.ip, http),
+        SocketAddr::new(args.bind.ip, https),
+    )
+}
+
+/// Turn a failure to bind into advice: which port, who holds it when that
+/// can be found out, and what to do.
+fn explain_bind_error(error: anyhow::Error, https: SocketAddr) -> anyhow::Error {
+    let Some(bind) = error.downcast_ref::<muru_edge::BindError>() else {
+        return error;
+    };
+    if bind.source.kind() != std::io::ErrorKind::AddrInUse {
+        return error;
+    }
+    let (address, port) = (bind.address, bind.address.port());
+    let flag = if address == https {
+        "--https-port"
+    } else {
+        "--port"
+    };
+    match port_holder(port) {
+        Some(holder) => anyhow::anyhow!(
+            "port {port} on {} is in use by {holder}; choose another with {flag}, or stop it",
+            address.ip()
+        ),
+        None => anyhow::anyhow!(
+            "port {port} on {} is in use; choose another with {flag} ({flag} auto picks a free one)",
+            address.ip()
+        ),
+    }
+}
+
+/// The process listening on a TCP port, as "command (pid N)", found with
+/// lsof or ss when either is installed.
+fn port_holder(port: u16) -> Option<String> {
+    let lsof = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    if let Some(output) = lsof {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let pid = text.lines().find_map(|line| line.strip_prefix('p'));
+        let command = text.lines().find_map(|line| line.strip_prefix('c'));
+        if let (Some(pid), Some(command)) = (pid, command) {
+            return Some(format!("{command} (pid {pid})"));
+        }
+    }
+    let ss = std::process::Command::new("ss")
+        .args(["-lptnH", &format!("sport = :{port}")])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8_lossy(&ss.stdout);
+    // users:(("python3",pid=1234,fd=5))
+    let users = text.split("users:((\"").nth(1)?;
+    let (command, rest) = users.split_once('"')?;
+    let pid = rest.split("pid=").nth(1)?.split(',').next()?;
+    Some(format!("{command} (pid {pid})"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Link {
+    Unix,
+    Tcp,
 }
 
 #[derive(Subcommand)]
@@ -45,11 +356,22 @@ enum EdgeCommand {
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
 
-    // Nothing is implemented yet; the skeleton only establishes the command shape.
     let name = match cli.command {
-        Command::Run => "run",
+        Command::Run(args) => {
+            return tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run(*args));
+        }
         Command::Daemon {
             command: DaemonCommand::Run,
         } => "daemon run",
@@ -58,4 +380,587 @@ fn main() -> anyhow::Result<()> {
         } => "edge run",
     };
     anyhow::bail!("muructl {name} is not implemented yet; see docs/project/roadmap.md")
+}
+
+/// Parse a duration such as 250ms, 1.5s or 2 (seconds).
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1.0)
+    } else {
+        (text, 1.0)
+    };
+    let value: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration such as 500ms or 2s"))?;
+    if value < 0.0 {
+        return Err("a duration cannot be negative".to_owned());
+    }
+    Ok(Duration::from_secs_f64(value * scale))
+}
+
+/// Parse NAME=DURATION for --timeout.
+fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
+    let (name, duration) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example queue=5s"))?;
+    let name = name.trim();
+    if ![
+        "queue",
+        "deadline",
+        "header_read",
+        "body_idle",
+        "response_idle",
+    ]
+    .contains(&name)
+    {
+        return Err(format!(
+            "{name:?} is not a timeout name: queue, deadline, header_read, body_idle or response_idle"
+        ));
+    }
+    Ok((name.to_owned(), parse_duration(duration)?))
+}
+
+/// Largest request body in development (section 13.1, ADR 0008).
+const DEVELOPMENT_MAX_BODY_SIZE: u64 = 100 * 1024 * 1024;
+
+fn limits(args: &RunArgs) -> muru_edge::Limits {
+    let defaults = muru_edge::Limits::default();
+    let mut limits = muru_edge::Limits {
+        max_body_size: args.max_body_size.unwrap_or(if args.allow_public {
+            defaults.max_body_size
+        } else {
+            DEVELOPMENT_MAX_BODY_SIZE
+        }),
+        ..defaults
+    };
+    for (name, duration) in &args.timeouts {
+        match name.as_str() {
+            "queue" => limits.queue_timeout = *duration,
+            "deadline" => limits.request_deadline = *duration,
+            "header_read" => limits.header_read_timeout = *duration,
+            "body_idle" => limits.body_idle_timeout = *duration,
+            "response_idle" => limits.response_idle_timeout = *duration,
+            _ => {}
+        }
+    }
+    limits
+}
+
+fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
+    use muru_edge::access::Destination;
+
+    let destination = match args.access_log.as_str() {
+        "terminal" => Destination::Terminal,
+        "off" => Destination::Off,
+        "errors" => Destination::Errors,
+        path => Destination::File(PathBuf::from(path)),
+    };
+    muru_edge::access::Config {
+        destination,
+        slow: args.slow,
+        exclude: args.access_log_exclude.clone(),
+    }
+}
+
+/// What `muructl run` runs once the command line and the project's
+/// [tool.muru] table are merged: a flag wins, then the table, then the
+/// defaults of section 13.1.
+struct Resolved {
+    entrypoint: String,
+    interface: muru_config::Interface,
+    factory: Option<muru_config::FactoryPhase>,
+    processes: usize,
+    threads: usize,
+    preload: muru_config::Preload,
+    hooks: Option<String>,
+    /// The directory the host runs in.
+    project: PathBuf,
+    /// The file the table came from, when there was one.
+    source: Option<PathBuf>,
+}
+
+/// Defaults for development runs (section 13.1): one worker with a few threads.
+const DEFAULT_PROCESSES: usize = 1;
+const DEFAULT_THREADS: usize = 4;
+
+fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
+    let chdir = args.chdir.clone();
+    let (entrypoint, project) = match args.app.as_deref() {
+        Some(app) if Path::new(app).is_dir() => {
+            anyhow::ensure!(
+                chdir.is_none(),
+                "give the project as the argument or with --chdir, not both"
+            );
+            (None, PathBuf::from(app))
+        }
+        Some(app)
+            if Path::new(app)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| muru_config::PROJECT_FILES.contains(&name)) =>
+        {
+            let path = Path::new(app);
+            anyhow::ensure!(path.is_file(), "{app} does not exist");
+            anyhow::ensure!(
+                chdir.is_none(),
+                "give the project as the argument or with --chdir, not both"
+            );
+            (
+                None,
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+            )
+        }
+        Some(app) => {
+            anyhow::ensure!(
+                !app.contains('/') && !app.ends_with(".py"),
+                "{app} is neither module:callable nor a project directory"
+            );
+            (
+                Some(app.to_owned()),
+                chdir.unwrap_or_else(|| PathBuf::from(".")),
+            )
+        }
+        None => (None, chdir.unwrap_or_else(|| PathBuf::from("."))),
+    };
+    let (source, table) = match muru_config::load_project(&project)? {
+        Some((path, table)) => (Some(path), table),
+        None => (None, muru_config::ToolMuru::default()),
+    };
+    // Whether the entrypoint is a factory belongs to the entrypoint: the
+    // table's factory settings apply to the table's entrypoint only.
+    let from_table = entrypoint.is_none();
+    let entrypoint = match entrypoint.or(table.entrypoint) {
+        Some(entrypoint) => entrypoint,
+        None => match &source {
+            Some(path) => anyhow::bail!(
+                "{} has no entrypoint in its [tool.muru] table; give one as module:callable",
+                path.display()
+            ),
+            None => anyhow::bail!(
+                "no entrypoint: give module:callable, or a project directory with a [tool.muru] table in its pyproject.toml or muru.toml"
+            ),
+        },
+    };
+    let factory = if args.factory || (from_table && table.factory == Some(true)) {
+        Some(
+            table
+                .factory_phase
+                .filter(|_| from_table)
+                .unwrap_or(muru_config::FactoryPhase::Worker),
+        )
+    } else {
+        None
+    };
+    Ok(Resolved {
+        entrypoint,
+        interface: args
+            .interface
+            .or(table.interface)
+            .unwrap_or(muru_config::Interface::Auto),
+        factory,
+        processes: args
+            .processes
+            .or(table.processes)
+            .unwrap_or(DEFAULT_PROCESSES),
+        threads: args.threads.or(table.threads).unwrap_or(DEFAULT_THREADS),
+        preload: args
+            .preload
+            .or(table.preload)
+            .unwrap_or(muru_config::Preload::Auto),
+        hooks: args.hooks.clone().or(table.hooks),
+        project,
+        source,
+    })
+}
+
+/// The declarative file equivalent to this run, for --print-config: the
+/// release as section 6.8 would define it, the listeners and the limits.
+fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
+    use muru_config::{App, Document, Listener, Release};
+
+    let name = app_name(&resolved.entrypoint);
+    let limits = limits(args);
+    let (http, https) = addresses(args);
+    let mut listeners = vec![Listener {
+        address: http.to_string(),
+        tls: false,
+    }];
+    if args.https || args.https_only || args.tls_cert.is_some() {
+        listeners.push(Listener {
+            address: https.to_string(),
+            tls: true,
+        });
+    }
+    let release = Release {
+        entrypoint: resolved.entrypoint.clone(),
+        interface: (resolved.interface != muru_config::Interface::Auto)
+            .then_some(resolved.interface),
+        factory: resolved.factory.map(|_| true),
+        factory_phase: resolved.factory,
+        python: Some(
+            python_interpreter(args.python.clone(), &resolved.project)
+                .display()
+                .to_string(),
+        ),
+        processes: Some(resolved.processes),
+        threads: Some(resolved.threads),
+        preload: Some(resolved.preload),
+        hooks: resolved.hooks.clone(),
+    };
+    let document = Document {
+        listener: listeners,
+        limits: Some(muru_config::Limits {
+            max_body_size: Some(muru_config::format_size(limits.max_body_size)),
+            max_header_bytes: Some(muru_config::format_size(limits.max_header_bytes as u64)),
+            max_headers: Some(limits.max_headers),
+            header_read_timeout: Some(muru_config::format_duration(limits.header_read_timeout)),
+            queue_timeout: Some(muru_config::format_duration(limits.queue_timeout)),
+            request_deadline: Some(muru_config::format_duration(limits.request_deadline)),
+            body_idle_timeout: Some(muru_config::format_duration(limits.body_idle_timeout)),
+            response_idle_timeout: Some(muru_config::format_duration(limits.response_idle_timeout)),
+        }),
+        app: std::collections::BTreeMap::from([(
+            name,
+            App {
+                release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
+            },
+        )]),
+    };
+    let text = document.to_toml().context("writing the configuration")?;
+    Ok(format!(
+        "# The declarative equivalent of this muructl run, for muructl apply (phase 2).\n\
+         # The release is written as r1; muructl deploy numbers releases itself.\n\n{text}"
+    ))
+}
+
+/// The application's name: the top-level module of its entrypoint, as
+/// the host names it for muru.context().
+fn app_name(entrypoint: &str) -> String {
+    let module = entrypoint.split(':').next().unwrap_or(entrypoint);
+    let top = module.split('.').next().unwrap_or(module);
+    if top.is_empty() {
+        "default".to_owned()
+    } else {
+        top.to_owned()
+    }
+}
+
+/// How TLS was set up: the listener configuration and, for a development
+/// certificate, where it came from.
+struct Tls {
+    https: muru_edge::Https,
+    development: Option<devcert::DevCertificate>,
+}
+
+/// The HTTPS listener for --https, --https-only or --tls-cert (section 13.1).
+fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
+    if !(args.https || args.https_only || args.tls_cert.is_some()) {
+        return Ok(None);
+    }
+    let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
+        (Some(certificate), Some(key)) => {
+            let (chain, key) = muru_edge::tls::load_pem_files(certificate, key)?;
+            (chain, key, None)
+        }
+        _ => {
+            let certificate = devcert::obtain(&devcert::cache_dir()?, &args.hosts)?;
+            let (chain, key) =
+                muru_edge::tls::load_pem_files(&certificate.certificate, &certificate.key)?;
+            (chain, key, Some(certificate))
+        }
+    };
+    Ok(Some(Tls {
+        https: muru_edge::Https {
+            listen: addresses(args).1,
+            config: muru_edge::tls::server_config(chain, key)?,
+            only: args.https_only,
+        },
+        development,
+    }))
+}
+
+/// The interpreter to run the host with (section 13.1): --python, else the
+/// active virtualenv, else the project's own .venv, else python3 on PATH. A
+/// path is made absolute, because a virtualenv's interpreter locates its
+/// site-packages from its own path.
+fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
+    let python = explicit
+        .or_else(|| {
+            std::env::var_os("VIRTUAL_ENV")
+                .map(|venv| PathBuf::from(venv).join("bin").join("python"))
+        })
+        .or_else(|| {
+            let venv = project.join(".venv").join("bin").join("python");
+            venv.is_file().then_some(venv)
+        })
+        .unwrap_or_else(|| PathBuf::from("python3"));
+    match (python.parent(), python.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
+            // Resolve the directory, not the file: the interpreter is often a
+            // symlink into a virtualenv, and following it would lose the venv.
+            match dir.canonicalize() {
+                Ok(dir) => dir.join(name),
+                Err(_) => python,
+            }
+        }
+        _ => python,
+    }
+}
+
+/// Development mode: one host with forked workers behind an embedded edge,
+/// replaced by a new one when --reload sees a source change.
+async fn run(args: RunArgs) -> anyhow::Result<()> {
+    let mut resolved = resolve(&args)?;
+    let development = !args.allow_public;
+    if !args.bind.ip.is_loopback() && development {
+        anyhow::bail!(
+            "muructl run serves loopback addresses only, because it is development mode: error \
+             pages show tracebacks and nothing is persisted. --allow-public serves {} with those \
+             behaviours off, but production is the daemon's job (section 13.3, phase 2)",
+            args.bind.ip
+        );
+    }
+    anyhow::ensure!(resolved.processes >= 1, "--processes must be at least 1");
+    anyhow::ensure!(resolved.threads >= 1, "--threads must be at least 1");
+    if args.single {
+        resolved.processes = 1;
+        resolved.threads = 1;
+    }
+    if args.print_config {
+        print!("{}", declarative(&args, &resolved)?);
+        return Ok(());
+    }
+    if let Some(source) = &resolved.source {
+        println!("muru: using [tool.muru] from {}", source.display());
+    }
+    // Certificates are sorted out before anything is started, so a bad
+    // --tls-cert or an unwritable cache fails with nothing to clean up.
+    let tls = tls(&args)?;
+    let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    let access_log = access_log_config(&args);
+    let spec = HostSpec {
+        python: python_interpreter(args.python.clone(), &resolved.project),
+        app: resolved.entrypoint.clone(),
+        interface: resolved.interface,
+        factory: resolved.factory,
+        processes: resolved.processes,
+        threads: resolved.threads,
+        preload: resolved.preload,
+        hooks: resolved.hooks.clone(),
+        chdir: Some(resolved.project.clone()),
+        tcp_base_port: (args.link == Link::Tcp).then_some(args.tcp_base_port),
+        single: args.single,
+    };
+
+    let logs = Logs::default();
+    let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
+    if let Err(error) = current.wait_ready(START_TIMEOUT).await {
+        current.stop().await;
+        let _ = std::fs::remove_dir_all(&run_dir);
+        return Err(error);
+    }
+
+    let (http_address, https_address) = addresses(&args);
+    let edge = match muru_edge::Edge::bind(muru_edge::Config {
+        listen: http_address,
+        sockets: current.sockets.clone(),
+        slots: resolved.threads,
+        development,
+        access_log,
+        limits: limits(&args),
+        https: tls.as_ref().map(|tls| tls.https.clone()),
+    })
+    .await
+    {
+        Ok(edge) => edge,
+        Err(error) => {
+            current.stop().await;
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(explain_bind_error(error, https_address));
+        }
+    };
+    let addresses = match edge.https_addr() {
+        Some(https) if args.https_only => {
+            format!(
+                "https://{https} (http://{} redirects to it)",
+                edge.local_addr()
+            )
+        }
+        Some(https) => format!("http://{} and https://{https}", edge.local_addr()),
+        None => format!("http://{}", edge.local_addr()),
+    };
+    println!(
+        "muru: serving {} on {addresses} with {} workers of {} threads",
+        resolved.entrypoint, resolved.processes, resolved.threads
+    );
+    if development {
+        println!(
+            "muru: development mode: error pages show tracebacks, nothing is persisted and only \
+             loopback is served; production runs under the daemon, which arrives in phase 2"
+        );
+    } else {
+        println!(
+            "muru: --allow-public: development behaviours are off, but muructl run is not the \
+             supported way to run in production; that is the daemon, which arrives in phase 2"
+        );
+    }
+    if let Some(tls) = &tls {
+        match (&tls.development, &args.tls_cert) {
+            (Some(certificate), _) => println!("{}", certificate.describe()),
+            (None, Some(path)) => println!("muru: TLS certificate from {}", path.display()),
+            (None, None) => {}
+        }
+    }
+
+    let release_number = Arc::new(AtomicU32::new(1));
+    let dashboard = match args.dashboard.as_deref() {
+        Some("off") => None,
+        Some(address) => Some(address.to_owned()),
+        None if development => Some("127.0.0.1:8081".to_owned()),
+        None => None,
+    };
+    if let Some(address) = dashboard {
+        match dashboard::start(
+            &address,
+            dashboard::Inputs {
+                development,
+                app: resolved.entrypoint.clone(),
+                listen: edge.local_addr(),
+                https: edge.https_addr(),
+                started: std::time::Instant::now(),
+                release: Arc::clone(&release_number),
+                pools: edge.pools(),
+                access_log: edge.access_log(),
+                logs: logs.clone(),
+            },
+        )
+        .await
+        {
+            Ok(address) => println!("muru: dashboard on http://{address}/"),
+            Err(error) => println!("muru: no dashboard: {error:#}"),
+        }
+    }
+
+    let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
+    if args.reload {
+        let directories = if args.reload_dir.is_empty() {
+            vec![resolved.project.clone()]
+        } else {
+            args.reload_dir.clone()
+        };
+        let directories: Vec<PathBuf> = directories
+            .into_iter()
+            .map(|directory| directory.canonicalize().unwrap_or(directory))
+            .collect();
+        let include = if args.reload_include.is_empty() {
+            vec!["**/*.py".to_owned()]
+        } else {
+            args.reload_include.clone()
+        };
+        let watch = Watch::new(directories, &include, &args.reload_exclude)?;
+        println!(
+            "muru: watching {} for changes",
+            watch
+                .directories()
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tokio::spawn(watch.run(WATCH_INTERVAL, changed_tx));
+    } else {
+        drop(changed_tx);
+    }
+
+    let pools = edge.pools();
+    let mut serving = tokio::spawn(edge.run());
+    let mut release = 1;
+    let outcome = loop {
+        tokio::select! {
+            served = &mut serving => {
+                break served.map_err(anyhow::Error::from).and_then(|result| result);
+            }
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+            status = current.exited() => {
+                break Err(anyhow::anyhow!("the host exited with {}", status?));
+            }
+            Some(path) = changed.recv() => {
+                let mut paths = vec![path];
+                settle(&mut changed, &mut paths).await;
+                println!("muru: reloading, {} changed", describe(&paths));
+                loop {
+                    release += 1;
+                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
+                        Ok(next) => next,
+                        Err(error) => {
+                            println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                            break;
+                        }
+                    };
+                    tokio::select! {
+                        ready = next.wait_ready(START_TIMEOUT) => match ready {
+                            Ok(()) => {
+                                match muru_edge::link::LinkPool::new(&next.sockets, resolved.threads) {
+                                    Ok(pool) => pools.replace(pool),
+                                    Err(error) => {
+                                        println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                        next.stop().await;
+                                        break;
+                                    }
+                                }
+                                println!("muru: switched to release r{release}");
+                                release_number.store(release, Ordering::Relaxed);
+                                let previous = std::mem::replace(&mut current, next);
+                                tokio::spawn(previous.stop());
+                                break;
+                            }
+                            Err(error) => {
+                                println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                next.stop().await;
+                                break;
+                            }
+                        },
+                        Some(path) = changed.recv() => {
+                            // Section 9.8: a release still starting is abandoned
+                            // when more changes arrive.
+                            let mut paths = vec![path];
+                            settle(&mut changed, &mut paths).await;
+                            println!("muru: {} changed again, restarting the reload", describe(&paths));
+                            next.stop().await;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    current.stop().await;
+    let _ = std::fs::remove_dir_all(&run_dir);
+    outcome
+}
+
+/// Keep collecting changes until none has arrived for the debounce period.
+async fn settle(changed: &mut mpsc::Receiver<PathBuf>, paths: &mut Vec<PathBuf>) {
+    while let Ok(Some(path)) = tokio::time::timeout(DEBOUNCE, changed.recv()).await {
+        paths.push(path);
+    }
+}
+
+/// Name the changed files briefly: the first, and how many more.
+fn describe(paths: &[PathBuf]) -> String {
+    let first = paths
+        .first()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    match paths.len() {
+        0 | 1 => first,
+        more => format!("{first} and {} more", more - 1),
+    }
 }

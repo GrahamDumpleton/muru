@@ -1,10 +1,17 @@
 # Muru
 
+[![CI](https://github.com/GrahamDumpleton/muru/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/GrahamDumpleton/muru/actions/workflows/ci.yml)
+[![Documentation](https://img.shields.io/readthedocs/muru?label=docs)](https://muru.readthedocs.io/)
+[![PyPI muructl](https://img.shields.io/pypi/v/muructl?label=muructl)](https://pypi.org/project/muructl/)
+[![PyPI muru](https://img.shields.io/pypi/v/muru?label=muru)](https://pypi.org/project/muru/)
+[![Python versions](https://img.shields.io/pypi/pyversions/muru)](https://pypi.org/project/muru/)
+[![Licence](https://img.shields.io/github/license/GrahamDumpleton/muru)](https://github.com/GrahamDumpleton/muru/blob/main/LICENSE)
+
 Muru is a routing edge, control plane and Python runtime for serving WSGI and
 ASGI applications, with zero-downtime releases, traffic management and
 Python-aware process management.
 
-A Rust edge accepts client connections and routes requests over gRPC to
+A Rust edge accepts client connections and routes requests over a private link to
 Python worker processes, which a Rust controller manages as immutable
 releases that can run side by side. A new release, possibly on a different
 Python version, starts beside the old one, and traffic moves when it is
@@ -14,27 +21,44 @@ rollback are policy changes, not restarts. The same model runs from
 
 ## Status
 
-Muru is at the design stage. Nothing is released and nothing runs yet. This
-repository holds the project skeleton, the
-[design specification](docs/project/design/index.md) and the initial
-[architecture decision records](docs/project/adr/index.md). The
-[roadmap](docs/project/roadmap.md) lists the phases, starting with a phase 0
-spike that benchmarks the edge-to-worker protocol.
+Muru is early in its life. Development mode works: `muructl run` serves a
+WSGI application on your machine with HTTP/1.1, HTTP/2 and HTTPS, forked
+workers with an import check before the fork, lifecycle hooks, watch
+reload, an access log and a small dashboard, tested with plain WSGI, Flask
+and Django on regular and free-threaded Python. The daemon, releases,
+traffic management and ASGI are still to come; the
+[roadmap](docs/project/roadmap.md) lists the phases. The
+[tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
+is the place to start, and the
+[design specification](docs/project/design/index.md) and
+[architecture decision records](docs/project/adr/index.md) describe what is
+being built.
+
+```
+uv tool install muructl          # the command
+uv add muru                      # the runtime library, in your application's environment
+muructl run app:application      # http://127.0.0.1:8080
+```
 
 ## What it will do
 
-- Serve WSGI and ASGI applications without Apache httpd or nginx, with
+- Serve WSGI and ASGI applications with no separate web server in front:
   HTTP/1.1, HTTP/2, TLS, virtual hosts, static files, uploads and internal
-  redirects handled by the edge.
+  redirects are handled by the edge.
 
 - Deploy without downtime: immutable releases, draining, blue/green,
   canaries with gates, deterministic bucketing, sticky sessions, previews and
   rollback.
 
-- Manage Python processes the way mod_wsgi daemon mode and gunicorn do, and
-  more: preload before fork with hooks, worker groups per path, mixed WSGI
-  and ASGI mounts in one process, free-threaded builds, memory policies,
-  soft and hard timeouts, and Python-aware scaling.
+- Manage Python processes: preload before fork with an import check and
+  hooks, worker groups per path, free-threaded builds, memory policies, soft
+  and hard timeouts, and Python-aware scaling.
+
+- Mix WSGI and ASGI in one process: mounts by path, and a WSGI view can
+  hand a request to an ASGI application on the event loop, which is how a
+  WSGI application takes WebSockets, or an ASGI application can hand one to
+  a WSGI callable on the thread pool, without either side changing
+  framework.
 
 - Reconfigure live through an API and CLI, with declarative files that
   export and apply round-trip, plus metrics, structured logs, an event
@@ -42,16 +66,25 @@ spike that benchmarks the edge-to-worker protocol.
 
 ## Install
 
-Not yet available. When released, `uv tool install muructl` installs the
-command line, and the daemon installs the `muru` runtime library for each
-interpreter it manages.
+Install the command line once with `uv tool install muructl` and add the
+`muru` runtime library to each application's environment with `uv add
+muru`. Both are pre-releases of the 0.1.0 line, so `pip install --pre` is
+needed where pip is used instead of uv. Pre-built wheels cover Linux and
+macOS on CPython 3.11 to 3.15, including the free-threaded builds.
 
 ## Five-minute start
+
+Today, in development:
+
+```
+muructl run app:application --reload     # HTTP on 8080, restarts on change
+muructl run --https                      # HTTPS on 8443 with a local certificate
+muructl run . --port auto                # the project's [tool.muru] table, free ports
+```
 
 Planned:
 
 ```
-muructl run app:application --reload     # development, HTTP on 8080
 muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
 muructl apply -f config/                 # several applications, virtual hosts, TLS
 muructl rollout canary shop@r43          # canary with gates and rollback

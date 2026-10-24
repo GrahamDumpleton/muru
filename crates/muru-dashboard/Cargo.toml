@@ -10,6 +10,15 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+askama = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

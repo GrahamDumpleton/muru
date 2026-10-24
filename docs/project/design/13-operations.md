@@ -22,8 +22,9 @@ muructl run app:app --single                       # one process, one thread, no
 ```
 
 - No daemon, root, state store or systemd, and nothing written into the project directory (locations in section 13.8). Controller and edge run as threads of one process, hosts and workers as children. Loopback only, HTTP on port 8080 by default, HTTPS on 8443 when enabled (below).
-- Interface detection from the callable. The interpreter comes from the active virtualenv or ./.venv, otherwise uv resolves --python or requires-python.
-- Defaults: one worker with a few threads for WSGI, one event loop for ASGI, preload auto as in the daemon (so an import that is not fork-safe is reported on the laptop, not in production), wsgi.multiprocess False for single-process runs, 100 MB body limit.
+- **Development mode is said out loud.** Start-up prints that error pages show tracebacks, nothing is persisted and only loopback is served, and the dashboard header says development mode, so nobody mistakes muructl run for a production setup. A --bind address outside loopback is refused with a message naming the daemon as the production path. --allow-public serves it anyway with the development behaviours off (no tracebacks in error pages, the 10 MB body limit of ADR 0008, no HSTS warning, no dashboard unless asked for) and a start-up line saying this is still not the supported way to run in production; it exists for trying Muru behind real clients before the daemon exists, and in containers whose port mapping needs 0.0.0.0.
+- The argument is an entrypoint (module:callable) or a project: a directory, or its pyproject.toml or muru.toml, whose [tool.muru] table names the entrypoint (section 6.8). With no argument the project is --chdir or the current directory. A flag wins over the table, the table over the defaults. An entrypoint given on the command line replaces the table's entrypoint together with its factory and factory_phase settings, since those describe the entrypoint; processes, threads, preload and hooks still come from the table. Interface detection from the callable. The interpreter comes from the active virtualenv or ./.venv, otherwise uv resolves --python or requires-python.
+- Defaults: one worker with a few threads for WSGI, one event loop for ASGI, preload auto as in the daemon (so an import that is not fork-safe is reported on the laptop, not in production), wsgi.multiprocess False for single-process runs, 100 MB body limit (--max-body-size changes it; the limit in force is muru.max_body_size in the environ).
 - Terminal output shows tagged application output and, by default, compact access log lines. --access-log controls the access log: terminal (default), off, errors (only 4xx and 5xx responses and requests slower than --slow, default 1 s), or a file path, which writes it there instead of the terminal. --access-log-exclude PATTERN hides matching paths, for example static assets or health probes (probes are already excluded). Whatever is shown, the access log is still kept in memory and available through muructl logs --access and the dashboard. The dashboard and admin socket are available on loopback.
 - --print-config writes the equivalent declarative file, which is the path to a long-running setup.
 
@@ -36,8 +37,9 @@ muructl run app:app --tls-cert cert.pem --tls-key key.pem # your own certificate
 muructl run app:app --https --host shop.localhost         # extra names on the certificate
 ```
 
-- **Certificates:** with --https and no certificate given, muructl creates one for localhost, 127.0.0.1, ::1 and any --host names. If a local development certificate authority created by mkcert is installed (found through mkcert -CAROOT), the certificate is issued from it, so browsers trust it without warnings. Otherwise a self-signed certificate is created and muructl prints how to trust it or install mkcert. Generated certificates and keys are kept in the user cache directory (section 13.8), never in the project, and are reused until they near expiry.
-- **Ports:** HTTP 8080 and HTTPS 8443 by default, changed with --port and --https-port. If a port is in use, muructl run fails with a message naming the port and the process holding it where it can determine that. --port auto picks free ports and prints them.
+- **Certificates:** with --https and no certificate given, muructl creates one for localhost, 127.0.0.1, ::1 and any --host names. If a local development certificate authority created by mkcert is installed (found through CAROOT in the environment, then mkcert -CAROOT, then mkcert's default location), the certificate is issued from it, so browsers trust it without warnings. Otherwise a self-signed certificate is created and muructl prints how to trust it or install mkcert. Generated certificates and keys are kept in the user cache directory (section 13.8) as certs/dev.pem and certs/dev-key.pem, never in the project, and are reused until they near expiry (30 days before, of a one-year validity), the authority changes or a name is asked for that they do not cover. ECDSA P-256 keys, signed with the ring provider (ADR 0024).
+- **Redirects:** with --https-only, the HTTP listener answers every request with 307 and the same path and query on the HTTPS port, taking the host name from the request. 307 keeps the method and is not cached, so a later run without TLS on the same port is unaffected.
+- **Ports:** HTTP 8080 and HTTPS 8443 by default on 127.0.0.1, changed with --port and --https-port, with --bind taking the address (an IP, or IP:PORT as a shorthand that --port overrides). If a port is in use, muructl run fails with a message naming the port and the process holding it where it can determine that (through lsof or ss). --port auto picks free ports and prints them; it covers the HTTPS port too unless --https-port says otherwise.
 - **Headers:** Muru adds no HSTS header in development, because HSTS on localhost would affect every other local server. The development page warns if the application itself sends one.
 
 ```mermaid
@@ -47,7 +49,7 @@ flowchart LR
     E[Edge] --- C[Controller]
     FW[File watcher] -->|change| C
   end
-  E -->|gRPC| W1[Current release workers]
+  E -->|worker link| W1[Current release workers]
   C -->|new release from same path| H2[New host]
   H2 -.-> W2[New workers]
   E -.->|switch after warm-up| W2

@@ -24,7 +24,9 @@ specification is maintained.
 | wsgi.version, wsgi.url_scheme, wsgi.input, wsgi.errors | as PEP 3333; wsgi.errors writes to the worker's stderr stream |
 | wsgi.multithread, wsgi.multiprocess, wsgi.run_once | section 6.5 |
 | wsgi.input_terminated | always True |
-| wsgi.file_wrapper | descriptor-based file hints |
+| wsgi.file_wrapper | the muru._native.FileWrapper class: block iteration, descriptor passing when the wrapper is returned as the iterable (section 6.5) |
+| muru.wsgi_to_asgi | the handoff object of section 6.14, present when the worker has an event loop |
+| muru.state | the ASGI scope state of a request handed from ASGI to WSGI (section 6.14) |
 | muru.request_id, muru.release, muru.group, muru.mount | request and placement |
 | muru.proxy_addr | original peer when behind trusted proxies |
 | muru.host_captures | named groups from regular expression host names |
@@ -33,7 +35,7 @@ specification is maintained.
 | muru.uploads | upload references, read through muru.uploads.files() |
 | muru.max_body_size | limit in effect |
 | muru.deadline | absolute request deadline (Unix time, seconds) |
-| muru.tls | dictionary of TLS details (version, cipher, SNI, client certificate when configured) |
+| muru.tls | dictionary of TLS details, present over HTTPS only: version (TLSv1.3 or TLSv1.2), cipher (the negotiated suite), server_name (the SNI, empty when the client sent none) and alpn (the negotiated application protocol, empty when none); client certificate details when configured |
 | muru.client_class | client class assigned by the edge (section 4.14) |
 | muru.mode | site mode such as read-only, usually set by an overlay (sections 4.15 and 9.10) |
 | muru.overlays | names of overlays active for this request's route |
@@ -41,7 +43,7 @@ specification is maintained.
 
 ## D.2 ASGI scope
 
-Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path, query_string, root_path, headers, client, server, state), with root_path set to the trusted prefix plus the mount path. Muru values are under scope['extensions']['muru'] with the same names as the muru.* environ keys. Supported extensions: http.response.trailers, http.response.pathsend and http.response.zerocopysend (file hints), and tls.
+Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path, query_string, root_path, headers, client, server, state), with root_path set to the trusted prefix plus the mount path. Muru values are under scope['extensions']['muru'] with the same names as the muru.* environ keys, plus asgi_to_wsgi, the handoff object of section 6.14, on http scopes. Supported extensions: http.response.trailers, http.response.pathsend and http.response.zerocopysend (file hints), and tls.
 
 ## D.3 Environment variables set by Muru
 

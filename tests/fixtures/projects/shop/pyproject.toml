@@ -1,0 +1,9 @@
+[project]
+name = "shop"
+version = "0.0.0"
+
+[tool.muru]
+entrypoint = "shop.wsgi:application"
+processes = 2
+threads = 3
+hooks = "shop.hooks"

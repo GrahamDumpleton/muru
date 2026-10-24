@@ -24,6 +24,14 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates depend on each other by path without a version.
+allow-wildcard-paths = true
+# TLS uses the ring provider (ADR 0024). aws-lc-rs would need cmake to
+# build, so it stays out of the tree.
+deny = [
+    { crate = "aws-lc-rs", reason = "rustls and rcgen use the ring provider (ADR 0024)" },
+    { crate = "aws-lc-sys", reason = "rustls and rcgen use the ring provider (ADR 0024)" },
+]
 
 [sources]
 unknown-registry = "deny"

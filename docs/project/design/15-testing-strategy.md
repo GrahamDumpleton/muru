@@ -123,7 +123,7 @@ flowchart LR
 | h2spec | HTTP/2 conformance | release binary, fetched by just bootstrap-conformance | same | optional |
 | gh | Pull requests and CI logs from the terminal | brew install gh | apt install gh | optional |
 
-Not needed: Node.js (the dashboard has no build step), OpenSSL (rustls is used), protoc (a vendored protoc is used by the build), a system SQLite (bundled) or a system Python (uv provides them).
+Not needed: Node.js (the dashboard has no build step), OpenSSL, cmake, Go or NASM (rustls on the ring provider is used, built by the C compiler, ADR 0024), protoc (a vendored protoc is used by the build), a system SQLite (bundled) or a system Python (uv provides them).
 
 **Setup and checks.** Three just targets make the environment reproducible for people and for AI coding agents alike:
 

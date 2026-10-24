@@ -15,8 +15,10 @@ specification is maintained.
 | --- | --- |
 | Name and binaries | Project muru. One binary muructl with daemon and edge subcommands. Runtime library distribution and import name muru |
 | Process layout | Separate edge processes from the daemon in production, embedded in one process in development. Both built as libraries |
-| Edge to worker protocol | gRPC (tonic) over Unix sockets, behind a transport trait, confirmed or replaced by the phase 0 spike |
-| Worker gRPC server | Rust inside the extension, started after fork. No grpcio for the internal link |
+| Edge to worker protocol | Own framing with protobuf payloads over Unix sockets, one request per pooled connection (ADR 0021, superseding ADR 0001). gRPC remains for the control plane and admin API |
+| Worker link server | Rust inside the extension, started after fork. No grpcio anywhere in the worker |
+| Application threads | A fixed pool of long-lived threads with persistent Python thread states, each request in a fresh contextvars context (ADR 0022) |
+| WSGI and ASGI in one worker | Requests handed across per request in either direction: the muru.wsgi_to_asgi environ key and the asgi_to_wsgi scope extension, with lifespan registration and a WebSocket adapter under muru.asgi (ADR 0023) |
 | Preload | auto by default everywhere: preload with an import check, falling back to per-worker imports when the import left sockets, threads, child processes or event loops behind (sections 6.1 and 6.2) |
 | Releases | Immutable. Configuration changes are new releases |
 | Environment builds | Prebuilt directories supported first, optional uv build step |
@@ -37,17 +39,18 @@ specification is maintained.
 | Free-threading | Supported from phase 1 with the WSGI bridge, with the extension designed for it from the outset (section 6.11) |
 | Runtime wheels | Version-specific wheels for every supported CPython, regular and free-threaded. No abi3 |
 | gRPC mounts and authentication sub-requests | In initial scope, phase 3 (sections 6.13 and 4.16) |
+| TLS cryptography | rustls, tokio-rustls and rcgen on the ring provider in every crate; aws-lc-rs banned by cargo-deny so cmake never becomes a prerequisite (ADR 0024) |
 
 ## 19.2 Open questions
 
-1. Acceptable overhead against gunicorn, uvicorn and Granian in the phase 0 benchmarks before replacing gRPC on the internal edge-to-worker link with a custom framed protocol (section 5.1). The comparison set includes mod_wsgi-express in embedded mode, daemon mode, and daemon mode with script reloading disabled and queue timeout set to 0 (section 15.4).
+1. Resolved by ADR 0021: the phase 0 benchmarks put gRPC 24 to 37 percent behind mod_wsgi daemon mode on hello world and the framed link ahead of it, so the framed link replaced gRPC on the edge-to-worker link (section 5.1).
 2. Retention defaults for warm superseded releases on memory-constrained nodes. Provisional choice, to review later: 30 minute retention, scaled down to the host plus one worker per group, dropping to host only and then stopping under memory pressure (section 9.1). After a deploy, the previous release is kept running with no traffic for a retention window (30 minutes by default, section 9.1) so a rollback is instant. That costs the old release's full memory for the whole window. The question is whether the default should stay at 30 minutes, become shorter, or be decided automatically from free memory, for example keeping the old release warm only while the node is under its memory budget and stopping it otherwise (rollback would then need a cold start).
 
 ## 19.3 Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| gRPC overhead for small requests | Throughput below alternatives | Phase 0 benchmarks, coalescing, transport trait for a framed protocol |
+| Link overhead for small requests | Throughput below alternatives | Retired: the framed link measured at the level of mod_wsgi embedded mode and gunicorn per request (ADR 0021). Coalescing stays |
 | GIL contention in the bridge | Lower throughput per worker | Environ built in Rust, GIL released while blocking, batched event delivery, early measurement |
 | Runtime wheel matrix | Build and test burden | One build path for all versions in the release workflow, CI matrix limits, new Python versions added as soon as their release candidates appear |
 | Preload incompatibilities | Applications break after fork | Import check with automatic fallback to per-worker imports, post_fork hooks, explicit preload settings, clear diagnostics |

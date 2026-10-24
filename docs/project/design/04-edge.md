@@ -30,7 +30,7 @@ flowchart TD
   I --> J{Capacity}
   J -->|no| Q[Queue with timeout, then 503 queue_full]
   J -->|yes| K[Body handling: stream, buffer or upload offload]
-  K --> L[gRPC stream to worker]
+  K --> L[Request on a pooled worker link connection]
   L --> M{Response}
   M -->|internal redirect| F
   M -->|file hint| S
@@ -71,7 +71,7 @@ flowchart TB
     T1 --- SNAP
     T2 --- SHM
   end
-  T1 -->|pooled gRPC connections| W[Workers]
+  T1 -->|pooled link connections| W[Workers]
   T3 --> W
 ```
 
@@ -83,7 +83,7 @@ flowchart TB
 | Blocking work | Operations that can block, mainly file opens, stat calls for static files and fallbacks, and writing upload spool files, run on tokio's blocking pool (edge.blocking_threads, default 64) so they never stall an event loop. sendfile on non-blocking sockets and DNS lookups through an asynchronous resolver stay on worker threads |
 | CPU-bound work | TLS handshakes and response compression run on worker threads but are short. Compression of large responses is chunked to avoid monopolising a thread |
 | Accepting connections | Every worker thread accepts from the shared listening sockets. With several edge processes, SO_REUSEPORT spreads connections across processes and the runtime spreads them across threads |
-| Shared state | The routing snapshot is read through arc-swap, so configuration changes never block requests. In-flight counters and rate limit buckets are atomics in shared memory, also visible to other edge processes. Per-worker gRPC connection pools are shared by all threads |
+| Shared state | The routing snapshot is read through arc-swap, so configuration changes never block requests. In-flight counters and rate limit buckets are atomics in shared memory, also visible to other edge processes. Per-worker link connection pools are shared by all threads |
 | Logging | Access log records go through a bounded channel to a dedicated writer thread, which drops and counts records rather than block requests (section 11.3) |
 | Timers | Timeouts, idle detection and queue deadlines use the runtime's timer wheel, so millions of pending timeouts cost little |
 
@@ -126,8 +126,9 @@ The controller compiles desired state into a complete, versioned, immutable snap
 | buffer_response | on | Responses are drained from workers at full speed and delivered to slow clients by the edge. Streaming routes opt out |
 
 - The 413 error page names the limit in effect and the setting that changes it. A declared Content-Length over max_body_size is answered with 413 before reading, without sending 100 Continue. Undeclared bodies are counted as they arrive. When streaming to a worker the stream is cancelled; the client receives 413 if no response has started, otherwise a reset. HTTP/1.1 connections are closed after a 413, HTTP/2 and HTTP/3 reset only the stream.
-- Expect: 100-continue is handled only by the edge. With buffered bodies it sends 100 once its own checks pass. With streamed bodies it sends 100 on the application's first read of the body. Upload prechecks (section 4.11) make the decision explicit.
+- Expect: 100-continue is handled only by the edge. With buffered bodies it sends 100 once its own checks pass. With streamed bodies it sends 100 when the worker's CONTINUE frame says the application has started reading (section 5.5), so an application that rejects before reading never receives the body. Upload prechecks (section 4.11) make the decision explicit. On HTTP/2 the interim response is not sent until the edge can send 1xx responses at all (the INFORMATIONAL frame of phase 2); a client waiting for it proceeds after its own timeout, and the rest behaves the same.
 - Slow clients never occupy Python threads: request heads are read in full before dispatch and responses are buffered at the edge.
+- **Bodies the application does not read.** When a response ends before the request body has been read, the edge sends ABORT on the link so the rest never crosses it (section 5.5), and decides what to do with the client connection before the response head goes out. HTTP/2 and HTTP/3 reset the stream and the connection carries on. For HTTP/1.1, if the unread remainder is within discard_body_limit (default 1 MiB) and arrives within discard_body_timeout (default 2 s) it is read and discarded and the connection is kept alive; otherwise the response carries Connection: close and the connection is closed after it, as RFC 9110 section 10.1.1 asks. A client that sent Expect: 100-continue and has not been told to continue has nothing to discard, but may still send the body once it tires of waiting, so the connection is closed after the response, as Apache does. Error responses the edge generates for malformed requests (400, 408, 413, 414, 431) always close HTTP/1.1 connections, as Apache does, because the parse state is suspect.
 
 ## 4.7 Trusted proxies and header handling
 
@@ -155,7 +156,7 @@ The edge retries only when it is provably safe: a connection failure before any 
 
   | Form | How the application produces it | What the edge does |
   | --- | --- | --- |
-  | By descriptor (preferred) | WSGI: returning the object from wsgi.file_wrapper. ASGI: the http.response.pathsend or http.response.zerocopysend extensions (section 6.6) | The worker passes a duplicate of the open descriptor over the side channel with an offset and length. The edge sends exactly that range with the status and headers the application chose. It needs no access to application files |
+  | By descriptor (preferred) | WSGI: returning the object from wsgi.file_wrapper. ASGI: the http.response.pathsend or http.response.zerocopysend extensions (section 6.6) | The worker passes a duplicate of the open descriptor on the link, attached to a FILE frame with an offset and length (section 5.7). The edge sends exactly that range with the status and headers the application chose. It needs no access to application files |
   | By path | The X-Muru-Sendfile response header (X-Sendfile in compatibility mode), for frameworks and middleware stacks where the file object is not visible to the server | The edge opens the path itself, which must lie inside the mount's sendfile_roots and be readable by the edge's user. Paths outside are refused and logged. The edge serves the file with full static-file behaviour: Range, conditional requests, ETag and Last-Modified |
 
   Range handling: for descriptor hints the application has already decided the status and headers, so the edge never applies the client's Range itself. Frameworks that support ranges (Django, Starlette) compute the range and the worker passes the matching offset and length. For path hints and internal redirects to static routes, the edge handles ranges and conditional requests, because it serves the file itself.
@@ -293,7 +294,7 @@ listing = { enabled = true, sort = 'name', show_hidden = false, exclude = ['*.tm
 | avatar.sha256 | hash computed while receiving (and other algorithms listed in hash) |
 | avatar.ref | opaque reference to the stored file, unique within the request |
 
-The file contents are not in the body. Each stored file arrives at the worker as an open descriptor on the side channel (section 5.7), tagged with the request id and its ref. With upload = 'raw', the body is empty, CONTENT_LENGTH is 0, and a single stored file stands for the whole original body.
+The file contents are not in the body. Each stored file arrives at the worker as an open descriptor attached to the REQUEST frame (section 5.7), matched to its ref by order. With upload = 'raw', the body is empty, CONTENT_LENGTH is 0, and a single stored file stands for the whole original body.
 
 **The uploads API.** muru.uploads connects refs to files for the current request:
 

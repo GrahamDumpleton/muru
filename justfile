@@ -22,19 +22,19 @@ bootstrap:
     uv sync
     uv run pre-commit install
     uv run pre-commit install --hook-type commit-msg
-    @echo "bootstrap complete; run 'just dev' to build the extension once crates/muru-py exists"
+    just dev
 
 # Optional extras for the conformance suites (h2spec, Autobahn) and fuzzing.
 bootstrap-conformance:
-    @echo "not yet implemented: fetches h2spec and prepares the Autobahn image (phase 1)"
+    bash packaging/dev/fetch-h2spec.sh
 
 bootstrap-fuzz:
     rustup toolchain install nightly
     just _cargo-tool cargo-fuzz
 
-# Build the extension into the development virtualenv.
+# Build the extension into the development virtualenv. Run again after `uv sync`, which removes it.
 dev:
-    uv run maturin develop --manifest-path packages/muru/pyproject.toml
+    cd packages/muru && uv run --project ../.. maturin develop
 
 # Formatting, lints, types and repository text checks.
 lint: lint-text lint-rust lint-python
@@ -66,12 +66,14 @@ test-rust:
 test-python:
     uv run pytest
 
-# Integration scenarios that need no Docker or network.
-test-integration:
+# Integration scenarios that need no Docker or network (builds muructl and the extension first).
+test-integration: dev
+    cargo build -p muructl
     uv run pytest tests/integration
 
-# WSGI, ASGI, HTTP and WebSocket conformance suites.
-conformance:
+# WSGI, ASGI, HTTP and WebSocket conformance suites (builds muructl and the extension first).
+conformance: dev
+    cargo build -p muructl
     uv run pytest tests/conformance
 
 # Container scenarios (needs a container runtime).
@@ -87,12 +89,16 @@ fuzz target:
     cargo +nightly fuzz run {{target}}
 
 # Performance scenarios (Linux only for representative numbers).
-bench:
-    @echo "not yet implemented: see bench/README.md"
+bench *args:
+    uv run --group bench python bench/run.py {{args}}
 
 # Build the documentation with warnings as errors.
 docs:
     uv run sphinx-build -W --keep-going -b html docs docs/_build/html
+
+# Build the LaTeX source for the PDF, which Read the Docs turns into the PDF (no TeX needed here).
+docs-latex:
+    uv run sphinx-build -W --keep-going -b latex docs docs/_build/latex
 
 # Check documentation links.
 docs-linkcheck:
@@ -115,8 +121,13 @@ docs-open: docs
 vm-up:
     limactl start --name muru packaging/dev/lima.yaml
 
-vm-test:
-    @echo "not yet implemented: syncs the source into the VM and runs the suites over SSH"
+# Copy the source into the VM, build there, and run the unit and integration suites.
+vm-test *args:
+    limactl shell muru -- bash -lc "bash '{{justfile_directory()}}/packaging/dev/vm-run.sh' '{{justfile_directory()}}' test {{args}}"
+
+# Copy the source into the VM, build there, and run the benchmarks (see bench/README.md).
+vm-bench *args:
+    limactl shell muru -- bash -lc "bash '{{justfile_directory()}}/packaging/dev/vm-run.sh' '{{justfile_directory()}}' bench {{args}}"
 
 vm-shell:
     limactl shell muru
@@ -136,7 +147,15 @@ bump version:
 
 # Preview the changelog that the fragments would produce.
 changelog-draft:
-    uv run towncrier build --draft
+    uv run towncrier build --draft --version "$(just version-pep440)"
+
+# Build the changelog from the fragments, for the release pull request.
+changelog:
+    uv run towncrier build --yes --version "$(just version-pep440)"
+
+# Print the project version in PEP 440 form, as PyPI shows it.
+version-pep440:
+    @uv run python -c "from packaging.version import Version; print(Version('$(just version)'))"
 
 # Remove build output.
 clean:

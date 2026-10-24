@@ -10,7 +10,8 @@ with attestations, so no long-lived tokens exist. The design is in
 
 1. Release pull request from `develop` to `main`: version bump with
    `just bump X.Y.Z` (Cargo.toml is the only place the version is stated),
-   changelog built from the towncrier fragments, documentation updated.
+   changelog built from the towncrier fragments (`just changelog`),
+   documentation updated.
 
 2. Merge, then tag `vX.Y.Z` on `main` (`git tag vX.Y.Z && git push origin
    vX.Y.Z`). The workflow refuses a tag that does not match Cargo.toml.
@@ -28,18 +29,19 @@ with attestations, so no long-lived tokens exist. The design is in
 ## Publishing setup
 
 Releases are published only by the release workflow, using PyPI trusted
-publishing (OpenID Connect), so no API tokens exist anywhere. The one-time
-setup, for each of the two distributions, is to register the workflow as a
-publisher on PyPI: project name `muru` (then `muructl`), owner
-`GrahamDumpleton`, repository `muru`, workflow `release.yml`, environment
-`pypi`. Before the first release this is done as a "pending publisher",
-which creates the project on first publish. PyPI may refuse a second
-pending publisher for the same workflow while the first is still pending;
-in that case publish the first distribution, register the second project's
-publisher (now that the first is a real publisher), and re-run the failed
-publish job. The publish step skips files that already exist on PyPI, so
-the re-run uploads only what is missing. The GitHub side is the `pypi`
+publishing (OpenID Connect), so no API tokens exist anywhere. Both
+distributions, `muru` and `muructl`, have the workflow registered as their
+publisher on PyPI: owner `GrahamDumpleton`, repository `muru`, workflow
+`release.yml`, environment `pypi`. The GitHub side is the `pypi`
 environment, limited to release tags and requiring a maintainer's approval.
+
+If a further distribution is ever added, register it on PyPI as a "pending
+publisher" with the same details before its first release; the project is
+created on first publish. PyPI accepts only one pending publisher for a
+given workflow at a time, so if the first release of two new distributions
+fails on the second one, register its publisher after the first has
+published and re-run the publish job. The publish step skips files that
+already exist on PyPI, so a re-run uploads only what is missing.
 
 TestPyPI is not used: the workflow installs every built wheel in a clean
 environment before publishing, and an upload-level problem on a pre-release
@@ -50,10 +52,10 @@ costs only a version number.
 Until the first usable version, every release is a pre-release of the 0.1.0
 line: `0.1.0-alpha.1` in Cargo.toml and the tag (`v0.1.0-alpha.1`), which
 is `0.1.0a1` on PyPI (maturin converts the version to PEP 440 form, and the
-release workflow checks the result). pip installs pre-releases only with
-`--pre` or an explicit version, while uv installs them by default when no
-final release exists, so nobody gets a non-functional package by accident.
-The first final release, `0.1.0`, is the first version that serves requests.
+release workflow checks the result). While a project has only pre-releases,
+pip and uv both install the newest of them by default; once a final release
+exists, later pre-releases need `--pre` or an explicit version. The first
+final release, `0.1.0`, is the first version that serves requests.
 
 ## Versioning
 
