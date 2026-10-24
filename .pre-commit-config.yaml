@@ -11,6 +11,13 @@ repos:
         language: system
         pass_filenames: false
 
+      - id: comment-spacing
+        stages: [pre-commit]
+        name: block comments have blank lines around them
+        entry: uv run python scripts/check-comment-spacing.py
+        language: system
+        types_or: [python, rust]
+
       - id: commit-message
         name: commit message has no agent attribution
         entry: sh scripts/check-commit-message.sh
