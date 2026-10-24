@@ -1,1 +1,0 @@
-Virtual hosts and TLS in the daemon: `[host.NAME]` and `[[route]]` tables applied with `muructl apply`, listeners with `tls = true` serving each host's certificate by SNI, a default host and 421 for unknown names, path-prefix routes, HTTPS redirects, `muructl host list` and `muructl route list`, and SERVER_NAME from the matched name.

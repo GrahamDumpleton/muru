@@ -1,1 +1,0 @@
-Running under systemd: the shipped unit starts the daemon as Type=notify and the daemon reports readiness with sd_notify; SIGTERM detaches it as `muructl daemon stop` does, `muructl daemon reload` (or SIGHUP) re-reads the `[proxy]` table, and `muructl daemon stop --timeout` bounds the wait for the daemon to exit.

@@ -1,1 +1,0 @@
-Trusted proxies: a `[proxy]` table in the daemon's configuration file names the peers whose Forwarded, X-Forwarded-For, -Proto, -Host, -Port, -Prefix and X-Real-IP headers are believed; forwarding headers from anyone else are removed, and the resolved client, scheme, host, port and prefix reach the application, with the proxy in `muru.proxy_addr`.

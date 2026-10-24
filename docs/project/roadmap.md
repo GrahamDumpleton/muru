@@ -29,7 +29,7 @@ development defaults and the loopback rule of section 13.1,
 `--print-config`, the read-only dashboard in `muructl run`, Flask and Django
 fixtures, and the many-threads stress test of section 6.11 on the
 free-threaded build. Sanitizer builds are a future idea (section 20.10).
-Phase 2 so far has the ASGI bridge: one event loop per worker, lifespan
+Phase 2 so far, released as 0.1.0a3, has the ASGI bridge: one event loop per worker, lifespan
 with its state, the sync thread pool, concurrency declared to the edge in
 HELLO, WebSockets relayed by the edge with the MESSAGE and CLOSE frames of
 section 5.6 and checked by the Autobahn suite, the ASGI conformance suite,

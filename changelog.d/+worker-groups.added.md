@@ -1,1 +1,0 @@
-Worker groups: `[groups.NAME]` tables in `[tool.muru]` or under a declared release give a release named groups with their own process and thread counts, selected by path prefix at the edge, with the group in `muru.context()` and `MURU_GROUP`.

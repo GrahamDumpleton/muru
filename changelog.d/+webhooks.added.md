@@ -1,1 +1,0 @@
-Event webhooks: `[[events.sink]]` entries in the daemon's configuration file deliver events as signed CloudEvents requests, filtered by type patterns and levels, in order and at least once from a cursor that survives receiver outages and daemon restarts.

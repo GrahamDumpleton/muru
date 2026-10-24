@@ -9,6 +9,72 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a3 (2026-10-25)
+
+### Added
+
+- Event webhooks: `[[events.sink]]` entries in the daemon's configuration file deliver events as signed CloudEvents requests, filtered by type patterns and levels, in order and at least once from a cursor that survives receiver outages and daemon restarts.
+- Logs under the daemon: `muructl logs APP[@RELEASE]` shows or follows a release's output and `muructl logs --access` the access log, whose records now name the application, release, host, group, mount and snapshot; `muructl logs reopen [--workers]` (or SIGUSR1 to the daemon) reopens every log file after logrotate has renamed them.
+- Mounts: `[mounts.NAME]` tables in `[tool.muru]` or under a declared release serve other entrypoints at path prefixes from the same workers, any mix of WSGI and ASGI, with the mount's path as `SCRIPT_NAME` or `root_path`.
+- Prometheus metrics: the daemon serves request counters, timing histograms, in-flight, queue depth and slot gauges and the workers ready at `/metrics` on the address `--metrics` or the `[metrics]` table names, `muructl metrics` prints the same text, and a development run serves it from the dashboard.
+- Python logging defaults: a `[tool.muru.logging.python]` table (or a declared release's `logging.python`) sets the root logger's level, the format of loggers without handlers (`standard`, `json` or a format string), warning capture and named loggers' levels before the application is imported, published as `MURU_LOG_LEVEL` and `MURU_LOG_FORMAT`, with `muru.logging.default_config()` giving the same defaults as a `dictConfig` dictionary.
+- Running under systemd: the shipped unit starts the daemon as Type=notify and the daemon reports readiness with sd_notify; SIGTERM detaches it as `muructl daemon stop` does, `muructl daemon reload` (or SIGHUP) re-reads the `[proxy]` table, and `muructl daemon stop --timeout` bounds the wait for the daemon to exit.
+- The daemon serves a read-only dashboard and JSON gateway on a loopback address given with `--dashboard` or a `[dashboard]` table: the node, every application's releases with their workers and slots, hosts and routes, recent requests, events and each serving release's log tail, with `/metrics` beside them.
+- The daemon: `muructl daemon start` (or `muructl up`) runs a daemon with
+  its own state store, runtime and log directories, and `muructl deploy APP
+  SOURCE` creates a release from a source directory, starts it, moves
+  traffic to it when every worker is ready and drains the release that
+  served before, so no request is refused during a deploy; the replaced
+  release stays warm for 30 minutes (`--retain`) so a rollback within that
+  window is instant. `muructl release
+  list` and `wait`, `rollback`, `drain`, `events` and `status` manage and
+  watch it; a release whose host dies is started again. The edge runs as a
+  process of its own on a socket the daemon binds and hands to it, and is
+  started again on the same socket if it dies. `daemon stop` detaches,
+  leaving the edge and the hosts serving for the next daemon to take over,
+  so a daemon restart costs no request; `daemon stop --shutdown` drains
+  and stops everything.
+- Trusted proxies: a `[proxy]` table in the daemon's configuration file names the peers whose Forwarded, X-Forwarded-For, -Proto, -Host, -Port, -Prefix and X-Real-IP headers are believed; forwarding headers from anyone else are removed, and the resolved client, scheme, host, port and prefix reach the application, with the proxy in `muru.proxy_addr`.
+- Virtual hosts and TLS in the daemon: `[host.NAME]` and `[[route]]` tables applied with `muructl apply`, listeners with `tls = true` serving each host's certificate by SNI, a default host and 421 for unknown names, path-prefix routes, HTTPS redirects, `muructl host list` and `muructl route list`, and SERVER_NAME from the matched name.
+- Worker groups: `[groups.NAME]` tables in `[tool.muru]` or under a declared release give a release named groups with their own process and thread counts, selected by path prefix at the edge, with the group in `muru.context()` and `MURU_GROUP`.
+- `muructl apply -f FILE or DIR` deploys the applications and releases a declarative file declares, with `--dry-run`, `--prune` and `--json`; `muructl config export` writes desired state as such a file and `muructl config diff -f` compares one with it. Release tables take a `source` key, which `muructl run --print-config` now writes.
+- `muructl run` now serves ASGI applications: an entrypoint whose callable is
+  a coroutine function, or one declared with `--interface asgi`, runs on one
+  event loop per worker with the lifespan protocol (startup before the worker
+  is ready, shutdown on stop, and the lifespan state copied into every
+  request's scope), request bodies as `http.request` messages,
+  `http.disconnect` when the client goes away or the response completes, a
+  sync thread pool for `asyncio.to_thread` and `sync_to_async`
+  (`--sync-threads`, default 8) and `--concurrency` (default 1000) requests
+  in flight per worker. WebSockets, trailers and the file extensions follow.
+- `muructl run` serves WebSockets to ASGI applications: the edge completes
+  the handshake once the application accepts (with its subprotocol and
+  headers), relays whole text and binary messages in both directions, carries
+  close codes each way, closes a socket with 1009 for a message over 1 MiB,
+  pings idle clients and closes a silent socket after five minutes. Closing
+  before accepting answers 403, and the `websocket.http.response` extension
+  lets the application decline with a full response. HTTP/2 extended CONNECT
+  is accepted as well.
+
+### Fixed
+
+- An application that fails after starting its response but before any of it
+  has reached the edge now gets the 500 error page, with the traceback in
+  development mode, instead of a dropped connection.
+- The edge binds its HTTPS listener together with the HTTP one, before it connects to the workers, so a client that finds one port open during start-up finds both.
+- `muructl run` now stops in order on SIGTERM as it does on Ctrl-C, and a host
+  whose parent has gone away still stops its workers; before, both could
+  leave worker processes running.
+
+### Documentation
+
+- Starlette, FastAPI and Django's ASGI handler now run through the test
+  suite under `muructl run`, including WebSockets and lifespan state, an
+  ASGI conformance suite pins the scope, message, lifespan and WebSocket
+  rules, the Autobahn test suite checks the WebSocket wire protocol, and a
+  how-to page covers the frameworks.
+
+
 ## 0.1.0a2 (2026-10-24)
 
 ### Added
