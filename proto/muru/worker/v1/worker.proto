@@ -93,6 +93,7 @@ message ResponseHead {
   uint32 status = 1;
   repeated Header headers = 2;      // ordered, as the application gave them
   FlushPolicy flush = 3;
+  string reason = 4;                // the application's reason phrase, for HTTP/1.1
 }
 
 // Payload of an END frame: the end of a body in one direction.

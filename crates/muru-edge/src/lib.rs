@@ -120,6 +120,9 @@ pub(crate) fn request_head(
         headers: parts
             .headers
             .iter()
+            // Section 4.7: a name with an underscore could masquerade as
+            // another header's HTTP_ key, so it never reaches the application.
+            .filter(|(name, _)| !name.as_str().contains('_'))
             .map(|(name, value)| pb::Header {
                 name: Bytes::copy_from_slice(name.as_str().as_bytes()),
                 value: Bytes::copy_from_slice(value.as_bytes()),

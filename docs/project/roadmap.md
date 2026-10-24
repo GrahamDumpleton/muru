@@ -13,9 +13,8 @@ criteria. The full table, with scope and exit criteria, is in
 | 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 0 complete on the code side, pending review.
-`muructl run` serves one WSGI application behind a preloaded, forked worker
-pool over the framed worker link chosen by
-[ADR 0021](adr/0021-framed-worker-link.md), on a fixed pool of long-lived
-application threads, and the benchmark harness compares it with gunicorn,
-uvicorn, Granian and mod_wsgi-express.
+Current position: phase 1 in progress. Phase 0 landed the framed worker
+link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a fixed pool of
+long-lived application threads and the benchmark harness. Phase 1 has
+started with the WSGI conformance suite (`just conformance`) and the bridge
+behaviour it pins down.

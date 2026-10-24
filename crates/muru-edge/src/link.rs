@@ -295,6 +295,11 @@ pub async fn handle(
     if let Some(headers) = builder.headers_mut() {
         crate::copy_headers(headers, head.headers);
     }
+    if !head.reason.is_empty()
+        && let Ok(reason) = hyper::ext::ReasonPhrase::try_from(head.reason.into_bytes())
+    {
+        builder = builder.extension(reason);
+    }
     if response_end {
         back.give_reader(Some(reader));
         let empty = Empty::<Bytes>::new()

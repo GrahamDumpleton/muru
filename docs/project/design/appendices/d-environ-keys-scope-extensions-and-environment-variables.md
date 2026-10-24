@@ -24,7 +24,7 @@ specification is maintained.
 | wsgi.version, wsgi.url_scheme, wsgi.input, wsgi.errors | as PEP 3333; wsgi.errors writes to the worker's stderr stream |
 | wsgi.multithread, wsgi.multiprocess, wsgi.run_once | section 6.5 |
 | wsgi.input_terminated | always True |
-| wsgi.file_wrapper | descriptor-based file hints |
+| wsgi.file_wrapper | the muru._native.FileWrapper class: block iteration, descriptor passing when the wrapper is returned as the iterable (section 6.5) |
 | muru.wsgi_to_asgi | the handoff object of section 6.14, present when the worker has an event loop |
 | muru.state | the ASGI scope state of a request handed from ASGI to WSGI (section 6.14) |
 | muru.request_id, muru.release, muru.group, muru.mount | request and placement |

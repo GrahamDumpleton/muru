@@ -6,4 +6,5 @@ listed in section 15.2 of the design specification. They are added from
 phase 1 onwards.
 
 Run with `just test-integration`. Scenarios that need Docker, network, root or
-a long time carry markers and are skipped by default.
+a long time carry markers and are skipped by default. Helpers for starting
+muructl and talking to it are in `tests/support`.

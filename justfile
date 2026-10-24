@@ -71,8 +71,9 @@ test-integration: dev
     cargo build -p muructl
     uv run pytest tests/integration
 
-# WSGI, ASGI, HTTP and WebSocket conformance suites.
-conformance:
+# WSGI, ASGI, HTTP and WebSocket conformance suites (builds muructl and the extension first).
+conformance: dev
+    cargo build -p muructl
     uv run pytest tests/conformance
 
 # Container scenarios (needs a container runtime).

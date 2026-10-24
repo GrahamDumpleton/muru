@@ -100,7 +100,7 @@ jobs:
       - run: uv sync --only-group dev --python ${{ matrix.python }}
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
-      - run: uv run pytest tests/integration
+      - run: uv run pytest tests/integration tests/conformance
 
   python:
     runs-on: ${{ matrix.os }}

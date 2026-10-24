@@ -252,22 +252,38 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 }
                 if !buffer.is_empty() {
                     let data = buffer.split().freeze();
-                    write_body(writer, &mut pending_head, &mut head_written, data, true).await?;
-                    return Ok(());
+                    sent += data.len() as u64;
+                    let short = content_length.is_some_and(|length| sent < length);
+                    write_body(writer, &mut pending_head, &mut head_written, data, !short).await?;
+                    if !short {
+                        return Ok(());
+                    }
                 }
                 if let Some(head) = pending_head.take() {
-                    return frame::write(writer, kind::RESPONSE, flag::END, head).await;
+                    if content_length.is_some_and(|length| length > 0) {
+                        frame::write(writer, kind::RESPONSE, 0, head).await?;
+                        head_written = true;
+                    } else {
+                        return frame::write(writer, kind::RESPONSE, flag::END, head).await;
+                    }
                 }
                 if !head_written {
                     // Nothing at all arrived: the bridge always sends a head, so
                     // this means the application thread died.
                     return Ok(());
                 }
-                let end = pb::End::default().encode_to_vec();
-                return frame::write(writer, kind::END, 0, end.into()).await;
+                let mut end = pb::End::default();
+                if let Some(length) = content_length.filter(|&length| sent < length) {
+                    end.error = format!(
+                        "the response ended after {sent} of the {length} bytes its Content-Length declared"
+                    );
+                    eprintln!("muru: {}", end.error);
+                }
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
             }
             Some(Some(Outgoing::Head {
                 status,
+                reason,
                 headers,
                 flush,
             })) => {
@@ -278,6 +294,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     .and_then(|(_, value)| std::str::from_utf8(value).ok()?.trim().parse().ok());
                 let head = pb::ResponseHead {
                     status,
+                    reason,
                     headers: headers
                         .into_iter()
                         .map(|(name, value)| pb::Header {
@@ -296,9 +313,16 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     ended = true;
                 }
             }
-            Some(Some(Outgoing::Body(data))) => {
+            Some(Some(Outgoing::Body(mut data))) => {
                 if ended {
                     continue;
+                }
+                // Nothing beyond the declared Content-Length is sent.
+                if let Some(length) = content_length {
+                    let remaining = length.saturating_sub(sent + buffer.len() as u64);
+                    if (data.len() as u64) > remaining {
+                        data.truncate(usize::try_from(remaining).unwrap_or(usize::MAX));
+                    }
                 }
                 if immediate || !first_block_sent {
                     first_block_sent = true;
