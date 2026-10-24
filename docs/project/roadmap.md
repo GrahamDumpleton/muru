@@ -25,5 +25,10 @@ watch reload, tagged worker output, Flask and Django fixtures, the
 minimal read-only dashboard in `muructl run`, the HTTP/1.1 parsing corpus
 and HTTPS in development with certificates from mkcert or self-signed
 ([ADR 0024](adr/0024-ring-tls-provider.md) picks the ring provider).
-Before phase 1 closes, its exit criteria in section 14.5 are checked end to
-end against the fixtures and a real project.
+Also in: projects run from their `[tool.muru]` table with factories and
+interface detection, `--port auto` and the port-in-use message, the
+development defaults of section 13.1, `--print-config`, and the many-threads
+stress test of section 6.11, which the VM runs on the free-threaded build.
+Still to come from phase 1: the nightly ThreadSanitizer build of the
+extension, and the check of the exit criteria in section 14.5 against a
+real project.
