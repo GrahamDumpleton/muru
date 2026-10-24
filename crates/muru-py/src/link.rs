@@ -2,13 +2,15 @@
 //! connections kept open (design specification section 5).
 //!
 //! Each connection is served by one task. It reads a REQUEST frame, runs the
-//! request on an application thread, forwards BODY frames to `wsgi.input`
-//! until the request body ends or the edge sends ABORT, and writes the
-//! response as RESPONSE, BODY and END frames, coalescing small chunks as
-//! section 5.4 describes. A CONTINUE frame goes out when the application
-//! first reads a body the client is holding back (section 5.5). When both directions have ended the connection is
-//! idle again and the next REQUEST may follow. The edge closing the
-//! connection cancels the request.
+//! request on an application thread (WSGI) or as a task on the event loop
+//! (ASGI), forwards BODY frames to `wsgi.input` or the application's
+//! `receive()` until the request body ends or the edge sends ABORT, and
+//! writes the response as RESPONSE, BODY and END frames, coalescing small
+//! chunks as section 5.4 describes. A CONTINUE frame goes out when the
+//! application first reads a body the client is holding back (section
+//! 5.5). When both directions have ended the connection is idle again and
+//! the next REQUEST may follow. The edge closing the connection cancels
+//! the request.
 
 use std::io;
 use std::sync::Arc;
@@ -25,8 +27,13 @@ use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
+use crate::asgi;
 use crate::pool::Shared;
 use crate::wsgi::{self, Outgoing};
+
+/// How long the event loop's requests may take to finish on drain, until
+/// drain timeouts arrive with the daemon.
+const DRAIN_WAIT: Duration = Duration::from_secs(30);
 
 /// Errors from the link server.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -96,10 +103,20 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         Ok(())
     });
 
-    // Requests already running finish on their threads while the runtime
-    // still carries their responses; then everything stops.
+    // Requests already running finish on their threads, or on the event
+    // loop, while the runtime still carries their responses; then
+    // everything stops.
     Lifecycle::call(lifecycle.on_drain.as_ref());
     shared.pool.shutdown();
+
+    // The pool joins its threads; the loop's requests are waited for here.
+    if shared.asgi.is_some() {
+        let deadline = Instant::now() + DRAIN_WAIT;
+        while shared.in_flight() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
     served
@@ -150,11 +167,21 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         }
         _ => return,
     }
-    let hello = pb::Hello {
-        protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-        worker_type: "wsgi".to_owned(),
-        slots: u32::try_from(shared.threads).unwrap_or(u32::MAX),
-        ..Default::default()
+    // Section 5.1: the edge acts on what HELLO declares. A WSGI worker
+    // runs requests on its threads, an ASGI worker on its loop.
+    let hello = match &shared.asgi {
+        Some(asgi) => pb::Hello {
+            protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+            worker_type: "asgi".to_owned(),
+            async_slots: u32::try_from(asgi.concurrency).unwrap_or(u32::MAX),
+            ..Default::default()
+        },
+        None => pb::Hello {
+            protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+            worker_type: "wsgi".to_owned(),
+            slots: u32::try_from(shared.threads).unwrap_or(u32::MAX),
+            ..Default::default()
+        },
     };
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
         .await
@@ -163,20 +190,68 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         return;
     }
 
+    let mut early: Option<frame::Frame> = None;
     loop {
-        let request = match frame::read(&mut reader).await {
-            Ok(Some(request)) if request.kind == kind::REQUEST => request,
-            _ => return,
+        let request = match early.take() {
+            Some(request) => request,
+            None => match frame::read(&mut reader).await {
+                Ok(Some(request)) if request.kind == kind::REQUEST => request,
+                // An ABORT for a response that had already ended when the
+                // edge sent it: nothing to do.
+                Ok(Some(request)) if request.kind == kind::ABORT => continue,
+                _ => return,
+            },
         };
         let request_end = request.is_end();
         let Ok(head) = pb::RequestHead::decode(request.payload) else {
             return;
         };
-        if handle_request(&mut reader, &mut writer, head, request_end, &shared)
-            .await
-            .is_err()
-        {
-            return;
+
+        match handle_request(&mut reader, &mut writer, head, request_end, &shared).await {
+            Ok(next) => early = next,
+            Err(_) => return,
+        }
+    }
+}
+
+/// What the request direction brought while the response was in progress.
+enum Interrupt {
+    /// The response completed; nothing more to watch for.
+    Done,
+    /// The edge has no more use for the request: the client has gone.
+    Abort,
+    /// The edge closed the connection.
+    Closed,
+    /// The next request, when the edge saw the response end before this
+    /// side stopped watching.
+    Request(frame::Frame),
+}
+
+/// After the request body has ended, keep watching the request direction
+/// until the response completes, for an ABORT (the client went away) or
+/// the edge closing the connection. Waiting on the buffer rather than a
+/// frame keeps the wait cancel-safe: a frame is only read once its first
+/// bytes are there, and then in full.
+async fn watch_request(reader: &mut Reader, done: &tokio::sync::Notify) -> io::Result<Interrupt> {
+    use tokio::io::AsyncBufReadExt;
+
+    tokio::select! {
+        biased;
+        _ = done.notified() => Ok(Interrupt::Done),
+        buffered = reader.fill_buf() => {
+            if buffered?.is_empty() {
+                return Ok(Interrupt::Closed);
+            }
+
+            match frame::read(reader).await? {
+                None => Ok(Interrupt::Closed),
+                Some(next) if next.kind == kind::ABORT => Ok(Interrupt::Abort),
+                Some(next) if next.kind == kind::REQUEST => Ok(Interrupt::Request(next)),
+                Some(next) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected frame type {} after the request body", next.kind),
+                )),
+            }
         }
     }
 }
@@ -191,10 +266,15 @@ async fn handle_request(
     head: pb::RequestHead,
     request_end: bool,
     shared: &Arc<Shared>,
-) -> io::Result<()> {
+) -> io::Result<Option<frame::Frame>> {
+    if let Some(asgi) = &shared.asgi {
+        return handle_asgi_request(reader, writer, head, request_end, shared, asgi).await;
+    }
+
     let cancelled = Arc::new(AtomicBool::new(false));
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
+    let done = tokio::sync::Notify::new();
     shared.request_started();
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
@@ -209,53 +289,177 @@ async fn handle_request(
 
     let read_side = async {
         let mut body_tx = Some(body_tx);
-        if request_end {
-            return Ok(());
-        }
-        loop {
-            let Some(next) = frame::read(reader).await? else {
-                cancelled.store(true, Ordering::Relaxed);
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the edge closed the connection during the request body",
-                ));
-            };
-            let end = next.is_end();
-            match next.kind {
-                kind::BODY => {
-                    if let Some(tx) = &body_tx
-                        && !next.payload.is_empty()
-                        && tx.send(next.payload).await.is_err()
-                    {
-                        // The application stopped reading; discard the rest.
-                        body_tx = None;
+        if !request_end {
+            loop {
+                let Some(next) = frame::read(reader).await? else {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the request body",
+                    ));
+                };
+                let end = next.is_end();
+                match next.kind {
+                    kind::BODY => {
+                        if let Some(tx) = &body_tx
+                            && !next.payload.is_empty()
+                            && tx.send(next.payload).await.is_err()
+                        {
+                            // The application stopped reading; discard the rest.
+                            body_tx = None;
+                        }
+                        if end {
+                            break;
+                        }
                     }
-                    if end {
+                    kind::END => break,
+                    kind::ABORT => {
+                        // The edge has no more use for the request. Whatever
+                        // the application has not read is gone, and its
+                        // iteration stops; the connection stays usable.
+                        cancelled.store(true, Ordering::Relaxed);
                         break;
                     }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected frame type {other} in a request body"),
+                        ));
+                    }
                 }
-                kind::END => break,
-                kind::ABORT => {
-                    // The edge has no more use for the request. Whatever the
-                    // application has not read is gone, and its iteration
-                    // stops; the connection stays usable.
+            }
+        }
+        drop(body_tx);
+
+        // Section 5.5: a client that goes away while the response is in
+        // progress is an ABORT, which stops the iteration.
+        loop {
+            match watch_request(reader, &done).await? {
+                Interrupt::Done => return Ok(None),
+                Interrupt::Request(next) => return Ok(Some(next)),
+                Interrupt::Abort => cancelled.store(true, Ordering::Relaxed),
+                Interrupt::Closed => {
                     cancelled.store(true, Ordering::Relaxed);
-                    break;
-                }
-                other => {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected frame type {other} in a request body"),
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the response",
                     ));
                 }
             }
         }
-        Ok(())
     };
-    let write_side = write_response(out_rx, writer);
+    let write_side = async {
+        let result = write_response(out_rx, writer).await;
+        done.notify_one();
+        result
+    };
+
     let (read_result, write_result) = tokio::join!(read_side, write_side);
-    read_result?;
-    write_result
+    let early = read_result?;
+    write_result?;
+    Ok(early)
+}
+
+/// Run one request as a task on the event loop: body frames become
+/// `http.request` messages for the application's `receive()`, ABORT or the
+/// end of the response becomes `http.disconnect`, and the output goes
+/// through the same coalescing writer as a WSGI response.
+async fn handle_asgi_request(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    head: pb::RequestHead,
+    request_end: bool,
+    shared: &Arc<Shared>,
+    asgi: &asgi::Asgi,
+) -> io::Result<Option<frame::Frame>> {
+    let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
+    let done = tokio::sync::Notify::new();
+
+    // The task starts on the loop now; the channel is how the two sides
+    // of this function reach it.
+    shared.request_started();
+    let channel = match asgi::start(shared, asgi, &head, out_tx) {
+        Ok(channel) => channel,
+        Err(error) => {
+            shared.request_finished();
+            return Err(io::Error::other(format!(
+                "the worker is shutting down: {error}"
+            )));
+        }
+    };
+    let channel = channel.get();
+
+    let read_side = async {
+        if request_end {
+            channel.deliver(Bytes::new(), false).await;
+        } else {
+            loop {
+                let Some(next) = frame::read(reader).await? else {
+                    channel.disconnect();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the request body",
+                    ));
+                };
+                let end = next.is_end();
+                match next.kind {
+                    kind::BODY => {
+                        if !next.payload.is_empty() || end {
+                            channel.deliver(next.payload, !end).await;
+                        }
+                        if end {
+                            break;
+                        }
+                    }
+                    kind::END => {
+                        channel.deliver(Bytes::new(), false).await;
+                        break;
+                    }
+                    kind::ABORT => {
+                        channel.disconnect();
+                        break;
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected frame type {other} in a request body"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Section 5.5: the client going away is http.disconnect.
+        loop {
+            match watch_request(reader, &done).await? {
+                Interrupt::Done => return Ok(None),
+                Interrupt::Request(next) => return Ok(Some(next)),
+                Interrupt::Abort => channel.disconnect(),
+                Interrupt::Closed => {
+                    channel.disconnect();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during the response",
+                    ));
+                }
+            }
+        }
+    };
+    let write_side = async {
+        let result = write_response(out_rx, writer).await;
+        channel.complete();
+        done.notify_one();
+        result
+    };
+
+    // The response is over: a receive() still waiting gets http.disconnect.
+    let (read_result, write_result) = tokio::join!(read_side, write_side);
+    channel.disconnect();
+    shared.request_finished();
+
+    let early = read_result?;
+    write_result?;
+    Ok(early)
 }
 
 /// Turn the application's output into frames, coalescing small chunks.
@@ -434,9 +638,10 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     )
                     .await?;
                 }
-                if let Some(head) = pending_head.take() {
-                    frame::write(writer, kind::RESPONSE, 0, head).await?;
-                }
+                // A head the writer was still holding never reached the
+                // edge, so the failure is reported in its place and the
+                // edge answers with its error page.
+                pending_head.take();
                 let end = pb::End {
                     error,
                     reason,

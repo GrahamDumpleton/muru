@@ -2,7 +2,7 @@
 
 The entrypoint comes from the command line or from a project's [tool.muru]
 table, a factory is called per worker or in the host, and an ASGI
-entrypoint is refused until phase 2.
+entrypoint, detected or declared, is served on the event loop.
 """
 
 from __future__ import annotations
@@ -109,28 +109,30 @@ def test_factory_flag_on_the_command_line() -> None:
 
 
 @pytest.mark.parametrize(
-    ("entrypoint", "args", "expected"),
+    ("entrypoint", "args"),
     [
-        ("factory_site:asgi_app", [], "is an ASGI application (detected)"),
-        (
-            "factory_site:AsgiCallable",
-            ["--factory", "--interface", "auto"],
-            "is an ASGI application (detected)",
-        ),
-        (
-            "factory_site:create_app",
-            ["--factory", "--interface", "asgi"],
-            "is an ASGI application (declared)",
-        ),
+        ("factory_site:asgi_app", []),
+        ("factory_site:AsgiCallable", ["--factory", "--interface", "auto"]),
+        ("factory_site:asgi_app", ["--interface", "asgi"]),
     ],
 )
-def test_asgi_entrypoints_are_refused_with_a_clear_message(
-    entrypoint: str, args: list[str], expected: str
-) -> None:
+def test_asgi_entrypoints_are_served_on_the_event_loop(entrypoint: str, args: list[str]) -> None:
+    server = support.start(entrypoint, chdir=PROJECTS / "factory", args=args)
+    try:
+        response = server.get("/")
+        assert response.status == 200
+        assert response.body == b"asgi\n"
+        assert " as ASGI" in server.log()
+    finally:
+        server.stop()
+
+
+def test_a_coroutine_declared_wsgi_is_refused() -> None:
     with pytest.raises(RuntimeError) as failure:
-        support.start(entrypoint, chdir=PROJECTS / "factory", args=args)
-    assert expected in str(failure.value)
-    assert "ASGI arrives in phase 2" in str(failure.value)
+        support.start(
+            "factory_site:asgi_app", chdir=PROJECTS / "factory", args=["--interface", "wsgi"]
+        )
+    assert "is declared WSGI but is a coroutine function" in str(failure.value)
 
 
 def test_missing_entrypoint_is_a_clear_error(tmp_path: Path) -> None:

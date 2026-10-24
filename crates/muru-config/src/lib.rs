@@ -178,6 +178,12 @@ pub struct Release {
     /// Application threads per worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
+    /// Threads for synchronous code called from an ASGI application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_threads: Option<usize>,
+    /// Requests an ASGI worker's event loop takes at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
     /// The preload mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<Preload>,
@@ -280,6 +286,13 @@ pub struct ToolMuru {
     /// Application threads per worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
+    /// Threads for synchronous code called from an ASGI application
+    /// (section 6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_threads: Option<usize>,
+    /// Requests an ASGI worker's event loop takes at once (section 6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
     /// The preload mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<Preload>,

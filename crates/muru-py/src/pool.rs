@@ -17,6 +17,8 @@ use std::thread::JoinHandle;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use crate::asgi::Asgi;
+
 /// A unit of work for an application thread.
 pub type Job = Box<dyn for<'py> FnOnce(Python<'py>) + Send + 'static>;
 
@@ -30,6 +32,8 @@ pub struct Shared {
     pub threads: usize,
     /// wsgi.multiprocess: False only for single-process development runs (section 6.5).
     pub multiprocess: bool,
+    /// The event loop side, when the application is ASGI (section 6.6).
+    pub asgi: Option<Asgi>,
     /// The application thread pool.
     pub pool: Pool,
     in_flight: AtomicU32,
@@ -43,6 +47,7 @@ impl Shared {
         errors: Py<PyAny>,
         threads: usize,
         multiprocess: bool,
+        asgi: Option<Asgi>,
     ) -> std::io::Result<Self> {
         let threads = threads.max(1);
         Ok(Self {
@@ -50,6 +55,7 @@ impl Shared {
             errors,
             threads,
             multiprocess,
+            asgi,
             pool: Pool::start(threads)?,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
@@ -65,6 +71,11 @@ impl Shared {
     /// Count a request as finished.
     pub fn request_finished(&self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Requests started and not yet finished.
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::Relaxed)
     }
 }
 

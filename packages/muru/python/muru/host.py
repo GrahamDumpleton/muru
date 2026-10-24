@@ -35,11 +35,11 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Any
 
-from muru import preload
+from muru import _asgi, preload
 from muru._context import Context
 from muru._context import _set as set_context
 from muru.hooks import Hooks
@@ -65,7 +65,13 @@ def log(message: str) -> None:
     """Write one line to standard error, prefixed so it can be told from application output."""
 
     prefix = "" if _in_worker else f"muru.host[{os.getpid()}]: "
-    print(f"{prefix}{message}", file=sys.stderr, flush=True)
+
+    # The parent that reads this stream may already be gone, and a log line
+    # lost then must not stop the host from stopping its workers.
+    try:
+        print(f"{prefix}{message}", file=sys.stderr, flush=True)
+    except OSError:
+        pass
 
 
 INTERFACES = ("auto", "wsgi", "asgi")
@@ -104,22 +110,24 @@ def detect_interface(app: Any) -> str:
     return "wsgi"
 
 
-def ensure_wsgi(spec: str, app: Any, interface: str) -> WSGIApplication:
-    """Check that the application can be served by the WSGI bridge.
+def resolve_interface(spec: str, app: Any, interface: str) -> str:
+    """Return the interface the application is served with: ``wsgi`` or ``asgi``.
 
-    ASGI arrives in phase 2; until then an ASGI entrypoint, declared or
-    detected, is a clear error rather than a confusing one.
+    ``auto`` detects it from the callable. A declared interface is trusted,
+    except that an application declared WSGI whose callable is a coroutine
+    function cannot be served that way and is refused.
     """
 
     detected = detect_interface(app)
-    if interface == "asgi" or (interface == "auto" and detected == "asgi"):
-        how = "declared" if interface == "asgi" else "detected"
+    if interface == "auto":
+        return detected
+
+    if interface == "wsgi" and detected == "asgi":
         raise RuntimeError(
-            f"{spec} is an ASGI application ({how}); only WSGI is served in phase 1, "
-            "ASGI arrives in phase 2"
+            f"{spec} is declared WSGI but is a coroutine function; declare it as asgi or "
+            "leave the interface to be detected"
         )
-    wsgi: WSGIApplication = app
-    return wsgi
+    return interface
 
 
 def app_name(spec: str) -> str:
@@ -129,8 +137,11 @@ def app_name(spec: str) -> str:
     return module_name.split(".")[0] or "default"
 
 
-def process_model(threads: int) -> str:
-    """Name the process model of section 6.4 for a WSGI release."""
+def process_model(threads: int, interface: str = "wsgi") -> str:
+    """Name the process model of section 6.4 for a release."""
+
+    if interface == "asgi":
+        return "async"
 
     gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
     if not gil_enabled:
@@ -145,12 +156,15 @@ class Release:
     spec: str
     hooks_module: str | None
     context: Context
+    threads: int = 1
     interface: str = "auto"
     factory: bool = False
     factory_phase: str = "worker"
     target: Any = None
-    app: WSGIApplication | None = None
+    app: Any = None
     hooks: Hooks | None = None
+    resolved: str | None = None
+    """The interface the application is served with, once it is known."""
 
     @property
     def preloaded(self) -> bool:
@@ -171,18 +185,31 @@ class Release:
         self.hooks = Hooks.load(self.hooks_module)
         self.target = resolve_app(self.spec, import_module)
         if not self.factory:
-            self.app = ensure_wsgi(self.spec, self.target, self.interface)
+            self.accept(self.target)
         elif self.factory_phase == "host":
-            self.app = ensure_wsgi(self.spec, self.target(), self.interface)
+            self.accept(self.target())
         return self.hooks
 
-    def realise(self) -> WSGIApplication:
+    def accept(self, app: Any) -> None:
+        """Keep the application and settle the interface it is served with."""
+
+        self.resolved = resolve_interface(self.spec, app, self.interface)
+        self.app = app
+
+        # The context tells hooks and the application what they run under.
+        self.context = replace(
+            self.context,
+            interface=self.resolved,
+            process_model=process_model(self.threads, self.resolved),
+        )
+
+    def realise(self) -> Any:
         """Return the application to serve, calling a per-worker factory now."""
 
         if self.app is None:
             if self.target is None:
                 raise RuntimeError(f"{self.spec} was not loaded")
-            self.app = ensure_wsgi(self.spec, self.target(), self.interface)
+            self.accept(self.target())
         return self.app
 
 
@@ -230,12 +257,16 @@ class Host:
         workers: int,
         threads: int,
         tcp_base_port: int | None = None,
+        sync_threads: int = 8,
+        concurrency: int = 1000,
     ) -> None:
         self.release = release
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.worker_count = workers
         self.threads = threads
+        self.sync_threads = sync_threads
+        self.concurrency = concurrency
         self.workers: dict[int, int] = {}
         self.stopping = False
         self.restart_after: dict[int, float] = {}
@@ -309,16 +340,11 @@ class Host:
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGCHLD):
             signal.signal(signum, signal.SIG_DFL)
         release = self.release
-        context = Context(
-            app=release.context.app,
-            release=release.context.release,
-            group=release.context.group,
-            worker_id=index,
-            interface=release.context.interface,
-            process_model=release.context.process_model,
-        )
+        context = replace(release.context, worker_id=index)
         set_context(context)
 
+        loop: _asgi.Loop | None = None
+        lifespan: _asgi.Lifespan | None = None
         try:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
@@ -330,26 +356,63 @@ class Host:
                 hooks.call("on_load", context)
                 hooks.call("pre_fork", context)
             hooks.call("post_fork", context)
-            # Section 6.8: a factory is called per worker, after post_fork.
+
+            # Section 6.8: a factory is called per worker, after post_fork,
+            # and only then is the interface known for certain.
+            known = release.resolved is not None
             app = release.realise()
+            context = replace(release.context, worker_id=index)
+            set_context(context)
+            if not known and release.resolved is not None:
+                log(f"worker {index} serves {release.spec} as {release.resolved.upper()}")
+
+            # Section 6.6: one event loop per worker, started after the
+            # fork, and lifespan startup before the worker is ready.
+            if release.resolved == "asgi":
+                loop = _asgi.Loop(self.sync_threads)
+                loop.start()
+                lifespan = _asgi.Lifespan(app, loop, release.spec)
+                lifespan.startup()
+
             hooks.call("on_ready", context)
         except Exception as error:
             log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
             traceback.print_exc()
+            if loop is not None:
+                loop.stop()
             return 1
 
         from muru import _native
+
+        def on_exit() -> None:
+            """Run lifespan shutdown and the hook, then stop the loop."""
+
+            if lifespan is not None:
+                lifespan.shutdown()
+            hooks.call_logged("on_exit", context)
+            if loop is not None:
+                loop.stop()
+
+        # An ASGI worker hands the extension its loop and the request runner.
+        asgi_arguments: dict[str, Any] = {}
+        if loop is not None and lifespan is not None:
+            asgi_arguments = {
+                "event_loop": loop.loop,
+                "runner": _asgi.runner(app, loop, lifespan.state),
+                "concurrency": self.concurrency,
+            }
 
         try:
             _native.serve(
                 self.socket_path(index),
                 app,
-                self.threads,
+                self.threads if loop is None else 1,
                 # Section 6.5: False only for a single-process development run.
                 multiprocess=self.worker_count > 1,
                 on_drain=lambda: hooks.call_logged("on_drain", context),
-                on_exit=lambda: hooks.call_logged("on_exit", context),
+                on_exit=on_exit,
                 on_reopen_logs=lambda: hooks.call_logged("on_reopen_logs", context),
+                **asgi_arguments,
             )
         except Exception as error:
             log(f"worker {index} failed: {error}")
@@ -552,6 +615,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--threads", type=int, default=4, help="application threads per worker")
     parser.add_argument(
+        "--sync-threads",
+        type=int,
+        default=8,
+        help="threads for synchronous code called from an ASGI application",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1000,
+        help="requests an ASGI worker's event loop takes at once",
+    )
+    parser.add_argument(
         "--preload",
         choices=PRELOAD_MODES,
         default="auto",
@@ -610,6 +685,7 @@ def main(argv: list[str] | None = None) -> int:
         args.app,
         args.hooks,
         context,
+        threads=args.threads,
         interface=args.interface,
         factory=args.factory,
         factory_phase=args.factory_phase,
@@ -628,6 +704,13 @@ def main(argv: list[str] | None = None) -> int:
             if not hooks.call_logged("on_load", context):
                 return 1
         log(f"preloaded {args.app} in {elapsed_ms(started)} ms")
+
+        # A preloaded application has settled its interface by now; a
+        # per-worker factory settles it in each worker.
+        if release.resolved is not None:
+            set_context(release.context)
+            log(f"{args.app} is served as {release.resolved.upper()}")
+
         findings = recorder.findings()
         if findings:
             for finding in findings:
@@ -655,7 +738,15 @@ def main(argv: list[str] | None = None) -> int:
             gc.collect()
 
     os.makedirs(args.socket_dir, exist_ok=True)
-    host = Host(release, args.socket_dir, args.processes, args.threads, args.tcp_base_port)
+    host = Host(
+        release,
+        args.socket_dir,
+        args.processes,
+        args.threads,
+        args.tcp_base_port,
+        sync_threads=args.sync_threads,
+        concurrency=args.concurrency,
+    )
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees
         # the application. The hooks run as they would in a worker.

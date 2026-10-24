@@ -160,13 +160,16 @@ impl StartResponse {
         );
     }
 
-    fn abort(&self, py: Python<'_>, message: &str) {
+    /// The application failed after start_response: the edge reports the
+    /// error if no output had reached it yet, and truncates the response
+    /// otherwise.
+    fn abort(&self, py: Python<'_>, message: &str, detail: String) {
         self.sink.send(
             py,
             Outgoing::Abort {
                 error: message.to_owned(),
                 reason: "app_error".to_owned(),
-                detail: String::new(),
+                detail,
             },
         );
     }
@@ -340,7 +343,7 @@ impl AsRef<[u8]> for PyBytesOwner {
 }
 
 /// Turn a Python bytes object into `Bytes`, without copying large ones.
-fn bytes_from_py(chunk: &Bound<'_, PyBytes>) -> Bytes {
+pub(crate) fn bytes_from_py(chunk: &Bound<'_, PyBytes>) -> Bytes {
     let data = chunk.as_bytes();
     if data.len() <= COPY_LIMIT {
         Bytes::copy_from_slice(data)
@@ -376,7 +379,7 @@ fn parse_status(status: &str) -> PyResult<(u32, String)> {
 }
 
 /// Responses that must not be buffered flush immediately (section 5.4).
-fn flush_policy(headers: &[(Vec<u8>, Vec<u8>)]) -> pb::FlushPolicy {
+pub(crate) fn flush_policy(headers: &[(Vec<u8>, Vec<u8>)]) -> pb::FlushPolicy {
     for (name, value) in headers {
         if name.eq_ignore_ascii_case(b"content-type")
             && value
@@ -568,7 +571,7 @@ fn latin1(bytes: &[u8]) -> String {
 }
 
 /// Decode `%XX` escapes. Other bytes, including `+`, are left alone.
-fn percent_decode(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn percent_decode(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut index = 0;
     while index < raw.len() {
@@ -729,7 +732,11 @@ pub fn run(
         if !start_response.head_sent() {
             start_response.fail(py, describe(py, &error));
         } else if !broken_pipe {
-            start_response.abort(py, "the application failed after the response started");
+            start_response.abort(
+                py,
+                "the application raised an exception",
+                describe(py, &error),
+            );
         }
     }
     let sink = Sink { tx: finished };
@@ -766,7 +773,7 @@ fn run_app<'py>(
 /// and an application raising SystemExit is a failed request, not a reason
 /// to stop serving.
 /// Format an exception with its traceback, as the traceback module does.
-fn describe(py: Python<'_>, error: &PyErr) -> String {
+pub(crate) fn describe(py: Python<'_>, error: &PyErr) -> String {
     let formatted = py
         .import(intern!(py, "traceback"))
         .and_then(|module| module.call_method1(intern!(py, "format_exception"), (error.value(py),)))

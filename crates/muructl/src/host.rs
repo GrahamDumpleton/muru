@@ -26,6 +26,10 @@ pub struct HostSpec {
     pub processes: usize,
     /// Application threads per worker.
     pub threads: usize,
+    /// Threads for synchronous code called from an ASGI application.
+    pub sync_threads: usize,
+    /// Requests an ASGI worker's event loop takes at once.
+    pub concurrency: usize,
     /// The preload mode.
     pub preload: muru_config::Preload,
     /// The hooks module, if any.
@@ -74,6 +78,10 @@ impl HostProcess {
             .arg(spec.processes.to_string())
             .arg("--threads")
             .arg(spec.threads.to_string())
+            .arg("--sync-threads")
+            .arg(spec.sync_threads.to_string())
+            .arg("--concurrency")
+            .arg(spec.concurrency.to_string())
             .arg("--preload")
             .arg(spec.preload.as_str())
             .arg("--interface")

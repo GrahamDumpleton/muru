@@ -41,10 +41,9 @@ pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 pub struct Config {
     /// Address for the HTTP listener. Port 0 picks a free port.
     pub listen: SocketAddr,
-    /// Unix socket paths of the workers.
+    /// Unix socket paths of the workers. Each worker's HELLO says how many
+    /// requests it takes at once.
     pub sockets: Vec<PathBuf>,
-    /// Requests a worker handles at once, which bounds its connection pool.
-    pub slots: usize,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
     /// Where the access log goes and what it leaves out.
@@ -162,10 +161,7 @@ impl Edge {
     /// Bind the listeners and prepare the worker pools.
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
         let pools = Arc::new(Pools {
-            current: RwLock::new(Arc::new(link::LinkPool::new(
-                &config.sockets,
-                config.slots,
-            )?)),
+            current: RwLock::new(Arc::new(link::LinkPool::connect(&config.sockets).await?)),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let http = TcpListener::bind(config.listen)

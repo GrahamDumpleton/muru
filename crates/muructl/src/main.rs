@@ -95,6 +95,15 @@ struct RunArgs {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Threads for synchronous code called from an ASGI application
+    /// through sync_to_async or asyncio.to_thread (default 8).
+    #[arg(long, value_name = "N")]
+    sync_threads: Option<usize>,
+
+    /// Requests an ASGI worker's event loop takes at once (default 1000).
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
+
     /// Import the application in the host before forking: auto preloads
     /// when the import is fork-safe and imports per worker otherwise, true
     /// fails instead, false imports in each worker (default auto).
@@ -475,6 +484,8 @@ struct Resolved {
     factory: Option<muru_config::FactoryPhase>,
     processes: usize,
     threads: usize,
+    sync_threads: usize,
+    concurrency: usize,
     preload: muru_config::Preload,
     hooks: Option<String>,
     /// The directory the host runs in.
@@ -486,6 +497,10 @@ struct Resolved {
 /// Defaults for development runs (section 13.1): one worker with a few threads.
 const DEFAULT_PROCESSES: usize = 1;
 const DEFAULT_THREADS: usize = 4;
+/// Defaults for ASGI workers (section 6.6): the sync pool and the loop's
+/// concurrency, the latter the mount default of appendix C.
+const DEFAULT_SYNC_THREADS: usize = 8;
+const DEFAULT_CONCURRENCY: usize = 1000;
 
 fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     let chdir = args.chdir.clone();
@@ -569,6 +584,14 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .or(table.processes)
             .unwrap_or(DEFAULT_PROCESSES),
         threads: args.threads.or(table.threads).unwrap_or(DEFAULT_THREADS),
+        sync_threads: args
+            .sync_threads
+            .or(table.sync_threads)
+            .unwrap_or(DEFAULT_SYNC_THREADS),
+        concurrency: args
+            .concurrency
+            .or(table.concurrency)
+            .unwrap_or(DEFAULT_CONCURRENCY),
         preload: args
             .preload
             .or(table.preload)
@@ -610,6 +633,8 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         ),
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
+        sync_threads: Some(resolved.sync_threads),
+        concurrency: Some(resolved.concurrency),
         preload: Some(resolved.preload),
         hooks: resolved.hooks.clone(),
     };
@@ -728,6 +753,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
     anyhow::ensure!(resolved.processes >= 1, "--processes must be at least 1");
     anyhow::ensure!(resolved.threads >= 1, "--threads must be at least 1");
+    anyhow::ensure!(
+        resolved.sync_threads >= 1,
+        "--sync-threads must be at least 1"
+    );
+    anyhow::ensure!(
+        resolved.concurrency >= 1,
+        "--concurrency must be at least 1"
+    );
     if args.single {
         resolved.processes = 1;
         resolved.threads = 1;
@@ -752,6 +785,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         factory: resolved.factory,
         processes: resolved.processes,
         threads: resolved.threads,
+        sync_threads: resolved.sync_threads,
+        concurrency: resolved.concurrency,
         preload: resolved.preload,
         hooks: resolved.hooks.clone(),
         chdir: Some(resolved.project.clone()),
@@ -771,7 +806,6 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
         sockets: current.sockets.clone(),
-        slots: resolved.threads,
         development,
         access_log,
         limits: limits(&args),
@@ -796,9 +830,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         Some(https) => format!("http://{} and https://{https}", edge.local_addr()),
         None => format!("http://{}", edge.local_addr()),
     };
+    // The workers said in HELLO what they are and how much they take at
+    // once, which is also what the edge dispatches by.
+    let capacity = match edge.pools().current().workers().first() {
+        Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
+        Some(worker) => format!("{} threads", worker.slots),
+        None => format!("{} threads", resolved.threads),
+    };
     println!(
-        "muru: serving {} on {addresses} with {} workers of {} threads",
-        resolved.entrypoint, resolved.processes, resolved.threads
+        "muru: serving {} on {addresses} with {} workers of {capacity}",
+        resolved.entrypoint, resolved.processes
     );
     if development {
         println!(
@@ -882,12 +923,18 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let pools = edge.pools();
     let mut serving = tokio::spawn(edge.run());
     let mut release = 1;
+
+    // Ctrl-C and SIGTERM both stop the run in order: the host is told to
+    // stop and its workers finish what they are serving.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
             _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = terminate.recv() => break Ok(()),
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
@@ -907,7 +954,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     tokio::select! {
                         ready = next.wait_ready(START_TIMEOUT) => match ready {
                             Ok(()) => {
-                                match muru_edge::link::LinkPool::new(&next.sockets, resolved.threads) {
+                                match muru_edge::link::LinkPool::connect(&next.sockets).await {
                                     Ok(pool) => pools.replace(pool),
                                     Err(error) => {
                                         println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);

@@ -13,7 +13,7 @@ criteria. The full table, with scope and exit criteria, is in
 | 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 1 complete, phase 2 next. Phase 0 landed the
+Current position: phase 2 in progress. Phase 0 landed the
 framed worker link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a
 fixed pool of long-lived application threads and the benchmark harness.
 Phase 1, released as 0.1.0a2, is development mode for one WSGI application:
@@ -29,4 +29,8 @@ development defaults and the loopback rule of section 13.1,
 `--print-config`, the read-only dashboard in `muructl run`, Flask and Django
 fixtures, and the many-threads stress test of section 6.11 on the
 free-threaded build. Sanitizer builds are a future idea (section 20.10).
-Phase 2 starts with the ASGI bridge and the daemon.
+Phase 2 so far has the ASGI bridge for HTTP: one event loop per worker,
+lifespan with its state, the sync thread pool, concurrency declared to the
+edge in HELLO, and a plain ASGI fixture. Next from phase 2: WebSockets with
+the Autobahn suite, the ASGI conformance suite with Starlette and FastAPI
+fixtures, then the daemon.

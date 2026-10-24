@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context as _;
 use bytes::{Bytes, BytesMut};
 use http::{Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -64,6 +65,10 @@ struct Conn {
 
 struct WorkerSlots {
     path: PathBuf,
+    /// What the worker called itself in HELLO (wsgi or asgi), informational.
+    worker_type: String,
+    /// Requests the worker takes at once, from its HELLO: its threads for
+    /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
     semaphore: Arc<Semaphore>,
     idle: Mutex<Vec<Conn>>,
@@ -76,7 +81,9 @@ pub struct WorkerStatus {
     pub index: usize,
     /// Its link socket.
     pub path: PathBuf,
-    /// Requests it can handle at once.
+    /// What it called itself in HELLO: wsgi or asgi.
+    pub worker_type: String,
+    /// Requests it can handle at once: threads, or the loop's concurrency.
     pub slots: usize,
     /// Requests it is handling now.
     pub in_flight: usize,
@@ -96,22 +103,33 @@ struct Lease {
 }
 
 impl LinkPool {
-    /// Create one pool per worker socket, each bounded to `slots` requests.
-    pub fn new(sockets: &[PathBuf], slots: usize) -> anyhow::Result<Self> {
+    /// Connect once to every worker socket and size its pool from what its
+    /// HELLO declares (section 5.1): the edge acts on the capabilities, not
+    /// on the kind of worker. The first connection stays in the pool.
+    pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !sockets.is_empty(),
             "at least one worker socket is required"
         );
+
+        let mut workers = Vec::with_capacity(sockets.len());
+        for path in sockets {
+            let (conn, hello) = connect(path)
+                .await
+                .with_context(|| format!("connecting to the worker at {}", path.display()))?;
+
+            let slots = capacity(&hello);
+            workers.push(WorkerSlots {
+                path: path.clone(),
+                worker_type: hello.worker_type,
+                slots,
+                semaphore: Arc::new(Semaphore::new(slots)),
+                idle: Mutex::new(vec![conn]),
+            });
+        }
+
         Ok(Self {
-            workers: sockets
-                .iter()
-                .map(|path| WorkerSlots {
-                    path: path.clone(),
-                    slots: slots.max(1),
-                    semaphore: Arc::new(Semaphore::new(slots.max(1))),
-                    idle: Mutex::new(Vec::new()),
-                })
-                .collect(),
+            workers,
             next: AtomicUsize::new(0),
         })
     }
@@ -124,6 +142,7 @@ impl LinkPool {
             .map(|(index, worker)| WorkerStatus {
                 index,
                 path: worker.path.clone(),
+                worker_type: worker.worker_type.clone(),
                 slots: worker.slots,
                 in_flight: worker.slots - worker.semaphore.available_permits(),
             })
@@ -152,7 +171,7 @@ impl LinkPool {
         let idle = worker.idle.lock().expect("pool poisoned").pop();
         let conn = match idle {
             Some(conn) => conn,
-            None => connect(&worker.path).await?,
+            None => connect(&worker.path).await?.0,
         };
         Ok(Lease {
             conn,
@@ -170,7 +189,19 @@ impl LinkPool {
     }
 }
 
-async fn connect(path: &PathBuf) -> io::Result<Conn> {
+/// How many requests a worker takes at once: on its threads when it has
+/// them, otherwise on its event loop.
+fn capacity(hello: &pb::Hello) -> usize {
+    let declared = if hello.slots > 0 {
+        hello.slots
+    } else {
+        hello.async_slots
+    };
+
+    usize::try_from(declared).unwrap_or(usize::MAX).max(1)
+}
+
+async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     let stream = UnixStream::connect(path).await?;
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::with_capacity(32 * 1024, read_half);
@@ -180,19 +211,18 @@ async fn connect(path: &PathBuf) -> io::Result<Conn> {
         ..Default::default()
     };
     frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into()).await?;
-    match frame::read(&mut reader).await? {
-        Some(reply) if reply.kind == kind::HELLO => {
-            pb::Hello::decode(reply.payload)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        }
+    let hello = match frame::read(&mut reader).await? {
+        Some(reply) if reply.kind == kind::HELLO => pb::Hello::decode(reply.payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "the worker did not answer HELLO",
             ));
         }
-    }
-    Ok(Conn { reader, writer })
+    };
+
+    Ok((Conn { reader, writer }, hello))
 }
 
 /// Collects the two halves of a leased connection as each direction
@@ -211,6 +241,8 @@ struct Return {
     proceeded: AtomicBool,
     /// Set when the client stopped sending its body for too long.
     client_stalled: AtomicBool,
+    /// Set once the response direction has ended, intact or not.
+    ended: AtomicBool,
 }
 
 struct ReturnState {
@@ -237,6 +269,7 @@ impl Return {
             proceed: Notify::new(),
             proceeded: AtomicBool::new(false),
             client_stalled: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
         })
     }
 
@@ -252,6 +285,7 @@ impl Return {
     }
 
     fn give_reader(&self, reader: Option<Reader>) {
+        self.ended.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().expect("return state poisoned");
         state.reader = reader;
         self.report(&mut state);
@@ -278,6 +312,33 @@ impl Return {
         // Release the slot after the connection is back in the pool, so the
         // next request finds it there.
         state.permit.take();
+    }
+}
+
+impl Drop for Return {
+    /// Dropped with the response still in progress means the client went
+    /// away before the worker answered. Section 5.5 asks for an ABORT so
+    /// the application learns of it; the connection is then closed rather
+    /// than drained for reuse, which is left for the daemon's edge.
+    fn drop(&mut self) {
+        if self.ended.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Drop runs inside the runtime when a request's task is dropped;
+        // without one there is nothing to write from.
+        let writer = self
+            .state
+            .lock()
+            .expect("return state poisoned")
+            .writer
+            .take();
+        if let (Some(mut writer), Ok(runtime)) = (writer, tokio::runtime::Handle::try_current()) {
+            runtime.spawn(async move {
+                let payload = pb::Abort::default().encode_to_vec();
+                let _ = frame::write(&mut writer, kind::ABORT, 0, payload.into()).await;
+            });
+        }
     }
 }
 
