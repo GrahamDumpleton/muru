@@ -32,6 +32,7 @@ timeouts
 recycling
 memory
 logging
+debugging
 metrics
 events
 systemd

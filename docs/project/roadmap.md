@@ -151,4 +151,17 @@ worker index recycled for memory three times in an hour raises
 `muru_worker_memory_bytes`, `muru_worker_requests_total` and
 `muru_worker_requests_in_flight` (max_surge, per-group settings, the
 node budget, allocator settings, per-request deltas and the request id
-on records later). Next from phase 2: worker inspection.
+on records later). Worker inspection (section 11.7) has its phase 2
+slice: each worker has a control connection to its host, created at
+fork, on which a thread of the runtime library answers requests after
+attaching to the interpreter, and the daemon's Debug operation reaches
+it through the host's control socket; `muructl debug status`, `stacks`
+(with the request each thread serves, merged across workers showing the
+same stack, and SIGQUIT to faulthandler for a worker that cannot
+answer), `tasks` (the event loop's tasks and lag) and `inspect`, and
+`muructl logging level` for time-limited logger levels. The reading
+from outside the process with PEP 768 is deferred by
+[ADR 0025](adr/0025-in-process-inspection-first.md); profiling, tracing,
+memory tracing, attach, exec and the automatic captures are phase 3.
+Next from phase 2: connection limits, compression and static files at
+the edge.

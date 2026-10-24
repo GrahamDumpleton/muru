@@ -1,5 +1,11 @@
 # Logging
 
+```{tip}
+`muructl logging level APP NAME=LEVEL --for 10m` changes a logger's level
+in a release's workers for a period, without a restart; the
+[inspecting workers guide](debugging.md) has the details.
+```
+
 ```{admonition} Status
 :class: note
 

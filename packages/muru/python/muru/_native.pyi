@@ -22,6 +22,8 @@ def serve(
     report: int | None = None,
     on_reclaim: Callable[[], Any] | None = None,
     memory_interval_ms: int = 5000,
+    control: int | None = None,
+    on_control: Callable[[str, list[dict[str, Any]], dict[int, str]], str] | None = None,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 

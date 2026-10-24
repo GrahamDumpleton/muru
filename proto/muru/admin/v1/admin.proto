@@ -66,6 +66,12 @@ service Admin {
   // (section 13.4). The daemon answers, then re-executes; the hosts and
   // the edge keep serving and the new image takes them over.
   rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
+
+  // Ask a release's workers something (section 11.7): status, stacks,
+  // tasks, inspect or logging, through the host's control connection.
+  // DumpStacks and SetLogLevel of appendix B are the stacks and logging
+  // operations of this one call.
+  rpc Debug(DebugRequest) returns (DebugResponse);
 }
 
 message GetStatusRequest {}
@@ -221,6 +227,28 @@ message ShutdownRequest {
 }
 
 message ShutdownResponse {}
+
+message DebugRequest {
+  string app = 1;
+  string release = 2;               // the application's current release when empty
+  string op = 3;                    // status, stacks, tasks, inspect or logging
+  optional uint32 worker = 4;       // one worker, else every worker
+  string args_json = 5;             // the operation's arguments as a JSON object
+}
+
+message DebugResponse {
+  repeated WorkerDebug workers = 1;
+  string release = 2;               // the release asked
+}
+
+// One worker's answer.
+message WorkerDebug {
+  uint32 index = 1;
+  uint32 pid = 2;
+  bool ok = 3;
+  string error = 4;                 // when not ok
+  string result_json = 5;           // the operation's result, when ok
+}
 
 message UpgradeDaemonRequest {}
 

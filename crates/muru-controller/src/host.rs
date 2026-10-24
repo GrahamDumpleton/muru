@@ -41,6 +41,30 @@ pub enum HostMessage {
         /// One entry per worker.
         workers: Vec<WorkerStatus>,
     },
+    /// The workers' answers to a request (section 11.7).
+    Response {
+        /// The request's id.
+        id: u64,
+        /// One answer per worker asked.
+        workers: Vec<WorkerReply>,
+        /// Why no worker was asked, when none was.
+        error: String,
+    },
+}
+
+/// One worker's answer to a request (section 11.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerReply {
+    /// The worker's index.
+    pub index: u32,
+    /// Its pid.
+    pub pid: u32,
+    /// Whether it answered.
+    pub ok: bool,
+    /// Why not, when it did not.
+    pub error: String,
+    /// Its answer as JSON text, when it did.
+    pub result_json: String,
 }
 
 /// What one worker last reported to its host (sections 7.6 and 7.7).
@@ -109,6 +133,28 @@ impl HostMessage {
                 kind: value["kind"].as_str().unwrap_or("worker.event").to_owned(),
                 level: value["level"].as_str().unwrap_or("info").to_owned(),
                 message: value["message"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "response" => Some(Self::Response {
+                id: value["id"].as_u64().unwrap_or(0),
+                error: value["error"].as_str().unwrap_or_default().to_owned(),
+                workers: value["workers"]
+                    .as_array()
+                    .map(|workers| {
+                        workers
+                            .iter()
+                            .map(|worker| WorkerReply {
+                                index: worker["index"].as_u64().unwrap_or(0) as u32,
+                                pid: worker["pid"].as_u64().unwrap_or(0) as u32,
+                                ok: worker["ok"].as_bool().unwrap_or(false),
+                                error: worker["error"].as_str().unwrap_or_default().to_owned(),
+                                result_json: worker
+                                    .get("result")
+                                    .map(|result| result.to_string())
+                                    .unwrap_or_default(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             "status" => Some(Self::Status {
                 workers: value["workers"]
@@ -200,6 +246,19 @@ impl HostControl {
         let _ = self
             .outgoing
             .send(format!("{{\"type\":\"applied\",\"version\":{version}}}\n"));
+    }
+
+    /// Ask the host's workers something (section 11.7); the answer comes
+    /// back as a Response message carrying the same id.
+    pub fn request(&self, id: u64, op: &str, worker: Option<u32>, args: &serde_json::Value) {
+        let message = serde_json::json!({
+            "type": "request",
+            "id": id,
+            "op": op,
+            "worker": worker,
+            "args": args,
+        });
+        let _ = self.outgoing.send(format!("{message}\n"));
     }
 }
 

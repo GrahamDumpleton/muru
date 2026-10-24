@@ -56,7 +56,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import _asgi, preload
+from muru import _asgi, _inspect, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -78,6 +78,11 @@ ROUTE_SETTLE_SECONDS = 1.0
 # How often the supervision loop runs when timeouts or recycling are on.
 
 TICK_SECONDS = 0.5
+
+# How long a worker is given to answer a control request before the
+# host answers for it.
+
+CONTROL_TIMEOUT_SECONDS = 5.0
 
 # Memory recycles of one worker index within this window raise a leak
 # warning, once per window.
@@ -406,6 +411,17 @@ class WorkerState:
 
 
 @dataclass
+class Pending:
+    """A supervisor's request to the workers, waiting for their answers."""
+
+    id: int
+    op: str
+    expected: dict[int, int]  # pid to index
+    answers: dict[int, dict[str, Any]] = field(default_factory=dict)
+    deadline: float = 0.0
+
+
+@dataclass
 class Replacement:
     """A worker being replaced by a fresh one (sections 7.6 and 7.7)."""
 
@@ -501,6 +517,15 @@ class Host:
 
         self.states: dict[int, WorkerState] = {}
         self.reports: dict[int, int] = {}
+
+        # Section 11.7: each worker's control connection, by descriptor,
+        # with what has arrived on it so far, and the supervisor's
+        # requests awaiting answers.
+
+        self.controls: dict[int, int] = {}
+        self.control_sockets: dict[int, socket.socket] = {}
+        self.control_buffers: dict[int, bytes] = {}
+        self.pending: dict[int, Pending] = {}
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
@@ -592,6 +617,7 @@ class Host:
         # of its own.
 
         report_read, report_write = os.pipe()
+        control_host, control_worker = socket.socketpair()
         path = self.socket_path(index)
 
         # Section 6.2: freeze before every fork so the collector in the
@@ -614,13 +640,19 @@ class Host:
                     report_read,
                     *self.outputs,
                     *self.reports,
+                    *self.controls,
                 )
                 for fd in inherited:
                     os.close(fd)
                 os.close(self.lifeline_write)
+                control_host.close()
                 self.close_control()
                 status = self.worker(
-                    index, lifeline=self.lifeline_read, report=report_write, path=path
+                    index,
+                    lifeline=self.lifeline_read,
+                    report=report_write,
+                    path=path,
+                    control=control_worker.detach(),
                 )
             except BaseException:
                 traceback.print_exc()
@@ -639,6 +671,12 @@ class Host:
         os.set_blocking(report_read, False)
         self.reports[report_read] = pid
         self.selector.register(report_read, selectors.EVENT_READ)
+        control_worker.close()
+        control_host.setblocking(False)
+        self.controls[control_host.fileno()] = pid
+        self.control_sockets[pid] = control_host
+        self.control_buffers[pid] = b""
+        self.selector.register(control_host, selectors.EVENT_READ)
 
         now = time.monotonic()
         state = WorkerState(index, pid, self.generation.get(index, 0), path, now, report_read)
@@ -667,13 +705,15 @@ class Host:
         lifeline: int | None = None,
         report: int | None = None,
         path: str | None = None,
+        control: int | None = None,
     ) -> int:
         """Run a worker: enable collection, run the hooks, then serve until the server stops.
 
         `lifeline` is the read end of the host's pipe, which the server
         watches so the worker stops when the host is gone; `report` the
         write end of the pipe its status lines go to; `path` the socket
-        to serve on, else the index's current one.
+        to serve on, else the index's current one; `control` the worker's
+        end of its control connection (section 11.7).
         """
 
         global _in_worker
@@ -830,6 +870,10 @@ class Host:
                 report=report,
                 on_reclaim=reclaim,
                 memory_interval_ms=int(self.memory.check_interval * 1000),
+                control=control,
+                on_control=lambda line, active, names: _inspect.handle(
+                    line, active, loop.loop if loop is not None else None, names
+                ),
                 **asgi_arguments,
             )
         except Exception as error:
@@ -888,7 +932,7 @@ class Host:
         while True:
             if self.restart_after:
                 timeout: float | None = 0.1
-            elif self.policies or self.replacing:
+            elif self.policies or self.replacing or self.pending:
                 timeout = TICK_SECONDS
             else:
                 timeout = None
@@ -907,6 +951,8 @@ class Host:
                     self.read_output(key.fd)
                 elif key.fd in self.reports:
                     self.read_report(key.fd)
+                elif key.fd in self.controls:
+                    self.read_worker_control(key.fd)
                 elif self.control_listener is not None and key.fileobj is self.control_listener:
                     self.accept_supervisor()
                 elif self.supervisor is not None and key.fileobj is self.supervisor:
@@ -998,6 +1044,8 @@ class Host:
 
             if message.get("type") == "applied":
                 self.acked = max(self.acked, int(message.get("version", 0)))
+            elif message.get("type") == "request":
+                self.take_request(message)
 
     def send_to_supervisor(self, message: dict[str, Any]) -> None:
         """Send one message as a JSON line, dropping the connection if that fails."""
@@ -1005,10 +1053,17 @@ class Host:
         if self.supervisor is None:
             return
 
+        # Blocking for the send, with a bound, so an answer larger than
+        # the socket's buffer (an inspect of many modules) gets through.
+
         try:
+            self.supervisor.settimeout(5.0)
             self.supervisor.sendall(json.dumps(message).encode() + b"\n")
         except OSError:
             self.drop_supervisor()
+            return
+
+        self.supervisor.setblocking(False)
 
     def workers_message(self) -> dict[str, Any]:
         """Build the announcement of the sockets the edge should route to, by group."""
@@ -1044,6 +1099,182 @@ class Host:
 
         log(message)
         self.send_to_supervisor({"type": "event", "kind": kind, "level": level, "message": message})
+
+    # Section 11.7: the supervisor's questions, answered by the host or
+    # passed to the workers.
+
+    def take_request(self, message: dict[str, Any]) -> None:
+        """Answer a request from the host's own state or ask the workers."""
+
+        request_id = int(message.get("id", 0))
+        op = str(message.get("op", ""))
+        wanted = message.get("worker")
+        args = message.get("args") or {}
+        targets = {
+            state.pid: state.index
+            for state in self.states.values()
+            if state.ready and not state.replaced and (wanted is None or state.index == wanted)
+        }
+
+        if op == "status":
+            self.send_to_supervisor(
+                {
+                    "type": "response",
+                    "id": request_id,
+                    "workers": [
+                        self.status_of(state)
+                        for state in sorted(self.states.values(), key=lambda s: s.index)
+                        if wanted is None or state.index == wanted
+                    ],
+                }
+            )
+            return
+
+        if not targets:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": "no such worker"}
+            )
+            return
+
+        pending = Pending(request_id, op, targets)
+        pending.deadline = time.monotonic() + float(args.get("timeout_s", CONTROL_TIMEOUT_SECONDS))
+        self.pending[request_id] = pending
+        line = json.dumps({"id": request_id, "op": op, "args": args}).encode() + b"\n"
+
+        for pid, index in list(targets.items()):
+            control = self.control_sockets.get(pid)
+
+            try:
+                if control is None:
+                    raise OSError("no control connection")
+
+                control.sendall(line)
+            except OSError as error:
+                pending.answers[pid] = {
+                    "index": index,
+                    "pid": pid,
+                    "ok": False,
+                    "error": f"could not be asked: {error}",
+                }
+
+        self.finish_if_answered(pending)
+
+    def status_of(self, state: WorkerState) -> dict[str, Any]:
+        """One worker's state as the host knows it."""
+
+        return {
+            "index": state.index,
+            "pid": state.pid,
+            "ok": True,
+            "result": {
+                "group": self.placement[state.index][0].name,
+                "generation": state.generation,
+                "socket": state.path,
+                "ready": state.ready,
+                "replaced": state.replaced,
+                "uptime_s": round(time.monotonic() - state.started_at, 1),
+                "requests": state.requests,
+                "in_flight": state.in_flight,
+                "oldest_ms": state.oldest_ms,
+                **state.memory,
+            },
+        }
+
+    def read_worker_control(self, fd: int) -> None:
+        """Take a worker's answers; drop the connection at end of file."""
+
+        pid = self.controls[fd]
+        control = self.control_sockets.get(pid)
+
+        if control is None:
+            return
+
+        try:
+            data = control.recv(READ_SIZE)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if not data:
+            self.selector.unregister(control)
+            control.close()
+            del self.controls[fd]
+            del self.control_sockets[pid]
+            self.control_buffers.pop(pid, None)
+            return
+
+        self.control_buffers[pid] = self.control_buffers.get(pid, b"") + data
+
+        while b"\n" in self.control_buffers[pid]:
+            line, _, self.control_buffers[pid] = self.control_buffers[pid].partition(b"\n")
+
+            try:
+                answer = json.loads(line)
+            except ValueError:
+                continue
+
+            # An answer without an id (the runtime could not run the
+            # handler) is for the oldest request this worker still owes.
+
+            if answer.get("id") is None:
+                pending = next(
+                    (
+                        candidate
+                        for candidate in sorted(self.pending.values(), key=lambda p: p.id)
+                        if pid in candidate.expected and pid not in candidate.answers
+                    ),
+                    None,
+                )
+            else:
+                pending = self.pending.get(int(answer["id"]))
+
+            if pending is None or pid not in pending.expected:
+                continue
+
+            pending.answers[pid] = {
+                "index": pending.expected[pid],
+                "pid": pid,
+                "ok": bool(answer.get("ok")),
+                **({"result": answer["result"]} if "result" in answer else {}),
+                **({"error": answer["error"]} if "error" in answer else {}),
+            }
+            self.finish_if_answered(pending)
+
+    def finish_if_answered(self, pending: Pending, expired: bool = False) -> None:
+        """Send the answers on once every worker has one, or the time is up."""
+
+        if not expired and len(pending.answers) < len(pending.expected):
+            return
+
+        for pid, index in pending.expected.items():
+            if pid in pending.answers:
+                continue
+
+            # A worker that cannot be read is at least made to write its
+            # stacks to the log, which needs no interpreter.
+
+            note = ""
+
+            if pending.op == "stacks":
+                self.signal(pid, signal.SIGQUIT)
+                note = "; its stacks were written to the log by faulthandler"
+
+            pending.answers[pid] = {
+                "index": index,
+                "pid": pid,
+                "ok": False,
+                "error": f"did not answer in {CONTROL_TIMEOUT_SECONDS:g} s{note}",
+            }
+
+        self.pending.pop(pending.id, None)
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": pending.id,
+                "workers": sorted(pending.answers.values(), key=lambda answer: answer["index"]),
+            }
+        )
 
     # Sections 7.6 and 7.7: reports, policies and replacements.
 
@@ -1245,6 +1476,10 @@ class Host:
 
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
+
+        for pending in list(self.pending.values()):
+            if now >= pending.deadline:
+                self.finish_if_answered(pending, expired=True)
 
     def replace(self, state: WorkerState, reason: str, kind: str, hard: bool = False) -> None:
         """Start replacing a worker with a fresh one on a new socket.

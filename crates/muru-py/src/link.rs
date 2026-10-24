@@ -70,6 +70,12 @@ pub struct Lifecycle {
     pub on_reclaim: Option<Py<PyAny>>,
     /// How often the report carries the worker's memory.
     pub memory_interval: Duration,
+    /// The worker's end of the control connection to the host (section
+    /// 11.7): a stream socket carrying one JSON request per line.
+    pub control: Option<i32>,
+    /// Answers a control request: called with the request line and the
+    /// requests in flight, returns the response line.
+    pub on_control: Option<Py<PyAny>>,
 }
 
 /// What a signal asks of the worker.
@@ -110,6 +116,18 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     let lifeline = lifecycle.lifeline;
     let report = lifecycle.report;
     let memory_interval = lifecycle.memory_interval;
+
+    // Section 11.7: the control thread answers the host's questions,
+    // attaching to the interpreter only to do so.
+
+    if let (Some(fd), Some(handler)) = (lifecycle.control, lifecycle.on_control.as_ref()) {
+        let handler = Python::attach(|py| handler.clone_ref(py));
+        let control_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("muru-control".to_owned())
+            .spawn(move || control_thread(fd, handler, control_shared))?;
+    }
+
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
@@ -241,6 +259,76 @@ impl Lifeline {
             }
         }
     }
+}
+
+/// Answer control requests from the host, one JSON line each, until the
+/// connection closes: each is handed to the Python handler with the
+/// requests in flight, and its answer written back as one line.
+fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
+    use std::io::{BufRead as _, Write as _};
+
+    // SAFETY: the descriptor was inherited from the host for this
+    // purpose and nothing else in the worker holds it.
+
+    let socket =
+        unsafe { <std::os::unix::net::UnixStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    crate::pool::name_this_thread("muru-control");
+    let _ = socket.set_nonblocking(false);
+    let Ok(mut writer) = socket.try_clone() else {
+        return;
+    };
+    let reader = std::io::BufReader::new(socket);
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let answer = Python::attach(|py| {
+            let active = shared.active_requests(py)?;
+            let names = crate::pool::thread_names(py)?;
+            let reply = handler.call1(py, (line.as_str(), active, names))?;
+            reply.extract::<String>(py)
+        });
+
+        let text = match answer {
+            Ok(text) => text,
+            Err(error) => format!(
+                "{{\"ok\":false,\"error\":{}}}",
+                serde_json_string(&error.to_string())
+            ),
+        };
+
+        if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            break;
+        }
+    }
+}
+
+/// A string as a JSON literal, escaped by hand so the runtime needs no
+/// JSON dependency for one error message.
+fn serde_json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+
+    out.push('"');
+    out
 }
 
 /// Write a status line to the report descriptor every second: requests
@@ -478,10 +566,11 @@ async fn handle_request(
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
-    let request_id = shared.request_started();
+    let request_id = shared.request_started(&head);
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
+        worker_shared.request_on_this_thread(request_id);
         wsgi::run(
             py,
             &worker_shared,
@@ -598,7 +687,7 @@ async fn handle_asgi_request(
     // The task starts on the loop now; the channel is how the two sides
     // of this function reach it.
 
-    let request_id = shared.request_started();
+    let request_id = shared.request_started(&head);
 
     let channel = match asgi::start(shared, asgi, &runner, &head, out_tx) {
         Ok(channel) => channel,

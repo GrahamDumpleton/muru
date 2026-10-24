@@ -181,6 +181,26 @@ pub fn format_size(bytes: u64) -> String {
     bytes.to_string()
 }
 
+/// Write a size for a reader, rounded to the largest unit that keeps a
+/// digit: 1.5GB, 800MB, 12KB.
+pub fn format_size_approx(bytes: u64) -> String {
+    let mut value = bytes as f64;
+
+    for unit in ["B", "KB", "MB", "GB"] {
+        if value < 1024.0 || unit == "GB" {
+            return if unit == "B" || value >= 10.0 {
+                format!("{value:.0}{unit}")
+            } else {
+                format!("{value:.1}{unit}")
+            };
+        }
+
+        value /= 1024.0;
+    }
+
+    bytes.to_string()
+}
+
 /// Parse a duration such as 250ms, 1.5s, 2m, 1h or 2 (seconds), as the
 /// configuration and the command line write them.
 pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {

@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
-use crate::host::{HostControl, HostMessage};
+use crate::host::{HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
@@ -175,6 +175,21 @@ pub enum Command {
         /// What it said.
         message: HostMessage,
     },
+    /// Ask a release's workers something (section 11.7).
+    Debug {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The operation: status, stacks, tasks, inspect or logging.
+        op: String,
+        /// One worker, or every worker.
+        worker: Option<u32>,
+        /// The operation's arguments.
+        args: serde_json::Value,
+        /// Answered with each worker's reply, or why none could be asked.
+        done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
+    },
 }
 
 /// What a previous daemon left behind about its edge, for re-adoption
@@ -292,6 +307,10 @@ struct Daemon {
     /// Where the hosts' control messages are sent, into the same inbox
     /// as the commands.
     commands: mpsc::Sender<Command>,
+    /// Requests to hosts awaiting their answers, by request id.
+    asked: HashMap<u64, oneshot::Sender<Result<Vec<WorkerReply>, String>>>,
+    /// The last request id given out.
+    last_request: u64,
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -492,6 +511,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         default_app: None,
         owns_log,
         commands: handle_commands,
+        asked: HashMap::new(),
+        last_request: 0,
     };
     daemon.restore().await;
 
@@ -1289,6 +1310,32 @@ impl Daemon {
             Command::HostMessage { app, id, message } => {
                 self.host_message(&app, &id, message).await;
             }
+            Command::Debug {
+                app,
+                id,
+                op,
+                worker,
+                args,
+                done,
+            } => {
+                let control = self
+                    .running
+                    .get(&(app.clone(), id.clone()))
+                    .and_then(|running| running.control.as_ref());
+
+                match control {
+                    Some(control) => {
+                        self.last_request += 1;
+                        control.request(self.last_request, &op, worker, &args);
+                        self.asked.insert(self.last_request, done);
+                    }
+                    None => {
+                        let _ = done.send(Err(format!(
+                            "release {app}@{id} is not running with a host control connection"
+                        )));
+                    }
+                }
+            }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
     }
@@ -2023,6 +2070,15 @@ impl Daemon {
             HostMessage::Status { workers } => {
                 if let Some(running) = self.running.get_mut(&key) {
                     running.status = workers;
+                }
+            }
+            HostMessage::Response { id, workers, error } => {
+                if let Some(done) = self.asked.remove(&id) {
+                    let _ = done.send(if error.is_empty() {
+                        Ok(workers)
+                    } else {
+                        Err(error)
+                    });
                 }
             }
             HostMessage::Event {

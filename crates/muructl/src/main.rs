@@ -116,6 +116,18 @@ enum Command {
         command: admin::ConfigCommand,
     },
 
+    /// Look into a release's workers: status, stacks, tasks, inspect.
+    Debug {
+        #[command(subcommand)]
+        command: admin::DebugCommand,
+    },
+
+    /// Change logger levels in a release's workers for a period.
+    Logging {
+        #[command(subcommand)]
+        command: admin::LoggingCommand,
+    },
+
     /// Show or follow the daemon's events.
     Events {
         /// Keep printing events as they happen.
@@ -503,6 +515,8 @@ fn main() -> anyhow::Result<()> {
             }
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
+        Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
@@ -1490,7 +1504,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     muru_controller::host::HostMessage::Event { kind, message, .. } => {
                         println!("muru: {kind}: {message}");
                     }
-                    muru_controller::host::HostMessage::Status { .. } => {}
+                    muru_controller::host::HostMessage::Status { .. }
+                    | muru_controller::host::HostMessage::Response { .. } => {}
                 }
             }
             Some(path) = changed.recv() => {

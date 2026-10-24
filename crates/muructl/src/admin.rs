@@ -448,6 +448,524 @@ pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Re
     }
 }
 
+/// What `debug` takes: a release or an application (its current
+/// release), one worker or all, and the output form.
+#[derive(Args)]
+pub struct DebugArgs {
+    /// The release as app@release, or an application for its current release.
+    target: String,
+
+    /// One worker, by index, instead of every worker of the release.
+    #[arg(long, value_name = "N")]
+    worker: Option<u32>,
+
+    /// Print each worker's answer as JSON instead of text.
+    #[arg(long)]
+    json: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// The debug subcommands (section 11.7).
+#[derive(Subcommand)]
+pub enum DebugCommand {
+    /// Each worker's pid, uptime, requests served and in flight, the age
+    /// of its oldest request and its memory, from the host.
+    Status(DebugArgs),
+
+    /// The Python stack of every thread in every worker, with the request
+    /// each thread is serving, merged where workers show the same stack.
+    Stacks(DebugArgs),
+
+    /// The asyncio tasks of each ASGI worker's event loop, what each
+    /// awaits, and the loop's lag.
+    Tasks(DebugArgs),
+
+    /// Each worker's interpreter, sys.path, loaded modules, threads,
+    /// descriptors and environment (secrets redacted).
+    Inspect(DebugArgs),
+}
+
+/// The logging subcommands (section 11.4).
+#[derive(Subcommand)]
+pub enum LoggingCommand {
+    /// Set loggers' levels in a release's workers, for a period or until reset.
+    Level {
+        /// The release as app@release, or an application for its current release.
+        target: String,
+
+        /// A logger and its level as NAME=LEVEL (root with an empty name,
+        /// as =DEBUG). Repeatable.
+        #[arg(value_name = "NAME=LEVEL", required_unless_present = "reset")]
+        levels: Vec<String>,
+
+        /// Revert on its own after this long, for example 10m.
+        #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        duration: Option<Duration>,
+
+        /// Put every level changed this way back.
+        #[arg(long)]
+        reset: bool,
+
+        /// One worker, by index, instead of every worker of the release.
+        #[arg(long, value_name = "N")]
+        worker: Option<u32>,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Ask a release's workers something and print what came back.
+pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
+    let (op, args) = match &command {
+        DebugCommand::Status(args) => ("status", args),
+        DebugCommand::Stacks(args) => ("stacks", args),
+        DebugCommand::Tasks(args) => ("tasks", args),
+        DebugCommand::Inspect(args) => ("inspect", args),
+    };
+
+    let response = ask(
+        &args.socket,
+        &args.target,
+        op,
+        args.worker,
+        serde_json::json!({}),
+    )
+    .await?;
+
+    if args.json {
+        print_json(&response);
+        return Ok(());
+    }
+
+    match op {
+        "status" => print_status(&response),
+        "stacks" => print_stacks(&response),
+        "tasks" => print_tasks(&response),
+        _ => print_inspect(&response),
+    }
+
+    Ok(())
+}
+
+/// Change logger levels in a release's workers.
+pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
+    let LoggingCommand::Level {
+        target,
+        levels,
+        duration,
+        reset,
+        worker,
+        socket,
+    } = command;
+
+    if reset {
+        let response = ask(
+            &socket,
+            &target,
+            "logging",
+            worker,
+            serde_json::json!({"reset": true}),
+        )
+        .await?;
+
+        for answer in &response.workers {
+            match parse_result(answer) {
+                Some(result) => println!(
+                    "worker {} (pid {}): reset {}",
+                    answer.index,
+                    answer.pid,
+                    result["reset"]
+                        .as_array()
+                        .map(|names| {
+                            names
+                                .iter()
+                                .filter_map(|name| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or_else(|| "nothing".to_owned())
+                ),
+                None => println!(
+                    "worker {} (pid {}): {}",
+                    answer.index, answer.pid, answer.error
+                ),
+            }
+        }
+
+        return Ok(());
+    }
+
+    for setting in levels {
+        let (name, level) = setting.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("{setting:?} is not NAME=LEVEL, for example myapp=DEBUG")
+        })?;
+        let args = serde_json::json!({
+            "logger": name,
+            "level": level,
+            "duration_s": duration.map(|duration| duration.as_secs_f64()),
+        });
+        let response = ask(&socket, &target, "logging", worker, args).await?;
+
+        for answer in &response.workers {
+            match parse_result(answer) {
+                Some(result) => println!(
+                    "worker {} (pid {}): {} {} (was {}){}",
+                    answer.index,
+                    answer.pid,
+                    result["logger"].as_str().unwrap_or("root"),
+                    result["level"].as_str().unwrap_or(level),
+                    result["previous"].as_str().unwrap_or("?"),
+                    duration
+                        .map(|duration| format!(", for {}", muru_config::format_duration(duration)))
+                        .unwrap_or_default()
+                ),
+                None => println!(
+                    "worker {} (pid {}): {}",
+                    answer.index, answer.pid, answer.error
+                ),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Send one debug request for a target: an application, or app@release.
+async fn ask(
+    socket: &SocketArgs,
+    target: &str,
+    op: &str,
+    worker: Option<u32>,
+    args: serde_json::Value,
+) -> anyhow::Result<pb::DebugResponse> {
+    let (app, release) = match target.split_once('@') {
+        Some((app, release)) if !app.is_empty() && !release.is_empty() => (app, release),
+        Some(_) => anyhow::bail!("{target:?} is not a release: expected app@release"),
+        None => (target, ""),
+    };
+
+    let mut client = client::connect(&socket.socket()).await?;
+    let response = client
+        .debug(pb::DebugRequest {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            op: op.to_owned(),
+            worker,
+            args_json: args.to_string(),
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if response.workers.is_empty() {
+        anyhow::bail!(
+            "{}@{} has no worker to ask{}",
+            app,
+            response.release,
+            worker
+                .map(|index| format!(" with index {index}"))
+                .unwrap_or_default()
+        );
+    }
+
+    Ok(response)
+}
+
+/// A worker's answer as JSON, when it answered.
+fn parse_result(answer: &pb::WorkerDebug) -> Option<serde_json::Value> {
+    if !answer.ok {
+        return None;
+    }
+
+    serde_json::from_str(&answer.result_json).ok()
+}
+
+fn print_json(response: &pb::DebugResponse) {
+    let workers: Vec<serde_json::Value> = response
+        .workers
+        .iter()
+        .map(|answer| {
+            serde_json::json!({
+                "index": answer.index,
+                "pid": answer.pid,
+                "ok": answer.ok,
+                "error": (!answer.error.is_empty()).then_some(answer.error.as_str()),
+                "result": parse_result(answer),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "release": response.release,
+            "workers": workers,
+        }))
+        .unwrap_or_default()
+    );
+}
+
+fn print_status(response: &pb::DebugResponse) {
+    println!(
+        "{:<7} {:<8} {:<10} {:<9} {:<10} {:<10} {:<9} {:<9} {:<9} STATE",
+        "WORKER", "PID", "GROUP", "UP", "REQUESTS", "IN-FLIGHT", "OLDEST", "RSS", "USS"
+    );
+
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!("{:<7} {:<8} {}", answer.index, answer.pid, answer.error);
+            continue;
+        };
+        let size = |key: &str| {
+            result[key]
+                .as_u64()
+                .map(muru_config::format_size_approx)
+                .unwrap_or_else(|| "-".to_owned())
+        };
+
+        let state = if result["replaced"].as_bool() == Some(true) {
+            "replaced"
+        } else if result["ready"].as_bool() == Some(true) {
+            "ready"
+        } else {
+            "starting"
+        };
+        println!(
+            "{:<7} {:<8} {:<10} {:<9} {:<10} {:<10} {:<9} {:<9} {:<9} {state}",
+            answer.index,
+            answer.pid,
+            result["group"].as_str().unwrap_or("default"),
+            format!("{:.0}s", result["uptime_s"].as_f64().unwrap_or(0.0)),
+            result["requests"].as_u64().unwrap_or(0),
+            result["in_flight"].as_u64().unwrap_or(0),
+            format!("{}ms", result["oldest_ms"].as_u64().unwrap_or(0)),
+            size("rss"),
+            size("uss"),
+        );
+    }
+}
+
+fn print_stacks(response: &pb::DebugResponse) {
+    // Threads with the same frames across workers are shown once with
+    // the workers they came from.
+
+    let mut merged: Vec<(String, Vec<String>, Vec<u32>, serde_json::Value)> = Vec::new();
+
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}\n",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        for thread in result["threads"].as_array().into_iter().flatten() {
+            let name = thread["name"].as_str().unwrap_or("?").to_owned();
+            let frames: Vec<String> = thread["frames"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|frame| {
+                    format!(
+                        "  File \"{}\", line {}, in {}\n    {}",
+                        frame["file"].as_str().unwrap_or("?"),
+                        frame["line"].as_u64().unwrap_or(0),
+                        frame["function"].as_str().unwrap_or("?"),
+                        frame["text"].as_str().unwrap_or("").trim()
+                    )
+                })
+                .collect();
+            let request = thread["request"].clone();
+            let same = merged
+                .iter_mut()
+                .find(|(other, other_frames, _, other_request)| {
+                    *other == name
+                        && *other_frames == frames
+                        && other_request.is_null()
+                        && request.is_null()
+                });
+
+            match same {
+                Some(entry) => entry.2.push(answer.index),
+                None => merged.push((name, frames, vec![answer.index], request)),
+            }
+        }
+    }
+
+    for (name, frames, workers, request) in merged {
+        let where_ = if workers.len() == 1 {
+            format!("worker {}", workers[0])
+        } else {
+            format!(
+                "{} workers ({})",
+                workers.len(),
+                workers
+                    .iter()
+                    .map(|index| index.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        println!("{name} in {where_}:");
+
+        if !request.is_null() {
+            println!(
+                "  serving {} {} for {:.1} s (request {})",
+                request["method"].as_str().unwrap_or("?"),
+                request["path"].as_str().unwrap_or("?"),
+                request["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0,
+                request["request_id"].as_str().unwrap_or("?")
+            );
+        }
+
+        if frames.is_empty() {
+            println!("  (no Python frames)");
+        }
+
+        for frame in frames {
+            println!("{frame}");
+        }
+
+        println!();
+    }
+}
+
+fn print_tasks(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        match result["lag_ms"].as_f64() {
+            Some(lag) => println!(
+                "worker {} (pid {}): loop lag {lag:.1} ms",
+                answer.index, answer.pid
+            ),
+            None => {
+                println!(
+                    "worker {} (pid {}): {}",
+                    answer.index,
+                    answer.pid,
+                    result["note"].as_str().unwrap_or("no event loop")
+                );
+                continue;
+            }
+        }
+
+        let tasks = result["tasks"].as_array().cloned().unwrap_or_default();
+
+        if tasks.is_empty() {
+            println!("  no tasks");
+        }
+
+        for task in tasks {
+            let at = task["at"]
+                .as_object()
+                .map(|at| {
+                    format!(
+                        " at {}:{}",
+                        at["file"].as_str().unwrap_or("?"),
+                        at["line"].as_u64().unwrap_or(0)
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "  {} {}{}{}",
+                task["name"].as_str().unwrap_or("?"),
+                task["coro"].as_str().unwrap_or("?"),
+                task["waiting_on"]
+                    .as_str()
+                    .map(|waiting| format!(" waiting on {waiting}"))
+                    .unwrap_or_default(),
+                at
+            );
+        }
+
+        println!();
+    }
+}
+
+fn print_inspect(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+        let settings = &result["settings"];
+        println!(
+            "worker {} (pid {}): python {} at {}, {} in {} (group {}, {}{})",
+            answer.index,
+            answer.pid,
+            result["python"].as_str().unwrap_or("?"),
+            result["executable"].as_str().unwrap_or("?"),
+            settings["app"].as_str().unwrap_or("?"),
+            result["cwd"].as_str().unwrap_or("?"),
+            settings["group"].as_str().unwrap_or("default"),
+            settings["process_model"].as_str().unwrap_or("?"),
+            if settings["gil_enabled"].as_bool() == Some(false) {
+                ", free-threaded"
+            } else {
+                ""
+            }
+        );
+        println!("  sys.path:");
+
+        for entry in result["sys_path"].as_array().into_iter().flatten() {
+            println!("    {}", entry.as_str().unwrap_or("?"));
+        }
+
+        let modules = result["modules"].as_object().cloned().unwrap_or_default();
+        let versioned: Vec<String> = modules
+            .iter()
+            .filter_map(|(name, module)| {
+                module["version"]
+                    .as_str()
+                    .map(|version| format!("{name} {version}"))
+            })
+            .collect();
+        println!(
+            "  {} modules loaded{}{}",
+            modules.len(),
+            if versioned.is_empty() {
+                ""
+            } else {
+                ", with versions: "
+            },
+            versioned.join(", ")
+        );
+        let threads: Vec<String> = result["threads"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|thread| thread["name"].as_str().unwrap_or("?").to_owned())
+            .collect();
+        println!("  threads: {}", threads.join(", "));
+
+        if let Some(count) = result["descriptors"]["count"].as_u64() {
+            println!("  {count} open descriptors");
+        }
+
+        println!("  environment:");
+
+        for (key, value) in result["environment"].as_object().into_iter().flatten() {
+            println!("    {key}={}", value.as_str().unwrap_or(""));
+        }
+
+        println!();
+    }
+}
+
 /// Print the node's metrics as Prometheus text.
 pub async fn metrics(socket: SocketArgs) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()).await?;
