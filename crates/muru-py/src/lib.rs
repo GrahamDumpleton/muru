@@ -32,6 +32,8 @@ fn version() -> &'static str {
 /// `on_drain` is called when the stop signal arrives, before the
 /// application threads finish their requests, `on_exit` once they have, and
 /// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3).
+// The arguments are the Python signature, keyword by keyword.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, on_drain=None, on_exit=None, on_reopen_logs=None))]
 fn serve(

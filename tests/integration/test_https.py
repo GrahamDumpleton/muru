@@ -137,8 +137,9 @@ def test_http2_is_negotiated_by_alpn(server: support.Server, cache: Path) -> Non
 
 
 def test_certificate_is_reused_and_can_be_given_explicitly(
-    cache: Path, no_authority: dict[str, str]
+    server: support.Server, cache: Path, no_authority: dict[str, str]
 ) -> None:
+    # The module's server made the certificate; a second run must reuse it.
     before = certificate(cache).read_bytes()
     again = support.start(
         "plain_wsgi:application",

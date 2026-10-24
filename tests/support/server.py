@@ -38,6 +38,18 @@ def extension_available() -> bool:
     return True
 
 
+def unavailable(reason: str) -> None:
+    """Skip the test for a missing binary or extension, or fail it under CI.
+
+    CI builds both before the suite runs, so there a skip would hide a
+    broken build (as when the extension was built for the wrong ABI).
+    """
+
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason}; CI must not skip the server tests")
+    pytest.skip(reason)
+
+
 def free_port() -> int:
     """Pick a port that is free right now."""
 
@@ -249,9 +261,9 @@ def start(
 
     muructl = muructl_path()
     if muructl is None:
-        pytest.skip("muructl is not built (cargo build -p muructl)")
+        unavailable("muructl is not built (cargo build -p muructl)")
     if not extension_available():
-        pytest.skip("the muru extension is not built into this interpreter (just dev)")
+        unavailable("the muru extension is not built into this interpreter (just dev)")
 
     port = free_port()
     https_port = free_port() if https else None

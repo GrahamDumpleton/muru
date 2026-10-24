@@ -27,6 +27,10 @@ from typing import Any
 
 __all__ = ["Finding", "ImportRecorder", "child_pids", "thread_count"]
 
+# Compared through a name rather than sys.platform itself, so that mypy on
+# one platform does not report the other platform's branch as unreachable.
+_PLATFORM = sys.platform
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -101,12 +105,12 @@ def thread_count() -> int:
     /proc on Linux and the task information on macOS.
     """
 
-    if sys.platform == "linux":
+    if _PLATFORM == "linux":
         try:
             return len(os.listdir("/proc/self/task"))
         except OSError:
             pass
-    elif sys.platform == "darwin":
+    elif _PLATFORM == "darwin":
         library = _libproc()
         if library is not None:
             buffer = ctypes.create_string_buffer(_TASKINFO_SIZE)
@@ -121,7 +125,7 @@ def child_pids() -> set[int]:
     """Return the pids of this process's live children."""
 
     pid = os.getpid()
-    if sys.platform == "linux":
+    if _PLATFORM == "linux":
         children: set[int] = set()
         try:
             for task in os.listdir("/proc/self/task"):
@@ -141,7 +145,7 @@ def child_pids() -> set[int]:
         except OSError:
             pass
         return children
-    if sys.platform == "darwin":
+    if _PLATFORM == "darwin":
         library = _libproc()
         if library is not None:
             buffer = (ctypes.c_int * 4096)()
@@ -157,7 +161,7 @@ Identity = tuple[int, int, int]
 
 
 def _fd_directory() -> str:
-    return "/proc/self/fd" if sys.platform == "linux" else "/dev/fd"
+    return "/proc/self/fd" if _PLATFORM == "linux" else "/dev/fd"
 
 
 def open_fds() -> dict[int, Identity]:
