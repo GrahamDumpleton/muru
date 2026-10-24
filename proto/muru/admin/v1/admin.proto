@@ -1,6 +1,315 @@
-// Admin API (design specification section 10.6 and Appendix B). Message
-// shapes are defined during phase 2; this file reserves the package.
+// Admin protocol between muructl (and the dashboard's JSON gateway) and the
+// daemon (design specification section 10.6 and appendix B). Served over the
+// admin Unix socket. Messages change additively within a major version.
+//
+// This is the first slice: applications, releases, deploys, rollback,
+// drains, events and daemon status. The remaining resources and operations
+// of appendix B are added as their features land.
 
 syntax = "proto3";
 
 package muru.admin.v1;
+
+service Admin {
+  // The daemon, its locations and listeners.
+  rpc GetStatus(GetStatusRequest) returns (Status);
+
+  // Applications.
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+  rpc GetApp(GetAppRequest) returns (App);
+
+  // Create a release from a source directory and apply the application's
+  // default strategy (blue/green): start it, move traffic when it is
+  // ready, drain the previous release.
+  rpc Deploy(DeployRequest) returns (Release);
+
+  // Releases.
+  rpc ListReleases(ListReleasesRequest) returns (ListReleasesResponse);
+  rpc GetRelease(GetReleaseRequest) returns (Release);
+  // Block until the release reaches one of the states, or the deadline.
+  rpc WaitRelease(WaitReleaseRequest) returns (Release);
+  // Restore traffic to the previous release of the application.
+  rpc Rollback(RollbackRequest) returns (Release);
+  // Drain a release: no new traffic, requests in flight finish, then stop.
+  rpc DrainRelease(DrainReleaseRequest) returns (Release);
+
+  // Events, from a sequence number.
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+
+  // Stop the daemon: detaching by default, or draining everything first.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Virtual hosts and routes (sections 4.3 and 4.5), as applied.
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+
+  // Declarative configuration (section 10.4): apply a document, compare
+  // one with desired state, or export desired state as one.
+  rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
+  rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
+  rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
+
+  // Logs (sections 11.2 and 11.3): a release's output or the access log,
+  // and reopening every log file after an external rotation.
+  rpc TailLogs(TailLogsRequest) returns (stream LogLine);
+  rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
+
+  // Metrics (section 11.1): the node's Prometheus text exposition.
+  rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
+
+  // Re-read the daemon's configuration file for what can change while
+  // running (section 13.3).
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+}
+
+message GetStatusRequest {}
+
+message Status {
+  string version = 1;
+  uint32 pid = 2;
+  string state_dir = 3;
+  string run_dir = 4;
+  string socket = 5;
+  repeated string listeners = 6;    // addresses the edge serves
+  uint64 started_unix_ms = 7;
+  uint32 apps = 8;
+  uint32 releases = 9;
+  uint32 edge_pid = 10;             // the edge process serving the listeners
+  string metrics = 11;              // the metrics listener's address, or empty
+  string dashboard = 12;            // the dashboard's address, or empty
+}
+
+message ListAppsRequest {}
+
+message ListAppsResponse {
+  repeated App apps = 1;
+}
+
+message GetAppRequest {
+  string name = 1;
+}
+
+message App {
+  string name = 1;
+  string current_release = 2;       // the release traffic goes to, if any
+  string previous_release = 3;      // the release a rollback restores, if any
+  uint64 resource_version = 4;
+  uint64 created_unix_ms = 5;
+}
+
+// A deploy names the application (created on first use) and the source.
+// Settings not given come from the source's [tool.muru] table, then from
+// the application's previous release, then from the defaults.
+message DeployRequest {
+  string app = 1;
+  string source = 2;                // a directory
+  string entrypoint = 3;            // module:callable, else from [tool.muru]
+  string interface = 4;             // auto, wsgi or asgi
+  string python = 5;                // interpreter path, else the source's .venv or the daemon's
+  optional uint32 processes = 6;
+  optional uint32 threads = 7;
+  optional uint32 sync_threads = 8;
+  optional uint32 concurrency = 9;
+  string preload = 10;              // auto, true or false
+  string hooks = 11;
+  optional bool factory = 12;
+  string factory_phase = 13;        // worker or host
+  string release = 14;              // a chosen release id, else generated
+  bool wait = 15;                   // return once the release serves, or fails
+  optional uint64 retain_ms = 16;   // how long the superseded release stays warm; default 30 minutes, 0 to stop it
+}
+
+message ListReleasesRequest {
+  string app = 1;                   // every application when empty
+}
+
+message ListReleasesResponse {
+  repeated Release releases = 1;
+}
+
+message GetReleaseRequest {
+  string app = 1;
+  string release = 2;
+}
+
+message WaitReleaseRequest {
+  string app = 1;
+  string release = 2;
+  repeated string states = 3;       // ready, failed, stopped, ...; ready and failed when empty
+  uint64 timeout_ms = 4;
+}
+
+message RollbackRequest {
+  string app = 1;
+}
+
+message DrainReleaseRequest {
+  string app = 1;
+  string release = 2;
+}
+
+// Section 9.1: pending, starting, warming, ready, draining, stopping,
+// stopped and failed.
+message Release {
+  string app = 1;
+  string id = 2;
+  string state = 3;
+  string message = 4;               // why it failed, or what it is doing
+  string source = 5;
+  string entrypoint = 6;
+  string interface = 7;
+  string python = 8;
+  uint32 processes = 9;
+  uint32 threads = 10;
+  uint32 sync_threads = 11;
+  uint32 concurrency = 12;
+  bool serving = 13;                // traffic goes to it
+  uint64 created_unix_ms = 14;
+  uint64 resource_version = 15;
+  repeated Worker workers = 16;
+  uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
+}
+
+message Worker {
+  uint32 index = 1;
+  uint32 pid = 2;
+  string socket = 3;
+}
+
+message ListEventsRequest {
+  uint64 after = 1;                 // sequence number; 0 for the oldest kept
+  uint32 limit = 2;
+}
+
+message ListEventsResponse {
+  repeated Event events = 1;
+}
+
+message WatchEventsRequest {
+  uint64 after = 1;
+}
+
+// Section 11.5: one stream of state changes.
+message Event {
+  uint64 sequence = 1;
+  uint64 time_unix_ms = 2;
+  string type = 3;                  // for example release.ready
+  string subject = 4;               // app, app@release
+  string level = 5;                 // info, notice, warning, error
+  string message = 6;
+}
+
+message ShutdownRequest {
+  bool drain = 1;                   // stop releases and the edge first
+}
+
+message ShutdownResponse {}
+
+// A document as muructl apply reads it: TOML with [app.NAME.release.ID]
+// tables, source paths already absolute.
+message ApplyConfigRequest {
+  string document = 1;
+  bool dry_run = 2;                 // report the plan and change nothing
+  bool prune = 3;                   // also remove what the document does not contain
+}
+
+message DiffConfigRequest {
+  string document = 1;
+}
+
+// What an apply would do, or did. With errors nothing is applied.
+message ConfigReport {
+  repeated string errors = 1;       // validation: unknown keys, bad values, missing sources, immutable releases
+  repeated string warnings = 2;     // what the daemon took no action on
+  repeated ConfigChange changes = 3;
+  uint32 unchanged = 4;             // releases already as declared
+  bool applied = 5;                 // the changes were carried out
+}
+
+message ConfigChange {
+  string action = 1;                // create-app, deploy, drain, remove-release, remove-app
+  string subject = 2;               // app, or app@release
+  string detail = 3;                // what the release runs, or why it goes
+  string outcome = 4;               // after an apply: ready, failed: ..., stopped, removed
+}
+
+message ExportConfigRequest {
+  string app = 1;                   // one application, else all
+  bool all_releases = 2;            // every release, not only the one that serves
+}
+
+message ExportConfigResponse {
+  string document = 1;              // TOML
+  string version = 2;               // the daemon's version
+  string node = 3;                  // the host name
+  uint64 time_unix_ms = 4;
+  uint64 state_version = 5;         // the last event sequence number
+}
+
+message ListHostsRequest {}
+
+message ListHostsResponse {
+  repeated Host hosts = 1;
+}
+
+message Host {
+  string name = 1;
+  repeated string names = 2;
+  repeated string listeners = 3;      // every listener when empty
+  bool tls = 4;                       // has a certificate
+  string certificate = 5;             // the certificate file
+  string canonical = 6;
+  bool https_redirect = 7;
+  bool use_canonical_name = 8;
+  bool default = 9;
+}
+
+message ListRoutesRequest {}
+
+message ListRoutesResponse {
+  repeated Route routes = 1;
+}
+
+message Route {
+  string host = 1;
+  string path = 2;
+  string app = 3;
+}
+
+// Which log to show: a release's output (its host's and workers' lines,
+// tagged by the host), or the access log the edge writes.
+message TailLogsRequest {
+  string app = 1;                   // unused with access
+  string release = 2;               // empty: the application's current release
+  bool follow = 3;                  // keep streaming as lines arrive
+  uint32 lines = 4;                 // how many recent lines first; 0 for none
+  bool access = 5;                  // the access log instead of a release
+}
+
+message LogLine {
+  string app = 1;
+  string release = 2;
+  string line = 3;
+}
+
+message ReopenLogsRequest {
+  bool workers = 1;                 // also run on_reopen_logs in every worker
+}
+
+message ReopenLogsResponse {
+  bool edge = 1;                    // the edge was told
+  uint32 hosts = 2;                 // hosts told
+}
+
+message GetMetricsRequest {}
+
+message MetricsText {
+  string text = 1;                  // the Prometheus text exposition
+}
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {
+  string message = 1;               // what was reloaded
+}

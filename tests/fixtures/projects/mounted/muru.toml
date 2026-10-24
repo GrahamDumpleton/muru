@@ -1,0 +1,11 @@
+entrypoint = "mounted:wsgi_app"
+threads = 2
+
+[mounts.asgi]
+path = "/asgi"
+entrypoint = "mounted:asgi_app"
+
+[mounts.reports]
+path = "/reports"
+entrypoint = "mounted:reports_app"
+interface = "wsgi"

@@ -13,6 +13,15 @@ otherwise. Three of its cases are allowed to fail: after an invalid preface
 or a client GOAWAY, hyper may close the socket with input unread, which the
 peer sees as a reset rather than a clean close.
 
+`asgi/` is the ASGI 3.0 suite: one server started from
+`tests/fixtures/apps/asgi_conformance.py` (with `asgi_lifespan_failing.py`
+and `asgi_no_lifespan.py` for the lifespan cases), and one module per area
+(scope, HTTP messages, lifespan, WebSocket), driven over HTTP, HTTP/2 with
+curl, and WebSockets with the websockets client library. `asgi/test_autobahn.py`
+runs the Autobahn test suite from its container against the plain ASGI
+fixture's echo endpoint; it needs a container runtime and runs with
+`just test-docker` (the `requires_docker` marker leaves it out of `just test`).
+
 `http1/` sends malformed and ambiguous HTTP/1.1 requests (the request smuggling corpus) and checks none reaches the application, recording where hyper is lenient. `wsgi/` is the PEP 3333 suite, plus the HTTP/2 module driven with curl: one server started from
 `tests/fixtures/apps/wsgi_conformance.py` for the whole run, and one test
 module per area (start_response, response iteration, wsgi.input, environ,

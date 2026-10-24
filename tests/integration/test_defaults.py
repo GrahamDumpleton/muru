@@ -19,6 +19,7 @@ def environ(server: support.Server) -> dict[str, object]:
 
 def test_single_process_run_reports_multiprocess_false() -> None:
     server = support.start("plain_wsgi:application", workers=None, threads=None)
+
     try:
         assert "with 1 workers of 4 threads" in server.log()
         data = environ(server)
@@ -31,6 +32,7 @@ def test_single_process_run_reports_multiprocess_false() -> None:
 
 def test_two_processes_report_multiprocess_true() -> None:
     server = support.start("plain_wsgi:application", workers=2, threads=1)
+
     try:
         data = environ(server)
         assert data["wsgi.multiprocess"] is True
@@ -41,6 +43,7 @@ def test_two_processes_report_multiprocess_true() -> None:
 
 def test_body_limit_is_a_setting() -> None:
     server = support.start("plain_wsgi:application", workers=1, args=["--max-body-size", "1MB"])
+
     try:
         assert environ(server)["muru.max_body_size"] == 1024 * 1024
         response = server.raw(
@@ -55,11 +58,13 @@ def test_body_limit_is_a_setting() -> None:
 
 def test_hsts_from_the_application_is_warned_about_once() -> None:
     server = support.start("plain_wsgi:application", workers=1)
+
     try:
         for _ in range(2):
             response = server.get("/hsts")
             assert response.status == 200
             assert response.header("Strict-Transport-Security") == "max-age=31536000"
+
         assert server.wait_for_log("Strict-Transport-Security on /hsts")
         assert len(re.findall("Strict-Transport-Security on /hsts", server.log())) == 1
     finally:

@@ -11,17 +11,47 @@ def serve(
     app: Callable[..., Any],
     threads: int = 4,
     multiprocess: bool = True,
+    event_loop: Any | None = None,
+    runner: Callable[[Any, Channel], None] | None = None,
+    concurrency: int = 0,
     on_drain: Callable[[], Any] | None = None,
     on_exit: Callable[[], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
+    lifeline: int | None = None,
+    mounts: list[tuple[str, Callable[..., Any], Callable[[Any, Channel], None] | None]] = [],
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
     multiprocess is what wsgi.multiprocess reports: False only for a
-    single-process development run. on_drain runs when the stop signal
-    arrives, before the application threads finish their requests, on_exit
-    after they have, and on_reopen_logs whenever SIGUSR1 arrives.
+    single-process development run. For an ASGI application, event_loop is
+    the worker's running asyncio loop, runner is scheduled on it with the
+    scope and channel of each request, and concurrency is how many requests
+    the loop takes at once. on_drain runs when the stop signal arrives,
+    before the requests in flight finish, on_exit after they have, and
+    on_reopen_logs whenever SIGUSR1 arrives. lifeline is a file descriptor
+    whose end of file also stops the server: the read end of a pipe whose
+    write end the host holds, so a worker never outlives its host. mounts
+    are the named mounts as (name, application, runner) tuples, the runner
+    None for a WSGI mount; event_loop is needed when any mount is ASGI.
     """
+
+def resolve_future(future: Any, value: Any) -> None:
+    """Complete an asyncio future with a value unless it is already done."""
+
+class Channel:
+    """The link side of one ASGI request: receive and send for the application."""
+
+    def receive(self) -> Any:
+        """Return a future for the next http.request or http.disconnect message."""
+
+    def send(self, message: dict[str, Any]) -> Any | None:
+        """Queue a response message; returns a future to await when the writer is behind."""
+
+    def finish(self) -> None:
+        """Record that the application returned, failing a response it never completed."""
+
+    def fail(self, detail: str) -> None:
+        """Fail the response because the application raised, with the formatted traceback."""
 
 class Input:
     """The wsgi.input stream."""

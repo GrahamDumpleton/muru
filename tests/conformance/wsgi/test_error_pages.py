@@ -32,7 +32,9 @@ def test_application_error_page_is_plain_text_by_default(server: Server) -> None
     body = response.body.decode()
     assert body.startswith("500 Internal Server Error\nreason: app_error\nrequest id: ")
     assert f"request id: {response.header('X-Request-ID')}" in body
+
     # Development mode shows the traceback.
+
     assert "RuntimeError: raise-first-boom" in body
 
 
@@ -66,11 +68,13 @@ def test_edge_generated_error_is_negotiated_too(server: Server) -> None:
             b"Content-Length: 99999999999\r\n\r\n"
         )
         data = b""
+
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
             data += chunk
+
     head, _, body = data.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.1 413")
     assert b"content-type: application/problem+json" in head.lower()

@@ -40,8 +40,8 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete. Sent in place of RESPONSE when the application failed before producing a head, with the reason and detail the edge's error page shows (section 4.12) |
 | ABORT | 6 | edge to worker | Abort | The edge has no more use for the request: the client has gone, or the response ended before the request body did (section 5.5) |
 | CONTINUE | 7 | worker to edge | empty | The application has started reading the request body, so the edge may send 100 Continue (section 4.6). Sent only when the request head says the client is waiting for it |
-| MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6). Phase 2 |
-| CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason. Phase 2 |
+| MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6) |
+| CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason (section 5.6) |
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
 | FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame (section 5.7). Phase 2 |
 | DETACH | 12 | worker to edge | Detach | The request moved from an application thread to the event loop, or back, so the edge counts the connection against async slots or slots accordingly (section 6.14). Phase 2 |
@@ -60,7 +60,7 @@ The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
 - **Abort:** a reason, for logs.
 
-- **Close:** a WebSocket close code and reason. **FileHint:** offset and length within the attached descriptor. **Detach:** which side the request moved to. All three are defined when their frames are implemented.
+- **Close:** a WebSocket close code (1000 when the application gave none) and reason. **FileHint:** offset and length within the attached descriptor. **Detach:** which side the request moved to. The last two are defined when their frames are implemented.
 
 Phase 0 implements HELLO, REQUEST, BODY, RESPONSE, END and ABORT. The others are reserved so that kind numbers are fixed now.
 

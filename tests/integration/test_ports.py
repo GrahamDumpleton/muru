@@ -23,6 +23,7 @@ def run_muructl(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
     if muructl is None or not support.extension_available():
         pytest.skip("muructl and the extension must be built")
     log = Path(tempfile.mkstemp(prefix="muru-ports-", suffix=".log")[1])
+
     with log.open("wb") as handle:
         process = subprocess.Popen(
             [
@@ -40,11 +41,13 @@ def run_muructl(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
             stdout=handle,
             stderr=subprocess.STDOUT,
         )
+
     return process, log
 
 
 def wait_for_line(log: Path, pattern: str, process: subprocess.Popen[bytes]) -> re.Match[str]:
     deadline = time.monotonic() + 30
+
     while time.monotonic() < deadline:
         match = re.search(pattern, log.read_text(errors="replace"))
         if match:
@@ -52,12 +55,14 @@ def wait_for_line(log: Path, pattern: str, process: subprocess.Popen[bytes]) -> 
         if process.poll() is not None:
             raise AssertionError(f"muructl exited with {process.returncode}:\n{log.read_text()}")
         time.sleep(0.05)
+
     raise AssertionError(f"no match for {pattern!r} in:\n{log.read_text()}")
 
 
 @pytest.fixture
 def auto_ports() -> Iterator[tuple[subprocess.Popen[bytes], Path]]:
     process, log = run_muructl("--bind", "127.0.0.1", "--port", "auto", "--https")
+
     try:
         yield process, log
     finally:
@@ -69,6 +74,7 @@ def test_port_auto_picks_free_ports_and_prints_them(
     auto_ports: tuple[subprocess.Popen[bytes], Path],
 ) -> None:
     process, log = auto_ports
+
     match = wait_for_line(
         log, r"serving .* on http://127\.0\.0\.1:(\d+) and https://127\.0\.0\.1:(\d+) ", process
     )
@@ -95,12 +101,14 @@ def test_a_https_port_in_use_names_the_https_flag(server: support.Server) -> Non
             "plain_wsgi:application",
             args=["--https", "--https-port", str(server.port), "--port", str(support.free_port())],
         )
+
     assert "--https-port" in str(failure.value)
 
 
 @pytest.fixture(scope="module")
 def server() -> Iterator[support.Server]:
     instance = support.start("plain_wsgi:application", workers=1, threads=1)
+
     try:
         yield instance
     finally:

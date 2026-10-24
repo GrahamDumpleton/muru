@@ -24,6 +24,7 @@ rustls-pki-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

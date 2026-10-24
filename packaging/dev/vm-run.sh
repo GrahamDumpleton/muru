@@ -49,7 +49,11 @@ case "$action" in
         rm -rf scratch/venv-315t scratch/wheels
         uv venv -q -p 3.15t scratch/venv-315t
         (cd packages/muru && uvx --from 'maturin>=1.8,<2' maturin build -i "$(uv python find 3.15t)" --out ../../scratch/wheels)
-        uv pip install -q --python scratch/venv-315t/bin/python pytest flask django scratch/wheels/muru-*cp315t*.whl
+        # The same test and fixture packages as the lock file gives 3.15.
+        uv export -q --no-hashes --no-emit-project --only-group dev --only-group fixtures \
+            --format requirements.txt -o scratch/requirements-315t.txt
+        uv pip install -q --python scratch/venv-315t/bin/python \
+            -r scratch/requirements-315t.txt scratch/wheels/muru-*cp315t*.whl
         scratch/venv-315t/bin/python -m pytest -p no:cacheprovider -o pythonpath=tests tests/integration tests/conformance "$@"
         ;;
     bench)

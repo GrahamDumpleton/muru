@@ -9,6 +9,7 @@
 //! the thread's context variables, so values set during one request are gone
 //! when the next request runs on the same thread.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -17,19 +18,44 @@ use std::thread::JoinHandle;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use crate::asgi::Asgi;
+
 /// A unit of work for an application thread.
 pub type Job = Box<dyn for<'py> FnOnce(Python<'py>) + Send + 'static>;
 
+/// One mount of a release (section 6.7): its application and, for an
+/// ASGI mount, the runner scheduled on the loop for each request.
+pub struct Mount {
+    /// The application callable.
+    pub app: Py<PyAny>,
+    /// The runner, when the mount is ASGI.
+    pub runner: Option<Py<PyAny>>,
+}
+
+impl Mount {
+    /// A new reference to the same mount.
+    pub fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            app: self.app.clone_ref(py),
+            runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
+        }
+    }
+}
+
 /// State shared by every request handled by this worker.
 pub struct Shared {
-    /// The WSGI application callable.
+    /// The default mount's application callable, at /.
     pub app: Py<PyAny>,
+    /// The named mounts (section 6.7), by name.
+    pub mounts: HashMap<String, Mount>,
     /// The `wsgi.errors` stream (sys.stderr at start-up).
     pub errors: Py<PyAny>,
     /// Application threads, which is also the slot count announced in HELLO.
     pub threads: usize,
     /// wsgi.multiprocess: False only for single-process development runs (section 6.5).
     pub multiprocess: bool,
+    /// The event loop side, when the application is ASGI (section 6.6).
+    pub asgi: Option<Asgi>,
     /// The application thread pool.
     pub pool: Pool,
     in_flight: AtomicU32,
@@ -40,20 +66,41 @@ impl Shared {
     /// Create the shared state for one worker, starting its thread pool.
     pub fn new(
         app: Py<PyAny>,
+        mounts: HashMap<String, Mount>,
         errors: Py<PyAny>,
         threads: usize,
         multiprocess: bool,
+        asgi: Option<Asgi>,
     ) -> std::io::Result<Self> {
         let threads = threads.max(1);
         Ok(Self {
             app,
+            mounts,
             errors,
             threads,
             multiprocess,
+            asgi,
             pool: Pool::start(threads)?,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
         })
+    }
+
+    /// The application a request head names: the default mount for an
+    /// empty name, else the mount of that name.
+    pub fn mount(&self, name: &str) -> Option<Mount> {
+        if name.is_empty() {
+            return Some(Mount {
+                app: Python::attach(|py| self.app.clone_ref(py)),
+                runner: self.asgi.as_ref().and_then(|asgi| {
+                    Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
+                }),
+            });
+        }
+
+        self.mounts
+            .get(name)
+            .map(|mount| Python::attach(|py| mount.clone_ref(py)))
     }
 
     /// Count a request as started.
@@ -65,6 +112,11 @@ impl Shared {
     /// Count a request as finished.
     pub fn request_finished(&self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Requests started and not yet finished.
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::Relaxed)
     }
 }
 
@@ -81,6 +133,7 @@ impl Pool {
         let receiver = Arc::new(Mutex::new(receiver));
 
         let mut handles = Vec::with_capacity(threads);
+
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
             let handle = std::thread::Builder::new()
@@ -99,6 +152,7 @@ impl Pool {
     /// shutting down.
     pub fn spawn(&self, job: Job) -> bool {
         let sender = self.sender.lock().expect("pool sender poisoned");
+
         match sender.as_ref() {
             Some(sender) => sender.send(job).is_ok(),
             None => false,
@@ -111,6 +165,7 @@ impl Pool {
     pub fn shutdown(&self) {
         self.sender.lock().expect("pool sender poisoned").take();
         let handles = std::mem::take(&mut *self.handles.lock().expect("pool handles poisoned"));
+
         for handle in handles {
             let _ = handle.join();
         }
@@ -123,6 +178,7 @@ fn thread_main(receiver: &Mutex<mpsc::Receiver<Job>>) {
         loop {
             // Wait for work with the interpreter detached. Only one idle
             // thread holds the receiver at a time; the others wait for it.
+
             let next = py.detach(|| receiver.lock().expect("pool receiver poisoned").recv());
 
             match next {
@@ -139,13 +195,16 @@ fn run_in_context(py: Python<'_>, job: Job) {
     // function. PyContext_CopyCurrent returns a new reference or null with an
     // exception set; a successful PyContext_Enter is always paired with
     // PyContext_Exit on the same thread before the reference is released.
+
     unsafe {
         let context = ffi::PyContext_CopyCurrent();
+
         if context.is_null() {
             report_error(py, "copying the context");
             job(py);
             return;
         }
+
         if ffi::PyContext_Enter(context) != 0 {
             report_error(py, "entering the context");
             ffi::Py_DECREF(context);
@@ -158,6 +217,7 @@ fn run_in_context(py: Python<'_>, job: Job) {
         if ffi::PyContext_Exit(context) != 0 {
             report_error(py, "leaving the context");
         }
+
         ffi::Py_DECREF(context);
     }
 }

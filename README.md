@@ -22,11 +22,14 @@ rollback are policy changes, not restarts. The same model runs from
 ## Status
 
 Muru is early in its life. Development mode works: `muructl run` serves a
-WSGI application on your machine with HTTP/1.1, HTTP/2 and HTTPS, forked
-workers with an import check before the fork, lifecycle hooks, watch
-reload, an access log and a small dashboard, tested with plain WSGI, Flask
-and Django on regular and free-threaded Python. The daemon, releases,
-traffic management and ASGI are still to come; the
+WSGI or ASGI application on your machine with HTTP/1.1, HTTP/2, HTTPS and
+WebSockets, forked workers with an import check before the fork, lifecycle
+hooks and ASGI lifespan, watch reload, an access log and a small dashboard,
+tested with plain WSGI and ASGI, Flask, Django, Starlette and FastAPI on
+regular and free-threaded Python. The daemon serves applications deployed from source
+directories with blue/green releases, rollback and drains, by virtual
+host with TLS, declared in files or on the command line; traffic
+management and the rest of the daemon are still to come; the
 [roadmap](docs/project/roadmap.md) lists the phases. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
 is the place to start, and the
@@ -74,7 +77,7 @@ macOS on CPython 3.11 to 3.15, including the free-threaded builds.
 
 ## Five-minute start
 
-Today, in development:
+Today:
 
 ```
 muructl run app:application --reload     # HTTP on 8080, restarts on change
@@ -82,11 +85,14 @@ muructl run --https                      # HTTPS on 8443 with a local certificat
 muructl run . --port auto                # the project's [tool.muru] table, free ports
 ```
 
+```
+muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
+muructl apply -f config/                 # applications, virtual hosts and TLS from files
+```
+
 Planned:
 
 ```
-muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
-muructl apply -f config/                 # several applications, virtual hosts, TLS
 muructl rollout canary shop@r43          # canary with gates and rollback
 ```
 

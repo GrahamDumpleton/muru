@@ -79,6 +79,7 @@ def test_large_bodies_in_both_directions(server: Server, tmp_path: Path) -> None
 def test_streams_multiplex_on_one_connection(server: Server) -> None:
     # --parallel sends the requests at once; with HTTP/2 they share a
     # connection as streams, so far fewer connections than requests open.
+
     assert CURL is not None
     paths = ["/response/slow-chunks"] * 6 + ["/response/list"] * 6
     command = [
@@ -89,9 +90,12 @@ def test_streams_multiplex_on_one_connection(server: Server) -> None:
         "-w",
         "%{http_version} %{response_code} %{num_connects}\n",
     ]
+
     for path in paths:
         # One --output per URL, or curl prints the later bodies to stdout.
+
         command.extend(["-o", "/dev/null", url(server, path)])
+
     completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
     assert completed.returncode == 0, completed.stderr
     results = [line.split() for line in completed.stdout.splitlines()]
@@ -101,6 +105,7 @@ def test_streams_multiplex_on_one_connection(server: Server) -> None:
 
 def test_reason_phrase_is_dropped(server: Server) -> None:
     # HTTP/2 has no reason phrase; the status still arrives.
+
     statuses, body = curl(server, url(server, "/start-response/status-reason-phrase"))
     assert statuses == ["HTTP/2 299"]
     assert body.endswith(b";end")

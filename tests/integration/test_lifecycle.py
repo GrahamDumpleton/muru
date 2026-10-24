@@ -19,6 +19,7 @@ def hooked() -> Iterator[support.Server]:
     instance = support.start(
         "preload_wsgi:application", workers=WORKERS, args=["--hooks", "hooks_log"]
     )
+
     try:
         yield instance
     finally:
@@ -30,10 +31,12 @@ def hook_lines(server: support.Server, name: str) -> list[dict[str, str]]:
 
     marker = f"HOOK {name} "
     lines = []
+
     for line in server.log().splitlines():
         at = line.find(marker)
         if at >= 0:
             lines.append(dict(word.split("=", 1) for word in line[at:].split()[2:]))
+
     return lines
 
 
@@ -56,7 +59,9 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
     assert {line["worker"] for line in post_fork} == {"0", "1"}
     assert all(line["pid"] != host for line in post_fork)
     assert len(hook_lines(hooked, "on_ready")) == WORKERS
+
     # Preloaded: every worker runs the application the host imported.
+
     assert import_pids(hooked, WORKERS * 8) == {int(host)}
     info = json.loads(hooked.get("/").body)
     assert info["worker_id"] in (0, 1)
@@ -68,6 +73,7 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
 def test_worker_output_is_tagged_with_the_worker(hooked: support.Server) -> None:
     # Section 11.2: a worker's stderr lines carry its index; its stdout
     # lines name the stream as well. The host's own lines are untagged.
+
     assert hooked.wait_for_log("HOOK post_fork ")
     log = hooked.log()
     assert any(line.startswith("muru.worker[0]: HOOK post_fork ") for line in log.splitlines())
@@ -92,6 +98,7 @@ def test_drain_and_exit_run_on_shutdown(hooked: support.Server) -> None:
     hooked.stop()
     assert len(hook_lines(hooked, "on_drain")) == WORKERS
     assert len(hook_lines(hooked, "on_exit")) == WORKERS
+
     for name in ("on_drain", "on_exit"):
         for line in hook_lines(hooked, name):
             assert line["pid"] != str(hooked.host_pid())
@@ -101,6 +108,7 @@ def test_unsafe_import_falls_back_to_per_worker_imports() -> None:
     server = support.start(
         "unsafe_import_wsgi:application", workers=WORKERS, args=["--hooks", "hooks_log"]
     )
+
     try:
         log = server.log()
         assert "preload: the import of unsafe_import_wsgi left a connected socket" in log
@@ -108,8 +116,10 @@ def test_unsafe_import_falls_back_to_per_worker_imports() -> None:
         pids = import_pids(server, WORKERS * 8)
         assert pids == set(server.worker_pids().values())
         assert server.host_pid() not in pids
+
         # on_load ran once in the host before the check, then on_load and
         # pre_fork run again in each worker, before its post_fork.
+
         on_load = hook_lines(server, "on_load")
         assert on_load[0] == {
             "pid": str(server.host_pid()),
@@ -132,6 +142,7 @@ def test_preload_true_fails_on_an_unsafe_import() -> None:
 
 def test_preload_false_imports_in_each_worker() -> None:
     server = support.start("preload_wsgi:application", workers=WORKERS, args=["--preload", "false"])
+
     try:
         assert "preloaded" not in server.log()
         assert import_pids(server, WORKERS * 8) == set(server.worker_pids().values())
@@ -150,6 +161,7 @@ def test_single_serves_in_the_host_process_without_forking() -> None:
     server = support.start(
         "preload_wsgi:application", workers=3, threads=4, args=["--single", "--hooks", "hooks_log"]
     )
+
     try:
         assert server.wait_for_log("serving in this process without forking")
         info = json.loads(server.get("/").body)
@@ -159,8 +171,10 @@ def test_single_serves_in_the_host_process_without_forking() -> None:
         assert info["worker_id"] == 0
         assert info["process_model"] in ("process-per-request", "free-threaded")
         assert server.worker_pids() == {}
+
         # Hooks still run, in this one process; nothing forks, so pre_fork
         # has no occasion.
+
         for name in ("on_load", "post_fork", "on_ready"):
             assert [line["pid"] for line in hook_lines(server, name)] == [str(host)], name
         assert hook_lines(server, "pre_fork") == []

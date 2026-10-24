@@ -3,7 +3,8 @@
 //! Every request produces a record with its identifier, method, path,
 //! status and reason, bytes sent, the worker that served it and timings:
 //! queue (waiting for a worker connection), application (until the
-//! response head arrived) and total. Records are kept in a bounded ring in
+//! response head arrived) and total, and the application, release, host,
+//! group and mount that served it. Records are kept in a bounded ring in
 //! memory for the dashboard and the CLI, and written to the terminal as
 //! compact lines, to a file as JSON lines, only for errors and slow
 //! requests, or not at all.
@@ -14,8 +15,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::metrics::Metrics;
 
 /// How many records the in-memory ring keeps.
 /// Records kept in memory for `recent()`, the dashboard and the CLI.
@@ -66,6 +69,18 @@ pub struct Record {
     pub request_id: String,
     /// The client address.
     pub client: IpAddr,
+    /// The application served, or empty when nothing names it.
+    pub app: String,
+    /// The release served, or empty when nothing names it.
+    pub release: String,
+    /// The virtual host that matched, else the host the client asked for.
+    pub host: String,
+    /// The worker group: `default`, or a named group's name.
+    pub group: String,
+    /// The mount: `default`, or a named mount's name.
+    pub mount: String,
+    /// The routing snapshot's version, 0 for a development run.
+    pub snapshot: u64,
     /// The HTTP method.
     pub method: String,
     /// The path with its query string.
@@ -118,13 +133,27 @@ pub struct Minute {
 }
 
 /// The access log: a ring of recent records, per-second counters for the
-/// last minute, and the configured output.
+/// last minute, the request metrics, and the configured output.
 pub struct AccessLog {
     config: Config,
     ring: Mutex<VecDeque<Record>>,
     minute: Mutex<[Bucket; MINUTE]>,
+    metrics: Metrics,
     started: u64,
     file: Option<Mutex<File>>,
+}
+
+/// A request counted as in flight until this is dropped.
+pub struct InFlight {
+    log: Arc<AccessLog>,
+    app: String,
+    release: String,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.log.metrics.finish(&self.app, &self.release);
+    }
 }
 
 fn unix_seconds(time: SystemTime) -> u64 {
@@ -141,13 +170,31 @@ impl AccessLog {
             )),
             _ => None,
         };
+
         Ok(Self {
             config,
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             minute: Mutex::new([Bucket::default(); MINUTE]),
+            metrics: Metrics::default(),
             started: unix_seconds(SystemTime::now()),
             file,
         })
+    }
+
+    /// The request metrics the records feed (section 11.1).
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// Count a request as in flight for the application and release it
+    /// is labelled with, until the returned guard is dropped.
+    pub fn begin(self: &Arc<Self>, app: &str, release: &str) -> InFlight {
+        self.metrics.begin(app, release);
+        InFlight {
+            log: Arc::clone(self),
+            app: app.to_owned(),
+            release: release.to_owned(),
+        }
     }
 
     /// Keep a record and write it where the configuration says.
@@ -155,17 +202,22 @@ impl AccessLog {
         if self.shows(&record) {
             self.write(&record);
         }
+
+        self.metrics.observe(&record);
         self.count(unix_seconds(SystemTime::now()), record.status);
         let mut ring = self.ring.lock().expect("access log ring poisoned");
+
         if ring.len() == RING_CAPACITY {
             ring.pop_front();
         }
+
         ring.push_back(record);
     }
 
     fn count(&self, second: u64, status: u16) {
         let mut minute = self.minute.lock().expect("access log counters poisoned");
         let bucket = &mut minute[(second % MINUTE as u64) as usize];
+
         if bucket.second != second {
             *bucket = Bucket {
                 second,
@@ -173,7 +225,9 @@ impl AccessLog {
                 errors: 0,
             };
         }
+
         bucket.requests += 1;
+
         if status >= 500 {
             bucket.errors += 1;
         }
@@ -201,6 +255,19 @@ impl AccessLog {
         }
     }
 
+    /// Open the file again by name, for section 11.3: after an external
+    /// rotation has renamed the file, lines go to a new one at the path.
+    /// Nothing happens when lines do not go to a file.
+    pub fn reopen(&self) -> io::Result<()> {
+        let (Destination::File(path), Some(file)) = (&self.config.destination, &self.file) else {
+            return Ok(());
+        };
+
+        let reopened = OpenOptions::new().create(true).append(true).open(path)?;
+        *file.lock().expect("access log file poisoned") = reopened;
+        Ok(())
+    }
+
     /// The most recent records, oldest first.
     pub fn recent(&self, limit: usize) -> Vec<Record> {
         let ring = self.ring.lock().expect("access log ring poisoned");
@@ -215,6 +282,7 @@ impl AccessLog {
             }
             _ => {}
         }
+
         let path = record.path();
         !self
             .config
@@ -228,6 +296,7 @@ impl AccessLog {
             Some(file) => {
                 let line = json_line(record);
                 let mut file = file.lock().expect("access log file poisoned");
+
                 if file.write_all(line.as_bytes()).is_err() {
                     // Section 11.2: a stalled log never holds up requests.
                 }
@@ -258,8 +327,12 @@ pub fn glob_matches(pattern: &str, path: &str) -> bool {
     step(&pattern, &path)
 }
 
+/// The group and mount name left out of the compact form.
+const DEFAULT: &str = "default";
+
 /// The compact terminal form: time, status, method, target, bytes and
-/// timings, then the worker and request id.
+/// timings, then the group and mount when named, the worker and request
+/// id.
 fn text_line(record: &Record) -> String {
     let mut line = String::with_capacity(160);
     let (_, hours, minutes, seconds, millis) = civil(record.started);
@@ -272,6 +345,7 @@ fn text_line(record: &Record) -> String {
         format_bytes(record.bytes),
         format_duration(record.total)
     );
+
     if record.worker.is_some() {
         let _ = write!(
             line,
@@ -280,12 +354,23 @@ fn text_line(record: &Record) -> String {
             format_duration(record.application)
         );
     }
+
     if !record.reason.is_empty() {
         let _ = write!(line, " reason={}", record.reason);
     }
+
+    if !record.group.is_empty() && record.group != DEFAULT {
+        let _ = write!(line, " group={}", record.group);
+    }
+
+    if !record.mount.is_empty() && record.mount != DEFAULT {
+        let _ = write!(line, " mount={}", record.mount);
+    }
+
     if let Some(worker) = record.worker {
         let _ = write!(line, " worker={worker}");
     }
+
     let _ = writeln!(line, " id={}", record.request_id);
     line
 }
@@ -296,9 +381,14 @@ fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
+        json_string(&record.app),
+        json_string(&record.release),
+        json_string(&record.host),
+        json_string(&record.group),
+        json_string(&record.mount),
         json_string(&record.method),
         json_string(&record.target),
         json_string(&record.version),
@@ -311,6 +401,7 @@ fn json_line(record: &Record) -> String {
         millis_f64(record.queue),
         millis_f64(record.application),
         millis_f64(record.total),
+        record.snapshot,
     );
     line.push('\n');
     line
@@ -323,6 +414,7 @@ fn millis_f64(duration: Duration) -> f64 {
 /// Format a duration briefly: 0.9ms, 42ms, 1.50s.
 pub fn format_duration(duration: Duration) -> String {
     let millis = millis_f64(duration);
+
     if millis >= 1000.0 {
         format!("{:.2}s", millis / 1000.0)
     } else if millis >= 10.0 {
@@ -377,6 +469,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
+
     for character in text.chars() {
         match character {
             '"' => out.push_str("\\\""),
@@ -390,6 +483,7 @@ fn json_string(text: &str) -> String {
             other => out.push(other),
         }
     }
+
     out.push('"');
     out
 }
@@ -406,8 +500,10 @@ mod tests {
             exclude: Vec::new(),
         })
         .expect("log");
+
         // Counted in time order, as they arrive: the second a minute before
         // `now` shares a bucket with `now` and is overwritten by it.
+
         let now = log.started + 10;
         log.count(now - 60, 200);
         log.count(now - 59, 500);
@@ -462,6 +558,12 @@ mod tests {
             started: SystemTime::now(),
             request_id: "id".to_owned(),
             client: "127.0.0.1".parse().expect("address"),
+            app: String::new(),
+            release: String::new(),
+            host: String::new(),
+            group: DEFAULT.to_owned(),
+            mount: DEFAULT.to_owned(),
+            snapshot: 0,
             method: "GET".to_owned(),
             target: target.to_owned(),
             version: "HTTP/1.1".to_owned(),

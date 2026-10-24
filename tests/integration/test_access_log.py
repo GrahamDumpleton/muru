@@ -18,16 +18,19 @@ LINE = re.compile(
 
 def access_lines(server: support.Server) -> list[re.Match[str]]:
     matches = []
+
     for line in server.log_since_mark().splitlines():
         match = LINE.match(line)
         if match:
             matches.append(match)
+
     return matches
 
 
 @pytest.fixture
 def default() -> Iterator[support.Server]:
     instance = support.start("wsgi_conformance:application", workers=1)
+
     try:
         yield instance
     finally:
@@ -69,6 +72,7 @@ def test_query_strings_are_kept(default: support.Server) -> None:
 
 def test_off_writes_nothing() -> None:
     server = support.start("wsgi_conformance:application", workers=1, args=["--access-log", "off"])
+
     try:
         server.mark_log()
         for _ in range(3):
@@ -85,6 +89,7 @@ def test_errors_mode_shows_failures_and_slow_requests() -> None:
         workers=1,
         args=["--access-log", "errors", "--slow", "100ms"],
     )
+
     try:
         server.mark_log()
         ok = server.get("/response/list")
@@ -105,6 +110,7 @@ def test_excluded_paths_are_hidden() -> None:
         workers=1,
         args=["--access-log-exclude", "/environ/*", "--access-log-exclude", "/method/?cho"],
     )
+
     try:
         server.mark_log()
         hidden = server.get("/environ/get?key=PATH_INFO")
@@ -124,6 +130,7 @@ def test_file_destination_writes_json_lines(tmp_path: Path) -> None:
     server = support.start(
         "wsgi_conformance:application", workers=1, args=["--access-log", str(log)]
     )
+
     try:
         server.mark_log()
         response = server.post("/input/read-all", b"hello")

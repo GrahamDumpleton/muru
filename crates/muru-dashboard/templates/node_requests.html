@@ -1,0 +1,15 @@
+<h2>Recent requests</h2>
+<table>
+  <tr><th>Time</th><th>Status</th><th>Method</th><th>Target</th><th>Release</th><th>Host</th><th class="num">Bytes</th><th class="num">Total</th><th class="num">Queue</th><th class="num">App</th><th>Worker</th><th>Request id</th></tr>
+  {% for request in data.requests %}
+  <tr>
+    <td>{{ request.time }}</td>
+    <td class="status-{{ request.status_class }}">{{ request.status }}{% if !request.reason.is_empty() %} {{ request.reason }}{% endif %}</td>
+    <td>{{ request.method }}</td><td>{{ request.target }}</td>
+    <td>{{ request.release }}</td><td>{{ request.host }}</td>
+    <td class="num">{{ request.bytes }}</td><td class="num">{{ request.total }}</td>
+    <td class="num">{{ request.queue }}</td><td class="num">{{ request.application }}</td>
+    <td>{{ request.worker }}</td><td>{{ request.request_id }}</td>
+  </tr>
+  {% endfor %}
+</table>

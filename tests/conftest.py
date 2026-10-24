@@ -14,6 +14,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         return
 
     skip = pytest.mark.skip(reason="needs Linux-only features")
+
     for item in items:
         if "requires_linux" in item.keywords:
             item.add_marker(skip)

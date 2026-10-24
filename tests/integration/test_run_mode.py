@@ -17,6 +17,7 @@ from support import server as support
 
 def test_development_mode_is_announced() -> None:
     server = support.start("plain_wsgi:application", workers=1)
+
     try:
         log = server.log()
         assert "muru: development mode: error pages show tracebacks" in log
@@ -33,6 +34,7 @@ def start_raw(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
     if muructl is None or not support.extension_available():
         pytest.skip("muructl and the extension must be built")
     log = Path(tempfile.mkstemp(prefix="muru-mode-", suffix=".log")[1])
+
     with log.open("wb") as handle:
         process = subprocess.Popen(
             [
@@ -50,6 +52,7 @@ def start_raw(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
             stdout=handle,
             stderr=subprocess.STDOUT,
         )
+
     return process, log
 
 
@@ -64,8 +67,10 @@ def test_a_public_address_is_refused_without_allow_public() -> None:
 
 def test_allow_public_turns_development_behaviours_off() -> None:
     process, log = start_raw("--bind", "0.0.0.0", "--port", "auto", "--allow-public")
+
     try:
         deadline = time.monotonic() + 30
+
         while time.monotonic() < deadline:
             match = re.search(r"serving .* on http://0\.0\.0\.0:(\d+) ", log.read_text())
             if match:
@@ -74,6 +79,7 @@ def test_allow_public_turns_development_behaviours_off() -> None:
             time.sleep(0.05)
         else:
             raise AssertionError(log.read_text())
+
         server = support.Server(int(match.group(1)), process, log, 1, 4)
         text = server.log()
         assert "muru: --allow-public: development behaviours are off" in text

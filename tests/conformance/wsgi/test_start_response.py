@@ -42,6 +42,7 @@ def test_second_call_before_output_replaces_status_and_headers(server: Server) -
     # PEP 3333 forbids a second call without exc_info; like mod_wsgi, Muru
     # tolerates it while nothing has reached the wire and the second call
     # wins. The strictness applies once output has started.
+
     response = server.get(f"{AREA}/double-before-output")
     assert response.status == 201
     assert response.header("X-First") is None

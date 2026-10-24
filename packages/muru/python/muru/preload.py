@@ -29,6 +29,7 @@ __all__ = ["Finding", "ImportRecorder", "child_pids", "thread_count"]
 
 # Compared through a name rather than sys.platform itself, so that mypy on
 # one platform does not report the other platform's branch as unreachable.
+
 _PLATFORM = sys.platform
 
 
@@ -60,6 +61,7 @@ class Finding:
                 "close it in a pre_fork hook and reopen it in post_fork, "
                 "or open it lazily on first use"
             )
+
         return "start it from a post_fork hook instead"
 
 
@@ -75,9 +77,11 @@ def _libproc() -> ctypes.CDLL | None:
     """Load the macOS libproc library once; None when it is unavailable."""
 
     global _libproc_handle
+
     if _libproc_handle is False:
         _libproc_handle = None
         path = ctypes.util.find_library("proc")
+
         if path is not None:
             try:
                 library = ctypes.CDLL(path)
@@ -94,6 +98,7 @@ def _libproc() -> ctypes.CDLL | None:
                 _libproc_handle = library
             except (OSError, AttributeError):
                 _libproc_handle = None
+
     return _libproc_handle if isinstance(_libproc_handle, ctypes.CDLL) else None
 
 
@@ -112,12 +117,15 @@ def thread_count() -> int:
             pass
     elif _PLATFORM == "darwin":
         library = _libproc()
+
         if library is not None:
             buffer = ctypes.create_string_buffer(_TASKINFO_SIZE)
             size = library.proc_pidinfo(os.getpid(), _PROC_PIDTASKINFO, 0, buffer, _TASKINFO_SIZE)
+
             if size >= _TASKINFO_SIZE:
                 raw = buffer.raw[_THREADNUM_OFFSET : _THREADNUM_OFFSET + 4]
                 return int.from_bytes(raw, sys.byteorder, signed=True)
+
     return threading.active_count()
 
 
@@ -125,15 +133,19 @@ def child_pids() -> set[int]:
     """Return the pids of this process's live children."""
 
     pid = os.getpid()
+
     if _PLATFORM == "linux":
         children: set[int] = set()
+
         try:
             for task in os.listdir("/proc/self/task"):
                 with open(f"/proc/self/task/{task}/children", encoding="ascii") as handle:
                     children.update(int(child) for child in handle.read().split())
+
             return children
         except OSError:
             pass
+
         try:
             for entry in os.listdir("/proc"):
                 if not entry.isdigit():
@@ -144,14 +156,18 @@ def child_pids() -> set[int]:
                     children.add(int(entry))
         except OSError:
             pass
+
         return children
+
     if _PLATFORM == "darwin":
         library = _libproc()
+
         if library is not None:
             buffer = (ctypes.c_int * 4096)()
             count = library.proc_listchildpids(pid, buffer, ctypes.sizeof(buffer))
             if count >= 0:
                 return {int(buffer[index]) for index in range(min(count, len(buffer)))}
+
     return set()
 
 
@@ -168,20 +184,26 @@ def open_fds() -> dict[int, Identity]:
     """Every open descriptor with its (mode, device, inode) identity."""
 
     found: dict[int, Identity] = {}
+
     try:
         entries = os.listdir(_fd_directory())
     except OSError:
         return found
+
     for entry in entries:
         if not entry.isdigit():
             continue
         fd = int(entry)
+
         try:
             info = os.fstat(fd)
         except OSError:
             # The descriptor used to list the directory, already closed.
+
             continue
+
         found[fd] = (stat.S_IFMT(info.st_mode), info.st_dev, info.st_ino)
+
     return found
 
 
@@ -201,6 +223,7 @@ def _format_peer(peer: Any) -> str:
     if isinstance(peer, tuple) and len(peer) >= 2:
         host, port = peer[0], peer[1]
         return f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
+
     if isinstance(peer, bytes):
         return repr(peer)
     return str(peer) or "an unnamed peer"
@@ -213,17 +236,20 @@ def _peer_name(fd: int) -> str | None:
         duplicate = os.dup(fd)
     except OSError:
         return None
+
     try:
         sock = socket.socket(fileno=duplicate)
     except OSError:
         os.close(duplicate)
         return None
+
     try:
         peer = sock.getpeername()
     except OSError:
         return None
     finally:
         sock.close()
+
     return _format_peer(peer)
 
 
@@ -239,6 +265,7 @@ def _classify(fd: int, mode: int, children_appeared: bool) -> tuple[str, str] | 
         if peer is None:
             return None
         return "socket", f"a connected socket (fd {fd}, to {peer})"
+
     if stat.S_ISFIFO(mode) and children_appeared:
         return "pipe", f"a pipe (fd {fd}) to a child process"
     return None
@@ -300,12 +327,15 @@ class ImportRecorder:
     ) -> ModuleType:
         original = self._original_import or builtins.__import__
         full_name = name
+
         if level > 0:
             package = globals.get("__package__") if globals else None
+
             try:
                 full_name = resolve_name("." * level + name, str(package or ""))
             except (ImportError, ValueError):
                 full_name = name
+
         if full_name in sys.modules:
             return original(name, globals, locals, fromlist, level)
         return self._record(full_name, lambda: original(name, globals, locals, fromlist, level))
@@ -313,6 +343,7 @@ class ImportRecorder:
     def _record(self, module: str, run: Callable[[], ModuleType]) -> ModuleType:
         fds_before = _fd_numbers()
         threads_before = thread_count()
+
         try:
             return run()
         finally:
@@ -327,24 +358,31 @@ class ImportRecorder:
 
         findings: list[Finding] = []
         children = child_pids() - self._children_before
+
         for fd, identity in sorted(open_fds().items()):
             if self._fds_before.get(fd) == identity:
                 continue
             classified = _classify(fd, identity[0], bool(children))
+
             if classified is not None:
                 kind, detail = classified
                 findings.append(Finding(kind, detail, self._fd_owner.get(fd)))
+
         extra_threads = thread_count() - self._threads_before
+
         if extra_threads > 0:
             attributed = 0
+
             for module, grown in self._thread_owners:
                 count = min(grown, extra_threads - attributed)
                 if count <= 0:
                     break
                 attributed += count
                 findings.append(Finding("thread", _threads(count), module))
+
             if attributed < extra_threads:
                 findings.append(Finding("thread", _threads(extra_threads - attributed)))
+
         for pid in sorted(children):
             findings.append(Finding("child", f"a child process running (pid {pid})"))
         return findings

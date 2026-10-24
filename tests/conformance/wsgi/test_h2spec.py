@@ -16,6 +16,7 @@ from support.server import ROOT, Server
 # input still unread, which the peer then sees as a reset rather than the
 # clean close h2spec waits for. Whether that happens depends on timing, so
 # these cases are allowed to fail. Neither affects a well-behaved client.
+
 ALLOWED_FAILURES = {
     ("http2/3.5", "Sends invalid connection preface"),
     ("http2/7", "Sends a GOAWAY frame with unknown error code"),
@@ -79,8 +80,10 @@ def parse_report(text: str) -> tuple[set[tuple[str, str]], int]:
 
     failed = set()
     total = 0
+
     for match in CASE.finditer(text):
         total += 1
         if "<failure" in match.group(3) or "<error" in match.group(3):
             failed.add((match.group(1), match.group(2)))
+
     return failed, total

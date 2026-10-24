@@ -14,6 +14,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # The Mozilla root store in webpki-roots, which the event webhook client
+    # trusts for HTTPS receivers.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",

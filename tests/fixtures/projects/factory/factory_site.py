@@ -34,11 +34,25 @@ def create_app() -> Callable[..., Iterable[bytes]]:
 
 
 async def asgi_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
-    """An ASGI application, which phase 1 refuses with a clear message."""
+    """An ASGI application, detected from the coroutine function."""
+
+    if scope["type"] == "lifespan":
+        return
+    body = b"asgi\n"
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain"), (b"content-length", b"5")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 class AsgiCallable:
-    """An object whose __call__ is a coroutine function."""
+    """An object whose __call__ is a coroutine function, so it is detected as ASGI."""
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        """Do nothing."""
+        """Answer like asgi_app."""
+
+        await asgi_app(scope, receive, send)
