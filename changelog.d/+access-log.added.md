@@ -1,0 +1,1 @@
+`muructl run` writes a compact access log line per request to the terminal, with the status, bytes, timings for queue, application and total, the worker and the request id. `--access-log` switches it off, limits it to errors and requests slower than `--slow`, or sends JSON lines to a file, and `--access-log-exclude` hides matching paths.

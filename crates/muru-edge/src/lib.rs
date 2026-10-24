@@ -25,6 +25,7 @@ use hyper_util::server::conn::auto;
 use muru_proto::worker::v1 as pb;
 use tokio::net::TcpListener;
 
+pub mod access;
 pub mod errors;
 pub mod link;
 
@@ -42,6 +43,8 @@ pub struct Config {
     pub slots: usize,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
+    /// Where the access log goes and what it leaves out.
+    pub access_log: access::Config,
 }
 
 /// Concurrent streams accepted per HTTP/2 connection (section 4.18).
@@ -55,12 +58,14 @@ pub struct Edge {
     request_ids: Arc<errors::RequestIds>,
     protocols: Arc<auto::Builder<TokioExecutor>>,
     development: bool,
+    access_log: Arc<access::AccessLog>,
 }
 
 impl Edge {
     /// Bind the listener and prepare the worker pools.
     pub async fn bind(config: Config) -> anyhow::Result<Self> {
         let pool = Arc::new(link::LinkPool::new(&config.sockets, config.slots)?);
+        let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
         let listener = TcpListener::bind(config.listen).await?;
         let local = listener.local_addr()?;
         // Each connection is served as HTTP/1.1 or, when it opens with the
@@ -77,12 +82,18 @@ impl Edge {
             request_ids: Arc::new(errors::RequestIds::new()),
             protocols: Arc::new(protocols),
             development: config.development,
+            access_log,
         })
     }
 
     /// The address the listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// The access log, for the dashboard and the CLI.
+    pub fn access_log(&self) -> Arc<access::AccessLog> {
+        Arc::clone(&self.access_log)
     }
 
     /// Accept connections until an accept error occurs.
@@ -95,14 +106,21 @@ impl Edge {
             let protocols = Arc::clone(&self.protocols);
             let local = self.local;
             let development = self.development;
+            let access_log = Arc::clone(&self.access_log);
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
                     let pool = Arc::clone(&pool);
+                    let access_log = Arc::clone(&access_log);
                     let request_id = ids.next();
                     async move {
-                        let mut response =
-                            link::handle(request, pool, &request_id, peer, local, development)
-                                .await;
+                        let context = link::Context {
+                            request_id: &request_id,
+                            peer,
+                            local,
+                            development,
+                            access_log,
+                        };
+                        let mut response = link::handle(request, pool, &context).await;
                         // Section 4.19: every response names its request.
                         if let Ok(value) = HeaderValue::from_str(&request_id) {
                             response

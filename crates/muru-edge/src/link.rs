@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
 use http::{Response, StatusCode};
@@ -37,6 +37,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::access::{AccessLog, Record};
 use crate::errors::{self, Negotiation, Problem};
 use crate::{BoxError, ResponseBody, close_after, request_head};
 
@@ -248,27 +249,83 @@ impl Return {
     }
 }
 
+/// What the edge knows about a request before it is handled.
+pub struct Context<'a> {
+    /// The request identifier (section 4.19).
+    pub request_id: &'a str,
+    /// The client's address.
+    pub peer: SocketAddr,
+    /// The listener's address.
+    pub local: SocketAddr,
+    /// Whether error pages show tracebacks.
+    pub development: bool,
+    /// Where the request's record goes once it is complete.
+    pub access_log: Arc<AccessLog>,
+}
+
+/// The access log record of a request in progress.
+struct Recording {
+    log: Arc<AccessLog>,
+    record: Record,
+    started: Instant,
+}
+
+impl Recording {
+    fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
+        Self {
+            log: Arc::clone(&context.access_log),
+            record: Record {
+                started: SystemTime::now(),
+                request_id: context.request_id.to_owned(),
+                client: context.peer.ip(),
+                method: parts.method.as_str().to_owned(),
+                target: parts
+                    .uri
+                    .path_and_query()
+                    .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string()),
+                version: format!("{:?}", parts.version),
+                status: 0,
+                reason: String::new(),
+                bytes: 0,
+                worker: None,
+                queue: Duration::ZERO,
+                application: Duration::ZERO,
+                total: Duration::ZERO,
+            },
+            started: Instant::now(),
+        }
+    }
+
+    fn complete(mut self, status: u16, reason: &str, bytes: u64) {
+        self.record.status = status;
+        self.record.reason = reason.to_owned();
+        self.record.bytes = bytes;
+        self.record.total = self.started.elapsed();
+        self.log.record(self.record);
+    }
+}
+
 /// Forward one request to a worker over the framed link.
 pub async fn handle(
     request: http::Request<Incoming>,
     pool: Arc<LinkPool>,
-    request_id: &str,
-    peer: SocketAddr,
-    local: SocketAddr,
-    development: bool,
+    context: &Context<'_>,
 ) -> Response<ResponseBody> {
     let (parts, mut body) = request.into_parts();
-    let mut head = request_head(&parts, request_id, peer, local);
+    let mut head = request_head(&parts, context.request_id, context.peer, context.local);
+    let mut recording = Recording::new(context, &parts);
     let failing = Failing {
-        request_id,
-        negotiation: Negotiation::from_headers(&parts.headers, development),
+        request_id: context.request_id,
+        negotiation: Negotiation::from_headers(&parts.headers, context.development),
         version: parts.version,
+        recording: Mutex::new(None),
     };
 
     if head
         .content_length
         .is_some_and(|length| length > MAX_BODY_SIZE)
     {
+        *failing.recording.lock().expect("recording poisoned") = Some(recording);
         return failing.too_large();
     }
 
@@ -284,9 +341,13 @@ pub async fn handle(
                 head.body_buffered = true;
                 buffered = Some(data);
             }
-            Err(BodyError::TooLarge) => return failing.too_large(),
+            Err(BodyError::TooLarge) => {
+                *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                return failing.too_large();
+            }
             Err(BodyError::Read(error)) => {
                 tracing::debug!(%error, "reading the request body failed");
+                *failing.recording.lock().expect("recording poisoned") = Some(recording);
                 return failing.close(Problem::new(
                     StatusCode::BAD_REQUEST,
                     "malformed",
@@ -297,6 +358,7 @@ pub async fn handle(
     }
     let expect_continue = head.expect_continue && !head.body_buffered;
 
+    let queued = Instant::now();
     let lease = match pool.acquire().await {
         Ok(lease) => lease,
         Err(error) => {
@@ -307,6 +369,7 @@ pub async fn handle(
                 "No worker is available to handle the request.",
             );
             problem.retry_after = Some(1);
+            *failing.recording.lock().expect("recording poisoned") = Some(recording);
             return failing.respond(problem);
         }
     };
@@ -319,11 +382,15 @@ pub async fn handle(
         mut reader,
         mut writer,
     } = conn;
+    recording.record.worker = Some(worker);
+    recording.record.queue = queued.elapsed();
+    let dispatched = Instant::now();
 
     let end = buffered
         .as_ref()
         .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
     let flags = if end { flag::END } else { 0 };
+    *failing.recording.lock().expect("recording poisoned") = Some(recording);
     if let Err(error) = frame::write(
         &mut writer,
         kind::REQUEST,
@@ -383,6 +450,11 @@ pub async fn handle(
         back.give_reader(None);
         return failing.worker_crashed("The worker sent an invalid response head.");
     };
+    let mut recording = failing.recording.lock().expect("recording poisoned").take();
+    if let Some(recording) = recording.as_mut() {
+        recording.record.application = dispatched.elapsed();
+        recording.record.status = u16::try_from(head.status).unwrap_or(500);
+    }
 
     let mut builder = Response::builder().status(crate::status_code(head.status));
     if let Some(headers) = builder.headers_mut() {
@@ -399,6 +471,10 @@ pub async fn handle(
     let response = if response_end {
         back.give_reader(Some(reader));
         back.abort_request();
+        if let Some(recording) = recording.take() {
+            let status = recording.record.status;
+            recording.complete(status, "", 0);
+        }
         let empty = Empty::<Bytes>::new()
             .map_err(|never| match never {})
             .boxed_unsync();
@@ -408,6 +484,8 @@ pub async fn handle(
             BodyState {
                 reader: Some(reader),
                 back,
+                recording,
+                bytes: 0,
             },
             next_chunk,
         );
@@ -425,16 +503,27 @@ pub async fn handle(
 }
 
 /// How this request's failures are answered: with the error pages of
-/// section 4.12, in the client's preferred format.
+/// section 4.12, in the client's preferred format, and a record in the
+/// access log.
 struct Failing<'a> {
     request_id: &'a str,
     negotiation: Negotiation,
     version: http::Version,
+    recording: Mutex<Option<Recording>>,
 }
 
 impl Failing<'_> {
     fn respond(&self, problem: Problem) -> Response<ResponseBody> {
-        errors::respond(&problem, self.request_id, &self.negotiation)
+        let response = errors::respond(&problem, self.request_id, &self.negotiation);
+        if let Some(recording) = self.recording.lock().expect("recording poisoned").take() {
+            let bytes = response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()?.parse().ok())
+                .unwrap_or(0);
+            recording.complete(problem.status.as_u16(), problem.reason, bytes);
+        }
+        response
     }
 
     /// Respond and close an HTTP/1.1 connection, whose state is suspect.
@@ -517,6 +606,8 @@ async fn read_body(body: &mut Incoming) -> Result<Bytes, BodyError> {
 struct BodyState {
     reader: Option<Reader>,
     back: Arc<Return>,
+    recording: Option<Recording>,
+    bytes: u64,
 }
 
 impl BodyState {
@@ -524,6 +615,14 @@ impl BodyState {
         let reader = self.reader.take();
         self.back.give_reader(if intact { reader } else { None });
         self.back.abort_request();
+        self.record();
+    }
+
+    fn record(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            let status = recording.record.status;
+            recording.complete(status, "", self.bytes);
+        }
     }
 }
 
@@ -532,6 +631,7 @@ impl Drop for BodyState {
     /// before the END frame has been read. Drain to the end in the
     /// background so the connection can go back to the pool.
     fn drop(&mut self) {
+        self.record();
         if let Some(mut reader) = self.reader.take() {
             let back = Arc::clone(&self.back);
             tokio::spawn(async move {
@@ -566,6 +666,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                 continue;
             }
             Ok(Some(next)) if next.kind == kind::BODY => {
+                state.bytes += next.payload.len() as u64;
                 if next.is_end() {
                     state.finish(true);
                 }

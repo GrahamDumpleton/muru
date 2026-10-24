@@ -13,7 +13,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER};
+use http::header::{
+    ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER,
+};
 use http::{HeaderMap, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 
@@ -130,6 +132,7 @@ pub fn respond(
             text(problem, title, request_id, detail),
         ),
     };
+    let length = body.len();
     let body = Full::new(Bytes::from(body))
         .map_err(|never: Infallible| match never {})
         .boxed_unsync();
@@ -137,6 +140,7 @@ pub fn respond(
     *response.status_mut() = problem.status;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     if let Some(seconds) = problem.retry_after {
         headers.insert(RETRY_AFTER, HeaderValue::from(seconds));

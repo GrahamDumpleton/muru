@@ -25,7 +25,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run an application with an embedded controller and edge (development mode).
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 
     /// Run or control the daemon.
     Daemon {
@@ -67,6 +67,22 @@ struct RunArgs {
     /// on_ready, on_drain, on_exit and on_reopen_logs.
     #[arg(long)]
     hooks: Option<String>,
+
+    /// Where access log lines go: terminal, off, errors (4xx and 5xx
+    /// responses and requests slower than --slow) or a file path, which
+    /// receives JSON lines.
+    #[arg(long, default_value = "terminal")]
+    access_log: String,
+
+    /// Hide requests whose path matches the pattern from the access log
+    /// (`*` matches anything, `?` one character). Repeatable.
+    #[arg(long = "access-log-exclude", value_name = "PATTERN")]
+    access_log_exclude: Vec<String>,
+
+    /// Requests at least this slow count as errors for --access-log errors,
+    /// for example 500ms or 2s.
+    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    slow: Duration,
 
     /// Python interpreter with the muru runtime library installed.
     /// Defaults to the active virtualenv's interpreter, else python3 on PATH.
@@ -137,7 +153,7 @@ fn main() -> anyhow::Result<()> {
             return tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(run(args));
+                .block_on(run(*args));
         }
         Command::Daemon {
             command: DaemonCommand::Run,
@@ -147,6 +163,42 @@ fn main() -> anyhow::Result<()> {
         } => "edge run",
     };
     anyhow::bail!("muructl {name} is not implemented yet; see docs/project/roadmap.md")
+}
+
+/// Parse a duration such as 250ms, 1.5s or 2 (seconds).
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1.0)
+    } else {
+        (text, 1.0)
+    };
+    let value: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration such as 500ms or 2s"))?;
+    if value < 0.0 {
+        return Err("a duration cannot be negative".to_owned());
+    }
+    Ok(Duration::from_secs_f64(value * scale))
+}
+
+fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
+    use muru_edge::access::Destination;
+
+    let destination = match args.access_log.as_str() {
+        "terminal" => Destination::Terminal,
+        "off" => Destination::Off,
+        "errors" => Destination::Errors,
+        path => Destination::File(PathBuf::from(path)),
+    };
+    muru_edge::access::Config {
+        destination,
+        slow: args.slow,
+        exclude: args.access_log_exclude.clone(),
+    }
 }
 
 /// The interpreter to run the host with. A path is made absolute, because a
@@ -176,6 +228,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.workers >= 1, "--workers must be at least 1");
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    let access_log = access_log_config(&args);
     let python = python_interpreter(args.python);
 
     let mut command = tokio::process::Command::new(&python);
@@ -245,6 +298,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         sockets,
         slots: args.threads,
         development: true,
+        access_log,
     })
     .await?;
     println!(

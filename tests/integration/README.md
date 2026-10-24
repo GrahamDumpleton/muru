@@ -12,6 +12,9 @@ design specification and are added as the features they cover land:
   imports, and the lifecycle hooks from on_load to on_exit, including
   on_reopen_logs on SIGUSR1.
 
+- `test_access_log.py`: the access log on the terminal, off, for errors
+  and slow requests only, with excluded paths, and as JSON lines in a file.
+
 Run with `just test-integration`. Scenarios that need Docker, network, root or
 a long time carry markers and are skipped by default. Helpers for starting
 muructl and talking to it are in `tests/support`.
