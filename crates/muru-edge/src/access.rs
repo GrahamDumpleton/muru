@@ -18,7 +18,8 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many records the in-memory ring keeps.
-const RING_CAPACITY: usize = 1000;
+/// Records kept in memory for `recent()`, the dashboard and the CLI.
+pub const RING_CAPACITY: usize = 1000;
 
 /// Where access log lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]

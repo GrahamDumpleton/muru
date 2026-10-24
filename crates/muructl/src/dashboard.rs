@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use muru_dashboard::{Data, RequestRow, Source, Summary, Worker};
 use muru_edge::Pools;
-use muru_edge::access::{AccessLog, Record, civil, format_bytes, format_duration};
+use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
 
 use crate::logs::Logs;
 
@@ -62,7 +62,7 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
 
 fn collect(inputs: &Inputs) -> Data {
     let now = SystemTime::now();
-    let records = inputs.access_log.recent(1000);
+    let records = inputs.access_log.recent(RING_CAPACITY);
     let recent: Vec<&Record> = records
         .iter()
         .filter(|record| {
@@ -70,6 +70,19 @@ fn collect(inputs: &Inputs) -> Data {
                 .map_or(true, |age| age <= WINDOW)
         })
         .collect();
+    // The ring holds a bounded number of records, so under load it reaches
+    // back less than a minute: the rate is taken over the span it covers,
+    // not over a minute it only partly describes.
+    let covered = if records.len() >= RING_CAPACITY {
+        records
+            .iter()
+            .filter_map(|record| now.duration_since(record.started).ok())
+            .max()
+            .map_or(WINDOW, |oldest| oldest.min(WINDOW))
+    } else {
+        WINDOW
+    };
+    let covered = covered.max(Duration::from_secs(1));
     let mut totals: Vec<Duration> = recent.iter().map(|record| record.total).collect();
     totals.sort();
     let percentile = |fraction: f64| -> String {
@@ -92,7 +105,7 @@ fn collect(inputs: &Inputs) -> Data {
         })
         .collect();
     let summary = Summary {
-        rate: format!("{:.1}", recent.len() as f64 / WINDOW.as_secs_f64()),
+        rate: format!("{:.1}", recent.len() as f64 / covered.as_secs_f64()),
         p50: percentile(0.5),
         p95: percentile(0.95),
         errors: recent.iter().filter(|record| record.status >= 500).count(),
