@@ -13,7 +13,7 @@ otherwise. Three of its cases are allowed to fail: after an invalid preface
 or a client GOAWAY, hyper may close the socket with input unread, which the
 peer sees as a reset rather than a clean close.
 
-`wsgi/` is the PEP 3333 suite, plus the HTTP/2 module driven with curl: one server started from
+`http1/` sends malformed and ambiguous HTTP/1.1 requests (the request smuggling corpus) and checks none reaches the application, recording where hyper is lenient. `wsgi/` is the PEP 3333 suite, plus the HTTP/2 module driven with curl: one server started from
 `tests/fixtures/apps/wsgi_conformance.py` for the whole run, and one test
 module per area (start_response, response iteration, wsgi.input, environ,
 headers, methods, file_wrapper, wsgi.errors, threads). The cases follow the
