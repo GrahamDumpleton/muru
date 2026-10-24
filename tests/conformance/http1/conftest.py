@@ -10,7 +10,9 @@ from support import server as support
 
 @pytest.fixture(scope="package")
 def server() -> Iterator[support.Server]:
-    instance = support.start("wsgi_conformance:application", workers=1, threads=2)
+    instance = support.start(
+        "wsgi_conformance:application", workers=1, threads=2, args=["--max-body-size", "10MB"]
+    )
     try:
         yield instance
     finally:

@@ -33,18 +33,19 @@ fn version() -> &'static str {
 /// application threads finish their requests, `on_exit` once they have, and
 /// `on_reopen_logs` whenever SIGUSR1 arrives (section 6.3).
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, on_drain=None, on_exit=None, on_reopen_logs=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, on_drain=None, on_exit=None, on_reopen_logs=None))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
     app: Py<PyAny>,
     threads: usize,
+    multiprocess: bool,
     on_drain: Option<Py<PyAny>>,
     on_exit: Option<Py<PyAny>>,
     on_reopen_logs: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
-    let shared = pool::Shared::new(app, errors, threads)
+    let shared = pool::Shared::new(app, errors, threads, multiprocess)
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let shared = Arc::new(shared);
     let lifecycle = link::Lifecycle {

@@ -103,6 +103,17 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     if path == "/error":
         raise RuntimeError("deliberate failure")
 
+    if path == "/hsts":
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/plain"),
+                ("Content-Length", "2"),
+                ("Strict-Transport-Security", "max-age=31536000"),
+            ],
+        )
+        return [b"ok"]
+
     if path == "/threadlocal":
         LOCAL.count = getattr(LOCAL, "count", 0) + 1
         body = json.dumps({"count": LOCAL.count, "thread": threading.get_ident()}).encode()

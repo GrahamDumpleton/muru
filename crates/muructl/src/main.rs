@@ -122,6 +122,11 @@ struct RunArgs {
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     slow: Duration,
 
+    /// Largest request body accepted, for example 100MB or 512KB (KB, MB
+    /// and GB are powers of 1024). Development runs default to 100MB.
+    #[arg(long, default_value = "100MB", value_name = "SIZE", value_parser = muru_config::parse_size)]
+    max_body_size: u64,
+
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s) or response_idle (60s).
     /// Repeatable.
@@ -404,7 +409,10 @@ fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
 }
 
 fn limits(args: &RunArgs) -> muru_edge::Limits {
-    let mut limits = muru_edge::Limits::default();
+    let mut limits = muru_edge::Limits {
+        max_body_size: args.max_body_size,
+        ..muru_edge::Limits::default()
+    };
     for (name, duration) in &args.timeouts {
         match name.as_str() {
             "queue" => limits.queue_timeout = *duration,

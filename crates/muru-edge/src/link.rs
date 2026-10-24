@@ -47,11 +47,11 @@ use crate::{BoxError, Limits, ResponseBody, close_after, request_head};
 const DISCARD_LIMIT: usize = 1024 * 1024;
 const DISCARD_DELAY: Duration = Duration::from_secs(2);
 
-/// The largest request body accepted (max_body_size in section 4.6, with
+/// The largest request body accepted by default (max_body_size in section 4.6, with
 /// the same default as mod_wsgi-express). A declared length beyond it is
 /// refused before anything is read; an undeclared one as soon as it is
 /// exceeded.
-pub const MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 
 type Reader = BufReader<OwnedReadHalf>;
 type Writer = OwnedWriteHalf;
@@ -420,14 +420,16 @@ pub async fn handle(
     let mut recording = Recording::new(context, &parts);
     let failing = Failing {
         request_id: context.request_id,
+        max_body_size: limits.max_body_size,
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
         version: parts.version,
         recording: Mutex::new(None),
     };
 
+    head.max_body_size = limits.max_body_size;
     if head
         .content_length
-        .is_some_and(|length| length > MAX_BODY_SIZE)
+        .is_some_and(|length| length > limits.max_body_size)
     {
         *failing.recording.lock().expect("recording poisoned") = Some(recording);
         return failing.too_large();
@@ -439,7 +441,7 @@ pub async fn handle(
     // send 100 Continue to a client that is waiting for it.
     let mut buffered: Option<Bytes> = None;
     if !body.is_end_stream() && head.content_length.is_none() {
-        match read_body(&mut body).await {
+        match read_body(&mut body, limits.max_body_size).await {
             Ok(data) => {
                 head.content_length = Some(data.len() as u64);
                 head.body_buffered = true;
@@ -606,6 +608,14 @@ pub async fn handle(
     let mut builder = Response::builder().status(crate::status_code(head.status));
     if let Some(headers) = builder.headers_mut() {
         crate::copy_headers(headers, head.headers);
+        if context.development {
+            let host = parts
+                .headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("this host");
+            crate::warn_about_hsts(headers, host, parts.uri.path());
+        }
     }
     if !head.reason.is_empty()
         && let Ok(reason) = hyper::ext::ReasonPhrase::try_from(head.reason.into_bytes())
@@ -655,6 +665,7 @@ pub async fn handle(
 /// access log.
 struct Failing<'a> {
     request_id: &'a str,
+    max_body_size: u64,
     negotiation: Negotiation,
     version: http::Version,
     recording: Mutex<Option<Recording>>,
@@ -684,7 +695,8 @@ impl Failing<'_> {
             StatusCode::PAYLOAD_TOO_LARGE,
             "body_too_large",
             format!(
-                "The request body is larger than max_body_size allows ({MAX_BODY_SIZE} bytes)."
+                "The request body is larger than max_body_size allows ({} bytes).",
+                self.max_body_size
             ),
         ))
     }
@@ -736,12 +748,12 @@ enum BodyError {
 }
 
 /// Read a request body in full, up to the size limit.
-async fn read_body(body: &mut Incoming) -> Result<Bytes, BodyError> {
+async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
     while let Some(next) = body.frame().await {
         let next = next.map_err(BodyError::Read)?;
         if let Ok(chunk) = next.into_data() {
-            if (data.len() + chunk.len()) as u64 > MAX_BODY_SIZE {
+            if (data.len() + chunk.len()) as u64 > max_body_size {
                 return Err(BodyError::TooLarge);
             }
             data.extend_from_slice(&chunk);

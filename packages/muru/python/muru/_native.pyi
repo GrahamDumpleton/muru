@@ -10,15 +10,17 @@ def serve(
     socket_path: str,
     app: Callable[..., Any],
     threads: int = 4,
+    multiprocess: bool = True,
     on_drain: Callable[[], Any] | None = None,
     on_exit: Callable[[], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
-    on_drain runs when the stop signal arrives, before the application
-    threads finish their requests, on_exit after they have, and
-    on_reopen_logs whenever SIGUSR1 arrives.
+    multiprocess is what wsgi.multiprocess reports: False only for a
+    single-process development run. on_drain runs when the stop signal
+    arrives, before the application threads finish their requests, on_exit
+    after they have, and on_reopen_logs whenever SIGUSR1 arrives.
     """
 
 class Input:

@@ -28,6 +28,8 @@ pub struct Shared {
     pub errors: Py<PyAny>,
     /// Application threads, which is also the slot count announced in HELLO.
     pub threads: usize,
+    /// wsgi.multiprocess: False only for single-process development runs (section 6.5).
+    pub multiprocess: bool,
     /// The application thread pool.
     pub pool: Pool,
     in_flight: AtomicU32,
@@ -36,12 +38,18 @@ pub struct Shared {
 
 impl Shared {
     /// Create the shared state for one worker, starting its thread pool.
-    pub fn new(app: Py<PyAny>, errors: Py<PyAny>, threads: usize) -> std::io::Result<Self> {
+    pub fn new(
+        app: Py<PyAny>,
+        errors: Py<PyAny>,
+        threads: usize,
+        multiprocess: bool,
+    ) -> std::io::Result<Self> {
         let threads = threads.max(1);
         Ok(Self {
             app,
             errors,
             threads,
+            multiprocess,
             pool: Pool::start(threads)?,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),

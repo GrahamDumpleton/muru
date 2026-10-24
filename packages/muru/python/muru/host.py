@@ -337,6 +337,8 @@ class Host:
                 self.socket_path(index),
                 app,
                 self.threads,
+                # Section 6.5: False only for a single-process development run.
+                multiprocess=self.worker_count > 1,
                 on_drain=lambda: hooks.call_logged("on_drain", context),
                 on_exit=lambda: hooks.call_logged("on_exit", context),
                 on_reopen_logs=lambda: hooks.call_logged("on_reopen_logs", context),

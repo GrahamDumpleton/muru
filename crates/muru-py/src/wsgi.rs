@@ -679,7 +679,7 @@ fn build_environ<'py>(
     environ.set_item(intern!(py, "wsgi.input"), input)?;
     environ.set_item(intern!(py, "wsgi.errors"), shared.errors.bind(py))?;
     environ.set_item(intern!(py, "wsgi.multithread"), shared.threads > 1)?;
-    environ.set_item(intern!(py, "wsgi.multiprocess"), true)?;
+    environ.set_item(intern!(py, "wsgi.multiprocess"), shared.multiprocess)?;
     environ.set_item(intern!(py, "wsgi.run_once"), false)?;
     environ.set_item(intern!(py, "wsgi.input_terminated"), true)?;
     environ.set_item(
@@ -687,6 +687,9 @@ fn build_environ<'py>(
         py.get_type::<FileWrapper>(),
     )?;
     environ.set_item(intern!(py, "muru.request_id"), &head.request_id)?;
+    if head.max_body_size != 0 {
+        environ.set_item(intern!(py, "muru.max_body_size"), head.max_body_size)?;
+    }
     Ok(environ)
 }
 

@@ -69,6 +69,9 @@ pub struct Https {
 /// The limits and timeouts of sections 4.6 and 7.6, with their defaults.
 #[derive(Debug, Clone)]
 pub struct Limits {
+    /// Largest request body accepted, else 413 (max_body_size in section
+    /// 4.6; 10 MB by ADR 0008, 100 MB in development).
+    pub max_body_size: u64,
     /// Largest request head accepted, else 431.
     pub max_header_bytes: usize,
     /// Most headers accepted in a request, else 431.
@@ -89,6 +92,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_body_size: 10 * 1024 * 1024,
             max_header_bytes: 64 * 1024,
             max_headers: 100,
             header_read_timeout: Duration::from_secs(30),
@@ -461,6 +465,23 @@ pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>)
         }
     }
     headers.insert(SERVER, HeaderValue::from_static("muru"));
+}
+
+/// Whether the HSTS warning of section 13.1 has been given this run.
+static HSTS_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// In development, warn once when the application sends
+/// Strict-Transport-Security: browsers apply it to every server on that
+/// host name, so on localhost it reaches every other local server too.
+pub(crate) fn warn_about_hsts(headers: &http::HeaderMap, host: &str, target: &str) {
+    if headers.contains_key(http::header::STRICT_TRANSPORT_SECURITY)
+        && !HSTS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            "the application sent Strict-Transport-Security on {target}; browsers will apply it \
+             to every server on {host}, so leave HSTS to production (section 13.1)"
+        );
+    }
 }
 
 /// Mark a response as the last on its HTTP/1.1 connection, which hyper

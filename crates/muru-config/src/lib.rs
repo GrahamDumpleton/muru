@@ -100,6 +100,33 @@ pub struct ParseError {
     pub accepted: &'static [&'static str],
 }
 
+/// Parse a size such as 10MB, 512KB, 1GB or a plain number of bytes.
+/// KB, MB and GB are powers of 1024, as mod_wsgi counts them (ADR 0008);
+/// case does not matter and a lone K, M or G is accepted.
+pub fn parse_size(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let upper = text.to_ascii_uppercase();
+    let (number, scale) = if let Some(number) = upper.strip_suffix("GB").or(upper.strip_suffix('G'))
+    {
+        (number, 1024u64 * 1024 * 1024)
+    } else if let Some(number) = upper.strip_suffix("MB").or(upper.strip_suffix('M')) {
+        (number, 1024 * 1024)
+    } else if let Some(number) = upper.strip_suffix("KB").or(upper.strip_suffix('K')) {
+        (number, 1024)
+    } else if let Some(number) = upper.strip_suffix('B') {
+        (number, 1)
+    } else {
+        (upper.as_str(), 1)
+    };
+    let value: u64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("{text:?} is not a size such as 10MB or 512KB"))?;
+    value
+        .checked_mul(scale)
+        .ok_or_else(|| format!("{text:?} is too large"))
+}
+
 /// The `[tool.muru]` table: defaults an application ships with (section
 /// 6.8). Every field is optional; what a command line or a release
 /// definition sets takes precedence.
@@ -227,6 +254,17 @@ mod tests {
             error.to_string(),
             "\"maybe\" is not a Preload: expected one of auto, true, false"
         );
+    }
+
+    #[test]
+    fn sizes_use_binary_units() {
+        assert_eq!(parse_size("10MB"), Ok(10 * 1024 * 1024));
+        assert_eq!(parse_size("512kb"), Ok(512 * 1024));
+        assert_eq!(parse_size("1G"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert_eq!(parse_size(" 2 MB "), Ok(2 * 1024 * 1024));
+        assert!(parse_size("ten").is_err());
+        assert!(parse_size("99999999999999999999GB").is_err());
     }
 
     #[test]
