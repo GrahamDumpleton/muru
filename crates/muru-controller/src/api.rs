@@ -57,6 +57,7 @@ struct Service {
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
+type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Admin for Service {
@@ -279,6 +280,83 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(release_message(release, &self.handle)))
+    }
+
+    type TailLogsStream = LogStream;
+
+    async fn tail_logs(
+        &self,
+        request: Request<pb::TailLogsRequest>,
+    ) -> Result<Response<LogStream>, Status> {
+        let request = request.into_inner();
+        let locations = &self.handle.info.locations;
+
+        // The access log is one file; a release's output is its host's
+        // file, the current release's when none is named.
+
+        let (app, release, path) = if request.access {
+            (String::new(), String::new(), locations.access_log())
+        } else {
+            if request.app.is_empty() {
+                return Err(Status::invalid_argument(
+                    "name an application, or ask for the access log",
+                ));
+            }
+
+            let app = self.handle.store.app(&request.app).map_err(not_found)?;
+
+            let release = if request.release.is_empty() {
+                app.current.clone().ok_or_else(|| {
+                    Status::failed_precondition(format!("{} has no current release", app.name))
+                })?
+            } else {
+                self.handle
+                    .store
+                    .release(&app.name, &request.release)
+                    .map_err(not_found)?
+                    .id
+            };
+
+            let path = locations.release_log(&app.name, &release);
+            (app.name, release, path)
+        };
+
+        if !request.follow && !path.exists() {
+            return Err(Status::not_found(format!(
+                "no log file at {}",
+                path.display()
+            )));
+        }
+
+        let lines = crate::logs::tail(path, request.lines as usize, request.follow);
+        let stream = tokio_stream::StreamExt::map(lines, move |line| {
+            Ok(pb::LogLine {
+                app: app.clone(),
+                release: release.clone(),
+                line,
+            })
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn reopen_logs(
+        &self,
+        request: Request<pb::ReopenLogsRequest>,
+    ) -> Result<Response<pb::ReopenLogsResponse>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::ReopenLogs {
+                workers: request.into_inner().workers,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let reopened = done_rx.await.map_err(|_| Status::unavailable(STOPPING))?;
+        Ok(Response::new(pb::ReopenLogsResponse {
+            edge: reopened.edge,
+            hosts: reopened.hosts,
+        }))
     }
 
     async fn list_events(

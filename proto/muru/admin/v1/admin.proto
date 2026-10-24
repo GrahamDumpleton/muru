@@ -49,6 +49,11 @@ service Admin {
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
   rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
   rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
+
+  // Logs (sections 11.2 and 11.3): a release's output or the access log,
+  // and reopening every log file after an external rotation.
+  rpc TailLogs(TailLogsRequest) returns (stream LogLine);
+  rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
 }
 
 message GetStatusRequest {}
@@ -261,4 +266,29 @@ message Route {
   string host = 1;
   string path = 2;
   string app = 3;
+}
+
+// Which log to show: a release's output (its host's and workers' lines,
+// tagged by the host), or the access log the edge writes.
+message TailLogsRequest {
+  string app = 1;                   // unused with access
+  string release = 2;               // empty: the application's current release
+  bool follow = 3;                  // keep streaming as lines arrive
+  uint32 lines = 4;                 // how many recent lines first; 0 for none
+  bool access = 5;                  // the access log instead of a release
+}
+
+message LogLine {
+  string app = 1;
+  string release = 2;
+  string line = 3;
+}
+
+message ReopenLogsRequest {
+  bool workers = 1;                 // also run on_reopen_logs in every worker
+}
+
+message ReopenLogsResponse {
+  bool edge = 1;                    // the edge was told
+  uint32 hosts = 2;                 // hosts told
 }

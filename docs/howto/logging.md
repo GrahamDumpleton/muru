@@ -3,13 +3,17 @@
 ```{admonition} Status
 :class: note
 
-Development mode: the terminal, or a file. The log collector, rotation and
-Python logging defaults arrive with the daemon.
+Development mode writes to the terminal, or a file. Under the daemon each
+release and the edge write files in the log directory, `muructl logs`
+shows or follows them, and `muructl logs reopen` works with logrotate.
+Built-in rotation, journald, Python logging defaults and runtime log
+levels are still to come.
 ```
 
 A development run writes two kinds of lines to the terminal: what your
 application and Muru's own processes print, and one access log line per
-request.
+request. The daemon writes the same lines to files, one per release and
+one access log, which `muructl logs` reads.
 
 ## Application output
 
@@ -60,17 +64,76 @@ A JSON line has these fields:
 
 ```json
 {"time": "2026-10-24T05:42:22.836Z", "request_id": "01M5P6WZBK740HFT2N80MAV4YV",
- "client": "127.0.0.1", "method": "GET", "target": "/hello", "version": "HTTP/1.1",
- "status": 200, "reason": "", "bytes": 18, "worker": 0,
- "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7}
+ "client": "127.0.0.1", "app": "shop", "release": "r1", "host": "shop.example.com",
+ "group": "default", "mount": "default", "method": "GET", "target": "/hello",
+ "version": "HTTP/1.1", "status": 200, "reason": "", "bytes": 18, "worker": 0,
+ "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3}
 ```
 
 `reason` is empty for responses the application produced and names the
 cause for ones Muru generated; the [error responses](../reference/errors.md)
-page lists them.
+page lists them. `app` and `release` name what served the request, `host`
+is the virtual host that matched or else the host the client asked for,
+`group` and `mount` are `default` or the named [worker
+group](worker-groups.md) and [mount](mounts.md), and `snapshot` is the
+version of the routing the edge used (0 in development mode). The compact
+line shows the group and mount only when they are named.
 
-## Log files and rotation
+## Under the daemon
 
-Only the access log can go to a file today. On SIGUSR1 each worker runs the
-`on_reopen_logs` hook, which is where an application that writes its own
-log files reopens them; rotation of Muru's own files is part of the daemon.
+The daemon writes everything to its log directory (`~/.local/state/muru/logs`
+on Linux, `~/Library/Logs/muru` on macOS, `/var/log/muru` in system mode,
+or `--log-dir`):
+
+| File | Holds |
+| --- | --- |
+| `apps/APP/RELEASE.log` | the release's host output and its workers' lines, tagged as above |
+| `access.log` | the access log as JSON lines |
+| `edge.log` | the edge process's own output |
+| `daemon.log` | the daemon's output when started with `muructl daemon start` |
+
+`muructl logs APP` shows the last hundred lines of the application's
+current release, `muructl logs APP@RELEASE` a particular release's, and
+`muructl logs --access` the access log as compact lines (`--json` for the
+records as written). `--lines N` changes how many lines come first and
+`--follow` keeps printing as lines arrive, through a rotation of the file:
+
+```
+$ muructl logs shop --follow
+muru.host[4242]: release ready: 2 workers listening
+muru.worker[0].stdout: shop: served /catalogue
+$ muructl logs --access --lines 1
+22:57:57.191 200 GET /catalogue 118B 1.2ms release=shop@r1 host=127.0.0.1 queue=0.1ms app=0.9ms worker=1 id=01M5P6WZBK740HFT2N80MAV4YV
+```
+
+## Rotation
+
+Rotation is external for now: logrotate, or anything else, renames the
+files, then `muructl logs reopen` makes every writer open its file again by
+name, so lines go to the new file and the renamed one is complete. Sending
+SIGUSR1 to the daemon does the same. `muructl logs reopen --workers` also
+runs the `on_reopen_logs` hook in every worker, for log files the
+application opened itself, which is where a `logging` file handler is
+reopened. A logrotate entry for a user-mode daemon:
+
+```
+/home/app/.local/state/muru/logs/*.log /home/app/.local/state/muru/logs/apps/*/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        muructl logs reopen --workers
+    endscript
+}
+```
+
+Each process reopens its own file: the edge the access log, each host its
+release's file (SIGUSR1 to the host does that alone, SIGUSR2 passes SIGUSR1
+on to its workers for the hook), and a background daemon its own log.
+Lines written between the rename and the reopen land in the renamed file,
+and none are lost. In development mode only the access log can go to a
+file, and SIGUSR1 to a worker runs the hook.

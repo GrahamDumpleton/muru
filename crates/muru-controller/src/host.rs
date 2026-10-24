@@ -174,8 +174,8 @@ impl HostProcess {
             command.arg("--single");
         }
 
-        if spec.detach_to.is_some() {
-            command.arg("--detach");
+        if let Some(log) = &spec.detach_to {
+            command.arg("--detach").arg("--log-file").arg(log);
         }
 
         for mount in &spec.mounts {
@@ -312,6 +312,17 @@ impl HostProcess {
             Process::Child(child) => child.id(),
             Process::Adopted(pid) => Some(*pid),
         }
+    }
+
+    /// Send the host a signal. Returns whether it was delivered.
+    pub fn signal(&self, signal: i32) -> bool {
+        let Some(pid) = self.pid() else {
+            return false;
+        };
+
+        // SAFETY: kill with a pid this process started or adopted.
+
+        unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
     }
 
     /// The release run directory.

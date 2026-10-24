@@ -94,6 +94,15 @@ pub enum Command {
         /// Where the acknowledgement goes.
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// Reopen every log file after an external rotation (section 11.3):
+    /// the daemon's own, the edge's access log and each host's, and with
+    /// `workers` the application's own files through on_reopen_logs.
+    ReopenLogs {
+        /// Also pass the request on to the workers.
+        workers: bool,
+        /// Where the count of what was told goes.
+        done: oneshot::Sender<Reopened>,
+    },
     /// Stop the daemon: detaching, with hosts and the edge left serving
     /// for the next daemon to re-adopt, or draining everything first.
     Shutdown {
@@ -166,6 +175,15 @@ pub struct Info {
     pub edge_pid: std::sync::atomic::AtomicU32,
 }
 
+/// What a ReopenLogs command reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reopened {
+    /// Whether the edge was told.
+    pub edge: bool,
+    /// How many hosts were told.
+    pub hosts: u32,
+}
+
 /// A running release: its host and the sockets its workers listen on,
 /// and, once superseded, when its retention ends.
 struct Running {
@@ -194,6 +212,9 @@ struct Daemon {
     /// The application whose workers take requests when no host is
     /// declared: the last one traffic was switched to.
     default_app: Option<String>,
+    /// Whether this process writes to the daemon log file, as a daemon
+    /// started in the background does, so a reopen applies to it too.
+    owns_log: bool,
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -333,6 +354,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ),
     );
 
+    let owns_log = writes_to(&locations.daemon_log());
+
     let mut daemon = Daemon {
         store,
         events,
@@ -344,6 +367,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
+        owns_log,
     };
     daemon.restore().await;
 
@@ -351,9 +375,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // noticed by the next pass.
 
     let mut drain_on_exit = true;
+    let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
 
     let outcome = loop {
         tokio::select! {
+            _ = reopen.recv() => {
+                daemon.reopen_logs(false);
+            }
             command = inbox.recv() => match command {
                 Some(Command::Shutdown { drain, done }) => {
                     drain_on_exit = drain;
@@ -607,6 +635,9 @@ impl Daemon {
             }
             Command::Reconfigure { done } => {
                 let _ = done.send(self.push_snapshot().await);
+            }
+            Command::ReopenLogs { workers, done } => {
+                let _ = done.send(self.reopen_logs(workers));
             }
             Command::Shutdown { .. } => {}
         }
@@ -868,6 +899,7 @@ impl Daemon {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 apps.push(pb::AppWorkers {
                     app: name.clone(),
+                    release: id.clone(),
                     sockets: running
                         .sockets
                         .iter()
@@ -1248,11 +1280,49 @@ impl Daemon {
         }
     }
 
-    /// Where a release's host writes its output.
+    /// Where a release's host writes its output, its directory created.
     fn host_log(&self, app: &str, id: &str) -> PathBuf {
-        let dir = self.locations.logs.path.join("apps").join(app);
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("{id}.log"))
+        let path = self.locations.release_log(app, id);
+
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        path
+    }
+
+    /// Section 11.3: after logrotate has renamed the files, every writer
+    /// opens its file again by name. The daemon reopens its own when it
+    /// was started in the background, the edge its access log on SIGUSR1,
+    /// and each host its release log on SIGUSR1; SIGUSR2 makes a host
+    /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
+    /// files the application opened itself.
+    fn reopen_logs(&mut self, workers: bool) -> Reopened {
+        if self.owns_log {
+            reopen_own_log(&self.locations.daemon_log());
+        }
+
+        let edge = self.edge.signal(libc::SIGUSR1);
+        let mut hosts = 0;
+
+        for running in self.running.values() {
+            if running.host.signal(libc::SIGUSR1) {
+                hosts += 1;
+            }
+
+            if workers {
+                running.host.signal(libc::SIGUSR2);
+            }
+        }
+
+        let message = format!(
+            "reopened the log files: {}{hosts} host{}{}",
+            if edge { "the edge and " } else { "" },
+            if hosts == 1 { "" } else { "s" },
+            if workers { " and their workers" } else { "" }
+        );
+        self.events.emit("logs.reopened", "logs", "info", &message);
+        Reopened { edge, hosts }
     }
 
     fn set_state(&self, release: &Release, state: ReleaseState, message: &str) {
@@ -1269,4 +1339,50 @@ impl Daemon {
 fn clock(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!("{:02}:{:02} UTC", seconds / 3600, (seconds % 3600) / 60)
+}
+
+/// Whether this process's standard output is the file at `path`, which
+/// is how a daemon started in the background finds that it owns the
+/// daemon log.
+fn writes_to(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(current) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    // SAFETY: fstat on descriptor 1 of this process, into a zeroed struct
+    // it fills; the descriptor stays open throughout.
+
+    let (described, stat) = unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        (libc::fstat(1, &mut stat) == 0, stat)
+    };
+
+    described
+        && current.dev() as libc::dev_t == stat.st_dev
+        && current.ino() as libc::ino_t == stat.st_ino
+}
+
+/// Open the daemon's log file again on standard output and error: once
+/// logrotate has renamed it away, the lines belong in a new file at the
+/// same path.
+fn reopen_own_log(path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd as _;
+
+    let Ok(log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+
+    // SAFETY: dup2 of an open file onto the standard descriptors, which
+    // stay valid; `log` closes its own descriptor when it drops.
+
+    unsafe {
+        libc::dup2(log.as_raw_fd(), 1);
+        libc::dup2(log.as_raw_fd(), 2);
+    }
 }

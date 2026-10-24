@@ -130,6 +130,10 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
+    /// Show or follow a release's output or the access log, or reopen
+    /// the log files after an external rotation.
+    Logs(admin::LogsArgs),
+
     /// Run an edge process (internal, started by the daemon).
     Edge {
         #[command(subcommand)]
@@ -516,6 +520,14 @@ fn main() -> anyhow::Result<()> {
             after,
             socket,
         } => runtime.block_on(admin::events(follow, after, socket)),
+        Command::Logs(args) => runtime.block_on(async move {
+            match args.command.clone() {
+                Some(admin::LogsCommand::Reopen { workers, socket }) => {
+                    admin::logs_reopen(workers, socket).await
+                }
+                None => admin::logs(args).await,
+            }
+        }),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
@@ -1022,8 +1034,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let (http_address, https_address) = addresses(&args);
 
+    let label = app_name(&resolved.entrypoint).replace('_', "-");
+
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
+        app: label.clone(),
+        release: "r1".to_owned(),
         sockets: current.default_sockets(),
         groups: group_sockets(&current, &resolved.groups),
         mounts: mount_paths(&resolved.mounts),
@@ -1191,6 +1207,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         ready = next.wait_ready(START_TIMEOUT) => match ready {
                             Ok(()) => {
                                 let connected = muru_edge::routing::AppPools::connect(
+                                    &label,
+                                    &format!("r{release}"),
                                     &next.default_sockets(),
                                     &group_sockets(&next, &group_tables),
                                 &mount_paths(&mount_tables),

@@ -45,6 +45,12 @@ pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 pub struct Config {
     /// Address for the HTTP listener. Port 0 picks a free port.
     pub listen: SocketAddr,
+    /// The application's name, as the access log labels its requests;
+    /// empty when a snapshot will name it.
+    pub app: String,
+    /// The release the workers serve, for the access log; empty when a
+    /// snapshot will name it.
+    pub release: String,
     /// Unix socket paths of the default group's workers. Each worker's
     /// HELLO says how many requests it takes at once.
     pub sockets: Vec<PathBuf>,
@@ -240,7 +246,14 @@ impl Edge {
     ) -> anyhow::Result<Self> {
         let pools = Arc::new(Pools {
             current: RwLock::new(Arc::new(routing::Routing::single(
-                routing::AppPools::connect(&config.sockets, &config.groups, &config.mounts).await?,
+                routing::AppPools::connect(
+                    &config.app,
+                    &config.release,
+                    &config.sockets,
+                    &config.groups,
+                    &config.mounts,
+                )
+                .await?,
             ))),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
@@ -445,6 +458,10 @@ async fn serve<I>(
                 access_log: Arc::clone(&shared.access_log),
                 limits: Arc::clone(&shared.limits),
                 server_name: None,
+                app: String::new(),
+                release: String::new(),
+                group: String::new(),
+                snapshot: routing.version(),
                 mount: String::new(),
                 mount_path: String::new(),
                 forwarded_host: forwarded.host.clone(),
@@ -482,6 +499,9 @@ async fn serve<I>(
                     },
                 ) => {
                     context.server_name = server_name;
+                    context.app = selection.app;
+                    context.release = selection.release;
+                    context.group = selection.group;
                     context.mount = selection.mount;
                     context.mount_path = selection.script_name;
                     link::handle(request, selection.pool, &context).await

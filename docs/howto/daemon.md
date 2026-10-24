@@ -186,5 +186,7 @@ manager or a terminal. Commands find the daemon through its admin socket:
 `--socket` or `MURU_SOCKET`, else the socket in the runtime directory.
 
 The access log is written as JSON lines to `access.log` in the log
-directory, and the events `muructl events` shows are kept in the state
-store.
+directory, `muructl logs` shows or follows it and each release's output,
+and `muructl logs reopen` works with logrotate; the [logging
+guide](logging.md) has the details. The events `muructl events` shows are
+kept in the state store.

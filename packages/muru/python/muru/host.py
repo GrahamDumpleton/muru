@@ -19,7 +19,11 @@ stream (section 11.2), so output from different workers can be told apart.
 
 One application, a fixed number of workers restarted when they die, and
 shutdown on SIGTERM, SIGINT or when standard input closes, which is how the
-parent `muructl` signals that it has gone away.
+parent `muructl` signals that it has gone away. Under the daemon the host
+writes to the file named with --log-file: SIGUSR1 opens it again by name
+after an external rotation (section 11.3), and SIGUSR2 passes SIGUSR1 on
+to every worker, whose on_reopen_logs hook handles the application's own
+files.
 """
 
 from __future__ import annotations
@@ -334,12 +338,14 @@ class Host:
         detach: bool = False,
         groups: list[Group] | None = None,
         mounts: list[Mount] | None = None,
+        log_file: str | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
+        self.log_file = log_file
         self.threads = threads
         self.sync_threads = sync_threads
         self.concurrency = concurrency
@@ -363,6 +369,8 @@ class Host:
         self.lifeline_read, self.lifeline_write = os.pipe()
         self.workers: dict[int, int] = {}
         self.stopping = False
+        self.reopen_requested = False
+        self.workers_reopen_requested = False
         self.restart_after: dict[int, float] = {}
         self.spawned_at: dict[int, float] = {}
         self.start_failures: dict[int, int] = {}
@@ -460,7 +468,14 @@ class Host:
         # server installs its own handling of SIGTERM, SIGINT and SIGUSR1.
 
         signal.set_wakeup_fd(-1)
-        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGCHLD):
+
+        for signum in (
+            signal.SIGTERM,
+            signal.SIGINT,
+            signal.SIGCHLD,
+            signal.SIGUSR1,
+            signal.SIGUSR2,
+        ):
             signal.signal(signum, signal.SIG_DFL)
 
         # Section 7.1: MURU_GROUP and the context identify the group after
@@ -600,9 +615,17 @@ class Host:
                 log(f"received {signal.Signals(signum).name}, stopping")
             self.stopping = True
 
+        def request_reopen(_signum: int, _frame: Any) -> None:
+            self.reopen_requested = True
+
+        def request_workers_reopen(_signum: int, _frame: Any) -> None:
+            self.workers_reopen_requested = True
+
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
+        signal.signal(signal.SIGUSR1, request_reopen)
+        signal.signal(signal.SIGUSR2, request_workers_reopen)
 
         # Section 13.3: a host under the daemon outlives it, so the daemon
         # can be restarted or upgraded and re-adopt it; one under muructl
@@ -637,6 +660,7 @@ class Host:
                     self.read_output(key.fd)
 
             self.reap()
+            self.reopen_if_requested()
             if self.stopping:
                 break
             self.restart_due()
@@ -646,6 +670,45 @@ class Host:
             self.read_output(fd, until_closed=True)
         signal.set_wakeup_fd(-1)
         return 1 if self.failed else 0
+
+    def reopen_if_requested(self) -> None:
+        """Carry out what SIGUSR1 and SIGUSR2 asked for, outside the handlers."""
+
+        if self.reopen_requested:
+            self.reopen_requested = False
+            self.reopen_log()
+
+        if self.workers_reopen_requested:
+            self.workers_reopen_requested = False
+
+            for pid in list(self.workers):
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except ProcessLookupError:
+                    pass
+
+    def reopen_log(self) -> None:
+        """Open the log file again by name on standard output and error.
+
+        The workers' pipes are relayed through this process's standard
+        error, so reopening it here is enough for their lines too.
+        """
+
+        if self.log_file is None:
+            return
+
+        try:
+            fd = os.open(self.log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        except OSError as error:
+            log(f"could not reopen {self.log_file}: {error}")
+            return
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        os.close(fd)
+        log(f"reopened {self.log_file}")
 
     def read_output(self, fd: int, until_closed: bool = False) -> None:
         """Relay what a worker has written; close the pipe once it is at end of file."""
@@ -851,6 +914,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="keep running when the parent goes away, for a daemon that re-adopts hosts",
     )
     parser.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="the file standard output and error go to, reopened by name on SIGUSR1",
+    )
+    parser.add_argument(
         "--group",
         action="append",
         default=[],
@@ -988,6 +1057,7 @@ def main(argv: list[str] | None = None) -> int:
         detach=args.detach,
         groups=args.group,
         mounts=mounts,
+        log_file=args.log_file,
     )
 
     if args.single:

@@ -140,6 +140,20 @@ impl Locations {
     pub fn pid_file(&self) -> PathBuf {
         self.run.path.join("daemon.pid")
     }
+
+    /// The access log the edge writes, as JSON lines.
+    pub fn access_log(&self) -> PathBuf {
+        self.logs.path.join("access.log")
+    }
+
+    /// Where a release's host writes its own and its workers' output.
+    pub fn release_log(&self, app: &str, id: &str) -> PathBuf {
+        self.logs
+            .path
+            .join("apps")
+            .join(app)
+            .join(format!("{id}.log"))
+    }
 }
 
 /// The first rule that applies: option, environment, systemd, default.

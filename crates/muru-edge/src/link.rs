@@ -420,6 +420,15 @@ pub struct Context<'a> {
     /// The virtual host name the application sees as SERVER_NAME, when a
     /// host matched (section 4.3).
     pub server_name: Option<String>,
+    /// The application the request goes to, for the access log; empty
+    /// before routing, or when nothing names it.
+    pub app: String,
+    /// The release, for the access log; empty when nothing names it.
+    pub release: String,
+    /// The worker group, for the access log; empty before routing.
+    pub group: String,
+    /// The routing snapshot's version, for the access log.
+    pub snapshot: u64,
     /// The host a trusted proxy forwarded, replacing the Host header.
     pub forwarded_host: Option<String>,
     /// The port a trusted proxy forwarded, for SERVER_PORT.
@@ -430,6 +439,18 @@ pub struct Context<'a> {
     pub mount: String,
     /// The mount's path, joined to SCRIPT_NAME.
     pub mount_path: String,
+}
+
+/// The host the client asked for, without its port, from the Host header
+/// or the request target.
+fn requested_host(parts: &http::request::Parts) -> String {
+    let header = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.host())
+        .unwrap_or("");
+    crate::routing::host_only(header).to_owned()
 }
 
 /// The access log record of a request in progress.
@@ -447,6 +468,19 @@ impl Recording {
                 started: SystemTime::now(),
                 request_id: context.request_id.to_owned(),
                 client: context.peer.ip(),
+                app: context.app.clone(),
+                release: context.release.clone(),
+                host: context
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| requested_host(parts)),
+                group: context.group.clone(),
+                mount: if context.mount.is_empty() {
+                    crate::routing::DEFAULT_GROUP.to_owned()
+                } else {
+                    context.mount.clone()
+                },
+                snapshot: context.snapshot,
                 method: parts.method.as_str().to_owned(),
                 target: parts
                     .uri

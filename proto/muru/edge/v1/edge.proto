@@ -67,6 +67,7 @@ message AppWorkers {
   repeated string sockets = 2;
   repeated Group groups = 3;
   repeated Mount mounts = 4;            // named mounts of the serving release (section 6.7)
+  string release = 5;                   // the release, for the access log
 }
 
 message Mount {

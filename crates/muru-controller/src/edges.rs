@@ -160,6 +160,17 @@ impl EdgeProcess {
         }
     }
 
+    /// Send the edge a signal. Returns whether it was delivered.
+    pub fn signal(&self, signal: i32) -> bool {
+        let Some(pid) = self.pid() else {
+            return false;
+        };
+
+        // SAFETY: kill with a pid this process started or adopted.
+
+        unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
+    }
+
     /// Where the edge hands its listener back.
     pub fn listener_socket(&self) -> &Path {
         &self.spec.listener_socket

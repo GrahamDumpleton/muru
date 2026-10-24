@@ -158,6 +158,8 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let edge = muru_edge::Edge::adopt(
         muru_edge::Config {
             listen,
+            app: String::new(),
+            release: String::new(),
             sockets: args.worker_sockets.clone(),
             groups: Vec::new(),
             mounts: Vec::new(),
@@ -193,6 +195,20 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             .serve_with_incoming(incoming)
             .await
             .map_err(anyhow::Error::from)
+    });
+
+    // Section 11.3: SIGUSR1 reopens the access log after logrotate has
+    // renamed it.
+
+    let access_log = edge.access_log();
+    let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    tokio::spawn(async move {
+        while reopen.recv().await.is_some() {
+            match access_log.reopen() {
+                Ok(()) => eprintln!("muru: edge reopened the access log"),
+                Err(error) => eprintln!("muru: edge could not reopen the access log: {error}"),
+            }
+        }
     });
 
     let mut serving = tokio::spawn(edge.run());

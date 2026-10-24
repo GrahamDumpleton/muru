@@ -62,6 +62,12 @@ pub struct MountPath {
 pub struct Selection {
     /// The workers.
     pub pool: Arc<LinkPool>,
+    /// The application's name, for the access log; empty when unnamed.
+    pub app: String,
+    /// The release, for the access log; empty when unnamed.
+    pub release: String,
+    /// The worker group's name: `default`, or a named group's.
+    pub group: String,
     /// The mount's name, empty for the default mount.
     pub mount: String,
     /// The mount's path, empty for the default mount.
@@ -72,14 +78,20 @@ pub struct Selection {
 /// groups, each with the paths that select it, most specific first, and
 /// the mounts, longest prefix first.
 pub struct AppPools {
+    app: String,
+    release: String,
     default: Arc<LinkPool>,
-    groups: Vec<(String, Arc<LinkPool>)>,
+    /// A group path prefix, the group's name and its pool.
+    groups: Vec<(String, String, Arc<LinkPool>)>,
     mounts: Vec<MountPath>,
 }
 
 impl AppPools {
-    /// Connect the default workers and each group's.
+    /// Connect the default workers and each group's. `app` and `release`
+    /// label the requests served in the access log.
     pub async fn connect(
+        app: &str,
+        release: &str,
         default: &[std::path::PathBuf],
         groups: &[GroupSockets],
         mounts: &[MountPath],
@@ -91,11 +103,11 @@ impl AppPools {
             let pool = Arc::new(LinkPool::connect(&group.sockets).await?);
 
             for path in &group.paths {
-                connected.push((group_prefix(path), Arc::clone(&pool)));
+                connected.push((group_prefix(path), group.name.clone(), Arc::clone(&pool)));
             }
         }
 
-        connected.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        connected.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
         let mut mounts: Vec<MountPath> = mounts
             .iter()
             .map(|mount| MountPath {
@@ -106,15 +118,19 @@ impl AppPools {
         mounts.sort_by_key(|mount| std::cmp::Reverse(mount.path.len()));
 
         Ok(Self {
+            app: app.to_owned(),
+            release: release.to_owned(),
             default,
             groups: connected,
             mounts,
         })
     }
 
-    /// A single pool with no groups or mounts.
+    /// A single pool with no groups or mounts, and no labels.
     pub fn single(pool: LinkPool) -> Self {
         Self {
+            app: String::new(),
+            release: String::new(),
             default: Arc::new(pool),
             groups: Vec::new(),
             mounts: Vec::new(),
@@ -125,12 +141,12 @@ impl AppPools {
     /// default group's, and the longest mount prefix, else the default
     /// mount (section 6.7).
     pub fn select(&self, path: &str) -> Selection {
-        let pool = self
+        let (group, pool) = self
             .groups
             .iter()
-            .find(|(prefix, _)| prefix_matches(prefix, path))
-            .map(|(_, pool)| Arc::clone(pool))
-            .unwrap_or_else(|| Arc::clone(&self.default));
+            .find(|(prefix, _, _)| prefix_matches(prefix, path))
+            .map(|(_, name, pool)| (name.clone(), Arc::clone(pool)))
+            .unwrap_or_else(|| (DEFAULT_GROUP.to_owned(), Arc::clone(&self.default)));
         let mount = self
             .mounts
             .iter()
@@ -138,6 +154,9 @@ impl AppPools {
 
         Selection {
             pool,
+            app: self.app.clone(),
+            release: self.release.clone(),
+            group,
             mount: mount.map(|mount| mount.name.clone()).unwrap_or_default(),
             script_name: mount.map(|mount| mount.path.clone()).unwrap_or_default(),
         }
@@ -148,6 +167,9 @@ impl AppPools {
         Arc::clone(&self.default)
     }
 }
+
+/// The name of the group a release's own settings size (section 7.1).
+pub const DEFAULT_GROUP: &str = "default";
 
 /// A group path as a route-style prefix: a trailing `*` means anything
 /// below, which is what a prefix already means.
@@ -228,7 +250,14 @@ impl Routing {
 
         let default = match default_app {
             Some(app) => {
-                AppPools::connect(&paths(&app.sockets), &groups_of(app), &mounts_of(app)).await?
+                AppPools::connect(
+                    &app.app,
+                    &app.release,
+                    &paths(&app.sockets),
+                    &groups_of(app),
+                    &mounts_of(app),
+                )
+                .await?
             }
             None => AppPools::single(LinkPool::connect(&paths(&snapshot.worker_sockets)).await?),
         };
@@ -236,8 +265,14 @@ impl Routing {
         let mut apps = HashMap::new();
 
         for app in &snapshot.apps {
-            let pools =
-                AppPools::connect(&paths(&app.sockets), &groups_of(app), &mounts_of(app)).await?;
+            let pools = AppPools::connect(
+                &app.app,
+                &app.release,
+                &paths(&app.sockets),
+                &groups_of(app),
+                &mounts_of(app),
+            )
+            .await?;
             apps.insert(app.app.clone(), Arc::new(pools));
         }
 
@@ -375,6 +410,9 @@ impl Routing {
             .map(|pools| pools.select(path))
             .unwrap_or_else(|| Selection {
                 pool: Arc::new(LinkPool::empty()),
+                app: route.app.clone(),
+                release: String::new(),
+                group: DEFAULT_GROUP.to_owned(),
                 mount: String::new(),
                 script_name: String::new(),
             });

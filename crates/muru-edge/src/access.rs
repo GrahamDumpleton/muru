@@ -3,7 +3,8 @@
 //! Every request produces a record with its identifier, method, path,
 //! status and reason, bytes sent, the worker that served it and timings:
 //! queue (waiting for a worker connection), application (until the
-//! response head arrived) and total. Records are kept in a bounded ring in
+//! response head arrived) and total, and the application, release, host,
+//! group and mount that served it. Records are kept in a bounded ring in
 //! memory for the dashboard and the CLI, and written to the terminal as
 //! compact lines, to a file as JSON lines, only for errors and slow
 //! requests, or not at all.
@@ -66,6 +67,18 @@ pub struct Record {
     pub request_id: String,
     /// The client address.
     pub client: IpAddr,
+    /// The application served, or empty when nothing names it.
+    pub app: String,
+    /// The release served, or empty when nothing names it.
+    pub release: String,
+    /// The virtual host that matched, else the host the client asked for.
+    pub host: String,
+    /// The worker group: `default`, or a named group's name.
+    pub group: String,
+    /// The mount: `default`, or a named mount's name.
+    pub mount: String,
+    /// The routing snapshot's version, 0 for a development run.
+    pub snapshot: u64,
     /// The HTTP method.
     pub method: String,
     /// The path with its query string.
@@ -208,6 +221,19 @@ impl AccessLog {
         }
     }
 
+    /// Open the file again by name, for section 11.3: after an external
+    /// rotation has renamed the file, lines go to a new one at the path.
+    /// Nothing happens when lines do not go to a file.
+    pub fn reopen(&self) -> io::Result<()> {
+        let (Destination::File(path), Some(file)) = (&self.config.destination, &self.file) else {
+            return Ok(());
+        };
+
+        let reopened = OpenOptions::new().create(true).append(true).open(path)?;
+        *file.lock().expect("access log file poisoned") = reopened;
+        Ok(())
+    }
+
     /// The most recent records, oldest first.
     pub fn recent(&self, limit: usize) -> Vec<Record> {
         let ring = self.ring.lock().expect("access log ring poisoned");
@@ -267,8 +293,12 @@ pub fn glob_matches(pattern: &str, path: &str) -> bool {
     step(&pattern, &path)
 }
 
+/// The group and mount name left out of the compact form.
+const DEFAULT: &str = "default";
+
 /// The compact terminal form: time, status, method, target, bytes and
-/// timings, then the worker and request id.
+/// timings, then the group and mount when named, the worker and request
+/// id.
 fn text_line(record: &Record) -> String {
     let mut line = String::with_capacity(160);
     let (_, hours, minutes, seconds, millis) = civil(record.started);
@@ -295,6 +325,14 @@ fn text_line(record: &Record) -> String {
         let _ = write!(line, " reason={}", record.reason);
     }
 
+    if !record.group.is_empty() && record.group != DEFAULT {
+        let _ = write!(line, " group={}", record.group);
+    }
+
+    if !record.mount.is_empty() && record.mount != DEFAULT {
+        let _ = write!(line, " mount={}", record.mount);
+    }
+
     if let Some(worker) = record.worker {
         let _ = write!(line, " worker={worker}");
     }
@@ -309,9 +347,14 @@ fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
+        json_string(&record.app),
+        json_string(&record.release),
+        json_string(&record.host),
+        json_string(&record.group),
+        json_string(&record.mount),
         json_string(&record.method),
         json_string(&record.target),
         json_string(&record.version),
@@ -324,6 +367,7 @@ fn json_line(record: &Record) -> String {
         millis_f64(record.queue),
         millis_f64(record.application),
         millis_f64(record.total),
+        record.snapshot,
     );
     line.push('\n');
     line
@@ -480,6 +524,12 @@ mod tests {
             started: SystemTime::now(),
             request_id: "id".to_owned(),
             client: "127.0.0.1".parse().expect("address"),
+            app: String::new(),
+            release: String::new(),
+            host: String::new(),
+            group: DEFAULT.to_owned(),
+            mount: DEFAULT.to_owned(),
+            snapshot: 0,
             method: "GET".to_owned(),
             target: target.to_owned(),
             version: "HTTP/1.1".to_owned(),

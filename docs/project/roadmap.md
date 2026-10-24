@@ -73,5 +73,12 @@ and ASGI loaded in the same workers from one preload, each ASGI
 application with its own lifespan on the worker's one loop, the mount
 chosen at the edge by the longest prefix and named in the request head,
 with its path as SCRIPT_NAME or root_path (per-mount pools, internal
-mounts and the groups `mounts` subset later). Next from phase 2: the
-metrics and logs.
+mounts and the groups `mounts` subset later). Logs (sections 11.2 and
+11.3) have their first slice: each release's host writes its tagged
+output to a file in the log directory and the edge the access log as
+JSON lines naming the application, release, host, group, mount and
+snapshot, `muructl logs` shows or follows either over the TailLogs
+operation, and `muructl logs reopen` or SIGUSR1 makes every writer
+reopen its file after an external rotation, with `--workers` running
+on_reopen_logs (built-in rotation, journald and the Python logging
+defaults later). Next from phase 2: metrics.

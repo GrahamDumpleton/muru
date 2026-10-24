@@ -2,7 +2,8 @@
 //! sections 10.4, 13.2 and 13.3, appendix A): `daemon run`, `daemon
 //! start`, `daemon stop`, `daemon status`, `up`, `deploy`, `app list`,
 //! `release list`, `release wait`, `rollback`, `drain`, `status`,
-//! `events`, `apply`, `config export` and `config diff`.
+//! `events`, `logs`, `logs reopen`, `apply`, `config export` and `config
+//! diff`.
 
 use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
@@ -1053,6 +1054,169 @@ pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Res
     }
 
     Ok(())
+}
+
+/// What `muructl logs` takes: a release's output, or the access log,
+/// shown or followed; or `logs reopen` after an external rotation.
+#[derive(Args, Clone)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct LogsArgs {
+    #[command(subcommand)]
+    pub command: Option<LogsCommand>,
+
+    /// The application, or app@release; the current release when only
+    /// the application is named.
+    #[arg(value_name = "APP[@RELEASE]", required_unless_present = "access")]
+    target: Option<String>,
+
+    /// Keep printing lines as they are written.
+    #[arg(long, short)]
+    follow: bool,
+
+    /// How many recent lines to show first.
+    #[arg(long, short = 'n', default_value = "100", value_name = "COUNT")]
+    lines: u32,
+
+    /// The access log the edge writes, instead of a release's output.
+    #[arg(long)]
+    access: bool,
+
+    /// Print access log records as the JSON lines they are kept as.
+    #[arg(long, requires = "access")]
+    json: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// The `muructl logs` subcommands.
+#[derive(Subcommand, Clone)]
+pub enum LogsCommand {
+    /// Reopen every log file by name, after logrotate has renamed them.
+    Reopen {
+        /// Also run on_reopen_logs in every worker, for files the
+        /// application opened itself.
+        #[arg(long)]
+        workers: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Show or follow a release's output or the access log.
+pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    let (app, release) = match &args.target {
+        Some(target) if target.contains('@') => {
+            let (app, release) = split_release(target)?;
+            (app.to_owned(), release.to_owned())
+        }
+        Some(app) => (app.clone(), String::new()),
+        None => (String::new(), String::new()),
+    };
+
+    let mut client = client::connect(&args.socket.socket()).await?;
+    let mut stream = client
+        .tail_logs(pb::TailLogsRequest {
+            app,
+            release,
+            follow: args.follow,
+            lines: args.lines,
+            access: args.access,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    while let Some(line) = stream.next().await {
+        let line = line.map_err(explain)?.line;
+
+        if args.access && !args.json {
+            println!("{}", format_access_line(&line));
+        } else {
+            println!("{line}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Reopen every log file after an external rotation.
+pub async fn logs_reopen(workers: bool, socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let reopened = client
+        .reopen_logs(pb::ReopenLogsRequest { workers })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    println!(
+        "muru: reopened the log files: {}{} host{}{}",
+        if reopened.edge { "the edge and " } else { "" },
+        reopened.hosts,
+        if reopened.hosts == 1 { "" } else { "s" },
+        if workers { " and their workers" } else { "" }
+    );
+    Ok(())
+}
+
+/// An access log record as the compact line a development run prints,
+/// with the release, host, group and mount when the record names them.
+/// A line that is not a record is printed as it is.
+fn format_access_line(line: &str) -> String {
+    let Ok(serde_json::Value::Object(record)) = serde_json::from_str::<serde_json::Value>(line)
+    else {
+        return line.to_owned();
+    };
+
+    let text = |key: &str| record.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let number = |key: &str| record.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let millis = |key: &str| {
+        muru_edge::access::format_duration(Duration::from_secs_f64(number(key) / 1000.0))
+    };
+    let bytes =
+        muru_edge::access::format_bytes(record.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0));
+    let time = text("time");
+    let clock = time.get(11..23).unwrap_or(time);
+    let mut out = format!(
+        "{clock} {} {} {} {bytes} {}",
+        number("status") as u64,
+        text("method"),
+        text("target"),
+        millis("total_ms")
+    );
+
+    if !text("app").is_empty() {
+        out.push_str(&format!(" release={}@{}", text("app"), text("release")));
+    }
+
+    if !text("host").is_empty() {
+        out.push_str(&format!(" host={}", text("host")));
+    }
+
+    if record.get("worker").is_some_and(|v| !v.is_null()) {
+        out.push_str(&format!(
+            " queue={} app={}",
+            millis("queue_ms"),
+            millis("app_ms")
+        ));
+    }
+
+    if !text("reason").is_empty() {
+        out.push_str(&format!(" reason={}", text("reason")));
+    }
+
+    for key in ["group", "mount"] {
+        if !text(key).is_empty() && text(key) != "default" {
+            out.push_str(&format!(" {key}={}", text(key)));
+        }
+    }
+
+    if let Some(worker) = record.get("worker").and_then(|v| v.as_u64()) {
+        out.push_str(&format!(" worker={worker}"));
+    }
+
+    out.push_str(&format!(" id={}", text("request_id")));
+    out
 }
 
 fn format_event(event: &pb::Event) -> String {

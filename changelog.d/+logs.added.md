@@ -1,0 +1,1 @@
+Logs under the daemon: `muructl logs APP[@RELEASE]` shows or follows a release's output and `muructl logs --access` the access log, whose records now name the application, release, host, group, mount and snapshot; `muructl logs reopen [--workers]` (or SIGUSR1 to the daemon) reopens every log file after logrotate has renamed them.
