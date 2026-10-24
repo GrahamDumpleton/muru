@@ -94,9 +94,9 @@ connection can be kept alive, and closing the connection after the
 response. It discards when the remainder is small and arrives promptly, and
 closes otherwise, telling the client so in the response. A client that sent
 Expect: 100-continue and was never told to continue has sent nothing, so
-there is nothing to discard. Because the edge buffers request bodies up to
-the size limit before dispatching them by default, the question only arises
-for bodies being streamed through.
+there is nothing to discard, but it may still send the body later, so that
+connection is closed after the response. Bodies without a declared length
+are read in full before dispatch, so for them the question never arises.
 
 The request head and the response head are protocol buffer messages, so
 fields can be added without breaking older workers. Everything else is

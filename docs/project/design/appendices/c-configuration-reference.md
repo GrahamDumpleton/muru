@@ -9,7 +9,7 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-This is the initial key list. The generated reference (section 18.3) becomes authoritative once muru-config exists. Sizes accept units (KB, MB, GB, KiB, MiB, GiB) and durations accept ms, s, m, h.
+This is the initial key list. The generated reference (section 18.3) becomes authoritative once muru-config exists. Sizes accept units (KB, MB, GB, or KiB, MiB, GiB, all powers of 1024 as mod_wsgi counts them, so 10MB is 10485760 bytes) and durations accept ms, s, m, h.
 
 ## C.1 File structure
 

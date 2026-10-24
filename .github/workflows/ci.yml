@@ -73,6 +73,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # pyo3 is configured for the interpreter it is built against, and
+          # the interpreter path is the same in every matrix job, so each
+          # Python version needs its own cache or a 3.15t job would reuse
+          # an extension built for 3.15 and import nothing.
+          key: ${{ matrix.python }}
       - run: uv python install ${{ matrix.python }}
       - run: echo "PYO3_PYTHON=$(uv python find ${{ matrix.python }})" >> "$GITHUB_ENV"
       - run: cargo clippy -p muru-py --all-targets -- -D warnings
@@ -96,11 +102,18 @@ jobs:
           enable-cache: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # pyo3 is configured for the interpreter it is built against, and
+          # the interpreter path is the same in every matrix job, so each
+          # Python version needs its own cache or a 3.15t job would reuse
+          # an extension built for 3.15 and import nothing.
+          key: ${{ matrix.python }}
       - run: uv python install ${{ matrix.python }}
-      - run: uv sync --only-group dev --python ${{ matrix.python }}
+      - run: uv sync --only-group dev --only-group fixtures --python ${{ matrix.python }}
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
-      - run: uv run pytest tests/integration
+      - run: bash packaging/dev/fetch-h2spec.sh
+      - run: uv run pytest tests/integration tests/conformance
 
   python:
     runs-on: ${{ matrix.os }}

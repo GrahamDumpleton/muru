@@ -26,7 +26,7 @@ bootstrap:
 
 # Optional extras for the conformance suites (h2spec, Autobahn) and fuzzing.
 bootstrap-conformance:
-    @echo "not yet implemented: fetches h2spec and prepares the Autobahn image (phase 1)"
+    bash packaging/dev/fetch-h2spec.sh
 
 bootstrap-fuzz:
     rustup toolchain install nightly
@@ -71,8 +71,9 @@ test-integration: dev
     cargo build -p muructl
     uv run pytest tests/integration
 
-# WSGI, ASGI, HTTP and WebSocket conformance suites.
-conformance:
+# WSGI, ASGI, HTTP and WebSocket conformance suites (builds muructl and the extension first).
+conformance: dev
+    cargo build -p muructl
     uv run pytest tests/conformance
 
 # Container scenarios (needs a container runtime).

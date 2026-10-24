@@ -37,9 +37,9 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | REQUEST | 2 | edge to worker | RequestHead | Opens a request. END flag when there is no body |
 | BODY | 3 | both | bytes | One piece of a request or response body. END flag on the last piece |
 | RESPONSE | 4 | worker to edge | ResponseHead | The final response head. END flag when there is no body. Status 101 accepts a WebSocket |
-| END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete |
+| END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete. Sent in place of RESPONSE when the application failed before producing a head, with the reason and detail the edge's error page shows (section 4.12) |
 | ABORT | 6 | edge to worker | Abort | The edge has no more use for the request: the client has gone, or the response ended before the request body did (section 5.5) |
-| CONTINUE | 7 | worker to edge | empty | The application has started reading the request body, so the edge may send 100 Continue (section 4.6). Phase 1 |
+| CONTINUE | 7 | worker to edge | empty | The application has started reading the request body, so the edge may send 100 Continue (section 4.6). Sent only when the request head says the client is waiting for it |
 | MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6). Phase 2 |
 | CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason. Phase 2 |
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
@@ -56,7 +56,7 @@ The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
 - **ResponseHead:** status, ordered headers, flush policy override.
 
-- **End:** trailers, and an error string when the body is incomplete.
+- **End:** trailers, and an error string when the body is incomplete. In place of a response head: the Appendix C.3 reason (app_error) and a detail string, the traceback, which the edge shows only in development mode.
 
 - **Abort:** a reason, for logs.
 
@@ -112,7 +112,7 @@ When the application declares a Content-Length, the worker sets the END flag on 
 
 - **Request body on demand.** The worker reads BODY frames into a bounded queue that wsgi.input and receive() pull from. When the application does not read, the queue fills, the worker stops reading the socket, and the edge stops reading from the client. The response direction is unaffected, so an application that writes before it reads cannot deadlock against a client that is still uploading.
 
-- **CONTINUE** (phase 1) lets the worker say that the application has started reading, so the edge can hold 100 Continue until then for streamed bodies and never send the body at all when the application rejects first.
+- **CONTINUE** lets the worker say that the application has started reading (its first read of wsgi.input, or its first receive() call), so the edge can hold 100 Continue until then for streamed bodies and never send the body at all when the application rejects first. The request head's expect_continue field tells the worker the client is waiting, so no frame is spent otherwise.
 
 - **Deadlines.** The deadline in the head bounds queue wait, and timeouts in section 7.6 handle stuck requests. The edge's backstop on dispatch age closes the connection, which is the hard cancellation.
 

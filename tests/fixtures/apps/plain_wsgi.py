@@ -51,7 +51,7 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
                 "environ": {
                     key: value
                     for key, value in environ.items()
-                    if isinstance(value, (str, int, bool, tuple))
+                    if isinstance(value, (str, int, bool, tuple, dict))
                 },
             }
         ).encode()
@@ -102,6 +102,17 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if path == "/error":
         raise RuntimeError("deliberate failure")
+
+    if path == "/hsts":
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/plain"),
+                ("Content-Length", "2"),
+                ("Strict-Transport-Security", "max-age=31536000"),
+            ],
+        )
+        return [b"ok"]
 
     if path == "/threadlocal":
         LOCAL.count = getattr(LOCAL, "count", 0) + 1

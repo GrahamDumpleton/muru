@@ -14,10 +14,16 @@ rollback are policy changes, not restarts.
 ```{admonition} Status
 :class: warning
 
-Muru is at the design stage. Pre-releases of the 0.1.0 line are on PyPI,
-but nothing runs yet. The
+Muru is early in its life. What works today is development mode:
+`muructl run` serves a WSGI application on your machine with HTTP/1.1,
+HTTP/2 and HTTPS, forked workers, lifecycle hooks, watch reload, an access
+log and a small dashboard, and it has been tested with plain WSGI, Flask and
+Django. The daemon, releases, traffic management and ASGI are still to come.
+The [tutorial](tutorials/first-wsgi-app.md) shows what exists, the
 [design specification](project/design/index.md) describes what is being built
-and the [roadmap](project/roadmap.md) describes in what order.
+and the [roadmap](project/roadmap.md) describes in what order. Pre-releases
+of the 0.1.0 line are on PyPI: `uv tool install muructl` for the command and
+`muru` in your application's environment for the runtime library.
 ```
 
 ```{admonition} A note on how Muru is built

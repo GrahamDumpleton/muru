@@ -5,7 +5,8 @@
 //! request on an application thread, forwards BODY frames to `wsgi.input`
 //! until the request body ends or the edge sends ABORT, and writes the
 //! response as RESPONSE, BODY and END frames, coalescing small chunks as
-//! section 5.4 describes. When both directions have ended the connection is
+//! section 5.4 describes. A CONTINUE frame goes out when the application
+//! first reads a body the client is holding back (section 5.5). When both directions have ended the connection is
 //! idle again and the next REQUEST may follow. The edge closing the
 //! connection cancels the request.
 
@@ -18,6 +19,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use muru_proto::frame::{self, flag, kind};
 use muru_proto::worker::v1 as pb;
 use prost::Message;
+use pyo3::prelude::*;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -39,9 +41,32 @@ const SMALL_PAYLOAD: usize = 16 * 1024;
 type Reader = BufReader<OwnedReadHalf>;
 type Writer = OwnedWriteHalf;
 
+/// Python callables run at points in the worker's life (section 6.3).
+pub struct Lifecycle {
+    /// Runs when the stop signal arrives, before requests in flight finish.
+    pub on_drain: Option<Py<PyAny>>,
+    /// Runs after the application threads have stopped.
+    pub on_exit: Option<Py<PyAny>>,
+    /// Runs on SIGUSR1.
+    pub on_reopen_logs: Option<Py<PyAny>>,
+}
+
+impl Lifecycle {
+    /// Call a hook with the interpreter attached, reporting any exception.
+    fn call(hook: Option<&Py<PyAny>>) {
+        if let Some(hook) = hook {
+            Python::attach(|py| {
+                if let Err(error) = hook.call0(py) {
+                    wsgi::report(py, &error);
+                }
+            });
+        }
+    }
+}
+
 /// Bind the socket and serve link connections until SIGTERM or SIGINT, then
 /// let the application threads finish their work.
-pub fn serve(socket_path: &str, shared: Arc<Shared>) -> Result<(), BoxError> {
+pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Result<(), BoxError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("muru-link")
@@ -49,18 +74,23 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>) -> Result<(), BoxError> {
         .build()?;
 
     let accepting = Arc::clone(&shared);
+    let reopen_logs = lifecycle.on_reopen_logs.as_ref();
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
-        let shutdown = shutdown_signal();
-        tokio::pin!(shutdown);
+        let mut signals = Signals::new()?;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
                     tokio::spawn(serve_connection(stream, Arc::clone(&accepting)));
                 }
-                _ = &mut shutdown => break,
+                stop = signals.next() => {
+                    if stop {
+                        break;
+                    }
+                    Lifecycle::call(reopen_logs);
+                }
             }
         }
         Ok(())
@@ -68,26 +98,39 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>) -> Result<(), BoxError> {
 
     // Requests already running finish on their threads while the runtime
     // still carries their responses; then everything stops.
+    Lifecycle::call(lifecycle.on_drain.as_ref());
     shared.pool.shutdown();
+    Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
     served
 }
 
-/// Resolve when SIGTERM or SIGINT arrives.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
+/// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks
+/// it to reopen its logs.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+}
 
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(signal) => signal,
-        Err(_) => return,
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(signal) => signal,
-        Err(_) => return,
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+impl Signals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            usr1: signal(SignalKind::user_defined1())?,
+        })
+    }
+
+    /// Wait for a signal: true to stop, false to reopen logs.
+    async fn next(&mut self) -> bool {
+        tokio::select! {
+            _ = self.term.recv() => true,
+            _ = self.int.recv() => true,
+            _ = self.usr1.recv() => false,
+        }
     }
 }
 
@@ -235,6 +278,12 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
             },
             None => Some(rx.recv().await),
         };
+        // The bridge says when the request is over; the channel closing
+        // without that only means the application thread died.
+        let item = match item {
+            Some(Some(Outgoing::Finished)) => Some(None),
+            other => other,
+        };
         match item {
             None => {
                 // The delay expired with data waiting.
@@ -252,22 +301,38 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 }
                 if !buffer.is_empty() {
                     let data = buffer.split().freeze();
-                    write_body(writer, &mut pending_head, &mut head_written, data, true).await?;
-                    return Ok(());
+                    sent += data.len() as u64;
+                    let short = content_length.is_some_and(|length| sent < length);
+                    write_body(writer, &mut pending_head, &mut head_written, data, !short).await?;
+                    if !short {
+                        return Ok(());
+                    }
                 }
                 if let Some(head) = pending_head.take() {
-                    return frame::write(writer, kind::RESPONSE, flag::END, head).await;
+                    if content_length.is_some_and(|length| length > 0) {
+                        frame::write(writer, kind::RESPONSE, 0, head).await?;
+                        head_written = true;
+                    } else {
+                        return frame::write(writer, kind::RESPONSE, flag::END, head).await;
+                    }
                 }
                 if !head_written {
                     // Nothing at all arrived: the bridge always sends a head, so
                     // this means the application thread died.
                     return Ok(());
                 }
-                let end = pb::End::default().encode_to_vec();
-                return frame::write(writer, kind::END, 0, end.into()).await;
+                let mut end = pb::End::default();
+                if let Some(length) = content_length.filter(|&length| sent < length) {
+                    end.error = format!(
+                        "the response ended after {sent} of the {length} bytes its Content-Length declared"
+                    );
+                    eprintln!("muru: {}", end.error);
+                }
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
             }
             Some(Some(Outgoing::Head {
                 status,
+                reason,
                 headers,
                 flush,
             })) => {
@@ -278,6 +343,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     .and_then(|(_, value)| std::str::from_utf8(value).ok()?.trim().parse().ok());
                 let head = pb::ResponseHead {
                     status,
+                    reason,
                     headers: headers
                         .into_iter()
                         .map(|(name, value)| pb::Header {
@@ -296,9 +362,16 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     ended = true;
                 }
             }
-            Some(Some(Outgoing::Body(data))) => {
+            Some(Some(Outgoing::Body(mut data))) => {
                 if ended {
                     continue;
+                }
+                // Nothing beyond the declared Content-Length is sent.
+                if let Some(length) = content_length {
+                    let remaining = length.saturating_sub(sent + buffer.len() as u64);
+                    if (data.len() as u64) > remaining {
+                        data.truncate(usize::try_from(remaining).unwrap_or(usize::MAX));
+                    }
                 }
                 if immediate || !first_block_sent {
                     first_block_sent = true;
@@ -333,7 +406,20 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     }
                 }
             }
-            Some(Some(Outgoing::Abort(message))) => {
+            Some(Some(Outgoing::Finished)) => unreachable!("mapped to the end of output above"),
+            Some(Some(Outgoing::Continue)) => {
+                // The application is reading the body. The edge may pass
+                // that on as 100 Continue (section 5.5); after the response
+                // has ended it no longer matters.
+                if !ended {
+                    frame::write(writer, kind::CONTINUE, 0, Bytes::new()).await?;
+                }
+            }
+            Some(Some(Outgoing::Abort {
+                error,
+                reason,
+                detail,
+            })) => {
                 if ended {
                     return Ok(());
                 }
@@ -352,7 +438,9 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     frame::write(writer, kind::RESPONSE, 0, head).await?;
                 }
                 let end = pb::End {
-                    error: message,
+                    error,
+                    reason,
+                    detail,
                     ..Default::default()
                 }
                 .encode_to_vec();

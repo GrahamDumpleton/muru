@@ -17,7 +17,7 @@ use pyo3::exceptions::{
 };
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
@@ -29,15 +29,34 @@ pub enum Outgoing {
     Head {
         /// HTTP status code.
         status: u32,
-        /// Ordered header pairs as the application gave them.
+        /// The reason phrase the application gave, possibly empty.
+        reason: String,
+        /// Ordered header pairs as the application gave them, latin-1 encoded.
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         /// Flush policy derived from the headers.
         flush: pb::FlushPolicy,
     },
     /// One body chunk.
     Body(Bytes),
-    /// The application failed after the head was sent; end the stream with an error.
-    Abort(String),
+    /// The application failed: before the head, in which case the edge
+    /// renders the error page from the reason and detail (section 4.12),
+    /// or after it, in which case the stream ends with the error.
+    Abort {
+        /// What went wrong, in a sentence.
+        error: String,
+        /// The Appendix C.3 reason, app_error for an exception.
+        reason: String,
+        /// The traceback, for development mode.
+        detail: String,
+    },
+    /// The application has started reading the request body (section 5.5).
+    Continue,
+    /// The request is over: the application returned and its iterable was
+    /// closed. Sent explicitly, because the `start_response` object that
+    /// also holds a sender can outlive the request when a framework keeps
+    /// an exception, and with it the frames that reference it, alive
+    /// until a later collection.
+    Finished,
 }
 
 /// Sends output to the coalescing task, detaching from the interpreter only
@@ -60,7 +79,7 @@ impl Sink {
 }
 
 struct HeadState {
-    status: Option<u32>,
+    status: Option<(u32, String)>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     sent: bool,
 }
@@ -95,7 +114,7 @@ impl StartResponse {
         if state.sent {
             return Ok(());
         }
-        let status = state.status.ok_or_else(|| {
+        let (status, reason) = state.status.take().ok_or_else(|| {
             PyRuntimeError::new_err("the application produced output before calling start_response")
         })?;
         state.sent = true;
@@ -106,6 +125,7 @@ impl StartResponse {
             py,
             Outgoing::Head {
                 status,
+                reason,
                 headers,
                 flush,
             },
@@ -126,77 +146,171 @@ impl StartResponse {
     }
 
     /// Reply with a plain 500 when the application failed before any output.
-    fn send_error_response(&self, py: Python<'_>) {
-        let body = b"Internal Server Error\n";
-        {
-            let mut state = self.state.lock().expect("head state poisoned");
-            state.sent = true;
-        }
-        let headers = vec![
-            (
-                b"content-type".to_vec(),
-                b"text/plain; charset=utf-8".to_vec(),
-            ),
-            (
-                b"content-length".to_vec(),
-                body.len().to_string().into_bytes(),
-            ),
-        ];
-        if self.sink.send(
+    /// The application failed before any response head: the edge renders
+    /// the error page, with the traceback in development mode.
+    fn fail(&self, py: Python<'_>, detail: String) {
+        self.state.lock().expect("head state poisoned").sent = true;
+        self.sink.send(
             py,
-            Outgoing::Head {
-                status: 500,
-                headers,
-                flush: pb::FlushPolicy::Unspecified,
+            Outgoing::Abort {
+                error: "the application raised an exception".to_owned(),
+                reason: "app_error".to_owned(),
+                detail,
             },
-        ) {
-            self.sink.send(py, Outgoing::Body(Bytes::from_static(body)));
-        }
+        );
     }
 
     fn abort(&self, py: Python<'_>, message: &str) {
-        self.sink.send(py, Outgoing::Abort(message.to_owned()));
+        self.sink.send(
+            py,
+            Outgoing::Abort {
+                error: message.to_owned(),
+                reason: "app_error".to_owned(),
+                detail: String::new(),
+            },
+        );
     }
 }
 
 #[pymethods]
 impl StartResponse {
+    /// PEP 3333 `start_response(status, headers, exc_info=None)`.
+    ///
+    /// Validation follows mod_wsgi: the status must be three digits, a
+    /// space and a reason without control characters; headers must be a
+    /// list of (str, str) tuples with token names, no CR or LF in values,
+    /// and latin-1 encodable. A second call before any output has been
+    /// sent replaces the first, with or without exc_info, which PEP 3333
+    /// forbids but every application that recovers from an error relies
+    /// on. After output has started, exc_info is re-raised and a call
+    /// without it is an error.
     #[pyo3(signature = (status, headers, exc_info=None))]
     fn __call__<'py>(
         slf: &Bound<'py, Self>,
         status: &str,
-        headers: Vec<(String, String)>,
+        headers: &Bound<'py, PyAny>,
         exc_info: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
         let this = slf.get();
-        {
-            let mut state = this.state.lock().expect("head state poisoned");
-            if state.sent {
-                return match exc_info {
-                    Some(info) => Err(PyErr::from_value(info.get_item(1)?)),
-                    None => Err(PyRuntimeError::new_err(
-                        "start_response called after the headers were sent",
-                    )),
-                };
-            }
-            if state.status.is_some() && exc_info.is_none() {
-                return Err(PyRuntimeError::new_err(
-                    "start_response called twice without exc_info",
+
+        if let Some(info) = &exc_info {
+            let tuple = info.cast::<PyTuple>().ok().filter(|tuple| tuple.len() == 3);
+            if tuple.is_none() {
+                return Err(PyTypeError::new_err(
+                    "start_response() exc_info must be a 3-tuple or None",
                 ));
             }
-            state.status = Some(parse_status(status)?);
-            state.headers = headers
-                .into_iter()
-                .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
-                .collect();
         }
-        slf.getattr(intern!(slf.py(), "write"))
+        if this.head_sent() {
+            return match exc_info {
+                Some(info) => Err(PyErr::from_value(info.get_item(1)?)),
+                None => Err(PyRuntimeError::new_err(
+                    "start_response() called again after the response started",
+                )),
+            };
+        }
+
+        let (code, reason) = parse_status(status)?;
+        let headers = validate_headers(py, headers)?;
+
+        let mut state = this.state.lock().expect("head state poisoned");
+        state.status = Some((code, reason));
+        state.headers = headers;
+        drop(state);
+
+        slf.getattr(intern!(py, "write"))
     }
 
     /// The `write` callable of PEP 3333: send one chunk immediately.
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         self.send_body(py, bytes_from_py(data))
     }
+}
+
+/// Check and latin-1 encode the headers given to start_response.
+fn validate_headers(
+    py: Python<'_>,
+    headers: &Bound<'_, PyAny>,
+) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    let Ok(list) = headers.cast::<PyList>() else {
+        return Err(PyTypeError::new_err(format!(
+            "start_response() headers must be a list, not {}",
+            type_name(headers)
+        )));
+    };
+
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let Ok(pair) = item.cast::<PyTuple>() else {
+            return Err(PyTypeError::new_err(format!(
+                "each header must be a (name, value) tuple, not {}",
+                type_name(&item)
+            )));
+        };
+        if pair.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "each header must be a (name, value) tuple, got length {}",
+                pair.len()
+            )));
+        }
+        let name_obj = pair.get_item(0)?;
+        let value_obj = pair.get_item(1)?;
+        let Ok(name) = name_obj.cast::<PyString>() else {
+            return Err(PyTypeError::new_err(format!(
+                "header name must be str, not {}",
+                type_name(&name_obj)
+            )));
+        };
+        let Ok(value) = value_obj.cast::<PyString>() else {
+            return Err(PyTypeError::new_err(format!(
+                "header value must be str, not {}",
+                type_name(&value_obj)
+            )));
+        };
+
+        let name = latin1_encode(py, name)?;
+        if name.is_empty() {
+            return Err(PyValueError::new_err("header name is empty"));
+        }
+        if name.iter().any(|&byte| byte <= b' ' || byte == 0x7f) {
+            return Err(PyValueError::new_err(format!(
+                "header name contains a space or control character: {:?}",
+                String::from_utf8_lossy(&name)
+            )));
+        }
+        let value = latin1_encode(py, value)?;
+        if value.contains(&b'\r') || value.contains(&b'\n') {
+            return Err(PyValueError::new_err(format!(
+                "header value contains a carriage return or line feed: {:?}",
+                String::from_utf8_lossy(&value)
+            )));
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            let text = std::str::from_utf8(&value).unwrap_or("");
+            if text.trim().parse::<u64>().is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "invalid Content-Length header value {text:?}"
+                )));
+            }
+        }
+        out.push((name, value));
+    }
+    Ok(out)
+}
+
+/// Encode a native string as latin-1, raising UnicodeEncodeError as Python would.
+fn latin1_encode(py: Python<'_>, text: &Bound<'_, PyString>) -> PyResult<Vec<u8>> {
+    let encoded = text.call_method1(intern!(py, "encode"), (intern!(py, "latin-1"),))?;
+    Ok(encoded.cast::<PyBytes>()?.as_bytes().to_vec())
+}
+
+fn type_name(object: &Bound<'_, PyAny>) -> String {
+    object
+        .get_type()
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "object".to_owned())
 }
 
 /// Chunks up to this size are copied; larger ones are shared with the Python object.
@@ -235,17 +349,30 @@ fn bytes_from_py(chunk: &Bound<'_, PyBytes>) -> Bytes {
     }
 }
 
-fn parse_status(status: &str) -> PyResult<u32> {
-    let code = status
-        .get(..3)
-        .and_then(|digits| digits.parse::<u32>().ok())
-        .filter(|code| (100..600).contains(code));
-    match code {
-        Some(code) if status.len() == 3 || status.as_bytes()[3] == b' ' => Ok(code),
-        _ => Err(PyValueError::new_err(format!(
+/// Split a WSGI status into its code and reason phrase, rejecting
+/// anything that is not three digits, a space and a reason free of
+/// control characters.
+fn parse_status(status: &str) -> PyResult<(u32, String)> {
+    let invalid = || {
+        PyValueError::new_err(format!(
             "invalid WSGI status {status:?}: expected three digits, a space and a reason"
-        ))),
+        ))
+    };
+    let bytes = status.as_bytes();
+    if bytes.len() < 4 || !bytes[..3].iter().all(u8::is_ascii_digit) || bytes[3] != b' ' {
+        return Err(invalid());
     }
+    let code: u32 = status[..3].parse().map_err(|_| invalid())?;
+    if !(100..600).contains(&code) {
+        return Err(invalid());
+    }
+    let reason = &status[4..];
+    if reason.chars().any(|c| c.is_control()) {
+        return Err(PyValueError::new_err(format!(
+            "control character in status reason phrase: {status:?}"
+        )));
+    }
+    Ok((code, reason.to_owned()))
 }
 
 /// Responses that must not be buffered flush immediately (section 5.4).
@@ -269,6 +396,9 @@ struct InputState {
     rx: mpsc::Receiver<Bytes>,
     pending: Bytes,
     eof: bool,
+    /// Where to announce the first read, when the client is waiting for
+    /// 100 Continue before it sends the body (section 5.5).
+    announce: Option<mpsc::Sender<Outgoing>>,
 }
 
 impl InputState {
@@ -279,6 +409,13 @@ impl InputState {
         }
         if self.eof {
             return false;
+        }
+        if let Some(tx) = self.announce.take()
+            && let Err(TrySendError::Full(item)) = tx.try_send(Outgoing::Continue)
+        {
+            py.detach(|| {
+                let _ = tx.blocking_send(item);
+            });
         }
         let next = match self.rx.try_recv() {
             Ok(data) => Some(data),
@@ -343,12 +480,13 @@ pub struct Input {
 }
 
 impl Input {
-    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+    fn new(rx: mpsc::Receiver<Bytes>, announce: Option<mpsc::Sender<Outgoing>>) -> Self {
         Self {
             state: Mutex::new(InputState {
                 rx,
                 pending: Bytes::new(),
                 eof: false,
+                announce,
             }),
         }
     }
@@ -513,6 +651,13 @@ fn build_environ<'py>(
             None => environ.set_item(key, value)?,
         }
     }
+    // A body the edge buffered has a length even when the client sent
+    // none (chunked_body = buffer in section 4.6).
+    if let Some(length) = head.content_length
+        && environ.get_item(intern!(py, "CONTENT_LENGTH"))?.is_none()
+    {
+        environ.set_item(intern!(py, "CONTENT_LENGTH"), length.to_string())?;
+    }
     environ.set_item(intern!(py, "wsgi.version"), (1, 0))?;
     let scheme = if head.scheme.is_empty() {
         "http"
@@ -520,13 +665,31 @@ fn build_environ<'py>(
         head.scheme.as_str()
     };
     environ.set_item(intern!(py, "wsgi.url_scheme"), scheme)?;
+    if scheme == "https" {
+        environ.set_item(intern!(py, "HTTPS"), "on")?;
+    }
+    if let Some(tls) = &head.tls {
+        let details = PyDict::new(py);
+        details.set_item(intern!(py, "version"), &tls.version)?;
+        details.set_item(intern!(py, "cipher"), &tls.cipher)?;
+        details.set_item(intern!(py, "server_name"), &tls.server_name)?;
+        details.set_item(intern!(py, "alpn"), &tls.alpn)?;
+        environ.set_item(intern!(py, "muru.tls"), details)?;
+    }
     environ.set_item(intern!(py, "wsgi.input"), input)?;
     environ.set_item(intern!(py, "wsgi.errors"), shared.errors.bind(py))?;
     environ.set_item(intern!(py, "wsgi.multithread"), shared.threads > 1)?;
-    environ.set_item(intern!(py, "wsgi.multiprocess"), true)?;
+    environ.set_item(intern!(py, "wsgi.multiprocess"), shared.multiprocess)?;
     environ.set_item(intern!(py, "wsgi.run_once"), false)?;
     environ.set_item(intern!(py, "wsgi.input_terminated"), true)?;
+    environ.set_item(
+        intern!(py, "wsgi.file_wrapper"),
+        py.get_type::<FileWrapper>(),
+    )?;
     environ.set_item(intern!(py, "muru.request_id"), &head.request_id)?;
+    if head.max_body_size != 0 {
+        environ.set_item(intern!(py, "muru.max_body_size"), head.max_body_size)?;
+    }
     Ok(environ)
 }
 
@@ -539,6 +702,8 @@ pub fn run(
     tx: mpsc::Sender<Outgoing>,
     cancelled: Arc<AtomicBool>,
 ) {
+    let announce = head.expect_continue.then(|| tx.clone());
+    let finished = tx.clone();
     let start_response = match Bound::new(py, StartResponse::new(tx)) {
         Ok(start_response) => start_response,
         Err(error) => {
@@ -547,18 +712,28 @@ pub fn run(
         }
     };
 
-    if let Err(error) = run_app(py, shared, &head, body_rx, &start_response, &cancelled) {
+    if let Err(error) = run_app(
+        py,
+        shared,
+        &head,
+        body_rx,
+        announce,
+        &start_response,
+        &cancelled,
+    ) {
         let broken_pipe = error.is_instance_of::<PyBrokenPipeError>(py);
         if !broken_pipe {
-            error.print(py);
+            report(py, &error);
         }
         let start_response = start_response.get();
         if !start_response.head_sent() {
-            start_response.send_error_response(py);
+            start_response.fail(py, describe(py, &error));
         } else if !broken_pipe {
             start_response.abort(py, "the application failed after the response started");
         }
     }
+    let sink = Sink { tx: finished };
+    sink.send(py, Outgoing::Finished);
 }
 
 fn run_app<'py>(
@@ -566,21 +741,53 @@ fn run_app<'py>(
     shared: &Shared,
     head: &pb::RequestHead,
     body_rx: mpsc::Receiver<Bytes>,
+    announce: Option<mpsc::Sender<Outgoing>>,
     start_response: &Bound<'py, StartResponse>,
     cancelled: &AtomicBool,
 ) -> PyResult<()> {
-    let input = Bound::new(py, Input::new(body_rx))?;
+    let input = Bound::new(py, Input::new(body_rx, announce))?;
     let environ = build_environ(py, shared, head, input)?;
     let result = shared.app.bind(py).call1((environ, start_response))?;
     let outcome = iterate(py, &result, start_response.get(), cancelled);
     // PEP 3333: close() is called whether or not the iteration completed.
-    if let Ok(close) = result.getattr(intern!(py, "close")) {
-        let closed = close.call0();
-        if outcome.is_ok() {
-            closed?;
-        }
+    // An error from close() is reported but does not fail a response that
+    // has been fully produced.
+    if let Ok(close) = result.getattr(intern!(py, "close"))
+        && let Err(error) = close.call0()
+    {
+        report(py, &error);
     }
     outcome
+}
+
+/// Print an exception with its traceback to stderr, the worker's log.
+///
+/// `PyErr::print` is not used because it exits the process for SystemExit,
+/// and an application raising SystemExit is a failed request, not a reason
+/// to stop serving.
+/// Format an exception with its traceback, as the traceback module does.
+fn describe(py: Python<'_>, error: &PyErr) -> String {
+    let formatted = py
+        .import(intern!(py, "traceback"))
+        .and_then(|module| module.call_method1(intern!(py, "format_exception"), (error.value(py),)))
+        .and_then(|lines| lines.extract::<Vec<String>>());
+    match formatted {
+        Ok(lines) => lines.concat(),
+        Err(_) => error.to_string(),
+    }
+}
+
+pub(crate) fn report(py: Python<'_>, error: &PyErr) {
+    let printed = py
+        .import(intern!(py, "traceback"))
+        .and_then(|module| module.call_method1(intern!(py, "print_exception"), (error.value(py),)));
+    if printed.is_err() {
+        eprintln!("muru: application error: {error}");
+    }
+    let _ = py
+        .import(intern!(py, "sys"))
+        .and_then(|sys| sys.getattr(intern!(py, "stderr")))
+        .and_then(|stderr| stderr.call_method0(intern!(py, "flush")));
 }
 
 fn iterate(
@@ -602,4 +809,56 @@ fn iterate(
         }
     }
     start_response.ensure_head_sent(py)
+}
+
+/// `wsgi.file_wrapper`: iterate a file-like object in blocks, and close it.
+///
+/// Phase 1 scope: the iteration form only. Descriptor passing to the edge
+/// (section 5.7) follows with the FILE frame.
+#[pyclass(frozen, module = "muru._native")]
+pub struct FileWrapper {
+    file: Py<PyAny>,
+    block_size: usize,
+}
+
+#[pymethods]
+impl FileWrapper {
+    #[new]
+    #[pyo3(signature = (filelike, block_size=8192))]
+    fn new(filelike: Py<PyAny>, block_size: usize) -> Self {
+        Self {
+            file: filelike,
+            block_size: block_size.max(1),
+        }
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let block = self
+            .file
+            .bind(py)
+            .call_method1(intern!(py, "read"), (self.block_size,))?;
+        let Ok(block) = block.cast_into::<PyBytes>() else {
+            return Err(PyTypeError::new_err(
+                "wsgi.file_wrapper: read() did not return bytes",
+            ));
+        };
+        if block.as_bytes().is_empty() {
+            Err(PyStopIteration::new_err(()))
+        } else {
+            Ok(block)
+        }
+    }
+
+    /// Close the wrapped file, if it can be closed.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let file = self.file.bind(py);
+        if file.hasattr(intern!(py, "close"))? {
+            file.call_method0(intern!(py, "close"))?;
+        }
+        Ok(())
+    }
 }

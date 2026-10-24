@@ -55,6 +55,7 @@ message RequestHead {
   bool precheck = 23;
   string http_version = 24;         // for example HTTP/1.1, for SERVER_PROTOCOL
   Scope scope = 25;                 // http unless the request is a WebSocket upgrade
+  bool expect_continue = 26;        // the client waits for 100 Continue before sending the body (section 5.5)
 }
 
 // What a REQUEST frame opens (section 5.6).
@@ -73,7 +74,13 @@ message Peer {
   uint32 port = 2;
 }
 
-message TlsInfo {}
+// The TLS connection a request arrived on, absent for cleartext.
+message TlsInfo {
+  string version = 1;               // for example TLSv1.3
+  string cipher = 2;                // negotiated cipher suite, for example TLS13_AES_256_GCM_SHA384
+  string server_name = 3;           // the name the client asked for (SNI), if any
+  string alpn = 4;                  // negotiated application protocol, for example h2
+}
 
 message InternalContext {}
 
@@ -93,12 +100,15 @@ message ResponseHead {
   uint32 status = 1;
   repeated Header headers = 2;      // ordered, as the application gave them
   FlushPolicy flush = 3;
+  string reason = 4;                // the application's reason phrase, for HTTP/1.1
 }
 
 // Payload of an END frame: the end of a body in one direction.
 message End {
   repeated Header trailers = 1;
   string error = 2;                 // non-empty when the body is incomplete
+  string reason = 3;                // Appendix C.3 reason when the worker failed before its response head, for example app_error
+  string detail = 4;                // the traceback or similar, shown by the edge in development mode only
 }
 
 // Payload of an ABORT frame, edge to worker: the client has gone, or the

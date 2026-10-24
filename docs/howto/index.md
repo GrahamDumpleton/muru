@@ -3,19 +3,18 @@
 Recipes for specific tasks, assuming you already know the basics. These pages
 are written as each capability lands.
 
-Planned:
+Still to be written, as their features land:
 
-- Django, Flask, FastAPI and Starlette.
+- FastAPI and Starlette.
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Running under systemd.
-- Virtual hosts and TLS.
+- Virtual hosts and TLS in production.
 - Behind a load balancer or CDN (trusted proxies).
 - Worker groups and mounts.
 - Uploads and authorised downloads (internal redirects), including upload adapters for Django, Flask and Starlette.
 - Custom error pages and maintenance mode.
 - Scaling, schedules and memory limits.
-- Timeouts.
-- Logging and log rotation.
+- Log rotation.
 - Containers and images.
 - uv and Python versions.
 - Event webhooks and OpenTelemetry.
@@ -25,4 +24,9 @@ Planned:
 
 ```{toctree}
 :maxdepth: 1
+
+flask-and-django
+https
+timeouts
+logging
 ```

@@ -51,3 +51,7 @@ An ASGI extension carrying an unframed bidirectional byte stream over the existi
 ## 20.9 Sync and async helpers
 
 Muru-bound versions of sync_to_async and async_to_sync, running on the worker's thread pool and loop with the caller's context, could be added under muru.asgi if applications want them. They are not in scope: asgiref's work unchanged under Muru and are what Django uses, muru.loop() covers the raw need, and generic versions bring the calling-convention introspection problems that wrapt's markers exist to solve. Any version added would be a plain closure so that inspect.iscoroutinefunction is right by construction.
+
+## 20.10 Sanitizer builds of the extension
+
+ThreadSanitizer finds data races in native code, which on the free-threaded build are the bugs a stress test only sometimes provokes, and a debug CPython (--with-pydebug) asserts on thread state and reference counting mistakes in C API use. Neither interpreter is provided by uv, so a nightly job would build CPython from source with the sanitizer or in debug mode, build the extension against it with the matching Rust sanitizer flags, and run the integration suite. Deferred because PyO3's types already enforce GIL and thread-state discipline in the bridge, and the many-threads stress test of section 6.11 runs on every free-threaded test run; the job would be worth adding once the extension carries more native code of its own, or if a race is ever suspected.

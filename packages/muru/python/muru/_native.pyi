@@ -6,8 +6,22 @@ from typing import Any
 def version() -> str:
     """Return the version of the extension."""
 
-def serve(socket_path: str, app: Callable[..., Any], threads: int = 4) -> None:
-    """Serve the worker link on a Unix socket until SIGTERM or SIGINT."""
+def serve(
+    socket_path: str,
+    app: Callable[..., Any],
+    threads: int = 4,
+    multiprocess: bool = True,
+    on_drain: Callable[[], Any] | None = None,
+    on_exit: Callable[[], Any] | None = None,
+    on_reopen_logs: Callable[[], Any] | None = None,
+) -> None:
+    """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
+
+    multiprocess is what wsgi.multiprocess reports: False only for a
+    single-process development run. on_drain runs when the stop signal
+    arrives, before the application threads finish their requests, on_exit
+    after they have, and on_reopen_logs whenever SIGUSR1 arrives.
+    """
 
 class Input:
     """The wsgi.input stream."""
@@ -15,6 +29,14 @@ class Input:
     def read(self, size: int = -1) -> bytes: ...
     def readline(self, limit: int = -1) -> bytes: ...
     def readlines(self, hint: int = -1) -> list[bytes]: ...
+    def __iter__(self) -> Iterator[bytes]: ...
+    def __next__(self) -> bytes: ...
+    def close(self) -> None: ...
+
+class FileWrapper:
+    """The wsgi.file_wrapper class: iterate a file-like object in blocks."""
+
+    def __init__(self, filelike: Any, block_size: int = 8192) -> None: ...
     def __iter__(self) -> Iterator[bytes]: ...
     def __next__(self) -> bytes: ...
     def close(self) -> None: ...

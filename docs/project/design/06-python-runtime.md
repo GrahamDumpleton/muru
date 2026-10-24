@@ -37,7 +37,7 @@ The host never serves requests, so its memory stays clean and shared copy-on-wri
 
 | Value | Behaviour |
 | --- | --- |
-| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen |
+| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead: it re-executes itself without preload, so nothing the import left behind reaches a worker. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen. The on_load hook has run once in the host by then, and runs again in each worker |
 | true | Preload, and treat any finding of the import check as a release failure during warm-up. For applications whose imports are known to be fork-safe, so that a regression is caught instead of silently costing the preload benefits |
 | false | Import in each worker. The check is skipped |
 
@@ -66,12 +66,14 @@ Hooks live in a module named by the hooks setting. Each receives a context objec
 | Hook | Runs in | Typical use |
 | --- | --- | --- |
 | on_load | host, after import | validate configuration, warm fork-safe caches |
-| pre_fork | host | close sockets and files that must not be shared |
-| post_fork | worker | reopen database connections, reseed, start background threads |
-| on_ready | worker | final warm-up |
-| on_drain | worker | stop background work, flush |
-| on_exit | worker | clean up |
-| on_reopen_logs | worker | reopen application-owned log files |
+| pre_fork | host, once before the first fork | close sockets and files that must not be shared |
+| post_fork | worker, after fork | reopen database connections, reseed, start background threads |
+| on_ready | worker, before its sockets are announced | final warm-up |
+| on_drain | worker, when told to stop, before requests in flight finish | stop background work, flush |
+| on_exit | worker, after the application threads have stopped | clean up |
+| on_reopen_logs | worker, on SIGUSR1 | reopen application-owned log files |
+
+An exception from on_load, pre_fork, post_fork or on_ready fails the host or the worker it runs in; one from on_drain, on_exit or on_reopen_logs is logged. Before every fork the host checks that it is still single-threaded and logs a warning naming the thread count otherwise, since threads do not exist in the child.
 
 ## 6.4 Process and threading models
 
@@ -94,6 +96,10 @@ Processes belong to worker groups (section 7.1). Threads belong to WSGI thread p
 - wsgi.multiprocess is True for any daemon-managed release, because releases overlap during deploys, recycles and scaling. It is False only for single-process development runs. wsgi.multithread is True when the pool serving the mount has more than one thread. Both can be forced per release. wsgi.run_once is False.
 - Response iteration pushes chunks into a bounded channel. wsgi.file_wrapper(filelike, block_size) returns a Muru wrapper that is also an ordinary iterable. When the application returns that wrapper itself as the response iterable and filelike.fileno() is a regular file, the bridge passes a duplicate descriptor to the edge on a FILE frame (section 5.7), starting at the file's current position and covering Content-Length bytes if that header is set, otherwise to the end of the file. If there is no fileno(), the file is not a regular file, or middleware has wrapped the iterable so the bridge cannot see the wrapper, it falls back to iterating read(block_size) chunks, as PEP 3333 requires. The worker closes its own descriptor once it is passed. close() is always called on the iterable, including after client disconnects.
 - The edge, not the application, handles 100 Continue (section 4.6).
+- **start_response validation**, following mod_wsgi. The status must be three digits, a space and a reason phrase without control characters (ValueError otherwise, TypeError when not a str); the reason phrase reaches HTTP/1.1 clients. Headers must be a list (TypeError) of (str, str) tuples (TypeError for other items or types, ValueError for a tuple of the wrong length); names must be non-empty tokens without spaces or control characters and values must not contain CR or LF (ValueError); both are latin-1 encoded, so other characters raise UnicodeEncodeError; a Content-Length that is not a non-negative integer is a ValueError. exc_info must be None or a 3-tuple (TypeError). A second call before any output has been sent replaces the first, with or without exc_info, as mod_wsgi allows; after output has started, exc_info is re-raised and a call without it is a RuntimeError.
+- **End of output.** The bridge tells the link explicitly when a request is over, after close() has run, rather than inferring it from the lifetime of the start_response object: frameworks keep exceptions, and so the frames that reference that object, alive in reference cycles until a later collection, which would otherwise hold the worker connection open.
+- **Response iteration rules.** Items must be bytes (TypeError, which is a 500 before output and a truncated response after). A declared Content-Length is enforced: output beyond it is dropped, and a body that ends short of it fails the response with the connection closed and a line in the log. close() is always called; an exception from close() is logged and does not fail a response that was fully produced. SystemExit and KeyboardInterrupt from the application are a 500 and a logged traceback like any other exception, never the end of the worker.
+- **Conformance suite.** tests/conformance/wsgi pins each of these rules, one test module per area, with cases taken from the mod_wsgi integration tests (section 15.1).
 
 ## 6.6 ASGI bridge
 
@@ -161,6 +167,7 @@ The daemon starts hosts itself and imports applications as modules, so applicati
 | muru.logging.default_config() | dictConfig dictionary matching the platform logging defaults |
 | muru.request_id() | Current request id, from a context variable |
 | muru.RequestTimeout | BaseException subclass raised by the soft timeout |
+| breakpoint() | The runtime library's breakpoint hook waits for muructl debug attach (section 11.7); outside Muru it is the ordinary pdb |
 | muru.host | Host entry point module (python -m muru.host). Internal |
 
 The API is typed (shipped with stub files) and every function is safe to call outside Muru.
@@ -193,7 +200,7 @@ Free-threaded CPython builds (3.14t and later) are supported from phase 1, toget
 - worker_cpu is normalised by the number of cores a worker may use. gil_wait is not reported on free-threaded builds. Lock contention measured in the bridge, scheduler latency and queue wait replace it as saturation signals.
 - Preload and fork work the same way. The garbage collection sequence of section 6.2 is verified on free-threaded builds in the phase 0 spike.
 
-**Testing:** the WSGI bridge, conformance suites and integration tests run on 3.14t from phase 1, including a stress test with many threads in one process, and ThreadSanitizer builds of the extension run nightly.
+**Testing:** the WSGI bridge, conformance suites and integration tests run on 3.14t from phase 1, including a stress test with many threads in one process. Sanitizer builds of the extension are a future idea (section 20.10).
 
 Running free-threaded and regular builds for the same application at once uses release variants (section 7.1): one variant per interpreter build, each with its own groups and paths.
 
@@ -257,7 +264,7 @@ A worker that serves both interfaces has application threads and an event loop. 
 
 - `scope`: the ASGI scope the application will receive, built from the request head and mutable until handoff. `scope["state"]` is where the WSGI code puts values for the application, as ASGI servers and middleware do.
 - `is_websocket`: whether the request is a WebSocket upgrade, which is `scope["type"] == "websocket"`.
-- `handoff(app)`: continue this request as `app` on the event loop. Allowed until a response head has left the worker, which only a prior write() can cause; raises afterwards. Returns at once.
+- `handoff(app)`: continue this request as `app` on the event loop. Allowed until a response head has left the worker, which only a prior write() can cause; raises afterwards. Returns at once with an empty response iterable, so a WSGI callable hands off and returns in one statement: `return bridge.handoff(app)`. The object is also a WSGI callable that returns itself, which lets a Flask view return it as well; a Django view returns an empty HttpResponse instead.
 - `handed_off`: whether handoff() succeeded, for middleware.
 
 After a handoff the bridge ignores the status, headers and write() output the WSGI code goes on to produce, closes the returned iterable without consuming it, and continues the request on the loop; a debug log line notes a non-empty iterable discarded this way. A view in Flask or Django can therefore hand off and return an empty response with no framework support. start_response called with exc_info after a handoff, or an exception leaving the application after one, is logged and the request is failed as an ASGI error would be. The request's contextvars context is copied into the task. Whatever the WSGI code has not read of the request body is what the application receives. Declining a WebSocket is ordinary WSGI: respond with any status and the edge sends it as the answer to the upgrade. The thread returns to the pool when the WSGI callable returns.
@@ -272,17 +279,15 @@ def application(environ, start_response):
         return [b"websocket required\n"]
 
     bridge.scope["state"]["user"] = current_user(environ)
-    bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
-    return []
+    return bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
 ```
 
-**ASGI to WSGI: `scope["extensions"]["muru"]["asgi_to_wsgi"]`.** Present on http scopes only, since WSGI has nothing to receive a WebSocket. `handoff(app)` is allowed until the coroutine has sent anything; the coroutine then returns and must not touch receive or send again. The bridge builds the native environ from the request head, streams what the coroutine has not consumed of the body through wsgi.input, runs the callable on the application thread pool inside a copy of the coroutine's context, and exposes `scope["state"]` as `environ["muru.state"]`. `handed_off` reports whether it happened.
+**ASGI to WSGI: `scope["extensions"]["muru"]["asgi_to_wsgi"]`.** Present on http scopes only, since WSGI has nothing to receive a WebSocket. `handoff(app)` is allowed until the coroutine has sent anything; it returns None, so `return bridge.handoff(app)` is the whole statement, and the coroutine must not touch receive or send again. The bridge builds the native environ from the request head, streams what the coroutine has not consumed of the body through wsgi.input, runs the callable on the application thread pool inside a copy of the coroutine's context, and exposes `scope["state"]` as `environ["muru.state"]`. `handed_off` reports whether it happened.
 
 ```python
 async def app(scope, receive, send):
     if scope["type"] == "http" and scope["path"].startswith("/legacy/"):
-        scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy_wsgi_app)
-        return
+        return scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy_wsgi_app)
     ...
 ```
 

@@ -16,11 +16,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
 libc = { workspace = true }
+muru-config = { workspace = true }
+muru-dashboard = { workspace = true }
 muru-edge = { workspace = true }
+rcgen = { workspace = true }
+rustls-pki-types = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+x509-parser = { workspace = true }
 
 [lints]
 workspace = true
