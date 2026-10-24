@@ -263,7 +263,7 @@ A worker that serves both interfaces has application threads and an event loop. 
 
 - `scope`: the ASGI scope the application will receive, built from the request head and mutable until handoff. `scope["state"]` is where the WSGI code puts values for the application, as ASGI servers and middleware do.
 - `is_websocket`: whether the request is a WebSocket upgrade, which is `scope["type"] == "websocket"`.
-- `handoff(app)`: continue this request as `app` on the event loop. Allowed until a response head has left the worker, which only a prior write() can cause; raises afterwards. Returns at once.
+- `handoff(app)`: continue this request as `app` on the event loop. Allowed until a response head has left the worker, which only a prior write() can cause; raises afterwards. Returns at once with an empty response iterable, so a WSGI callable hands off and returns in one statement: `return bridge.handoff(app)`. The object is also a WSGI callable that returns itself, which lets a Flask view return it as well; a Django view returns an empty HttpResponse instead.
 - `handed_off`: whether handoff() succeeded, for middleware.
 
 After a handoff the bridge ignores the status, headers and write() output the WSGI code goes on to produce, closes the returned iterable without consuming it, and continues the request on the loop; a debug log line notes a non-empty iterable discarded this way. A view in Flask or Django can therefore hand off and return an empty response with no framework support. start_response called with exc_info after a handoff, or an exception leaving the application after one, is logged and the request is failed as an ASGI error would be. The request's contextvars context is copied into the task. Whatever the WSGI code has not read of the request body is what the application receives. Declining a WebSocket is ordinary WSGI: respond with any status and the edge sends it as the answer to the upgrade. The thread returns to the pool when the WSGI callable returns.
@@ -278,17 +278,15 @@ def application(environ, start_response):
         return [b"websocket required\n"]
 
     bridge.scope["state"]["user"] = current_user(environ)
-    bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
-    return []
+    return bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
 ```
 
-**ASGI to WSGI: `scope["extensions"]["muru"]["asgi_to_wsgi"]`.** Present on http scopes only, since WSGI has nothing to receive a WebSocket. `handoff(app)` is allowed until the coroutine has sent anything; the coroutine then returns and must not touch receive or send again. The bridge builds the native environ from the request head, streams what the coroutine has not consumed of the body through wsgi.input, runs the callable on the application thread pool inside a copy of the coroutine's context, and exposes `scope["state"]` as `environ["muru.state"]`. `handed_off` reports whether it happened.
+**ASGI to WSGI: `scope["extensions"]["muru"]["asgi_to_wsgi"]`.** Present on http scopes only, since WSGI has nothing to receive a WebSocket. `handoff(app)` is allowed until the coroutine has sent anything; it returns None, so `return bridge.handoff(app)` is the whole statement, and the coroutine must not touch receive or send again. The bridge builds the native environ from the request head, streams what the coroutine has not consumed of the body through wsgi.input, runs the callable on the application thread pool inside a copy of the coroutine's context, and exposes `scope["state"]` as `environ["muru.state"]`. `handed_off` reports whether it happened.
 
 ```python
 async def app(scope, receive, send):
     if scope["type"] == "http" and scope["path"].startswith("/legacy/"):
-        scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy_wsgi_app)
-        return
+        return scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy_wsgi_app)
     ...
 ```
 

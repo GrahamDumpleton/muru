@@ -59,7 +59,9 @@ is its mirror. Specification section 6.14 defines the result.
 Chosen option: the general hand-over. Environ carries `muru.wsgi_to_asgi`
 with `scope`, `is_websocket`, `handoff(app)` and `handed_off`; the scope
 carries `extensions["muru"]["asgi_to_wsgi"]` with `handoff(app)` on http
-scopes. After a hand-over the bridge ignores the WSGI response and closes
+scopes. Each `handoff` returns what its caller should return, an empty
+response iterable on the WSGI side and None on the ASGI side, so the
+hand-over and the return are one statement. After a hand-over the bridge ignores the WSGI response and closes
 the iterable without consuming it, or requires the coroutine to return,
 carries the request's context across, and streams whatever body remains.
 The worker tells the edge with a DETACH frame so the connection is counted

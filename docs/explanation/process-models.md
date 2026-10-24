@@ -155,8 +155,7 @@ def application(environ, start_response):
         return [b"websocket required\n"]
 
     bridge.scope["state"]["user"] = current_user(environ)
-    bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
-    return []
+    return bridge.handoff(websocket.Handler(Chat(), subprotocol="chat"))
 ```
 
 Declining is ordinary WSGI: respond with any status and the client receives
@@ -168,8 +167,10 @@ too.
 This works from inside a framework. After a handoff, Muru ignores the
 status, headers and body the framework goes on to produce for the request,
 closes the response iterable without consuming it, and continues the
-request on the loop. A Flask or Django view can therefore hand off and
-return an empty response, and nothing in the framework needs to know.
+request on the loop. `handoff()` returns an empty iterable that is also a
+WSGI callable, so a plain WSGI application or a Flask view returns it
+directly; a Django view hands off and returns an empty `HttpResponse`.
+Nothing in the framework needs to know.
 
 The handler above is Muru's WebSocket adapter: an ordinary ASGI application
 that accepts the socket and calls `on_connect`, `on_receive` and
