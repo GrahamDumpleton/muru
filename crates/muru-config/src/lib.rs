@@ -447,6 +447,17 @@ pub struct App {
     pub release: BTreeMap<String, Release>,
 }
 
+/// The `[metrics]` table (section 11.1): where the daemon serves the
+/// Prometheus exposition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// The address `/metrics` is served on, an internal one such as
+    /// 127.0.0.1:9464; not served when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+}
+
 /// A declarative configuration file as `muructl apply` reads it and
 /// `muructl config export` writes it (section 10.4): listeners and limits,
 /// which belong to the daemon's own file, and applications with their
@@ -463,6 +474,9 @@ pub struct Document {
     /// Trusted proxies and the headers taken from them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<Proxy>,
+    /// The metrics listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
@@ -496,6 +510,10 @@ impl Document {
 
         if other.limits.is_some() {
             self.limits = other.limits;
+        }
+
+        if other.metrics.is_some() {
+            self.metrics = other.metrics;
         }
 
         if other.proxy.is_some() {

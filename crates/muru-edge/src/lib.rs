@@ -32,6 +32,7 @@ use tokio_rustls::TlsAcceptor;
 pub mod access;
 pub mod errors;
 pub mod link;
+pub mod metrics;
 pub mod proxy;
 pub mod routing;
 pub mod tls;

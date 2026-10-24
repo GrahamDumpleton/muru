@@ -52,12 +52,19 @@ pub struct Config {
     pub proxy: Option<muru_config::Proxy>,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
+    /// Where the Prometheus exposition is served, or nowhere.
+    pub metrics: Option<SocketAddr>,
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
 }
 
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
+    /// The node's metrics as the Prometheus text exposition.
+    Metrics {
+        /// Answered with the text.
+        done: oneshot::Sender<String>,
+    },
     /// Create a release and apply the blue/green strategy.
     Deploy {
         /// The application.
@@ -173,6 +180,8 @@ pub struct Info {
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
     pub edge_pid: std::sync::atomic::AtomicU32,
+    /// Where the Prometheus exposition is served, or nowhere.
+    pub metrics: Option<SocketAddr>,
 }
 
 /// What a ReopenLogs command reached.
@@ -231,6 +240,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("[proxy]: {error}"))?;
     }
 
+    let metrics = config.metrics;
     let locations = config.locations;
 
     for location in [&locations.state, &locations.run, &locations.logs] {
@@ -325,6 +335,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         listeners: listeners.clone(),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
+        metrics,
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -332,6 +343,22 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         commands,
         info: Arc::clone(&info),
     };
+
+    // The metrics listener (section 11.1), on an internal address.
+
+    let scraper = match metrics {
+        Some(address) => {
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("cannot listen for metrics on {address}"))?;
+            Some(tokio::spawn(crate::metrics::serve(
+                listener,
+                handle.commands.clone(),
+            )))
+        }
+        None => None,
+    };
+
     let socket = locations.admin_socket();
     let (api_stop, api_stopped) = oneshot::channel();
     let api = crate::api::serve(socket.clone(), handle, api_stopped).await?;
@@ -428,6 +455,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let _ = api_stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), &mut api).await;
+
+    if let Some(scraper) = scraper {
+        scraper.abort();
+    }
+
     let _ = std::fs::remove_file(&socket);
     outcome
 }
@@ -493,6 +525,43 @@ fn command_mentions(pid: u32, path: &Path) -> bool {
 }
 
 impl Daemon {
+    /// The node's metrics: the edge's samples with the daemon's own
+    /// gauges added, as the Prometheus text exposition.
+    async fn metrics(&self) -> String {
+        let mut samples = match self.edge.metrics().await {
+            Ok(samples) => samples,
+            Err(error) => {
+                tracing::warn!(%error, "the edge's metrics could not be read");
+                Vec::new()
+            }
+        };
+
+        for ((app, id), running) in &self.running {
+            let mut groups = vec![(
+                muru_edge::routing::DEFAULT_GROUP.to_owned(),
+                running.sockets.len(),
+            )];
+
+            for group in &running.groups {
+                groups.push((group.name.clone(), group.sockets.len()));
+            }
+
+            for (group, workers) in groups {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_workers_ready",
+                    &[
+                        ("app", app.as_str()),
+                        ("release", id.as_str()),
+                        ("group", group.as_str()),
+                    ],
+                    workers as f64,
+                ));
+            }
+        }
+
+        muru_edge::metrics::render(&muru_edge::metrics::aggregate(samples))
+    }
+
     /// Re-adopt the hosts a previous daemon left running (section 10.2),
     /// and start again the release that served if its host is gone.
     async fn restore(&mut self) {
@@ -638,6 +707,9 @@ impl Daemon {
             }
             Command::ReopenLogs { workers, done } => {
                 let _ = done.send(self.reopen_logs(workers));
+            }
+            Command::Metrics { done } => {
+                let _ = done.send(self.metrics().await);
             }
             Command::Shutdown { .. } => {}
         }

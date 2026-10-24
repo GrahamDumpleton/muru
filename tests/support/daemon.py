@@ -162,13 +162,15 @@ def start_daemon(
     port: int | None = None,
     listeners: list[tuple[int, bool]] | None = None,
     config_extra: str = "",
+    arguments: list[str] | None = None,
 ) -> Daemon:
     """Start a daemon in the foreground with directories under `base`.
 
     With `listeners`, pairs of port and whether it carries TLS, the daemon
     reads them from a configuration file written under `base`, and
     `config_extra` is appended to that file (the `[proxy]` table, say);
-    otherwise it serves plain HTTP on `port`. A second daemon over the
+    otherwise it serves plain HTTP on `port`. `arguments` are passed to
+    `muructl daemon run` as given. A second daemon over the
     same `run_dir` and listeners re-adopts what the first left running.
     """
 
@@ -216,6 +218,7 @@ def start_daemon(
                 "--log-dir",
                 str(base / "logs"),
                 *where,
+                *(arguments or []),
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,

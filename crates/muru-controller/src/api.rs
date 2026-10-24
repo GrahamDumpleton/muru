@@ -86,6 +86,10 @@ impl Admin for Service {
             apps: apps.len() as u32,
             releases: releases.len() as u32,
             edge_pid: info.edge_pid.load(std::sync::atomic::Ordering::Relaxed),
+            metrics: info
+                .metrics
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
         }))
     }
 
@@ -357,6 +361,20 @@ impl Admin for Service {
             edge: reopened.edge,
             hosts: reopened.hosts,
         }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _: Request<pb::GetMetricsRequest>,
+    ) -> Result<Response<pb::MetricsText>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Metrics { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let text = done_rx.await.map_err(|_| Status::unavailable(STOPPING))?;
+        Ok(Response::new(pb::MetricsText { text }))
     }
 
     async fn list_events(

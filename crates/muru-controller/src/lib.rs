@@ -15,5 +15,6 @@ pub mod fdpass;
 pub mod host;
 pub mod locations;
 pub mod logs;
+pub mod metrics;
 pub mod model;
 pub mod store;

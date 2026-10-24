@@ -55,6 +55,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | Exec | POST /v1/apps/{app}/releases/{release}:exec | one-off command, streamed output |
 | TailLogs | GET /v1/apps/{app}/releases/{release}/logs | stream logs |
 | ReopenLogs | POST /v1/logs:reopen | reopen log files, optionally in workers |
+| GetMetrics | GET /metrics | the Prometheus text exposition (11.1) |
 | SetLogLevel | POST /v1/apps/{app}/releases/{release}:loglevel | time-limited logger levels |
 | DumpStacks | POST /v1/.../workers/{worker}:stacks | Python stacks |
 | WatchEvents | GET /v1/events (Server-Sent Events) | event stream from a sequence number |

@@ -139,6 +139,11 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "ADDRESS")]
     listen: Option<SocketAddr>,
 
+    /// Serve Prometheus metrics at /metrics on this address, instead of
+    /// the [metrics] table's listen address (none by default).
+    #[arg(long, value_name = "ADDRESS")]
+    metrics: Option<SocketAddr>,
+
     #[command(flatten)]
     locations: LocationArgs,
 }
@@ -154,6 +159,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     };
 
     let limits = limits_from(&document)?;
+    let metrics = metrics_from(&document, args.metrics)?;
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -181,6 +187,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         limits,
         proxy: document.proxy.clone(),
         access_log,
+        metrics,
         executable: std::env::current_exe().context("finding the muructl executable")?,
     })
     .await
@@ -216,6 +223,10 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     if let Some(listen) = args.listen {
         command.arg("--listen").arg(listen.to_string());
+    }
+
+    if let Some(metrics) = args.metrics {
+        command.arg("--metrics").arg(metrics.to_string());
     }
 
     command.args(args.locations.as_arguments());
@@ -304,6 +315,18 @@ pub async fn daemon_stop(socket: SocketArgs, shutdown: bool) -> anyhow::Result<(
     anyhow::bail!("the daemon (pid {}) did not exit", status.pid)
 }
 
+/// Print the node's metrics as Prometheus text.
+pub async fn metrics(socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let text = client
+        .get_metrics(pb::GetMetricsRequest {})
+        .await?
+        .into_inner()
+        .text;
+    print!("{text}");
+    Ok(())
+}
+
 /// Show the daemon's status.
 pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()).await?;
@@ -316,6 +339,11 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
     println!("edge     pid {}", status.edge_pid);
     println!("serving  {}", status.listeners.join(", "));
     println!("socket   {}", status.socket);
+
+    if !status.metrics.is_empty() {
+        println!("metrics  http://{}/metrics", status.metrics);
+    }
+
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
     println!("apps     {} ({} releases)", status.apps, status.releases);
@@ -1267,6 +1295,31 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// The metrics address: the flag, else the [metrics] table's listen
+/// address, else none.
+fn metrics_from(
+    document: &muru_config::Document,
+    flag: Option<SocketAddr>,
+) -> anyhow::Result<Option<SocketAddr>> {
+    if flag.is_some() {
+        return Ok(flag);
+    }
+
+    let listen = document
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.listen.as_deref());
+
+    match listen {
+        Some(address) => Ok(Some(address.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "[metrics] listen = {address:?} is not an address such as 127.0.0.1:9464"
+            )
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// The listeners of the configuration file, or plain HTTP on 127.0.0.1:8080.

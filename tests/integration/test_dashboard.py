@@ -86,3 +86,19 @@ def test_dashboard_refuses_non_loopback_addresses() -> None:
         assert server.get("/").status == 200
     finally:
         server.stop()
+
+
+def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, int]) -> None:
+    server, port = dashboard
+    assert server.get("/response/list").status == 200
+    status, headers, body = fetch(port, "/metrics")
+    assert status == 200
+    assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+    text = body.decode()
+    assert "# TYPE muru_requests_total counter\n" in text
+    assert (
+        'muru_requests_total{app="wsgi-conformance",release="r1",group="default",'
+        'mount="default",status="2xx"} ' in text
+    ), text
+    assert 'muru_slots_total{app="wsgi-conformance",release="r1",group="default"} ' in text, text
+    assert "muru_snapshot_version 0\n" in text, text

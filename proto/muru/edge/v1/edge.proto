@@ -19,6 +19,9 @@ service EdgeControl {
   rpc Apply(Snapshot) returns (Applied);
   // The edge's pid, listener and snapshot version.
   rpc GetStatus(EdgeStatusRequest) returns (EdgeStatus);
+  // The edge's metrics as samples (section 11.1), which the daemon
+  // aggregates across edges and serves.
+  rpc GetMetrics(MetricsRequest) returns (MetricsReport);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
 }
@@ -102,3 +105,22 @@ message Listener {
 message StopRequest {}
 
 message Stopped {}
+
+message MetricsRequest {}
+
+message MetricsReport {
+  repeated Sample samples = 1;
+}
+
+// One metric sample: a family name (with _bucket, _sum or _count for a
+// histogram), its labels in order, and its value.
+message Sample {
+  string name = 1;
+  repeated Label labels = 2;
+  double value = 3;
+}
+
+message Label {
+  string name = 1;
+  string value = 2;
+}

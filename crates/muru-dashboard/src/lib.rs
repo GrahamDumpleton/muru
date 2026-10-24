@@ -109,6 +109,12 @@ pub struct RequestRow {
 /// Produces the data for one rendering.
 pub type Source = Arc<dyn Fn() -> Data + Send + Sync>;
 
+/// Produces the Prometheus text exposition for `/metrics` (section 11.1).
+pub type MetricsSource = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// The content type of the Prometheus text exposition.
+pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexPage<'a> {
@@ -134,14 +140,20 @@ struct LogsFragment<'a> {
 }
 
 /// Serve the dashboard on a bound listener until the task is dropped.
-pub async fn serve(listener: TcpListener, source: Source) -> anyhow::Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    source: Source,
+    metrics: MetricsSource,
+) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let source = Arc::clone(&source);
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
-                async move { Ok::<_, Infallible>(respond(&request, &source)) }
+                let metrics = Arc::clone(&metrics);
+                async move { Ok::<_, Infallible>(respond(&request, &source, &metrics)) }
             });
             if let Err(error) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -158,12 +170,26 @@ pub async fn bind(address: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::bind(address).await?)
 }
 
-fn respond(request: &Request<Incoming>, source: &Source) -> Response<Full<Bytes>> {
+fn respond(
+    request: &Request<Incoming>,
+    source: &Source,
+    metrics: &MetricsSource,
+) -> Response<Full<Bytes>> {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
 
     match request.uri().path() {
+        "/metrics" => {
+            let mut response = Response::new(Full::new(Bytes::from(metrics())));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, METRICS_CONTENT_TYPE.parse().expect("static"));
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, "no-store".parse().expect("static"));
+            response
+        }
         "/static/htmx.min.js" => {
             let mut response = Response::new(Full::new(Bytes::from_static(HTMX)));
             response

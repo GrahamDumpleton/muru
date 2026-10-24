@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use muru_dashboard::{Data, RequestRow, Source, Summary, Worker};
+use muru_dashboard::{Data, MetricsSource, RequestRow, Source, Summary, Worker};
 use muru_edge::Pools;
 use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
+use muru_edge::metrics::{aggregate, pool_samples, render};
 
 use muru_controller::logs::Logs;
 
@@ -53,9 +54,20 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
     );
     let listener = muru_dashboard::bind(address).await?;
     let bound = listener.local_addr()?;
+    let pools = Arc::clone(&inputs.pools);
+    let access_log = Arc::clone(&inputs.access_log);
+    let metrics: MetricsSource = Arc::new(move || {
+        let routing = pools.current();
+        let samples = access_log
+            .metrics()
+            .samples()
+            .into_iter()
+            .chain(pool_samples(&routing));
+        render(&aggregate(samples))
+    });
     let source: Source = Arc::new(move || collect(&inputs));
     tokio::spawn(async move {
-        if let Err(error) = muru_dashboard::serve(listener, source).await {
+        if let Err(error) = muru_dashboard::serve(listener, source, metrics).await {
             tracing::warn!(%error, "the dashboard stopped");
         }
     });

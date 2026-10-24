@@ -95,6 +95,18 @@ pub struct WorkerStatus {
 pub struct LinkPool {
     workers: Vec<WorkerSlots>,
     next: AtomicUsize,
+    /// Requests waiting for a slot, for the metrics.
+    waiting: AtomicUsize,
+}
+
+/// One request's place in the queue for a slot, given back when it gets
+/// one or gives up.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A connection taken from the pool for one request.
@@ -132,6 +144,7 @@ impl LinkPool {
         Ok(Self {
             workers,
             next: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
         })
     }
 
@@ -156,7 +169,13 @@ impl LinkPool {
         Self {
             workers: Vec::new(),
             next: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
         }
+    }
+
+    /// Requests waiting for a slot right now.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
     }
 
     /// Whether the pool has any workers.
@@ -194,10 +213,13 @@ impl LinkPool {
         }
 
         let worker = &self.workers[best];
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let waiting = Waiting(&self.waiting);
         let permit = Arc::clone(&worker.semaphore)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("pool closed"))?;
+        drop(waiting);
         let idle = worker.idle.lock().expect("pool poisoned").pop();
 
         let conn = match idle {
@@ -458,12 +480,15 @@ pub(crate) struct Recording {
     log: Arc<AccessLog>,
     record: Record,
     started: Instant,
+    /// Counted as in flight until the recording is dropped.
+    _in_flight: crate::access::InFlight,
 }
 
 impl Recording {
     fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
         Self {
             log: Arc::clone(&context.access_log),
+            _in_flight: context.access_log.begin(&context.app, &context.release),
             record: Record {
                 started: SystemTime::now(),
                 request_id: context.request_id.to_owned(),

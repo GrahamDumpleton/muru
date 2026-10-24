@@ -54,6 +54,9 @@ service Admin {
   // and reopening every log file after an external rotation.
   rpc TailLogs(TailLogsRequest) returns (stream LogLine);
   rpc ReopenLogs(ReopenLogsRequest) returns (ReopenLogsResponse);
+
+  // Metrics (section 11.1): the node's Prometheus text exposition.
+  rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
 }
 
 message GetStatusRequest {}
@@ -69,6 +72,7 @@ message Status {
   uint32 apps = 8;
   uint32 releases = 9;
   uint32 edge_pid = 10;             // the edge process serving the listeners
+  string metrics = 11;              // the metrics listener's address, or empty
 }
 
 message ListAppsRequest {}
@@ -291,4 +295,10 @@ message ReopenLogsRequest {
 message ReopenLogsResponse {
   bool edge = 1;                    // the edge was told
   uint32 hosts = 2;                 // hosts told
+}
+
+message GetMetricsRequest {}
+
+message MetricsText {
+  string text = 1;                  // the Prometheus text exposition
 }

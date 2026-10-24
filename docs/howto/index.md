@@ -31,4 +31,5 @@ mounts
 https
 timeouts
 logging
+metrics
 ```

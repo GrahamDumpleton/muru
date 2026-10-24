@@ -177,6 +177,13 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
         );
     }
 
+    if document.metrics.is_some() {
+        plan.warnings.push(
+            "the [metrics] table belongs in the daemon configuration file and was not applied"
+                .to_owned(),
+        );
+    }
+
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
     }

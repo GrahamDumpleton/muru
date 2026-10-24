@@ -160,7 +160,9 @@ with the same keys `muructl run --print-config` writes.
 `daemon.log` in the log directory, and waits until it answers; `muructl
 up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
-listener and its locations.
+listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
+in the configuration file, serves Prometheus metrics on an internal
+address; the [metrics guide](metrics.md) lists them.
 
 The daemon binds the listening sockets itself and hands them to an edge
 process started from the same executable, which carries the traffic;

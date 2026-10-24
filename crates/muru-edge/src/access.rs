@@ -15,8 +15,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::metrics::Metrics;
 
 /// How many records the in-memory ring keeps.
 /// Records kept in memory for `recent()`, the dashboard and the CLI.
@@ -131,13 +133,27 @@ pub struct Minute {
 }
 
 /// The access log: a ring of recent records, per-second counters for the
-/// last minute, and the configured output.
+/// last minute, the request metrics, and the configured output.
 pub struct AccessLog {
     config: Config,
     ring: Mutex<VecDeque<Record>>,
     minute: Mutex<[Bucket; MINUTE]>,
+    metrics: Metrics,
     started: u64,
     file: Option<Mutex<File>>,
+}
+
+/// A request counted as in flight until this is dropped.
+pub struct InFlight {
+    log: Arc<AccessLog>,
+    app: String,
+    release: String,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.log.metrics.finish(&self.app, &self.release);
+    }
 }
 
 fn unix_seconds(time: SystemTime) -> u64 {
@@ -159,9 +175,26 @@ impl AccessLog {
             config,
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             minute: Mutex::new([Bucket::default(); MINUTE]),
+            metrics: Metrics::default(),
             started: unix_seconds(SystemTime::now()),
             file,
         })
+    }
+
+    /// The request metrics the records feed (section 11.1).
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// Count a request as in flight for the application and release it
+    /// is labelled with, until the returned guard is dropped.
+    pub fn begin(self: &Arc<Self>, app: &str, release: &str) -> InFlight {
+        self.metrics.begin(app, release);
+        InFlight {
+            log: Arc::clone(self),
+            app: app.to_owned(),
+            release: release.to_owned(),
+        }
     }
 
     /// Keep a record and write it where the configuration says.
@@ -170,6 +203,7 @@ impl AccessLog {
             self.write(&record);
         }
 
+        self.metrics.observe(&record);
         self.count(unix_seconds(SystemTime::now()), record.status);
         let mut ring = self.ring.lock().expect("access log ring poisoned");
 

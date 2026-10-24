@@ -213,6 +213,21 @@ impl EdgeProcess {
         Ok(())
     }
 
+    /// The edge's metrics as samples (section 11.1).
+    pub async fn metrics(&self) -> anyhow::Result<Vec<muru_edge::metrics::Sample>> {
+        let mut client = connect(&self.spec.control).await?;
+        let report = client
+            .get_metrics(pb::MetricsRequest {})
+            .await
+            .map_err(|status| anyhow::anyhow!("the edge did not answer: {}", status.message()))?
+            .into_inner();
+        Ok(report
+            .samples
+            .into_iter()
+            .map(muru_edge::metrics::Sample::from_message)
+            .collect())
+    }
+
     /// Respawn the edge if it has exited, with the same listener and the
     /// last snapshot. Returns whether it had to.
     pub async fn check(&mut self) -> anyhow::Result<bool> {

@@ -186,6 +186,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         pools,
         resolver,
         listeners,
+        access_log: edge.access_log(),
         version: AtomicU64::new(0),
         stop: stop_tx,
     });
@@ -258,6 +259,7 @@ struct Control {
     pools: Arc<muru_edge::Pools>,
     resolver: Arc<muru_edge::tls::Resolver>,
     listeners: Vec<(SocketAddr, bool)>,
+    access_log: Arc<muru_edge::access::AccessLog>,
     version: AtomicU64,
     stop: tokio::sync::mpsc::Sender<()>,
 }
@@ -319,6 +321,22 @@ impl EdgeControl for Control {
                 })
                 .collect(),
         }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _: Request<pb::MetricsRequest>,
+    ) -> Result<Response<pb::MetricsReport>, Status> {
+        let routing = self.pools.current();
+        let samples = self
+            .access_log
+            .metrics()
+            .samples()
+            .into_iter()
+            .chain(muru_edge::metrics::pool_samples(&routing))
+            .map(|sample| sample.to_message())
+            .collect();
+        Ok(Response::new(pb::MetricsReport { samples }))
     }
 
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {

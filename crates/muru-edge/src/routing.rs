@@ -166,6 +166,25 @@ impl AppPools {
     pub fn default_pool(&self) -> Arc<LinkPool> {
         Arc::clone(&self.default)
     }
+
+    /// The application and release the pools serve, empty when nothing
+    /// names them.
+    pub fn labels(&self) -> (&str, &str) {
+        (&self.app, &self.release)
+    }
+
+    /// Every group's pool once, by group name, the default group first.
+    pub fn pools(&self) -> Vec<(String, Arc<LinkPool>)> {
+        let mut pools = vec![(DEFAULT_GROUP.to_owned(), Arc::clone(&self.default))];
+
+        for (_, name, pool) in &self.groups {
+            if !pools.iter().any(|(seen, _)| seen == name) {
+                pools.push((name.clone(), Arc::clone(pool)));
+            }
+        }
+
+        pools
+    }
 }
 
 /// The name of the group a release's own settings size (section 7.1).
@@ -240,28 +259,6 @@ impl Routing {
     /// Compile a snapshot, connecting to every worker it names first, so
     /// a snapshot that cannot be reached is refused whole.
     pub async fn from_snapshot(snapshot: &pb::Snapshot) -> anyhow::Result<Self> {
-        // The default workers are one application's, found by its sockets
-        // so its groups come along; without one, a plain pool.
-
-        let default_app = snapshot
-            .apps
-            .iter()
-            .find(|app| app.sockets == snapshot.worker_sockets);
-
-        let default = match default_app {
-            Some(app) => {
-                AppPools::connect(
-                    &app.app,
-                    &app.release,
-                    &paths(&app.sockets),
-                    &groups_of(app),
-                    &mounts_of(app),
-                )
-                .await?
-            }
-            None => AppPools::single(LinkPool::connect(&paths(&snapshot.worker_sockets)).await?),
-        };
-
         let mut apps = HashMap::new();
 
         for app in &snapshot.apps {
@@ -276,6 +273,23 @@ impl Routing {
             apps.insert(app.app.clone(), Arc::new(pools));
         }
 
+        // The default workers are one application's, found by its sockets
+        // so its groups come along and its pools are shared; without one,
+        // a plain pool.
+
+        let default_app = snapshot
+            .apps
+            .iter()
+            .find(|app| app.sockets == snapshot.worker_sockets)
+            .and_then(|app| apps.get(&app.app));
+
+        let default = match default_app {
+            Some(pools) => Arc::clone(pools),
+            None => Arc::new(AppPools::single(
+                LinkPool::connect(&paths(&snapshot.worker_sockets)).await?,
+            )),
+        };
+
         // Exact names go in a map; wildcards keep their suffix, longest
         // first, so *.shop.example.com beats *.example.com.
 
@@ -287,7 +301,7 @@ impl Routing {
         let mut routing = Self {
             version: snapshot.version,
             trust,
-            default: Arc::new(default),
+            default,
             apps,
             hosts: Vec::new(),
             exact: HashMap::new(),
@@ -376,6 +390,19 @@ impl Routing {
     /// dashboard counts.
     pub fn default_pool(&self) -> Arc<LinkPool> {
         self.default.default_pool()
+    }
+
+    /// Every application's pools once: the named applications, and the
+    /// default pools when they are nobody's.
+    pub fn app_pools(&self) -> Vec<Arc<AppPools>> {
+        let mut pools: Vec<Arc<AppPools>> = self.apps.values().cloned().collect();
+        pools.sort_by(|left, right| left.labels().cmp(&right.labels()));
+
+        if !pools.iter().any(|seen| Arc::ptr_eq(seen, &self.default)) {
+            pools.insert(0, Arc::clone(&self.default));
+        }
+
+        pools
     }
 
     /// Where a request goes, from the host the client asked for, the

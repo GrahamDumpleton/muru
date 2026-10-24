@@ -1,0 +1,1 @@
+Prometheus metrics: the daemon serves request counters, timing histograms, in-flight, queue depth and slot gauges and the workers ready at `/metrics` on the address `--metrics` or the `[metrics]` table names, `muructl metrics` prints the same text, and a development run serves it from the dashboard.

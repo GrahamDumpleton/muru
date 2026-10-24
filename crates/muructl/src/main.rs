@@ -134,6 +134,12 @@ enum Command {
     /// the log files after an external rotation.
     Logs(admin::LogsArgs),
 
+    /// Print the node's metrics as Prometheus text.
+    Metrics {
+        #[command(flatten)]
+        socket: admin::SocketArgs,
+    },
+
     /// Run an edge process (internal, started by the daemon).
     Edge {
         #[command(subcommand)]
@@ -528,6 +534,7 @@ fn main() -> anyhow::Result<()> {
                 None => admin::logs(args).await,
             }
         }),
+        Command::Metrics { socket } => runtime.block_on(admin::metrics(socket)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),

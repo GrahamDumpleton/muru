@@ -972,7 +972,11 @@ name = "muru-controller"
 version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
+ "http",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "libc",
  "muru-config",

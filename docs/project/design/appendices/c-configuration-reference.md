@@ -19,6 +19,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[tools]` | daemon file | uv path and version constraints |
 | `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, PROXY protocol, processes, threads |
 | `[proxy]` | daemon, host or listener | trusted proxies and header types |
+| `[metrics]` | daemon file | the internal address `/metrics` is served on (`listen`), none by default |
 | `[limits]` | global, host, route, mount, group | request limits and timeouts |
 | `[logging.access]`, `[logging.apps]`, `[logging.python]` | global, application, release | sinks, formats, rotation, Python defaults |
 | `[[events.sink]]` | daemon file | event sinks |

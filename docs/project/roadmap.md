@@ -81,4 +81,12 @@ snapshot, `muructl logs` shows or follows either over the TailLogs
 operation, and `muructl logs reopen` or SIGUSR1 makes every writer
 reopen its file after an external rotation, with `--workers` running
 on_reopen_logs (built-in rotation, journald and the Python logging
-defaults later). Next from phase 2: metrics.
+defaults later). Metrics (section 11.1) have their first slice: the edge
+counts completed requests by status class and reason, keeps queue,
+application and total time histograms, and in-flight, queue depth and
+slot gauges per group, and reports its samples to the daemon over the
+control socket; the daemon adds the workers ready and serves the
+Prometheus text exposition on the `[metrics]` listener or `--metrics` and
+through `muructl metrics`, and a development run serves `/metrics` from
+its dashboard (worker CPU and memory, scaling, edge and TLS metrics and
+OTLP export later). Next from phase 2: the Python logging defaults.
