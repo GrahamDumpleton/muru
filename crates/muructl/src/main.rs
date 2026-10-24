@@ -152,11 +152,136 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
+    /// Serve a directory of files with no configuration (section 4.9),
+    /// for a built front end or a documentation build.
+    ServeStatic(Box<ServeStaticArgs>),
+
     /// Run an edge process (internal, started by the daemon).
     Edge {
         #[command(subcommand)]
         command: edge::EdgeCommand,
     },
+}
+
+/// What `serve-static` takes.
+#[derive(Args)]
+struct ServeStaticArgs {
+    /// The directory to serve.
+    directory: PathBuf,
+
+    /// Address to listen on, as IP or IP:PORT.
+    #[arg(long, default_value = "127.0.0.1", value_parser = parse_bind)]
+    bind: Bind,
+
+    /// Port for HTTP (default 8080), or auto to pick a free port and
+    /// print it.
+    #[arg(long, value_parser = parse_port)]
+    port: Option<Port>,
+
+    /// A file served for a directory, tried in order (default index.html).
+    /// Repeatable.
+    #[arg(long = "index", value_name = "NAME")]
+    index: Vec<String>,
+
+    /// The file served for any path that has no file of its own, for a
+    /// single-page application.
+    #[arg(long, value_name = "NAME")]
+    fallback: Option<String>,
+
+    /// Do not compress responses or serve precompressed variants.
+    #[arg(long)]
+    no_compression: bool,
+
+    /// Where access log lines go: terminal, off, errors or a file path.
+    #[arg(long, default_value = "terminal")]
+    access_log: String,
+}
+
+/// Serve a directory with the edge's static file code and nothing else.
+async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
+    let directory = args
+        .directory
+        .canonicalize()
+        .with_context(|| format!("{} is not a directory", args.directory.display()))?;
+    anyhow::ensure!(
+        directory.is_dir(),
+        "{} is not a directory",
+        directory.display()
+    );
+
+    let port = match args.port {
+        Some(Port::Auto) => 0,
+        Some(Port::Number(port)) => port,
+        None => args.bind.port.unwrap_or(8080),
+    };
+
+    let compression = if args.no_compression {
+        muru_edge::compression::Compression::off()
+    } else {
+        muru_edge::compression::Compression::default()
+    };
+    let access_log = muru_edge::access::Config {
+        destination: match args.access_log.as_str() {
+            "terminal" => muru_edge::access::Destination::Terminal,
+            "off" => muru_edge::access::Destination::Off,
+            "errors" => muru_edge::access::Destination::Errors,
+            path => muru_edge::access::Destination::File(PathBuf::from(path)),
+        },
+        ..muru_edge::access::Config::default()
+    };
+    let edge = muru_edge::Edge::bind(muru_edge::Config {
+        listen: SocketAddr::new(args.bind.ip, port),
+        app: "static".to_owned(),
+        release: String::new(),
+        sockets: Vec::new(),
+        groups: Vec::new(),
+        mounts: Vec::new(),
+        development: true,
+        access_log,
+        limits: muru_edge::Limits::default(),
+        compression: compression.clone(),
+        https: None,
+    })
+    .await
+    .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
+
+    // One default host with one static route at /, as a snapshot would
+    // describe it, so the same code serves here and under the daemon.
+
+    let snapshot = muru_proto::edge::v1::Snapshot {
+        version: 1,
+        hosts: vec![muru_proto::edge::v1::Host {
+            name: "static".to_owned(),
+            default: true,
+            ..Default::default()
+        }],
+        routes: vec![muru_proto::edge::v1::Route {
+            host: "static".to_owned(),
+            path: "/".to_owned(),
+            static_dir: directory.display().to_string(),
+            index: args.index.clone(),
+            fallback_file: args.fallback.clone().unwrap_or_default(),
+            ..Default::default()
+        }],
+        compression: Some(compression.to_message()),
+        ..Default::default()
+    };
+    let routing = muru_edge::routing::Routing::from_snapshot(&snapshot).await?;
+    edge.pools().apply(routing);
+    println!(
+        "muru: serving {} on http://{}",
+        directory.display(),
+        edge.local_addr()
+    );
+    let mut serving = tokio::spawn(edge.run());
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+
+    tokio::select! {
+        served = &mut serving => served.map_err(anyhow::Error::from).and_then(|result| result),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 #[derive(Args)]
@@ -503,6 +628,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
+        Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,

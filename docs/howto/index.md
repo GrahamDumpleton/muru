@@ -28,6 +28,7 @@ behind-a-proxy
 worker-groups
 mounts
 https
+static-files
 compression
 timeouts
 recycling

@@ -587,6 +587,11 @@ impl Admin for Service {
                     host: route.host,
                     path: route.path,
                     app: route.app,
+                    static_dir: route.static_dir.unwrap_or_default(),
+                    fallback_app: route
+                        .fallback
+                        .and_then(|fallback| fallback.app)
+                        .unwrap_or_default(),
                 })
                 .collect(),
         }))

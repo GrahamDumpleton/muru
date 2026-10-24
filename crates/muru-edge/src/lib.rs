@@ -36,6 +36,7 @@ pub mod link;
 pub mod metrics;
 pub mod proxy;
 pub mod routing;
+pub mod static_files;
 pub mod tls;
 pub mod websocket;
 
@@ -601,6 +602,76 @@ async fn serve<I>(
                         "No virtual host answers to that name on this listener.",
                     ),
                 ),
+                (
+                    None,
+                    routing::Decision::Static {
+                        route,
+                        prefix,
+                        fallback,
+                        server_name,
+                    },
+                ) => {
+                    // Section 4.9: the file, or the fallback application
+                    // when no file answers, or a 404 or 405.
+
+                    context.server_name = server_name;
+                    let path = request.uri().path().to_owned();
+                    let within = path
+                        .strip_prefix(prefix.trim_end_matches('/'))
+                        .unwrap_or("")
+                        .to_owned();
+                    let target = request
+                        .uri()
+                        .path_and_query()
+                        .map_or_else(|| path.clone(), |target| target.to_string());
+                    let outcome = static_files::serve(
+                        &route,
+                        request.method(),
+                        &within,
+                        &target,
+                        request.headers(),
+                        routing.compression(),
+                    )
+                    .await;
+
+                    match (outcome, fallback) {
+                        (
+                            static_files::Outcome::Served {
+                                response,
+                                status,
+                                reason,
+                                bytes,
+                            },
+                            _,
+                        ) => {
+                            let (parts, _body) = request.into_parts();
+                            link::record(&context, &parts, status, reason, bytes);
+                            response
+                        }
+                        (_, Some(selection)) => {
+                            context.app = selection.app.clone();
+                            context.release = selection.release.clone();
+                            context.group = selection.group.clone();
+                            context.mount = selection.mount.clone();
+                            context.mount_path = selection.script_name.clone();
+                            link::handle(request, selection.pool, &context).await
+                        }
+                        (static_files::Outcome::MethodNotAllowed, None) => {
+                            let (parts, _body) = request.into_parts();
+                            link::record(&context, &parts, 405, "method_not_allowed", 0);
+                            static_files::method_not_allowed()
+                        }
+                        (static_files::Outcome::Fallback, None) => link::reject(
+                            request,
+                            &context,
+                            errors::Problem::new(
+                                StatusCode::NOT_FOUND,
+                                "not_found",
+                                "No file answers to that path.",
+                            ),
+                        ),
+                    }
+                }
                 (None, routing::Decision::NoRoute) => link::reject(
                     request,
                     &context,

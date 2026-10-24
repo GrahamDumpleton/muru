@@ -15,12 +15,16 @@ brotli = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
+globset = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
+httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+mime_guess = { workspace = true }
 muru-proto = { workspace = true }
+percent-encoding = { workspace = true }
 prost = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

@@ -82,7 +82,9 @@ def test_sigterm_detaches_and_the_next_daemon_readopts(tmp_path: Path) -> None:
     second = None
 
     try:
-        assert first.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        assert first.deploy("shop", SHOP, "--processes", "1") == (
+            "muru: release shop@r1 is ready and serving"
+        )
         pid = json.loads(first.get("/info").body)["pid"]
         os.kill(first.process.pid, signal.SIGTERM)
         first.process.wait(timeout=30)

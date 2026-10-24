@@ -325,7 +325,9 @@ message ListRoutesResponse {
 message Route {
   string host = 1;
   string path = 2;
-  string app = 3;
+  string app = 3;                   // empty for a static route
+  string static_dir = 4;            // the directory, for a static route (section 4.9)
+  string fallback_app = 5;          // the application behind a static route, when there is one
 }
 
 // Which log to show: a release's output (its host's and workers' lines,

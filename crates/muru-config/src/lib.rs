@@ -208,6 +208,10 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
 
     let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
         (number, 0.001)
+    } else if let Some(number) = text.strip_suffix('y') {
+        (number, 365.0 * 86400.0)
+    } else if let Some(number) = text.strip_suffix('d') {
+        (number, 86400.0)
     } else if let Some(number) = text.strip_suffix('h') {
         (number, 3600.0)
     } else if let Some(number) = text.strip_suffix('m') {
@@ -663,8 +667,61 @@ pub struct Route {
     /// The path prefix, `/` for everything. The longest prefix wins.
     #[serde(default = "root_path")]
     pub path: String,
-    /// The application whose serving release takes the requests.
+    /// The application whose serving release takes the requests; empty
+    /// for a static route.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app: String,
+    /// The directory served by the edge (section 4.9), instead of an
+    /// application.
+    #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
+    pub static_dir: Option<String>,
+    /// The files tried, in order, when a directory is requested
+    /// (default index.html).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index: Vec<String>,
+    /// What takes a request no file answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Fallback>,
+    /// The cache headers files are sent with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheTable>,
+    /// Whether a directory asked for without a trailing slash is
+    /// redirected to the slash form (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_slash: Option<bool>,
+    /// `strict` (the default), which matches names as they are on disk,
+    /// or `insensitive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
+}
+
+/// A static route's fallback (section 4.9): an application, or a file
+/// within the directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fallback {
+    /// The application that takes requests no file answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// The file served for paths with no file of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+/// A static route's cache headers (section 4.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheTable {
+    /// How long clients may keep a file, for example 1y or 1h.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<String>,
+    /// Whether files are marked immutable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immutable: Option<bool>,
+    /// Files that get no-cache instead, by pattern on their path within
+    /// the route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<String>,
 }
 
 fn root_path() -> String {
@@ -1023,6 +1080,12 @@ mod tests {
             host: "shop".to_owned(),
             path: "/".to_owned(),
             app: "shop".to_owned(),
+            static_dir: None,
+            index: Vec::new(),
+            fallback: None,
+            cache: None,
+            redirect_slash: None,
+            case: None,
         });
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");

@@ -170,5 +170,14 @@ for streamed bodies, never for a response already encoded or opted out
 with X-Muru-Compress or Cache-Control: no-transform, from the daemon's
 `[compression]` table (applied on reload) or `muructl run`'s defaults
 (per-host and per-route settings, precompressed static variants and
-request decompression later). Next from phase 2: connection limits and
-static files at the edge.
+request decompression later). Static files (section 4.9) have their
+first slice: a route that names a directory is served by the edge with
+index files, ETag and Last-Modified, conditional requests, single
+ranges, precompressed variants next to the file, cache headers with
+exceptions, a redirect to the slash form of a directory, and a fallback
+to an application or a file, never a hidden file, a path that climbs
+out, a symbolic link leaving the directory or a name that differs from
+the file's on disk, declared through apply and exported, and `muructl
+serve-static DIR` serves a directory with the same code (listings,
+release static files, file hints, internal redirects and the metadata
+cache later). Next from phase 2: connection limits at the edge.

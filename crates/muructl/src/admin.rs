@@ -1334,10 +1334,17 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<16} {:<24} APP", "HOST", "PATH");
+    println!("{:<16} {:<24} TARGET", "HOST", "PATH");
 
     for route in routes {
-        println!("{:<16} {:<24} {}", route.host, route.path, route.app);
+        let target = if route.static_dir.is_empty() {
+            route.app
+        } else if route.fallback_app.is_empty() {
+            format!("static {}", route.static_dir)
+        } else {
+            format!("static {}, else {}", route.static_dir, route.fallback_app)
+        };
+        println!("{:<16} {:<24} {target}", route.host, route.path);
     }
 
     Ok(())

@@ -1742,6 +1742,36 @@ impl Daemon {
                 host: route.host,
                 path: route.path,
                 app: route.app,
+                static_dir: route.static_dir.unwrap_or_default(),
+                index: route.index,
+                fallback_app: route
+                    .fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.app.clone())
+                    .unwrap_or_default(),
+                fallback_file: route
+                    .fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.file.clone())
+                    .unwrap_or_default(),
+                cache_max_age_s: route
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.max_age.as_deref())
+                    .and_then(|text| muru_config::parse_duration(text).ok())
+                    .map_or(0, |duration| duration.as_secs()),
+                cache_immutable: route
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.immutable)
+                    .unwrap_or(false),
+                cache_except: route
+                    .cache
+                    .as_ref()
+                    .map(|cache| cache.except.clone())
+                    .unwrap_or_default(),
+                no_redirect_slash: route.redirect_slash == Some(false),
+                case_insensitive: route.case.as_deref() == Some("insensitive"),
             })
             .collect();
 

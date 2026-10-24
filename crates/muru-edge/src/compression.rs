@@ -239,6 +239,22 @@ impl Compression {
         })
     }
 
+    /// Every encoding of the policy the client accepts, in the policy's
+    /// order, for callers that can offer more than one.
+    pub fn accepted(&self, accept: Option<&HeaderValue>) -> Vec<Encoding> {
+        let mut accepted = Vec::new();
+        let mut remaining = self.clone();
+
+        while let Some(encoding) = remaining.choose(accept) {
+            accepted.push(encoding);
+            remaining
+                .encodings
+                .retain(|candidate| *candidate != encoding);
+        }
+
+        accepted
+    }
+
     /// Whether a content type is one the policy compresses.
     pub fn compresses_type(&self, content_type: &str) -> bool {
         let essence = content_type

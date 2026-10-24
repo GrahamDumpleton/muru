@@ -423,12 +423,90 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             valid = false;
         }
 
-        if !document.app.contains_key(&route.app) && !stored_apps.contains(&route.app) {
-            plan.errors.push(format!(
-                "route {} {}: no application named {}",
-                route.host, route.path, route.app
-            ));
-            valid = false;
+        // Section 4.9: a route names an application or a directory, and
+        // a directory route's settings are checked here, before the edge
+        // sees them.
+
+        let fallback_app = route
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.app.as_deref());
+        let known_app =
+            |app: &str| document.app.contains_key(app) || stored_apps.iter().any(|a| a == app);
+
+        match (&route.static_dir, route.app.is_empty()) {
+            (Some(_), false) => {
+                plan.errors.push(format!(
+                    "route {} {}: names both an application and a static directory",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+            (None, true) => {
+                plan.errors.push(format!(
+                    "route {} {}: names neither an application nor a static directory",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+            (Some(directory), true) => {
+                if !Path::new(directory).is_dir() {
+                    plan.errors.push(format!(
+                        "route {} {}: {directory} is not a directory",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+
+                if let Some(app) = fallback_app
+                    && !known_app(app)
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: no application named {app} for the fallback",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+
+                if let Some(text) = route
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.max_age.as_deref())
+                    && let Err(error) = muru_config::parse_duration(text)
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: cache.max_age: {error}",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+
+                if let Some(case) = route.case.as_deref()
+                    && !["strict", "insensitive"].contains(&case)
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: case must be strict or insensitive, not {case:?}",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+            }
+            (None, false) => {
+                if !known_app(&route.app) {
+                    plan.errors.push(format!(
+                        "route {} {}: no application named {}",
+                        route.host, route.path, route.app
+                    ));
+                    valid = false;
+                }
+
+                if route.fallback.is_some() || route.cache.is_some() || !route.index.is_empty() {
+                    plan.warnings.push(format!(
+                        "route {} {}: index, fallback and cache apply to static routes only",
+                        route.host, route.path
+                    ));
+                }
+            }
         }
 
         if seen.contains(&key) {
