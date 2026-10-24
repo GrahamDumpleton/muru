@@ -29,6 +29,6 @@ Also in: projects run from their `[tool.muru]` table with factories and
 interface detection, `--port auto` and the port-in-use message, the
 development defaults of section 13.1, `--print-config`, and the many-threads
 stress test of section 6.11, which the VM runs on the free-threaded build.
-Still to come from phase 1: the nightly ThreadSanitizer build of the
-extension, and the check of the exit criteria in section 14.5 against a
-real project.
+Sanitizer builds moved to the future ideas (section 20.10). Still to come
+from phase 1: the check of the exit criteria in section 14.5 against a real
+project.
