@@ -1,1 +1,0 @@
-Added `--print-config` to `muructl run`, which writes the declarative\nequivalent of the run (listeners, limits and the release) as the TOML that\n`muructl apply` will read, instead of running.\n

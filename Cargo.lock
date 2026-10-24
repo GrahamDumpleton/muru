@@ -825,11 +825,11 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "muru-common"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "muru-config"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "thiserror",
@@ -838,11 +838,11 @@ dependencies = [
 
 [[package]]
 name = "muru-controller"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "muru-dashboard"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "muru-edge"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "muru-proto"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bytes",
  "prost",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "muru-py"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bytes",
  "muru-proto",
@@ -904,15 +904,15 @@ dependencies = [
 
 [[package]]
 name = "muru-supervisor"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "muru-testkit"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "muructl"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",

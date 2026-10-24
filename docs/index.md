@@ -21,9 +21,9 @@ log and a small dashboard, and it has been tested with plain WSGI, Flask and
 Django. The daemon, releases, traffic management and ASGI are still to come.
 The [tutorial](tutorials/first-wsgi-app.md) shows what exists, the
 [design specification](project/design/index.md) describes what is being built
-and the [roadmap](project/roadmap.md) describes in what order. The published
-pre-releases on PyPI predate all of this; until the next one, Muru is built
-from source.
+and the [roadmap](project/roadmap.md) describes in what order. Pre-releases
+of the 0.1.0 line are on PyPI: `uv tool install muructl` for the command and
+`muru` in your application's environment for the runtime library.
 ```
 
 ```{admonition} A note on how Muru is built

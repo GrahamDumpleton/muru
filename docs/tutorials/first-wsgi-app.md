@@ -3,9 +3,9 @@
 ```{admonition} Status
 :class: note
 
-This tutorial covers development mode, which is what exists today. The
-install step builds Muru from source, because the pre-releases on PyPI
-predate it; that changes with the next pre-release.
+This tutorial covers development mode, which is what exists today. It uses
+the pre-releases on PyPI; while Muru has only pre-releases, pip and uv
+install the newest one without being asked for `--pre`.
 ```
 
 In about ten minutes you will serve a small WSGI application with
@@ -15,28 +15,33 @@ application fails, and try watch reload, HTTPS and the dashboard.
 ## Install
 
 Muru is two pieces: `muructl`, the command, and `muru`, the Python runtime
-library that runs inside your application's interpreter. Until a pre-release
-carries them, build both from the repository. You need a C toolchain, git,
-[rustup](https://rustup.rs), [uv](https://docs.astral.sh/uv/) and
-[just](https://github.com/casey/just); the
-[contributing guide](../project/contributing.md) has the install commands for
-macOS and Linux.
+library that runs inside your application's interpreter. Both are on PyPI,
+with wheels for Linux and macOS on CPython 3.11 and later, including the
+free-threaded builds.
+
+Install the command once, for your user:
 
 ```
-git clone https://github.com/GrahamDumpleton/muru
-cd muru
-just bootstrap          # Rust components, Python interpreters, the dev environment
-just dev                # builds the muru extension into the repository's .venv
-cargo build -p muructl  # the command, at target/debug/muructl
+uv tool install muructl
 ```
 
-The rest of this tutorial uses the repository's virtualenv, so that the
-runtime library is importable. Put `target/debug` on your PATH, or spell
-out the path to `muructl` each time.
+(or `pipx install muructl`, or `pip install muructl` into any environment;
+it is a single binary with no Python dependencies). Then make a project
+directory with a virtualenv and the runtime library in it:
+
+```
+mkdir hello && cd hello
+uv init --bare
+uv add muru
+```
+
+With pip instead: `python -m venv .venv && .venv/bin/pip install muru`.
+`muructl` finds the interpreter in the active virtualenv or the project's
+`.venv`, so it knows where `muru` is.
 
 ## A small application
 
-Make a directory anywhere outside the repository and save this as `app.py`:
+Save this as `app.py` in the project directory:
 
 ```python
 def application(environ, start_response):
@@ -51,12 +56,11 @@ Any WSGI callable works the same way: a Flask `app`, a Django
 ## Run it
 
 ```
-muructl run app:application --python /path/to/muru/.venv/bin/python
+muructl run app:application
 ```
 
-The argument is `module:callable`. `--python` names the interpreter that has
-the runtime library; once `muru` is installed in your own virtualenv, you
-activate that and leave the flag out. The terminal shows:
+The argument is `module:callable`. If the virtualenv is somewhere else,
+`--python path/to/python` names its interpreter. The terminal shows:
 
 ```
 muru.host[12345]: preloaded app:application in 2 ms

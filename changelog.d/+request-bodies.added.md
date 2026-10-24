@@ -1,1 +1,0 @@
-Request bodies without a Content-Length are read in full at the edge so the application sees CONTENT_LENGTH, bodies over 10 MiB are refused with 413, hop-by-hop headers never reach the application, and a client sending Expect: 100-continue is told to continue only once the application starts reading, so a request it rejects first never carries its body across the link.

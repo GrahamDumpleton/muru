@@ -1,1 +1,0 @@
-Flask and Django fixture applications (`tests/fixtures/apps`, installed from the `fixtures` dependency group) run through `muructl run` in the integration suite: forms and uploads, cookies and sessions, redirects, streaming, file responses, framework error pages and application errors.

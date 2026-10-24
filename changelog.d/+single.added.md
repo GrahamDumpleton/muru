@@ -1,1 +1,0 @@
-`muructl run --single` serves in the host process with one thread and no fork, so a debugger attached to it sees the application. The hooks run there too, except pre_fork, which has no fork to precede.

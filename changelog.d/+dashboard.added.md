@@ -1,1 +1,0 @@
-`muructl run` serves a read-only dashboard on loopback (http://127.0.0.1:8081/ by default, `--dashboard` to move or switch it off): workers and their in-flight requests, requests per second and latency percentiles over the last minute, recent requests and the host and worker output, refreshed by the embedded htmx.
