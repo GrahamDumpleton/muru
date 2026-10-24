@@ -866,9 +866,14 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
     )?;
     scope.set_item(
         "server",
-        head.server
-            .as_ref()
-            .map(|peer| (peer.address.as_str(), peer.port)),
+        head.server.as_ref().map(|peer| {
+            let name = if head.server_name.is_empty() {
+                peer.address.as_str()
+            } else {
+                head.server_name.as_str()
+            };
+            (name, peer.port)
+        }),
     )?;
     scope.set_item("state", PyDict::new(py))?;
 

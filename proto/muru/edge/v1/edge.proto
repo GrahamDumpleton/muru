@@ -3,9 +3,11 @@
 // listener sockets and pushes routing snapshots over the edge's control
 // socket. Internal; messages change additively within a major version.
 //
-// First slice: a snapshot is the list of worker sockets of the release that
-// serves. Virtual hosts, routes, certificates and the rest of section 4.4
-// are added as their features land.
+// A snapshot carries the virtual hosts with their certificates, the routes
+// and the worker sockets of each application's serving release (section
+// 4.4). Without hosts, every request goes to the default worker sockets.
+// Traffic policies, upstreams and the rest of section 4.4 are added as
+// their features land.
 
 syntax = "proto3";
 
@@ -23,7 +25,36 @@ service EdgeControl {
 
 message Snapshot {
   uint64 version = 1;
-  repeated string worker_sockets = 2;
+  repeated string worker_sockets = 2;   // where requests go when no host is declared
+  repeated Host hosts = 3;
+  repeated Route routes = 4;
+  repeated AppWorkers apps = 5;
+}
+
+// A virtual host (section 4.3).
+message Host {
+  string name = 1;
+  repeated string names = 2;            // exact names and *.wildcards, normalised
+  repeated string listeners = 3;        // listener addresses it answers on; all when empty
+  string certificate_pem = 4;           // the chain, when the host has TLS
+  string key_pem = 5;
+  bool https_redirect = 6;              // plain HTTP requests are redirected to HTTPS
+  string canonical = 7;
+  bool use_canonical_name = 8;          // SERVER_NAME is the canonical name
+  bool default = 9;                     // answers requests whose host matches no host
+}
+
+// A route (section 4.5): a path prefix of a host to an application.
+message Route {
+  string host = 1;
+  string path = 2;
+  string app = 3;
+}
+
+// The worker sockets of an application's serving release.
+message AppWorkers {
+  string app = 1;
+  repeated string sockets = 2;
 }
 
 message Applied {
@@ -34,8 +65,14 @@ message EdgeStatusRequest {}
 
 message EdgeStatus {
   uint32 pid = 1;
-  string listen = 2;
+  string listen = 2;                    // the first listener
   uint64 snapshot_version = 3;
+  repeated Listener listeners = 4;
+}
+
+message Listener {
+  string address = 1;
+  bool tls = 2;
 }
 
 message StopRequest {}

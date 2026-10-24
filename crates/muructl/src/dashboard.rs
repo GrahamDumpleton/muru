@@ -91,6 +91,7 @@ fn collect(inputs: &Inputs) -> Data {
     let workers: Vec<Worker> = inputs
         .pools
         .current()
+        .default_pool()
         .workers()
         .into_iter()
         .map(|worker| Worker {

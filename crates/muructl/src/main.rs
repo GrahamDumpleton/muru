@@ -71,6 +71,18 @@ enum Command {
         command: admin::ReleaseCommand,
     },
 
+    /// Manage virtual hosts.
+    Host {
+        #[command(subcommand)]
+        command: admin::HostCommand,
+    },
+
+    /// Manage routes.
+    Route {
+        #[command(subcommand)]
+        command: admin::RouteCommand,
+    },
+
     /// Restore traffic to an application's previous release.
     Rollback {
         /// The application.
@@ -465,6 +477,12 @@ fn main() -> anyhow::Result<()> {
                 } => admin::release_wait(release, states, timeout, socket).await,
             }
         }),
+        Command::Host {
+            command: admin::HostCommand::List { socket },
+        } => runtime.block_on(admin::host_list(socket)),
+        Command::Route {
+            command: admin::RouteCommand::List { socket },
+        } => runtime.block_on(admin::route_list(socket)),
         Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
@@ -754,6 +772,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
                 release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
             },
         )]),
+        ..Document::default()
     };
     let text = document.to_toml().context("writing the configuration")?;
     Ok(format!(
@@ -937,7 +956,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // The workers said in HELLO what they are and how much they take at
     // once, which is also what the edge dispatches by.
 
-    let capacity = match edge.pools().current().workers().first() {
+    let capacity = match edge.pools().current().default_pool().workers().first() {
         Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
         Some(worker) => format!("{} threads", worker.slots),
         None => format!("{} threads", resolved.threads),

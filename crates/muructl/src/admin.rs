@@ -132,8 +132,8 @@ pub enum DaemonCommand {
 /// What `daemon run` and `daemon start` take.
 #[derive(Args, Clone)]
 pub struct DaemonRunArgs {
-    /// The address to serve HTTP on (default 127.0.0.1:8080, or the
-    /// first listener in the configuration file).
+    /// Serve plain HTTP on this address alone, instead of the [[listener]]
+    /// entries of the configuration file (default 127.0.0.1:8080).
     #[arg(long, value_name = "ADDRESS")]
     listen: Option<SocketAddr>,
 
@@ -145,9 +145,9 @@ pub struct DaemonRunArgs {
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve();
     let document = read_config(&locations.config.path)?;
-    let listen = match args.listen {
-        Some(listen) => listen,
-        None => first_listener(&document)?,
+    let listeners = match args.listen {
+        Some(listen) => vec![(listen, false)],
+        None => listeners_from(&document)?,
     };
     let limits = limits_from(&document)?;
 
@@ -173,7 +173,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     }
     muru_controller::daemon::run(muru_controller::daemon::Config {
         locations,
-        listen,
+        listeners,
         limits,
         access_log,
         executable: std::env::current_exe().context("finding the muructl executable")?,
@@ -297,7 +297,7 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
 
     println!("daemon   pid {} version {}", status.pid, status.version);
     println!("edge     pid {}", status.edge_pid);
-    println!("serving  {}", status.listeners.join(" and "));
+    println!("serving  {}", status.listeners.join(", "));
     println!("socket   {}", status.socket);
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
@@ -464,6 +464,83 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             or_dash(&app.current_release),
             or_dash(&app.previous_release)
         );
+    }
+    Ok(())
+}
+
+/// The virtual host subcommands.
+#[derive(Subcommand)]
+pub enum HostCommand {
+    /// List the virtual hosts.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// List virtual hosts.
+pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let hosts = client
+        .list_hosts(pb::ListHostsRequest {})
+        .await?
+        .into_inner()
+        .hosts;
+
+    if hosts.is_empty() {
+        println!("no virtual hosts");
+        return Ok(());
+    }
+    println!("{:<16} {:<8} {:<10} NAMES", "HOST", "TLS", "LISTENERS");
+    for host in hosts {
+        let mut names = host.names.join(", ");
+        if host.default {
+            names.push_str(if names.is_empty() {
+                "(default)"
+            } else {
+                " (default)"
+            });
+        }
+        println!(
+            "{:<16} {:<8} {:<10} {names}",
+            host.name,
+            if host.tls { "yes" } else { "" },
+            if host.listeners.is_empty() {
+                "all".to_owned()
+            } else {
+                host.listeners.join(",")
+            }
+        );
+    }
+    Ok(())
+}
+
+/// The route subcommands.
+#[derive(Subcommand)]
+pub enum RouteCommand {
+    /// List the routes.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// List routes.
+pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let routes = client
+        .list_routes(pb::ListRoutesRequest {})
+        .await?
+        .into_inner()
+        .routes;
+
+    if routes.is_empty() {
+        println!("no routes");
+        return Ok(());
+    }
+    println!("{:<16} {:<24} APP", "HOST", "PATH");
+    for route in routes {
+        println!("{:<16} {:<24} {}", route.host, route.path, route.app);
     }
     Ok(())
 }
@@ -778,13 +855,24 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let absolute = |path: &str| {
+            if Path::new(path).is_relative() {
+                base.join(path).display().to_string()
+            } else {
+                path.to_owned()
+            }
+        };
         for app in parsed.app.values_mut() {
             for release in app.release.values_mut() {
-                if let Some(source) = &release.source
-                    && Path::new(source).is_relative()
-                {
-                    release.source = Some(base.join(source).display().to_string());
+                if let Some(source) = &release.source {
+                    release.source = Some(absolute(source));
                 }
+            }
+        }
+        for host in parsed.host.values_mut() {
+            if let Some(tls) = &mut host.tls {
+                tls.certificate = absolute(&tls.certificate);
+                tls.key = absolute(&tls.key);
             }
         }
 
@@ -805,7 +893,7 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
         }
     } else if report.changes.is_empty() {
         println!(
-            "muru: no changes ({} release{} as declared)",
+            "muru: no changes ({} object{} as declared)",
             report.unchanged,
             if report.unchanged == 1 { "" } else { "s" }
         );
@@ -830,7 +918,7 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
         }
         if report.unchanged > 0 {
             println!(
-                "  {} release{} as declared",
+                "  {} object{} as declared",
                 report.unchanged,
                 if report.unchanged == 1 { "" } else { "s" }
             );
@@ -969,14 +1057,21 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn first_listener(document: &muru_config::Document) -> anyhow::Result<SocketAddr> {
-    match document.listener.first() {
-        Some(listener) => listener
+/// The listeners of the configuration file, or plain HTTP on 127.0.0.1:8080.
+fn listeners_from(document: &muru_config::Document) -> anyhow::Result<Vec<(SocketAddr, bool)>> {
+    if document.listener.is_empty() {
+        return Ok(vec![("127.0.0.1:8080".parse()?, false)]);
+    }
+
+    let mut listeners = Vec::new();
+    for listener in &document.listener {
+        let address = listener
             .address
             .parse()
-            .with_context(|| format!("listener address {:?}", listener.address)),
-        None => Ok("127.0.0.1:8080".parse()?),
+            .with_context(|| format!("listener address {:?}", listener.address))?;
+        listeners.push((address, listener.tls));
     }
+    Ok(listeners)
 }
 
 /// The edge limits from the [limits] table, with the defaults for the rest.

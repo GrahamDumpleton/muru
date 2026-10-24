@@ -27,9 +27,10 @@ pub enum EdgeCommand {
 /// What the daemon starts an edge with.
 #[derive(Args)]
 pub struct EdgeRunArgs {
-    /// The file descriptor of the bound, listening HTTP socket.
-    #[arg(long, value_name = "FD")]
-    listener_fd: i32,
+    /// A bound, listening socket as its file descriptor, with :tls when
+    /// the edge terminates TLS on it. The first is the main listener.
+    #[arg(long = "listener", value_name = "FD[:tls]", required = true, value_parser = parse_listener)]
+    listeners: Vec<(i32, bool)>,
 
     /// The Unix socket to serve the control protocol on.
     #[arg(long, value_name = "PATH")]
@@ -93,18 +94,48 @@ impl EdgeRunArgs {
     }
 }
 
-/// Run the edge until the daemon tells it to stop or the listener fails.
-pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
-    // The listener was bound by the daemon and inherited across exec.
-    // SAFETY: the daemon passed this descriptor for the edge to own, and
-    // nothing else in this process refers to it.
+/// Parse FD or FD:tls.
+fn parse_listener(text: &str) -> Result<(i32, bool), String> {
+    let (fd, tls) = match text.split_once(':') {
+        Some((fd, "tls")) => (fd, true),
+        Some((_, other)) => return Err(format!("{other:?} is not tls")),
+        None => (text, false),
+    };
+    let fd: i32 = fd
+        .parse()
+        .map_err(|_| format!("{text:?} is not a file descriptor number"))?;
 
-    let listener = unsafe { std::net::TcpListener::from_raw_fd(args.listener_fd) };
-    let listen = listener
-        .local_addr()
-        .context("the inherited listener has no address")?;
+    Ok((fd, tls))
+}
+
+/// Run the edge until the daemon tells it to stop or a listener fails.
+pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
+    // The listeners were bound by the daemon and inherited across exec.
+
+    let mut inherited = Vec::new();
+    for (fd, tls) in &args.listeners {
+        // SAFETY: the daemon passed this descriptor for the edge to own,
+        // and nothing else in this process refers to it.
+
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(*fd) };
+        listener
+            .local_addr()
+            .with_context(|| format!("the inherited listener {fd} has no address"))?;
+        inherited.push(muru_edge::Inherited {
+            listener,
+            tls: *tls,
+        });
+    }
+    let listen = inherited[0].listener.local_addr()?;
+
     let handing_back = match &args.listener_socket {
-        Some(path) => Some(hand_back_listener(path, listener.try_clone()?)?),
+        Some(path) => {
+            let copies = inherited
+                .iter()
+                .map(|inherited| inherited.listener.try_clone())
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(hand_back_listeners(path, copies)?)
+        }
         None => None,
     };
     let access_log = muru_edge::access::Config {
@@ -115,6 +146,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         ..muru_edge::access::Config::default()
     };
 
+    let resolver = Arc::new(muru_edge::tls::Resolver::default());
     let edge = muru_edge::Edge::adopt(
         muru_edge::Config {
             listen,
@@ -124,10 +156,12 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             limits: args.limits(),
             https: None,
         },
-        listener,
+        inherited,
+        Arc::clone(&resolver),
     )
     .await?;
     let pools = edge.pools();
+    let listeners = edge.listeners();
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // The control socket, on which the daemon pushes snapshots.
@@ -138,7 +172,8 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(control);
     let service = EdgeControlServer::new(Control {
         pools,
-        listen,
+        resolver,
+        listeners,
         version: AtomicU64::new(0),
         stop: stop_tx,
     });
@@ -169,10 +204,11 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
 }
 
 /// Serve the listener-return socket: each connection receives a copy of
-/// the listening socket over SCM_RIGHTS.
-fn hand_back_listener(
+/// every listening socket over SCM_RIGHTS, in order, then the connection
+/// closes.
+fn hand_back_listeners(
     path: &std::path::Path,
-    listener: std::net::TcpListener,
+    listeners: Vec<std::net::TcpListener>,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     let _ = std::fs::remove_file(path);
     let socket = std::os::unix::net::UnixListener::bind(path)
@@ -180,7 +216,11 @@ fn hand_back_listener(
 
     Ok(std::thread::spawn(move || {
         for connection in socket.incoming().flatten() {
-            let _ = muru_controller::fdpass::send_fd(&connection, listener.as_raw_fd());
+            for listener in &listeners {
+                if muru_controller::fdpass::send_fd(&connection, listener.as_raw_fd()).is_err() {
+                    break;
+                }
+            }
         }
     }))
 }
@@ -188,7 +228,8 @@ fn hand_back_listener(
 /// The control service: snapshots in, status out.
 struct Control {
     pools: Arc<muru_edge::Pools>,
-    listen: SocketAddr,
+    resolver: Arc<muru_edge::tls::Resolver>,
+    listeners: Vec<(SocketAddr, bool)>,
     version: AtomicU64,
     stop: tokio::sync::mpsc::Sender<()>,
 }
@@ -197,15 +238,34 @@ struct Control {
 impl EdgeControl for Control {
     async fn apply(&self, request: Request<pb::Snapshot>) -> Result<Response<pb::Applied>, Status> {
         let snapshot = request.into_inner();
-        let sockets: Vec<PathBuf> = snapshot.worker_sockets.iter().map(PathBuf::from).collect();
 
-        // The new pool is connected before it replaces the old one, so a
-        // snapshot that cannot be reached leaves the last good one serving.
+        // The tables are built and every worker connected before anything
+        // replaces the last good snapshot, and so are the certificates.
 
-        let pool = muru_edge::link::LinkPool::connect(&sockets)
+        let routing = muru_edge::routing::Routing::from_snapshot(&snapshot)
             .await
             .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
-        self.pools.replace(pool);
+        let mut certificates = Vec::new();
+        for host in &snapshot.hosts {
+            if host.certificate_pem.is_empty() {
+                continue;
+            }
+            let (chain, key) = muru_edge::tls::parse_pem(&host.certificate_pem, &host.key_pem)
+                .map_err(|error| {
+                    Status::failed_precondition(format!("host {}: {error:#}", host.name))
+                })?;
+            let key = muru_edge::tls::certified_key(chain, key).map_err(|error| {
+                Status::failed_precondition(format!("host {}: {error:#}", host.name))
+            })?;
+            certificates.push(muru_edge::tls::HostCertificate {
+                names: host.names.clone(),
+                key,
+                default: host.default,
+            });
+        }
+
+        self.resolver.replace(certificates);
+        self.pools.apply(routing);
         self.version.store(snapshot.version, Ordering::Relaxed);
         Ok(Response::new(pb::Applied {
             version: snapshot.version,
@@ -218,8 +278,16 @@ impl EdgeControl for Control {
     ) -> Result<Response<pb::EdgeStatus>, Status> {
         Ok(Response::new(pb::EdgeStatus {
             pid: std::process::id(),
-            listen: self.listen.to_string(),
+            listen: self.listeners[0].0.to_string(),
             snapshot_version: self.version.load(Ordering::Relaxed),
+            listeners: self
+                .listeners
+                .iter()
+                .map(|(address, tls)| pb::Listener {
+                    address: address.to_string(),
+                    tls: *tls,
+                })
+                .collect(),
         }))
     }
 

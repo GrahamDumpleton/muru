@@ -61,7 +61,7 @@ def test_apply_deploys_declared_releases_and_is_idempotent(daemon: Daemon, tmp_p
 
     again = apply(daemon, config)
     assert again.returncode == 0, again.stdout + again.stderr
-    assert again.stdout.strip() == "muru: no changes (1 release as declared)"
+    assert again.stdout.strip() == "muru: no changes (1 object as declared)"
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
 
 
@@ -77,7 +77,7 @@ def test_dry_run_plans_without_changing_anything(daemon: Daemon, tmp_path: Path)
     assert lines[0] == "muru: plan (nothing changed)"
     assert lines[1].split()[:2] == ["deploy", "shop@r2"]
     assert "shop.wsgi:application 2x1" in lines[1]
-    assert lines[2].strip() == "1 release as declared"
+    assert lines[2].strip() == "1 object as declared"
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
 
     # The JSON report says the same.
@@ -109,7 +109,7 @@ def test_prune_removes_what_the_files_no_longer_contain(daemon: Daemon, tmp_path
 
     config.write_text(release("shop", "r2"))
     kept = apply(daemon, config)
-    assert kept.stdout.strip() == "muru: no changes (1 release as declared)"
+    assert kept.stdout.strip() == "muru: no changes (1 object as declared)"
     assert [row["release"] for row in daemon.releases("shop")] == ["shop@r2", "shop@r1"]
 
     pruned = apply(daemon, config, "--prune")
@@ -149,7 +149,7 @@ def test_export_applies_back_without_changes(daemon: Daemon, tmp_path: Path) -> 
 
     config = tmp_path / "export.toml"
     config.write_text(exported)
-    assert apply(daemon, config).stdout.strip() == "muru: no changes (1 release as declared)"
+    assert apply(daemon, config).stdout.strip() == "muru: no changes (1 object as declared)"
     assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
 
     # By default only the serving release is written; --all-releases

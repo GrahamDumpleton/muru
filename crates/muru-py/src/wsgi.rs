@@ -645,9 +645,18 @@ fn build_environ<'py>(
         head.http_version.as_str()
     };
     environ.set_item(intern!(py, "SERVER_PROTOCOL"), protocol)?;
+
+    // Section 4.3: SERVER_NAME is the virtual host matched, else the
+    // listener's address.
+
     match &head.server {
         Some(server) => {
-            environ.set_item(intern!(py, "SERVER_NAME"), &server.address)?;
+            let name = if head.server_name.is_empty() {
+                server.address.as_str()
+            } else {
+                head.server_name.as_str()
+            };
+            environ.set_item(intern!(py, "SERVER_NAME"), name)?;
             environ.set_item(intern!(py, "SERVER_PORT"), server.port.to_string())?;
         }
         None => {

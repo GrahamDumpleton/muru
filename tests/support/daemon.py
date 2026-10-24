@@ -9,6 +9,8 @@ what the first left running.
 from __future__ import annotations
 
 import http.client
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,7 @@ class Daemon:
     base: Path
     run_dir: Path
     log_path: Path
+    listeners: list[tuple[int, bool]]
 
     def muructl(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         """Run a muructl command against this daemon."""
@@ -60,13 +63,43 @@ class Daemon:
         return completed.stdout.strip()
 
     def get(self, path: str = "/") -> support.Response:
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        return self.request(path)
+
+    def request(
+        self,
+        path: str = "/",
+        host: str | None = None,
+        port: int | None = None,
+        cafile: Path | None = None,
+        server_hostname: str | None = None,
+    ) -> support.Response:
+        """One request, with a Host header and, given a CA file, over TLS.
+
+        The TLS connection carries `server_hostname` (else `host`) as SNI
+        and the certificate is checked against it.
+        """
+
+        port = port or self.port
+        headers = {"Host": host} if host else {}
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        if cafile is not None:
+            context = ssl.create_default_context(cafile=cafile)
+            connection.sock = context.wrap_socket(
+                socket.create_connection(("127.0.0.1", port), timeout=30),
+                server_hostname=server_hostname or host or "localhost",
+            )
         try:
-            connection.request("GET", path)
+            connection.request("GET", path, headers=headers)
             raw = connection.getresponse()
             return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
         finally:
             connection.close()
+
+    @property
+    def https_port(self) -> int | None:
+        """The first TLS listener's port, when the daemon has one."""
+
+        return next((port for port, tls in self.listeners if tls), None)
 
     def releases(self, app: str = "") -> list[dict[str, str]]:
         """The release table as muructl prints it, parsed by column."""
@@ -113,11 +146,18 @@ class Daemon:
                 )
 
 
-def start_daemon(base: Path, run_dir: Path | None = None, port: int | None = None) -> Daemon:
+def start_daemon(
+    base: Path,
+    run_dir: Path | None = None,
+    port: int | None = None,
+    listeners: list[tuple[int, bool]] | None = None,
+) -> Daemon:
     """Start a daemon in the foreground with directories under `base`.
 
-    A second daemon over the same `run_dir` and `port` re-adopts what the
-    first left running.
+    With `listeners`, pairs of port and whether it carries TLS, the daemon
+    reads them from a configuration file written under `base`; otherwise
+    it serves plain HTTP on `port`. A second daemon over the same
+    `run_dir` and listeners re-adopts what the first left running.
     """
 
     muructl = support.muructl_path()
@@ -131,7 +171,20 @@ def start_daemon(base: Path, run_dir: Path | None = None, port: int | None = Non
     # deep temporary directory.
 
     run_dir = run_dir or Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
-    port = port or support.free_port()
+    if listeners is None:
+        port = port or support.free_port()
+        listeners = [(port, False)]
+        where = ["--listen", f"127.0.0.1:{port}"]
+    else:
+        port = listeners[0][0]
+        config = base / "muru.toml"
+        config.write_text(
+            "".join(
+                f"[[listener]]\naddress = '127.0.0.1:{port}'\n" + ("tls = true\n" if tls else "")
+                for port, tls in listeners
+            )
+        )
+        where = ["--config", str(config)]
     log_path = base / "daemon.out"
     with log_path.open("ab") as handle:
         process = subprocess.Popen(
@@ -145,13 +198,12 @@ def start_daemon(base: Path, run_dir: Path | None = None, port: int | None = Non
                 str(run_dir),
                 "--log-dir",
                 str(base / "logs"),
-                "--listen",
-                f"127.0.0.1:{port}",
+                *where,
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,
         )
-    daemon = Daemon(process, port, base, run_dir, log_path)
+    daemon = Daemon(process, port, base, run_dir, log_path, listeners)
 
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:

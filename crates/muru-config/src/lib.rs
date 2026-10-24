@@ -256,15 +256,76 @@ pub struct Limits {
     pub response_idle_timeout: Option<String>,
 }
 
-/// A listener, one of the `[[listener]]` entries (appendix C).
+/// A listener, one of the `[[listener]]` entries (appendix C), in the
+/// daemon's own file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     /// The address, as IP:PORT.
     pub address: String,
-    /// Whether TLS is terminated on it.
+    /// Whether TLS is terminated on it, with the certificates of the
+    /// virtual hosts it serves, chosen by SNI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tls: bool,
+}
+
+/// A virtual host, the `[host.NAME]` table (section 4.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Host {
+    /// The names it answers to: exact names, or `*.example.com` for one
+    /// label. Compared case-insensitively, without a port or trailing dot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    /// The listener addresses it answers on; every listener when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listeners: Vec<String>,
+    /// Its certificate and key, for TLS listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<HostTls>,
+    /// The name the host is known by, for `use_canonical_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<String>,
+    /// Redirect plain HTTP requests to HTTPS.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub https_redirect: bool,
+    /// Give the application the canonical name as SERVER_NAME rather than
+    /// the name matched.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_canonical_name: bool,
+    /// Answer requests whose host matches no virtual host, which are
+    /// otherwise refused with 421.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+}
+
+/// A virtual host's certificate chain and private key, as PEM files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostTls {
+    /// The certificate chain, leaf first. A relative path is taken from
+    /// the file's directory.
+    pub certificate: String,
+    /// The private key.
+    pub key: String,
+}
+
+/// A route, one of the `[[route]]` entries (section 4.5): a path prefix
+/// of a virtual host to an application.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    /// The virtual host.
+    pub host: String,
+    /// The path prefix, `/` for everything. The longest prefix wins.
+    #[serde(default = "root_path")]
+    pub path: String,
+    /// The application whose serving release takes the requests.
+    pub app: String,
+}
+
+fn root_path() -> String {
+    "/".to_owned()
 }
 
 /// An application's table and its releases.
@@ -289,6 +350,12 @@ pub struct Document {
     /// Limits in force everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Limits>,
+    /// Virtual hosts by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host: BTreeMap<String, Host>,
+    /// Routes, in the order written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route: Vec<Route>,
     /// Applications by name.
     #[serde(default)]
     pub app: BTreeMap<String, App>,
@@ -306,13 +373,22 @@ impl Document {
         toml::from_str(text).map_err(|error| error.to_string())
     }
 
-    /// Fold another document into this one: its listeners are appended,
-    /// its limits replace these when given, and its applications and
-    /// releases are added. A release declared in both is an error.
+    /// Fold another document into this one: its listeners and routes are
+    /// appended, its limits replace these when given, and its hosts,
+    /// applications and releases are added. A host or a release declared
+    /// in both is an error.
     pub fn merge(&mut self, other: Document) -> Result<(), String> {
         self.listener.extend(other.listener);
+        self.route.extend(other.route);
         if other.limits.is_some() {
             self.limits = other.limits;
+        }
+
+        for (name, host) in other.host {
+            if self.host.contains_key(&name) {
+                return Err(format!("host {name} is declared twice"));
+            }
+            self.host.insert(name, host);
         }
 
         for (name, app) in other.app {
@@ -513,8 +589,30 @@ mod tests {
                 )]),
             },
         );
+        document.host.insert(
+            "shop".to_owned(),
+            Host {
+                names: vec![
+                    "shop.example.com".to_owned(),
+                    "*.shop.example.com".to_owned(),
+                ],
+                tls: Some(HostTls {
+                    certificate: "certs/shop.pem".to_owned(),
+                    key: "certs/shop-key.pem".to_owned(),
+                }),
+                https_redirect: true,
+                ..Host::default()
+            },
+        );
+        document.route.push(Route {
+            host: "shop".to_owned(),
+            path: "/".to_owned(),
+            app: "shop".to_owned(),
+        });
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
+        assert!(text.contains("[host.shop]"), "{text}");
+        assert!(text.contains("[[route]]"), "{text}");
         assert!(
             text.contains("entrypoint = \"shop.wsgi:application\""),
             "{text}"
@@ -537,6 +635,12 @@ mod tests {
         let again = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
         let error = first.merge(again).unwrap_err();
         assert_eq!(error, "release shop@r2 is declared twice");
+
+        let routed = Document::parse("[[route]]\nhost = 'shop'\napp = 'shop'\n").unwrap();
+        assert_eq!(routed.route[0].path, "/", "the path defaults to the root");
+        first.merge(routed.clone()).unwrap();
+        first.merge(routed).unwrap();
+        assert_eq!(first.route.len(), 2, "routes accumulate");
     }
 
     #[test]

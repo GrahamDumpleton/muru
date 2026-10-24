@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use muru_proto::edge::v1 as pb;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::edges::{EdgeProcess, EdgeSpec};
@@ -42,8 +43,9 @@ pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 pub struct Config {
     /// Where everything lives.
     pub locations: Locations,
-    /// The HTTP listener.
-    pub listen: SocketAddr,
+    /// The listeners, each with whether it carries TLS; the first is the
+    /// main one.
+    pub listeners: Vec<(SocketAddr, bool)>,
     /// Timeouts and limits for the edge.
     pub limits: muru_edge::Limits,
     /// Where the edge writes the access log, or none.
@@ -85,6 +87,11 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
+    /// Push a fresh snapshot: the hosts or routes changed.
+    Reconfigure {
+        /// Where the acknowledgement goes.
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Stop the daemon: detaching, with hosts and the edge left serving
     /// for the next daemon to re-adopt, or draining everything first.
     Shutdown {
@@ -102,6 +109,15 @@ struct EdgeRecord {
     pid: u32,
     control: PathBuf,
     listener_socket: PathBuf,
+    #[serde(default)]
+    listeners: Vec<ListenerRecord>,
+}
+
+/// One of the edge's listeners, for re-adoption.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ListenerRecord {
+    address: SocketAddr,
+    tls: bool,
 }
 
 /// What a previous daemon left behind about a release's host, in the
@@ -129,8 +145,8 @@ pub struct Handle {
 pub struct Info {
     /// Where everything lives.
     pub locations: Locations,
-    /// The address the edge serves.
-    pub listen: SocketAddr,
+    /// The addresses the edge serves, each with whether it carries TLS.
+    pub listeners: Vec<(SocketAddr, bool)>,
     /// When the daemon started, Unix milliseconds.
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
@@ -154,6 +170,12 @@ struct Daemon {
     info: Arc<Info>,
     logs: Logs,
     running: HashMap<(String, String), Running>,
+    /// The release each application's traffic goes to, as the edge has
+    /// been told; the store catches up once a switch has happened.
+    serving: HashMap<String, String>,
+    /// The application whose workers take requests when no host is
+    /// declared: the last one traffic was switched to.
+    default_app: Option<String>,
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -183,6 +205,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.executable.clone(),
             record.control,
             record.listener_socket,
+            record
+                .listeners
+                .iter()
+                .map(|listener| listener.tls)
+                .collect(),
             edge_log.clone(),
             config.access_log.clone(),
             config.limits.clone(),
@@ -198,11 +225,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             edge
         }
         None => {
-            let listener = std::net::TcpListener::bind(config.listen)
-                .with_context(|| format!("cannot listen on {}", config.listen))?;
+            anyhow::ensure!(!config.listeners.is_empty(), "no listener to serve on");
+            let mut listeners = Vec::new();
+            for (address, tls) in &config.listeners {
+                let socket = std::net::TcpListener::bind(address)
+                    .with_context(|| format!("cannot listen on {address}"))?;
+                listeners.push(crate::edges::Listener { socket, tls: *tls });
+            }
             EdgeProcess::spawn(EdgeSpec {
                 executable: config.executable,
-                listener,
+                listeners,
                 control,
                 listener_socket,
                 log: edge_log,
@@ -212,13 +244,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .await?
         }
     };
-    let listen = edge.listen()?;
+    let listeners = edge.listeners();
     write_record(
         &locations.run.path.join("edge.toml"),
         &EdgeRecord {
             pid: edge.pid().unwrap_or(0),
             control: edge.control().to_path_buf(),
             listener_socket: edge.listener_socket().to_path_buf(),
+            listeners: listeners
+                .iter()
+                .map(|(address, tls)| ListenerRecord {
+                    address: *address,
+                    tls: *tls,
+                })
+                .collect(),
         },
     );
 
@@ -227,7 +266,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let (commands, mut inbox) = mpsc::channel::<Command>(16);
     let info = Arc::new(Info {
         locations: locations.clone(),
-        listen,
+        listeners: listeners.clone(),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
     });
@@ -245,7 +284,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         "daemon",
         "info",
         &format!(
-            "serving on http://{listen}, admin socket {}",
+            "serving on {}, admin socket {}",
+            listeners
+                .iter()
+                .map(|(address, tls)| format!(
+                    "{}://{address}",
+                    if *tls { "https" } else { "http" }
+                ))
+                .collect::<Vec<_>>()
+                .join(" and "),
             socket.display()
         ),
     );
@@ -258,6 +305,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         info,
         logs: Logs::default(),
         running: HashMap::new(),
+        serving: HashMap::new(),
+        default_app: None,
     };
     daemon.restore().await;
 
@@ -309,6 +358,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_file(&socket);
     outcome
+}
+
+/// A host's certificate chain and key as PEM text, for the snapshot.
+fn read_pem_pair(certificate: &str, key: &str) -> anyhow::Result<(String, String)> {
+    let chain =
+        std::fs::read_to_string(certificate).with_context(|| format!("reading {certificate}"))?;
+    let key = std::fs::read_to_string(key).with_context(|| format!("reading {key}"))?;
+
+    Ok((chain, key))
 }
 
 /// Read a record a previous daemon wrote, if there is one it can decode.
@@ -461,6 +519,9 @@ impl Daemon {
             }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
+            }
+            Command::Reconfigure { done } => {
+                let _ = done.send(self.push_snapshot().await);
             }
             Command::Shutdown { .. } => {}
         }
@@ -630,15 +691,18 @@ impl Daemon {
         Ok(())
     }
 
-    /// Point the edge at a release's workers.
+    /// Point the edge at a release's workers: the application's serving
+    /// release in the snapshot, and the default workers when no host is
+    /// declared.
     async fn switch_to(&mut self, app: &str, id: &str) {
         let subject = format!("{app}@{id}");
-        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+        if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
             return;
-        };
+        }
 
-        let sockets = running.sockets.clone();
-        match self.edge.apply(&sockets).await {
+        self.serving.insert(app.to_owned(), id.to_owned());
+        self.default_app = Some(app.to_owned());
+        match self.push_snapshot().await {
             Ok(()) => {
                 self.events.emit(
                     "traffic.switched",
@@ -652,10 +716,106 @@ impl Daemon {
                     "release.failed",
                     &subject,
                     "error",
-                    &format!("the edge could not take the release: {error:#}"),
+                    &format!("the edge could not take the release: {error}"),
                 );
             }
         }
+    }
+
+    /// Section 4.4: desired state compiled for the edge. Each application
+    /// contributes the workers of its serving release when that release
+    /// runs; the hosts carry their certificates read from disk, so a
+    /// replaced file takes effect with the next snapshot; the default
+    /// workers are those of the application traffic was last switched to.
+    fn build_snapshot(&mut self) -> pb::Snapshot {
+        let mut apps = Vec::new();
+        let mut serving: Vec<(&String, &String)> = self.serving.iter().collect();
+        serving.sort();
+        for (name, id) in serving {
+            if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
+                apps.push(pb::AppWorkers {
+                    app: name.clone(),
+                    sockets: running
+                        .sockets
+                        .iter()
+                        .map(|socket| socket.display().to_string())
+                        .collect(),
+                });
+            }
+        }
+        if self
+            .default_app
+            .as_ref()
+            .is_some_and(|name| !apps.iter().any(|app| &app.app == name))
+        {
+            self.default_app = None;
+        }
+        let default = self
+            .default_app
+            .as_ref()
+            .and_then(|name| apps.iter().find(|app| &app.app == name))
+            .or_else(|| apps.first());
+        let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
+
+        let mut hosts = Vec::new();
+        for (name, host) in self.store.hosts().unwrap_or_default() {
+            let (certificate_pem, key_pem) = match &host.tls {
+                Some(tls) => {
+                    match read_pem_pair(&tls.certificate, &tls.key) {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            self.events.emit(
+                            "certificate.unreadable",
+                            &format!("host {name}"),
+                            "error",
+                            &format!("{error:#}; the host serves without TLS until the files are back"),
+                        );
+                            (String::new(), String::new())
+                        }
+                    }
+                }
+                None => (String::new(), String::new()),
+            };
+            hosts.push(pb::Host {
+                name,
+                names: host.names,
+                listeners: host.listeners,
+                certificate_pem,
+                key_pem,
+                https_redirect: host.https_redirect,
+                canonical: host.canonical.unwrap_or_default(),
+                use_canonical_name: host.use_canonical_name,
+                default: host.default,
+            });
+        }
+        let routes = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|route| pb::Route {
+                host: route.host,
+                path: route.path,
+                app: route.app,
+            })
+            .collect();
+
+        pb::Snapshot {
+            version: 0,
+            worker_sockets,
+            hosts,
+            routes,
+            apps,
+        }
+    }
+
+    /// Compile and push a snapshot.
+    async fn push_snapshot(&mut self) -> Result<(), String> {
+        let snapshot = self.build_snapshot();
+        self.edge
+            .apply(snapshot)
+            .await
+            .map_err(|error| format!("{error:#}"))
     }
 
     /// Section 9.5: with traffic already elsewhere, wait for the release's
@@ -796,7 +956,7 @@ impl Daemon {
             .map_err(|error| error.to_string())?;
 
         if record.current.as_deref() == Some(id) {
-            self.clear_traffic().await;
+            self.clear_traffic(app).await;
             self.store
                 .set_app_releases(app, None, Some(id))
                 .map_err(|error| error.to_string())?;
@@ -838,7 +998,7 @@ impl Daemon {
                 .as_deref()
                 == Some(id.as_str());
             if serving {
-                self.clear_traffic().await;
+                self.clear_traffic(&app).await;
                 self.events.emit(
                     "release.restarting",
                     &subject,
@@ -852,10 +1012,12 @@ impl Daemon {
         }
     }
 
-    /// Point the edge at no workers at all.
-    async fn clear_traffic(&mut self) {
-        if let Err(error) = self.edge.apply(&[]).await {
-            tracing::error!(%error, "clearing the edge's snapshot failed");
+    /// Push a snapshot without the application's workers: its serving
+    /// release has just been unset or is being restarted.
+    async fn clear_traffic(&mut self, app: &str) {
+        self.serving.remove(app);
+        if let Err(error) = self.push_snapshot().await {
+            tracing::error!(%error, "pushing the snapshot failed");
         }
     }
 
@@ -885,8 +1047,11 @@ impl Daemon {
 
     /// Stop every host, for shutdown.
     async fn stop_all(&mut self) {
-        self.clear_traffic().await;
         let running = std::mem::take(&mut self.running);
+        self.serving.clear();
+        if let Err(error) = self.push_snapshot().await {
+            tracing::error!(%error, "pushing the empty snapshot failed");
+        }
         for ((app, id), running) in running {
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopping, "the daemon is stopping");

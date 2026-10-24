@@ -6,10 +6,11 @@
 The daemon serves one or more applications on one node, each deployed
 from a source directory with the blue/green strategy, with rollback,
 drains and an event log, through an edge process of its own, and it can
-be stopped and started again without interrupting traffic. Applications
-and their releases can be declared in files and applied, exported and
-compared. What is still to come: virtual hosts and TLS, canaries, and
-the rest of the roadmap.
+be stopped and started again without interrupting traffic. Applications,
+releases, virtual hosts and routes can be declared in files and applied,
+exported and compared, and TLS listeners serve each host's certificate.
+What is still to come: canaries, worker groups, and the rest of the
+roadmap.
 ```
 
 `muructl run` is for development. For an application that stays up, start
@@ -20,7 +21,8 @@ muructl daemon start
 muructl deploy shop /srv/shop
 ```
 
-The daemon serves HTTP on 127.0.0.1:8080 unless its configuration file or
+The daemon serves HTTP on 127.0.0.1:8080 unless its configuration file
+names listeners (see [virtual hosts and TLS](virtual-hosts.md)) or
 `--listen` says otherwise, answering 503 until a release is ready. The
 first deploy creates the application and its first release; each later
 deploy creates the next release, starts it beside the one that serves,
@@ -66,7 +68,9 @@ the previous release serving and reports the failure.
 ## Declaring applications in files
 
 A file declares applications and their releases with the keys `muructl
-deploy` takes, and `muructl apply -f FILE` makes the daemon match it:
+deploy` takes, and virtual hosts and routes (see
+[virtual hosts and TLS](virtual-hosts.md)), and `muructl apply -f FILE`
+makes the daemon match it:
 
 ```toml
 [app.shop.release.r1]
@@ -96,8 +100,9 @@ name order, as one configuration.
 
 An apply creates the applications the files name, deploys each declared
 release the daemon does not have (in id order, so the last declared
-release of an application is the one that serves) and leaves a release
-that is already recorded as declared alone. Releases are immutable: a
+release of an application is the one that serves), creates or updates
+the hosts and routes, and leaves anything already recorded as declared
+alone. Releases are immutable: a
 declared release whose settings differ from the recorded ones is an
 error, and the file is applied only when it has no errors at all. Unknown
 keys, invalid names, a missing source directory and a source without an
@@ -106,8 +111,9 @@ table belong in the daemon's own configuration file; in an applied file
 they are reported as warnings and not applied.
 
 `--dry-run` prints the plan and changes nothing. `--prune` also removes
-the applications and releases the files do not contain: a running
-release drains and stops first. `--json` writes the report as JSON. The
+the routes, hosts, releases and applications the files do not contain,
+in that order: a running release drains and stops first. `--json` writes
+the report as JSON. The
 exit code is 0 when there is nothing to do or everything applied, 2 for
 a dry run with changes planned, and 1 for errors.
 
@@ -142,8 +148,9 @@ path is limited to about a hundred bytes, so a deep `--run-dir` is
 refused with a message saying so.
 
 The configuration file is optional. Its `[[listener]]` entries name the
-addresses to serve and its `[limits]` table sets the body size limit and
-timeouts, with the same keys `muructl run --print-config` writes.
+addresses to serve, each with `tls = true` when the edge terminates TLS
+on it, and its `[limits]` table sets the body size limit and timeouts,
+with the same keys `muructl run --print-config` writes.
 
 ## Running it
 
@@ -153,7 +160,7 @@ up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
 listener and its locations.
 
-The daemon binds the listening socket itself and hands it to an edge
+The daemon binds the listening sockets itself and hands them to an edge
 process started from the same executable, which carries the traffic;
 the daemon is never on the request path. If the edge exits, the daemon
 starts another on the same socket with the same routing, and connections

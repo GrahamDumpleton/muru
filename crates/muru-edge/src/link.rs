@@ -401,6 +401,9 @@ pub struct Context<'a> {
     pub access_log: Arc<AccessLog>,
     /// The timeouts in force.
     pub limits: Arc<Limits>,
+    /// The virtual host name the application sees as SERVER_NAME, when a
+    /// host matched (section 4.3).
+    pub server_name: Option<String>,
 }
 
 /// The access log record of a request in progress.
@@ -448,6 +451,26 @@ impl Recording {
 /// Answer a plain HTTP request with a redirect to the HTTPS listener
 /// (--https-only, section 13.1). 307 keeps the method and is never cached,
 /// so a later run without TLS on the same port is unaffected.
+/// Answer a request the routing tables refuse (421 or 404), recording it
+/// in the access log like any other edge-generated response.
+pub(crate) fn reject(
+    request: http::Request<Incoming>,
+    context: &Context<'_>,
+    problem: Problem,
+) -> Response<ResponseBody> {
+    let (parts, _body) = request.into_parts();
+    let recording = Recording::new(context, &parts);
+    let failing = Failing {
+        request_id: context.request_id,
+        max_body_size: context.limits.max_body_size,
+        negotiation: Negotiation::from_headers(&parts.headers, context.development),
+        version: parts.version,
+        recording: Mutex::new(Some(recording)),
+    };
+
+    failing.respond(problem)
+}
+
 pub(crate) fn redirect_to_https(
     request: http::Request<Incoming>,
     context: &Context<'_>,
@@ -459,7 +482,7 @@ pub(crate) fn redirect_to_https(
         .headers
         .get(http::header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(host_only)
+        .map(crate::routing::host_only)
         .or_else(|| parts.uri.host().map(str::to_owned))
         .unwrap_or_else(|| match to.ip() {
             std::net::IpAddr::V4(ip) => ip.to_string(),
@@ -488,23 +511,6 @@ pub(crate) fn redirect_to_https(
 
 /// A Host header value without its port: `shop.localhost:8080` becomes
 /// `shop.localhost` and `[::1]:8080` becomes `[::1]`.
-fn host_only(host: &str) -> String {
-    let host = host.trim();
-    if host.starts_with('[') {
-        return match host.find(']') {
-            Some(end) => host[..=end].to_owned(),
-            None => host.to_owned(),
-        };
-    }
-    match host.rsplit_once(':') {
-        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
-            name.to_owned()
-        }
-        _ => host.to_owned(),
-    }
-}
-
-/// Forward one request to a worker over the framed link.
 pub async fn handle(
     request: http::Request<Incoming>,
     pool: Arc<LinkPool>,
@@ -1124,19 +1130,5 @@ async fn discard(mut body: Incoming) {
                 return;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::host_only;
-
-    #[test]
-    fn host_only_strips_ports_and_keeps_ipv6_brackets() {
-        assert_eq!(host_only("shop.localhost:8080"), "shop.localhost");
-        assert_eq!(host_only("localhost"), "localhost");
-        assert_eq!(host_only("[::1]:8080"), "[::1]");
-        assert_eq!(host_only("[::1]"), "[::1]");
-        assert_eq!(host_only("127.0.0.1:8080 "), "127.0.0.1");
     }
 }

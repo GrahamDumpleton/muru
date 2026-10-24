@@ -48,6 +48,12 @@ for an instant rollback (whole, until the host control socket brings the
 warm floor of section 9.1). Declarative configuration has its first
 slice: `muructl apply -f` with dry runs and prune, `config export` and
 `config diff` over the ApplyConfig, ExportConfig and DiffConfig
-operations of appendix B, for applications and releases (listeners and
-limits stay in the daemon's own file until virtual hosts arrive). Next
-from phase 2: virtual hosts and TLS.
+operations of appendix B, for applications, releases, virtual hosts and
+routes (listeners and limits stay in the daemon's own file). Virtual
+hosts and TLS are in: several listeners handed to the edge, hosts with
+exact and single-label wildcard names and a default host (421
+otherwise), path-prefix routes to applications, certificates carried in
+the snapshot and chosen by SNI, HTTPS redirects, and SERVER_NAME from
+the matched name (regular expression names, host-level settings and
+trusted proxies later). Next from phase 2: trusted proxies, worker
+groups and mounts, and the metrics and logs.

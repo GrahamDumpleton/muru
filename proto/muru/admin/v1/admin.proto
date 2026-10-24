@@ -40,6 +40,10 @@ service Admin {
   // Stop the daemon: detaching by default, or draining everything first.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 
+  // Virtual hosts and routes (sections 4.3 and 4.5), as applied.
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+
   // Declarative configuration (section 10.4): apply a document, compare
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
@@ -227,4 +231,34 @@ message ExportConfigResponse {
   string node = 3;                  // the host name
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
+}
+
+message ListHostsRequest {}
+
+message ListHostsResponse {
+  repeated Host hosts = 1;
+}
+
+message Host {
+  string name = 1;
+  repeated string names = 2;
+  repeated string listeners = 3;      // every listener when empty
+  bool tls = 4;                       // has a certificate
+  string certificate = 5;             // the certificate file
+  string canonical = 6;
+  bool https_redirect = 7;
+  bool use_canonical_name = 8;
+  bool default = 9;
+}
+
+message ListRoutesRequest {}
+
+message ListRoutesResponse {
+  repeated Route routes = 1;
+}
+
+message Route {
+  string host = 1;
+  string path = 2;
+  string app = 3;
 }

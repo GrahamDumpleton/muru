@@ -1,8 +1,8 @@
 //! The edge processes the daemon runs (design specification section 2.3
-//! and ADR 0002): the daemon binds the listening socket and hands it to an
-//! edge spawned from its own executable, pushes routing snapshots over the
-//! edge's control socket, and respawns the edge with the same socket and
-//! the last snapshot if it dies, so connections are never refused.
+//! and ADR 0002): the daemon binds the listening sockets and hands them to
+//! an edge spawned from its own executable, pushes routing snapshots over
+//! the edge's control socket, and respawns the edge with the same sockets
+//! and the last snapshot if it dies, so connections are never refused.
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -16,12 +16,21 @@ use muru_proto::edge::v1::edge_control_client::EdgeControlClient;
 use tokio::process::{Child, Command};
 use tonic::transport::{Channel, Endpoint, Uri};
 
+/// A listener the daemon bound for the edge.
+pub struct Listener {
+    /// The bound, listening socket.
+    pub socket: std::net::TcpListener,
+    /// Whether the edge terminates TLS on it.
+    pub tls: bool,
+}
+
 /// How an edge is started.
 pub struct EdgeSpec {
     /// The executable to spawn, normally the daemon's own.
     pub executable: PathBuf,
-    /// The bound, listening socket the edge serves.
-    pub listener: std::net::TcpListener,
+    /// The bound, listening sockets the edge serves; the first is the
+    /// main one.
+    pub listeners: Vec<Listener>,
     /// Where the edge's control socket goes.
     pub control: PathBuf,
     /// Where the edge hands its listener back to a restarted daemon.
@@ -47,8 +56,12 @@ enum Process {
     Adopted(u32),
 }
 
-/// The descriptor number the listener takes in the edge process.
+/// The descriptor number the first listener takes in the edge process;
+/// the others follow it.
 const LISTENER_FD: i32 = 3;
+
+/// How many listeners an edge can be handed.
+const MAX_LISTENERS: usize = 16;
 
 impl EdgeProcess {
     /// Spawn the edge and wait until its control socket answers.
@@ -64,13 +77,16 @@ impl EdgeProcess {
     }
 
     /// Take over an edge a previous daemon started: it must answer on its
-    /// control socket and hand its listener back, so this daemon can
-    /// respawn it later. Its snapshot is replaced by the caller.
+    /// control socket and hand its listeners back, so this daemon can
+    /// respawn it later. `tls` says which of them carry TLS, in order.
+    /// Its snapshot is replaced by the caller.
+    #[allow(clippy::too_many_arguments)] // one call site, every argument a distinct location
     pub async fn adopt(
         pid: u32,
         executable: PathBuf,
         control: PathBuf,
         listener_socket: PathBuf,
+        tls: Vec<bool>,
         log: PathBuf,
         access_log: Option<PathBuf>,
         limits: muru_edge::Limits,
@@ -88,19 +104,24 @@ impl EdgeProcess {
             control.display()
         );
 
-        // The listener comes back over the edge's listener socket.
+        // The listeners come back over the edge's listener socket, in
+        // order, until it closes.
 
-        let listener = {
-            let socket = std::os::unix::net::UnixStream::connect(&listener_socket)
-                .with_context(|| format!("connecting to {}", listener_socket.display()))?;
-            let fd = crate::fdpass::recv_fd(&socket).context("taking the listener back")?;
-            std::net::TcpListener::from(fd)
-        };
+        let socket = std::os::unix::net::UnixStream::connect(&listener_socket)
+            .with_context(|| format!("connecting to {}", listener_socket.display()))?;
+        let mut listeners = Vec::new();
+        while let Ok(fd) = crate::fdpass::recv_fd(&socket) {
+            listeners.push(Listener {
+                socket: std::net::TcpListener::from(fd),
+                tls: tls.get(listeners.len()).copied().unwrap_or(false),
+            });
+        }
+        anyhow::ensure!(!listeners.is_empty(), "the edge handed no listener back");
 
         Ok(Self {
             spec: EdgeSpec {
                 executable,
-                listener,
+                listeners,
                 control,
                 listener_socket,
                 log,
@@ -110,14 +131,23 @@ impl EdgeProcess {
             process: Process::Adopted(pid),
             snapshot: pb::Snapshot {
                 version: status.snapshot_version,
-                worker_sockets: Vec::new(),
+                ..Default::default()
             },
         })
     }
 
-    /// The address the edge serves.
+    /// The address the edge's first listener serves.
     pub fn listen(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.spec.listener.local_addr()
+        self.spec.listeners[0].socket.local_addr()
+    }
+
+    /// Every listener's address and whether it carries TLS.
+    pub fn listeners(&self) -> Vec<(std::net::SocketAddr, bool)> {
+        self.spec
+            .listeners
+            .iter()
+            .filter_map(|listener| Some((listener.socket.local_addr().ok()?, listener.tls)))
+            .collect()
     }
 
     /// The edge's pid.
@@ -154,14 +184,11 @@ impl EdgeProcess {
         }
     }
 
-    /// Push a snapshot: the sockets of the workers that serve.
-    pub async fn apply(&mut self, sockets: &[PathBuf]) -> anyhow::Result<()> {
+    /// Push a snapshot, numbered after the last one.
+    pub async fn apply(&mut self, snapshot: pb::Snapshot) -> anyhow::Result<()> {
         self.snapshot = pb::Snapshot {
             version: self.snapshot.version + 1,
-            worker_sockets: sockets
-                .iter()
-                .map(|socket| socket.display().to_string())
-                .collect(),
+            ..snapshot
         };
         let mut client = connect(&self.spec.control).await?;
         client
@@ -180,11 +207,14 @@ impl EdgeProcess {
             return Ok(false);
         }
 
-        // The new edge starts with the last snapshot, so a connection that
-        // waited in the backlog is served by the right workers.
+        // The new edge starts with the default workers of the last
+        // snapshot, so a connection that waited in the backlog is served,
+        // and takes the whole snapshot again right after.
 
         self.process = Process::Child(start(&self.spec, &self.snapshot.worker_sockets)?);
         self.wait_ready().await?;
+        let snapshot = self.snapshot.clone();
+        self.apply(snapshot).await?;
         Ok(true)
     }
 
@@ -244,8 +274,9 @@ impl EdgeProcess {
     }
 }
 
-/// Start the edge process with the listener as descriptor 3, the workers
-/// it serves from the start, and its output appended to its log.
+/// Start the edge process with the listeners as descriptors 3, 4 and so
+/// on, the workers it serves from the start, and its output appended to
+/// its log.
 fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -253,11 +284,16 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .open(&spec.log)
         .with_context(|| format!("opening {}", spec.log.display()))?;
     let mut command = Command::new(&spec.executable);
+    command.arg("edge").arg("run");
+    for (index, listener) in spec.listeners.iter().enumerate() {
+        let fd = LISTENER_FD + index as i32;
+        command.arg("--listener").arg(if listener.tls {
+            format!("{fd}:tls")
+        } else {
+            fd.to_string()
+        });
+    }
     command
-        .arg("edge")
-        .arg("run")
-        .arg("--listener-fd")
-        .arg(LISTENER_FD.to_string())
         .arg("--control")
         .arg(&spec.control)
         .arg("--listener-socket")
@@ -290,19 +326,41 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .stdout(log.try_clone()?)
         .stderr(log);
 
-    // The listener's descriptor is duplicated onto a fixed number in the
+    // Each listener's descriptor is duplicated onto a fixed number in the
     // child, which also clears close-on-exec for that copy, and the edge
     // gets a session of its own so it outlives a daemon that detaches.
+    // The sources are raised above the targets first, so no target
+    // overwrites a source still to be copied.
 
-    let raw = spec.listener.as_raw_fd();
+    anyhow::ensure!(
+        spec.listeners.len() <= MAX_LISTENERS,
+        "at most {MAX_LISTENERS} listeners can be handed to an edge"
+    );
+    let mut raw = [-1i32; MAX_LISTENERS];
+    for (slot, listener) in raw.iter_mut().zip(&spec.listeners) {
+        *slot = listener.socket.as_raw_fd();
+    }
+    let count = spec.listeners.len();
 
-    // SAFETY: dup2 and setsid are async-signal-safe and the closure runs
-    // in the child between fork and exec, where it touches nothing else.
+    // SAFETY: dup2, fcntl, close and setsid are async-signal-safe and the
+    // closure runs in the child between fork and exec, where it touches
+    // nothing else and allocates nothing (the arrays are on the stack).
 
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(raw, LISTENER_FD) < 0 {
-                return Err(std::io::Error::last_os_error());
+            let mut sources = [-1i32; MAX_LISTENERS];
+            for index in 0..count {
+                let raised = libc::fcntl(raw[index], libc::F_DUPFD, LISTENER_FD + count as i32);
+                if raised < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                sources[index] = raised;
+            }
+            for (index, source) in sources.iter().enumerate().take(count) {
+                if libc::dup2(*source, LISTENER_FD + index as i32) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(*source);
             }
             libc::setsid();
             Ok(())

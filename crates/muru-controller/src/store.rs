@@ -8,6 +8,8 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use muru_config::{Host as VirtualHost, Route};
+
 use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
 
 /// Why a store operation failed.
@@ -44,6 +46,18 @@ CREATE TABLE IF NOT EXISTS releases (
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (app, id)
 );
+CREATE TABLE IF NOT EXISTS hosts (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS routes (
+    host TEXT NOT NULL,
+    path TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (host, path)
+);
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     time_unix_ms INTEGER NOT NULL,
@@ -56,6 +70,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
+
+/// The schema this build writes.
+const SCHEMA_VERSION: i64 = 2;
 
 /// The store.
 pub struct Store {
@@ -71,13 +88,21 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
 
-        // Version 1 is the first schema; later versions migrate from it.
+        // Version 1 had applications, releases and events; version 2
+        // added hosts and routes, which the CREATE statements above supply
+        // to a version 1 store, so the version only needs recording.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
             .optional()?;
-        if version.is_none() {
-            connection.execute("INSERT INTO schema (version) VALUES (1)", [])?;
+        match version {
+            None => {
+                connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
+            }
+            Some(version) if version < SCHEMA_VERSION => {
+                connection.execute("UPDATE schema SET version = ?1", [SCHEMA_VERSION])?;
+            }
+            Some(_) => {}
         }
 
         Ok(Self {
@@ -89,7 +114,7 @@ impl Store {
     pub fn in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(SCHEMA)?;
-        connection.execute("INSERT INTO schema (version) VALUES (1)", [])?;
+        connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -245,6 +270,86 @@ impl Store {
         })
     }
 
+    /// Every virtual host, by name, with its definition.
+    pub fn hosts(&self) -> Result<Vec<(String, VirtualHost)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("SELECT name, spec FROM hosts ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut hosts = Vec::new();
+            for row in rows {
+                let (name, encoded) = row?;
+                hosts.push((name, decode(&encoded)?));
+            }
+            Ok(hosts)
+        })
+    }
+
+    /// Create or replace a virtual host.
+    pub fn put_host(&self, name: &str, host: &VirtualHost) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(host).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO hosts (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a virtual host and its routes.
+    pub fn delete_host(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM routes WHERE host = ?1", [name])?;
+            connection.execute("DELETE FROM hosts WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Every route, by host then path.
+    pub fn routes(&self) -> Result<Vec<Route>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT spec FROM routes ORDER BY host, path")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut routes = Vec::new();
+            for row in rows {
+                routes.push(decode(&row?)?);
+            }
+            Ok(routes)
+        })
+    }
+
+    /// Create or replace a route, identified by its host and path.
+    pub fn put_route(&self, route: &Route) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(route).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO routes (host, path, spec) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(host, path) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![route.host, route.path, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a route.
+    pub fn delete_route(&self, host: &str, path: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM routes WHERE host = ?1 AND path = ?2",
+                params![host, path],
+            )?;
+            Ok(())
+        })
+    }
+
     /// The sequence number of the last event: a version of the whole
     /// store, since every change to it is an event.
     pub fn state_version(&self) -> Result<u64, StoreError> {
@@ -354,6 +459,11 @@ fn undecodable(
     error: impl std::error::Error + Send + Sync + 'static,
 ) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
+}
+
+/// A stored definition, as TOML, back as its type.
+fn decode<T: serde::de::DeserializeOwned>(encoded: &str) -> Result<T, StoreError> {
+    toml::from_str(encoded).map_err(|error| StoreError::Decode(error.to_string()))
 }
 
 fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {

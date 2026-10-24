@@ -3,12 +3,16 @@
 //! out, and the export of desired state as a document that applies back
 //! without changes.
 //!
-//! This slice covers applications and their releases. Listeners and
-//! limits belong to the daemon's own file and are reported, not applied.
+//! This covers applications, releases, virtual hosts and routes.
+//! Listeners and limits belong to the daemon's own file and are reported,
+//! not applied.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use muru_config::{App as AppTable, Document, Release as ReleaseTable};
+use muru_config::{
+    App as AppTable, Document, Host as VirtualHost, Release as ReleaseTable, Route as RouteTable,
+};
 use muru_proto::admin::v1 as pb;
 
 use crate::model::{ReleaseSpec, valid_name};
@@ -18,24 +22,87 @@ use crate::store::{Store, StoreError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Record a new application.
-    CreateApp,
+    CreateApp {
+        /// The application.
+        app: String,
+    },
     /// Create a release with this spec and move traffic to it.
-    Deploy(ReleaseSpec),
+    Deploy {
+        /// The application.
+        app: String,
+        /// The declared release id.
+        id: String,
+        /// The resolved spec.
+        spec: ReleaseSpec,
+    },
     /// Drain the release if it runs, then drop its record (prune).
-    RemoveRelease,
+    RemoveRelease {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+    },
     /// Drop an application whose releases are gone (prune).
-    RemoveApp,
+    RemoveApp {
+        /// The application.
+        app: String,
+    },
+    /// Create or replace a virtual host.
+    PutHost {
+        /// The host's name.
+        name: String,
+        /// Its definition.
+        host: VirtualHost,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a virtual host and its routes (prune).
+    RemoveHost {
+        /// The host's name.
+        name: String,
+    },
+    /// Create or replace a route.
+    PutRoute {
+        /// The route.
+        route: RouteTable,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a route (prune).
+    RemoveRoute {
+        /// The host.
+        host: String,
+        /// The path prefix.
+        path: String,
+    },
 }
 
 impl Action {
     /// The action's name as the report shows it.
     pub fn name(&self) -> &'static str {
         match self {
-            Action::CreateApp => "create-app",
-            Action::Deploy(_) => "deploy",
-            Action::RemoveRelease => "remove-release",
-            Action::RemoveApp => "remove-app",
+            Action::CreateApp { .. } => "create-app",
+            Action::Deploy { .. } => "deploy",
+            Action::RemoveRelease { .. } => "remove-release",
+            Action::RemoveApp { .. } => "remove-app",
+            Action::PutHost { new: true, .. } => "create-host",
+            Action::PutHost { new: false, .. } => "update-host",
+            Action::RemoveHost { .. } => "remove-host",
+            Action::PutRoute { new: true, .. } => "create-route",
+            Action::PutRoute { new: false, .. } => "update-route",
+            Action::RemoveRoute { .. } => "remove-route",
         }
+    }
+
+    /// Whether the edge's snapshot changes with the action.
+    pub fn reconfigures(&self) -> bool {
+        matches!(
+            self,
+            Action::PutHost { .. }
+                | Action::RemoveHost { .. }
+                | Action::PutRoute { .. }
+                | Action::RemoveRoute { .. }
+        )
     }
 }
 
@@ -44,20 +111,22 @@ impl Action {
 pub struct Change {
     /// What happens.
     pub action: Action,
-    /// The application.
-    pub app: String,
-    /// The release, for release actions.
-    pub id: Option<String>,
     /// What the release runs, or why the object goes.
     pub detail: String,
 }
 
 impl Change {
-    /// The subject as the API names it: app, or app@release.
+    /// The subject as the API names it: app, app@release, host NAME, or
+    /// route HOST PATH.
     pub fn subject(&self) -> String {
-        match &self.id {
-            Some(id) => format!("{}@{id}", self.app),
-            None => self.app.clone(),
+        match &self.action {
+            Action::CreateApp { app } | Action::RemoveApp { app } => app.clone(),
+            Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
+                format!("{app}@{id}")
+            }
+            Action::PutHost { name, .. } | Action::RemoveHost { name } => format!("host {name}"),
+            Action::PutRoute { route, .. } => format!("route {} {}", route.host, route.path),
+            Action::RemoveRoute { host, path } => format!("route {host} {path}"),
         }
     }
 }
@@ -71,14 +140,15 @@ pub struct Plan {
     pub warnings: Vec<String>,
     /// The changes, in the order they are carried out.
     pub changes: Vec<Change>,
-    /// Releases already recorded as declared.
+    /// Releases, hosts and routes already recorded as declared.
     pub unchanged: u32,
 }
 
 /// Compare a document with desired state. Creates and deploys come
 /// first, application by application with releases in id order, so the
-/// last declared release of an application is the one that serves; with
-/// `prune`, removals of what the document does not contain follow.
+/// last declared release of an application is the one that serves; hosts
+/// and routes follow; with `prune`, removals of what the document does
+/// not contain come last.
 pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
     let mut plan = Plan::default();
 
@@ -101,6 +171,8 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
     }
+    plan_hosts(store, document, &mut plan);
+    plan_routes(store, document, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -119,9 +191,9 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
     }
     if store.app(name).is_err() {
         plan.changes.push(Change {
-            action: Action::CreateApp,
-            app: name.to_owned(),
-            id: None,
+            action: Action::CreateApp {
+                app: name.to_owned(),
+            },
             detail: String::new(),
         });
     }
@@ -157,25 +229,205 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
                 differences(&spec, &recorded.spec).join(", ")
             )),
             Err(_) => deploys.push(Change {
-                action: Action::Deploy(spec.clone()),
-                app: name.to_owned(),
-                id: Some(id.clone()),
                 detail: describe(&spec),
+                action: Action::Deploy {
+                    app: name.to_owned(),
+                    id: id.clone(),
+                    spec,
+                },
             }),
         }
     }
 
-    deploys.sort_by_key(|change| release_order(change.id.as_deref().unwrap_or_default()));
+    deploys.sort_by_key(|change| match &change.action {
+        Action::Deploy { id, .. } => release_order(id),
+        _ => release_order(""),
+    });
     plan.changes.extend(deploys);
 }
 
-/// With prune, releases and applications in desired state that the
-/// document does not declare go.
+/// The changes the document's hosts imply (section 4.3): names are
+/// checked, duplicates refused and certificates read, so a bad host
+/// never reaches the edge.
+fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
+    let stored: BTreeMap<String, VirtualHost> =
+        store.hosts().unwrap_or_default().into_iter().collect();
+    let mut seen_names: BTreeMap<String, String> = BTreeMap::new();
+    let mut defaults = 0;
+
+    for (name, host) in &document.host {
+        if !valid_name(name) {
+            plan.errors
+                .push(format!("host {name:?} is not a valid name"));
+            continue;
+        }
+        let mut valid = true;
+
+        for declared in &host.names {
+            let normalised = muru_edge::routing::normalise(declared);
+            let label = normalised.strip_prefix("*.").unwrap_or(&normalised);
+            if label.is_empty() || label.contains('*') || label.contains('/') {
+                plan.errors
+                    .push(format!("host {name}: {declared:?} is not a host name"));
+                valid = false;
+                continue;
+            }
+            if let Some(other) = seen_names.insert(normalised.clone(), name.clone())
+                && other != *name
+            {
+                plan.errors.push(format!(
+                    "host {name}: {normalised} is also a name of host {other}"
+                ));
+                valid = false;
+            }
+        }
+        if host.names.is_empty() && !host.default {
+            plan.errors
+                .push(format!("host {name} has no names and is not the default"));
+            valid = false;
+        }
+        if host.use_canonical_name && host.canonical.is_none() {
+            plan.errors.push(format!(
+                "host {name}: use_canonical_name needs a canonical name"
+            ));
+            valid = false;
+        }
+        if host.default {
+            defaults += 1;
+        }
+        if let Some(tls) = &host.tls {
+            let loaded =
+                muru_edge::tls::load_pem_files(Path::new(&tls.certificate), Path::new(&tls.key))
+                    .and_then(|(chain, key)| muru_edge::tls::certified_key(chain, key));
+            if let Err(error) = loaded {
+                plan.errors.push(format!("host {name}: {error:#}"));
+                valid = false;
+            }
+        }
+        if !valid {
+            continue;
+        }
+
+        match stored.get(name) {
+            Some(recorded) if recorded == host => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutHost {
+                    name: name.clone(),
+                    host: host.clone(),
+                    new: recorded.is_none(),
+                },
+                detail: describe_host(host),
+            }),
+        }
+    }
+
+    if defaults > 1 {
+        plan.errors
+            .push("more than one host is the default".to_owned());
+    }
+}
+
+/// The changes the document's routes imply (section 4.5).
+fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
+    let stored: BTreeMap<(String, String), RouteTable> = store
+        .routes()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|route| ((route.host.clone(), route.path.clone()), route))
+        .collect();
+    let stored_hosts: Vec<String> = store
+        .hosts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let stored_apps: Vec<String> = store
+        .apps()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|app| app.name)
+        .collect();
+    let mut seen = Vec::new();
+
+    for route in &document.route {
+        let key = (route.host.clone(), route.path.clone());
+        let mut valid = true;
+        if !route.path.starts_with('/') {
+            plan.errors.push(format!(
+                "route {} {}: the path must start with /",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+        if !document.host.contains_key(&route.host) && !stored_hosts.contains(&route.host) {
+            plan.errors.push(format!(
+                "route {} {}: no host named {}",
+                route.host, route.path, route.host
+            ));
+            valid = false;
+        }
+        if !document.app.contains_key(&route.app) && !stored_apps.contains(&route.app) {
+            plan.errors.push(format!(
+                "route {} {}: no application named {}",
+                route.host, route.path, route.app
+            ));
+            valid = false;
+        }
+        if seen.contains(&key) {
+            plan.errors.push(format!(
+                "route {} {} is declared twice",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+        seen.push(key.clone());
+        if !valid {
+            continue;
+        }
+
+        match stored.get(&key) {
+            Some(recorded) if recorded == route => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutRoute {
+                    route: route.clone(),
+                    new: recorded.is_none(),
+                },
+                detail: format!("to {}", route.app),
+            }),
+        }
+    }
+}
+
+/// With prune, routes, hosts, releases and applications in desired state
+/// that the document does not declare go, in that order.
 fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
+    for route in store.routes().unwrap_or_default() {
+        let declared = document
+            .route
+            .iter()
+            .any(|candidate| candidate.host == route.host && candidate.path == route.path);
+        if !declared {
+            plan.changes.push(Change {
+                action: Action::RemoveRoute {
+                    host: route.host,
+                    path: route.path,
+                },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+    for (name, _) in store.hosts().unwrap_or_default() {
+        if !document.host.contains_key(&name) {
+            plan.changes.push(Change {
+                action: Action::RemoveHost { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
     let Ok(apps) = store.apps() else {
         return;
     };
-
     for app in apps {
         let declared = document.app.get(&app.name);
         let Ok(releases) = store.releases(Some(&app.name)) else {
@@ -186,18 +438,19 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
             let kept = declared.is_some_and(|table| table.release.contains_key(&release.id));
             if !kept {
                 plan.changes.push(Change {
-                    action: Action::RemoveRelease,
-                    app: app.name.clone(),
-                    id: Some(release.id.clone()),
+                    action: Action::RemoveRelease {
+                        app: app.name.clone(),
+                        id: release.id.clone(),
+                    },
                     detail: format!("{} and not declared", release.state),
                 });
             }
         }
         if declared.is_none() {
             plan.changes.push(Change {
-                action: Action::RemoveApp,
-                app: app.name.clone(),
-                id: None,
+                action: Action::RemoveApp {
+                    app: app.name.clone(),
+                },
                 detail: "not declared".to_owned(),
             });
         }
@@ -205,7 +458,8 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
 }
 
 /// Desired state as a document: each application with the release that
-/// serves it, or with every release. Applying it back changes nothing.
+/// serves it, or with every release, and the hosts and routes. Applying
+/// it back changes nothing.
 pub fn export(
     store: &Store,
     app: Option<&str>,
@@ -231,7 +485,41 @@ pub fn export(
         document.app.insert(app.name, table);
     }
 
+    // Hosts and routes are node-wide; with one application asked for,
+    // only the routes to it and their hosts are written.
+
+    let routes = store.routes()?;
+    let hosts = store.hosts()?;
+    for route in routes {
+        if app.is_none_or(|name| route.app == name) {
+            document.route.push(route);
+        }
+    }
+    for (name, host) in hosts {
+        let routed = document.route.iter().any(|route| route.host == name);
+        if app.is_none() || routed {
+            document.host.insert(name, host);
+        }
+    }
+
     Ok(document)
+}
+
+/// A host for the report: its names, and whether it has TLS.
+fn describe_host(host: &VirtualHost) -> String {
+    let mut parts = vec![if host.names.is_empty() {
+        "no names".to_owned()
+    } else {
+        host.names.join(", ")
+    }];
+    if host.tls.is_some() {
+        parts.push("with TLS".to_owned());
+    }
+    if host.default {
+        parts.push("default".to_owned());
+    }
+
+    parts.join(", ")
 }
 
 /// Resolve a deploy request into a release spec: the request's settings,

@@ -67,7 +67,13 @@ impl Admin for Service {
             state_dir: info.locations.state.path.display().to_string(),
             run_dir: info.locations.run.path.display().to_string(),
             socket: info.locations.admin_socket().display().to_string(),
-            listeners: vec![format!("http://{}", info.listen)],
+            listeners: info
+                .listeners
+                .iter()
+                .map(|(address, tls)| {
+                    format!("{}://{address}", if *tls { "https" } else { "http" })
+                })
+                .collect(),
             started_unix_ms: info.started_unix_ms,
             apps: apps.len() as u32,
             releases: releases.len() as u32,
@@ -333,6 +339,46 @@ impl Admin for Service {
         Ok(Response::new(pb::ShutdownResponse {}))
     }
 
+    async fn list_hosts(
+        &self,
+        _: Request<pb::ListHostsRequest>,
+    ) -> Result<Response<pb::ListHostsResponse>, Status> {
+        let hosts = self.handle.store.hosts().map_err(internal)?;
+        Ok(Response::new(pb::ListHostsResponse {
+            hosts: hosts
+                .into_iter()
+                .map(|(name, host)| pb::Host {
+                    name,
+                    names: host.names,
+                    listeners: host.listeners,
+                    tls: host.tls.is_some(),
+                    certificate: host.tls.map(|tls| tls.certificate).unwrap_or_default(),
+                    canonical: host.canonical.unwrap_or_default(),
+                    https_redirect: host.https_redirect,
+                    use_canonical_name: host.use_canonical_name,
+                    default: host.default,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn list_routes(
+        &self,
+        _: Request<pb::ListRoutesRequest>,
+    ) -> Result<Response<pb::ListRoutesResponse>, Status> {
+        let routes = self.handle.store.routes().map_err(internal)?;
+        Ok(Response::new(pb::ListRoutesResponse {
+            routes: routes
+                .into_iter()
+                .map(|route| pb::Route {
+                    host: route.host,
+                    path: route.path,
+                    app: route.app,
+                })
+                .collect(),
+        }))
+    }
+
     async fn apply_config(
         &self,
         request: Request<pb::ApplyConfigRequest>,
@@ -359,6 +405,20 @@ impl Admin for Service {
             }
         }
         report.applied = true;
+
+        // Hosts and routes reach the edge with the next snapshot.
+
+        if plan
+            .changes
+            .iter()
+            .any(|change| change.action.reconfigures())
+            && let Err(error) = self.reconfigure().await
+        {
+            report
+                .warnings
+                .push(format!("the edge did not take the new snapshot: {error}"));
+            failures += 1;
+        }
 
         let summary = format!(
             "{} changes applied, {} failed, {} releases unchanged",
@@ -415,19 +475,32 @@ impl Service {
     /// Carry out one change of a plan and say how it went: an outcome
     /// starting with "failed" is counted as a failure.
     async fn carry_out(&self, change: &Change) -> String {
+        let store = &self.handle.store;
         let outcome = match &change.action {
-            Action::CreateApp => self
-                .handle
-                .store
-                .ensure_app(&change.app)
+            Action::CreateApp { app } => store
+                .ensure_app(app)
                 .map(|_| "created".to_owned())
                 .map_err(|error| error.to_string()),
-            Action::Deploy(spec) => self.deploy_declared(change, spec).await,
-            Action::RemoveRelease => self.remove_release(change).await,
-            Action::RemoveApp => self
-                .handle
-                .store
-                .delete_app(&change.app)
+            Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
+            Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
+            Action::RemoveApp { app } => store
+                .delete_app(app)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutHost { name, host, new } => store
+                .put_host(name, host)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveHost { name } => store
+                .delete_host(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutRoute { route, new } => store
+                .put_route(route)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveRoute { host, path } => store
+                .delete_route(host, path)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
         };
@@ -437,15 +510,20 @@ impl Service {
 
     /// Deploy a declared release under its declared id and wait for the
     /// outcome, as a deploy with --wait does.
-    async fn deploy_declared(&self, change: &Change, spec: &ReleaseSpec) -> Result<String, String> {
+    async fn deploy_declared(
+        &self,
+        app: &str,
+        id: &str,
+        spec: &ReleaseSpec,
+    ) -> Result<String, String> {
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
             .send(Command::Deploy {
-                app: change.app.clone(),
+                app: app.to_owned(),
                 spec: spec.clone(),
-                id: change.id.clone(),
+                id: Some(id.to_owned()),
                 retain: crate::daemon::RETENTION,
                 created: created_tx,
                 done: done_tx,
@@ -472,12 +550,11 @@ impl Service {
     }
 
     /// Drain a release if it runs, then drop its record.
-    async fn remove_release(&self, change: &Change) -> Result<String, String> {
-        let id = change.id.clone().unwrap_or_default();
+    async fn remove_release(&self, app: &str, id: &str) -> Result<String, String> {
         let running = self
             .handle
             .store
-            .release(&change.app, &id)
+            .release(app, id)
             .is_ok_and(|release| release.state.is_running());
 
         let mut outcome = "removed";
@@ -486,8 +563,8 @@ impl Service {
             self.handle
                 .commands
                 .send(Command::Drain {
-                    app: change.app.clone(),
-                    id: id.clone(),
+                    app: app.to_owned(),
+                    id: id.to_owned(),
                     done: done_tx,
                 })
                 .await
@@ -498,9 +575,21 @@ impl Service {
 
         self.handle
             .store
-            .delete_release(&change.app, &id)
+            .delete_release(app, id)
             .map_err(|error| error.to_string())?;
         Ok(outcome.to_owned())
+    }
+
+    /// Push a snapshot with the hosts and routes as they now are.
+    async fn reconfigure(&self) -> Result<(), String> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Reconfigure { done: done_tx })
+            .await
+            .map_err(|_| STOPPING.to_owned())?;
+
+        done_rx.await.map_err(|_| STOPPING.to_owned())?
     }
 }
 
