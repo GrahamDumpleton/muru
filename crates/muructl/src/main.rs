@@ -165,6 +165,12 @@ struct RunArgs {
     #[arg(long = "host", value_name = "NAME")]
     hosts: Vec<String>,
 
+    /// Write the equivalent declarative configuration (appendix C) to
+    /// standard output instead of running: the path from a development
+    /// run to a long-running setup.
+    #[arg(long)]
+    print_config: bool,
+
     /// One process and one thread, serving without forking, for debuggers.
     /// Implies --workers 1 --threads 1.
     #[arg(long)]
@@ -555,6 +561,78 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     })
 }
 
+/// The declarative file equivalent to this run, for --print-config: the
+/// release as section 6.8 would define it, the listeners and the limits.
+fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
+    use muru_config::{App, Document, Listener, Release};
+
+    let name = app_name(&resolved.entrypoint);
+    let limits = limits(args);
+    let (http, https) = addresses(args);
+    let mut listeners = vec![Listener {
+        address: http.to_string(),
+        tls: false,
+    }];
+    if args.https || args.https_only || args.tls_cert.is_some() {
+        listeners.push(Listener {
+            address: https.to_string(),
+            tls: true,
+        });
+    }
+    let release = Release {
+        entrypoint: resolved.entrypoint.clone(),
+        interface: (resolved.interface != muru_config::Interface::Auto)
+            .then_some(resolved.interface),
+        factory: resolved.factory.map(|_| true),
+        factory_phase: resolved.factory,
+        python: Some(
+            python_interpreter(args.python.clone(), &resolved.project)
+                .display()
+                .to_string(),
+        ),
+        processes: Some(resolved.processes),
+        threads: Some(resolved.threads),
+        preload: Some(resolved.preload),
+        hooks: resolved.hooks.clone(),
+    };
+    let document = Document {
+        listener: listeners,
+        limits: Some(muru_config::Limits {
+            max_body_size: Some(muru_config::format_size(limits.max_body_size)),
+            max_header_bytes: Some(muru_config::format_size(limits.max_header_bytes as u64)),
+            max_headers: Some(limits.max_headers),
+            header_read_timeout: Some(muru_config::format_duration(limits.header_read_timeout)),
+            queue_timeout: Some(muru_config::format_duration(limits.queue_timeout)),
+            request_deadline: Some(muru_config::format_duration(limits.request_deadline)),
+            body_idle_timeout: Some(muru_config::format_duration(limits.body_idle_timeout)),
+            response_idle_timeout: Some(muru_config::format_duration(limits.response_idle_timeout)),
+        }),
+        app: std::collections::BTreeMap::from([(
+            name,
+            App {
+                release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
+            },
+        )]),
+    };
+    let text = document.to_toml().context("writing the configuration")?;
+    Ok(format!(
+        "# The declarative equivalent of this muructl run, for muructl apply (phase 2).\n\
+         # The release is written as r1; muructl deploy numbers releases itself.\n\n{text}"
+    ))
+}
+
+/// The application's name: the top-level module of its entrypoint, as
+/// the host names it for muru.context().
+fn app_name(entrypoint: &str) -> String {
+    let module = entrypoint.split(':').next().unwrap_or(entrypoint);
+    let top = module.split('.').next().unwrap_or(module);
+    if top.is_empty() {
+        "default".to_owned()
+    } else {
+        top.to_owned()
+    }
+}
+
 /// How TLS was set up: the listener configuration and, for a development
 /// certificate, where it came from.
 struct Tls {
@@ -626,6 +704,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     if args.single {
         resolved.processes = 1;
         resolved.threads = 1;
+    }
+    if args.print_config {
+        print!("{}", declarative(&args, &resolved)?);
+        return Ok(());
     }
     if let Some(source) = &resolved.source {
         println!("muru: using [tool.muru] from {}", source.display());

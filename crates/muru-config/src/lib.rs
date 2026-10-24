@@ -6,9 +6,11 @@
 //! application-shipped defaults of section 6.8: the `[tool.muru]` table in a
 //! project's pyproject.toml, or the same keys at the top of a muru.toml.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +127,133 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
     value
         .checked_mul(scale)
         .ok_or_else(|| format!("{text:?} is too large"))
+}
+
+/// Write a size the way the configuration accepts it: the largest unit
+/// that divides it exactly, else bytes.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+    for (scale, unit) in UNITS {
+        if bytes != 0 && bytes.is_multiple_of(scale) {
+            return format!("{}{unit}", bytes / scale);
+        }
+    }
+    bytes.to_string()
+}
+
+/// Write a duration the way the configuration accepts it: whole seconds
+/// as `5s`, otherwise milliseconds as `250ms`.
+pub fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis != 0 && millis.is_multiple_of(1000) {
+        format!("{}s", millis / 1000)
+    } else {
+        format!("{millis}ms")
+    }
+}
+
+/// A release definition, the `[app.NAME.release.ID]` table (appendix C).
+/// Phase 1 holds the keys a development run uses; `muructl run
+/// --print-config` writes one so a laptop setup can become a declared
+/// release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    /// The application as module:callable.
+    pub entrypoint: String,
+    /// The interface, when declared rather than detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<Interface>,
+    /// Whether the entrypoint is a factory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory: Option<bool>,
+    /// When a factory is called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_phase: Option<FactoryPhase>,
+    /// The interpreter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+    /// Worker processes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<usize>,
+    /// Application threads per worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<usize>,
+    /// The preload mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preload: Option<Preload>,
+    /// The hooks module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<String>,
+}
+
+/// The `[limits]` table (appendix C): sizes and durations as the
+/// configuration writes them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Largest request body, for example 10MB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<String>,
+    /// Largest request head, for example 64KB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_header_bytes: Option<String>,
+    /// Most headers in a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_headers: Option<usize>,
+    /// Time allowed for a complete request head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_read_timeout: Option<String>,
+    /// Time a request may wait for a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout: Option<String>,
+    /// Time a request may take to produce its response head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_deadline: Option<String>,
+    /// Time a client may pause while sending a body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_idle_timeout: Option<String>,
+    /// Time a worker may pause mid-response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_idle_timeout: Option<String>,
+}
+
+/// A listener, one of the `[[listener]]` entries (appendix C).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listener {
+    /// The address, as IP:PORT.
+    pub address: String,
+    /// Whether TLS is terminated on it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tls: bool,
+}
+
+/// An application's table and its releases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct App {
+    /// Releases by identifier.
+    #[serde(default)]
+    pub release: BTreeMap<String, Release>,
+}
+
+/// A declarative configuration file as `muructl apply` will read it: the
+/// subset a development run can describe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Document {
+    /// Listeners.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listener: Vec<Listener>,
+    /// Limits in force everywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Limits>,
+    /// Applications by name.
+    #[serde(default)]
+    pub app: BTreeMap<String, App>,
+}
+
+impl Document {
+    /// The document as TOML.
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
 }
 
 /// The `[tool.muru]` table: defaults an application ships with (section
@@ -265,6 +394,53 @@ mod tests {
         assert_eq!(parse_size(" 2 MB "), Ok(2 * 1024 * 1024));
         assert!(parse_size("ten").is_err());
         assert!(parse_size("99999999999999999999GB").is_err());
+    }
+
+    #[test]
+    fn sizes_and_durations_are_written_in_the_largest_exact_unit() {
+        assert_eq!(format_size(100 * 1024 * 1024), "100MB");
+        assert_eq!(format_size(64 * 1024), "64KB");
+        assert_eq!(format_size(1500), "1500");
+        assert_eq!(format_duration(Duration::from_secs(300)), "300s");
+        assert_eq!(format_duration(Duration::from_millis(250)), "250ms");
+    }
+
+    #[test]
+    fn a_document_round_trips_through_toml() {
+        let mut document = Document {
+            listener: vec![Listener {
+                address: "127.0.0.1:8080".to_owned(),
+                tls: false,
+            }],
+            limits: Some(Limits {
+                max_body_size: Some("100MB".to_owned()),
+                ..Limits::default()
+            }),
+            ..Document::default()
+        };
+        document.app.insert(
+            "shop".to_owned(),
+            App {
+                release: BTreeMap::from([(
+                    "r1".to_owned(),
+                    Release {
+                        entrypoint: "shop.wsgi:application".to_owned(),
+                        processes: Some(2),
+                        preload: Some(Preload::Auto),
+                        ..Release::default()
+                    },
+                )]),
+            },
+        );
+        let text = document.to_toml().unwrap();
+        assert!(text.contains("[app.shop.release.r1]"), "{text}");
+        assert!(
+            text.contains("entrypoint = \"shop.wsgi:application\""),
+            "{text}"
+        );
+        assert!(text.contains("[[listener]]"), "{text}");
+        let back: Document = toml::from_str(&text).unwrap();
+        assert_eq!(back, document);
     }
 
     #[test]
