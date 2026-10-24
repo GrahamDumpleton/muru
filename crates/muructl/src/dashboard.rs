@@ -62,6 +62,11 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
 
 fn collect(inputs: &Inputs) -> Data {
     let now = SystemTime::now();
+    // Rate and errors come from the per-second counters, which are exact
+    // at any load. The record ring is bounded, so under load it reaches
+    // back less than a minute: the percentiles and the request rows are
+    // taken from whatever it covers.
+    let minute = inputs.access_log.last_minute();
     let records = inputs.access_log.recent(RING_CAPACITY);
     let recent: Vec<&Record> = records
         .iter()
@@ -70,19 +75,6 @@ fn collect(inputs: &Inputs) -> Data {
                 .map_or(true, |age| age <= WINDOW)
         })
         .collect();
-    // The ring holds a bounded number of records, so under load it reaches
-    // back less than a minute: the rate is taken over the span it covers,
-    // not over a minute it only partly describes.
-    let covered = if records.len() >= RING_CAPACITY {
-        records
-            .iter()
-            .filter_map(|record| now.duration_since(record.started).ok())
-            .max()
-            .map_or(WINDOW, |oldest| oldest.min(WINDOW))
-    } else {
-        WINDOW
-    };
-    let covered = covered.max(Duration::from_secs(1));
     let mut totals: Vec<Duration> = recent.iter().map(|record| record.total).collect();
     totals.sort();
     let percentile = |fraction: f64| -> String {
@@ -105,10 +97,10 @@ fn collect(inputs: &Inputs) -> Data {
         })
         .collect();
     let summary = Summary {
-        rate: format!("{:.1}", recent.len() as f64 / covered.as_secs_f64()),
+        rate: format!("{:.1}", minute.requests as f64 / minute.seconds as f64),
         p50: percentile(0.5),
         p95: percentile(0.95),
-        errors: recent.iter().filter(|record| record.status >= 500).count(),
+        errors: minute.errors,
         in_flight: workers.iter().map(|worker| worker.in_flight).sum(),
     };
     let requests = records

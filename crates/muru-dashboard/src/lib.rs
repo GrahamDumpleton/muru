@@ -57,7 +57,7 @@ pub struct Summary {
     /// 95th percentile total time.
     pub p95: String,
     /// Responses with a 5xx status.
-    pub errors: usize,
+    pub errors: u64,
     /// Requests being handled right now.
     pub in_flight: usize,
 }

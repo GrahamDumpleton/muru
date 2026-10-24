@@ -94,11 +94,42 @@ impl Record {
     }
 }
 
-/// The access log: a ring of recent records plus the configured output.
+/// Requests and 5xx responses completed within one second.
+#[derive(Debug, Default, Clone, Copy)]
+struct Bucket {
+    second: u64,
+    requests: u64,
+    errors: u64,
+}
+
+/// Seconds of per-second counters kept.
+const MINUTE: usize = 60;
+
+/// Totals for the last minute, from the per-second counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Minute {
+    /// Requests completed.
+    pub requests: u64,
+    /// Responses with a 5xx status.
+    pub errors: u64,
+    /// Seconds the totals cover: fewer than 60 while the log is younger
+    /// than a minute, never fewer than 1.
+    pub seconds: u64,
+}
+
+/// The access log: a ring of recent records, per-second counters for the
+/// last minute, and the configured output.
 pub struct AccessLog {
     config: Config,
     ring: Mutex<VecDeque<Record>>,
+    minute: Mutex<[Bucket; MINUTE]>,
+    started: u64,
     file: Option<Mutex<File>>,
+}
+
+fn unix_seconds(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 impl AccessLog {
@@ -113,6 +144,8 @@ impl AccessLog {
         Ok(Self {
             config,
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
+            minute: Mutex::new([Bucket::default(); MINUTE]),
+            started: unix_seconds(SystemTime::now()),
             file,
         })
     }
@@ -122,11 +155,50 @@ impl AccessLog {
         if self.shows(&record) {
             self.write(&record);
         }
+        self.count(unix_seconds(SystemTime::now()), record.status);
         let mut ring = self.ring.lock().expect("access log ring poisoned");
         if ring.len() == RING_CAPACITY {
             ring.pop_front();
         }
         ring.push_back(record);
+    }
+
+    fn count(&self, second: u64, status: u16) {
+        let mut minute = self.minute.lock().expect("access log counters poisoned");
+        let bucket = &mut minute[(second % MINUTE as u64) as usize];
+        if bucket.second != second {
+            *bucket = Bucket {
+                second,
+                requests: 0,
+                errors: 0,
+            };
+        }
+        bucket.requests += 1;
+        if status >= 500 {
+            bucket.errors += 1;
+        }
+    }
+
+    /// Requests and errors over the last minute. Unlike `recent()`, this
+    /// is exact at any rate: the counters are per second, not per record.
+    pub fn last_minute(&self) -> Minute {
+        self.minute_at(unix_seconds(SystemTime::now()))
+    }
+
+    fn minute_at(&self, now: u64) -> Minute {
+        let since = now.saturating_sub(MINUTE as u64 - 1);
+        let minute = self.minute.lock().expect("access log counters poisoned");
+        let (requests, errors) = minute
+            .iter()
+            .filter(|bucket| bucket.second >= since && bucket.second <= now)
+            .fold((0, 0), |(requests, errors), bucket| {
+                (requests + bucket.requests, errors + bucket.errors)
+            });
+        Minute {
+            requests,
+            errors,
+            seconds: (now.saturating_sub(self.started) + 1).clamp(1, MINUTE as u64),
+        }
     }
 
     /// The most recent records, oldest first.
@@ -325,6 +397,29 @@ fn json_string(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_second_counters_sum_over_the_last_minute() {
+        let log = AccessLog::new(Config {
+            destination: Destination::Off,
+            slow: Duration::from_secs(1),
+            exclude: Vec::new(),
+        })
+        .expect("log");
+        // Counted in time order, as they arrive: the second a minute before
+        // `now` shares a bucket with `now` and is overwritten by it.
+        let now = log.started + 10;
+        log.count(now - 60, 200);
+        log.count(now - 59, 500);
+        log.count(now, 200);
+        log.count(now, 503);
+        let minute = log.minute_at(now);
+        assert_eq!(minute.requests, 3, "the record a minute old has aged out");
+        assert_eq!(minute.errors, 2);
+        assert_eq!(minute.seconds, 11, "the log is eleven seconds old");
+        assert_eq!(log.minute_at(log.started + 200).seconds, 60);
+        assert_eq!(log.minute_at(log.started + 200).requests, 0);
+    }
 
     #[test]
     fn globs() {
