@@ -138,8 +138,9 @@ def test_the_dashboard_is_loopback_only(tmp_path: Path) -> None:
         start_daemon(tmp_path, arguments=["--dashboard", "0.0.0.0:0"])
 
 
-def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0) -> str:
-    """Read a Server-Sent Events stream until a message of `wanted` type arrives."""
+def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0, count: int = 1) -> str:
+    """Read a Server-Sent Events stream until `count` messages of `wanted` type
+    have arrived."""
 
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
 
@@ -159,10 +160,9 @@ def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0) -> str:
 
             collected += chunk
 
-            if (
-                f"event: {wanted}\n".encode() in collected
-                and b"\n\n" in collected.split(f"event: {wanted}\n".encode(), 1)[1]
-            ):
+            complete = collected.rsplit(b"\n\n", 1)[0] + b"\n\n" if b"\n\n" in collected else b""
+
+            if complete.count(f"event: {wanted}\n".encode()) >= count:
                 return collected.decode()
 
         raise AssertionError(f"no {wanted} event in {collected!r}")
@@ -195,8 +195,10 @@ def test_the_history_grows_and_streams_for_the_charts(served: tuple[Daemon, int]
     assert any(point[6] == 2 for point in points), "two workers listening"
     assert fetch_json(port, "/v1/history?range=24h")["step_s"] == 60
 
-    stream = read_sse(port, "/v1/history/stream", "point")
-    assert "event: point\ndata: [" in stream
+    # The stream keeps delivering: one point a second, not just the first.
+
+    stream = read_sse(port, "/v1/history/stream", "point", count=3)
+    assert stream.count("event: point\ndata: [") >= 3
 
     # The page carries the charts and their script, which the policy
     # allows alongside the stylesheet.

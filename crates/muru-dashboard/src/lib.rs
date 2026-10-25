@@ -460,10 +460,12 @@ fn shared_paths(request: &Request<Incoming>, history: &Arc<History>) -> Option<R
             }))
         }
         "/v1/history/stream" => {
-            let mut live = history.subscribe();
-            sse(futures::stream::unfold((), move |()| {
-                let mut live = std::mem::replace(&mut live, history_placeholder());
-                async move {
+            // The receiver is the stream's state, carried from one message
+            // to the next.
+
+            sse(futures::stream::unfold(
+                history.subscribe(),
+                |mut live| async move {
                     let chunk = loop {
                         match tokio::time::timeout(Duration::from_secs(15), live.recv()).await {
                             Ok(Ok(point)) => {
@@ -477,20 +479,12 @@ fn shared_paths(request: &Request<Incoming>, history: &Arc<History>) -> Option<R
                         }
                     };
 
-                    Some((chunk, ()))
-                }
-            }))
+                    Some((chunk, live))
+                },
+            ))
         }
         _ => return None,
     })
-}
-
-/// A receiver that never yields, to stand in while the real one is
-/// moved into a stream step.
-fn history_placeholder() -> tokio::sync::broadcast::Receiver<Point> {
-    let (sender, receiver) = tokio::sync::broadcast::channel(1);
-    std::mem::forget(sender);
-    receiver
 }
 
 fn page(rendered: Result<String, askama::Error>) -> Response<Body> {
@@ -604,30 +598,26 @@ async fn respond_node(
         // Each event as a rendered row for the page's table, and as JSON
         // in the same message's `json` field for scripts.
 
-        let mut live = events();
-        return sse(futures::stream::unfold((), move |()| {
-            let mut live = std::mem::replace(&mut live, events_placeholder());
-            async move {
-                let chunk = loop {
-                    match tokio::time::timeout(Duration::from_secs(15), live.recv()).await {
-                        Ok(Ok(event)) => {
-                            let row = NodeEventRow { event: &event }
-                                .render()
-                                .unwrap_or_default()
-                                .replace('\n', "");
-                            break format!(
-                                "event: event\ndata: {row}\n\nevent: json\ndata: {}\n\n",
-                                serde_json::to_string(&event).unwrap_or_default()
-                            );
-                        }
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                        Ok(Err(_)) => return None,
-                        Err(_) => break ": keep-alive\n\n".to_owned(),
+        return sse(futures::stream::unfold(events(), |mut live| async move {
+            let chunk = loop {
+                match tokio::time::timeout(Duration::from_secs(15), live.recv()).await {
+                    Ok(Ok(event)) => {
+                        let row = NodeEventRow { event: &event }
+                            .render()
+                            .unwrap_or_default()
+                            .replace('\n', "");
+                        break format!(
+                            "event: event\ndata: {row}\n\nevent: json\ndata: {}\n\n",
+                            serde_json::to_string(&event).unwrap_or_default()
+                        );
                     }
-                };
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(_)) => return None,
+                    Err(_) => break ": keep-alive\n\n".to_owned(),
+                }
+            };
 
-                Some((chunk, ()))
-            }
+            Some((chunk, live))
         }));
     }
 
@@ -667,14 +657,6 @@ async fn respond_node(
             None => plain(StatusCode::NOT_FOUND, "not found\n"),
         },
     }
-}
-
-/// A receiver that never yields, to stand in while the real one is
-/// moved into a stream step.
-fn events_placeholder() -> tokio::sync::broadcast::Receiver<EventRow> {
-    let (sender, receiver) = tokio::sync::broadcast::channel(1);
-    std::mem::forget(sender);
-    receiver
 }
 
 /// A Server-Sent Events response from a stream of messages.
