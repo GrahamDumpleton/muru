@@ -1037,6 +1037,10 @@ pub struct Host {
     /// (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_override: Option<ErrorOverride>,
+    /// The `[rate_limit.NAME]` tables applied to every request for the
+    /// host (section 4.15), before a route's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<String>,
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
@@ -1142,6 +1146,388 @@ pub struct Route {
     /// request on the route arrives (10GB by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spool_quota: Option<String>,
+    /// The `[rate_limit.NAME]` tables applied to the route's requests
+    /// (section 4.15), after the host's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<String>,
+    /// Methods the route refuses (section 4.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Methods>,
+    /// The site mode passed to the application as muru.mode, for example
+    /// read-only (section 4.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// A route's method restrictions (section 4.15).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Methods {
+    /// The methods refused, for example POST, PUT, PATCH and DELETE.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// `read_only` (the default) answers 503 read_only;
+    /// `method_not_allowed` answers 405 with the methods left in Allow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+}
+
+/// Check a route's rate limit names, method restrictions and mode.
+/// Whether the rate limits exist is for the daemon to check.
+pub fn check_route_policies(route: &Route) -> Result<(), String> {
+    for name in &route.rate_limits {
+        check_policy_name("rate_limits", name)?;
+    }
+
+    if let Some(methods) = &route.methods {
+        if methods.deny.is_empty() {
+            return Err("methods.deny names no method".to_owned());
+        }
+
+        for method in &methods.deny {
+            if method.is_empty() || !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+                return Err(format!(
+                    "methods.deny: {method:?} is not a method such as POST"
+                ));
+            }
+        }
+
+        if let Some(answer) = &methods.answer
+            && answer != "read_only"
+            && answer != "method_not_allowed"
+        {
+            return Err(format!(
+                "methods.answer must be read_only or method_not_allowed, not {answer:?}"
+            ));
+        }
+    }
+
+    if let Some(mode) = &route.mode
+        && (mode.is_empty() || mode.len() > 64 || !mode.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(format!(
+            "mode: {mode:?} must be a short word such as read-only"
+        ));
+    }
+
+    Ok(())
+}
+
+/// A client class or rate limit name: lower case letters, digits, `_`
+/// and `-`, as `ai_crawler` or `crawlers`.
+fn check_policy_name(key: &str, name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        });
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key}: {name:?} must be lower case letters, digits, _ and -"
+        ))
+    }
+}
+
+/// A `[[client_class]]` rule (section 4.14). A request gets the class
+/// when every input the rule names matches, each input matching when any
+/// of its entries does; rules are tried in order and a request that
+/// matches none is class `default`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientClass {
+    /// The class's name, as logs, metrics, rate limits and applications
+    /// see it.
+    pub name: String,
+    /// User-Agent substrings, compared without regard to case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent: Vec<String>,
+    /// User-Agent regular expressions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_regex: Vec<String>,
+    /// A file of User-Agent substrings, one a line, relative to the
+    /// configuration file's directory and read again when it changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent_list: Option<String>,
+    /// Client addresses and networks, such as 203.0.113.0/24.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    /// A file of addresses and networks, one a line, as for
+    /// `user_agent_list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_list: Option<String>,
+    /// Request headers by name, each value matched by a regular
+    /// expression: a CDN's verdict, say.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Cookies by name, each value matched by a regular expression.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cookies: BTreeMap<String, String>,
+    /// `dns` confirms the client's address by reverse and forward lookup
+    /// against `verify_domains`; until it is confirmed the rule does not
+    /// match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<String>,
+    /// The domains a verified name must be, or end in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_domains: Vec<String>,
+}
+
+/// The class a request matching no rule gets.
+pub const DEFAULT_CLIENT_CLASS: &str = "default";
+
+/// Check a `[[client_class]]` rule: a name, at least one input, regular
+/// expressions that compile and a verification with its domains. Whether
+/// the list files can be read is for the daemon to check.
+pub fn check_client_class(class: &ClientClass) -> Result<(), String> {
+    check_policy_name("client_class", &class.name)?;
+
+    if class.name == DEFAULT_CLIENT_CLASS {
+        return Err("client_class: default is the class of requests no rule matches".to_owned());
+    }
+
+    let inputs = !class.user_agent.is_empty()
+        || !class.user_agent_regex.is_empty()
+        || class.user_agent_list.is_some()
+        || !class.addresses.is_empty()
+        || class.address_list.is_some()
+        || !class.headers.is_empty()
+        || !class.cookies.is_empty();
+
+    if !inputs {
+        return Err(format!(
+            "client_class {}: names nothing to match",
+            class.name
+        ));
+    }
+
+    for pattern in class
+        .user_agent_regex
+        .iter()
+        .chain(class.headers.values())
+        .chain(class.cookies.values())
+    {
+        regex::Regex::new(pattern).map_err(|error| {
+            format!(
+                "client_class {}: {pattern:?} is not a regular expression: {error}",
+                class.name
+            )
+        })?;
+    }
+
+    match class.verify.as_deref() {
+        None if !class.verify_domains.is_empty() => {
+            return Err(format!(
+                "client_class {}: verify_domains needs verify = 'dns'",
+                class.name
+            ));
+        }
+        None => {}
+        Some("dns") if class.verify_domains.is_empty() => {
+            return Err(format!(
+                "client_class {}: verify = 'dns' needs verify_domains",
+                class.name
+            ));
+        }
+        Some("dns") => {}
+        Some(other) => {
+            return Err(format!(
+                "client_class {}: verify must be dns, not {other:?}",
+                class.name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// A `[rate_limit.NAME]` table (section 4.15): a token bucket for each
+/// key, which requests of the matching classes draw from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    /// Which requests draw from the buckets; all of them without it.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<RateLimitMatch>,
+    /// What a bucket is kept for: `address` (the default),
+    /// `client_class`, `header:NAME`, `cookie:NAME`, or a list of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<RateLimitKey>,
+    /// How fast a bucket fills, for example 2/s, 100/m or 1000/h.
+    pub rate: String,
+    /// How many requests a full bucket allows at once (the rate's count
+    /// by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+    /// `reject` (the default) answers 429, `delay` holds the request up
+    /// to `max_delay` first, `log` only counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// The longest a request is held under `delay` (1s by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<String>,
+    /// The leading bits of an IPv4 address that make the key (32).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_prefix: Option<u8>,
+    /// The leading bits of an IPv6 address that make the key (64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_prefix: Option<u8>,
+    /// Send the RateLimit-Policy and RateLimit fields with a 429.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<bool>,
+}
+
+/// The requests a rate limit applies to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitMatch {
+    /// Client classes (section 4.14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<String>,
+}
+
+/// One key part or several.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RateLimitKey {
+    /// A single part.
+    One(String),
+    /// Parts combined.
+    Many(Vec<String>),
+}
+
+/// A rate limit with its defaults in place, as `check_rate_limit`
+/// resolves it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitSettings {
+    /// The classes it applies to; every class when empty.
+    pub classes: Vec<String>,
+    /// The key's parts.
+    pub key: Vec<String>,
+    /// Tokens added each second.
+    pub per_second: f64,
+    /// The bucket's size.
+    pub burst: u32,
+    /// reject, delay or log.
+    pub action: String,
+    /// The longest hold under delay.
+    pub max_delay: std::time::Duration,
+    /// The address prefixes.
+    pub ipv4_prefix: u8,
+    /// The address prefixes.
+    pub ipv6_prefix: u8,
+    /// Whether a 429 carries the RateLimit fields.
+    pub headers: bool,
+}
+
+/// Parse a rate such as 2/s, 100/m or 1000/h into the count and the
+/// period's seconds.
+pub fn parse_rate(text: &str) -> Result<(u32, u64), String> {
+    let (count, period) = text
+        .split_once('/')
+        .ok_or_else(|| format!("{text:?} is not a rate such as 2/s, 100/m or 1000/h"))?;
+    let count: u32 = count
+        .trim()
+        .parse()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| format!("{text:?} is not a rate such as 2/s, 100/m or 1000/h"))?;
+
+    let seconds = match period.trim() {
+        "s" | "second" => 1,
+        "m" | "minute" => 60,
+        "h" | "hour" => 3600,
+        _ => {
+            return Err(format!(
+                "{text:?} is not a rate such as 2/s, 100/m or 1000/h"
+            ));
+        }
+    };
+
+    Ok((count, seconds))
+}
+
+/// Check a `[rate_limit.NAME]` table and resolve it with its defaults.
+pub fn check_rate_limit(name: &str, limit: &RateLimit) -> Result<RateLimitSettings, String> {
+    check_policy_name("rate_limit", name)?;
+    let (count, seconds) =
+        parse_rate(&limit.rate).map_err(|error| format!("rate_limit {name}: rate: {error}"))?;
+
+    let key = match &limit.key {
+        None => vec!["address".to_owned()],
+        Some(RateLimitKey::One(part)) => vec![part.clone()],
+        Some(RateLimitKey::Many(parts)) => parts.clone(),
+    };
+
+    if key.is_empty() {
+        return Err(format!("rate_limit {name}: key names no part"));
+    }
+
+    for part in &key {
+        let valid = matches!(part.as_str(), "address" | "client_class")
+            || part
+                .strip_prefix("header:")
+                .or_else(|| part.strip_prefix("cookie:"))
+                .is_some_and(|rest| !rest.is_empty());
+
+        if !valid {
+            return Err(format!(
+                "rate_limit {name}: key {part:?} must be address, client_class, header:NAME or cookie:NAME"
+            ));
+        }
+    }
+
+    let action = limit.action.clone().unwrap_or_else(|| "reject".to_owned());
+
+    if !matches!(action.as_str(), "reject" | "delay" | "log") {
+        return Err(format!(
+            "rate_limit {name}: action must be reject, delay or log, not {action:?}"
+        ));
+    }
+
+    let max_delay = match &limit.max_delay {
+        Some(_) if action != "delay" => {
+            return Err(format!(
+                "rate_limit {name}: max_delay needs action = 'delay'"
+            ));
+        }
+        Some(text) => parse_duration(text)
+            .map_err(|error| format!("rate_limit {name}: max_delay: {error}"))?,
+        None => std::time::Duration::from_secs(1),
+    };
+
+    let ipv4_prefix = limit.ipv4_prefix.unwrap_or(32);
+    let ipv6_prefix = limit.ipv6_prefix.unwrap_or(64);
+
+    if ipv4_prefix == 0 || ipv4_prefix > 32 || ipv6_prefix == 0 || ipv6_prefix > 128 {
+        return Err(format!(
+            "rate_limit {name}: ipv4_prefix is 1 to 32 and ipv6_prefix 1 to 128"
+        ));
+    }
+
+    let classes = limit
+        .matches
+        .as_ref()
+        .map(|matches| matches.client_class.clone())
+        .unwrap_or_default();
+
+    for class in &classes {
+        check_policy_name("match.client_class", class)?;
+    }
+
+    Ok(RateLimitSettings {
+        classes,
+        key,
+        per_second: f64::from(count) / seconds as f64,
+        burst: limit.burst.unwrap_or(count).max(1),
+        action,
+        max_delay,
+        ipv4_prefix,
+        ipv6_prefix,
+        headers: limit.headers.unwrap_or(false),
+    })
 }
 
 /// The upload settings of a route with their defaults in place (section
@@ -2080,6 +2466,13 @@ pub struct Document {
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
+    /// Client classification rules, in order (section 4.14), from the
+    /// daemon's own file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<ClientClass>,
+    /// Rate limits by name (section 4.15), from the daemon's own file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rate_limit: BTreeMap<String, RateLimit>,
     /// Routes, in the order written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<Route>,
@@ -2110,6 +2503,15 @@ impl Document {
     pub fn merge(&mut self, other: Document) -> Result<(), String> {
         self.listener.extend(other.listener);
         self.route.extend(other.route);
+        self.client_class.extend(other.client_class);
+
+        for (name, limit) in other.rate_limit {
+            if self.rate_limit.contains_key(&name) {
+                return Err(format!("rate_limit {name} is declared twice"));
+            }
+
+            self.rate_limit.insert(name, limit);
+        }
 
         if other.limits.is_some() {
             self.limits = other.limits;
@@ -2134,6 +2536,24 @@ impl Document {
         if other.proxy.is_some() {
             self.proxy = other.proxy;
         }
+
+        if other.compression.is_some() {
+            self.compression = other.compression;
+        }
+
+        if other.error_override.is_some() {
+            self.error_override = other.error_override;
+        }
+
+        if other.secrets.is_some() {
+            self.secrets = other.secrets;
+        }
+
+        if other.logs.is_some() {
+            self.logs = other.logs;
+        }
+
+        self.error_pages.extend(other.error_pages);
 
         for (name, host) in other.host {
             if self.host.contains_key(&name) {
@@ -2389,6 +2809,111 @@ mod tests {
     }
 
     #[test]
+    fn rates_are_parsed() {
+        assert_eq!(parse_rate("2/s"), Ok((2, 1)));
+        assert_eq!(parse_rate("100 / m"), Ok((100, 60)));
+        assert_eq!(parse_rate("1000/hour"), Ok((1000, 3600)));
+
+        for bad in ["2", "0/s", "2/d", "x/s"] {
+            assert!(parse_rate(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rate_limits_resolve_with_their_defaults() {
+        let limit: RateLimit = toml::from_str("rate = '120/m'").unwrap();
+        let settings = check_rate_limit("crawlers", &limit).unwrap();
+        assert_eq!(settings.key, vec!["address".to_owned()]);
+        assert!((settings.per_second - 2.0).abs() < f64::EPSILON);
+        assert_eq!(settings.burst, 120);
+        assert_eq!(settings.action, "reject");
+        assert_eq!((settings.ipv4_prefix, settings.ipv6_prefix), (32, 64));
+
+        let limit: RateLimit = toml::from_str(
+            "rate = '2/s'\nburst = 10\nkey = ['client_class', 'header:x-api-key']\naction = 'delay'\nmax_delay = '500ms'\nmatch = { client_class = ['ai_crawler'] }",
+        )
+        .unwrap();
+        let settings = check_rate_limit("crawlers", &limit).unwrap();
+        assert_eq!(settings.classes, vec!["ai_crawler".to_owned()]);
+        assert_eq!(settings.key.len(), 2);
+        assert_eq!(settings.max_delay, std::time::Duration::from_millis(500));
+
+        for (text, expected) in [
+            ("rate = '2/s'\nkey = 'path'", "key \"path\""),
+            ("rate = '2/s'\naction = 'drop'", "action must be"),
+            ("rate = '2/s'\nmax_delay = '1s'", "max_delay needs"),
+            ("rate = '2/s'\nipv6_prefix = 0", "ipv6_prefix"),
+            ("rate = 'often'", "rate:"),
+        ] {
+            let limit: RateLimit = toml::from_str(text).unwrap();
+            let error = check_rate_limit("crawlers", &limit).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+
+        assert!(check_rate_limit("Crawlers", &RateLimit::default()).is_err());
+    }
+
+    #[test]
+    fn client_classes_are_checked() {
+        let class = |text: &str| -> ClientClass { toml::from_str(text).unwrap() };
+        assert!(
+            check_client_class(&class("name = 'partner'\naddresses = ['203.0.113.0/24']")).is_ok()
+        );
+
+        for (text, expected) in [
+            ("name = 'partner'", "names nothing"),
+            (
+                "name = 'default'\nuser_agent = ['x']",
+                "default is the class",
+            ),
+            (
+                "name = 'bot'\nuser_agent_regex = ['(']",
+                "not a regular expression",
+            ),
+            (
+                "name = 'bot'\nuser_agent = ['x']\nverify = 'dns'",
+                "needs verify_domains",
+            ),
+            (
+                "name = 'bot'\nuser_agent = ['x']\nverify_domains = ['a.com']",
+                "needs verify = 'dns'",
+            ),
+            (
+                "name = 'bot'\nuser_agent = ['x']\nverify = 'whois'\nverify_domains = ['a.com']",
+                "verify must be dns",
+            ),
+        ] {
+            let error = check_client_class(&class(text)).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn route_policies_are_checked() {
+        let route = |keys: &str| upload_route(keys);
+        assert!(
+            check_route_policies(&route(
+                "rate_limits = ['crawlers']\nmode = 'read-only'\nmethods = { deny = ['POST'] }"
+            ))
+            .is_ok()
+        );
+
+        for (keys, expected) in [
+            ("methods = { deny = [] }", "names no method"),
+            ("methods = { deny = ['post'] }", "not a method"),
+            (
+                "methods = { deny = ['POST'], answer = 'teapot' }",
+                "methods.answer",
+            ),
+            ("mode = 'read only'", "mode:"),
+            ("rate_limits = ['Bad']", "rate_limits:"),
+        ] {
+            let error = check_route_policies(&route(keys)).unwrap_err();
+            assert!(error.contains(expected), "{keys}: {error}");
+        }
+    }
+
+    #[test]
     fn upload_keys_are_checked() {
         for (keys, expected) in [
             ("upload = 'stream'", "upload must be multipart or raw"),
@@ -2518,8 +3043,16 @@ mod tests {
             hash: Some(Vec::new()),
             precheck: Some(true),
             spool_quota: None,
+            rate_limits: vec!["crawlers".to_owned()],
+            methods: Some(Methods {
+                deny: vec!["POST".to_owned()],
+                answer: None,
+            }),
+            mode: Some("read-only".to_owned()),
         });
         let text = document.to_toml().unwrap();
+        assert!(text.contains("rate_limits = [\"crawlers\"]"), "{text}");
+        assert!(text.contains("mode = \"read-only\""), "{text}");
         assert!(text.contains("upload = \"multipart\""), "{text}");
         assert!(text.contains("hash = []"), "{text}");
         assert!(text.contains("[app.shop.release.r1]"), "{text}");

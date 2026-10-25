@@ -191,7 +191,7 @@ pub struct Plan {
 /// last declared release of an application is the one that serves; hosts
 /// and routes follow; with `prune`, removals of what the document does
 /// not contain come last.
-pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
+pub fn plan(store: &Store, document: &Document, prune: bool, rate_limits: &[String]) -> Plan {
     let mut plan = Plan::default();
 
     // Listeners and limits are node settings, read from the daemon's own
@@ -247,13 +247,21 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
         );
     }
 
+    if !document.client_class.is_empty() || !document.rate_limit.is_empty() {
+        plan.warnings.push(
+            "[[client_class]] and [rate_limit] tables belong in the daemon configuration file \
+             and were not applied"
+                .to_owned(),
+        );
+    }
+
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
     }
 
-    plan_hosts(store, document, &mut plan);
+    plan_hosts(store, document, rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
-    plan_routes(store, document, &mut plan);
+    plan_routes(store, document, rate_limits, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -401,7 +409,17 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
 /// The changes the document's hosts imply (section 4.3): names are
 /// checked, duplicates refused and certificates read, so a bad host
 /// never reaches the edge.
-fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
+/// Section 4.15: the rate limits `names` asks for that the daemon's file
+/// does not define.
+fn unknown_limits(names: &[String], defined: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| !defined.contains(name))
+        .cloned()
+        .collect()
+}
+
+fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: &mut Plan) {
     let stored: BTreeMap<String, VirtualHost> =
         store.hosts().unwrap_or_default().into_iter().collect();
     let mut seen_names: BTreeMap<String, String> = BTreeMap::new();
@@ -415,6 +433,13 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
         }
 
         let mut valid = true;
+
+        for missing in unknown_limits(&host.rate_limits, rate_limits) {
+            plan.errors.push(format!(
+                "host {name}: no rate limit named {missing} in the daemon configuration file"
+            ));
+            valid = false;
+        }
 
         for declared in &host.names {
             let normalised = muru_edge::routing::normalise(declared);
@@ -496,7 +521,7 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
 }
 
 /// The changes the document's routes imply (section 4.5).
-fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan: &mut Plan) {
     let stored: BTreeMap<(String, String), RouteTable> = store
         .routes()
         .unwrap_or_default()
@@ -685,6 +710,23 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                     ));
                 }
             }
+        }
+
+        // Section 4.15: the route's rate limits, method restrictions and
+        // mode.
+
+        if let Err(error) = muru_config::check_route_policies(route) {
+            plan.errors
+                .push(format!("route {} {}: {error}", route.host, route.path));
+            valid = false;
+        }
+
+        for missing in unknown_limits(&route.rate_limits, rate_limits) {
+            plan.errors.push(format!(
+                "route {} {}: no rate limit named {missing} in the daemon configuration file",
+                route.host, route.path
+            ));
+            valid = false;
         }
 
         // Sections 4.6 and 4.11: the body limit, and the upload keys, which
@@ -2892,7 +2934,7 @@ mod tests {
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
 
-        let plan = plan(&store, &Document::parse(&text).unwrap(), true);
+        let plan = plan(&store, &Document::parse(&text).unwrap(), true, &[]);
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.changes.is_empty(), "{:?}", plan.changes);
         assert_eq!(plan.unchanged, 1);
@@ -2921,7 +2963,7 @@ mod tests {
             source.display()
         );
 
-        let plan = plan(&store, &Document::parse(&text).unwrap(), false);
+        let plan = plan(&store, &Document::parse(&text).unwrap(), false, &[]);
         assert_eq!(plan.errors.len(), 1, "{:?}", plan.errors);
         assert!(
             plan.errors[0].contains("shop@r1 already exists")
@@ -2948,7 +2990,7 @@ mod tests {
     fn prune_removes_what_is_not_declared() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let plan = plan(&store, &Document::default(), true);
+        let plan = plan(&store, &Document::default(), true, &[]);
         let names: Vec<(&str, String)> = plan
             .changes
             .iter()
@@ -2972,7 +3014,7 @@ mod tests {
                     [app.shop.release.r2]\nsource = '/nonexistent/dir'\n\
                     [[listener]]\naddress = '127.0.0.1:8080'\n";
 
-        let plan = plan(&store, &Document::parse(text).unwrap(), false);
+        let plan = plan(&store, &Document::parse(text).unwrap(), false, &[]);
         assert_eq!(plan.errors.len(), 3, "{:?}", plan.errors);
         assert!(plan.errors[0].contains("\"Shop\" is not a valid application name"));
         assert!(plan.errors[1].contains("shop@r1 has no source directory"));

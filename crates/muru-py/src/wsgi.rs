@@ -881,6 +881,17 @@ fn build_environ<'py>(
         environ.set_item(intern!(py, "muru.precheck"), true)?;
     }
 
+    // Sections 4.14 and 4.15: the client's class, and the route's site
+    // mode when it has one.
+
+    if !head.client_class.is_empty() {
+        environ.set_item(intern!(py, "muru.client_class"), &head.client_class)?;
+    }
+
+    if !head.mode.is_empty() {
+        environ.set_item(intern!(py, "muru.mode"), &head.mode)?;
+    }
+
     // Section 4.10: a request that arrived by internal redirect carries
     // the CGI REDIRECT_* variables for what the client asked for.
 

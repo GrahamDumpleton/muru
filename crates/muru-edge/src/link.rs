@@ -498,6 +498,10 @@ pub struct Context<'a> {
     pub upload: Option<Arc<crate::uploads::Policy>>,
     /// Where uploads are stored.
     pub spool: Option<Arc<crate::uploads::Spool>>,
+    /// The client's class (section 4.14).
+    pub client_class: Arc<str>,
+    /// The route's site mode (section 4.15), for the application.
+    pub mode: Option<Arc<str>>,
 }
 
 impl<'a> Context<'a> {
@@ -540,6 +544,8 @@ impl<'a> Context<'a> {
             handler: Some(budget),
             upload: None,
             spool: self.spool.clone(),
+            client_class: Arc::clone(&self.client_class),
+            mode: None,
         }
     }
 }
@@ -693,6 +699,7 @@ impl Recording {
                 application: Duration::ZERO,
                 total: Duration::ZERO,
                 redirects: context.hops.clone(),
+                client_class: context.client_class.to_string(),
             },
             started: Instant::now(),
         }

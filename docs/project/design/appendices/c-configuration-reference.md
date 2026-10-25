@@ -61,6 +61,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | upload, max_file_size, max_files, hash, precheck, spool_quota | route (spool_quota also in the daemon's [limits], for every application together) | off, unlimited, 100 (at most 500), [sha256], false, 10GB per application (none for the node) | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache | route | none | 4.9 |
 | sendfile_roots, sendfile_header | release, mount, upstream | none, none | 4.9 |
+| rate_limits | host, route | none | 4.15 |
+| methods (deny, answer), mode | route | none, read_only, none | 4.15 |
 | error_pages, error_override | global, host, application (release), route | built-in, off | 4.12 |
 | maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release | none, none, none, 60s | 4.12 |
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |

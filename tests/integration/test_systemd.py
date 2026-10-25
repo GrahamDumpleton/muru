@@ -123,7 +123,7 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
         # Nothing changed yet, and the daemon says so.
 
         unchanged = daemon.muructl("daemon", "reload").stdout
-        assert "[error_override] tables are unchanged" in unchanged, unchanged
+        assert "[rate_limit] tables are unchanged" in unchanged, unchanged
 
         # The table appears in the file; a reload hands it to the edge.
 
@@ -131,7 +131,7 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
             handle.write("\n[proxy]\ntrusted = ['loopback']\n")
 
         reloaded = daemon.muructl("daemon", "reload").stdout
-        assert "[error_override] tables changed and the edge has them" in reloaded
+        assert "[rate_limit] tables changed and the edge has them" in reloaded
         environ = json.loads(daemon.request("/info", headers=headers).body)["environ"]
         assert environ["REMOTE_ADDR"] == "203.0.113.5"
         assert daemon.events().count("config.reloaded") == 2

@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod client;
+pub mod clients;
 pub mod config;
 pub mod daemon;
 pub mod dashboard;

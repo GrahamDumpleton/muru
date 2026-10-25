@@ -1161,6 +1161,17 @@ fn build_scope<'py>(
         muru.set_item("precheck", true)?;
     }
 
+    // Sections 4.14 and 4.15: the client's class, and the route's site
+    // mode when it has one.
+
+    if !head.client_class.is_empty() {
+        muru.set_item("client_class", &head.client_class)?;
+    }
+
+    if !head.mode.is_empty() {
+        muru.set_item("mode", &head.mode)?;
+    }
+
     // Section 4.10: a request that arrived by internal redirect says so,
     // with what the client asked for.
 

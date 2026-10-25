@@ -31,12 +31,14 @@ use tokio_rustls::TlsAcceptor;
 
 pub mod access;
 pub mod auth;
+pub mod classify;
 pub mod compression;
 pub mod connections;
 pub mod errors;
 pub mod link;
 pub mod metrics;
 pub mod proxy;
+pub mod ratelimit;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
@@ -245,6 +247,11 @@ struct Shared {
     admission: Vec<Arc<connections::Connections>>,
     /// Where upload routes store files (section 4.11).
     spool: Option<Arc<uploads::Spool>>,
+    /// Claimed crawlers' confirmed names (section 4.14), kept across
+    /// snapshots.
+    verifier: Arc<classify::Verifier>,
+    /// The rate limits' buckets (section 4.15), kept across snapshots.
+    buckets: ratelimit::Buckets,
 }
 
 /// Stops an edge accepting and lets its connections finish (section
@@ -433,6 +440,8 @@ impl Edge {
                 connections: Arc::new(()),
                 admission,
                 spool: config.spool,
+                verifier: classify::Verifier::new(),
+                buckets: ratelimit::Buckets::default(),
             }),
         })
     }
@@ -722,6 +731,11 @@ async fn serve<I>(
             let redirect_to = redirect_to.filter(|_| !secure);
             let client = forwarded.client.unwrap_or(peer);
             let proxy = forwarded.client.map(|_| peer);
+
+            // Section 4.14: the client's class, from the address and
+            // headers the request arrived with.
+
+            let client_class = routing.classify(client.ip(), &parts.headers, &shared.verifier);
             let client_target = parts
                 .uri
                 .path_and_query()
@@ -753,6 +767,7 @@ async fn serve<I>(
             let mut issued: Vec<String> = Vec::new();
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
+            let mut admitted = false;
 
             let response = loop {
                 let decision = routing.select(
@@ -815,7 +830,52 @@ async fn serve<I>(
                     handler: handling.as_ref().map(|_| link::HANDLER_TIMEOUT),
                     upload: None,
                     spool: shared.spool.clone(),
+                    client_class: Arc::clone(&client_class),
+                    mode: None,
                 };
+
+                // Section 4.15: a client's own request draws from the
+                // host's and the route's rate limits, then meets the
+                // route's method restrictions.
+
+                if !admitted && origin.is_none() && handling.is_none() && redirect_to.is_none() {
+                    admitted = true;
+                    let outcome = shared.buckets.check(
+                        decision.limits(),
+                        &client_class,
+                        client.ip(),
+                        &parts.headers,
+                        Instant::now(),
+                    );
+
+                    for (limit, result) in &outcome.counted {
+                        shared
+                            .access_log
+                            .metrics()
+                            .count_rate_limit(limit, &client_class, result);
+                    }
+
+                    match outcome.verdict {
+                        ratelimit::Verdict::Allow => {}
+                        ratelimit::Verdict::Delay(wait) => tokio::time::sleep(wait).await,
+                        ratelimit::Verdict::Reject { limit, retry_after } => {
+                            break link::reject(
+                                &parts,
+                                &context,
+                                ratelimit::rejected(&limit, retry_after),
+                            );
+                        }
+                    }
+
+                    if let routing::Decision::Serve {
+                        methods: Some(methods),
+                        ..
+                    } = &decision
+                        && let Some(problem) = methods.refuse(&parts.method)
+                    {
+                        break link::reject(&parts, &context, problem);
+                    }
+                }
 
                 // Section 4.16: a guarded route is served only once its
                 // handler allows the client's request; a sub-request of
@@ -918,6 +978,9 @@ async fn serve<I>(
                             auth: _,
                             upload,
                             max_body_size,
+                            limits: _,
+                            methods: _,
+                            mode,
                         },
                     ) => {
                         // Section 4.12: an application does not serve its
@@ -934,6 +997,7 @@ async fn serve<I>(
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
+                        context.mode = mode;
 
                         if origin.is_none()
                             && let Some(maintenance) = &selection.maintenance
@@ -1034,6 +1098,7 @@ async fn serve<I>(
                             server_name,
                             cookies,
                             auth: _,
+                            limits: _,
                         },
                     ) => {
                         // Section 4.9: the file, or the fallback application
@@ -1576,6 +1641,8 @@ pub(crate) fn request_head(
         http_version: format!("{:?}", parts.version),
         expect_continue: expects_continue(parts) && content_length != Some(0),
         server_name: context.server_name.clone().unwrap_or_default(),
+        client_class: context.client_class.to_string(),
+        mode: context.mode.as_deref().unwrap_or_default().to_owned(),
         internal: context
             .internal
             .as_ref()

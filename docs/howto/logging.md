@@ -119,7 +119,8 @@ A JSON line has these fields:
  "client": "127.0.0.1", "app": "shop", "release": "r1", "host": "shop.example.com",
  "group": "default", "mount": "default", "method": "GET", "target": "/hello",
  "version": "HTTP/1.1", "status": 200, "reason": "", "bytes": 18, "worker": 0,
- "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3}
+ "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3, "redirects": [],
+ "client_class": "default"}
 ```
 
 `reason` is empty for responses the application produced and names the
@@ -128,8 +129,11 @@ page lists them. `app` and `release` name what served the request, `host`
 is the virtual host that matched or else the host the client asked for,
 `group` and `mount` are `default` or the named [worker
 group](worker-groups.md) and [mount](mounts.md), and `snapshot` is the
-version of the routing the edge used (0 in development mode). The compact
-line shows the group and mount only when they are named.
+version of the routing the edge used (0 in development mode).
+`redirects` lists the targets of [internal redirects](internal-redirects.md)
+the request went through, and `client_class` is its [client
+class](client-classes.md). The compact line shows the group, the mount and
+the class (as `class=`) only when they are not `default`.
 
 ## Under the daemon
 

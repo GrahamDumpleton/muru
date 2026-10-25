@@ -41,6 +41,7 @@ class Site:
     daemon: Daemon
     base: Path
     prechecks: Path
+    metrics_port: int
 
     @property
     def spool(self) -> Path:
@@ -68,7 +69,10 @@ def site(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Site]:
     prechecks = base / "prechecks"
     prechecks.touch()
     (base / "daemon").mkdir()
-    daemon = start_daemon(base / "daemon")
+    metrics_port = support.free_port()
+    daemon = start_daemon(
+        base / "daemon", config_extra=f"[metrics]\nlisten = '127.0.0.1:{metrics_port}'\n"
+    )
 
     try:
         config = base / "site.toml"
@@ -140,7 +144,7 @@ upload = 'multipart'
         )
         daemon.muructl("apply", "-f", str(config))
         daemon.muructl("release", "wait", "uploads@r1", "--timeout", "60")
-        yield Site(daemon, base, prechecks)
+        yield Site(daemon, base, prechecks, metrics_port)
     finally:
         daemon.stop()
 
@@ -375,6 +379,18 @@ def test_saved_files_are_linked_and_unsaved_ones_vanish(site: Site, tmp_path: Pa
         time.sleep(0.1)
 
     assert list(site.spool.iterdir()) == []
+
+    # And the gauge is back to nothing held.
+
+    connection = http.client.HTTPConnection("127.0.0.1", site.metrics_port, timeout=30)
+
+    try:
+        connection.request("GET", "/metrics")
+        exposition = connection.getresponse().read().decode()
+    finally:
+        connection.close()
+
+    assert 'muru_upload_spool_bytes{app="uploads"} 0' in exposition
 
 
 def test_upload_path_opens_the_file(site: Site) -> None:

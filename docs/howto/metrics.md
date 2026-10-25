@@ -51,9 +51,11 @@ Names start with `muru_`. Where they apply, labels name the application
 
 | Metric | Kind | Labels | Holds |
 | --- | --- | --- | --- |
-| `muru_requests_total` | counter | app, release, group, mount, status, reason | requests completed; `status` is the class (`2xx`) and `reason` is present when Muru generated the response, with the values the [error responses](../reference/errors.md) page lists |
+| `muru_requests_total` | counter | app, release, group, mount, status, reason, client_class | requests completed; `status` is the class (`2xx`), `reason` is present when Muru generated the response, with the values the [error responses](../reference/errors.md) page lists, and `client_class` is the request's [class](client-classes.md) |
 | `muru_request_duration_seconds` | histogram | app, release, phase | time in the `queue` (waiting for a worker slot), in the `application` (until the response head arrived) and in `total`; the first two only for requests a worker served |
 | `muru_requests_in_flight` | gauge | app, release | requests taken and not yet answered |
+| `muru_rate_limited_total` | counter | limit, client_class, action | requests a [rate limit](client-classes.md) refused (`rejected`), held (`delayed`) or only counted (`logged`) |
+| `muru_upload_spool_bytes` | gauge | app | bytes the edge holds for each application's [uploads](uploads.md) in progress |
 | `muru_auth_requests_total` | counter | result | [authentication sub-requests](auth-subrequests.md) by result: `allowed`, `cached`, `denied` or `unavailable` |
 | `muru_queue_depth` | gauge | app, release, group | requests waiting for a slot |
 | `muru_slots_busy` | gauge | app, release, group | slots handling a request |
@@ -73,8 +75,8 @@ tables, carries no application or release labels.
 ```
 # HELP muru_requests_total Requests completed, by status class and the reason when the edge generated the response.
 # TYPE muru_requests_total counter
-muru_requests_total{app="shop",release="r1",group="default",mount="default",status="2xx"} 1284
-muru_requests_total{app="shop",release="r1",group="default",mount="default",status="5xx",reason="app_error"} 3
+muru_requests_total{app="shop",release="r1",group="default",mount="default",status="2xx",client_class="default"} 1284
+muru_requests_total{app="shop",release="r1",group="default",mount="default",status="5xx",reason="app_error",client_class="default"} 3
 # HELP muru_request_duration_seconds Time a request spent waiting for a worker (queue), in the application, and in total.
 # TYPE muru_request_duration_seconds histogram
 muru_request_duration_seconds_bucket{app="shop",release="r1",phase="total",le="0.005"} 1180

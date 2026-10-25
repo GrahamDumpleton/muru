@@ -129,7 +129,8 @@ pub enum DaemonCommand {
     },
 
     /// Re-read the daemon's configuration file for what can change while
-    /// it runs: the [proxy] and [compression] tables.
+    /// it runs: the [proxy], [compression], [error_pages],
+    /// [error_override], [[client_class]] and [rate_limit] tables.
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
@@ -262,6 +263,8 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         compression: document.compression.clone(),
         error_pages: document.error_pages.clone(),
         error_override: document.error_override.clone(),
+        client_classes: document.client_class.clone(),
+        rate_limits: document.rate_limit.clone(),
         secrets,
         rotation: muru_controller::rotation::Policy::from_table(document.logs.as_ref())?,
         access_log,

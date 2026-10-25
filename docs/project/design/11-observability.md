@@ -23,6 +23,7 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 | Scaling | muru_scaling_decisions_total, muru_workers_desired, muru_workers_ready, muru_churn_reaps_total |
 | Edge | muru_edge_connections, muru_tls_handshakes_total, muru_snapshot_version, muru_edge_cpu_ratio per thread, muru_upstream_health |
 | Bodies and uploads | muru_body_rejections_total, muru_upload_spool_bytes |
+| Clients | muru_requests_total by client_class, muru_rate_limited_total by limit, client class and action |
 
 The dashboard reads the same values from in-memory history. OTLP metric export is optional.
 

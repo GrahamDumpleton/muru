@@ -351,6 +351,25 @@ application and for the node answer 413 `upload_too_large`,
 read. Recipes for Flask, Starlette and Django turn the files into each
 framework's own upload objects, and the test fixtures run all three.
 
+Client classes, rate limits, method restrictions and route site modes
+(sections 4.14 and 4.15) are in. `[[client_class]]` rules in the
+daemon's file classify each request by user agent (substrings, regular
+expressions or a list file), address (or a list file), headers and
+cookies, first match wins, with a claimed crawler confirmed by reverse
+and forward DNS in the background; list files are read again when they
+change, and the class reaches the access log, `muru_requests_total` and
+the application as `muru.client_class`. `[rate_limit.NAME]` token
+buckets keyed by address prefix, class, header or cookie, which hosts
+and routes name, reject with 429 and Retry-After (and the RateLimit
+fields where asked), delay, or only log, counted in
+`muru_rate_limited_total` with the `ratelimit.enforcing` event. A
+route's `methods` refuses methods with 503 read_only or 405, and its
+`mode` reaches the application as `muru.mode`. Still to come: routing
+on a class (routes, traffic policies and worker groups), classes and
+limits in applied files, the application-level mode and modes set by
+overlays (section 9.10), buckets shared between several edge processes,
+and TLS fingerprints as an input.
+
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as
 a file read when the snapshot is compiled, a template the edge renders

@@ -104,6 +104,8 @@ pub struct Record {
     /// The targets the request was redirected to internally (section
     /// 4.10), in order; empty when it was served where it arrived.
     pub redirects: Vec<String>,
+    /// The client's class (section 4.14).
+    pub client_class: String,
 }
 
 impl Record {
@@ -381,6 +383,10 @@ fn text_line(record: &Record) -> String {
         let _ = write!(line, " mount={}", record.mount);
     }
 
+    if !record.client_class.is_empty() && record.client_class != DEFAULT {
+        let _ = write!(line, " class={}", record.client_class);
+    }
+
     if let Some(worker) = record.worker {
         let _ = write!(line, " worker={worker}");
     }
@@ -395,7 +401,7 @@ fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}]}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -422,6 +428,7 @@ fn json_line(record: &Record) -> String {
             .map(|target| json_string(target))
             .collect::<Vec<_>>()
             .join(","),
+        json_string(&record.client_class),
     );
     line.push('\n');
     line
@@ -595,6 +602,7 @@ mod tests {
             application: Duration::ZERO,
             total,
             redirects: Vec::new(),
+            client_class: "default".to_owned(),
         };
         assert!(!log.shows(&record(200, "/", Duration::from_millis(10))));
         assert!(log.shows(&record(500, "/", Duration::from_millis(10))));

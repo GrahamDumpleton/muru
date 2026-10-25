@@ -35,6 +35,7 @@ https
 static-files
 file-hints
 uploads
+client-classes
 internal-redirects
 error-pages
 auth-subrequests

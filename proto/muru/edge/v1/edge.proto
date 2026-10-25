@@ -42,6 +42,42 @@ message Snapshot {
   repeated Upstream upstreams = 10;     // section 4.13: the HTTP upstreams routes may name
   string default_app = 11;              // the application the default workers belong to; found by sockets when empty
   string default_release = 12;          // and its release
+  repeated ClientClass client_classes = 13; // section 4.14: classification rules, in order
+  repeated RateLimit rate_limits = 14;  // section 4.15: the rate limits hosts and routes name
+}
+
+// Section 4.14: a client classification rule, with its list files read.
+// Every input it names must match, an input matching when any of its
+// entries does.
+message ClientClass {
+  string name = 1;
+  repeated string user_agents = 2;      // substrings, compared without regard to case, the list file's included
+  repeated string user_agent_regexes = 3;
+  repeated string addresses = 4;        // addresses and networks, the list file's included
+  map<string, string> headers = 5;      // lower-case header name to a regular expression its value must match
+  map<string, string> cookies = 6;      // cookie name to a regular expression its value must match
+  repeated string verify_domains = 7;   // reverse and forward DNS must confirm a name in one of these; no verification when empty
+}
+
+// Section 4.15: a token bucket for each key, which requests of the
+// matching classes draw from.
+message RateLimit {
+  string name = 1;
+  repeated string classes = 2;          // the classes it applies to; all when empty
+  repeated string key = 3;              // address, client_class, header:NAME or cookie:NAME, combined
+  double per_second = 4;                // tokens added each second
+  uint32 burst = 5;                     // the bucket's size
+  string action = 6;                    // reject, delay or log
+  uint64 max_delay_ms = 7;              // the longest hold under delay
+  uint32 ipv4_prefix = 8;
+  uint32 ipv6_prefix = 9;
+  bool headers = 10;                    // RateLimit-Policy and RateLimit fields on a 429
+}
+
+// Section 4.15: methods a route refuses.
+message Methods {
+  repeated string deny = 1;
+  bool not_allowed = 2;                 // 405 method_not_allowed rather than 503 read_only
 }
 
 // Section 4.13: an unmanaged HTTP server that routes, fallbacks, traffic
@@ -131,6 +167,7 @@ message Host {
   bool default = 9;                     // answers requests whose host matches no host
   repeated ErrorPage error_pages = 10;  // section 4.12: the host's pages
   ErrorOverride error_override = 11;
+  repeated string rate_limits = 12;     // section 4.15: applied to every request for the host
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -158,6 +195,9 @@ message Route {
   string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
   Upload upload = 21;                   // section 4.11: uploads received and stored by the edge; off when absent
   uint64 max_body_size = 22;            // section 4.6: the route's body limit; the edge's own when 0
+  repeated string rate_limits = 23;     // section 4.15: applied after the host's
+  Methods methods = 24;                 // methods the route refuses; none when absent
+  string mode = 25;                     // the site mode the application sees as muru.mode; none when empty
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.

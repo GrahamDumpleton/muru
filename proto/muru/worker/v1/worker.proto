@@ -57,6 +57,8 @@ message RequestHead {
   Scope scope = 25;                 // http unless the request is a WebSocket upgrade
   bool expect_continue = 26;        // the client waits for 100 Continue before sending the body (section 5.5)
   string server_name = 27;          // the virtual host name matched, or its canonical name (section 4.3); SERVER_NAME when set
+  string client_class = 28;         // section 4.14: the class the edge assigned, default when no rule matched
+  string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
 }
 
 // What a REQUEST frame opens (section 5.6).

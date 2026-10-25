@@ -24,13 +24,16 @@ precisely than the status, appears in the access log line as
 | 404 | `internal_only` | The route or mount is reachable only through an internal redirect (see the [internal redirects guide](../howto/internal-redirects.md)) |
 | 408 | `client_timeout` | The client paused for longer than the body idle timeout while sending a body |
 | 413 | `body_too_large` | The declared or actual body is over the limit in force; the page names the limit and the setting. Declared lengths are refused before the body is read. On an upload route, also a form whose fields other than files hold more than 10MB |
+| 405 | `method_not_allowed` | The route refuses the method with `answer = 'method_not_allowed'`; `Allow` names the methods left (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |
 | 413 | `upload_too_large`, `too_many_files` | A file of an [upload](../howto/uploads.md) is over the route's `max_file_size`, or the form has more files than its `max_files` |
+| 429 | `rate_limited` | A [rate limit](../howto/client-classes.md) of the host or route refused the request, with `Retry-After`, and the RateLimit fields when the limit sends them |
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
 | 500 | `redirect_loop` | The application redirected internally more than 5 times for one request |
 | 502 | `upstream_failed` | No address of the [HTTP upstream](../howto/upstreams.md) could be reached, or the one that took the request did not answer it, or a WebSocket upgrade was asked of an HTTP/2 upstream |
 | 502 | `worker_crashed` | The worker's connection ended before a response head, or it sent something invalid |
 | 503 | `auth_unavailable` | The route's [authentication handler](../howto/auth-subrequests.md) could not decide: it failed, answered something other than 2xx, 3xx, 401 or 403, redirected internally, or did not answer within its timeout |
 | 503 | `maintenance` | The application is in maintenance mode (`muructl maintenance on`) and nothing exempted the request; `Retry-After` is the release's `retry_after`, 60 s by default (see the [error pages guide](../howto/error-pages.md)) |
+| 503 | `read_only` | The route refuses the method while its site is read-only (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |
 | 503 | `no_workers` | No worker is available at all, with `Retry-After: 1` |
 | 503 | `queue_full` | Every worker thread was busy for longer than the queue timeout, with `Retry-After: 1` |
 | 504 | `deadline` | The application or upstream did not produce a response head within the request deadline |

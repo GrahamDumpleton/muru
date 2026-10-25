@@ -37,6 +37,9 @@ pub struct Host {
     pub server_name: String,
     /// The host's error pages and override (section 4.12).
     pub errors: Arc<ErrorPolicy>,
+    /// The rate limits every request for the host draws from (section
+    /// 4.15).
+    pub rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
 }
 
 /// Maintenance mode for an application (section 4.12): the edge answers
@@ -122,6 +125,13 @@ struct Route {
     upload: Option<Arc<crate::uploads::Policy>>,
     /// The route's body limit, in place of the edge's (section 4.6).
     max_body_size: Option<u64>,
+    /// The rate limits the route's requests draw from after the host's
+    /// (section 4.15).
+    rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
+    /// The methods the route refuses.
+    methods: Option<Arc<crate::ratelimit::Methods>>,
+    /// The site mode the application sees.
+    mode: Option<Arc<str>>,
 }
 
 impl Route {
@@ -811,6 +821,8 @@ pub struct Routing {
     errors: Arc<ErrorPolicy>,
     /// The HTTP upstreams by name (section 4.13).
     upstreams: HashMap<String, Arc<Upstream>>,
+    /// The client classification rules (section 4.14).
+    classifier: crate::classify::Classifier,
 }
 
 /// Where a request goes.
@@ -831,6 +843,12 @@ pub enum Decision {
         upload: Option<Arc<crate::uploads::Policy>>,
         /// The route's body limit, in place of the edge's (section 4.6).
         max_body_size: Option<u64>,
+        /// The host's and the route's rate limits (section 4.15).
+        limits: Vec<Arc<crate::ratelimit::Limit>>,
+        /// The methods the route refuses.
+        methods: Option<Arc<crate::ratelimit::Methods>>,
+        /// The route's site mode.
+        mode: Option<Arc<str>>,
     },
     /// Redirected to HTTPS: the host insists on it.
     Redirect,
@@ -863,7 +881,20 @@ pub enum Decision {
         cookies: Vec<String>,
         /// The check the route asks for first (section 4.16).
         auth: Option<Arc<crate::auth::Auth>>,
+        /// The host's and the route's rate limits (section 4.15).
+        limits: Vec<Arc<crate::ratelimit::Limit>>,
     },
+}
+
+impl Decision {
+    /// The rate limits the request draws from: the host's, then the
+    /// route's.
+    pub fn limits(&self) -> &[Arc<crate::ratelimit::Limit>] {
+        match self {
+            Self::Serve { limits, .. } | Self::Static { limits, .. } => limits,
+            _ => &[],
+        }
+    }
 }
 
 impl Routing {
@@ -883,6 +914,7 @@ impl Routing {
             routes: Vec::new(),
             errors: Arc::new(ErrorPolicy::default()),
             upstreams: HashMap::new(),
+            classifier: crate::classify::Classifier::default(),
         }
     }
 
@@ -1003,6 +1035,35 @@ impl Routing {
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
 
+        // Sections 4.14 and 4.15: the classes and the rate limits hosts
+        // and routes name. A name with no limit is left out, with a
+        // warning, rather than refusing the snapshot.
+
+        let classifier = crate::classify::Classifier::from_messages(&snapshot.client_classes)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let mut limits: HashMap<String, Arc<crate::ratelimit::Limit>> = HashMap::new();
+
+        for message in &snapshot.rate_limits {
+            let limit = crate::ratelimit::Limit::from_message(message)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            limits.insert(message.name.clone(), limit);
+        }
+
+        let named_limits = |names: &[String], owner: &str| -> Vec<Arc<crate::ratelimit::Limit>> {
+            names
+                .iter()
+                .filter_map(|name| {
+                    let found = limits.get(name).cloned();
+
+                    if found.is_none() {
+                        tracing::warn!(%owner, limit = %name, "no rate limit by that name; it is not applied");
+                    }
+
+                    found
+                })
+                .collect()
+        };
+
         let mut routing = Self {
             version: snapshot.version,
             trust,
@@ -1016,6 +1077,7 @@ impl Routing {
             routes: Vec::new(),
             errors: Arc::new(errors),
             upstreams: upstreams.clone(),
+            classifier,
         };
 
         for host in &snapshot.hosts {
@@ -1050,6 +1112,7 @@ impl Routing {
                 https_redirect: host.https_redirect,
                 server_name,
                 errors: Arc::new(errors),
+                rate_limits: named_limits(&host.rate_limits, &format!("host {}", host.name)),
             });
             routing.routes.push(Vec::new());
         }
@@ -1113,6 +1176,15 @@ impl Routing {
                         .as_ref()
                         .and_then(crate::uploads::Policy::from_message),
                     max_body_size: (route.max_body_size > 0).then_some(route.max_body_size),
+                    rate_limits: named_limits(
+                        &route.rate_limits,
+                        &format!("route {} {}", route.host, route.path),
+                    ),
+                    methods: route
+                        .methods
+                        .as_ref()
+                        .and_then(crate::ratelimit::Methods::from_message),
+                    mode: (!route.mode.is_empty()).then(|| Arc::from(route.mode.as_str())),
                 });
             }
         }
@@ -1122,6 +1194,16 @@ impl Routing {
         }
 
         Ok(routing)
+    }
+
+    /// The class of a request (section 4.14).
+    pub fn classify(
+        &self,
+        client: std::net::IpAddr,
+        headers: &HeaderMap,
+        verifier: &Arc<crate::classify::Verifier>,
+    ) -> Arc<str> {
+        self.classifier.classify(client, headers, verifier)
     }
 
     /// The snapshot's version.
@@ -1262,6 +1344,9 @@ impl Routing {
                     auth: None,
                     upload: None,
                     max_body_size: None,
+                    limits: Vec::new(),
+                    methods: None,
+                    mode: None,
                 },
                 None => Decision::InternalOnly,
             };
@@ -1328,6 +1413,12 @@ impl Routing {
                 }),
                 cookies,
                 auth: route.auth.clone(),
+                limits: host
+                    .rate_limits
+                    .iter()
+                    .chain(&route.rate_limits)
+                    .cloned()
+                    .collect(),
             };
         }
 
@@ -1364,6 +1455,14 @@ impl Routing {
             auth: route.auth.clone(),
             upload: route.upload.clone(),
             max_body_size: route.max_body_size,
+            limits: host
+                .rate_limits
+                .iter()
+                .chain(&route.rate_limits)
+                .cloned()
+                .collect(),
+            methods: route.methods.clone(),
+            mode: route.mode.clone(),
         }
     }
 
@@ -1549,6 +1648,8 @@ mod tests {
     fn snapshot() -> pb::Snapshot {
         pb::Snapshot {
             version: 7,
+            client_classes: Vec::new(),
+            rate_limits: Vec::new(),
             compression: None,
             worker_sockets: Vec::new(),
             default_app: String::new(),

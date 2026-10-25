@@ -76,6 +76,10 @@ pub struct Config {
     pub error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
     /// The node-wide error override (section 4.12).
     pub error_override: Option<muru_config::ErrorOverride>,
+    /// The client classification rules (section 4.14).
+    pub client_classes: Vec<muru_config::ClientClass>,
+    /// The rate limits hosts and routes may name (section 4.15).
+    pub rate_limits: std::collections::BTreeMap<String, muru_config::RateLimit>,
     /// The secret stores (section 10.8).
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
@@ -394,6 +398,9 @@ pub struct Info {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
     pub dashboard: Option<SocketAddr>,
+    /// The rate limits the daemon's file defines (section 4.15), which
+    /// applied hosts and routes may name.
+    pub rate_limits: std::sync::RwLock<Vec<String>>,
 }
 
 /// What a ReopenLogs command reached.
@@ -550,6 +557,11 @@ struct Daemon {
     /// 4.12), for every snapshot.
     error_pages: Vec<pb::ErrorPage>,
     error_override: Option<pb::ErrorOverride>,
+    /// The client classes and rate limits (sections 4.14 and 4.15), for
+    /// every snapshot, with the list files they were read from.
+    clients: crate::clients::ClientPolicies,
+    /// Which rate limits are refusing requests, for the events.
+    enforcement: crate::clients::Enforcement,
     /// The applications in maintenance mode (section 4.12), with when
     /// each was put there.
     maintenance: HashMap<String, u64>,
@@ -605,6 +617,12 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let (error_pages, error_override) =
         error_tables_message(&config.error_pages, config.error_override.as_ref())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let clients = crate::clients::ClientPolicies::resolve(
+        &config.client_classes,
+        &config.rate_limits,
+        &config_directory(&config.locations.config.path),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
@@ -734,6 +752,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
         dashboard,
+        rate_limits: std::sync::RwLock::new(clients.limit_names()),
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -821,6 +840,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         compression,
         error_pages,
         error_override,
+        clients,
+        enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
@@ -927,6 +948,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
+                daemon.refresh_client_lists().await;
+                daemon.watch_rate_limits(samples.as_deref());
             }
         }
     };
@@ -1101,6 +1124,12 @@ fn upload_message(route: &muru_config::Route) -> Option<pb::Upload> {
         precheck: settings.precheck,
         spool_quota: settings.spool_quota,
     })
+}
+
+/// The directory a configuration file's relative paths start from.
+fn config_directory(path: &Path) -> PathBuf {
+    path.parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// The upload spool, open to the edge's user alone: the service user
@@ -1638,21 +1667,30 @@ impl Daemon {
             .map_err(|error| format!("[compression]: {error}"))?;
         let (error_pages, error_override) =
             error_tables_message(&document.error_pages, document.error_override.as_ref())?;
+        let clients = crate::clients::ClientPolicies::resolve(
+            &document.client_class,
+            &document.rate_limit,
+            &config_directory(&path),
+        )?;
         let changed = proxy != self.proxy
             || compression != self.compression
             || error_pages != self.error_pages
-            || error_override != self.error_override;
+            || error_override != self.error_override
+            || clients.classes_message != self.clients.classes_message
+            || clients.limits_message != self.clients.limits_message;
         self.proxy = proxy;
         self.compression = compression;
         self.error_pages = error_pages;
         self.error_override = error_override;
+        *self.info.rate_limits.write().expect("rate limits poisoned") = clients.limit_names();
+        self.clients = clients;
 
         if changed {
             self.push_snapshot().await?;
         }
 
         let message = format!(
-            "reloaded {}: the [proxy], [compression], [error_pages] and [error_override] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
@@ -1663,6 +1701,52 @@ impl Daemon {
         self.events
             .emit("config.reloaded", "daemon", "info", &message);
         Ok(message)
+    }
+
+    /// Section 4.14: read the client classes' list files again when one
+    /// has changed, and give the edge the result.
+    async fn refresh_client_lists(&mut self) {
+        match self.clients.refresh() {
+            Ok(changed) if changed.is_empty() => {}
+            Ok(changed) => {
+                let names: Vec<String> = changed
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                self.events.emit(
+                    "client_class.list_reloaded",
+                    "daemon",
+                    "info",
+                    &format!("read {} again", names.join(", ")),
+                );
+
+                if let Err(error) = self.push_snapshot().await {
+                    tracing::error!(%error, "pushing the snapshot with the reloaded lists failed");
+                }
+            }
+            Err(error) => {
+                // The classes the edge has stay until the list reads.
+
+                tracing::warn!(%error, "a client class list could not be read; the edge keeps the last one read");
+            }
+        }
+    }
+
+    /// Section 4.15: a rate limit that begins refusing or holding
+    /// requests, after a quiet minute, is an event.
+    fn watch_rate_limits(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
+        };
+
+        for (limit, count) in self.enforcement.observe(samples, Instant::now()) {
+            self.events.emit(
+                "ratelimit.enforcing",
+                &format!("rate_limit {limit}"),
+                "warning",
+                &format!("began refusing or holding requests: {count:.0} so far"),
+            );
+        }
     }
 
     /// The node's metrics: the edge's samples with the daemon's own
@@ -2881,6 +2965,7 @@ impl Daemon {
                 default: host.default,
                 error_pages: error_pages_message(&host.error_pages, None),
                 error_override: host.error_override.as_ref().map(error_override_message),
+                rate_limits: host.rate_limits,
             });
         }
 
@@ -2952,6 +3037,12 @@ impl Daemon {
                 error_pages: error_pages_message(&route.error_pages, None),
                 error_override: route.error_override.as_ref().map(error_override_message),
                 auth: route.auth.as_ref().map(auth_message),
+                rate_limits: route.rate_limits,
+                methods: route.methods.as_ref().map(|methods| pb::Methods {
+                    deny: methods.deny.clone(),
+                    not_allowed: methods.answer.as_deref() == Some("method_not_allowed"),
+                }),
+                mode: route.mode.unwrap_or_default(),
             })
             .collect();
 
@@ -2968,6 +3059,8 @@ impl Daemon {
             upstreams,
             default_app,
             default_release,
+            client_classes: self.clients.classes_message.clone(),
+            rate_limits: self.clients.limits_message.clone(),
         }
     }
 

@@ -887,7 +887,14 @@ impl Admin for Service {
             Err(error) => return Ok(Response::new(parse_failure(error))),
         };
 
-        let plan = config::plan(&self.handle.store, &document, request.prune);
+        let rate_limits = self
+            .handle
+            .info
+            .rate_limits
+            .read()
+            .expect("rate limits poisoned")
+            .clone();
+        let plan = config::plan(&self.handle.store, &document, request.prune, &rate_limits);
         let mut report = report_message(&plan);
 
         if !plan.errors.is_empty() || request.dry_run {
@@ -950,7 +957,14 @@ impl Admin for Service {
         // A diff shows both directions: what the document would add and
         // what desired state holds beyond it.
 
-        let plan = config::plan(&self.handle.store, &document, true);
+        let rate_limits = self
+            .handle
+            .info
+            .rate_limits
+            .read()
+            .expect("rate limits poisoned")
+            .clone();
+        let plan = config::plan(&self.handle.store, &document, true, &rate_limits);
         Ok(Response::new(report_message(&plan)))
     }
 

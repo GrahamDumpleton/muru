@@ -1115,6 +1115,7 @@ version = "0.1.0-alpha.5"
 name = "muru-config"
 version = "0.1.0-alpha.5"
 dependencies = [
+ "regex",
  "serde",
  "thiserror",
  "toml",
@@ -1142,6 +1143,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -1193,6 +1195,7 @@ dependencies = [
  "percent-encoding",
  "prost",
  "rcgen",
+ "regex",
  "ring",
  "rustls",
  "rustls-pki-types",
