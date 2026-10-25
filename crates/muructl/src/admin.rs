@@ -1354,6 +1354,20 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
 }
 
+/// An interpreter as the daemon should see it: a path with a directory in
+/// it is made absolute against `base` (else the working directory), since
+/// the daemon runs elsewhere; a bare command name is left for the PATH.
+fn absolute_interpreter(python: &Path, base: Option<&Path>) -> String {
+    if python.is_absolute() || python.components().count() < 2 {
+        return python.display().to_string();
+    }
+
+    let base = base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    base.join(python).display().to_string()
+}
+
 /// Deploy a release.
 pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let source = args
@@ -1374,7 +1388,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
         python: args
             .python
-            .map(|path| path.display().to_string())
+            .map(|path| absolute_interpreter(&path, None))
             .unwrap_or_default(),
         processes: args.processes,
         threads: args.threads,
@@ -1923,6 +1937,10 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
             for release in app.release.values_mut() {
                 if let Some(source) = &release.source {
                     release.source = Some(absolute(source));
+                }
+
+                if let Some(python) = &release.python {
+                    release.python = Some(absolute_interpreter(Path::new(python), Some(&base)));
                 }
             }
         }

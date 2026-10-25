@@ -237,6 +237,20 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
     assert not any(first.run_dir.name in line for line in listing.splitlines())
 
 
+def test_a_relative_interpreter_path_is_resolved_where_the_command_runs(
+    daemon: Daemon,
+) -> None:
+    # The daemon starts the host elsewhere, so a path relative to the
+    # shell is made absolute by the client; a bare name stays a command.
+
+    relative = os.path.relpath(sys.executable)
+    assert not os.path.isabs(relative) and os.sep in relative
+    deployed = daemon.muructl("deploy", "shop", str(SHOP), "--python", relative)
+    assert deployed.stdout.strip() == "muru: release shop@r1 is ready and serving"
+    inspected = daemon.muructl("debug", "inspect", "shop").stdout
+    assert f"at {os.path.abspath(relative)}," in inspected, inspected
+
+
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():

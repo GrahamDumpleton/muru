@@ -44,6 +44,18 @@ def apply(daemon: Daemon, path: Path, *arguments: str) -> subprocess.CompletedPr
     return daemon.muructl("apply", "-f", str(path), *arguments, check=False)
 
 
+def test_an_interpreter_relative_to_the_file_is_resolved_there(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    config = tmp_path / "shop.toml"
+    relative = os.path.relpath(sys.executable, tmp_path)
+    config.write_text(release("shop", "r1").replace(sys.executable, relative))
+    assert relative in config.read_text() and os.sep in relative
+    assert apply(daemon, config).returncode == 0
+    inspected = daemon.muructl("debug", "inspect", "shop").stdout
+    assert f"at {os.path.normpath(tmp_path / relative)}," in inspected, inspected
+
+
 def test_apply_deploys_declared_releases_and_is_idempotent(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(release("shop", "r1"))
