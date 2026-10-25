@@ -235,6 +235,10 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         },
         ..muru_edge::access::Config::default()
     };
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("installing the SIGINT handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
     let edge = muru_edge::Edge::bind(muru_edge::Config {
         listen: SocketAddr::new(args.bind.ip, port),
         app: "static".to_owned(),
@@ -280,12 +284,10 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         edge.local_addr()
     );
     let mut serving = tokio::spawn(edge.run());
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing the SIGTERM handler")?;
 
     tokio::select! {
         served = &mut serving => served.map_err(anyhow::Error::from).and_then(|result| result),
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
     }
 }
@@ -1419,6 +1421,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         "--concurrency must be at least 1"
     );
 
+    // The stop signals are caught before the host starts, so that a Ctrl-C
+    // or SIGTERM arriving while the workers are coming up stops the run in
+    // order instead of killing muructl and leaving the host to notice.
+
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("installing the SIGINT handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+
     if args.single {
         resolved.processes = 1;
         resolved.threads = 1;
@@ -1664,15 +1675,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // Ctrl-C and SIGTERM both stop the run in order: the host is told to
     // stop and its workers finish what they are serving.
 
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing the SIGTERM handler")?;
-
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = interrupt.recv() => break Ok(()),
             _ = terminate.recv() => break Ok(()),
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));

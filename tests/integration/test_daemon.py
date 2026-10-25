@@ -199,7 +199,9 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
     second = None
 
     try:
-        first.deploy("shop", SHOP)
+        # One worker, so that the pid each answer carries is the one worker's.
+
+        first.deploy("shop", SHOP, "--processes", "1")
         pid = json.loads(first.get("/info").body)["pid"]
         edge_pid = edge_pid_of(first)
 
