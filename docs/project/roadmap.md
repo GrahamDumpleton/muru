@@ -195,5 +195,12 @@ the file, env and exec kinds, references from a release's `[env]` table
 or `deploy --secret`, resolved when the release starts and delivered as
 variables or as files named by NAME_FILE, never recorded, exported or
 printed, and `muructl secret set`, `list` and `remove` for file stores
-with the value read from standard input. Next from phase 2:
-per-application users, then log rotation and the dashboard's charts.
+with the value read from standard input. Built-in log rotation (section
+11.3) is in: the daemon rotates the access log, the edge's log, each
+release's log and its own when the period changes (daily by default, or
+hourly or weekly, in UTC) or a size is reached, has every writer reopen
+by name, compresses the archive in the background with zstd or gzip and
+keeps the newest `keep` archives, from the `[logs]` table, with
+`rotate = 'external'` leaving it to logrotate (reopen_on_rename,
+on_overflow and journald later). Next from phase 2: per-application
+users, then the dashboard's charts.

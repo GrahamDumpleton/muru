@@ -422,6 +422,29 @@ pub struct SecretRef {
     pub key: String,
 }
 
+/// The `[logs]` table of the daemon's file (section 11.3): how the
+/// daemon rotates the log files it and its processes write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Logs {
+    /// `built-in` (the default) or `external`, for logrotate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<String>,
+    /// Rotate a file that reaches this size, for example 100MB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Rotate by the clock: `off`, `hourly`, `daily` (the default) or
+    /// `weekly`, at the period's start in UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+    /// Archives kept per log (default 14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<usize>,
+    /// How archives are compressed: `zstd` (the default), `gzip` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress: Option<String>,
+}
+
 /// The `[secrets]` table of the daemon's file (section 10.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -864,6 +887,9 @@ pub struct Document {
     /// Secret stores (section 10.8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Secrets>,
+    /// Log rotation (section 11.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Logs>,
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,

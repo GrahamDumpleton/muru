@@ -247,6 +247,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
         secrets,
+        rotation: muru_controller::rotation::Policy::from_table(document.logs.as_ref())?,
         access_log,
         metrics,
         dashboard,

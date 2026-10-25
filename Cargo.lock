@@ -1083,6 +1083,7 @@ version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "bytes",
+ "flate2",
  "futures",
  "http",
  "http-body-util",
@@ -1105,6 +1106,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

@@ -55,6 +55,8 @@ pub struct Config {
     pub compression: Option<muru_config::Compression>,
     /// The secret stores (section 10.8).
     pub secrets: Vec<crate::secrets::Store>,
+    /// Log rotation (section 11.3), or none for external rotation.
+    pub rotation: Option<crate::rotation::Policy>,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
     /// Where the Prometheus exposition is served, or nowhere.
@@ -302,6 +304,8 @@ struct Daemon {
     compression: pb::Compression,
     /// The secret stores releases may refer to (section 10.8).
     secrets: Vec<crate::secrets::Store>,
+    /// Built-in log rotation (section 11.3), when it is on.
+    rotation: Option<crate::rotation::Rotator>,
     running: HashMap<(String, String), Running>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
@@ -519,6 +523,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         proxy,
         compression,
         secrets: config.secrets.clone(),
+        rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
@@ -596,6 +601,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
                 daemon.expire_retained().await;
+                daemon.rotate_logs();
             }
         }
     };
@@ -1136,7 +1142,7 @@ impl Daemon {
         }
 
         let message = format!(
-            "reloaded {}: the [proxy] and [compression] tables {}; listeners, limits, metrics and event sinks are read at start",
+            "reloaded {}: the [proxy] and [compression] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
@@ -2302,6 +2308,73 @@ impl Daemon {
     /// and each host its release log on SIGUSR1; SIGUSR2 makes a host
     /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
     /// files the application opened itself.
+    /// Section 11.3: rotate the log files that are due, by size or by the
+    /// clock, then have every writer reopen its file by name.
+    fn rotate_logs(&mut self) {
+        let Some(rotator) = self.rotation.as_mut() else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        let mut candidates = vec![
+            self.locations.access_log(),
+            self.locations.logs.path.join("edge.log"),
+        ];
+
+        if self.owns_log {
+            candidates.push(self.locations.daemon_log());
+        }
+
+        for (app, id) in self.running.keys() {
+            candidates.push(self.locations.release_log(app, id));
+        }
+
+        let mut rotated = Vec::new();
+
+        for path in candidates {
+            if !path.is_file() || !rotator.due(&path, now) {
+                continue;
+            }
+
+            match rotator.rotate(&path, now) {
+                Ok(archive) => rotated.push(archive),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "rotating a log failed");
+                }
+            }
+        }
+
+        if rotated.is_empty() {
+            return;
+        }
+
+        if self.owns_log {
+            reopen_own_log(&self.locations.daemon_log());
+        }
+
+        self.edge.signal(libc::SIGUSR1);
+
+        for running in self.running.values() {
+            running.host.signal(libc::SIGUSR1);
+        }
+
+        let names: Vec<String> = rotated
+            .iter()
+            .map(|archive| {
+                archive
+                    .strip_prefix(&self.locations.logs.path)
+                    .unwrap_or(archive)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        self.events.emit(
+            "logs.rotated",
+            "logs",
+            "info",
+            &format!("rotated {}", names.join(", ")),
+        );
+    }
+
     fn reopen_logs(&mut self, workers: bool) -> Reopened {
         if self.owns_log {
             reopen_own_log(&self.locations.daemon_log());
