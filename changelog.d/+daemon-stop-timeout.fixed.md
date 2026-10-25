@@ -1,0 +1,1 @@
+`muructl daemon stop` and `muructl daemon upgrade` bound every exchange with the daemon, so a daemon that accepts a connection and never answers cannot hold the command past its `--timeout`; the daemon also closes its API connections once the shutdown grace period ends.

@@ -360,37 +360,76 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     )
 }
 
+/// How long one exchange with a daemon that is being stopped may take
+/// before it counts as not answering.
+const STOP_EXCHANGE: Duration = Duration::from_secs(5);
+
+/// Ask the daemon at `path` for its status, within `bound`. None when
+/// there is no daemon there, it refused, or it did not answer in time.
+async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
+    let exchange = async {
+        let mut client = client::connect(path).await.ok()?;
+        client
+            .get_status(pb::GetStatusRequest {})
+            .await
+            .ok()
+            .map(|status| status.into_inner())
+    };
+
+    tokio::time::timeout(bound, exchange).await.ok().flatten()
+}
+
 /// Stop the daemon through its API and wait for its process to go.
+///
+/// Every exchange with the daemon is bounded, so a daemon that accepts a
+/// connection and then never answers, or one that lingers after it has
+/// logged its exit, cannot hold the command past `timeout`.
 pub async fn daemon_stop(
     socket: SocketArgs,
     shutdown: bool,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let path = socket.socket();
-    let mut client = client::connect(&path).await?;
-    let status = client
-        .get_status(pb::GetStatusRequest {})
-        .await?
+    let started = Instant::now();
+    let bound = timeout.min(STOP_EXCHANGE);
+    let connected = tokio::time::timeout(bound, client::connect(&path)).await;
+
+    let mut client = match connected {
+        Ok(client) => client?,
+        Err(_) => anyhow::bail!(
+            "the daemon at {} did not complete a connection within {} seconds",
+            path.display(),
+            bound.as_secs()
+        ),
+    };
+
+    let status = tokio::time::timeout(bound, client.get_status(pb::GetStatusRequest {}))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the daemon at {} did not answer within {} seconds",
+                path.display(),
+                bound.as_secs()
+            )
+        })??
         .into_inner();
 
-    // The daemon may close the connection as it exits; whether it did
-    // exit is checked below either way.
+    // The daemon may close the connection as it exits, or take its time
+    // answering; whether it did exit is checked below either way.
 
-    let _ = client
-        .shutdown(pb::ShutdownRequest { drain: shutdown })
-        .await;
+    let _ = tokio::time::timeout(
+        bound,
+        client.shutdown(pb::ShutdownRequest { drain: shutdown }),
+    )
+    .await;
 
     // The daemon removes its socket as it exits; a process that has exited
     // but not been reaped would still answer kill(0), so the socket is the
     // signal to wait for.
 
-    let started = Instant::now();
-
     while started.elapsed() < timeout {
-        let answering = match client::connect(&path).await {
-            Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.is_ok(),
-            Err(_) => false,
-        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let answering = status_within(&path, remaining.min(bound)).await.is_some();
 
         if !answering && (!path.exists() || !process_alive(status.pid)) {
             if shutdown {
@@ -404,7 +443,12 @@ pub async fn daemon_stop(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    anyhow::bail!("the daemon (pid {}) did not exit", status.pid)
+    anyhow::bail!(
+        "the daemon (pid {}) did not exit within {} seconds; see {}",
+        status.pid,
+        timeout.as_secs(),
+        socket.locations.resolve().daemon_log().display()
+    )
 }
 
 /// Re-execute the daemon from the installed binary and wait until it
@@ -433,11 +477,8 @@ pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Re
     let mut latest = None;
 
     while started.elapsed() < timeout {
-        let status = match client::connect(&path).await {
-            Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.ok(),
-            Err(_) => None,
-        }
-        .map(|status| status.into_inner());
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let status = status_within(&path, remaining.min(STOP_EXCHANGE)).await;
 
         if let Some(status) = status {
             if status.started_unix_ms != before.started_unix_ms

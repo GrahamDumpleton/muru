@@ -681,10 +681,20 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     // The API answers the Shutdown call that brought the daemon here
-    // before the socket goes.
+    // before the socket goes. A client holding a connection open would
+    // keep the server from finishing, so after a grace period it is
+    // aborted, which closes the listener and every connection before the
+    // socket is unlinked; a stop command polling the socket then gets a
+    // refusal straight away instead of waiting on a silent connection.
 
     let _ = api_stop.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(5), &mut api).await;
+
+    if tokio::time::timeout(Duration::from_secs(5), &mut api)
+        .await
+        .is_err()
+    {
+        api.abort();
+    }
 
     if let Some(scraper) = scraper {
         scraper.abort();
