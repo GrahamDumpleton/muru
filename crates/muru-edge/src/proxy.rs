@@ -24,7 +24,7 @@ const FORWARDING_HEADERS: [&str; 7] = [
 
 /// Who is trusted: an address range, or a class of addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Network {
+pub(crate) enum Network {
     Range(IpAddr, u8),
     Loopback,
     Private,
@@ -32,7 +32,7 @@ enum Network {
 }
 
 impl Network {
-    fn contains(&self, address: IpAddr) -> bool {
+    pub(crate) fn contains(&self, address: IpAddr) -> bool {
         match self {
             Network::Range(network, prefix) => in_range(*network, *prefix, address),
             Network::Loopback => address.is_loopback(),
@@ -81,7 +81,7 @@ fn is_private(address: IpAddr) -> bool {
 }
 
 /// Parse an entry of `trusted`: an address, a CIDR range, or a word.
-fn parse_network(text: &str) -> Result<Network, String> {
+pub(crate) fn parse_network(text: &str) -> Result<Network, String> {
     let text = text.trim();
 
     match text {

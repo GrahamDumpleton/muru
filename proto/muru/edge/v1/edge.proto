@@ -37,6 +37,37 @@ message Snapshot {
   repeated AppWorkers apps = 5;
   Proxy proxy = 6;                      // trusted proxies; nothing trusted when absent
   Compression compression = 7;          // section 4.17; the defaults when absent
+  repeated ErrorPage error_pages = 8;   // section 4.12: the node-wide pages
+  ErrorOverride error_override = 9;     // the node-wide override; off when absent
+}
+
+// Section 4.12: a custom error page for a status, or for a status and
+// reason, at one level: the node, a host, a release or a route. The most
+// specific level that has a page for the status wins, and within a level
+// a status:reason entry beats the status's.
+message ErrorPage {
+  string key = 1;                       // 404, or 503:maintenance
+  string file = 2;                      // a file sent as the body, by absolute path
+  string template = 3;                  // a template the edge renders
+  string path = 4;                      // an application path asked for the page as a sub-request
+  string content_type = 5;              // the type of a template; text/html when empty
+}
+
+// Section 4.12: which of an application's own error responses the edge
+// replaces with error pages.
+message ErrorOverride {
+  repeated uint32 statuses = 1;
+  string when = 2;                      // all, empty_body, not_json or html_only; all when empty
+}
+
+// Section 4.12: maintenance mode for an application, and what it lets
+// through.
+message Maintenance {
+  bool on = 1;
+  repeated string exempt_paths = 2;     // path prefixes served as usual
+  repeated string exempt_addresses = 3; // client addresses or CIDR ranges served as usual
+  string bypass_cookie = 4;             // name=value; a client sending it is served as usual
+  uint64 retry_after_s = 5;             // Retry-After on the page; 60 when 0
 }
 
 // Section 4.17: how responses are compressed for clients.
@@ -67,6 +98,8 @@ message Host {
   string canonical = 7;
   bool use_canonical_name = 8;          // SERVER_NAME is the canonical name
   bool default = 9;                     // answers requests whose host matches no host
+  repeated ErrorPage error_pages = 10;  // section 4.12: the host's pages
+  ErrorOverride error_override = 11;
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -87,6 +120,8 @@ message Route {
   Traffic traffic = 13;                 // how the application's releases share the requests (section 9.4)
   bool internal = 14;                   // reachable only through internal redirects; 404 to clients (section 4.10)
   repeated string accept_redirects_from = 15; // applications other than the route's own whose redirects may reach it
+  repeated ErrorPage error_pages = 16;  // section 4.12: the route's pages
+  ErrorOverride error_override = 17;
 }
 
 // A route's traffic policy (section 9.4). Buckets run from 0 to 9999;
@@ -117,6 +152,9 @@ message AppWorkers {
   bool serving = 6;                     // the application's serving release, which takes what no policy assigns
   bool accel_redirect = 7;              // the default mount honours X-Accel-Redirect (section 4.10)
   bool cgi_local_redirect = 8;          // the default mount treats a 200 with a local Location and no body as a redirect
+  repeated ErrorPage error_pages = 9;   // section 4.12: the release's pages, the application level
+  ErrorOverride error_override = 10;
+  Maintenance maintenance = 11;         // maintenance mode and its exemptions; off when absent
 }
 
 message Mount {

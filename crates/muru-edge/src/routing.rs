@@ -19,8 +19,9 @@ use std::sync::Arc;
 use http::HeaderMap;
 use muru_proto::edge::v1 as pb;
 
+use crate::errors::{Chain, ErrorPolicy};
 use crate::link::LinkPool;
-use crate::proxy::Trust;
+use crate::proxy::{Network, Trust};
 
 /// What the snapshot says about one virtual host.
 #[derive(Debug, Clone)]
@@ -33,6 +34,64 @@ pub struct Host {
     pub https_redirect: bool,
     /// The name the application sees as SERVER_NAME.
     pub server_name: String,
+    /// The host's error pages and override (section 4.12).
+    pub errors: Arc<ErrorPolicy>,
+}
+
+/// Maintenance mode for an application (section 4.12): the edge answers
+/// 503 maintenance for it, except for what the exemptions let through.
+#[derive(Debug)]
+pub struct Maintenance {
+    exempt_paths: Vec<String>,
+    exempt_addresses: Vec<Network>,
+    bypass_cookie: Option<(String, String)>,
+    /// The Retry-After the page carries, in seconds.
+    pub retry_after: u32,
+}
+
+impl Maintenance {
+    /// Compile the snapshot's message; none when maintenance is off.
+    pub fn from_message(message: &pb::Maintenance) -> Result<Option<Self>, String> {
+        if !message.on {
+            return Ok(None);
+        }
+
+        let exempt_addresses = message
+            .exempt_addresses
+            .iter()
+            .map(|text| crate::proxy::parse_network(text))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("maintenance: exempt_addresses: {error}"))?;
+        let bypass_cookie = message
+            .bypass_cookie
+            .split_once('=')
+            .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        Ok(Some(Self {
+            exempt_paths: message.exempt_paths.clone(),
+            exempt_addresses,
+            bypass_cookie,
+            retry_after: u32::try_from(message.retry_after_s)
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(60),
+        }))
+    }
+
+    /// Whether a request is served as usual: its path is exempt, or the
+    /// client's address is, or it carries the bypass cookie.
+    pub fn exempts(&self, path: &str, peer: IpAddr, headers: &HeaderMap) -> bool {
+        self.exempt_paths
+            .iter()
+            .any(|prefix| prefix_matches(prefix, path))
+            || self
+                .exempt_addresses
+                .iter()
+                .any(|network| network.contains(peer))
+            || self
+                .bypass_cookie
+                .as_ref()
+                .is_some_and(|(name, value)| cookie(headers, name).as_deref() == Some(value))
+    }
 }
 
 struct Route {
@@ -49,6 +108,8 @@ struct Route {
     /// Applications other than the route's own whose redirects may
     /// reach it.
     accept_redirects_from: Vec<String>,
+    /// The route's error pages and override (section 4.12).
+    errors: Arc<ErrorPolicy>,
 }
 
 impl Route {
@@ -74,10 +135,15 @@ impl Route {
 /// release a redirect back into the same application is pinned to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
-    /// The application that redirected.
+    /// The application that redirected; empty for an error page
+    /// sub-request (section 4.12) for a request no application took.
     pub app: String,
     /// The release that redirected.
     pub release: String,
+    /// An error page sub-request (section 4.12): internal routes and
+    /// mounts open to it without being asked, since the operator named
+    /// the path.
+    pub privileged: bool,
 }
 
 /// Which response forms a mount treats as internal redirects (section
@@ -137,6 +203,8 @@ pub struct Selection {
     pub script_name: String,
     /// Which response forms from the mount are internal redirects.
     pub redirects: RedirectFlags,
+    /// Maintenance mode, when the application is in it (section 4.12).
+    pub maintenance: Option<Arc<Maintenance>>,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -364,6 +432,10 @@ pub struct AppPools {
     mounts: Vec<MountPath>,
     /// The default mount's redirect forms (section 4.10).
     redirects: RedirectFlags,
+    /// The release's error pages and override (section 4.12).
+    errors: Arc<ErrorPolicy>,
+    /// Maintenance mode, when the application is in it.
+    maintenance: Option<Arc<Maintenance>>,
 }
 
 impl AppPools {
@@ -411,6 +483,8 @@ impl AppPools {
             groups: connected,
             mounts,
             redirects,
+            errors: Arc::new(ErrorPolicy::default()),
+            maintenance: None,
         })
     }
 
@@ -423,7 +497,22 @@ impl AppPools {
             groups: Vec::new(),
             mounts: Vec::new(),
             redirects: RedirectFlags::default(),
+            errors: Arc::new(ErrorPolicy::default()),
+            maintenance: None,
         }
+    }
+
+    /// The same pools with the release's error pages and override
+    /// (section 4.12).
+    pub fn with_errors(mut self, errors: Arc<ErrorPolicy>) -> Self {
+        self.errors = errors;
+        self
+    }
+
+    /// The same pools in maintenance mode, or out of it.
+    pub fn with_maintenance(mut self, maintenance: Option<Arc<Maintenance>>) -> Self {
+        self.maintenance = maintenance;
+        self
     }
 
     /// Where a path goes: the most specific group path's pool, else the
@@ -471,6 +560,7 @@ impl AppPools {
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
             }),
+            maintenance: self.maintenance.clone(),
         })
     }
 
@@ -532,6 +622,8 @@ pub struct Routing {
     wildcards: Vec<(String, usize)>,
     default_host: Option<usize>,
     routes: Vec<Vec<Route>>,
+    /// The node's error pages and override (section 4.12).
+    errors: Arc<ErrorPolicy>,
 }
 
 /// Where a request goes.
@@ -594,6 +686,7 @@ impl Routing {
             wildcards: Vec::new(),
             default_host: None,
             routes: Vec::new(),
+            errors: Arc::new(ErrorPolicy::default()),
         }
     }
 
@@ -603,6 +696,17 @@ impl Routing {
         let mut apps: HashMap<String, AppReleases> = HashMap::new();
 
         for app in &snapshot.apps {
+            let errors = ErrorPolicy::load(&app.error_pages, app.error_override.as_ref())
+                .await
+                .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?;
+            let maintenance = app
+                .maintenance
+                .as_ref()
+                .map(Maintenance::from_message)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?
+                .flatten()
+                .map(Arc::new);
             let pools = Arc::new(
                 AppPools::connect(
                     &app.app,
@@ -615,7 +719,9 @@ impl Routing {
                         cgi_local_redirect: app.cgi_local_redirect,
                     },
                 )
-                .await?,
+                .await?
+                .with_errors(Arc::new(errors))
+                .with_maintenance(maintenance),
             );
             let releases = apps.entry(app.app.clone()).or_insert_with(|| AppReleases {
                 serving: Arc::clone(&pools),
@@ -660,6 +766,10 @@ impl Routing {
             None => crate::compression::Compression::default(),
         };
 
+        let errors = ErrorPolicy::load(&snapshot.error_pages, snapshot.error_override.as_ref())
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
         let mut routing = Self {
             version: snapshot.version,
             trust,
@@ -671,10 +781,14 @@ impl Routing {
             wildcards: Vec::new(),
             default_host: None,
             routes: Vec::new(),
+            errors: Arc::new(errors),
         };
 
         for host in &snapshot.hosts {
             let index = routing.hosts.len();
+            let errors = ErrorPolicy::load(&host.error_pages, host.error_override.as_ref())
+                .await
+                .map_err(|error| anyhow::anyhow!("host {}: {error}", host.name))?;
 
             for name in &host.names {
                 let name = normalise(name);
@@ -701,6 +815,7 @@ impl Routing {
                 listeners: host.listeners.clone(),
                 https_redirect: host.https_redirect,
                 server_name,
+                errors: Arc::new(errors),
             });
             routing.routes.push(Vec::new());
         }
@@ -733,6 +848,11 @@ impl Routing {
                     .map_err(|error| {
                         anyhow::anyhow!("route {} {}: traffic: {error}", route.host, route.path)
                     })?;
+                let errors = ErrorPolicy::load(&route.error_pages, route.error_override.as_ref())
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
+                    })?;
                 routing.routes[index].push(Route {
                     path: route.path.clone(),
                     app: route.app.clone(),
@@ -741,6 +861,7 @@ impl Routing {
                     traffic,
                     internal: route.internal,
                     accept_redirects_from: route.accept_redirects_from.clone(),
+                    errors: Arc::new(errors),
                 });
             }
         }
@@ -755,6 +876,52 @@ impl Routing {
     /// The snapshot's version.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// The error pages and override in force for a request (section
+    /// 4.12), most specific first: the route's, the release's (the
+    /// application the request was routed to, as `located` names it),
+    /// the host's and the node's.
+    pub fn errors_for(
+        &self,
+        name: Option<&str>,
+        path: &str,
+        listener: &str,
+        located: Option<(&str, &str)>,
+    ) -> Chain {
+        let mut levels = Vec::with_capacity(4);
+
+        if self.hosts.is_empty() {
+            levels.push(Arc::clone(&self.default.errors));
+            levels.push(Arc::clone(&self.errors));
+            return Chain::new(levels);
+        }
+
+        let host = self
+            .host_for(name, listener)
+            .or_else(|| name.and_then(|name| self.hosts.iter().position(|host| host.name == name)));
+
+        if let Some(index) = host
+            && let Some(route) = self.routes[index]
+                .iter()
+                .find(|route| prefix_matches(&route.path, path))
+        {
+            levels.push(Arc::clone(&route.errors));
+        }
+
+        if let Some((app, release)) = located
+            && let Some(releases) = self.apps.get(app)
+            && let Some(pools) = releases.releases.get(release)
+        {
+            levels.push(Arc::clone(&pools.errors));
+        }
+
+        if let Some(index) = host {
+            levels.push(Arc::clone(&self.hosts[index].errors));
+        }
+
+        levels.push(Arc::clone(&self.errors));
+        Chain::new(levels)
     }
 
     /// Which peers may speak for the client (section 4.7).
@@ -854,7 +1021,7 @@ impl Routing {
 
         match origin {
             None if route.internal => return Decision::InternalOnly,
-            Some(origin) if !route.accepts(&origin.app) => {
+            Some(origin) if !origin.privileged && !route.accepts(&origin.app) => {
                 return Decision::NotAccepted {
                     app: origin.app.clone(),
                 };
@@ -952,6 +1119,7 @@ impl Routing {
                 mount: String::new(),
                 script_name: String::new(),
                 redirects: RedirectFlags::default(),
+                maintenance: None,
             }),
         }
     }
@@ -1112,6 +1280,8 @@ mod tests {
             ],
             apps: Vec::new(),
             proxy: None,
+            error_pages: Vec::new(),
+            error_override: None,
         }
     }
 

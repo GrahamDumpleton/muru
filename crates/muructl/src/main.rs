@@ -110,6 +110,13 @@ enum Command {
     /// Pin a worker group's count, or show the autoscaler's state.
     Scale(admin::ScaleArgs),
 
+    /// Serve an application's maintenance page at the edge, or serve it
+    /// as usual again.
+    Maintenance {
+        #[command(subcommand)]
+        command: admin::MaintenanceCommand,
+    },
+
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
@@ -257,6 +264,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         mounts: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
+        errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
         access_log,
         limits: muru_edge::Limits::default(),
@@ -714,6 +722,7 @@ fn main() -> anyhow::Result<()> {
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
+        Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
@@ -1072,6 +1081,11 @@ struct Resolved {
     /// Section 4.10: the default mount's redirect settings from the table.
     accel_redirect: bool,
     cgi_local_redirect: bool,
+    /// Section 4.12: the error pages, override and maintenance
+    /// exemptions from the table.
+    error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    error_override: Option<muru_config::ErrorOverride>,
+    maintenance: Option<muru_config::Maintenance>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
     /// Environment variables from the table (section 10.8).
@@ -1196,6 +1210,9 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         mounts: table.mounts,
         accel_redirect: table.accel_redirect.unwrap_or(false),
         cgi_local_redirect: table.cgi_local_redirect.unwrap_or(false),
+        error_pages: table.error_pages,
+        error_override: table.error_override,
+        maintenance: table.maintenance,
         logging: table.logging,
         max_requests: args.max_requests.or(table.max_requests),
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
@@ -1255,6 +1272,9 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         mounts: resolved.mounts.clone(),
         accel_redirect: resolved.accel_redirect.then_some(true),
         cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
+        error_pages: resolved.error_pages.clone(),
+        error_override: resolved.error_override.clone(),
+        maintenance: resolved.maintenance.clone(),
         logging: resolved.logging.clone(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
@@ -1599,6 +1619,32 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
     };
+
+    // Section 4.12: the project's error pages, with files under it.
+
+    muru_config::check_error_pages(&resolved.error_pages, true)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    if let Some(table) = &resolved.error_override {
+        muru_config::check_error_override(table)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    }
+
+    let error_policy = Arc::new(
+        muru_edge::errors::ErrorPolicy::load(
+            &muru_controller::daemon::error_pages_message(
+                &resolved.error_pages,
+                Some(&resolved.project),
+            ),
+            resolved
+                .error_override
+                .as_ref()
+                .map(muru_controller::daemon::error_override_message)
+                .as_ref(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
+    );
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -1622,6 +1668,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         mounts: mounts.clone(),
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
+        errors: Arc::clone(&error_policy),
         development,
         access_log,
         limits: limits(&args),
@@ -1784,7 +1831,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             &mounts,
                             redirect_flags,
                         )
-                        .await;
+                        .await
+                        .map(|pools| pools.with_errors(Arc::clone(&error_policy)));
 
                         match connected {
                             Ok(connected) => {
@@ -1833,7 +1881,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     &mounts,
                                     redirect_flags,
                                 )
-                                .await;
+                                .await
+                                .map(|pools| pools.with_errors(Arc::clone(&error_policy)));
 
                                 match connected {
                                     Ok(connected) => pools.replace(connected),

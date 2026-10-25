@@ -70,6 +70,11 @@ pub struct Config {
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
     pub compression: Option<muru_config::Compression>,
+    /// The node-wide error pages (section 4.12), by status or
+    /// status:reason.
+    pub error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    /// The node-wide error override (section 4.12).
+    pub error_override: Option<muru_config::ErrorOverride>,
     /// The secret stores (section 10.8).
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
@@ -209,6 +214,16 @@ pub enum Command {
         id: String,
         /// Where the groups' states go.
         done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
+    },
+    /// Section 4.12: serve the maintenance page for an application, or
+    /// serve it as usual again.
+    SetMaintenance {
+        /// The application.
+        app: String,
+        /// On or off.
+        on: bool,
+        /// Answered with when maintenance began, or none when it is off.
+        done: oneshot::Sender<Result<Option<u64>, String>>,
     },
     /// Blue/green (section 9.2): move all of an application's traffic to a
     /// release now and drain the one that served.
@@ -429,6 +444,13 @@ struct Daemon {
     proxy: Option<pb::Proxy>,
     /// The [compression] table, for every snapshot.
     compression: pb::Compression,
+    /// The node-wide [error_pages] and [error_override] tables (section
+    /// 4.12), for every snapshot.
+    error_pages: Vec<pb::ErrorPage>,
+    error_override: Option<pb::ErrorOverride>,
+    /// The applications in maintenance mode (section 4.12), with when
+    /// each was put there.
+    maintenance: HashMap<String, u64>,
     /// The secret stores releases may refer to (section 10.8).
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
@@ -478,6 +500,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     let compression = compression_message(config.compression.as_ref())
         .map_err(|error| anyhow::anyhow!("[compression]: {error}"))?;
+    let (error_pages, error_override) =
+        error_tables_message(&config.error_pages, config.error_override.as_ref())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
@@ -683,6 +708,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         logs: Logs::default(),
         proxy,
         compression,
+        error_pages,
+        error_override,
+        maintenance: HashMap::new(),
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
@@ -1077,6 +1105,78 @@ fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
     }
 }
 
+/// The node-wide error pages and override as the snapshot carries them
+/// (section 4.12), checked; a page file must be an absolute path.
+fn error_tables_message(
+    pages: &std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    override_: Option<&muru_config::ErrorOverride>,
+) -> Result<(Vec<pb::ErrorPage>, Option<pb::ErrorOverride>), String> {
+    muru_config::check_error_pages(pages, false).map_err(|error| format!("[{error}]"))?;
+
+    if let Some(table) = override_ {
+        muru_config::check_error_override(table).map_err(|error| format!("[{error}]"))?;
+    }
+
+    Ok((
+        error_pages_message(pages, None),
+        override_.map(error_override_message),
+    ))
+}
+
+/// Error pages as the snapshot carries them, a relative file resolved
+/// against `base`.
+pub fn error_pages_message(
+    pages: &std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    base: Option<&Path>,
+) -> Vec<pb::ErrorPage> {
+    pages
+        .iter()
+        .map(|(key, page)| pb::ErrorPage {
+            key: key.clone(),
+            file: page
+                .file
+                .as_ref()
+                .map(|file| match base {
+                    Some(base) => base.join(file).display().to_string(),
+                    None => file.clone(),
+                })
+                .unwrap_or_default(),
+            template: page.template.clone().unwrap_or_default(),
+            path: page.path.clone().unwrap_or_default(),
+            content_type: page.content_type.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// An error override as the snapshot carries it.
+pub fn error_override_message(table: &muru_config::ErrorOverride) -> pb::ErrorOverride {
+    pb::ErrorOverride {
+        statuses: table
+            .statuses
+            .iter()
+            .map(|status| u32::from(*status))
+            .collect(),
+        when: table.when.clone().unwrap_or_default(),
+    }
+}
+
+/// Maintenance mode as the snapshot carries it: whether it is on, and the
+/// release's exemptions.
+fn maintenance_message(on: bool, table: Option<&muru_config::Maintenance>) -> pb::Maintenance {
+    let table = table.cloned().unwrap_or_default();
+    pb::Maintenance {
+        on,
+        exempt_paths: table.exempt_paths,
+        exempt_addresses: table.exempt_addresses,
+        bypass_cookie: table.bypass_cookie.unwrap_or_default(),
+        retry_after_s: table
+            .retry_after
+            .as_deref()
+            .and_then(|text| muru_config::parse_duration(text).ok())
+            .map_or(0, |duration| duration.as_secs()),
+    }
+}
+
 /// The [compression] table as the snapshot carries it, checked: the
 /// defaults of section 4.17 where the table is silent.
 fn compression_message(
@@ -1376,16 +1476,23 @@ impl Daemon {
 
         let compression = compression_message(document.compression.as_ref())
             .map_err(|error| format!("[compression]: {error}"))?;
-        let changed = proxy != self.proxy || compression != self.compression;
+        let (error_pages, error_override) =
+            error_tables_message(&document.error_pages, document.error_override.as_ref())?;
+        let changed = proxy != self.proxy
+            || compression != self.compression
+            || error_pages != self.error_pages
+            || error_override != self.error_override;
         self.proxy = proxy;
         self.compression = compression;
+        self.error_pages = error_pages;
+        self.error_override = error_override;
 
         if changed {
             self.push_snapshot().await?;
         }
 
         let message = format!(
-            "reloaded {}: the [proxy] and [compression] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the [proxy], [compression], [error_pages] and [error_override] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
@@ -1514,6 +1621,13 @@ impl Daemon {
     /// Re-adopt the hosts a previous daemon left running (section 10.2),
     /// and start again the release that served if its host is gone.
     async fn restore(&mut self) {
+        self.maintenance = self
+            .store
+            .maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         let apps = match self.store.apps() {
             Ok(apps) => apps,
             Err(error) => {
@@ -1699,6 +1813,9 @@ impl Daemon {
             }
             Command::GetScaleStatus { app, id, done } => {
                 let _ = done.send(self.scale_status(&app, &id));
+            }
+            Command::SetMaintenance { app, on, done } => {
+                let _ = done.send(self.set_maintenance(&app, on).await);
             }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
@@ -2272,6 +2389,30 @@ impl Daemon {
                         .store
                         .release(name, id)
                         .is_ok_and(|release| release.spec.cgi_local_redirect),
+                    error_pages: self
+                        .store
+                        .release(name, id)
+                        .map(|release| {
+                            error_pages_message(
+                                &release.spec.error_pages,
+                                Some(&release.spec.source),
+                            )
+                        })
+                        .unwrap_or_default(),
+                    error_override: self
+                        .store
+                        .release(name, id)
+                        .ok()
+                        .and_then(|release| release.spec.error_override)
+                        .map(|table| error_override_message(&table)),
+                    maintenance: Some(maintenance_message(
+                        self.maintenance.contains_key(name),
+                        self.store
+                            .release(name, id)
+                            .ok()
+                            .and_then(|release| release.spec.maintenance)
+                            .as_ref(),
+                    )),
                 });
             }
         }
@@ -2321,6 +2462,8 @@ impl Daemon {
                 canonical: host.canonical.unwrap_or_default(),
                 use_canonical_name: host.use_canonical_name,
                 default: host.default,
+                error_pages: error_pages_message(&host.error_pages, None),
+                error_override: host.error_override.as_ref().map(error_override_message),
             });
         }
 
@@ -2363,6 +2506,8 @@ impl Daemon {
                 case_insensitive: route.case.as_deref() == Some("insensitive"),
                 internal: route.internal == Some(true),
                 accept_redirects_from: route.accept_redirects_from,
+                error_pages: error_pages_message(&route.error_pages, None),
+                error_override: route.error_override.as_ref().map(error_override_message),
             })
             .collect();
 
@@ -2374,6 +2519,8 @@ impl Daemon {
             apps,
             proxy: self.proxy.clone(),
             compression: Some(self.compression.clone()),
+            error_pages: self.error_pages.clone(),
+            error_override: self.error_override.clone(),
         }
     }
 
@@ -3233,6 +3380,47 @@ impl Daemon {
         }
 
         self.scale_status(app, id)
+    }
+
+    /// Section 4.12: put an application into maintenance mode or take it
+    /// out, recorded so a daemon restart keeps it, announced as an event,
+    /// and pushed to the edge.
+    async fn set_maintenance(&mut self, app: &str, on: bool) -> Result<Option<u64>, String> {
+        self.store.app(app).map_err(|error| error.to_string())?;
+        let was = self.maintenance.get(app).copied();
+
+        match (on, was) {
+            (true, Some(since)) => return Ok(Some(since)),
+            (false, None) => return Ok(None),
+            (true, None) => {
+                let since = crate::model::now_unix_ms();
+                self.store
+                    .set_maintenance(app, Some(since))
+                    .map_err(|error| error.to_string())?;
+                self.maintenance.insert(app.to_owned(), since);
+                self.events.emit(
+                    "maintenance.changed",
+                    app,
+                    "notice",
+                    "maintenance on: the edge serves the maintenance page",
+                );
+            }
+            (false, Some(_)) => {
+                self.store
+                    .set_maintenance(app, None)
+                    .map_err(|error| error.to_string())?;
+                self.maintenance.remove(app);
+                self.events.emit(
+                    "maintenance.changed",
+                    app,
+                    "notice",
+                    "maintenance off: the application serves again",
+                );
+            }
+        }
+
+        self.push_snapshot().await?;
+        Ok(self.maintenance.get(app).copied())
     }
 
     /// The autoscaler's state for each group of a running release.

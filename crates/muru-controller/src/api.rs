@@ -104,8 +104,15 @@ impl Admin for Service {
         _: Request<pb::ListAppsRequest>,
     ) -> Result<Response<pb::ListAppsResponse>, Status> {
         let apps = self.handle.store.apps().map_err(internal)?;
+        let maintenance = self.handle.store.maintenance().map_err(internal)?;
         Ok(Response::new(pb::ListAppsResponse {
-            apps: apps.into_iter().map(app_message).collect(),
+            apps: apps
+                .into_iter()
+                .map(|app| {
+                    let on = maintenance.iter().any(|(name, _)| *name == app.name);
+                    app_message(app, on)
+                })
+                .collect(),
         }))
     }
 
@@ -118,7 +125,41 @@ impl Admin for Service {
             .store
             .app(&request.into_inner().name)
             .map_err(not_found)?;
-        Ok(Response::new(app_message(app)))
+        let on = self
+            .handle
+            .store
+            .maintenance()
+            .map_err(internal)?
+            .iter()
+            .any(|(name, _)| *name == app.name);
+        Ok(Response::new(app_message(app, on)))
+    }
+
+    async fn set_maintenance(
+        &self,
+        request: Request<pb::SetMaintenanceRequest>,
+    ) -> Result<Response<pb::MaintenanceStatus>, Status> {
+        let request = request.into_inner();
+        self.handle.store.app(&request.app).map_err(not_found)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::SetMaintenance {
+                app: request.app.clone(),
+                on: request.on,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let since = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::MaintenanceStatus {
+            app: request.app,
+            on: since.is_some(),
+            since_unix_ms: since.unwrap_or(0),
+        }))
     }
 
     async fn deploy(
@@ -134,7 +175,7 @@ impl Admin for Service {
             .and_then(|app| app.current.or(app.previous))
             .and_then(|id| self.handle.store.release(&request.app, &id).ok())
             .map(|release| release.spec);
-        let spec = config::resolve_spec(&request, previous.as_ref(), None, None, None, None)
+        let spec = config::resolve_spec(&request, previous.as_ref(), &config::Tables::default())
             .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -1077,7 +1118,7 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
     }
 }
 
-fn app_message(app: crate::model::App) -> pb::App {
+fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
     pb::App {
         name: app.name,
         current_release: app.current.unwrap_or_default(),
@@ -1087,6 +1128,7 @@ fn app_message(app: crate::model::App) -> pb::App {
         user: app.user.unwrap_or_default(),
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
+        maintenance,
     }
 }
 

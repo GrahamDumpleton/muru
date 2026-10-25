@@ -82,6 +82,39 @@ def redirecting(
         )
         return [b""]
 
+    # Section 4.12: error page handlers, asked for a page by the edge
+    # with REDIRECT_STATUS and muru.error_reason. One reports what it
+    # sees, one fails, one is too slow for the handler's 2 s.
+
+    if name == "error-page":
+        body = json.dumps(
+            {
+                "internal": is_internal(environ),
+                "redirect_status": environ.get("REDIRECT_STATUS"),
+                "redirect_url": environ.get("REDIRECT_URL"),
+                "error_reason": environ.get("muru.error_reason"),
+                "request_id": environ.get("muru.request_id"),
+                "method": environ["REQUEST_METHOD"],
+            }
+        ).encode()
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(body))),
+                ("X-Handler", "shop"),
+            ],
+        )
+        return [body]
+
+    if name == "error-fail":
+        raise RuntimeError("the error page failed too")
+
+    if name == "error-slow":
+        time.sleep(3)
+        start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "4")])
+        return [b"late"]
+
     if name == "internal-info":
         body = json.dumps(
             {
@@ -116,8 +149,39 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     print(f"shop: served {environ['PATH_INFO']}", flush=True)
 
-    if environ["PATH_INFO"] == "/error":
+    if environ["PATH_INFO"].endswith("/error"):
         raise RuntimeError("deliberate failure")
+
+    # /status/CODE answers with that status, for the error override
+    # tests: body=html, json or empty, override=off to keep the response,
+    # www=1 for a WWW-Authenticate header and allow=METHODS for Allow.
+
+    if "/status/" in environ["PATH_INFO"]:
+        query = environ.get("QUERY_STRING", "")
+        params = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        code = int(environ["PATH_INFO"].rsplit("/", 1)[-1])
+        kind = params.get("body", "html")
+        body = {
+            "html": b"<h1>the application's own page</h1>\n",
+            "json": b'{"error": "the application\'s own document"}\n',
+            "empty": b"",
+        }[kind]
+        content_type = {"html": "text/html", "json": "application/json", "empty": "text/plain"}[
+            kind
+        ]
+        headers = [("Content-Type", content_type), ("Content-Length", str(len(body)))]
+
+        if params.get("override") == "off":
+            headers.append(("X-Muru-Error-Override", "off"))
+
+        if params.get("www") == "1":
+            headers.append(("WWW-Authenticate", 'Basic realm="shop"'))
+
+        if "allow" in params:
+            headers.append(("Allow", params["allow"]))
+
+        start_response(f"{code} Status", headers)
+        return [body]
 
     redirected = redirecting(environ, start_response)
 

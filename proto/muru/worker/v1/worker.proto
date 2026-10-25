@@ -92,6 +92,7 @@ message InternalContext {
   uint32 redirect_status = 3;       // the status the redirecting application answered
   repeated Header headers = 4;      // headers added with X-Muru-Redirect-Header-NAME
   uint32 hop = 5;                   // 1 for the first redirect, up to the limit
+  string error_reason = 6;          // for an error page sub-request (section 4.12): the reason of the error, as muru.error_reason
 }
 
 message UploadRef {

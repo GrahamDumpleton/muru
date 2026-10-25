@@ -59,7 +59,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | max_header_bytes, max_headers, header_read_timeout | listener, host | 64KiB, 100, 30s | 4.6 |
 | upload, max_file_size, max_files, hash, precheck, spool quota | route | off, unlimited, 100, sha256, false, 10GB per application | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache, sendfile_roots | route, mount | none | 4.9 |
-| error_pages, error_override | global, host, application, route | built-in, off | 4.12 |
+| error_pages, error_override | global, host, application (release), route | built-in, off | 4.12 |
+| maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release | none, none, none, 60s | 4.12 |
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |
 | names, listeners, tls, canonical, https_redirect, use_canonical_name | host | none, all, none, none, false, false | 4.3 |
 | traffic: split, sticky, hash_key, salt, sticky_grace | route | 100% to newest ready release, off, cookie, per route, 10m | 9.4 |
@@ -92,6 +93,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | 504 | deadline, soft_timeout, hard_timeout |
 | 507 | upload_spool_full |
 | 403, 405 | blocked (client class or rule), method_not_allowed |
+| any | error_override (an application response the override replaced, with its own status) |
 
 ## C.4 Event types
 

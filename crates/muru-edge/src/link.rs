@@ -473,7 +473,16 @@ pub struct Context<'a> {
     pub client_target: Option<String>,
     /// The targets the request has been redirected to so far.
     pub hops: Vec<String>,
+    /// The error pages and override in force (section 4.12).
+    pub errors: errors::Chain,
+    /// This hop asks an application for an error page (section 4.12):
+    /// it gets 2 s, its own errors are never replaced, and it is logged
+    /// as a hop of the request that failed.
+    pub handler: bool,
 }
+
+/// How long an application gets to produce an error page (section 4.12).
+pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What a redirected sub-request's application learns about the request
 /// it stands in for (section 4.10): REDIRECT_URL, REDIRECT_QUERY_STRING
@@ -491,6 +500,9 @@ pub struct Internal {
     pub headers: Vec<(String, Bytes)>,
     /// 1 for the first redirect.
     pub hop: u32,
+    /// For an error page sub-request (section 4.12), the reason of the
+    /// error, as muru.error_reason; empty for a redirect.
+    pub error_reason: String,
 }
 
 /// What handling a request produced: a response for the client, or an
@@ -542,6 +554,8 @@ fn requested_host(parts: &http::request::Parts) -> String {
 /// The access log record of a request in progress.
 pub(crate) struct Recording {
     log: Arc<AccessLog>,
+    /// Logged as a hop rather than a line of its own (section 4.12).
+    silent: bool,
     record: Record,
     started: Instant,
     /// Counted as in flight until the recording is dropped.
@@ -564,6 +578,7 @@ impl Recording {
     fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
         Self {
             log: Arc::clone(&context.access_log),
+            silent: context.handler,
             _in_flight: context.access_log.begin(&context.app, &context.release),
             record: Record {
                 started: SystemTime::now(),
@@ -617,7 +632,16 @@ impl Recording {
         self.record.reason = reason.to_owned();
         self.record.bytes = bytes;
         self.record.total = self.started.elapsed();
-        self.log.record(self.record);
+
+        // Section 4.12: an error page sub-request counts in the metrics
+        // of the application that served it, while the line is the
+        // failed request's own.
+
+        if self.silent {
+            self.log.record_hop(&self.record);
+        } else {
+            self.log.record(self.record);
+        }
     }
 }
 
@@ -638,6 +662,9 @@ pub(crate) fn reject(
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
         version: parts.version,
         recording: Mutex::new(Some(recording)),
+        errors: &context.errors,
+        host: requested_host(parts),
+        path: parts.uri.path().to_owned(),
     };
 
     failing.respond(problem)
@@ -719,7 +746,21 @@ async fn handle_inner(
     let upgrade = crate::websocket::detect(parts);
     let mut head = request_head(parts, context);
     let limits = &context.limits;
-    let deadline = context.arrived + limits.request_deadline;
+
+    // Section 4.12: an application asked for an error page gets 2 s of
+    // what is left of the deadline, queueing included.
+
+    let (deadline, queue_timeout) = if context.handler {
+        (
+            (context.arrived + limits.request_deadline).min(Instant::now() + HANDLER_TIMEOUT),
+            limits.queue_timeout.min(HANDLER_TIMEOUT),
+        )
+    } else {
+        (
+            context.arrived + limits.request_deadline,
+            limits.queue_timeout,
+        )
+    };
     head.deadline_unix_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
@@ -735,6 +776,9 @@ async fn handle_inner(
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
         version: parts.version,
         recording: Mutex::new(None),
+        errors: &context.errors,
+        host: requested_host(parts),
+        path: parts.uri.path().to_owned(),
     };
 
     head.max_body_size = limits.max_body_size;
@@ -790,7 +834,7 @@ async fn handle_inner(
 
     let queued = Instant::now();
 
-    let lease = match tokio::time::timeout(limits.queue_timeout, pool.acquire()).await {
+    let lease = match tokio::time::timeout(queue_timeout, pool.acquire()).await {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
             tracing::warn!(%error, "no worker connection");
@@ -982,6 +1026,26 @@ async fn handle_inner(
             "redirect",
             "The application redirected internally.",
         ));
+    }
+
+    // Section 4.12: the override replaces an error response of the
+    // application's own with the error page, before any body byte goes
+    // out. The rest of the response is drained as for a redirect.
+
+    if upgrade.is_none()
+        && !context.handler
+        && let Some(problem) =
+            override_from(&head, response_end, &failing.negotiation, &context.errors)
+    {
+        if response_end {
+            back.give_reader(Some(reader));
+            back.abort_request();
+        } else {
+            drain_response(reader, &back, limits.response_idle_timeout).await;
+        }
+
+        *failing.recording.lock().expect("recording poisoned") = recording.take();
+        return failing.respond(problem);
     }
 
     // The worker accepted the WebSocket: finish the handshake and relay
@@ -1190,11 +1254,25 @@ struct Failing<'a> {
     negotiation: Negotiation,
     version: http::Version,
     recording: Mutex<Option<Recording>>,
+    /// The custom pages in force (section 4.12).
+    errors: &'a errors::Chain,
+    /// The host and path the client asked for, for templates.
+    host: String,
+    path: String,
 }
 
 impl Failing<'_> {
     fn respond(&self, problem: Problem) -> Response<ResponseBody> {
-        let response = errors::respond(&problem, self.request_id, &self.negotiation);
+        let response = errors::respond(
+            &problem,
+            &errors::Rendering {
+                request_id: self.request_id,
+                negotiation: &self.negotiation,
+                errors: self.errors,
+                host: &self.host,
+                path: &self.path,
+            },
+        );
 
         if let Some(recording) = self.recording.lock().expect("recording poisoned").take() {
             let bytes = response
@@ -1259,6 +1337,69 @@ impl Failing<'_> {
 
         self.respond(problem)
     }
+}
+
+/// The problem the override makes of an application's response head
+/// (section 4.12), if the status is listed, the condition holds and the
+/// application did not opt out with X-Muru-Error-Override: off. The
+/// response's Retry-After, WWW-Authenticate and Allow are kept.
+fn override_from(
+    head: &pb::ResponseHead,
+    response_end: bool,
+    negotiation: &Negotiation,
+    errors: &errors::Chain,
+) -> Option<Problem> {
+    let status = u16::try_from(head.status).ok()?;
+    let when = errors.override_for(status)?;
+    let header = |wanted: &str| {
+        head.headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(wanted.as_bytes()))
+            .map(|header| header.value.clone())
+    };
+
+    if header("x-muru-error-override").is_some_and(|value| value.eq_ignore_ascii_case(b"off")) {
+        return None;
+    }
+
+    let applies = match when {
+        errors::When::All => true,
+        errors::When::EmptyBody => {
+            response_end || header("content-length").is_some_and(|value| value.as_ref() == b"0")
+        }
+        errors::When::NotJson => !header("content-type").is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.starts_with(b"application/json") || value.starts_with(b"application/problem+json")
+        }),
+        errors::When::HtmlOnly => negotiation.format == errors::Format::Html,
+    };
+
+    if !applies {
+        return None;
+    }
+
+    let status = StatusCode::from_u16(status).ok()?;
+    let mut problem = Problem::new(
+        status,
+        errors::OVERRIDE_REASON,
+        format!(
+            "The application answered {} {}.",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Error")
+        ),
+    );
+
+    for name in ["retry-after", "www-authenticate", "allow"] {
+        if let Some(value) = header(name)
+            && let Ok(value) = http::HeaderValue::from_bytes(&value)
+        {
+            problem
+                .headers
+                .push((http::HeaderName::from_static(name), value));
+        }
+    }
+
+    Some(problem)
 }
 
 /// Start a sentence with a capital letter and end it with a full stop.

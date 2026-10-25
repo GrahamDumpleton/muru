@@ -67,6 +67,8 @@ pub struct Config {
     /// The default mount treats a 200 with a local Location and no body
     /// as an internal redirect (section 4.10).
     pub cgi_local_redirect: bool,
+    /// The application's error pages and override (section 4.12).
+    pub errors: Arc<errors::ErrorPolicy>,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
     /// Where the access log goes and what it leaves out.
@@ -350,7 +352,8 @@ impl Edge {
                             cgi_local_redirect: config.cgi_local_redirect,
                         },
                     )
-                    .await?,
+                    .await?
+                    .with_errors(Arc::clone(&config.errors)),
                 )
                 .with_compression(config.compression.clone()),
             )),
@@ -724,6 +727,7 @@ async fn serve<I>(
             let mut merged = HeaderMap::new();
             let mut request_id = base_id.clone();
             let mut issued: Vec<String> = Vec::new();
+            let mut handling: Option<Handling> = None;
 
             let response = loop {
                 let decision = routing.select(
@@ -739,6 +743,24 @@ async fn serve<I>(
                     },
                     origin.as_ref(),
                 );
+
+                // Section 4.12: the error pages in force come from the
+                // route, the release the request was routed to, the host
+                // and the node.
+
+                let located = match &decision {
+                    routing::Decision::Serve { selection, .. } => {
+                        Some((selection.app.as_str(), selection.release.as_str()))
+                    }
+                    routing::Decision::Static {
+                        fallback: Some(selection),
+                        ..
+                    } => Some((selection.app.as_str(), selection.release.as_str())),
+                    _ => None,
+                };
+
+                let errors =
+                    routing.errors_for(host.as_deref(), parts.uri.path(), &listener, located);
                 let mut context = link::Context {
                     request_id: &request_id,
                     peer: client,
@@ -763,6 +785,8 @@ async fn serve<I>(
                     arrived,
                     client_target: (!hops.is_empty()).then(|| client_target.clone()),
                     hops: hops.clone(),
+                    errors,
+                    handler: handling.is_some(),
                 };
 
                 let handled = match (redirect_to, decision) {
@@ -777,22 +801,47 @@ async fn serve<I>(
                             cookies,
                         },
                     ) => {
-                        issued = cookies;
+                        // Section 4.12: an application does not serve its
+                        // own page for a capacity failure, and one in
+                        // maintenance answers 503 to clients, except for
+                        // what its exemptions let through.
+
+                        if handling.as_ref().is_some_and(|handling| {
+                            handling.capacity && selection.app == handling.app
+                        }) {
+                            break handling.take().expect("checked").fallback;
+                        }
+
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
-                        context.group = selection.group;
-                        context.mount = selection.mount;
-                        context.mount_path = selection.script_name;
-                        link::handle(
-                            &mut parts,
-                            body.take(),
-                            buffered.take(),
-                            selection.pool,
-                            &context,
-                            selection.redirects,
-                        )
-                        .await
+
+                        if origin.is_none()
+                            && let Some(maintenance) = &selection.maintenance
+                            && !maintenance.exempts(parts.uri.path(), client.ip(), &parts.headers)
+                        {
+                            let mut problem = errors::Problem::new(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "maintenance",
+                                "The application is down for maintenance.",
+                            );
+                            problem.retry_after = Some(maintenance.retry_after);
+                            link::Handled::Response(link::reject(&parts, &context, problem))
+                        } else {
+                            issued = cookies;
+                            context.group = selection.group;
+                            context.mount = selection.mount;
+                            context.mount_path = selection.script_name;
+                            link::handle(
+                                &mut parts,
+                                body.take(),
+                                buffered.take(),
+                                selection.pool,
+                                &context,
+                                selection.redirects,
+                            )
+                            .await
+                        }
                     }
                     (None, routing::Decision::Redirect) => {
                         link::Handled::Response(link::redirect_to_https(
@@ -932,8 +981,70 @@ async fn serve<I>(
                 };
 
                 let redirect = match handled {
-                    link::Handled::Response(response) => break response,
-                    link::Handled::Redirect(redirect) => redirect,
+                    link::Handled::Response(mut response) => {
+                        // Section 4.12: the handler's answer becomes the
+                        // page, or the built-in page stands; and a
+                        // generated error whose page is an application
+                        // path asks that application for it.
+
+                        if let Some(done) = handling.take() {
+                            break error_page_from(done, response);
+                        }
+
+                        match response.extensions_mut().remove::<errors::Handler>() {
+                            Some(handler) => {
+                                let hop = hops.len() as u32 + 1;
+                                hops.push(handler.path.clone());
+                                internal = Some(link::Internal {
+                                    redirect_url: parts.uri.path().to_owned(),
+                                    redirect_query_string: parts
+                                        .uri
+                                        .query()
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    redirect_status: handler.status.as_u16(),
+                                    headers: Vec::new(),
+                                    hop,
+                                    error_reason: handler.reason.to_owned(),
+                                });
+                                origin = Some(routing::Origin {
+                                    app: context.app.clone(),
+                                    release: context.release.clone(),
+                                    privileged: true,
+                                });
+
+                                if parts.method != Method::HEAD {
+                                    parts.method = Method::GET;
+                                }
+
+                                parts.uri = handler
+                                    .path
+                                    .parse()
+                                    .unwrap_or_else(|_| Uri::from_static("/"));
+                                parts.headers.remove(EXPECT);
+                                parts.headers.remove(CONTENT_LENGTH);
+                                parts.headers.remove(http::header::CONTENT_TYPE);
+                                body = None;
+                                buffered = None;
+                                handling = Some(Handling {
+                                    capacity: capacity_failure(handler.reason),
+                                    app: context.app.clone(),
+                                    handler,
+                                    fallback: response,
+                                });
+                                request_id = format!("{base_id}-{hop}");
+                                continue;
+                            }
+                            None => break response,
+                        }
+                    }
+                    link::Handled::Redirect(redirect) => {
+                        if let Some(done) = handling.take() {
+                            break done.fallback;
+                        }
+
+                        redirect
+                    }
                 };
 
                 hops.push(redirect.target.clone());
@@ -962,10 +1073,12 @@ async fn serve<I>(
                     redirect_status: redirect.status,
                     headers: redirect.headers.clone(),
                     hop,
+                    error_reason: String::new(),
                 });
                 origin = Some(routing::Origin {
                     app: context.app.clone(),
                     release: context.release.clone(),
+                    privileged: false,
                 });
                 let preserve = redirect.preserve_method && redirect.body.is_some();
 
@@ -1101,6 +1214,61 @@ async fn serve<I>(
 
     drop(token);
     drop(guard);
+}
+
+/// An error page being asked of an application (section 4.12): the page
+/// it is for, the built-in page to send if the handler fails, and the
+/// application that failed.
+struct Handling {
+    handler: errors::Handler,
+    fallback: Response<ResponseBody>,
+    /// The application that failed; empty when none was selected.
+    app: String,
+    /// The failure was one of capacity, which the failing application
+    /// may not be asked to answer.
+    capacity: bool,
+}
+
+/// Section 4.12: the reasons that mean the application's workers could
+/// not take the request.
+fn capacity_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "no_workers"
+            | "queue_full"
+            | "cold_start_timeout"
+            | "draining"
+            | "release_failed"
+            | "edge_overloaded"
+    )
+}
+
+/// The page an application answered for an error (section 4.12), with
+/// the error's own status and headers; the built-in page when the
+/// handler failed, so an error never recurses.
+fn error_page_from(
+    handling: Handling,
+    mut response: Response<ResponseBody>,
+) -> Response<ResponseBody> {
+    if response.status().as_u16() >= 400 {
+        return handling.fallback;
+    }
+
+    *response.status_mut() = handling.handler.status;
+    let headers = response.headers_mut();
+
+    for (name, value) in handling.handler.headers {
+        headers.insert(name, value);
+    }
+
+    if !headers.contains_key(http::header::CACHE_CONTROL) {
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
+
+    response
 }
 
 /// Headers that describe this connection rather than the request, which
@@ -1265,6 +1433,7 @@ pub(crate) fn request_head(
                     })
                     .collect(),
                 hop: internal.hop,
+                error_reason: internal.error_reason.clone(),
             }),
         ..Default::default()
     }
@@ -1283,10 +1452,16 @@ pub(crate) fn status_code(status: u32) -> StatusCode {
 /// alone (section 4.10).
 pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>) {
     for header in from {
-        if header
-            .name
+        // Sections 4.10 and 4.12: the redirect and override headers
+        // instruct the edge and never reach the client; the compression
+        // header is consumed by section 4.17 later.
+
+        let name = header.name.as_ref();
+
+        if name
             .get(..15)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-muru-redirect"))
+            || name.eq_ignore_ascii_case(errors::X_MURU_ERROR_OVERRIDE.as_str().as_bytes())
         {
             continue;
         }

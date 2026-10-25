@@ -48,6 +48,9 @@ service Admin {
   // autoscaler's signals, decisions and churn for a release.
   rpc SetScale(SetScaleRequest) returns (ScaleStatus);
   rpc GetScaleStatus(GetScaleStatusRequest) returns (ScaleStatus);
+  // Section 4.12: serve the maintenance page for an application at the
+  // edge, or serve it as usual again.
+  rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
@@ -126,6 +129,7 @@ message App {
   string user = 6;                  // the user its processes run as under a root daemon (section 10.9)
   string group = 7;
   string umask = 8;                 // octal
+  bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
 }
 
 // A deploy names the application (created on first use) and the source.
@@ -270,6 +274,17 @@ message SetScaleRequest {
   string group = 3;                 // default when empty
   optional uint32 processes = 4;    // the count to pin
   bool unpin = 5;                   // let the autoscaler decide again
+}
+
+message SetMaintenanceRequest {
+  string app = 1;
+  bool on = 2;
+}
+
+message MaintenanceStatus {
+  string app = 1;
+  bool on = 2;
+  uint64 since_unix_ms = 3;         // when it was turned on, 0 when off
 }
 
 message GetScaleStatusRequest {

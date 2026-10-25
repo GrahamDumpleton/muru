@@ -3,6 +3,7 @@
 //! of one application needs; routes, hosts and the rest arrive with their
 //! features.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -209,6 +210,17 @@ pub struct ReleaseSpec {
     /// as an internal redirect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cgi_local_redirect: bool,
+    /// Custom error pages (section 4.12), by status or status:reason; a
+    /// relative file is taken from the source directory.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, muru_config::ErrorPage>,
+    /// Which of the application's own error responses the edge replaces
+    /// with error pages (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<muru_config::ErrorOverride>,
+    /// What maintenance mode lets through (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<muru_config::Maintenance>,
 }
 
 /// One environment variable of a release (section 10.8).

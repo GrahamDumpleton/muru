@@ -4,7 +4,7 @@
 :class: note
 
 These are the responses the edge generates today. Reasons for releases,
-rollouts, upstreams and maintenance mode arrive with those features;
+rollouts and upstreams arrive with those features;
 [appendix C](../project/design/appendices/c-configuration-reference.md)
 of the design specification has the full planned list.
 ```
@@ -25,10 +25,12 @@ precisely than the status, appears in the access log line as
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
 | 500 | `redirect_loop` | The application redirected internally more than 5 times for one request |
 | 502 | `worker_crashed` | The worker's connection ended before a response head, or it sent something invalid |
+| 503 | `maintenance` | The application is in maintenance mode (`muructl maintenance on`) and nothing exempted the request; `Retry-After` is the release's `retry_after`, 60 s by default (see the [error pages guide](../howto/error-pages.md)) |
 | 503 | `no_workers` | No worker is available at all, with `Retry-After: 1` |
 | 503 | `queue_full` | Every worker thread was busy for longer than the queue timeout, with `Retry-After: 1` |
 | 504 | `deadline` | The application did not produce a response head within the request deadline |
 | 504 | `soft_timeout` | The request ran past the soft timeout and was interrupted in the worker before it produced a response head; development mode includes the traceback of where it was (see the [timeouts guide](../howto/timeouts.md)) |
+| any | `error_override` | The application's own response had a status that `error_override` lists, and the edge replaced it with the error page; the status is the application's |
 
 The HTTP parser answers a few things itself, before a request exists: a
 request head over the size limit, too many headers, an invalid request
@@ -37,7 +39,10 @@ and the connection is closed. Those carry no reason and no request id.
 
 ## The page
 
-The body is negotiated from the `Accept` header:
+A custom page configured for the status, or the status and reason,
+replaces the body described here; the [error pages
+guide](../howto/error-pages.md) covers those. Otherwise the body is
+negotiated from the `Accept` header:
 
 - `text/html` gets a small HTML page with the status, the description, the
   request id and, in development mode, the traceback;

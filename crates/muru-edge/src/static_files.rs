@@ -696,7 +696,7 @@ fn parse_range(value: &str, length: u64) -> Option<Range> {
 }
 
 /// The content type from the file's name, with a charset for text.
-fn content_type(path: &Path) -> HeaderValue {
+pub(crate) fn content_type(path: &Path) -> HeaderValue {
     let guess = mime_guess::from_path(path).first_or_octet_stream();
 
     let text = if guess.type_() == mime_guess::mime::TEXT {

@@ -317,6 +317,20 @@ redirecting response's Content-Disposition, Cache-Control, Expires,
 Set-Cookie, Vary and non-empty Content-Type carry over; a chain stops
 after 5 hops with 500 redirect_loop under the client's deadline, with
 one access log line naming every hop; and a client's X-Muru-* request
-headers are stripped at the edge. Still to come: upload offloading, the
-file hints (X-Muru-Sendfile) the same directory serving backs, and error
-page handlers reached by internal path.
+headers are stripped at the edge. Still to come: upload offloading and
+the file hints (X-Muru-Sendfile) the same directory serving backs.
+
+Custom error pages and maintenance mode (section 4.12) are in: pages by
+status or status:reason at the route, release, host and node levels, as
+a file read when the snapshot is compiled, a template the edge renders
+with the status, title, reason, description, request id, Retry-After,
+host and path, or an application path the edge asks for the page as an
+internal sub-request (2 s, never for a capacity failure of the same
+application, never recursing, the error's own status and headers kept);
+`error_override` with `when` = all, empty_body, not_json or html_only
+and the `X-Muru-Error-Override: off` opt-out; `muructl maintenance on`
+and `off` over SetMaintenance, serving 503 maintenance at the edge with
+exemptions by path, address and bypass cookie, recorded in the store,
+announced as `maintenance.changed` and marked in `muructl app list`; and
+`muru.error_reason` for handlers. Still to come: the dashboard's
+maintenance control.

@@ -392,6 +392,16 @@ pub struct Release {
     /// body as an internal redirect, the CGI convention (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgi_local_redirect: Option<bool>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
+    /// What maintenance mode lets through (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
 }
 
 /// How a worker group is scaled (section 7.2).
@@ -899,6 +909,13 @@ pub struct Host {
     /// otherwise refused with 421.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
@@ -962,6 +979,13 @@ pub struct Route {
     /// route with no fallback needs it for any redirect to reach it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_redirects_from: Vec<String>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
 }
 
 /// A route's traffic policy (section 9.4): the share of requests each
@@ -1027,6 +1051,214 @@ fn root_path() -> String {
     "/".to_owned()
 }
 
+/// A custom error page (section 4.12): one entry of an `error_pages`
+/// table, keyed by status (`404`) or status and reason
+/// (`"503:maintenance"`). Exactly one of `file`, `template` and `path`
+/// is given.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorPage {
+    /// A file sent as the body, with the content type its name implies.
+    /// A release's page may be a path relative to its source directory;
+    /// elsewhere the path is absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// A template the edge renders, with `{status}`, `{title}`,
+    /// `{reason}`, `{description}`, `{request_id}`, `{retry_after}`,
+    /// `{host}` and `{path}` filled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// An application path the edge asks for the page, as an internal
+    /// sub-request that sees `REDIRECT_STATUS` and `muru.error_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The content type of a template (default `text/html;
+    /// charset=utf-8`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+/// Replacing an application's own error responses with error pages
+/// (section 4.12), the `error_override` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorOverride {
+    /// The statuses replaced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<u16>,
+    /// When a listed response is replaced: `all` (the default),
+    /// `empty_body`, `not_json` or `html_only`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
+/// What maintenance mode lets through (section 4.12), the `maintenance`
+/// table of a release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Maintenance {
+    /// Path prefixes served as usual while the application is in
+    /// maintenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_paths: Vec<String>,
+    /// Client addresses, or ranges in CIDR form, served as usual.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_addresses: Vec<String>,
+    /// A `name=value` cookie that lets a client through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_cookie: Option<String>,
+    /// The `Retry-After` the maintenance page carries, for example 5m
+    /// (default 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+}
+
+/// Check an `error_pages` table: the keys name a status, with a reason
+/// after a colon or not, and each page is exactly one of a file, a
+/// template or a path. With `relative_files` a file may be a relative
+/// path, which a release resolves against its source.
+pub fn check_error_pages(
+    pages: &BTreeMap<String, ErrorPage>,
+    relative_files: bool,
+) -> Result<(), String> {
+    for (key, page) in pages {
+        let (status, reason) = match key.split_once(':') {
+            Some((status, reason)) => (status, Some(reason)),
+            None => (key.as_str(), None),
+        };
+
+        let status: u16 = status.parse().unwrap_or(0);
+
+        if !(400..=599).contains(&status) {
+            return Err(format!(
+                "error_pages: {key:?} is not a status from 400 to 599, or STATUS:reason"
+            ));
+        }
+
+        if reason.is_some_and(|reason| {
+            reason.is_empty()
+                || !reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }) {
+            return Err(format!(
+                "error_pages: {key:?} does not name a reason such as no_route"
+            ));
+        }
+
+        let given = [
+            page.file.is_some(),
+            page.template.is_some(),
+            page.path.is_some(),
+        ]
+        .into_iter()
+        .filter(|given| *given)
+        .count();
+
+        if given != 1 {
+            return Err(format!(
+                "error_pages: {key} needs exactly one of file, template and path"
+            ));
+        }
+
+        if let Some(path) = &page.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("error_pages: {key}: path must start with /"));
+        }
+
+        if let Some(file) = &page.file
+            && !relative_files
+            && !file.starts_with('/')
+        {
+            return Err(format!(
+                "error_pages: {key}: file must be an absolute path here"
+            ));
+        }
+
+        if page.content_type.is_some() && page.template.is_none() {
+            return Err(format!(
+                "error_pages: {key}: content_type goes with a template"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check an `error_override` table: statuses from 400 to 599, and a
+/// known `when`.
+pub fn check_error_override(table: &ErrorOverride) -> Result<(), String> {
+    if table.statuses.is_empty() {
+        return Err("error_override: statuses names nothing".to_owned());
+    }
+
+    if let Some(status) = table
+        .statuses
+        .iter()
+        .find(|status| !(400..=599).contains(*status))
+    {
+        return Err(format!(
+            "error_override: {status} is not a status from 400 to 599"
+        ));
+    }
+
+    if let Some(when) = table.when.as_deref()
+        && !matches!(when, "all" | "empty_body" | "not_json" | "html_only")
+    {
+        return Err(format!(
+            "error_override: when must be all, empty_body, not_json or html_only, not {when:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check a `maintenance` table: paths, addresses, the cookie and the
+/// retry period.
+pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
+    if let Some(path) = table
+        .exempt_paths
+        .iter()
+        .find(|path| !path.starts_with('/'))
+    {
+        return Err(format!(
+            "maintenance: exempt_paths: {path:?} must start with /"
+        ));
+    }
+
+    for address in &table.exempt_addresses {
+        let (network, prefix) = match address.split_once('/') {
+            Some((network, prefix)) => (network, Some(prefix)),
+            None => (address.as_str(), None),
+        };
+
+        let parsed: Option<std::net::IpAddr> = network.parse().ok();
+        let bits = parsed.map_or(0, |address| if address.is_ipv4() { 32 } else { 128 });
+        let prefix_ok = prefix.is_none_or(|prefix| prefix.parse::<u8>().is_ok_and(|n| n <= bits));
+
+        if parsed.is_none() || !prefix_ok {
+            return Err(format!(
+                "maintenance: exempt_addresses: {address:?} is not an address or a CIDR range"
+            ));
+        }
+    }
+
+    if let Some(cookie) = &table.bypass_cookie
+        && !matches!(cookie.split_once('='), Some((name, value)) if !name.is_empty() && !value.is_empty())
+    {
+        return Err("maintenance: bypass_cookie must be name=value".to_owned());
+    }
+
+    if let Some(text) = &table.retry_after
+        && let Err(error) = parse_duration(text)
+    {
+        return Err(format!("maintenance: retry_after: {error}"));
+    }
+
+    Ok(())
+}
+
 /// An application's table and its releases.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1079,6 +1311,13 @@ pub struct Document {
     /// How responses are compressed (section 4.17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<Compression>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
     /// Secret stores (section 10.8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Secrets>,
@@ -1260,6 +1499,16 @@ pub struct ToolMuru {
     /// body as an internal redirect, the CGI convention (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgi_local_redirect: Option<bool>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
+    /// What maintenance mode lets through (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
 }
 
 /// Why a project's configuration could not be read.
@@ -1442,6 +1691,8 @@ mod tests {
             case: None,
             internal: None,
             accept_redirects_from: Vec::new(),
+            error_pages: BTreeMap::new(),
+            error_override: None,
             traffic: Some(Traffic {
                 split: BTreeMap::from([("r2".to_owned(), 10)]),
                 sticky: Some(true),

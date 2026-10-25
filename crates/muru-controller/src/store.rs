@@ -86,13 +86,17 @@ CREATE TABLE IF NOT EXISTS event_sinks (
     name TEXT PRIMARY KEY,
     delivered INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS maintenance (
+    app TEXT PRIMARY KEY,
+    since_unix_ms INTEGER NOT NULL
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The store.
 pub struct Store {
@@ -113,7 +117,8 @@ impl Store {
         // added hosts and routes and version 3 the event sink cursors,
         // which the CREATE statements above supply to an older store;
         // version 4 added the application's user, group and umask, which
-        // are added to an older table here.
+        // are added to an older table here; version 5 added the
+        // applications in maintenance mode (section 4.12).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -314,7 +319,42 @@ impl Store {
     pub fn delete_app(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM releases WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Section 4.12: the applications in maintenance mode, each with when
+    /// it was turned on.
+    pub fn maintenance(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT app, since_unix_ms FROM maintenance ORDER BY app")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Put an application into maintenance mode, or take it out.
+    pub fn set_maintenance(&self, app: &str, since_unix_ms: Option<u64>) -> Result<(), StoreError> {
+        self.with(|connection| {
+            match since_unix_ms {
+                Some(since) => {
+                    connection.execute(
+                        "INSERT INTO maintenance (app, since_unix_ms) VALUES (?1, ?2) \
+                         ON CONFLICT(app) DO NOTHING",
+                        params![app, since as i64],
+                    )?;
+                }
+                None => {
+                    connection.execute("DELETE FROM maintenance WHERE app = ?1", [app])?;
+                }
+            }
+
             Ok(())
         })
     }
@@ -759,6 +799,9 @@ mod tests {
             scaling: ScalingSpec::default(),
             accel_redirect: false,
             cgi_local_redirect: false,
+            error_pages: Default::default(),
+            error_override: None,
+            maintenance: None,
         }
     }
 

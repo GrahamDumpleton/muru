@@ -7,7 +7,6 @@ Still to be written, as their features land:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Uploads, including upload adapters for Django, Flask and Starlette.
-- Custom error pages and maintenance mode.
 - Scaling and schedules.
 - Log rotation.
 - Containers and images.
@@ -35,6 +34,7 @@ mounts
 https
 static-files
 internal-redirects
+error-pages
 compression
 timeouts
 connections

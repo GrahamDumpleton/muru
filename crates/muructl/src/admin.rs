@@ -260,6 +260,8 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         service_user,
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
+        error_pages: document.error_pages.clone(),
+        error_override: document.error_override.clone(),
         secrets,
         rotation: muru_controller::rotation::Policy::from_table(document.logs.as_ref())?,
         access_log,
@@ -2027,7 +2029,7 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             format!("{}:{}", app.user, app.group)
         };
         println!(
-            "{:<20} {:<12} {:<12} {user}{}",
+            "{:<20} {:<12} {:<12} {user}{}{}",
             app.name,
             or_dash(&app.current_release),
             or_dash(&app.previous_release),
@@ -2035,8 +2037,62 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
                 String::new()
             } else {
                 format!(" umask {}", app.umask)
+            },
+            if app.maintenance {
+                " [maintenance]"
+            } else {
+                ""
             }
         );
+    }
+
+    Ok(())
+}
+
+/// The `muructl maintenance` subcommands (section 4.12).
+#[derive(Subcommand)]
+pub enum MaintenanceCommand {
+    /// Serve the application's maintenance page at the edge: 503
+    /// maintenance, except for what its exemptions let through.
+    On {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Serve the application as usual again.
+    Off {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Turn maintenance mode on or off.
+pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
+    let (app, on, socket) = match command {
+        MaintenanceCommand::On { app, socket } => (app, true, socket),
+        MaintenanceCommand::Off { app, socket } => (app, false, socket),
+    };
+
+    let mut client = client::connect(&socket.socket()).await?;
+    let status = client
+        .set_maintenance(pb::SetMaintenanceRequest { app, on })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if status.on {
+        println!(
+            "muru: {} is in maintenance: clients get 503 maintenance until `muructl maintenance off {}`",
+            status.app, status.app
+        );
+    } else {
+        println!("muru: {} serves as usual again", status.app);
     }
 
     Ok(())

@@ -1018,6 +1018,10 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         muru.set_item("redirect_url", &internal.redirect_url)?;
         muru.set_item("redirect_query_string", &internal.redirect_query_string)?;
         muru.set_item("redirect_status", internal.redirect_status)?;
+
+        if !internal.error_reason.is_empty() {
+            muru.set_item("error_reason", &internal.error_reason)?;
+        }
     }
 
     if let Some(proxy) = &head.proxy {

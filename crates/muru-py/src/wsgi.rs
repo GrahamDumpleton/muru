@@ -826,6 +826,12 @@ fn build_environ<'py>(
             intern!(py, "REDIRECT_STATUS"),
             internal.redirect_status.to_string(),
         )?;
+
+        // Section 4.12: an error page sub-request says which error.
+
+        if !internal.error_reason.is_empty() {
+            environ.set_item(intern!(py, "muru.error_reason"), &internal.error_reason)?;
+        }
     }
 
     // Section 4.7: behind a trusted proxy, REMOTE_ADDR is the resolved

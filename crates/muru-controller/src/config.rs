@@ -214,6 +214,14 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
         );
     }
 
+    if !document.error_pages.is_empty() || document.error_override.is_some() {
+        plan.warnings.push(
+            "the node-wide [error_pages] and [error_override] tables belong in the daemon \
+             configuration file and were not applied"
+                .to_owned(),
+        );
+    }
+
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
     }
@@ -314,17 +322,17 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             continue;
         };
 
-        let groups = (!table.groups.is_empty()).then_some(&table.groups);
-        let mounts = (!table.mounts.is_empty()).then_some(&table.mounts);
+        let tables = Tables {
+            groups: (!table.groups.is_empty()).then_some(&table.groups),
+            mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
+            logging: table.logging.as_ref(),
+            scaling: table.scaling.as_ref(),
+            error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
+            error_override: table.error_override.as_ref(),
+            maintenance: table.maintenance.as_ref(),
+        };
 
-        let spec = match resolve_spec(
-            &request_from(name, table, source),
-            None,
-            groups,
-            mounts,
-            table.logging.as_ref(),
-            table.scaling.as_ref(),
-        ) {
+        let spec = match resolve_spec(&request_from(name, table, source), None, &tables) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -405,6 +413,13 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
             plan.errors.push(format!(
                 "host {name}: use_canonical_name needs a canonical name"
             ));
+            valid = false;
+        }
+
+        // Section 4.12: the host's error pages, with absolute file paths.
+
+        if let Err(error) = check_error_tables(&host.error_pages, host.error_override.as_ref()) {
+            plan.errors.push(format!("host {name}: {error}"));
             valid = false;
         }
 
@@ -640,6 +655,14 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }
         }
 
+        // Section 4.12: the route's error pages.
+
+        if let Err(error) = check_error_tables(&route.error_pages, route.error_override.as_ref()) {
+            plan.errors
+                .push(format!("route {} {}: {error}", route.host, route.path));
+            valid = false;
+        }
+
         // Section 4.10: the applications a route accepts redirects from
         // must exist.
 
@@ -698,6 +721,21 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }),
         }
     }
+}
+
+/// Section 4.12: a host's or route's error pages and override, whose
+/// files must be absolute paths.
+fn check_error_tables(
+    pages: &BTreeMap<String, muru_config::ErrorPage>,
+    override_: Option<&muru_config::ErrorOverride>,
+) -> Result<(), String> {
+    muru_config::check_error_pages(pages, false)?;
+
+    if let Some(table) = override_ {
+        muru_config::check_error_override(table)?;
+    }
+
+    Ok(())
 }
 
 /// A traffic policy in words, for plans and events: the shares, the
@@ -869,17 +907,42 @@ fn describe_host(host: &VirtualHost) -> String {
     parts.join(", ")
 }
 
+/// The sub-tables of a declared release (`muructl apply`), which take
+/// precedence over the source's own [tool.muru] table; a deploy gives
+/// none.
+#[derive(Default, Clone, Copy)]
+pub struct Tables<'a> {
+    /// Worker groups (section 7.1).
+    pub groups: Option<&'a BTreeMap<String, GroupTable>>,
+    /// Mounts (section 6.7).
+    pub mounts: Option<&'a BTreeMap<String, MountTable>>,
+    /// Logging (section 11.4).
+    pub logging: Option<&'a muru_config::Logging>,
+    /// Scaling (section 7.2).
+    pub scaling: Option<&'a muru_config::Scaling>,
+    /// Error pages (section 4.12).
+    pub error_pages: Option<&'a BTreeMap<String, muru_config::ErrorPage>>,
+    /// The error override (section 4.12).
+    pub error_override: Option<&'a muru_config::ErrorOverride>,
+    /// Maintenance exemptions (section 4.12).
+    pub maintenance: Option<&'a muru_config::Maintenance>,
+}
+
 /// Resolve a deploy request into a release spec: the request's settings,
 /// then the source's [tool.muru] table, then the previous release when
 /// one is given (a deploy), then the defaults of section 13.1.
 pub fn resolve_spec(
     request: &pb::DeployRequest,
     previous: Option<&ReleaseSpec>,
-    groups: Option<&BTreeMap<String, GroupTable>>,
-    mounts: Option<&BTreeMap<String, MountTable>>,
-    logging: Option<&muru_config::Logging>,
-    scaling: Option<&muru_config::Scaling>,
+    tables: &Tables<'_>,
 ) -> Result<ReleaseSpec, String> {
+    let Tables {
+        groups,
+        mounts,
+        logging,
+        scaling,
+        ..
+    } = *tables;
     let source = Path::new(&request.source);
 
     if !source.is_dir() {
@@ -1210,6 +1273,45 @@ pub fn resolve_spec(
     let (scaling, processes) =
         resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
 
+    // Section 4.12: the release's error pages, override and maintenance
+    // exemptions, from the declared table else the source's own; a page
+    // file is checked to exist under the source.
+
+    let error_pages = tables
+        .error_pages
+        .cloned()
+        .unwrap_or_else(|| table.error_pages.clone());
+    muru_config::check_error_pages(&error_pages, true)?;
+
+    for (key, page) in &error_pages {
+        if let Some(file) = &page.file
+            && !source.join(file).is_file()
+        {
+            return Err(format!(
+                "error_pages: {key}: {} is not a file",
+                source.join(file).display()
+            ));
+        }
+    }
+
+    let error_override = tables
+        .error_override
+        .cloned()
+        .or_else(|| table.error_override.clone());
+
+    if let Some(override_) = &error_override {
+        muru_config::check_error_override(override_)?;
+    }
+
+    let maintenance = tables
+        .maintenance
+        .cloned()
+        .or_else(|| table.maintenance.clone());
+
+    if let Some(maintenance) = &maintenance {
+        muru_config::check_maintenance(maintenance)?;
+    }
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -1248,6 +1350,9 @@ pub fn resolve_spec(
         memory,
         env,
         scaling,
+        error_pages,
+        error_override,
+        maintenance,
     })
 }
 
@@ -1726,6 +1831,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         }),
         accel_redirect: spec.accel_redirect.then_some(true),
         cgi_local_redirect: spec.cgi_local_redirect.then_some(true),
+        error_pages: spec.error_pages.clone(),
+        error_override: spec.error_override.clone(),
+        maintenance: spec.maintenance.clone(),
     }
 }
 
@@ -1904,8 +2012,90 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         declared.scaling.describe(),
         recorded.scaling.describe(),
     );
+    compare(
+        "error_pages",
+        describe_error_pages(&declared.error_pages),
+        describe_error_pages(&recorded.error_pages),
+    );
+    compare(
+        "error_override",
+        describe_error_override(declared.error_override.as_ref()),
+        describe_error_override(recorded.error_override.as_ref()),
+    );
+    compare(
+        "maintenance",
+        describe_maintenance(declared.maintenance.as_ref()),
+        describe_maintenance(recorded.maintenance.as_ref()),
+    );
 
     found
+}
+
+/// Error pages as one phrase: each key and what it is.
+fn describe_error_pages(pages: &BTreeMap<String, muru_config::ErrorPage>) -> String {
+    if pages.is_empty() {
+        return "none".to_owned();
+    }
+
+    pages
+        .iter()
+        .map(
+            |(key, page)| match (&page.file, &page.template, &page.path) {
+                (Some(file), _, _) => format!("{key} file {file}"),
+                (_, Some(_), _) => format!("{key} template"),
+                (_, _, Some(path)) => format!("{key} path {path}"),
+                _ => key.clone(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// An error override as one phrase.
+fn describe_error_override(table: Option<&muru_config::ErrorOverride>) -> String {
+    match table {
+        Some(table) => format!(
+            "{} when {}",
+            table
+                .statuses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            table.when.as_deref().unwrap_or("all")
+        ),
+        None => "off".to_owned(),
+    }
+}
+
+/// Maintenance exemptions as one phrase.
+fn describe_maintenance(table: Option<&muru_config::Maintenance>) -> String {
+    let Some(table) = table else {
+        return "no exemptions".to_owned();
+    };
+    let mut parts = Vec::new();
+
+    if !table.exempt_paths.is_empty() {
+        parts.push(format!("paths {}", table.exempt_paths.join(", ")));
+    }
+
+    if !table.exempt_addresses.is_empty() {
+        parts.push(format!("addresses {}", table.exempt_addresses.join(", ")));
+    }
+
+    if table.bypass_cookie.is_some() {
+        parts.push("a bypass cookie".to_owned());
+    }
+
+    if let Some(retry) = &table.retry_after {
+        parts.push(format!("retry after {retry}"));
+    }
+
+    if parts.is_empty() {
+        "no exemptions".to_owned()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// An environment as one phrase, for the report, never with a secret's
@@ -2045,10 +2235,7 @@ mod tests {
                 ..Default::default()
             },
             None,
-            None,
-            None,
-            None,
-            None,
+            &Tables::default(),
         )
         .unwrap();
         store.create_release("shop", "r1", &spec).unwrap();

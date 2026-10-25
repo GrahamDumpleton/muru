@@ -116,7 +116,8 @@ accel_redirect = false       # this mount's own choice
 ```
 
 Without the setting the headers pass through to the client like any
-other. `X-Muru-Redirect` is always honoured and never reaches a client.
+other. `X-Muru-Redirect` is always honoured, and no response header
+starting with `X-Muru-` reaches a client.
 
 ## Limits
 
