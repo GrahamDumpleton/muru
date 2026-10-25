@@ -6,8 +6,7 @@ are written as each capability lands.
 Still to be written, as their features land:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
-- Uploads and authorised downloads (internal redirects), including upload adapters for Django, Flask and Starlette.
-- Custom error pages and maintenance mode.
+- Uploads, including upload adapters for Django, Flask and Starlette.
 - Scaling and schedules.
 - Log rotation.
 - Containers and images.
@@ -26,11 +25,20 @@ daemon
 secrets
 users
 virtual-hosts
+traffic
+rollouts
 behind-a-proxy
 worker-groups
+scaling
 mounts
 https
 static-files
+file-hints
+internal-redirects
+error-pages
+auth-subrequests
+upstreams
+managed-servers
 compression
 timeouts
 connections

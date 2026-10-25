@@ -13,8 +13,10 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::config::{self, Action, Change, Plan};
-use crate::daemon::{Command, Handle};
-use crate::model::{Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
+use crate::daemon::{Command, Handle, RolloutAction};
+use crate::model::{
+    Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
+};
 
 /// Serve the API on the socket until the returned future ends.
 pub async fn serve(
@@ -102,8 +104,15 @@ impl Admin for Service {
         _: Request<pb::ListAppsRequest>,
     ) -> Result<Response<pb::ListAppsResponse>, Status> {
         let apps = self.handle.store.apps().map_err(internal)?;
+        let maintenance = self.handle.store.maintenance().map_err(internal)?;
         Ok(Response::new(pb::ListAppsResponse {
-            apps: apps.into_iter().map(app_message).collect(),
+            apps: apps
+                .into_iter()
+                .map(|app| {
+                    let on = maintenance.iter().any(|(name, _)| *name == app.name);
+                    app_message(app, on)
+                })
+                .collect(),
         }))
     }
 
@@ -116,7 +125,41 @@ impl Admin for Service {
             .store
             .app(&request.into_inner().name)
             .map_err(not_found)?;
-        Ok(Response::new(app_message(app)))
+        let on = self
+            .handle
+            .store
+            .maintenance()
+            .map_err(internal)?
+            .iter()
+            .any(|(name, _)| *name == app.name);
+        Ok(Response::new(app_message(app, on)))
+    }
+
+    async fn set_maintenance(
+        &self,
+        request: Request<pb::SetMaintenanceRequest>,
+    ) -> Result<Response<pb::MaintenanceStatus>, Status> {
+        let request = request.into_inner();
+        self.handle.store.app(&request.app).map_err(not_found)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::SetMaintenance {
+                app: request.app.clone(),
+                on: request.on,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let since = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::MaintenanceStatus {
+            app: request.app,
+            on: since.is_some(),
+            since_unix_ms: since.unwrap_or(0),
+        }))
     }
 
     async fn deploy(
@@ -132,7 +175,7 @@ impl Admin for Service {
             .and_then(|app| app.current.or(app.previous))
             .and_then(|id| self.handle.store.release(&request.app, &id).ok())
             .map(|release| release.spec);
-        let spec = config::resolve_spec(&request, previous.as_ref(), None, None, None)
+        let spec = config::resolve_spec(&request, previous.as_ref(), &config::Tables::default())
             .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -145,6 +188,7 @@ impl Admin for Service {
                 retain: request
                     .retain_ms
                     .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                hold: request.hold,
                 created: created_tx,
                 done: done_tx,
             })
@@ -459,21 +503,7 @@ impl Admin for Service {
         request: Request<pb::DebugRequest>,
     ) -> Result<Response<pb::DebugResponse>, Status> {
         let request = request.into_inner();
-
-        // The application's current release unless one is named.
-
-        let release = if request.release.is_empty() {
-            let app = self.handle.store.app(&request.app).map_err(not_found)?;
-            app.current.ok_or_else(|| {
-                Status::failed_precondition(format!("{} has no current release", request.app))
-            })?
-        } else {
-            request.release.clone()
-        };
-        self.handle
-            .store
-            .release(&request.app, &release)
-            .map_err(not_found)?;
+        let release = self.current_release(&request.app, &request.release)?;
 
         let args: serde_json::Value = if request.args_json.trim().is_empty() {
             serde_json::json!({})
@@ -552,6 +582,189 @@ impl Admin for Service {
         Ok(Response::new(pb::ShutdownResponse {}))
     }
 
+    async fn start_rollout(
+        &self,
+        request: Request<pb::StartRolloutRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        let request = request.into_inner();
+        let steps = request
+            .steps
+            .iter()
+            .map(|step| RolloutStep {
+                percent: step.percent,
+                hold_ms: step.hold_ms,
+            })
+            .collect();
+        let gates = RolloutGates {
+            max_error_rate: if request.max_error_rate > 0.0 {
+                request.max_error_rate
+            } else {
+                0.01
+            },
+            max_p95_ms: (request.max_p95_ms > 0).then_some(request.max_p95_ms),
+            min_requests: if request.min_requests > 0 {
+                request.min_requests
+            } else {
+                100
+            },
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::StartRollout {
+                app: request.app,
+                release: request.release,
+                steps,
+                gates,
+                approve_each_step: request.approve_each_step,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rollout = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(rollout_message(&rollout)))
+    }
+
+    async fn get_rollout(
+        &self,
+        request: Request<pb::GetRolloutRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        let request = request.into_inner();
+        let rollout = self
+            .handle
+            .store
+            .rollout(&request.app, &request.rollout)
+            .map_err(not_found)?;
+        Ok(Response::new(rollout_message(&rollout)))
+    }
+
+    async fn list_rollouts(
+        &self,
+        request: Request<pb::ListRolloutsRequest>,
+    ) -> Result<Response<pb::ListRolloutsResponse>, Status> {
+        let request = request.into_inner();
+        let rollouts = self
+            .handle
+            .store
+            .rollouts((!request.app.is_empty()).then_some(request.app.as_str()))
+            .map_err(internal)?;
+        Ok(Response::new(pb::ListRolloutsResponse {
+            rollouts: rollouts.iter().map(rollout_message).collect(),
+        }))
+    }
+
+    async fn pause_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Pause)
+            .await
+    }
+
+    async fn resume_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Resume)
+            .await
+    }
+
+    async fn promote_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Promote)
+            .await
+    }
+
+    async fn abort_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Abort)
+            .await
+    }
+
+    async fn promote_release(
+        &self,
+        request: Request<pb::PromoteReleaseRequest>,
+    ) -> Result<Response<pb::Release>, Status> {
+        let request = request.into_inner();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::PromoteRelease {
+                app: request.app,
+                id: request.release,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let release = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(release_message(release, &self.handle)))
+    }
+
+    async fn set_scale(
+        &self,
+        request: Request<pb::SetScaleRequest>,
+    ) -> Result<Response<pb::ScaleStatus>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+
+        let group = if request.group.is_empty() {
+            muru_edge::routing::DEFAULT_GROUP.to_owned()
+        } else {
+            request.group.clone()
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::SetScale {
+                app: request.app.clone(),
+                id: release.clone(),
+                group,
+                processes: request.processes,
+                unpin: request.unpin,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let groups = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(scale_message(&request.app, &release, groups)))
+    }
+
+    async fn get_scale_status(
+        &self,
+        request: Request<pb::GetScaleStatusRequest>,
+    ) -> Result<Response<pb::ScaleStatus>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::GetScaleStatus {
+                app: request.app.clone(),
+                id: release.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let groups = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(scale_message(&request.app, &release, groups)))
+    }
+
     async fn list_hosts(
         &self,
         _: Request<pb::ListHostsRequest>,
@@ -575,6 +788,29 @@ impl Admin for Service {
         }))
     }
 
+    async fn list_upstreams(
+        &self,
+        _: Request<pb::ListUpstreamsRequest>,
+    ) -> Result<Response<pb::ListUpstreamsResponse>, Status> {
+        let upstreams = self.handle.store.upstreams().map_err(internal)?;
+        Ok(Response::new(pb::ListUpstreamsResponse {
+            upstreams: upstreams
+                .into_iter()
+                .map(|(name, upstream)| pb::Upstream {
+                    name,
+                    addresses: upstream.addresses,
+                    protocol: upstream.protocol.unwrap_or_else(|| "http1".to_owned()),
+                    tls: upstream.tls.is_some(),
+                    health_path: upstream
+                        .health
+                        .and_then(|health| health.path)
+                        .unwrap_or_default(),
+                    trust_muru_headers: upstream.trust_muru_headers,
+                })
+                .collect(),
+        }))
+    }
+
     async fn list_routes(
         &self,
         _: Request<pb::ListRoutesRequest>,
@@ -584,13 +820,50 @@ impl Admin for Service {
             routes: routes
                 .into_iter()
                 .map(|route| pb::Route {
+                    traffic: route
+                        .traffic
+                        .as_ref()
+                        .map(|traffic| {
+                            traffic
+                                .split
+                                .iter()
+                                .map(|(release, percent)| pb::TrafficShare {
+                                    release: release.clone(),
+                                    percent: *percent,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    sticky: route
+                        .traffic
+                        .as_ref()
+                        .and_then(|traffic| traffic.sticky)
+                        .unwrap_or(false),
+                    hash_key: route
+                        .traffic
+                        .as_ref()
+                        .and_then(|traffic| traffic.hash_key.clone())
+                        .unwrap_or_default(),
+                    internal: route.internal == Some(true),
+                    accept_redirects_from: route.accept_redirects_from,
+                    auth: route
+                        .auth
+                        .as_ref()
+                        .map(|auth| format!("{} {}", config::auth_handler(auth), auth.path))
+                        .unwrap_or_default(),
                     host: route.host,
                     path: route.path,
                     app: route.app,
+                    upstream: route.upstream,
                     static_dir: route.static_dir.unwrap_or_default(),
                     fallback_app: route
                         .fallback
-                        .and_then(|fallback| fallback.app)
+                        .as_ref()
+                        .and_then(|fallback| fallback.app.clone())
+                        .unwrap_or_default(),
+                    fallback_upstream: route
+                        .fallback
+                        .and_then(|fallback| fallback.upstream)
                         .unwrap_or_default(),
                 })
                 .collect(),
@@ -729,12 +1002,44 @@ impl Service {
                 .delete_host(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
-            Action::PutRoute { route, new } => store
-                .put_route(route)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
+            Action::PutRoute { route, new } => {
+                let before = store
+                    .routes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|stored| stored.host == route.host && stored.path == route.path)
+                    .and_then(|stored| stored.traffic);
+
+                // Section 9.4: a changed policy is an event of its own.
+
+                if before != route.traffic {
+                    self.handle.events.emit(
+                        "traffic_policy.changed",
+                        &format!("route {} {}", route.host, route.path),
+                        "notice",
+                        &crate::config::describe_traffic(route.traffic.as_ref()),
+                    );
+                }
+
+                store
+                    .put_route(route)
+                    .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                    .map_err(|error| error.to_string())
+            }
             Action::RemoveRoute { host, path } => store
                 .delete_route(host, path)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutUpstream {
+                name,
+                upstream,
+                new,
+            } => store
+                .put_upstream(name, upstream)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveUpstream { name } => store
+                .delete_upstream(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
         };
@@ -759,6 +1064,7 @@ impl Service {
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
                 retain: crate::daemon::RETENTION,
+                hold: false,
                 created: created_tx,
                 done: done_tx,
             })
@@ -858,7 +1164,7 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
     }
 }
 
-fn app_message(app: crate::model::App) -> pb::App {
+fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
     pb::App {
         name: app.name,
         current_release: app.current.unwrap_or_default(),
@@ -868,6 +1174,123 @@ fn app_message(app: crate::model::App) -> pb::App {
         user: app.user.unwrap_or_default(),
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
+        maintenance,
+    }
+}
+
+impl Service {
+    /// The release named, or the application's current release when none
+    /// is; checked to exist.
+    fn current_release(&self, app: &str, release: &str) -> Result<String, Status> {
+        let release = if release.is_empty() {
+            let record = self.handle.store.app(app).map_err(not_found)?;
+            record.current.ok_or_else(|| {
+                Status::failed_precondition(format!("{app} has no current release"))
+            })?
+        } else {
+            release.to_owned()
+        };
+        self.handle
+            .store
+            .release(app, &release)
+            .map_err(not_found)?;
+        Ok(release)
+    }
+
+    /// Send a rollout action to the daemon and answer with the rollout.
+    async fn control_rollout(
+        &self,
+        app: String,
+        action: RolloutAction,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::ControlRollout {
+                app,
+                action,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rollout = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(rollout_message(&rollout)))
+    }
+}
+
+/// The scaling state of a release's groups as the API shows it.
+fn scale_message(
+    app: &str,
+    release: &str,
+    groups: Vec<(String, crate::scaling::ScaleStatus)>,
+) -> pb::ScaleStatus {
+    pb::ScaleStatus {
+        app: app.to_owned(),
+        release: release.to_owned(),
+        groups: groups
+            .into_iter()
+            .map(|(group, status)| pb::GroupScale {
+                group,
+                mode: status.spec.mode.as_str().to_owned(),
+                min_workers: status.spec.min_workers,
+                max_workers: status.spec.max_workers,
+                desired: status.desired,
+                ready: status.ready,
+                pinned: status.pinned.is_some(),
+                advisory: status.spec.advisory,
+                slots_busy: status.busy,
+                slots_total: status.total,
+                idle_workers: status.idle,
+                queue_wait_p95_ms: status.queue_wait_p95_ms,
+                last_decision: status
+                    .last
+                    .as_ref()
+                    .map(|(_, what)| what.clone())
+                    .unwrap_or_default(),
+                last_decision_age_ms: status
+                    .last
+                    .as_ref()
+                    .map(|(age, _)| age.as_millis() as u64)
+                    .unwrap_or_default(),
+                reaps_last_hour: status.reaps,
+                churn_budget: status.spec.churn_budget,
+                suspended: status.suspended,
+                policy: status.spec.describe(),
+                scale_outs: status.decisions.0,
+                scale_ins: status.decisions.1,
+            })
+            .collect(),
+    }
+}
+
+/// A rollout record as the API shows it.
+fn rollout_message(rollout: &Rollout) -> pb::Rollout {
+    pb::Rollout {
+        app: rollout.app.clone(),
+        id: rollout.id.clone(),
+        candidate: rollout.candidate.clone(),
+        baseline: rollout.baseline.clone(),
+        steps: rollout
+            .steps
+            .iter()
+            .map(|step| pb::RolloutStep {
+                percent: step.percent,
+                hold_ms: step.hold_ms,
+            })
+            .collect(),
+        state: rollout.state.as_str().to_owned(),
+        step: rollout.step as u32,
+        percent: rollout.percent(),
+        message: rollout.message.clone(),
+        created_unix_ms: rollout.created_unix_ms,
+        updated_unix_ms: rollout.updated_unix_ms,
+        max_error_rate: rollout.gates.max_error_rate,
+        max_p95_ms: rollout.gates.max_p95_ms.unwrap_or(0),
+        min_requests: rollout.gates.min_requests,
+        approve_each_step: rollout.approve_each_step,
     }
 }
 
@@ -898,6 +1321,24 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         resource_version: release.resource_version,
         workers: Vec::new(),
         retained_until_unix_ms: 0,
+        kind: if release.spec.http.is_some() {
+            "http".to_owned()
+        } else {
+            "workers".to_owned()
+        },
+        profile: release
+            .spec
+            .http
+            .as_ref()
+            .map(|http| http.profile.as_str().to_owned())
+            .unwrap_or_default(),
+        instances: release.spec.http.as_ref().map_or(0, |http| http.instances),
+        command: release
+            .spec
+            .http
+            .as_ref()
+            .map(|http| http.command.clone())
+            .unwrap_or_default(),
     }
 }
 

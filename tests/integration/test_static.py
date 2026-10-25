@@ -268,7 +268,7 @@ def test_static_routes_under_the_daemon_with_cache_headers_and_an_app_fallback(
         refused = daemon.muructl("apply", "-f", str(config), check=False)
         assert refused.returncode == 1
         text = refused.stdout + refused.stderr
-        assert "names both an application and a static directory" in text
+        assert "names more than one of an application, an upstream and a static directory" in text
         assert "is not a directory" in text
     finally:
         daemon.stop()

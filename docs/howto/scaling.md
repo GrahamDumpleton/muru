@@ -1,0 +1,145 @@
+# Scaling
+
+```{admonition} Status
+:class: note
+
+The spare and target modes with their windows and churn budget, pins and
+`muructl scale status`, under the daemon. Scheduled capacity, node budgets
+across applications, worker CPU and GIL signals, and scale to zero are
+still to come.
+```
+
+A worker group has a fixed number of processes unless it is given a
+scaling policy. With one, the daemon watches what the edge reports for the
+group each second, forks more workers when they are wanted and drains them
+slowly when they are not. Workers fork from the preloaded host, so a new
+one costs a fork rather than an import and is serving within seconds.
+
+## Spare mode
+
+Spare mode keeps some idle workers in hand, like Apache's prefork module:
+
+```toml
+[tool.muru]
+entrypoint = "shop.wsgi:application"
+processes = 2
+threads = 4
+
+[tool.muru.scaling]
+mode = "spare"
+min_workers = 2
+max_workers = 12
+min_spare = 1
+max_spare = 4
+```
+
+The group starts with `processes` workers, never fewer than `min_workers`.
+Idle workers are counted in worker equivalents: free slots (threads, or an
+event loop's concurrency) over the slots a worker offers, with workers
+still starting counted as capacity on the way and requests waiting at the
+edge counted as slots wanted. When fewer than `min_spare` idle workers
+remain for `scale_out_window` (5 seconds by default), the group grows by
+what is missing, up to `max_step_up` (4) at a time and never past
+`max_workers`. While requests queue at the edge the group is saturated and
+the signals cannot say how much more is wanted, so each step soon after
+the last doubles the previous one, still bounded by `max_step_up`.
+
+Scale-in is slow on purpose. One worker is drained when, over the whole
+`scale_in_window` (10 minutes), more than `max_spare` workers were idle at
+every moment, or no request arrived for `idle_reap_after` (10 minutes).
+Never within `hold_after_growth` (5 minutes) of a scale-out, never more
+than one per `reap_interval` (60 seconds), never below `min_workers`, and
+never a worker younger than `min_lifetime` (15 minutes, or 30 times the
+measured time to ready, whichever is longer). `max_spare` must be at least
+`min_spare + 2`, so the two thresholds cannot chase each other.
+
+## Target mode
+
+Target mode tracks how busy the group's slots are:
+
+```toml
+[tool.muru.scaling]
+mode = "target"
+min_workers = 1
+max_workers = 8
+slot_utilization = 0.6
+queue_wait_p95 = "100ms"
+```
+
+The group grows when more than `slot_utilization` of its slots (70 percent
+by default) have been busy for `scale_out_window`, or when the 95th
+percentile of the time requests waited for a worker over that window is
+above `queue_wait_p95`, to the count that would carry the load at the
+target. It shrinks by one worker when the peak over `scale_in_window`
+could be carried by fewer workers at the target, under the same slow
+rules as spare mode.
+
+## The churn budget
+
+Each release has a `churn_budget` of reaps per hour (6 by default),
+counted across its groups' scale-ins. When it is spent, scale-in is
+suspended until the hour passes, a `churn_budget.exhausted` warning is
+raised, and the scale-in window is doubled until no reap remains in the
+last hour. Timeout kills and recycles do not count against it.
+
+## Groups and the declared release
+
+A policy on the release applies to its default group. Each named group has
+its own, static unless given one:
+
+```toml
+[app.shop.release.r42.scaling]
+mode = "spare"
+max_workers = 12
+
+[app.shop.release.r42.groups.reports]
+paths = ["/reports/*"]
+processes = 1
+threads = 1
+scaling = { mode = "target", max_workers = 6, slot_utilization = 0.8 }
+```
+
+A declared table replaces the source's `[tool.muru.scaling]`. The spare
+and target modes need `max_workers`; `min_workers` defaults to 1 and
+cannot be 0 yet; `processes` must not be over `max_workers` and is raised
+to `min_workers` when below it. In static mode the table takes no other
+key, so a key that does nothing is never written by mistake. `muructl
+config export` writes the resolved policy with every key.
+
+## Watching and overriding
+
+```console
+$ muructl scale status shop
+shop@r42
+GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
+default      3 -> 5       12/12      -1.0    230 ms     0/6        spare 2-12 workers, 1-4 idle
+  last: scale out from 3 to 5 workers: short by 1.0 workers for 5s (2s ago)
+reports      1            0/1        1.0     -          0/6        target 1-6 workers, 80% of slots busy
+```
+
+`WORKERS` shows the workers the edge routes to and, while they differ, the
+count the group is being brought to. `IDLE` is the idle worker
+equivalents, negative when the group is short. `REAPS` is the churn budget
+used in the last hour, with `halt` while scale-in is suspended.
+
+Every decision is a `scaling.decision` event with its reasons, and
+`muru_workers_desired`, `muru_scaling_decisions_total` and
+`muru_churn_reaps_total` are in the metrics beside `muru_workers_ready`.
+
+A pin overrides the autoscaler:
+
+```console
+$ muructl scale shop --processes 6
+muru: shop@r42 default pinned to 6 workers
+$ muructl scale shop --group reports --processes 2
+muru: shop@r42 reports pinned to 2 workers
+$ muructl scale shop --unpin
+muru: shop@r42 default unpinned; the autoscaler decides again
+```
+
+The group is brought to the pinned count and left there, through daemon
+restarts, until it is unpinned or the release stops. A pin on a scaled
+group must not be over its `max_workers`; a static group can be pinned to
+any count. With `advisory = true` in the policy the autoscaler decides and
+reports as `advisory: would scale ...` events without acting, so windows
+and thresholds can be tuned before they move anything.

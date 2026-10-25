@@ -12,13 +12,13 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header::{
     CONNECTION, CONTENT_LENGTH, EXPECT, HOST, HeaderMap, HeaderName, HeaderValue, SERVER,
 };
-use http::{Response, StatusCode, Version};
+use http::{Method, Response, StatusCode, Uri, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 pub mod access;
+pub mod auth;
 pub mod compression;
 pub mod connections;
 pub mod errors;
@@ -39,6 +40,7 @@ pub mod proxy;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
+pub mod upstream;
 pub mod websocket;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -62,6 +64,15 @@ pub struct Config {
     pub groups: Vec<routing::GroupSockets>,
     /// The named mounts, with the paths that select them.
     pub mounts: Vec<routing::MountPath>,
+    /// The default mount honours X-Accel-Redirect (section 4.10).
+    pub accel_redirect: bool,
+    /// The default mount treats a 200 with a local Location and no body
+    /// as an internal redirect (section 4.10).
+    pub cgi_local_redirect: bool,
+    /// The default mount's file hints by path (section 4.9).
+    pub sendfile: Arc<routing::Sendfile>,
+    /// The application's error pages and override (section 4.12).
+    pub errors: Arc<errors::ErrorPolicy>,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
     /// Where the access log goes and what it leaves out.
@@ -340,8 +351,14 @@ impl Edge {
                         &config.sockets,
                         &config.groups,
                         &config.mounts,
+                        routing::RedirectFlags {
+                            accel_redirect: config.accel_redirect,
+                            cgi_local_redirect: config.cgi_local_redirect,
+                        },
                     )
-                    .await?,
+                    .await?
+                    .with_errors(Arc::clone(&config.errors))
+                    .with_sendfile(Arc::clone(&config.sendfile)),
                 )
                 .with_compression(config.compression.clone()),
             )),
@@ -659,11 +676,11 @@ async fn serve<I>(
     };
     let max_requests = shared.limits.max_requests_per_connection;
     let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let service = service_fn(move |mut request: http::Request<Incoming>| {
+    let service = service_fn(move |request: http::Request<Incoming>| {
         let shared = Arc::clone(&shared);
         let tls = tls.clone();
         let listener = listener.clone();
-        let request_id = shared.request_ids.next();
+        let base_id = shared.request_ids.next();
         let served = Arc::clone(&served);
         async move {
             // Section 4.7: forwarding headers from a trusted proxy say who
@@ -671,12 +688,10 @@ async fn serve<I>(
             // are removed.
 
             let routing = shared.pools.current();
-            let forwarded = routing.trust().resolve(&peer, request.headers_mut());
-            let accept_encoding = request
-                .headers()
-                .get(http::header::ACCEPT_ENCODING)
-                .cloned();
-            let method = request.method().clone();
+            let (mut parts, body) = request.into_parts();
+            let forwarded = routing.trust().resolve(&peer, &mut parts.headers);
+            let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();
+            let method = parts.method.clone();
 
             let scheme: &'static str = match forwarded.scheme.as_deref() {
                 Some("https") => "https",
@@ -686,160 +701,548 @@ async fn serve<I>(
 
             let secure = tls.is_some() || scheme == "https";
             let redirect_to = redirect_to.filter(|_| !secure);
-
-            let mut context = link::Context {
-                request_id: &request_id,
-                peer: forwarded.client.unwrap_or(peer),
-                proxy: forwarded.client.map(|_| peer),
-                local,
-                scheme,
-                tls: tls.as_deref(),
-                development: shared.development,
-                access_log: Arc::clone(&shared.access_log),
-                limits: Arc::clone(&shared.limits),
-                server_name: None,
-                app: String::new(),
-                release: String::new(),
-                group: String::new(),
-                snapshot: routing.version(),
-                mount: String::new(),
-                mount_path: String::new(),
-                forwarded_host: forwarded.host.clone(),
-                forwarded_port: forwarded.port,
-                prefix: forwarded.prefix.clone(),
-            };
+            let client = forwarded.client.unwrap_or(peer);
+            let proxy = forwarded.client.map(|_| peer);
+            let client_target = parts
+                .uri
+                .path_and_query()
+                .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string());
+            let arrived = Instant::now();
 
             // Sections 4.3 and 4.5: the host the client asked for and the
             // path select the application, or refuse the request. With no
             // TLS listener there is nowhere to redirect to, so a host's
-            // https_redirect is ignored.
+            // https_redirect is ignored. Section 4.10: a response that is
+            // an internal redirect sends the request through routing
+            // again as the application's sub-request, up to the hop limit.
 
-            let host = forwarded.host.clone().or_else(|| {
-                request
-                    .headers()
+            let mut host = forwarded.host.clone().or_else(|| {
+                parts
+                    .headers
                     .get(HOST)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned)
-                    .or_else(|| request.uri().host().map(str::to_owned))
+                    .or_else(|| parts.uri.host().map(str::to_owned))
             });
-            let decision = routing.select(
-                host.as_deref(),
-                request.uri().path(),
-                &listener,
-                secure || shared.https_port.is_none(),
-            );
+            let mut body = Some(body);
+            let mut buffered: Option<Bytes> = None;
+            let mut origin: Option<routing::Origin> = None;
+            let mut internal: Option<link::Internal> = None;
+            let mut hops: Vec<String> = Vec::new();
+            let mut merged = HeaderMap::new();
+            let mut request_id = base_id.clone();
+            let mut issued: Vec<String> = Vec::new();
+            let mut handling: Option<Handling> = None;
+            let mut checks = 0usize;
 
-            let response = match (redirect_to, decision) {
-                (Some(to), _) => link::redirect_to_https(request, &context, to),
-                (
-                    None,
-                    routing::Decision::Serve {
-                        selection,
-                        server_name,
+            let response = loop {
+                let decision = routing.select(
+                    host.as_deref(),
+                    parts.uri.path(),
+                    &listener,
+                    secure || shared.https_port.is_none(),
+                    &routing::Client {
+                        headers: &parts.headers,
+                        peer: client.ip(),
+                        secure,
+                        ids: &shared.request_ids,
                     },
-                ) => {
-                    context.server_name = server_name;
-                    context.app = selection.app;
-                    context.release = selection.release;
-                    context.group = selection.group;
-                    context.mount = selection.mount;
-                    context.mount_path = selection.script_name;
-                    link::handle(request, selection.pool, &context).await
-                }
-                (None, routing::Decision::Redirect) => link::redirect_to_https(
-                    request,
-                    &context,
-                    SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443)),
-                ),
-                (None, routing::Decision::Misdirected) => link::reject(
-                    request,
-                    &context,
-                    errors::Problem::new(
-                        StatusCode::MISDIRECTED_REQUEST,
-                        "misdirected",
-                        "No virtual host answers to that name on this listener.",
-                    ),
-                ),
-                (
-                    None,
+                    origin.as_ref(),
+                );
+
+                // Section 4.12: the error pages in force come from the
+                // route, the release the request was routed to, the host
+                // and the node.
+
+                let located = match &decision {
+                    routing::Decision::Serve { selection, .. } => {
+                        Some((selection.app.as_str(), selection.release.as_str()))
+                    }
                     routing::Decision::Static {
-                        route,
-                        prefix,
-                        fallback,
-                        server_name,
-                    },
-                ) => {
-                    // Section 4.9: the file, or the fallback application
-                    // when no file answers, or a 404 or 405.
+                        fallback: Some(selection),
+                        ..
+                    } => Some((selection.app.as_str(), selection.release.as_str())),
+                    _ => None,
+                };
 
-                    context.server_name = server_name;
-                    let path = request.uri().path().to_owned();
-                    let within = path
-                        .strip_prefix(prefix.trim_end_matches('/'))
-                        .unwrap_or("")
-                        .to_owned();
-                    let target = request
-                        .uri()
-                        .path_and_query()
-                        .map_or_else(|| path.clone(), |target| target.to_string());
-                    let outcome = static_files::serve(
-                        &route,
-                        request.method(),
-                        &within,
-                        &target,
-                        request.headers(),
-                        routing.compression(),
+                let errors =
+                    routing.errors_for(host.as_deref(), parts.uri.path(), &listener, located);
+                let mut context = link::Context {
+                    request_id: &request_id,
+                    peer: client,
+                    proxy,
+                    local,
+                    scheme,
+                    tls: tls.as_deref(),
+                    development: shared.development,
+                    access_log: Arc::clone(&shared.access_log),
+                    limits: Arc::clone(&shared.limits),
+                    server_name: None,
+                    app: String::new(),
+                    release: String::new(),
+                    group: String::new(),
+                    snapshot: routing.version(),
+                    mount: String::new(),
+                    mount_path: String::new(),
+                    sendfile: Arc::default(),
+                    forwarded_host: forwarded.host.clone(),
+                    forwarded_port: forwarded.port,
+                    prefix: forwarded.prefix.clone(),
+                    internal: internal.clone(),
+                    arrived,
+                    client_target: (!hops.is_empty()).then(|| client_target.clone()),
+                    hops: hops.clone(),
+                    errors,
+                    handler: handling.as_ref().map(|_| link::HANDLER_TIMEOUT),
+                };
+
+                // Section 4.16: a guarded route is served only once its
+                // handler allows the client's request; a sub-request of
+                // the edge's own is not checked again.
+
+                let guard = match &decision {
+                    routing::Decision::Serve {
+                        auth: Some(auth), ..
+                    }
+                    | routing::Decision::Static {
+                        auth: Some(auth), ..
+                    } if origin.is_none() && redirect_to.is_none() => Some(Arc::clone(auth)),
+                    _ => None,
+                };
+
+                if let Some(auth) = guard {
+                    auth.strip(&mut parts.headers);
+                    let hop = hops.len() as u32 + 1;
+                    let sub_id = format!("{base_id}-{hop}");
+                    hops.push(auth.path.clone());
+                    checks += 1;
+                    context.hops = hops.clone();
+                    let outcome = auth::check(
+                        &auth,
+                        auth::Check {
+                            routing: &routing,
+                            parts: &parts,
+                            context: &context,
+                            request_id: &sub_id,
+                            client: &routing::Client {
+                                headers: &parts.headers,
+                                peer: client.ip(),
+                                secure,
+                                ids: &shared.request_ids,
+                            },
+                        },
                     )
                     .await;
 
-                    match (outcome, fallback) {
-                        (
-                            static_files::Outcome::Served {
-                                response,
-                                status,
-                                reason,
+                    match outcome {
+                        auth::Outcome::Allowed { copied, result } => {
+                            shared.access_log.metrics().count_auth(result);
+
+                            for (name, value) in copied {
+                                parts.headers.append(name, value);
+                            }
+                        }
+                        auth::Outcome::Denied(response) => {
+                            shared.access_log.metrics().count_auth("denied");
+                            let status = response.status();
+
+                            // A page configured for the status and the
+                            // reason replaces the handler's body.
+
+                            if context
+                                .errors
+                                .reason_page(status.as_u16(), auth::DENIED_REASON)
+                                .is_some()
+                            {
+                                let problem = auth::denied(status, response.headers());
+                                break link::reject(&parts, &context, problem);
+                            }
+
+                            let bytes = response
+                                .headers()
+                                .get(CONTENT_LENGTH)
+                                .and_then(|value| value.to_str().ok()?.parse().ok())
+                                .unwrap_or(0);
+                            link::record(
+                                &context,
+                                &parts,
+                                status.as_u16(),
+                                auth::DENIED_REASON,
                                 bytes,
-                            },
-                            _,
-                        ) => {
-                            let (parts, _body) = request.into_parts();
-                            link::record(&context, &parts, status, reason, bytes);
-                            response
+                            );
+                            break response;
                         }
-                        (_, Some(selection)) => {
-                            context.app = selection.app.clone();
-                            context.release = selection.release.clone();
-                            context.group = selection.group.clone();
-                            context.mount = selection.mount.clone();
-                            context.mount_path = selection.script_name.clone();
-                            link::handle(request, selection.pool, &context).await
+                        auth::Outcome::Unavailable(detail) => {
+                            shared.access_log.metrics().count_auth("unavailable");
+                            tracing::warn!(
+                                app = %auth.app,
+                                target = %parts.uri.path(),
+                                "authentication sub-request failed: {detail}"
+                            );
+                            break link::reject(&parts, &context, auth::unavailable());
                         }
-                        (static_files::Outcome::MethodNotAllowed, None) => {
-                            let (parts, _body) = request.into_parts();
-                            link::record(&context, &parts, 405, "method_not_allowed", 0);
-                            static_files::method_not_allowed()
+                    }
+                }
+
+                let handled = match (redirect_to, decision) {
+                    (Some(to), _) => {
+                        link::Handled::Response(link::redirect_to_https(&parts, &context, to))
+                    }
+                    (
+                        None,
+                        routing::Decision::Serve {
+                            selection,
+                            server_name,
+                            cookies,
+                            auth: _,
+                        },
+                    ) => {
+                        // Section 4.12: an application does not serve its
+                        // own page for a capacity failure, and one in
+                        // maintenance answers 503 to clients, except for
+                        // what its exemptions let through.
+
+                        if handling.as_ref().is_some_and(|handling| {
+                            handling.capacity && selection.app == handling.app
+                        }) {
+                            break handling.take().expect("checked").fallback;
                         }
-                        (static_files::Outcome::Fallback, None) => link::reject(
-                            request,
+
+                        context.server_name = server_name;
+                        context.app = selection.app;
+                        context.release = selection.release;
+
+                        if origin.is_none()
+                            && let Some(maintenance) = &selection.maintenance
+                            && !maintenance.exempts(parts.uri.path(), client.ip(), &parts.headers)
+                        {
+                            let mut problem = errors::Problem::new(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "maintenance",
+                                "The application is down for maintenance.",
+                            );
+                            problem.retry_after = Some(maintenance.retry_after);
+                            link::Handled::Response(link::reject(&parts, &context, problem))
+                        } else {
+                            issued = cookies;
+                            context.group = selection.group;
+                            context.mount = selection.mount;
+                            context.mount_path = selection.script_name;
+                            context.sendfile = selection.sendfile;
+                            dispatch(
+                                &mut parts,
+                                body.take(),
+                                buffered.take(),
+                                selection.pool,
+                                selection.upstream,
+                                &context,
+                                selection.redirects,
+                            )
+                            .await
+                        }
+                    }
+                    (None, routing::Decision::Redirect) => {
+                        link::Handled::Response(link::redirect_to_https(
+                            &parts,
+                            &context,
+                            SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443)),
+                        ))
+                    }
+                    (None, routing::Decision::Misdirected) => {
+                        link::Handled::Response(link::reject(
+                            &parts,
+                            &context,
+                            errors::Problem::new(
+                                StatusCode::MISDIRECTED_REQUEST,
+                                "misdirected",
+                                "No virtual host answers to that name on this listener.",
+                            ),
+                        ))
+                    }
+                    (None, routing::Decision::InternalOnly) => {
+                        link::Handled::Response(link::reject(
+                            &parts,
                             &context,
                             errors::Problem::new(
                                 StatusCode::NOT_FOUND,
-                                "not_found",
-                                "No file answers to that path.",
+                                "internal_only",
+                                "The path is reachable only through an internal redirect.",
                             ),
+                        ))
+                    }
+                    (None, routing::Decision::NotAccepted { app }) => {
+                        tracing::warn!(
+                            from = %app,
+                            target = %parts.uri.path(),
+                            "internal redirect refused: the route does not list the \
+                             application in accept_redirects_from"
+                        );
+                        link::Handled::Response(link::reject(
+                            &parts,
+                            &context,
+                            errors::Problem::new(
+                                StatusCode::NOT_FOUND,
+                                "no_route",
+                                "The virtual host has no route for this path.",
+                            ),
+                        ))
+                    }
+                    (
+                        None,
+                        routing::Decision::Static {
+                            route,
+                            prefix,
+                            fallback,
+                            server_name,
+                            cookies,
+                            auth: _,
+                        },
+                    ) => {
+                        // Section 4.9: the file, or the fallback application
+                        // when no file answers, or a 404 or 405.
+
+                        issued = cookies;
+                        context.server_name = server_name;
+                        let path = parts.uri.path().to_owned();
+                        let within = path
+                            .strip_prefix(prefix.trim_end_matches('/'))
+                            .unwrap_or("")
+                            .to_owned();
+                        let target = parts
+                            .uri
+                            .path_and_query()
+                            .map_or_else(|| path.clone(), |target| target.to_string());
+                        let outcome = static_files::serve(
+                            &route,
+                            &parts.method,
+                            &within,
+                            &target,
+                            &parts.headers,
+                            routing.compression(),
+                        )
+                        .await;
+
+                        match (outcome, fallback) {
+                            (
+                                static_files::Outcome::Served {
+                                    response,
+                                    status,
+                                    reason,
+                                    bytes,
+                                },
+                                _,
+                            ) => {
+                                link::record(&context, &parts, status, reason, bytes);
+                                link::Handled::Response(response)
+                            }
+                            (_, Some(selection)) => {
+                                context.app = selection.app.clone();
+                                context.release = selection.release.clone();
+                                context.group = selection.group.clone();
+                                context.mount = selection.mount.clone();
+                                context.mount_path = selection.script_name.clone();
+                                context.sendfile = Arc::clone(&selection.sendfile);
+                                dispatch(
+                                    &mut parts,
+                                    body.take(),
+                                    buffered.take(),
+                                    selection.pool,
+                                    selection.upstream,
+                                    &context,
+                                    selection.redirects,
+                                )
+                                .await
+                            }
+                            (static_files::Outcome::MethodNotAllowed, None) => {
+                                link::record(&context, &parts, 405, "method_not_allowed", 0);
+                                link::Handled::Response(static_files::method_not_allowed())
+                            }
+                            (static_files::Outcome::Fallback, None) => {
+                                link::Handled::Response(link::reject(
+                                    &parts,
+                                    &context,
+                                    errors::Problem::new(
+                                        StatusCode::NOT_FOUND,
+                                        "not_found",
+                                        "No file answers to that path.",
+                                    ),
+                                ))
+                            }
+                        }
+                    }
+                    (None, routing::Decision::NoRoute) => link::Handled::Response(link::reject(
+                        &parts,
+                        &context,
+                        errors::Problem::new(
+                            StatusCode::NOT_FOUND,
+                            "no_route",
+                            "The virtual host has no route for this path.",
                         ),
+                    )),
+                };
+
+                let redirect = match handled {
+                    link::Handled::Response(mut response) => {
+                        // Section 4.12: the handler's answer becomes the
+                        // page, or the built-in page stands; and a
+                        // generated error whose page is an application
+                        // path asks that application for it.
+
+                        if let Some(done) = handling.take() {
+                            break error_page_from(done, response);
+                        }
+
+                        match response.extensions_mut().remove::<errors::Handler>() {
+                            Some(handler) => {
+                                let hop = hops.len() as u32 + 1;
+                                hops.push(handler.path.clone());
+                                internal = Some(link::Internal {
+                                    redirect_url: parts.uri.path().to_owned(),
+                                    redirect_query_string: parts
+                                        .uri
+                                        .query()
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    redirect_status: handler.status.as_u16(),
+                                    headers: Vec::new(),
+                                    hop,
+                                    error_reason: handler.reason.to_owned(),
+                                    original: None,
+                                });
+                                origin = Some(routing::Origin {
+                                    app: context.app.clone(),
+                                    release: context.release.clone(),
+                                    privileged: true,
+                                });
+
+                                if parts.method != Method::HEAD {
+                                    parts.method = Method::GET;
+                                }
+
+                                parts.uri = handler
+                                    .path
+                                    .parse()
+                                    .unwrap_or_else(|_| Uri::from_static("/"));
+                                parts.headers.remove(EXPECT);
+                                parts.headers.remove(CONTENT_LENGTH);
+                                parts.headers.remove(http::header::CONTENT_TYPE);
+                                body = None;
+                                buffered = None;
+                                handling = Some(Handling {
+                                    capacity: capacity_failure(handler.reason),
+                                    app: context.app.clone(),
+                                    handler,
+                                    fallback: response,
+                                });
+                                request_id = format!("{base_id}-{hop}");
+                                continue;
+                            }
+                            None => break response,
+                        }
+                    }
+                    link::Handled::Redirect(redirect) => {
+                        if let Some(done) = handling.take() {
+                            break done.fallback;
+                        }
+
+                        redirect
+                    }
+                };
+
+                hops.push(redirect.target.clone());
+
+                if hops.len() - checks > link::MAX_REDIRECT_HOPS {
+                    break link::reject(
+                        &parts,
+                        &context,
+                        errors::Problem::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "redirect_loop",
+                            "The application redirected internally more times than allowed.",
+                        ),
+                    );
+                }
+
+                // The sub-request: GET (HEAD stays HEAD) unless the method
+                // and a buffered body are preserved, the client's headers
+                // with the trusted ones added, and what the target sees as
+                // REDIRECT_URL, REDIRECT_QUERY_STRING and REDIRECT_STATUS.
+
+                let hop = hops.len() as u32;
+                internal = Some(link::Internal {
+                    redirect_url: parts.uri.path().to_owned(),
+                    redirect_query_string: parts.uri.query().unwrap_or_default().to_owned(),
+                    redirect_status: redirect.status,
+                    headers: redirect.headers.clone(),
+                    hop,
+                    error_reason: String::new(),
+                    original: None,
+                });
+                origin = Some(routing::Origin {
+                    app: context.app.clone(),
+                    release: context.release.clone(),
+                    privileged: false,
+                });
+                let preserve = redirect.preserve_method && redirect.body.is_some();
+
+                if !preserve && parts.method != Method::HEAD {
+                    parts.method = Method::GET;
+                }
+
+                parts.uri = redirect
+                    .target
+                    .parse()
+                    .unwrap_or_else(|_| Uri::from_static("/"));
+                parts.headers.remove(EXPECT);
+
+                if preserve {
+                    buffered = redirect.body;
+
+                    if let Some(data) = &buffered {
+                        parts
+                            .headers
+                            .insert(CONTENT_LENGTH, HeaderValue::from(data.len()));
+                    }
+                } else {
+                    parts.headers.remove(CONTENT_LENGTH);
+                    parts.headers.remove(http::header::CONTENT_TYPE);
+                    buffered = None;
+                }
+
+                for (name, value) in &redirect.headers {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_bytes(value),
+                    ) {
+                        parts.headers.insert(name, value);
                     }
                 }
-                (None, routing::Decision::NoRoute) => link::reject(
-                    request,
-                    &context,
-                    errors::Problem::new(
-                        StatusCode::NOT_FOUND,
-                        "no_route",
-                        "The virtual host has no route for this path.",
-                    ),
-                ),
+
+                if let Some(name) = redirect.host {
+                    if let Ok(value) = HeaderValue::from_str(&name) {
+                        parts.headers.insert(HOST, value);
+                    }
+
+                    host = Some(name);
+                }
+
+                merged.extend(redirect.merged);
+                body = None;
+                request_id = format!("{base_id}-{hop}");
             };
+
+            // Section 4.10: what the redirecting application said about
+            // the final response.
+
+            let mut response = response;
+
+            for (name, value) in &merged {
+                if name == http::header::SET_COOKIE {
+                    response.headers_mut().append(name.clone(), value.clone());
+                } else {
+                    response.headers_mut().insert(name.clone(), value.clone());
+                }
+            }
 
             // Section 4.17: compressed for the client when the policy and
             // the response allow it.
@@ -864,10 +1267,20 @@ async fn serve<I>(
 
             // Section 4.19: every response names its request.
 
-            if let Ok(value) = HeaderValue::from_str(&request_id) {
+            if let Ok(value) = HeaderValue::from_str(&base_id) {
                 response
                     .headers_mut()
                     .insert(errors::X_REQUEST_ID.clone(), value);
+            }
+
+            // Section 9.4: the cookies the release choice issued.
+
+            for cookie in &issued {
+                if let Ok(value) = HeaderValue::from_str(cookie) {
+                    response
+                        .headers_mut()
+                        .append(http::header::SET_COOKIE, value);
+                }
             }
 
             Ok::<_, Infallible>(response)
@@ -906,6 +1319,79 @@ async fn serve<I>(
     drop(guard);
 }
 
+/// Send a request where its selection says: to the workers of the pool,
+/// or to an HTTP upstream (section 4.13).
+#[allow(clippy::too_many_arguments)] // each argument is a distinct part of the request
+pub(crate) async fn dispatch(
+    parts: &mut http::request::Parts,
+    body: Option<Incoming>,
+    buffered: Option<Bytes>,
+    pool: Arc<link::LinkPool>,
+    upstream: Option<Arc<upstream::Upstream>>,
+    context: &link::Context<'_>,
+    flags: routing::RedirectFlags,
+) -> link::Handled {
+    match upstream {
+        Some(upstream) => upstream::handle(parts, body, buffered, upstream, context).await,
+        None => link::handle(parts, body, buffered, pool, context, flags).await,
+    }
+}
+
+/// An error page being asked of an application (section 4.12): the page
+/// it is for, the built-in page to send if the handler fails, and the
+/// application that failed.
+struct Handling {
+    handler: errors::Handler,
+    fallback: Response<ResponseBody>,
+    /// The application that failed; empty when none was selected.
+    app: String,
+    /// The failure was one of capacity, which the failing application
+    /// may not be asked to answer.
+    capacity: bool,
+}
+
+/// Section 4.12: the reasons that mean the application's workers could
+/// not take the request.
+fn capacity_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "no_workers"
+            | "queue_full"
+            | "cold_start_timeout"
+            | "draining"
+            | "release_failed"
+            | "edge_overloaded"
+    )
+}
+
+/// The page an application answered for an error (section 4.12), with
+/// the error's own status and headers; the built-in page when the
+/// handler failed, so an error never recurses.
+fn error_page_from(
+    handling: Handling,
+    mut response: Response<ResponseBody>,
+) -> Response<ResponseBody> {
+    if response.status().as_u16() >= 400 {
+        return handling.fallback;
+    }
+
+    *response.status_mut() = handling.handler.status;
+    let headers = response.headers_mut();
+
+    for (name, value) in handling.handler.headers {
+        headers.insert(name, value);
+    }
+
+    if !headers.contains_key(http::header::CACHE_CONTROL) {
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
+
+    response
+}
+
 /// Headers that describe this connection rather than the request, which
 /// never reach the application (section 4.7). Those named by a Connection
 /// header are removed as well.
@@ -919,7 +1405,7 @@ const HOP_BY_HOP: [&str; 7] = [
     "upgrade",
 ];
 
-fn is_hop_by_hop(name: &str, named_in_connection: &[String]) -> bool {
+pub(crate) fn is_hop_by_hop(name: &str, named_in_connection: &[String]) -> bool {
     HOP_BY_HOP.contains(&name) || named_in_connection.iter().any(|named| named == name)
 }
 
@@ -1018,6 +1504,13 @@ pub(crate) fn request_head(
                     return None;
                 }
 
+                // Section 4.10: X-Muru headers are the edge's own; a
+                // client's never reach the application.
+
+                if name.starts_with("x-muru-") {
+                    return None;
+                }
+
                 if replaces_host && name == "host" {
                     return None;
                 }
@@ -1045,6 +1538,40 @@ pub(crate) fn request_head(
         http_version: format!("{:?}", parts.version),
         expect_continue: expects_continue(parts) && content_length != Some(0),
         server_name: context.server_name.clone().unwrap_or_default(),
+        internal: context
+            .internal
+            .as_ref()
+            .map(|internal| pb::InternalContext {
+                redirect_url: internal.redirect_url.clone(),
+                redirect_query_string: internal.redirect_query_string.clone(),
+                redirect_status: u32::from(internal.redirect_status),
+                headers: internal
+                    .headers
+                    .iter()
+                    .map(|(name, value)| pb::Header {
+                        name: Bytes::from(name.to_ascii_lowercase()),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                hop: internal.hop,
+                error_reason: internal.error_reason.clone(),
+                auth_request: internal.original.is_some(),
+                original_method: internal
+                    .original
+                    .as_ref()
+                    .map(|original| original.method.clone())
+                    .unwrap_or_default(),
+                original_uri: internal
+                    .original
+                    .as_ref()
+                    .map(|original| original.uri.clone())
+                    .unwrap_or_default(),
+                original_host: internal
+                    .original
+                    .as_ref()
+                    .map(|original| original.host.clone())
+                    .unwrap_or_default(),
+            }),
         ..Default::default()
     }
 }
@@ -1057,9 +1584,26 @@ pub(crate) fn status_code(status: u32) -> StatusCode {
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Copy the worker's headers into a response, dropping any that are invalid.
+/// Copy the worker's headers into a response, dropping any that are
+/// invalid, and the X-Muru-Redirect headers, which are for the edge
+/// alone (section 4.10).
 pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>) {
     for header in from {
+        // Sections 4.10 and 4.12: the redirect and override headers
+        // instruct the edge and never reach the client; the compression
+        // header is consumed by section 4.17 later.
+
+        let name = header.name.as_ref();
+
+        if name
+            .get(..15)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-muru-redirect"))
+            || name.eq_ignore_ascii_case(b"x-muru-sendfile")
+            || name.eq_ignore_ascii_case(errors::X_MURU_ERROR_OVERRIDE.as_str().as_bytes())
+        {
+            continue;
+        }
+
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(&header.name),
             HeaderValue::from_bytes(&header.value),

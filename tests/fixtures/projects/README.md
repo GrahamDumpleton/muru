@@ -12,5 +12,10 @@ sections 6.8 and 13.1):
   application reports the group and worker that served each request.
 - `mounted/`: a muru.toml with a WSGI default entrypoint and ASGI and WSGI
   mounts (section 6.7), each reporting the paths it saw.
+- `legacy/`: a stdlib HTTP server, a WSGI and an ASGI application for the
+  managed HTTP server releases of section 9.9.
+- `files/`: a module whose WSGI default, ASGI, compatibility and Starlette
+  mounts hand files to the edge (section 4.9); the tests write its
+  muru.toml, since `sendfile_roots` names a directory they create.
 
 Run one directly with `muructl run tests/fixtures/projects/shop`.

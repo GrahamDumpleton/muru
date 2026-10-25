@@ -77,14 +77,25 @@ async def asgi_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
             "pid": os.getpid(),
         }
     ).encode()
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+
+    # Section 4.16: as an authentication handler, report what the scope
+    # says about the request being decided, in a header the route copies.
+
+    muru = scope.get("extensions", {}).get("muru", {})
+
+    if muru.get("auth_request"):
+        seen = f"{muru['original_method']} {muru['original_uri']} {muru['original_host']}"
+        headers.append((b"x-auth-seen", seen.encode()))
+
     await send(
         {
             "type": "http.response.start",
             "status": 200,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
+            "headers": headers,
         }
     )
     await send({"type": "http.response.body", "body": body})

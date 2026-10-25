@@ -33,6 +33,25 @@ service Admin {
   // Drain a release: no new traffic, requests in flight finish, then stop.
   rpc DrainRelease(DrainReleaseRequest) returns (Release);
 
+  // Section 9.3: shift an application's traffic to a release step by step,
+  // with gates, and control the rollout; or move all of it at once.
+  rpc StartRollout(StartRolloutRequest) returns (Rollout);
+  rpc GetRollout(GetRolloutRequest) returns (Rollout);
+  rpc ListRollouts(ListRolloutsRequest) returns (ListRolloutsResponse);
+  rpc PauseRollout(RolloutControlRequest) returns (Rollout);
+  rpc ResumeRollout(RolloutControlRequest) returns (Rollout);
+  rpc PromoteRollout(RolloutControlRequest) returns (Rollout);
+  rpc AbortRollout(RolloutControlRequest) returns (Rollout);
+  rpc PromoteRelease(PromoteReleaseRequest) returns (Release);
+
+  // Section 7.4: pin or release a worker group's count, and read the
+  // autoscaler's signals, decisions and churn for a release.
+  rpc SetScale(SetScaleRequest) returns (ScaleStatus);
+  rpc GetScaleStatus(GetScaleStatusRequest) returns (ScaleStatus);
+  // Section 4.12: serve the maintenance page for an application at the
+  // edge, or serve it as usual again.
+  rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
+
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
@@ -43,6 +62,9 @@ service Admin {
   // Virtual hosts and routes (sections 4.3 and 4.5), as applied.
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
   rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+
+  // HTTP upstreams (section 4.13), as applied.
+  rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);
 
   // Declarative configuration (section 10.4): apply a document, compare
   // one with desired state, or export desired state as one.
@@ -110,6 +132,7 @@ message App {
   string user = 6;                  // the user its processes run as under a root daemon (section 10.9)
   string group = 7;
   string umask = 8;                 // octal
+  bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
 }
 
 // A deploy names the application (created on first use) and the source.
@@ -144,6 +167,20 @@ message DeployRequest {
   optional uint64 memory_hard_limit = 26;   // bytes; over it the worker is replaced at once
   optional uint64 memory_check_interval_ms = 27;
   repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
+  bool hold = 29;                           // start the release but leave traffic where it is, for a preview or a rollout
+  optional uint64 soft_timeout_ms = 30;     // how long a request may run before it is interrupted (section 7.6)
+  optional bool accel_redirect = 31;        // X-Accel-Redirect from the default mount is an internal redirect (section 4.10)
+  optional bool cgi_local_redirect = 32;    // a 200 with a local Location and no body is an internal redirect
+  string kind = 33;                         // workers (the default) or http, a managed HTTP server release (section 9.9)
+  string profile = 34;                      // the server of an http release: gunicorn, uvicorn, granian, mod_wsgi-express or generic
+  repeated string command = 35;             // the command of an http release, with {bind} where the server takes its address
+  string bind = 36;                         // how an http release binds: unix (the default) or port
+  optional uint32 instances = 37;           // instances of the command; 1 when absent
+  string readiness_path = 38;               // the path probed until an instance answers 2xx or 3xx; any answer when empty
+  optional uint64 readiness_timeout_ms = 39; // how long the instances get to be ready; 60 s when absent
+  string stop_signal = 40;                  // the signal that stops an instance gracefully; the profile's when empty
+  repeated string sendfile_roots = 41;      // section 4.9: directories an X-Muru-Sendfile path must lie in; the table's when empty
+  optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
 }
 
 // One environment variable: a value, or a secret reference.
@@ -184,6 +221,121 @@ message DrainReleaseRequest {
   string release = 2;
 }
 
+// Section 9.3: a canary rollout of a candidate release against the
+// baseline that serves.
+message StartRolloutRequest {
+  string app = 1;
+  string release = 2;               // the candidate
+  repeated RolloutStep steps = 3;   // in order; the last step passing promotes the candidate
+  double max_error_rate = 4;        // a gate: the candidate's 5xx ratio over the step, 0.01 when 0
+  uint64 max_p95_ms = 5;            // a gate: the candidate's p95 over the step; none when 0
+  uint64 min_requests = 6;          // requests before the gates judge, 100 when 0
+  bool approve_each_step = 7;       // wait for ResumeRollout before each step after the first
+}
+
+message RolloutStep {
+  uint32 percent = 1;               // of the application's requests
+  uint64 hold_ms = 2;               // how long the step lasts before the gates decide
+}
+
+message Rollout {
+  string app = 1;
+  string id = 2;
+  string candidate = 3;
+  string baseline = 4;
+  repeated RolloutStep steps = 5;
+  string state = 6;                 // running, paused, awaiting_approval, promoted or rolled_back
+  uint32 step = 7;                  // the current step, from 0
+  uint32 percent = 8;               // the candidate's share in force
+  string message = 9;
+  uint64 created_unix_ms = 10;
+  uint64 updated_unix_ms = 11;
+  double max_error_rate = 12;
+  uint64 max_p95_ms = 13;
+  uint64 min_requests = 14;
+  bool approve_each_step = 15;
+}
+
+message GetRolloutRequest {
+  string app = 1;
+  string rollout = 2;               // the latest when empty
+}
+
+message ListRolloutsRequest {
+  string app = 1;                   // all applications when empty
+}
+
+message ListRolloutsResponse {
+  repeated Rollout rollouts = 1;
+}
+
+message RolloutControlRequest {
+  string app = 1;                   // the application's active rollout
+}
+
+// Blue/green (section 9.2): move all traffic to the release now.
+message PromoteReleaseRequest {
+  string app = 1;
+  string release = 2;
+}
+
+// Section 7.4: pin a group's worker count, so the autoscaler stands
+// aside, or let it decide again.
+message SetScaleRequest {
+  string app = 1;
+  string release = 2;               // the application's serving release when empty
+  string group = 3;                 // default when empty
+  optional uint32 processes = 4;    // the count to pin
+  bool unpin = 5;                   // let the autoscaler decide again
+}
+
+message SetMaintenanceRequest {
+  string app = 1;
+  bool on = 2;
+}
+
+message MaintenanceStatus {
+  string app = 1;
+  bool on = 2;
+  uint64 since_unix_ms = 3;         // when it was turned on, 0 when off
+}
+
+message GetScaleStatusRequest {
+  string app = 1;
+  string release = 2;               // the application's serving release when empty
+}
+
+message ScaleStatus {
+  string app = 1;
+  string release = 2;
+  repeated GroupScale groups = 3;
+}
+
+// One worker group's scaling: the policy, where it stands and what the
+// autoscaler saw and did last (section 7.3 and 7.4).
+message GroupScale {
+  string group = 1;
+  string mode = 2;                  // static, spare or target
+  uint32 min_workers = 3;
+  uint32 max_workers = 4;
+  uint32 desired = 5;               // the count the group is being brought to
+  uint32 ready = 6;                 // workers the edge routes to
+  bool pinned = 7;
+  bool advisory = 8;
+  double slots_busy = 9;
+  double slots_total = 10;
+  double idle_workers = 11;         // idle worker equivalents; negative when short
+  optional double queue_wait_p95_ms = 12;
+  string last_decision = 13;        // what the autoscaler did last and why
+  uint64 last_decision_age_ms = 14;
+  uint32 reaps_last_hour = 15;
+  uint32 churn_budget = 16;
+  bool suspended = 17;              // scale-in suspended by the churn budget
+  string policy = 18;               // the policy as one phrase
+  uint64 scale_outs = 19;
+  uint64 scale_ins = 20;
+}
+
 // Section 9.1: pending, starting, warming, ready, draining, stopping,
 // stopped and failed.
 message Release {
@@ -204,6 +356,10 @@ message Release {
   uint64 resource_version = 15;
   repeated Worker workers = 16;
   uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
+  string kind = 18;                 // workers or http (section 9.9)
+  string profile = 19;              // the server of an http release
+  uint32 instances = 20;            // instances of an http release's command
+  repeated string command = 21;     // the command of an http release
 }
 
 message Worker {
@@ -341,6 +497,36 @@ message Route {
   string app = 3;                   // empty for a static route
   string static_dir = 4;            // the directory, for a static route (section 4.9)
   string fallback_app = 5;          // the application behind a static route, when there is one
+  repeated TrafficShare traffic = 6; // the traffic policy's shares (section 9.4), empty without one
+  bool sticky = 7;
+  string hash_key = 8;              // the policy's key, when it names one
+  bool internal = 9;                // reachable only through internal redirects (section 4.10)
+  repeated string accept_redirects_from = 10; // other applications whose redirects may reach the route
+  string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route (section 4.16)
+  string upstream = 12;             // the upstream that takes the requests (section 4.13), for an upstream route
+  string fallback_upstream = 13;    // the upstream behind a static route, when there is one
+}
+
+message ListUpstreamsRequest {}
+
+message ListUpstreamsResponse {
+  repeated Upstream upstreams = 1;
+}
+
+// An HTTP upstream (section 4.13), as applied.
+message Upstream {
+  string name = 1;
+  repeated string addresses = 2;
+  string protocol = 3;              // http1, h2c or h2
+  bool tls = 4;
+  string health_path = 5;           // the path probed, when one is
+  bool trust_muru_headers = 6;
+}
+
+// One release's share of a route's requests, in percent.
+message TrafficShare {
+  string release = 1;
+  uint32 percent = 2;
 }
 
 // Which log to show: a release's output (its host's and workers' lines,

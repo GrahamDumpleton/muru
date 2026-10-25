@@ -3,11 +3,12 @@
 //! of one application needs; routes, hosts and the rest arrive with their
 //! features.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use muru_config::{FactoryPhase, Interface, Preload};
+use muru_config::{FactoryPhase, Interface, Preload, ScalingMode, ServerBind, ServerProfile};
 use serde::{Deserialize, Serialize};
 
 /// The states of section 9.1.
@@ -112,6 +113,26 @@ pub struct MountSpec {
     pub entrypoint: String,
     /// The interface, auto when detected.
     pub interface: Interface,
+    /// Reachable only through internal redirects (section 4.10).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
+    /// Other applications whose redirects may reach the mount when it is
+    /// internal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_redirects_from: Vec<String>,
+    /// X-Accel-Redirect from the mount is an internal redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accel_redirect: bool,
+    /// A 200 with a local Location and no body is an internal redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cgi_local_redirect: bool,
+    /// Directories the mount's X-Muru-Sendfile paths must lie in
+    /// (section 4.9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second header honoured as X-Muru-Sendfile is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -130,6 +151,9 @@ pub struct GroupSpec {
     pub sync_threads: u32,
     /// Requests an ASGI worker's event loop takes at once.
     pub concurrency: u32,
+    /// How the group is scaled (sections 7.2 and 7.4).
+    #[serde(default)]
+    pub scaling: ScalingSpec,
 }
 
 /// What a release runs: its source and the settings fixed at creation
@@ -183,6 +207,75 @@ pub struct ReleaseSpec {
     /// order; secret values are never recorded, only their references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvSpec>,
+    /// How the default group is scaled (sections 7.2 and 7.4).
+    #[serde(default)]
+    pub scaling: ScalingSpec,
+    /// The default mount honours X-Accel-Redirect (section 4.10).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accel_redirect: bool,
+    /// The default mount treats a 200 with a local Location and no body
+    /// as an internal redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cgi_local_redirect: bool,
+    /// Directories the default mount's X-Muru-Sendfile paths must lie in
+    /// (section 4.9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second header honoured as X-Muru-Sendfile is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
+    /// Custom error pages (section 4.12), by status or status:reason; a
+    /// relative file is taken from the source directory.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, muru_config::ErrorPage>,
+    /// Which of the application's own error responses the edge replaces
+    /// with error pages (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<muru_config::ErrorOverride>,
+    /// What maintenance mode lets through (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<muru_config::Maintenance>,
+    /// Section 9.9: the HTTP server the release runs instead of workers,
+    /// when it is a managed HTTP release; `source` is then the directory
+    /// its command runs in, and the worker settings are unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpServerSpec>,
+}
+
+/// Section 9.9: a release that runs an HTTP server of its own instead
+/// of Muru workers, started from a command and routed to as an upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpServerSpec {
+    /// The server, which fixes how it binds and how it is stopped.
+    pub profile: ServerProfile,
+    /// The command, with `{bind}` where the server takes its address.
+    pub command: Vec<String>,
+    /// How each instance binds.
+    pub bind: ServerBind,
+    /// How many instances run.
+    pub instances: u32,
+    /// The path probed until an instance answers 2xx or 3xx; any answer
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_path: Option<String>,
+    /// How long the instances get to be ready, in milliseconds.
+    pub readiness_timeout_ms: u64,
+    /// The signal that stops an instance gracefully, when the release
+    /// names one; the profile's otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+}
+
+impl HttpServerSpec {
+    /// The server and its instances as a phrase: `gunicorn, 2 instances`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, {} instance{}",
+            self.profile.as_str(),
+            self.instances,
+            if self.instances == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// One environment variable of a release (section 10.8).
@@ -214,6 +307,105 @@ impl EnvSpec {
                 if self.as_file { " as file" } else { "" }
             ),
             _ => format!("{}={}", self.name, self.value.clone().unwrap_or_default()),
+        }
+    }
+}
+
+/// How a worker group is scaled (sections 7.2 and 7.4), resolved with
+/// the defaults of appendix C; durations in milliseconds. The default is
+/// a fixed count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalingSpec {
+    /// static, spare or target.
+    pub mode: ScalingMode,
+    /// The fewest workers.
+    pub min_workers: u32,
+    /// The most workers; the fixed count in static mode.
+    pub max_workers: u32,
+    /// Spare mode: scale out below this many idle workers.
+    pub min_spare: u32,
+    /// Spare mode: scale in above this many idle workers.
+    pub max_spare: u32,
+    /// Target mode: the percentage of slots to keep busy.
+    pub slot_utilization_percent: u32,
+    /// Target mode: scale out while the p95 queue wait is over this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_p95_ms: Option<u64>,
+    /// How long a scale-out condition must hold.
+    pub scale_out_window_ms: u64,
+    /// How long every scale-in condition must hold.
+    pub scale_in_window_ms: u64,
+    /// No scale-in this long after a scale-out.
+    pub hold_after_growth_ms: u64,
+    /// At most one worker reaped per this interval.
+    pub reap_interval_ms: u64,
+    /// A wholly idle group scales in after this.
+    pub idle_reap_after_ms: u64,
+    /// No worker younger than this is reaped; from the measured time to
+    /// ready when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_lifetime_ms: Option<u64>,
+    /// The most workers one scale-out adds.
+    pub max_step_up: u32,
+    /// Reaps allowed per hour per release.
+    pub churn_budget: u32,
+    /// Decide and report without acting.
+    pub advisory: bool,
+}
+
+impl Default for ScalingSpec {
+    fn default() -> Self {
+        Self {
+            mode: ScalingMode::Static,
+            min_workers: 1,
+            max_workers: 0,
+            min_spare: 1,
+            max_spare: 3,
+            slot_utilization_percent: 70,
+            queue_wait_p95_ms: None,
+            scale_out_window_ms: 5_000,
+            scale_in_window_ms: 600_000,
+            hold_after_growth_ms: 300_000,
+            reap_interval_ms: 60_000,
+            idle_reap_after_ms: 600_000,
+            min_lifetime_ms: None,
+            max_step_up: 4,
+            churn_budget: 6,
+            advisory: false,
+        }
+    }
+}
+
+impl ScalingSpec {
+    /// Whether the count is fixed.
+    pub fn is_static(&self) -> bool {
+        self.mode == ScalingMode::Static
+    }
+
+    /// The policy as one phrase, for reports: `static`, or the mode with
+    /// its bounds and what makes it move.
+    pub fn describe(&self) -> String {
+        match self.mode {
+            ScalingMode::Static => "static".to_owned(),
+            ScalingMode::Spare => format!(
+                "spare {}-{} workers, {}-{} idle{}",
+                self.min_workers,
+                self.max_workers,
+                self.min_spare,
+                self.max_spare,
+                if self.advisory { ", advisory" } else { "" }
+            ),
+            ScalingMode::Target => format!(
+                "target {}-{} workers, {}% of slots busy{}{}",
+                self.min_workers,
+                self.max_workers,
+                self.slot_utilization_percent,
+                match self.queue_wait_p95_ms {
+                    Some(ms) => format!(", queue wait p95 {ms} ms"),
+                    None => String::new(),
+                },
+                if self.advisory { ", advisory" } else { "" }
+            ),
         }
     }
 }
@@ -277,6 +469,10 @@ fn default_check_interval_ms() -> u64 {
 /// milliseconds; the defaults are those of appendix C.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTimeouts {
+    /// How long a request may run before it is interrupted; off when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout_ms: Option<u64>,
     /// How long a request may run before its worker is replaced; off
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +488,7 @@ pub struct WorkerTimeouts {
 impl Default for WorkerTimeouts {
     fn default() -> Self {
         Self {
+            soft_timeout_ms: None,
             hard_timeout_ms: None,
             hard_drain_grace_ms: default_hard_drain_grace_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
@@ -305,6 +502,116 @@ fn default_hard_drain_grace_ms() -> u64 {
 
 fn default_shutdown_timeout_ms() -> u64 {
     5_000
+}
+
+/// Section 9.3: where a rollout is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutState {
+    /// Shifting traffic step by step.
+    Running,
+    /// Held where it is by hand; resume continues.
+    Paused,
+    /// The next step waits for approval (resume).
+    AwaitingApproval,
+    /// The candidate serves everything; the rollout is over.
+    Promoted,
+    /// The candidate was taken out of traffic; the rollout is over.
+    RolledBack,
+}
+
+impl RolloutState {
+    /// The name as the API and the CLI show it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RolloutState::Running => "running",
+            RolloutState::Paused => "paused",
+            RolloutState::AwaitingApproval => "awaiting_approval",
+            RolloutState::Promoted => "promoted",
+            RolloutState::RolledBack => "rolled_back",
+        }
+    }
+
+    /// Whether the rollout still shapes traffic.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            RolloutState::Running | RolloutState::Paused | RolloutState::AwaitingApproval
+        )
+    }
+}
+
+/// One step of a rollout: the candidate's share and how long it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutStep {
+    /// Percent of the application's requests.
+    pub percent: u32,
+    /// How long the step lasts before the gates decide.
+    pub hold_ms: u64,
+}
+
+/// Section 9.3: what the candidate must not exceed over a step, judged
+/// against the baseline over the same window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutGates {
+    /// The 5xx ratio.
+    pub max_error_rate: f64,
+    /// The 95th percentile of total request time, when set.
+    pub max_p95_ms: Option<u64>,
+    /// Requests the candidate must have served before the gates judge.
+    pub min_requests: u64,
+}
+
+/// A rollout record (section 9.3): a candidate release taking a growing
+/// share of its application's traffic from the baseline, step by step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rollout {
+    /// The application.
+    pub app: String,
+    /// The id, unique within the application.
+    pub id: String,
+    /// The release gaining traffic.
+    pub candidate: String,
+    /// The release that served when the rollout began.
+    pub baseline: String,
+    /// The steps, in order; the last one passing promotes the candidate.
+    pub steps: Vec<RolloutStep>,
+    /// The gates.
+    pub gates: RolloutGates,
+    /// Whether each step after the first waits for approval.
+    pub approve_each_step: bool,
+    /// Where it is.
+    pub state: RolloutState,
+    /// The current step's index.
+    pub step: usize,
+    /// When the current step began, Unix milliseconds.
+    pub step_started_unix_ms: u64,
+    /// What it is doing, or why it ended.
+    pub message: String,
+    /// When it was created, Unix milliseconds.
+    pub created_unix_ms: u64,
+    /// When it last changed, Unix milliseconds.
+    pub updated_unix_ms: u64,
+}
+
+impl Rollout {
+    /// The candidate's share in force: the current step's while running
+    /// or paused, the step before while the next awaits approval, all of
+    /// it once promoted and none once rolled back.
+    pub fn percent(&self) -> u32 {
+        match self.state {
+            RolloutState::Promoted => 100,
+            RolloutState::RolledBack => 0,
+            RolloutState::AwaitingApproval => self
+                .step
+                .checked_sub(1)
+                .and_then(|index| self.steps.get(index))
+                .map_or(0, |step| step.percent),
+            RolloutState::Running | RolloutState::Paused => {
+                self.steps.get(self.step).map_or(0, |step| step.percent)
+            }
+        }
+    }
 }
 
 /// A release record: its spec, where it is in section 9.1, and why.

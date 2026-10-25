@@ -5,9 +5,10 @@
 
 Static routes to a directory, with index files, conditional requests,
 ranges, precompressed variants, cache headers and a fallback to an
-application or a file, and `muructl serve-static`. Directory listings,
-static files that belong to a release, file hints from applications
-(`X-Muru-Sendfile`), internal redirects and the metadata cache are still
+application or a file, `muructl serve-static`, internal routes that only
+an [internal redirect](internal-redirects.md) reaches, and
+[file hints](file-hints.md) from applications. Directory listings,
+static files that belong to a release and the metadata cache are still
 to come.
 ```
 
@@ -26,10 +27,12 @@ cache = { max_age = '1y', immutable = true }
 | --- | --- | --- |
 | `static` | | the directory served |
 | `index` | `['index.html']` | the files tried, in order, when a directory is requested |
-| `fallback` | none | `{ app = 'name' }` sends what no file answers to the application; `{ file = 'index.html' }` serves that file instead, for a single-page application |
+| `fallback` | none | `{ app = 'name' }` sends what no file answers to the application, `{ upstream = 'name' }` to an [HTTP upstream](upstreams.md); `{ file = 'index.html' }` serves that file instead, for a single-page application |
 | `cache` | none | `max_age` (for example `1y` or `1h`), `immutable`, and `except`, patterns of files that get `no-cache` instead |
 | `redirect_slash` | `true` | redirect a directory asked for without a trailing slash (301) to the slash form, so relative links resolve |
 | `case` | `strict` | `insensitive` accepts names that differ from the file's on disk in case |
+| `internal` | `false` | the route answers 404 to clients and is reached only through an [internal redirect](internal-redirects.md) |
+| `accept_redirects_from` | none | applications other than the `fallback` one whose redirects may reach the route |
 
 Every file is sent with `Content-Type` from its name, `ETag`,
 `Last-Modified` and `Accept-Ranges`. `If-None-Match` and

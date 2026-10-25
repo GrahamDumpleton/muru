@@ -18,7 +18,7 @@ default-members = [
 
 [workspace.package]
 # The only place the project version is stated. Change it with `just bump`.
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -70,6 +70,7 @@ time = "0.3"
 toml = "1.1"
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal", "process", "fs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "channel", "router"] }

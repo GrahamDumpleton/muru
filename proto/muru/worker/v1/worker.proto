@@ -83,10 +83,32 @@ message TlsInfo {
   string alpn = 4;                  // negotiated application protocol, for example h2
 }
 
-message InternalContext {}
+// How a request arrived by internal redirect (section 4.10): what the
+// application that redirected it was asked for, and the trusted headers
+// it added.
+message InternalContext {
+  string redirect_url = 1;          // the path the client asked for, as REDIRECT_URL
+  string redirect_query_string = 2; // its query string
+  uint32 redirect_status = 3;       // the status the redirecting application answered
+  repeated Header headers = 4;      // headers added with X-Muru-Redirect-Header-NAME
+  uint32 hop = 5;                   // 1 for the first redirect, up to the limit
+  string error_reason = 6;          // for an error page sub-request (section 4.12): the reason of the error, as muru.error_reason
+  bool auth_request = 7;            // an authentication sub-request (section 4.16): muru.auth_request, with the original request below and no REDIRECT_* keys
+  string original_method = 8;       // the protected request's method, as muru.original_method
+  string original_uri = 9;          // its path and query, as muru.original_uri
+  string original_host = 10;        // the host it asked for, as muru.original_host
+}
 
 message UploadRef {
   string ref = 1;
+}
+
+// Payload of a FILE frame (section 5.7): the response body, or the next
+// piece of it, is `length` bytes of the file whose descriptor is attached
+// to the frame, from `offset`. The END flag ends the body with it.
+message FileHint {
+  uint64 offset = 1;
+  uint64 length = 2;
 }
 
 // How the worker should flush response body chunks (section 5.4).

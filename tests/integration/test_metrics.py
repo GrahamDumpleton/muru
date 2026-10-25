@@ -70,11 +70,11 @@ def test_requests_are_counted_and_served_to_a_scraper(scraped: tuple[Daemon, int
         text,
     ), text
     assert "# TYPE muru_request_duration_seconds histogram\n" in text
+    labels = 'app="shop",release="r1",group="default"'
     assert (
-        'muru_request_duration_seconds_bucket{app="shop",release="r1",phase="total",le="+Inf"} 2\n'
-        in text
+        f'muru_request_duration_seconds_bucket{{{labels},phase="total",le="+Inf"}} 2\n' in text
     ), text
-    assert 'muru_request_duration_seconds_count{app="shop",release="r1",phase="queue"} 2\n' in text
+    assert f'muru_request_duration_seconds_count{{{labels},phase="queue"}} 2\n' in text
     assert 'muru_requests_in_flight{app="shop",release="r1"} 0\n' in text, text
     assert 'muru_queue_depth{app="shop",release="r1",group="default"} 0\n' in text, text
     assert 'muru_slots_busy{app="shop",release="r1",group="default"} 0\n' in text, text

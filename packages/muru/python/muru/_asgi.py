@@ -245,7 +245,11 @@ def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, An
 
         try:
             await app(scope, channel.receive, send)
-        except BaseException as error:  # a failed request never ends the worker
+        except BaseException as error:
+            # A failed request never ends the worker. A task the soft
+            # timeout cancelled (section 7.6) fails the response as a
+            # timeout, and the traceback shows where it waited.
+
             detail = "".join(traceback.format_exception(error))
             sys.stderr.write(detail)
             sys.stderr.flush()
@@ -255,6 +259,6 @@ def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, An
 
     def run(scope: MutableMapping[str, Any], channel: Any) -> None:
         scope["state"] = dict(state)
-        event_loop.create_task(serve(scope, channel))
+        channel.started(event_loop.create_task(serve(scope, channel)))
 
     return run

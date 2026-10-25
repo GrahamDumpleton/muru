@@ -97,6 +97,16 @@ pub struct Channel {
     websocket: bool,
     /// Mirrors `SendState.accepted`, for the link's read side.
     accepted: AtomicBool,
+    /// The worker's shared state and the request's id in it, so a
+    /// streaming response or an accepted WebSocket can be exempted from
+    /// the timeouts (section 7.6).
+    shared: Arc<Shared>,
+    request: u64,
+    /// The application's task, once the runner has started it, which the
+    /// soft timeout cancels.
+    task: Mutex<Option<Py<PyAny>>>,
+    /// The soft timeout has cancelled the task.
+    timed_out: AtomicBool,
 }
 
 impl Channel {
@@ -105,6 +115,8 @@ impl Channel {
         asgi: &Asgi,
         tx: mpsc::Sender<Outgoing>,
         head: &pb::RequestHead,
+        shared: Arc<Shared>,
+        request: u64,
     ) -> Self {
         Self {
             inbox: Mutex::new(Inbox {
@@ -124,12 +136,38 @@ impl Channel {
             announce: AtomicBool::new(head.expect_continue),
             websocket: head.scope == pb::Scope::Websocket as i32,
             accepted: AtomicBool::new(false),
+            shared,
+            request,
+            task: Mutex::new(None),
+            timed_out: AtomicBool::new(false),
         }
     }
 
     /// Whether the application has accepted the WebSocket.
     pub fn accepted(&self) -> bool {
         self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Section 7.6: the request has run past the soft timeout. Cancel the
+    /// application's task on the loop; the runner then fails the response
+    /// as a timeout.
+    pub fn cancel(&self, py: Python<'_>) {
+        self.timed_out.store(true, Ordering::SeqCst);
+        let task = self.task.lock().expect("task poisoned").take();
+
+        let Some(task) = task else {
+            return;
+        };
+
+        let cancelled = task.bind(py).getattr("cancel").and_then(|cancel| {
+            self.event_loop
+                .bind(py)
+                .call_method1("call_soon_threadsafe", (cancel,))
+        });
+
+        if let Err(error) = cancelled {
+            tracing::debug!(%error, "cancelling an ASGI task failed");
+        }
     }
 
     /// Hand the WebSocket's connect event to the application.
@@ -302,11 +340,11 @@ impl Channel {
 
     /// End the response with an error: the edge reports it if no output had
     /// reached it yet, and truncates the response otherwise.
-    fn abort(&self, py: Python<'_>, error: &str, detail: String) {
+    fn abort(&self, py: Python<'_>, error: &str, reason: &str, detail: String) {
         let items = vec![
             Outgoing::Abort {
                 error: error.to_owned(),
-                reason: "app_error".to_owned(),
+                reason: reason.to_owned(),
                 detail,
             },
             Outgoing::Finished,
@@ -353,6 +391,10 @@ impl Channel {
                 state.accepted = true;
                 state.head_sent = true;
                 self.accepted.store(true, Ordering::Relaxed);
+
+                // Section 7.6: a WebSocket runs as long as it needs to.
+
+                self.shared.request_exempt(self.request);
                 let head = Outgoing::Head {
                     status: 101,
                     reason: String::new(),
@@ -576,6 +618,14 @@ impl Channel {
                 state.head_sent = true;
                 drop(state);
                 let flush = wsgi::flush_policy(&headers);
+
+                // Section 7.6: a response that streams runs as long as it
+                // needs to.
+
+                if flush == pb::FlushPolicy::Immediate {
+                    self.shared.request_exempt(self.request);
+                }
+
                 self.enqueue(
                     py,
                     vec![Outgoing::Head {
@@ -629,11 +679,49 @@ impl Channel {
                 drop(state);
                 self.enqueue(py, items)
             }
-            "http.response.trailers" | "http.response.pathsend" | "http.response.zerocopysend" => {
-                Err(PyRuntimeError::new_err(format!(
-                    "{kind} is not advertised in scope['extensions'] and cannot be sent"
-                )))
+            "http.response.pathsend" | "http.response.zerocopysend" => {
+                if self.websocket {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} is not advertised in scope['extensions'] and cannot be sent"
+                    )));
+                }
+
+                if !state.head_sent {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} sent before http.response.start"
+                    )));
+                }
+
+                if state.body_ended {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} sent after the response was completed"
+                    )));
+                }
+
+                let (fd, offset, length, more) = if kind == "http.response.pathsend" {
+                    let (fd, length) = open_path(py, message)?;
+                    (fd, 0, length, false)
+                } else {
+                    zerocopy_range(py, message)?
+                };
+                let mut items = vec![Outgoing::File {
+                    fd,
+                    offset,
+                    length,
+                    more,
+                }];
+
+                if !more {
+                    state.body_ended = true;
+                    items.push(Outgoing::Finished);
+                }
+
+                drop(state);
+                self.enqueue(py, items)
             }
+            "http.response.trailers" => Err(PyRuntimeError::new_err(format!(
+                "{kind} is not advertised in scope['extensions'] and cannot be sent"
+            ))),
             other => Err(PyRuntimeError::new_err(format!(
                 "unexpected ASGI message type {other:?} on an http connection"
             ))),
@@ -674,12 +762,13 @@ impl Channel {
         } else {
             "the application returned without sending a response"
         };
-        self.abort(py, error, String::new());
+        self.abort(py, error, "app_error", String::new());
     }
 
-    /// Fail the response because the application raised. `detail` is the
-    /// formatted traceback, shown by the edge in development mode when no
-    /// output had reached it.
+    /// Fail the response because the application raised, or because the
+    /// soft timeout cancelled it. `detail` is the formatted traceback,
+    /// shown by the edge in development mode when no output had reached
+    /// it.
     fn fail(&self, py: Python<'_>, detail: String) {
         let state = self.state.lock().expect("send state poisoned");
         let (body_ended, accepted, closed) = (state.body_ended, state.accepted, state.closed);
@@ -689,7 +778,8 @@ impl Channel {
             return;
         }
 
-        // An accepted WebSocket ends with 1011; anything else is a 500.
+        // An accepted WebSocket ends with 1011; anything else is a 500,
+        // or a 504 for a timeout.
 
         if accepted {
             let _ = self.enqueue(
@@ -702,7 +792,34 @@ impl Channel {
             return;
         }
 
-        self.abort(py, "the application raised an exception", detail);
+        if self.timed_out()
+            && let Some(timeout) = self.shared.soft_timeout.as_ref()
+        {
+            let message = format!(
+                "the request ran past the soft timeout of {}",
+                wsgi::describe_seconds(timeout.after)
+            );
+            self.abort(py, &message, "soft_timeout", detail);
+            return;
+        }
+
+        self.abort(
+            py,
+            "the application raised an exception",
+            "app_error",
+            detail,
+        );
+    }
+
+    /// Note the task the runner started for this request, so the soft
+    /// timeout can cancel it.
+    fn started(&self, task: Py<PyAny>) {
+        *self.task.lock().expect("task poisoned") = Some(task);
+    }
+
+    /// Whether the soft timeout has cancelled the request's task.
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::SeqCst)
     }
 }
 
@@ -718,6 +835,100 @@ pub fn resolve_future(future: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> Py
 }
 
 /// Build the dictionary the application receives for a message.
+/// `http.response.pathsend`: the file at `path`, opened as the
+/// application's user, and its size.
+fn open_path(py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<(std::os::fd::OwnedFd, u64)> {
+    let path = message
+        .get_item("path")?
+        .ok_or_else(|| PyTypeError::new_err("http.response.pathsend has no path"))?;
+    let path = py
+        .import(pyo3::intern!(py, "os"))?
+        .call_method1(pyo3::intern!(py, "fsdecode"), (path,))?
+        .extract::<String>()
+        .map_err(|_| PyTypeError::new_err("http.response.pathsend path must be a path"))?;
+    let file = std::fs::File::open(&path).map_err(|error| {
+        pyo3::exceptions::PyOSError::new_err(format!("http.response.pathsend: {path}: {error}"))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        pyo3::exceptions::PyOSError::new_err(format!("http.response.pathsend: {path}: {error}"))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(pyo3::exceptions::PyOSError::new_err(format!(
+            "http.response.pathsend: {path} is not a regular file"
+        )));
+    }
+
+    Ok((file.into(), metadata.len()))
+}
+
+/// `http.response.zerocopysend`: a duplicate of the file's descriptor with
+/// the range to send and whether body chunks follow.
+fn zerocopy_range(
+    py: Python<'_>,
+    message: &Bound<'_, PyDict>,
+) -> PyResult<(std::os::fd::OwnedFd, u64, u64, bool)> {
+    use std::os::fd::BorrowedFd;
+
+    let file = message
+        .get_item("file")?
+        .ok_or_else(|| PyTypeError::new_err("http.response.zerocopysend has no file"))?;
+    let raw = file
+        .call_method0(pyo3::intern!(py, "fileno"))?
+        .extract::<i32>()
+        .map_err(|_| PyTypeError::new_err("http.response.zerocopysend file has no descriptor"))?;
+
+    if raw < 0 {
+        return Err(PyValueError::new_err(
+            "http.response.zerocopysend file has no descriptor",
+        ));
+    }
+
+    // SAFETY: the descriptor is the application's open file, alive for the
+    // call since the message holding the file object is.
+
+    let copy = std::fs::File::from(unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?);
+    let metadata = copy.metadata()?;
+
+    if !metadata.is_file() {
+        return Err(PyValueError::new_err(
+            "http.response.zerocopysend file is not a regular file",
+        ));
+    }
+
+    let optional = |name: &str| -> PyResult<Option<u64>> {
+        match message.get_item(name)? {
+            Some(value) if !value.is_none() => value.extract::<u64>().map(Some).map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "http.response.zerocopysend {name} must be a non-negative int"
+                ))
+            }),
+            _ => Ok(None),
+        }
+    };
+
+    // The range: from the given offset, else the file's position, for
+    // the given count, else the rest of the file.
+
+    let offset = match optional("offset")? {
+        Some(offset) => offset,
+        None => file
+            .call_method0(pyo3::intern!(py, "tell"))
+            .and_then(|value| value.extract::<u64>())
+            .unwrap_or(0),
+    };
+
+    let rest = metadata.len().saturating_sub(offset);
+    let count = optional("count")?.map_or(rest, |count| count.min(rest));
+
+    let more = match message.get_item("more_body")? {
+        Some(more) => more.is_truthy()?,
+        None => false,
+    };
+
+    Ok((copy.into(), offset, count, more))
+}
+
 fn message_dict<'py>(
     py: Python<'py>,
     message: &Message,
@@ -931,6 +1142,31 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         muru.set_item("max_body_size", head.max_body_size)?;
     }
 
+    // Section 4.10: a request that arrived by internal redirect says so,
+    // with what the client asked for.
+
+    if let Some(internal) = &head.internal {
+        muru.set_item("internal", true)?;
+
+        // Section 4.16: an authentication sub-request describes the
+        // request it decides about instead.
+
+        if internal.auth_request {
+            muru.set_item("auth_request", true)?;
+            muru.set_item("original_method", &internal.original_method)?;
+            muru.set_item("original_uri", &internal.original_uri)?;
+            muru.set_item("original_host", &internal.original_host)?;
+        } else {
+            muru.set_item("redirect_url", &internal.redirect_url)?;
+            muru.set_item("redirect_query_string", &internal.redirect_query_string)?;
+            muru.set_item("redirect_status", internal.redirect_status)?;
+        }
+
+        if !internal.error_reason.is_empty() {
+            muru.set_item("error_reason", &internal.error_reason)?;
+        }
+    }
+
     if let Some(proxy) = &head.proxy {
         muru.set_item("proxy_addr", &proxy.address)?;
     }
@@ -951,6 +1187,11 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         // Declining the handshake with a full response (section 5.6).
 
         extensions.set_item("websocket.http.response", PyDict::new(py))?;
+    } else {
+        // Section 6.6: the file extensions, served as FILE frames.
+
+        extensions.set_item("http.response.pathsend", PyDict::new(py))?;
+        extensions.set_item("http.response.zerocopysend", PyDict::new(py))?;
     }
 
     scope.set_item("extensions", extensions)?;
@@ -959,19 +1200,21 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 }
 
 /// Start a request on the event loop: build its scope and channel and
-/// schedule the runner. Fails when the loop is gone, which means the
-/// worker is stopping.
+/// schedule the runner. `request` is the request's id in the shared
+/// state. Fails when the loop is gone, which means the worker is
+/// stopping.
 pub fn start(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     asgi: &Asgi,
     runner: &Py<PyAny>,
     head: &pb::RequestHead,
     tx: mpsc::Sender<Outgoing>,
+    request: u64,
 ) -> Result<Py<Channel>, String> {
-    let _ = shared;
     Python::attach(|py| {
-        let channel =
-            Bound::new(py, Channel::new(py, asgi, tx, head)).map_err(|error| error.to_string())?;
+        let channel = Channel::new(py, asgi, tx, head, Arc::clone(shared), request);
+        let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
+        shared.request_channel(request, channel.clone().unbind());
         let scope = build_scope(py, head).map_err(|error| error.to_string())?;
 
         asgi.event_loop

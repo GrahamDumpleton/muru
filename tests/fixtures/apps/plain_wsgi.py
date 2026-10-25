@@ -12,6 +12,8 @@ import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
+import muru
+
 HELLO = b"Hello, world!\n"
 LARGE = b"x" * (1024 * 1024)
 
@@ -154,6 +156,51 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         time.sleep(float(query.get("seconds", "0.1")))
         start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "5")])
         return [b"slept"]
+
+    if path == "/busy":
+        # Runs Python bytecode for the time, so the soft timeout's
+        # exception can be raised at any point.
+
+        until = time.monotonic() + float(query.get("seconds", "0.1"))
+
+        while time.monotonic() < until:
+            time.sleep(0.01)
+
+        start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "4")])
+        return [b"busy"]
+
+    if path == "/busy-handled":
+        # An application that answers for itself when its request is
+        # interrupted.
+
+        until = time.monotonic() + float(query.get("seconds", "0.1"))
+
+        try:
+            while time.monotonic() < until:
+                time.sleep(0.01)
+        except muru.RequestTimeout:
+            start_response(
+                "503 Service Unavailable",
+                [("Content-Type", "text/plain"), ("Content-Length", "14")],
+            )
+            return [b"took too long\n"]
+
+        start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "4")])
+        return [b"busy"]
+
+    if path == "/events":
+        # A server-sent event stream, which is exempt from the timeouts.
+
+        count = int(query.get("count", "5"))
+        delay = float(query.get("delay", "0.1"))
+        start_response("200 OK", [("Content-Type", "text/event-stream")])
+
+        def events() -> Iterable[bytes]:
+            for index in range(count):
+                yield b"data: %d\n\n" % index
+                time.sleep(delay)
+
+        return events()
 
     if path == "/error":
         raise RuntimeError("deliberate failure")

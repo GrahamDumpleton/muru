@@ -268,6 +268,12 @@ pub struct HostSpec {
     pub python: PathBuf,
     /// The application as module:callable.
     pub app: String,
+    /// The application's name and the release's id, which the runtime
+    /// library reports through `muru.context()` (section 6.9); none in
+    /// development, where they are `default` and `dev`.
+    pub name: Option<String>,
+    /// The release's id, with `name`.
+    pub release: Option<String>,
     /// The interface the entrypoint speaks.
     pub interface: muru_config::Interface,
     /// Whether the entrypoint is a factory, and when it is called.
@@ -304,6 +310,9 @@ pub struct HostSpec {
     pub max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     pub max_lifetime: Option<Duration>,
+    /// How long a request may run before it is interrupted (section
+    /// 7.6); off when absent.
+    pub soft_timeout: Option<Duration>,
     /// How long a request may run before its worker is replaced (section
     /// 7.6); off when absent.
     pub hard_timeout: Option<Duration>,
@@ -452,6 +461,16 @@ impl HostProcess {
             .arg(&spec.app)
             .arg("--socket-dir")
             .arg(&run_dir)
+            .args(
+                spec.name
+                    .iter()
+                    .flat_map(|name| ["--name".to_owned(), name.clone()]),
+            )
+            .args(
+                spec.release
+                    .iter()
+                    .flat_map(|release| ["--release".to_owned(), release.clone()]),
+            )
             .arg("--processes")
             .arg(spec.processes.to_string())
             .arg("--threads")
@@ -475,38 +494,7 @@ impl HostProcess {
                     .with_context(|| format!("opening {}", log.display()))?;
                 command.stdout(log.try_clone()?).stderr(log);
 
-                // Its own session, so the daemon's signals and terminal do
-                // not reach it, and the application's identity (section
-                // 10.9) when one is set.
-
-                let identity = spec.identity;
-
-                // SAFETY: setsid, setgroups, setgid, setuid and umask are
-                // async-signal-safe and the closure runs in the child
-                // between fork and exec, touching nothing else.
-
-                unsafe {
-                    command.pre_exec(move || {
-                        libc::setsid();
-
-                        if let Some(identity) = identity {
-                            let groups = [identity.gid as libc::gid_t];
-
-                            if libc::setgroups(1, groups.as_ptr()) != 0
-                                || libc::setgid(identity.gid as libc::gid_t) != 0
-                                || libc::setuid(identity.uid as libc::uid_t) != 0
-                            {
-                                return Err(std::io::Error::last_os_error());
-                            }
-
-                            if let Some(mask) = identity.umask {
-                                libc::umask(mask as libc::mode_t);
-                            }
-                        }
-
-                        Ok(())
-                    });
-                }
+                own_session(&mut command, spec.identity);
             }
             None => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -600,6 +588,12 @@ impl HostProcess {
             command
                 .arg("--max-lifetime")
                 .arg(lifetime.as_secs_f64().to_string());
+        }
+
+        if let Some(timeout) = spec.soft_timeout {
+            command
+                .arg("--soft-timeout")
+                .arg(timeout.as_secs_f64().to_string());
         }
 
         if let Some(timeout) = spec.hard_timeout {
@@ -859,6 +853,38 @@ impl HostProcess {
             let _ = child.try_wait();
             std::mem::forget(child);
         }
+    }
+}
+
+/// Run a child in a session of its own, so the daemon's signals and
+/// terminal do not reach it, and as `identity` when one is set (section
+/// 10.9).
+pub(crate) fn own_session(command: &mut Command, identity: Option<Identity>) {
+    // SAFETY: setsid, setgroups, setgid, setuid and umask are
+    // async-signal-safe and the closure runs in the child between fork
+    // and exec, touching nothing else.
+
+    unsafe {
+        command.pre_exec(move || {
+            libc::setsid();
+
+            if let Some(identity) = identity {
+                let groups = [identity.gid as libc::gid_t];
+
+                if libc::setgroups(1, groups.as_ptr()) != 0
+                    || libc::setgid(identity.gid as libc::gid_t) != 0
+                    || libc::setuid(identity.uid as libc::uid_t) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+
+                if let Some(mask) = identity.umask {
+                    libc::umask(mask as libc::mode_t);
+                }
+            }
+
+            Ok(())
+        });
     }
 }
 
