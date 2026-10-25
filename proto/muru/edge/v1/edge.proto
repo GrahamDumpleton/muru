@@ -84,16 +84,35 @@ message Route {
   repeated string cache_except = 10;    // patterns of files that get no-cache instead
   bool no_redirect_slash = 11;          // do not redirect a directory to its slash form
   bool case_insensitive = 12;           // accept names that differ from the file's on disk
+  Traffic traffic = 13;                 // how the application's releases share the requests (section 9.4)
 }
 
-// The worker sockets of an application's serving release: the default
+// A route's traffic policy (section 9.4). Buckets run from 0 to 9999;
+// the shares take theirs from the top in the order listed, newest release
+// first, and the application's serving release takes the rest.
+message Traffic {
+  repeated Share shares = 1;
+  string hash_key = 2;                  // cookie, header:NAME, cookie:NAME or client
+  string salt = 3;
+  bool sticky = 4;                      // a cookie keeps a client on the release it first got
+  uint64 sticky_grace_s = 5;
+}
+
+message Share {
+  string release = 1;
+  uint32 weight = 2;                    // buckets of the 10000
+}
+
+// The worker sockets of one release of an application: the default
 // group's, and each named group's with the paths it serves (section 7.1).
+// An application has one entry per release that may take requests.
 message AppWorkers {
   string app = 1;
   repeated string sockets = 2;
   repeated Group groups = 3;
-  repeated Mount mounts = 4;            // named mounts of the serving release (section 6.7)
-  string release = 5;                   // the release, for the access log
+  repeated Mount mounts = 4;            // named mounts of the release (section 6.7)
+  string release = 5;                   // the release, for the access log and traffic policies
+  bool serving = 6;                     // the application's serving release, which takes what no policy assigns
 }
 
 message Mount {

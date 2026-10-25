@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +39,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a superseded release stays warm (section 9.1), provisional
 /// (section 19.2).
 pub const RETENTION: Duration = Duration::from_secs(30 * 60);
+
+/// Section 9.4: how long sticky clients keep a release that is leaving
+/// traffic, unless the policy says otherwise.
+pub const STICKY_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The account a root daemon runs the edge and the applications as when
 /// none is named (ADR 0026).
@@ -292,6 +296,10 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// Section 9.4: while set, the release is leaving traffic but stays
+    /// reachable by sticky cookie until the instant, when it drains with
+    /// the retention given.
+    sticky_until: Option<(Instant, Duration)>,
     /// The host's control connection, once it is up.
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
@@ -575,6 +583,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         last_request: 0,
     };
     daemon.restore().await;
+    daemon.reconcile_traffic().await;
 
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
@@ -642,6 +651,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
+                daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
                 daemon.sample_history().await;
@@ -1429,6 +1439,7 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        sticky_until: None,
                         control: None,
                         status: Vec::new(),
                     },
@@ -1478,6 +1489,7 @@ impl Daemon {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
             Command::Reconfigure { done } => {
+                self.reconcile_traffic().await;
                 let _ = done.send(self.push_snapshot().await);
             }
             Command::Reload { done } => {
@@ -1573,7 +1585,11 @@ impl Daemon {
             .set_app_releases(app, Some(&release.id), previous.as_deref())
             .map_err(|error| error.to_string())?;
 
-        if let Some(previous) = previous.filter(|previous| previous != &release.id) {
+        if let Some(previous) = previous.filter(|previous| previous != &release.id)
+            && !self
+                .referenced_releases()
+                .contains(&(app.to_owned(), previous.clone()))
+        {
             self.drain(app, &previous, retain).await;
         }
 
@@ -1704,6 +1720,8 @@ impl Daemon {
         let host_spec = HostSpec {
             python: spec.python.clone(),
             app: spec.entrypoint.clone(),
+            name: Some(app.to_owned()),
+            release: Some(id.to_owned()),
             interface: spec.interface,
             factory: spec.factory,
             processes: spec.processes as usize,
@@ -1853,6 +1871,7 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                sticky_until: None,
                 control: None,
                 status: Vec::new(),
             },
@@ -1912,14 +1931,37 @@ impl Daemon {
     /// workers are those of the application traffic was last switched to.
     fn build_snapshot(&mut self) -> pb::Snapshot {
         let mut apps = Vec::new();
-        let mut serving: Vec<(&String, &String)> = self.serving.iter().collect();
-        serving.sort();
+        let routes = self.store.routes().unwrap_or_default();
+        let referenced = referenced_in(&routes);
 
-        for (name, id) in serving {
+        // Section 9.4: an application's serving release takes requests,
+        // and so do the releases its routes' policies name and a release
+        // sticky clients may still reach, while they run and are not
+        // merely kept warm.
+
+        let mut routable: Vec<(&String, &String)> = self
+            .running
+            .iter()
+            .filter(|((app, id), running)| {
+                self.serving.get(app) == Some(id)
+                    || running.sticky_until.is_some()
+                    || (running.retained_until.is_none()
+                        && referenced.contains(&((*app).clone(), (*id).clone())))
+            })
+            .map(|((app, id), _)| (app, id))
+            .collect();
+        routable.sort();
+        let included: BTreeSet<(String, String)> = routable
+            .iter()
+            .map(|(app, id)| ((*app).clone(), (*id).clone()))
+            .collect();
+
+        for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 apps.push(pb::AppWorkers {
                     app: name.clone(),
                     release: id.clone(),
+                    serving: self.serving.get(name) == Some(id),
                     sockets: running
                         .sockets
                         .iter()
@@ -2005,12 +2047,13 @@ impl Daemon {
             });
         }
 
-        let routes = self
-            .store
-            .routes()
-            .unwrap_or_default()
+        let routes = routes
             .into_iter()
             .map(|route| pb::Route {
+                traffic: route
+                    .traffic
+                    .as_ref()
+                    .map(|traffic| self.traffic_message(&route, traffic, &included)),
                 host: route.host,
                 path: route.path,
                 app: route.app,
@@ -2083,6 +2126,41 @@ impl Daemon {
 
             return;
         }
+
+        // Section 9.4: with a sticky policy on the application's routes,
+        // clients whose cookie names the release keep reaching it for the
+        // grace period; it drains when that passes (expire_sticky).
+
+        if let Some(grace) = self.sticky_grace(app)
+            && let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned()))
+            && running.sticky_until.is_none()
+        {
+            running.sticky_until = Some((Instant::now() + grace, retain));
+            let message = format!(
+                "sticky clients keep it for {}",
+                muru_config::format_duration(grace)
+            );
+            self.set_state(&release, ReleaseState::Draining, &message);
+            self.events
+                .emit("release.draining", &subject, "info", &message);
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a sticky drain failed");
+            }
+
+            return;
+        }
+
+        self.drain_now(app, id, retain).await;
+    }
+
+    /// Drain a release that is out of the snapshot: wait for its requests
+    /// in flight, then keep it warm for `retain` or stop it.
+    async fn drain_now(&mut self, app: &str, id: &str, retain: Duration) {
+        let subject = format!("{app}@{id}");
+        let Ok(release) = self.store.release(app, id) else {
+            return;
+        };
 
         // The previous pool is gone from the edge, so what is in flight on
         // these workers is what the edge had already dispatched; a short
@@ -2159,6 +2237,144 @@ impl Daemon {
             .emit("release.stopped", &subject, "info", "stopped");
     }
 
+    /// Section 9.4: the releases whose sticky grace has passed leave the
+    /// snapshot and drain.
+    async fn expire_sticky(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(String, String, Duration)> = self
+            .running
+            .iter()
+            .filter_map(|((app, id), running)| {
+                let (until, retain) = running.sticky_until?;
+                (until <= now).then(|| (app.clone(), id.clone(), retain))
+            })
+            .collect();
+
+        for (app, id, retain) in expired {
+            if let Some(running) = self.running.get_mut(&(app.clone(), id.clone())) {
+                running.sticky_until = None;
+            }
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot after a sticky grace failed");
+            }
+
+            self.drain_now(&app, &id, retain).await;
+        }
+    }
+
+    /// Section 9.4: the releases the route policies name must run, and a
+    /// release that only a policy kept in traffic drains once no policy
+    /// names it. Called after the configuration changes and at start.
+    async fn reconcile_traffic(&mut self) {
+        let referenced = self.referenced_releases();
+
+        for (app, id) in &referenced {
+            let key = (app.clone(), id.clone());
+
+            let needs_start = match self.running.get(&key) {
+                None => true,
+                Some(running) => running.retained_until.is_some() || running.sticky_until.is_some(),
+            };
+
+            if !needs_start || self.store.release(app, id).is_err() {
+                continue;
+            }
+
+            if let Some(running) = self.running.get_mut(&key) {
+                running.sticky_until = None;
+            }
+
+            if let Err(error) = self.start(app, id).await {
+                self.events.emit(
+                    "traffic_policy.release_unavailable",
+                    &format!("{app}@{id}"),
+                    "warning",
+                    &format!("a traffic policy names the release but it cannot start: {error}"),
+                );
+            }
+        }
+
+        let unreferenced: Vec<(String, String)> = self
+            .running
+            .iter()
+            .filter(|((app, id), running)| {
+                running.retained_until.is_none()
+                    && running.sticky_until.is_none()
+                    && self.serving.get(app) != Some(id)
+                    && !referenced.contains(&((*app).clone(), (*id).clone()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for (app, id) in unreferenced {
+            self.drain(&app, &id, RETENTION).await;
+        }
+    }
+
+    /// The releases the route policies name, by application.
+    fn referenced_releases(&self) -> BTreeSet<(String, String)> {
+        referenced_in(&self.store.routes().unwrap_or_default())
+    }
+
+    /// Section 9.4: the longest sticky grace among the application's
+    /// routes with a sticky policy, or none when no route is sticky.
+    fn sticky_grace(&self, app: &str) -> Option<Duration> {
+        self.store
+            .routes()
+            .unwrap_or_default()
+            .iter()
+            .filter(|route| route_apps(route).contains(&app))
+            .filter_map(|route| route.traffic.as_ref())
+            .filter(|traffic| traffic.sticky == Some(true))
+            .map(sticky_grace_of)
+            .filter(|grace| !grace.is_zero())
+            .max()
+    }
+
+    /// A route's traffic policy for the edge: the shares of the releases
+    /// the snapshot carries, newest first so the newest release's buckets
+    /// are at the top (section 9.4), with the key, salt and stickiness.
+    fn traffic_message(
+        &self,
+        route: &muru_config::Route,
+        traffic: &muru_config::Traffic,
+        included: &BTreeSet<(String, String)>,
+    ) -> pb::Traffic {
+        let app = route_apps(route).first().copied().unwrap_or_default();
+        let mut shares: Vec<(u64, &String, u32)> = traffic
+            .split
+            .iter()
+            .filter(|(id, _)| included.contains(&(app.to_owned(), (*id).clone())))
+            .map(|(id, percent)| {
+                let created = self
+                    .store
+                    .release(app, id)
+                    .map(|release| release.created_unix_ms)
+                    .unwrap_or(0);
+                (created, id, *percent)
+            })
+            .collect();
+        shares.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+
+        pb::Traffic {
+            shares: shares
+                .into_iter()
+                .map(|(_, release, percent)| pb::Share {
+                    release: release.clone(),
+                    weight: percent.min(100) * 100,
+                })
+                .collect(),
+            hash_key: traffic.hash_key.clone().unwrap_or_default(),
+            salt: traffic
+                .salt
+                .clone()
+                .unwrap_or_else(|| format!("{} {}", route.host, route.path)),
+            sticky: traffic.sticky.unwrap_or(false),
+            sticky_grace_s: sticky_grace_of(traffic).as_secs(),
+        }
+    }
+
     /// Stop the retained releases whose window has passed.
     async fn expire_retained(&mut self) {
         let now = Instant::now();
@@ -2196,7 +2412,11 @@ impl Daemon {
             &format!("rolled back to {previous}"),
         );
 
-        if let Some(current) = current.filter(|current| current != &previous) {
+        if let Some(current) = current.filter(|current| current != &previous)
+            && !self
+                .referenced_releases()
+                .contains(&(app.to_owned(), current.clone()))
+        {
             self.drain(app, &current, RETENTION).await;
         }
 
@@ -2712,4 +2932,50 @@ fn reopen_own_log(path: &std::path::Path) {
         libc::dup2(log.as_raw_fd(), 1);
         libc::dup2(log.as_raw_fd(), 2);
     }
+}
+
+/// The applications a route sends requests to: the application, or a
+/// static route's fallback.
+fn route_apps(route: &muru_config::Route) -> Vec<&str> {
+    let mut apps = Vec::new();
+
+    if !route.app.is_empty() {
+        apps.push(route.app.as_str());
+    }
+
+    if let Some(app) = route
+        .fallback
+        .as_ref()
+        .and_then(|fallback| fallback.app.as_deref())
+    {
+        apps.push(app);
+    }
+
+    apps
+}
+
+/// The releases the routes' traffic policies name, as (application,
+/// release) pairs (section 9.4).
+fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
+    routes
+        .iter()
+        .filter_map(|route| route.traffic.as_ref().map(|traffic| (route, traffic)))
+        .flat_map(|(route, traffic)| {
+            route_apps(route).into_iter().flat_map(move |app| {
+                traffic
+                    .split
+                    .keys()
+                    .map(move |id| (app.to_owned(), id.clone()))
+            })
+        })
+        .collect()
+}
+
+/// A policy's sticky grace: what it says, or 10 minutes.
+fn sticky_grace_of(traffic: &muru_config::Traffic) -> Duration {
+    traffic
+        .sticky_grace
+        .as_deref()
+        .and_then(|text| muru_config::parse_duration(text).ok())
+        .unwrap_or(STICKY_GRACE)
 }

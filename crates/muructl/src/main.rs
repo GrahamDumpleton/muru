@@ -1456,6 +1456,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
+        name: None,
+        release: None,
         interface: resolved.interface,
         factory: resolved.factory,
         processes: resolved.processes,

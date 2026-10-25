@@ -1634,13 +1634,34 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
     println!("{:<16} {:<24} TARGET", "HOST", "PATH");
 
     for route in routes {
-        let target = if route.static_dir.is_empty() {
+        let mut target = if route.static_dir.is_empty() {
             route.app
         } else if route.fallback_app.is_empty() {
             format!("static {}", route.static_dir)
         } else {
             format!("static {}, else {}", route.static_dir, route.fallback_app)
         };
+
+        // Section 9.4: the policy, when the route has one.
+
+        if !route.traffic.is_empty() || route.sticky || !route.hash_key.is_empty() {
+            let mut parts: Vec<String> = route
+                .traffic
+                .iter()
+                .map(|share| format!("{} {}%", share.release, share.percent))
+                .collect();
+
+            if route.sticky {
+                parts.push("sticky".to_owned());
+            }
+
+            if !route.hash_key.is_empty() {
+                parts.push(format!("by {}", route.hash_key));
+            }
+
+            target = format!("{target} ({})", parts.join(", "));
+        }
+
         println!("{:<16} {:<24} {target}", route.host, route.path);
     }
 

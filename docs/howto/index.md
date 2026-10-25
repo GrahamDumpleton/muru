@@ -26,6 +26,7 @@ daemon
 secrets
 users
 virtual-hosts
+traffic
 behind-a-proxy
 worker-groups
 mounts

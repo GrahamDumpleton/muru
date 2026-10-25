@@ -341,6 +341,15 @@ message Route {
   string app = 3;                   // empty for a static route
   string static_dir = 4;            // the directory, for a static route (section 4.9)
   string fallback_app = 5;          // the application behind a static route, when there is one
+  repeated TrafficShare traffic = 6; // the traffic policy's shares (section 9.4), empty without one
+  bool sticky = 7;
+  string hash_key = 8;              // the policy's key, when it names one
+}
+
+// One release's share of a route's requests, in percent.
+message TrafficShare {
+  string release = 1;
+  uint32 percent = 2;
 }
 
 // Which log to show: a release's output (its host's and workers' lines,

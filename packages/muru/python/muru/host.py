@@ -1824,6 +1824,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(prog="python -m muru.host", description=__doc__)
     parser.add_argument("--app", required=True, help="application as module:callable")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="the application's name for muru.context(); the entrypoint's module otherwise",
+    )
+    parser.add_argument(
+        "--release", default=None, help="the release's id for muru.context(); dev otherwise"
+    )
     parser.add_argument("--socket-dir", required=True, help="directory for the worker sockets")
     parser.add_argument("--processes", type=int, default=1, help="worker processes to fork")
     parser.add_argument(
@@ -2059,7 +2067,11 @@ def main(argv: list[str] | None = None) -> int:
         print("--processes must be at least 1", file=sys.stderr)
         return 2
 
-    context = Context(app=app_name(args.app), process_model=process_model(args.threads))
+    context = Context(
+        app=args.name or app_name(args.app),
+        release=args.release or "dev",
+        process_model=process_model(args.threads),
+    )
     set_context(context)
     release = Release(
         args.app,

@@ -115,14 +115,14 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
     deploy_plain(daemon, processes=1)
     text = daemon.muructl("debug", "inspect", "plain").stdout
     assert "worker 0 (pid" in text and "python 3." in text
-    assert "plain_wsgi in " in text and "(group default, " in text
+    assert "plain in " in text and "(group default, " in text
     assert "modules loaded" in text
     assert "MURU_GROUP=default" in text
 
     answer = json.loads(daemon.muructl("debug", "inspect", "plain", "--json").stdout)
     result = answer["workers"][0]["result"]
     assert "plain_wsgi" in result["modules"]
-    assert result["settings"]["app"] == "plain_wsgi"
+    assert result["settings"]["app"] == "plain"
     assert result["descriptors"]["count"] is None or result["descriptors"]["count"] > 3
     assert any(name == "MainThread" for name in (t["name"] for t in result["threads"]))
 

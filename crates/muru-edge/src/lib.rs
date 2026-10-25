@@ -727,7 +727,14 @@ async fn serve<I>(
                 request.uri().path(),
                 &listener,
                 secure || shared.https_port.is_none(),
+                &routing::Client {
+                    headers: request.headers(),
+                    peer: context.peer.ip(),
+                    secure,
+                    ids: &shared.request_ids,
+                },
             );
+            let mut issued: Vec<String> = Vec::new();
 
             let response = match (redirect_to, decision) {
                 (Some(to), _) => link::redirect_to_https(request, &context, to),
@@ -736,8 +743,10 @@ async fn serve<I>(
                     routing::Decision::Serve {
                         selection,
                         server_name,
+                        cookies,
                     },
                 ) => {
+                    issued = cookies;
                     context.server_name = server_name;
                     context.app = selection.app;
                     context.release = selection.release;
@@ -767,11 +776,13 @@ async fn serve<I>(
                         prefix,
                         fallback,
                         server_name,
+                        cookies,
                     },
                 ) => {
                     // Section 4.9: the file, or the fallback application
                     // when no file answers, or a 404 or 405.
 
+                    issued = cookies;
                     context.server_name = server_name;
                     let path = request.uri().path().to_owned();
                     let within = path
@@ -868,6 +879,16 @@ async fn serve<I>(
                 response
                     .headers_mut()
                     .insert(errors::X_REQUEST_ID.clone(), value);
+            }
+
+            // Section 9.4: the cookies the release choice issued.
+
+            for cookie in &issued {
+                if let Ok(value) = HeaderValue::from_str(cookie) {
+                    response
+                        .headers_mut()
+                        .append(http::header::SET_COOKIE, value);
+                }
             }
 
             Ok::<_, Infallible>(response)

@@ -822,6 +822,41 @@ pub struct Route {
     /// or `insensitive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case: Option<String>,
+    /// How requests are shared between the application's releases
+    /// (section 9.4); without it every request goes to the serving
+    /// release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<Traffic>,
+}
+
+/// A route's traffic policy (section 9.4): the share of requests each
+/// release takes, the key requests are bucketed by, and stickiness.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Traffic {
+    /// Percent of requests to each release, by id; the application's
+    /// serving release takes the rest. A release at 0 is reached only by
+    /// preview or by a sticky cookie.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub split: BTreeMap<String, u32>,
+    /// What a request is bucketed by: `cookie` (the default, an anonymous
+    /// id cookie the edge issues), `header:NAME`, `cookie:NAME`, or
+    /// `client` (the client address). A missing header or cookie falls
+    /// back to the client address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_key: Option<String>,
+    /// Mixed into the hash, so two routes split the same users
+    /// differently; the route's host and path by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// Whether a client keeps the release it first got, through a cookie
+    /// (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<bool>,
+    /// How long sticky clients keep a release that is leaving the route
+    /// alive, for example 10m (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_grace: Option<String>,
 }
 
 /// A static route's fallback (section 4.9): an application, or a file
@@ -1252,9 +1287,16 @@ mod tests {
             cache: None,
             redirect_slash: None,
             case: None,
+            traffic: Some(Traffic {
+                split: BTreeMap::from([("r2".to_owned(), 10)]),
+                sticky: Some(true),
+                ..Traffic::default()
+            }),
         });
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
+        assert!(text.contains("[route.traffic]"), "{text}");
+        assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");
         assert!(text.contains("[[route]]"), "{text}");
         assert!(

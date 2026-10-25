@@ -584,6 +584,30 @@ impl Admin for Service {
             routes: routes
                 .into_iter()
                 .map(|route| pb::Route {
+                    traffic: route
+                        .traffic
+                        .as_ref()
+                        .map(|traffic| {
+                            traffic
+                                .split
+                                .iter()
+                                .map(|(release, percent)| pb::TrafficShare {
+                                    release: release.clone(),
+                                    percent: *percent,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    sticky: route
+                        .traffic
+                        .as_ref()
+                        .and_then(|traffic| traffic.sticky)
+                        .unwrap_or(false),
+                    hash_key: route
+                        .traffic
+                        .as_ref()
+                        .and_then(|traffic| traffic.hash_key.clone())
+                        .unwrap_or_default(),
                     host: route.host,
                     path: route.path,
                     app: route.app,
@@ -729,10 +753,30 @@ impl Service {
                 .delete_host(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
-            Action::PutRoute { route, new } => store
-                .put_route(route)
-                .map(|()| if *new { "created" } else { "updated" }.to_owned())
-                .map_err(|error| error.to_string()),
+            Action::PutRoute { route, new } => {
+                let before = store
+                    .routes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|stored| stored.host == route.host && stored.path == route.path)
+                    .and_then(|stored| stored.traffic);
+
+                // Section 9.4: a changed policy is an event of its own.
+
+                if before != route.traffic {
+                    self.handle.events.emit(
+                        "traffic_policy.changed",
+                        &format!("route {} {}", route.host, route.path),
+                        "notice",
+                        &crate::config::describe_traffic(route.traffic.as_ref()),
+                    );
+                }
+
+                store
+                    .put_route(route)
+                    .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                    .map_err(|error| error.to_string())
+            }
             Action::RemoveRoute { host, path } => store
                 .delete_route(host, path)
                 .map(|()| "removed".to_owned())

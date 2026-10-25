@@ -78,7 +78,7 @@ pub enum Action {
     /// Create or replace a route.
     PutRoute {
         /// The route.
-        route: RouteTable,
+        route: Box<RouteTable>,
         /// Whether it is new rather than changed.
         new: bool,
     },
@@ -573,6 +573,72 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }
         }
 
+        // Section 9.4: a traffic policy names releases of the route's
+        // application that exist or are declared, with shares that fit.
+
+        if let Some(traffic) = &route.traffic {
+            let app = if route.app.is_empty() {
+                fallback_app
+            } else {
+                Some(route.app.as_str())
+            };
+
+            match app {
+                None => {
+                    plan.errors.push(format!(
+                        "route {} {}: traffic needs an application; a static route takes it through its fallback",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+                Some(app) => {
+                    for id in traffic.split.keys() {
+                        let declared = document
+                            .app
+                            .get(app)
+                            .is_some_and(|table| table.release.contains_key(id));
+
+                        if !declared && store.release(app, id).is_err() {
+                            plan.errors.push(format!(
+                                "route {} {}: traffic.split names {app}@{id}, which does not exist",
+                                route.host, route.path
+                            ));
+                            valid = false;
+                        }
+                    }
+                }
+            }
+
+            if traffic.split.values().sum::<u32>() > 100 {
+                plan.errors.push(format!(
+                    "route {} {}: traffic.split adds up to more than 100 percent",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+
+            if let Some(key) = traffic.hash_key.as_deref()
+                && !matches!(key, "cookie" | "client")
+                && !matches!(key.split_once(':'), Some(("header" | "cookie", name)) if !name.is_empty())
+            {
+                plan.errors.push(format!(
+                    "route {} {}: traffic.hash_key must be cookie, header:NAME, cookie:NAME or client, not {key:?}",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+
+            if let Some(text) = traffic.sticky_grace.as_deref()
+                && let Err(error) = muru_config::parse_duration(text)
+            {
+                plan.errors.push(format!(
+                    "route {} {}: traffic.sticky_grace: {error}",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+        }
+
         if seen.contains(&key) {
             plan.errors.push(format!(
                 "route {} {} is declared twice",
@@ -591,13 +657,45 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             Some(recorded) if recorded == route => plan.unchanged += 1,
             recorded => plan.changes.push(Change {
                 action: Action::PutRoute {
-                    route: route.clone(),
+                    route: Box::new(route.clone()),
                     new: recorded.is_none(),
                 },
-                detail: format!("to {}", route.app),
+                detail: match &route.traffic {
+                    Some(traffic) => {
+                        format!("to {}, {}", route.app, describe_traffic(Some(traffic)))
+                    }
+                    None => format!("to {}", route.app),
+                },
             }),
         }
     }
+}
+
+/// A traffic policy in words, for plans and events: the shares, the
+/// stickiness and the key.
+pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
+    let Some(traffic) = traffic else {
+        return "every request to the serving release".to_owned();
+    };
+    let mut parts: Vec<String> = traffic
+        .split
+        .iter()
+        .map(|(release, percent)| format!("{release} {percent}%"))
+        .collect();
+
+    if parts.is_empty() {
+        parts.push("no shares".to_owned());
+    }
+
+    if traffic.sticky == Some(true) {
+        parts.push("sticky".to_owned());
+    }
+
+    if let Some(key) = &traffic.hash_key {
+        parts.push(format!("by {key}"));
+    }
+
+    parts.join(", ")
 }
 
 /// With prune, routes, hosts, releases and applications in desired state

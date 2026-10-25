@@ -230,3 +230,21 @@ the next step on that path and is still to come. That completes the
 phase 2 scope: the exit runs passed in the virtual machine, deploys and
 rollbacks under sustained load and daemon and edge restarts and upgrades
 with no failed request, and 0.1.0a4 is the release.
+
+Phase 3 has started with traffic policies (section 9.4), which canaries
+and the rest of the phase's traffic management build on: a route's
+`traffic` table shares its requests between an application's releases by
+percentage, each client hashed to one of 10,000 buckets by an anonymous
+id cookie the edge issues, a header, a cookie or the client address, with
+a salt per route and the newest release's buckets at the top so a client
+stays in a growing share; `sticky` keeps a client on its release through
+a cookie, with a grace period during which a release leaving the route
+stays reachable by cookie alone before it drains; the `Muru-Preview`
+header or `muru_preview` cookie pins a release, including one at 0%; the
+daemon keeps every release a policy names running, drains one no policy
+names, and leaves a superseded release a policy still names in place;
+`muructl route list` shows the policy and a change records
+`traffic_policy.changed`. The host now tells the runtime library its
+application name and release id, so `muru.context()` reports them.
+Rollouts with steps and gates, bucketing by header matches and the
+remaining strategies of section 9.2 come next.

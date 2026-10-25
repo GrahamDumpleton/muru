@@ -5,14 +5,18 @@
 //! mode: every request goes to its workers. With hosts, a request's host
 //! name selects the virtual host (exact name, then the wildcard with the
 //! longest suffix, then the listener's default host, else 421), the
-//! longest route prefix selects the application, and the application's
-//! serving release takes the request. Within a release, the most specific
-//! worker group path selects the group's workers, else the default
-//! group's (section 7.1).
+//! longest route prefix selects the application, and the route's traffic
+//! policy, when it has one, selects the release (section 9.4: a preview
+//! header or cookie, then a sticky cookie, then the bucket the client's
+//! key hashes to), else the application's serving release takes the
+//! request. Within a release, the most specific worker group path selects
+//! the group's workers, else the default group's (section 7.1).
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
+use http::HeaderMap;
 use muru_proto::edge::v1 as pb;
 
 use crate::link::LinkPool;
@@ -38,6 +42,8 @@ struct Route {
     static_route: Option<Arc<crate::static_files::StaticRoute>>,
     /// The application that takes what no file answers.
     fallback_app: String,
+    /// How the application's releases share the requests (section 9.4).
+    traffic: Option<Policy>,
 }
 
 /// The worker sockets of one group of a release, as a snapshot or a
@@ -76,6 +82,219 @@ pub struct Selection {
     pub mount: String,
     /// The mount's path, empty for the default mount.
     pub script_name: String,
+}
+
+/// What a request brings to the release choice (section 9.4): its
+/// headers, for the preview, sticky and id cookies and a header key, and
+/// the client's address.
+pub struct Client<'a> {
+    /// The request headers.
+    pub headers: &'a HeaderMap,
+    /// The client's address, the key of last resort.
+    pub peer: IpAddr,
+    /// Whether the response travels inside TLS, which marks the cookies
+    /// the edge issues Secure.
+    pub secure: bool,
+    /// Issues an anonymous id to a client that has none yet.
+    pub ids: &'a crate::errors::RequestIds,
+}
+
+/// An application's releases that may take requests: the serving one,
+/// which takes what no policy assigns, and every release by id.
+struct AppReleases {
+    serving: Arc<AppPools>,
+    releases: HashMap<String, Arc<AppPools>>,
+}
+
+/// The number of buckets a route's clients are spread over.
+pub const BUCKETS: u32 = 10_000;
+
+/// The anonymous id cookie the edge issues (section 9.4).
+pub const ID_COOKIE: &str = "muru_id";
+
+/// The cookie that keeps a client on the release it first got.
+pub const STICKY_COOKIE: &str = "muru_release";
+
+/// The cookie that pins a release for previews.
+pub const PREVIEW_COOKIE: &str = "muru_preview";
+
+/// The header that pins a release for previews. It is not an X-Muru
+/// header, which the edge removes from every request (section 4.6).
+pub const PREVIEW_HEADER: &str = "muru-preview";
+
+/// A route's compiled traffic policy (section 9.4).
+#[derive(Debug, Clone)]
+pub struct Policy {
+    /// Each share's release and bucket range, low inclusive, high
+    /// exclusive, from the top down.
+    shares: Vec<(String, u32, u32)>,
+    key: Key,
+    salt: String,
+    sticky: bool,
+}
+
+/// What a request is bucketed by.
+#[derive(Debug, Clone)]
+enum Key {
+    /// The anonymous id cookie, issued when missing.
+    Anonymous,
+    /// A request header, lower-cased; the client address when missing.
+    Header(String),
+    /// A cookie; the client address when missing.
+    Cookie(String),
+    /// The client address.
+    Client,
+}
+
+impl Policy {
+    /// Compile a snapshot's policy, laying the shares out from the top
+    /// bucket down in the order given.
+    pub fn from_message(message: &pb::Traffic) -> Result<Self, String> {
+        let key = match message.hash_key.as_str() {
+            "" | "cookie" => Key::Anonymous,
+            "client" => Key::Client,
+            other => match other.split_once(':') {
+                Some(("header", name)) if !name.is_empty() => {
+                    Key::Header(name.to_ascii_lowercase())
+                }
+                Some(("cookie", name)) if !name.is_empty() => Key::Cookie(name.to_owned()),
+                _ => {
+                    return Err(format!(
+                        "hash_key {other:?} is not cookie, header:NAME, cookie:NAME or client"
+                    ));
+                }
+            },
+        };
+
+        let mut top = BUCKETS;
+        let mut shares = Vec::new();
+
+        for share in &message.shares {
+            let low = top
+                .checked_sub(share.weight)
+                .ok_or_else(|| "the shares add up to more than the whole".to_owned())?;
+            shares.push((share.release.clone(), low, top));
+            top = low;
+        }
+
+        Ok(Self {
+            shares,
+            key,
+            salt: message.salt.clone(),
+            sticky: message.sticky,
+        })
+    }
+
+    /// The bucket a key falls in: FNV-1a over the salt and the key, so
+    /// the same client lands in the same bucket in every edge process
+    /// and across upgrades.
+    pub fn bucket(salt: &str, key: &str) -> u32 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+
+        for byte in salt.bytes().chain(std::iter::once(0)).chain(key.bytes()) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+
+        (hash % u64::from(BUCKETS)) as u32
+    }
+
+    /// The release whose share a bucket falls in, if any.
+    fn share_for(&self, bucket: u32) -> Option<&str> {
+        self.shares
+            .iter()
+            .find(|(_, low, high)| (*low..*high).contains(&bucket))
+            .map(|(release, _, _)| release.as_str())
+    }
+}
+
+/// Section 4.5: which of an application's releases takes a request. The
+/// release a preview header or cookie names comes first, then the one a
+/// sticky cookie records, then the policy's bucket for the client's key,
+/// else the serving release. Cookies the edge issues on the way go into
+/// `cookies` as Set-Cookie values.
+fn choose<'a>(
+    app: &'a AppReleases,
+    policy: Option<&Policy>,
+    client: &Client<'_>,
+    cookies: &mut Vec<String>,
+) -> &'a Arc<AppPools> {
+    let preview = client
+        .headers
+        .get(PREVIEW_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| cookie(client.headers, PREVIEW_COOKIE));
+
+    if let Some(release) = preview
+        .as_deref()
+        .and_then(|release| app.releases.get(release))
+    {
+        return release;
+    }
+
+    let Some(policy) = policy else {
+        return &app.serving;
+    };
+
+    if policy.sticky
+        && let Some(release) =
+            cookie(client.headers, STICKY_COOKIE).and_then(|release| app.releases.get(&release))
+    {
+        return release;
+    }
+
+    let secure = if client.secure { "; Secure" } else { "" };
+
+    let key = match &policy.key {
+        Key::Anonymous => match cookie(client.headers, ID_COOKIE) {
+            Some(id) => id,
+            None => {
+                let id = client.ids.next();
+                cookies.push(format!(
+                    "{ID_COOKIE}={id}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax{secure}"
+                ));
+                id
+            }
+        },
+        Key::Header(name) => client
+            .headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| client.peer.to_string()),
+        Key::Cookie(name) => {
+            cookie(client.headers, name).unwrap_or_else(|| client.peer.to_string())
+        }
+        Key::Client => client.peer.to_string(),
+    };
+
+    let bucket = Policy::bucket(&policy.salt, &key);
+    let chosen = policy
+        .share_for(bucket)
+        .and_then(|release| app.releases.get(release))
+        .unwrap_or(&app.serving);
+
+    if policy.sticky {
+        cookies.push(format!(
+            "{STICKY_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax{secure}",
+            chosen.labels().1
+        ));
+    }
+
+    chosen
+}
+
+/// The value of a cookie among the request's Cookie headers.
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.trim().to_owned())
 }
 
 /// An application's connected workers: the default group and the named
@@ -218,7 +437,7 @@ pub struct Routing {
     trust: Trust,
     compression: crate::compression::Compression,
     default: Arc<AppPools>,
-    apps: HashMap<String, Arc<AppPools>>,
+    apps: HashMap<String, AppReleases>,
     hosts: Vec<Host>,
     exact: HashMap<String, usize>,
     wildcards: Vec<(String, usize)>,
@@ -235,6 +454,9 @@ pub enum Decision {
         selection: Selection,
         /// The matched or canonical host name, when a host matched.
         server_name: Option<String>,
+        /// Set-Cookie values the edge issues with the response: the
+        /// anonymous id and the sticky release (section 9.4).
+        cookies: Vec<String>,
     },
     /// Redirected to HTTPS: the host insists on it.
     Redirect,
@@ -253,6 +475,8 @@ pub enum Decision {
         fallback: Option<Selection>,
         /// The matched or canonical host name.
         server_name: Option<String>,
+        /// Set-Cookie values the edge issues with the response.
+        cookies: Vec<String>,
     },
 }
 
@@ -277,18 +501,29 @@ impl Routing {
     /// Compile a snapshot, connecting to every worker it names first, so
     /// a snapshot that cannot be reached is refused whole.
     pub async fn from_snapshot(snapshot: &pb::Snapshot) -> anyhow::Result<Self> {
-        let mut apps = HashMap::new();
+        let mut apps: HashMap<String, AppReleases> = HashMap::new();
 
         for app in &snapshot.apps {
-            let pools = AppPools::connect(
-                &app.app,
-                &app.release,
-                &paths(&app.sockets),
-                &groups_of(app),
-                &mounts_of(app),
-            )
-            .await?;
-            apps.insert(app.app.clone(), Arc::new(pools));
+            let pools = Arc::new(
+                AppPools::connect(
+                    &app.app,
+                    &app.release,
+                    &paths(&app.sockets),
+                    &groups_of(app),
+                    &mounts_of(app),
+                )
+                .await?,
+            );
+            let releases = apps.entry(app.app.clone()).or_insert_with(|| AppReleases {
+                serving: Arc::clone(&pools),
+                releases: HashMap::new(),
+            });
+
+            if app.serving {
+                releases.serving = Arc::clone(&pools);
+            }
+
+            releases.releases.insert(app.release.clone(), pools);
         }
 
         // The default workers are one application's, found by its sockets
@@ -299,7 +534,7 @@ impl Routing {
             .apps
             .iter()
             .find(|app| app.sockets == snapshot.worker_sockets)
-            .and_then(|app| apps.get(&app.app));
+            .and_then(|app| apps.get(&app.app)?.releases.get(&app.release));
 
         let default = match default_app {
             Some(pools) => Arc::clone(pools),
@@ -387,11 +622,20 @@ impl Routing {
                         anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
                     })?
                     .map(Arc::new);
+                let traffic = route
+                    .traffic
+                    .as_ref()
+                    .map(Policy::from_message)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("route {} {}: traffic: {error}", route.host, route.path)
+                    })?;
                 routing.routes[index].push(Route {
                     path: route.path.clone(),
                     app: route.app.clone(),
                     static_route,
                     fallback_app: route.fallback_app.clone(),
+                    traffic,
                 });
             }
         }
@@ -439,7 +683,11 @@ impl Routing {
     /// Every application's pools once: the named applications, and the
     /// default pools when they are nobody's.
     pub fn app_pools(&self) -> Vec<Arc<AppPools>> {
-        let mut pools: Vec<Arc<AppPools>> = self.apps.values().cloned().collect();
+        let mut pools: Vec<Arc<AppPools>> = self
+            .apps
+            .values()
+            .flat_map(|releases| releases.releases.values().cloned())
+            .collect();
         pools.sort_by(|left, right| left.labels().cmp(&right.labels()));
 
         if !pools.iter().any(|seen| Arc::ptr_eq(seen, &self.default)) {
@@ -450,12 +698,21 @@ impl Routing {
     }
 
     /// Where a request goes, from the host the client asked for, the
-    /// path, the listener it arrived on and whether that was over TLS.
-    pub fn select(&self, name: Option<&str>, path: &str, listener: &str, tls: bool) -> Decision {
+    /// path, the listener it arrived on, whether that was over TLS, and
+    /// what the request brings to the release choice.
+    pub fn select(
+        &self,
+        name: Option<&str>,
+        path: &str,
+        listener: &str,
+        tls: bool,
+        client: &Client<'_>,
+    ) -> Decision {
         if self.hosts.is_empty() {
             return Decision::Serve {
                 selection: self.default.select(path),
                 server_name: None,
+                cookies: Vec::new(),
             };
         }
 
@@ -475,34 +732,38 @@ impl Routing {
             return Decision::NoRoute;
         };
 
-        let select_app = |app: &str| {
-            self.apps
-                .get(app)
-                .map(|pools| pools.select(path))
-                .unwrap_or_else(|| Selection {
-                    pool: Arc::new(LinkPool::empty()),
-                    app: app.to_owned(),
-                    release: String::new(),
-                    group: DEFAULT_GROUP.to_owned(),
-                    mount: String::new(),
-                    script_name: String::new(),
-                })
-        };
+        let mut cookies = Vec::new();
 
         if let Some(static_route) = &route.static_route {
+            let fallback = (!route.fallback_app.is_empty()).then(|| {
+                self.selection_for(
+                    &route.fallback_app,
+                    route.traffic.as_ref(),
+                    path,
+                    client,
+                    &mut cookies,
+                )
+            });
             return Decision::Static {
                 route: Arc::clone(static_route),
                 prefix: route.path.clone(),
-                fallback: (!route.fallback_app.is_empty()).then(|| select_app(&route.fallback_app)),
+                fallback,
                 server_name: Some(if host.server_name.is_empty() {
                     name.map(normalise).unwrap_or_default()
                 } else {
                     host.server_name.clone()
                 }),
+                cookies,
             };
         }
 
-        let selection = select_app(&route.app);
+        let selection = self.selection_for(
+            &route.app,
+            route.traffic.as_ref(),
+            path,
+            client,
+            &mut cookies,
+        );
 
         // SERVER_NAME is the name the request matched with, or the
         // canonical name when the host says so (section 4.3).
@@ -516,6 +777,32 @@ impl Routing {
         Decision::Serve {
             selection,
             server_name,
+            cookies,
+        }
+    }
+
+    /// The workers of an application for a request: the release the
+    /// route's policy and the request choose, and within it the group and
+    /// mount for the path. An application the snapshot does not name has
+    /// no workers, and the request fails as unavailable.
+    fn selection_for(
+        &self,
+        app: &str,
+        policy: Option<&Policy>,
+        path: &str,
+        client: &Client<'_>,
+        cookies: &mut Vec<String>,
+    ) -> Selection {
+        match self.apps.get(app) {
+            Some(releases) => choose(releases, policy, client, cookies).select(path),
+            None => Selection {
+                pool: Arc::new(LinkPool::empty()),
+                app: app.to_owned(),
+                release: String::new(),
+                group: DEFAULT_GROUP.to_owned(),
+                mount: String::new(),
+                script_name: String::new(),
+            },
         }
     }
 
@@ -681,6 +968,29 @@ mod tests {
             .unwrap()
     }
 
+    /// A request with these headers, from a fixed client.
+    fn client<'a>(headers: &'a HeaderMap, ids: &'a crate::errors::RequestIds) -> Client<'a> {
+        Client {
+            headers,
+            peer: "10.0.0.1".parse().unwrap(),
+            secure: false,
+            ids,
+        }
+    }
+
+    /// Select with no headers of note.
+    fn select(
+        routing: &Routing,
+        name: Option<&str>,
+        path: &str,
+        listener: &str,
+        tls: bool,
+    ) -> Decision {
+        let headers = HeaderMap::new();
+        let ids = crate::errors::RequestIds::new();
+        routing.select(name, path, listener, tls, &client(&headers, &ids))
+    }
+
     fn serves(decision: Decision) -> Option<String> {
         match decision {
             Decision::Serve { server_name, .. } => server_name,
@@ -697,32 +1007,56 @@ mod tests {
         let plain = "127.0.0.1:8080";
 
         assert_eq!(
-            serves(routing.select(Some("shop.example.com:8443"), "/", plain, true)),
+            serves(select(
+                &routing,
+                Some("shop.example.com:8443"),
+                "/",
+                plain,
+                true
+            )),
             Some("shop.example.com".to_owned()),
             "exact, case and port aside, with the canonical name"
         );
         assert_eq!(
-            serves(routing.select(Some("eu.shop.example.com"), "/", plain, true)),
+            serves(select(
+                &routing,
+                Some("eu.shop.example.com"),
+                "/",
+                plain,
+                true
+            )),
             Some("shop.example.com".to_owned()),
             "the longest wildcard suffix wins"
         );
         assert_eq!(
-            serves(routing.select(Some("Blog.example.com"), "/", plain, false)),
+            serves(select(
+                &routing,
+                Some("Blog.example.com"),
+                "/",
+                plain,
+                false
+            )),
             Some("blog.example.com".to_owned()),
             "a wildcard match gives the name asked for"
         );
         assert_eq!(
-            serves(routing.select(Some("a.b.example.com"), "/", plain, false)),
+            serves(select(&routing, Some("a.b.example.com"), "/", plain, false)),
             Some("a.b.example.com".to_owned()),
             "two labels do not match a single-label wildcard, so the default host answers"
         );
         assert_eq!(
-            serves(routing.select(Some("a.b.example.com"), "/", "127.0.0.1:8443", true)),
+            serves(select(
+                &routing,
+                Some("a.b.example.com"),
+                "/",
+                "127.0.0.1:8443",
+                true
+            )),
             Some("421".to_owned()),
             "the default host answers only on its listener"
         );
         assert_eq!(
-            serves(routing.select(None, "/", plain, false)),
+            serves(select(&routing, None, "/", plain, false)),
             None,
             "no host header falls to the default host"
         );
@@ -734,11 +1068,23 @@ mod tests {
         let plain = "127.0.0.1:8080";
 
         assert_eq!(
-            serves(routing.select(Some("shop.example.com"), "/", plain, false)),
+            serves(select(
+                &routing,
+                Some("shop.example.com"),
+                "/",
+                plain,
+                false
+            )),
             Some("redirect".to_owned())
         );
 
-        match routing.select(Some("shop.example.com"), "/api/users", plain, true) {
+        match select(
+            &routing,
+            Some("shop.example.com"),
+            "/api/users",
+            plain,
+            true,
+        ) {
             Decision::Serve { selection, .. } => {
                 assert!(selection.pool.is_empty(), "the api app has no workers");
             }
@@ -752,12 +1098,237 @@ mod tests {
         assert!(prefix_matches("/", "/anything"));
     }
 
+    /// A snapshot whose shop application has two releases, r1 serving
+    /// and r2 with a share of the root route, sticky and keyed by the
+    /// anonymous cookie.
+    fn split_snapshot(sticky: bool, hash_key: &str) -> pb::Snapshot {
+        let mut snapshot = snapshot();
+        snapshot.apps = vec![
+            pb::AppWorkers {
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                serving: true,
+                ..Default::default()
+            },
+            pb::AppWorkers {
+                app: "shop".to_owned(),
+                release: "r2".to_owned(),
+                ..Default::default()
+            },
+        ];
+        snapshot.routes[0].traffic = Some(pb::Traffic {
+            shares: vec![pb::Share {
+                release: "r2".to_owned(),
+                weight: 2500,
+            }],
+            hash_key: hash_key.to_owned(),
+            salt: "shop /".to_owned(),
+            sticky,
+            sticky_grace_s: 600,
+        });
+        snapshot
+    }
+
+    fn release_of(decision: Decision) -> (String, Vec<String>) {
+        match decision {
+            Decision::Serve {
+                selection, cookies, ..
+            } => (selection.release, cookies),
+            _ => panic!("not served"),
+        }
+    }
+
+    #[test]
+    fn buckets_are_laid_out_from_the_top_and_are_stable() {
+        let policy = Policy::from_message(&pb::Traffic {
+            shares: vec![
+                pb::Share {
+                    release: "r3".to_owned(),
+                    weight: 1000,
+                },
+                pb::Share {
+                    release: "r2".to_owned(),
+                    weight: 2500,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(policy.share_for(9999), Some("r3"));
+        assert_eq!(policy.share_for(9000), Some("r3"));
+        assert_eq!(policy.share_for(8999), Some("r2"));
+        assert_eq!(policy.share_for(6500), Some("r2"));
+        assert_eq!(
+            policy.share_for(6499),
+            None,
+            "the rest is the serving release's"
+        );
+        assert_eq!(
+            Policy::bucket("shop /", "user-42"),
+            Policy::bucket("shop /", "user-42"),
+            "the same key lands in the same bucket"
+        );
+        assert_ne!(
+            Policy::bucket("shop /", "user-42"),
+            Policy::bucket("shop /api", "user-42"),
+            "the salt moves it"
+        );
+        assert!(
+            Policy::from_message(&pb::Traffic {
+                shares: vec![pb::Share {
+                    release: "r2".to_owned(),
+                    weight: 10_001,
+                }],
+                ..Default::default()
+            })
+            .is_err(),
+            "shares beyond the whole are refused"
+        );
+        assert!(
+            Policy::from_message(&pb::Traffic {
+                hash_key: "header:".to_owned(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_policy_spreads_clients_and_issues_an_id_cookie() {
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&split_snapshot(false, "")))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for n in 0..200 {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                format!("{ID_COOKIE}=client-{n}").parse().unwrap(),
+            );
+            let (release, cookies) = release_of(routing.select(
+                Some("shop.example.com"),
+                "/",
+                "127.0.0.1:8080",
+                true,
+                &client(&headers, &ids),
+            ));
+            assert!(cookies.is_empty(), "a client with an id gets no cookie");
+            seen.insert(release);
+        }
+
+        assert_eq!(seen.len(), 2, "both releases take clients: {seen:?}");
+
+        let headers = HeaderMap::new();
+        let (_, cookies) = release_of(routing.select(
+            Some("shop.example.com"),
+            "/",
+            "127.0.0.1:8080",
+            true,
+            &client(&headers, &ids),
+        ));
+        assert_eq!(cookies.len(), 1);
+        assert!(
+            cookies[0].starts_with(&format!("{ID_COOKIE}=")) && cookies[0].contains("HttpOnly"),
+            "{cookies:?}"
+        );
+    }
+
+    #[test]
+    fn preview_and_sticky_cookies_pin_the_release() {
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&split_snapshot(
+                true,
+                "header:x-user",
+            )))
+            .unwrap();
+        let ids = crate::errors::RequestIds::new();
+        let plain = "127.0.0.1:8080";
+
+        let mut headers = HeaderMap::new();
+        headers.insert(PREVIEW_HEADER, "r2".parse().unwrap());
+        let (release, cookies) = release_of(routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+        ));
+        assert_eq!(
+            (release.as_str(), cookies.len()),
+            ("r2", 0),
+            "the preview header pins"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("{PREVIEW_COOKIE}=r9").parse().unwrap(),
+        );
+        headers.insert(PREVIEW_HEADER, "r9".parse().unwrap());
+        let (release, _) = release_of(routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+        ));
+        assert_ne!(release, "r9", "an unknown release is ignored");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("a=b; {STICKY_COOKIE}=r2; c=d").parse().unwrap(),
+        );
+        let (release, cookies) = release_of(routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+        ));
+        assert_eq!(
+            (release.as_str(), cookies.len()),
+            ("r2", 0),
+            "a sticky cookie holds"
+        );
+
+        // Keyed by a header: the same user gets the same release and a
+        // sticky cookie naming it; no id cookie is issued.
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user", "alice".parse().unwrap());
+        let (first, cookies) = release_of(routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+        ));
+        assert_eq!(cookies.len(), 1, "{cookies:?}");
+        assert!(
+            cookies[0].starts_with(&format!("{STICKY_COOKIE}={first};")),
+            "{cookies:?}"
+        );
+        let (again, _) = release_of(routing.select(
+            Some("shop.example.com"),
+            "/",
+            plain,
+            true,
+            &client(&headers, &ids),
+        ));
+        assert_eq!(first, again);
+    }
+
     #[test]
     fn without_hosts_everything_is_served() {
         let routing = Routing::single(AppPools::single(LinkPool::empty()));
         assert!(!routing.has_hosts());
         assert!(matches!(
-            routing.select(Some("whatever"), "/", "127.0.0.1:1", false),
+            select(&routing, Some("whatever"), "/", "127.0.0.1:1", false),
             Decision::Serve { .. }
         ));
     }

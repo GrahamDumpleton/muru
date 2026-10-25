@@ -268,6 +268,12 @@ pub struct HostSpec {
     pub python: PathBuf,
     /// The application as module:callable.
     pub app: String,
+    /// The application's name and the release's id, which the runtime
+    /// library reports through `muru.context()` (section 6.9); none in
+    /// development, where they are `default` and `dev`.
+    pub name: Option<String>,
+    /// The release's id, with `name`.
+    pub release: Option<String>,
     /// The interface the entrypoint speaks.
     pub interface: muru_config::Interface,
     /// Whether the entrypoint is a factory, and when it is called.
@@ -452,6 +458,16 @@ impl HostProcess {
             .arg(&spec.app)
             .arg("--socket-dir")
             .arg(&run_dir)
+            .args(
+                spec.name
+                    .iter()
+                    .flat_map(|name| ["--name".to_owned(), name.clone()]),
+            )
+            .args(
+                spec.release
+                    .iter()
+                    .flat_map(|release| ["--release".to_owned(), release.clone()]),
+            )
             .arg("--processes")
             .arg(spec.processes.to_string())
             .arg("--threads")
