@@ -13,7 +13,8 @@ criteria. The full table, with scope and exit criteria, is in
 | 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 2 complete, phase 3 next. Phase 0 landed the
+Current position: phase 3 in progress, its first half released as
+0.1.0a5. Phase 0 landed the
 framed worker link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a
 fixed pool of long-lived application threads and the benchmark harness.
 Phase 1, released as 0.1.0a2, is development mode for one WSGI application:
