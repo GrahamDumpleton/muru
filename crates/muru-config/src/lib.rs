@@ -895,6 +895,10 @@ pub struct Limits {
     /// HTTP/2 settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http2: Option<Http2Limits>,
+    /// What stored uploads may hold at once across every application
+    /// (section 4.11); no limit without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spool_quota: Option<String>,
 }
 
 /// The `[limits.http2]` table (section 4.18).
@@ -1111,7 +1115,136 @@ pub struct Route {
     /// it serves the route (section 4.16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    /// The largest request body, for example 1GB, replacing the daemon's
+    /// `[limits]` value for the route (section 4.6). On an upload route
+    /// it bounds the body as received, files included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<String>,
+    /// Section 4.11: `multipart` or `raw` makes the edge receive and store
+    /// uploads before the application sees the request; off without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<String>,
+    /// The largest uploaded file, for example 512MB; no limit without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_size: Option<String>,
+    /// The most files in one request (100 by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<u32>,
+    /// The digests computed while receiving: sha256 (the default),
+    /// sha384, sha512 or sha1; an empty list for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Vec<String>>,
+    /// Ask the application with the request's headers alone first, and
+    /// read the body only when it answers 2xx (false by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precheck: Option<bool>,
+    /// What the application's stored uploads may hold at once when a
+    /// request on the route arrives (10GB by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spool_quota: Option<String>,
 }
+
+/// The upload settings of a route with their defaults in place (section
+/// 4.11), as `check_upload` resolves them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadSettings {
+    /// `multipart` or `raw`.
+    pub mode: String,
+    /// Bytes per file; no limit when none.
+    pub max_file_size: Option<u64>,
+    /// Files per request.
+    pub max_files: u32,
+    /// Digest algorithms, in the order given.
+    pub hash: Vec<String>,
+    /// Ask the application first.
+    pub precheck: bool,
+    /// Bytes the application's stored uploads may hold at once.
+    pub spool_quota: u64,
+}
+
+/// The digest algorithms an upload route may ask for.
+pub const UPLOAD_HASHES: [&str; 4] = ["sha256", "sha384", "sha512", "sha1"];
+
+/// Files per upload request unless the route says otherwise.
+pub const DEFAULT_MAX_FILES: u32 = 100;
+
+/// What an application's stored uploads may hold unless the route says
+/// otherwise.
+pub const DEFAULT_SPOOL_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Check a route's body limit and upload keys, and resolve the upload
+/// settings with their defaults: none when the route takes no uploads.
+/// The upload keys other than `upload` need it, and `max_files` stays
+/// within what one request can pass to a worker.
+pub fn check_upload(route: &Route) -> Result<Option<UploadSettings>, String> {
+    if let Some(size) = &route.max_body_size {
+        parse_size(size).map_err(|error| format!("max_body_size: {error}"))?;
+    }
+
+    let Some(mode) = &route.upload else {
+        let stray = [
+            ("max_file_size", route.max_file_size.is_some()),
+            ("max_files", route.max_files.is_some()),
+            ("hash", route.hash.is_some()),
+            ("precheck", route.precheck.is_some()),
+            ("spool_quota", route.spool_quota.is_some()),
+        ];
+
+        return match stray.iter().find(|(_, set)| *set) {
+            Some((key, _)) => Err(format!("{key} needs upload = 'multipart' or 'raw'")),
+            None => Ok(None),
+        };
+    };
+
+    if mode != "multipart" && mode != "raw" {
+        return Err(format!("upload must be multipart or raw, not {mode:?}"));
+    }
+
+    let max_file_size = route
+        .max_file_size
+        .as_deref()
+        .map(parse_size)
+        .transpose()
+        .map_err(|error| format!("max_file_size: {error}"))?;
+    let max_files = route.max_files.unwrap_or(DEFAULT_MAX_FILES);
+
+    if max_files == 0 || max_files > MAX_UPLOAD_FILES {
+        return Err(format!(
+            "max_files must be from 1 to {MAX_UPLOAD_FILES}, not {max_files}"
+        ));
+    }
+
+    let hash = route
+        .hash
+        .clone()
+        .unwrap_or_else(|| vec!["sha256".to_owned()]);
+
+    for name in &hash {
+        if !UPLOAD_HASHES.contains(&name.as_str()) {
+            return Err(format!(
+                "hash: {name:?} is not one of {}",
+                UPLOAD_HASHES.join(", ")
+            ));
+        }
+    }
+
+    let spool_quota = match &route.spool_quota {
+        Some(size) => parse_size(size).map_err(|error| format!("spool_quota: {error}"))?,
+        None => DEFAULT_SPOOL_QUOTA,
+    };
+
+    Ok(Some(UploadSettings {
+        mode: mode.clone(),
+        max_file_size,
+        max_files,
+        hash,
+        precheck: route.precheck.unwrap_or(false),
+        spool_quota,
+    }))
+}
+
+/// The most files one request may carry to a worker.
+pub const MAX_UPLOAD_FILES: u32 = 500;
 
 /// A route's authentication sub-request (section 4.16): the edge sends a
 /// bodiless GET to an application path and serves the route only when
@@ -2228,6 +2361,52 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 mod tests {
     use super::*;
 
+    fn upload_route(keys: &str) -> Route {
+        toml::from_str(&format!("host = 'shop'\napp = 'shop'\n{keys}")).unwrap()
+    }
+
+    #[test]
+    fn upload_settings_resolve_with_their_defaults() {
+        let settings = check_upload(&upload_route("upload = 'raw'"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.mode, "raw");
+        assert_eq!(settings.max_file_size, None);
+        assert_eq!(settings.max_files, DEFAULT_MAX_FILES);
+        assert_eq!(settings.hash, vec!["sha256".to_owned()]);
+        assert!(!settings.precheck);
+        assert_eq!(settings.spool_quota, DEFAULT_SPOOL_QUOTA);
+
+        let settings = check_upload(&upload_route(
+            "upload = 'multipart'\nmax_file_size = '5MB'\nhash = ['sha512', 'sha1']\nspool_quota = '1GB'",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(settings.max_file_size, Some(5 * 1024 * 1024));
+        assert_eq!(settings.hash, vec!["sha512".to_owned(), "sha1".to_owned()]);
+        assert_eq!(settings.spool_quota, 1024 * 1024 * 1024);
+        assert_eq!(check_upload(&upload_route("")).unwrap(), None);
+    }
+
+    #[test]
+    fn upload_keys_are_checked() {
+        for (keys, expected) in [
+            ("upload = 'stream'", "upload must be multipart or raw"),
+            ("precheck = true", "precheck needs upload"),
+            ("upload = 'raw'\nmax_files = 0", "max_files must be from 1"),
+            (
+                "upload = 'raw'\nmax_files = 501",
+                "max_files must be from 1",
+            ),
+            ("upload = 'raw'\nhash = ['md5']", "hash: \"md5\""),
+            ("upload = 'raw'\nmax_file_size = 'big'", "max_file_size:"),
+            ("max_body_size = 'lots'", "max_body_size:"),
+        ] {
+            let error = check_upload(&upload_route(keys)).unwrap_err();
+            assert!(error.contains(expected), "{keys}: {error}");
+        }
+    }
+
     #[test]
     fn words_round_trip() {
         for word in Preload::ALL {
@@ -2332,8 +2511,17 @@ mod tests {
                 sticky: Some(true),
                 ..Traffic::default()
             }),
+            max_body_size: Some("1GB".to_owned()),
+            upload: Some("multipart".to_owned()),
+            max_file_size: None,
+            max_files: Some(5),
+            hash: Some(Vec::new()),
+            precheck: Some(true),
+            spool_quota: None,
         });
         let text = document.to_toml().unwrap();
+        assert!(text.contains("upload = \"multipart\""), "{text}");
+        assert!(text.contains("hash = []"), "{text}");
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
         assert!(text.contains("[app.shop.release.r1.scaling]"), "{text}");
         assert!(text.contains("mode = \"spare\""), "{text}");

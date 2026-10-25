@@ -41,6 +41,8 @@ it adds.
 | --- | --- |
 | `muru.request_id` | The request id, a 26-character ULID. The same value is in the `X-Request-ID` response header, the access log line and the error page |
 | `muru.max_body_size` | The body limit in force, in bytes: 100 MB in development, 10 MB with `--allow-public`, or what `--max-body-size` set |
+| `muru.uploads` | Present only on an [upload route](../howto/uploads.md) whose request brought files: their descriptions, which `muru.uploads.files(environ)` turns into upload objects |
+| `muru.precheck` | `True` on an upload route's precheck, the request's headers sent before its body; absent otherwise |
 | `muru.proxy_addr` | Present only when a trusted proxy forwarded the request (see [behind a proxy](../howto/behind-a-proxy.md)): the address of the proxy that connected, while `REMOTE_ADDR` is the client it forwarded |
 | `muru.internal` | `True` on a request that arrived by internal redirect, absent otherwise; `muru.is_internal(environ)` reads it |
 | `muru.error_reason` | Present only when the edge asked the application for an [error page](../howto/error-pages.md): the error's reason, for example `app_error`, while `REDIRECT_STATUS` is its status |

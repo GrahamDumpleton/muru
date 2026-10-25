@@ -2353,6 +2353,16 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
             target.push_str(&format!(" [auth by {}]", route.auth));
         }
 
+        // Sections 4.6 and 4.11: the route's body limit and uploads.
+
+        if !route.max_body_size.is_empty() {
+            target.push_str(&format!(" [max body {}]", route.max_body_size));
+        }
+
+        if !route.upload.is_empty() {
+            target.push_str(&format!(" [uploads {}]", route.upload));
+        }
+
         println!("{:<16} {:<24} {target}", route.host, route.path);
     }
 
@@ -3194,6 +3204,10 @@ fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Li
 
     if let Some(count) = table.max_requests_per_connection {
         limits.max_requests_per_connection = count;
+    }
+
+    if let Some(size) = &table.spool_quota {
+        limits.spool_quota = muru_config::parse_size(size).map_err(anyhow::Error::msg)?;
     }
 
     if let Some(count) = table

@@ -13,7 +13,7 @@
 //! the request.
 
 use std::io;
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,8 +26,10 @@ use prost::Message;
 use pyo3::prelude::*;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
+
+use muru_proto::descriptors::FdReader;
 
 use crate::asgi;
 use crate::pool::Shared;
@@ -51,7 +53,7 @@ const COALESCE_MAX_DELAY: Duration = Duration::from_millis(10);
 /// Payloads up to this size are copied into one buffer with their header.
 const SMALL_PAYLOAD: usize = 16 * 1024;
 
-type Reader = BufReader<OwnedReadHalf>;
+type Reader = BufReader<FdReader>;
 type Writer = OwnedWriteHalf;
 
 /// Python callables run at points in the worker's life (section 6.3).
@@ -464,7 +466,7 @@ impl Signals {
 
 async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
     let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::with_capacity(32 * 1024, read_half);
+    let mut reader = BufReader::with_capacity(32 * 1024, FdReader::new(read_half));
     let mut writer = write_half;
 
     match frame::read(&mut reader).await {
@@ -535,7 +537,28 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
             return;
         };
 
-        match handle_request(&mut reader, &mut writer, head, request_end, &shared).await {
+        // Section 5.7: the request's stored uploads arrived with its first
+        // bytes, one descriptor for each reference, in order.
+
+        let mut uploads = Vec::with_capacity(head.uploads.len());
+
+        for _ in 0..head.uploads.len() {
+            match reader.get_mut().take_fd() {
+                Some(fd) => uploads.push(fd),
+                None => return,
+            }
+        }
+
+        match handle_request(
+            &mut reader,
+            &mut writer,
+            head,
+            uploads,
+            request_end,
+            &shared,
+        )
+        .await
+        {
             Ok(next) => early = next,
             Err(_) => return,
         }
@@ -588,10 +611,13 @@ fn same_major(version: &str) -> bool {
     version.split('.').next() == pb::PROTOCOL_VERSION.split('.').next()
 }
 
+/// Serve one request. `uploads` are its stored files' descriptors, held
+/// until the request ends (section 4.11).
 async fn handle_request(
     reader: &mut Reader,
     writer: &mut Writer,
     head: pb::RequestHead,
+    uploads: Vec<OwnedFd>,
     request_end: bool,
     shared: &Arc<Shared>,
 ) -> io::Result<Option<frame::Frame>> {
@@ -606,7 +632,17 @@ async fn handle_request(
     };
 
     if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner) {
-        return handle_asgi_request(reader, writer, head, request_end, shared, asgi, runner).await;
+        return handle_asgi_request(
+            reader,
+            writer,
+            head,
+            uploads,
+            request_end,
+            shared,
+            asgi,
+            runner,
+        )
+        .await;
     }
 
     let app = mount.app;
@@ -619,17 +655,20 @@ async fn handle_request(
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
         worker_shared.request_on_this_thread(request_id);
+        let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
         wsgi::run(
             py,
             &worker_shared,
             request_id,
             &app,
             head,
+            &fds,
             body_rx,
             out_tx,
             worker_cancelled,
             interrupt,
         );
+        drop(uploads);
         worker_shared.request_finished(request_id);
     }));
 
@@ -722,10 +761,12 @@ async fn handle_request(
 /// `http.request` messages for the application's `receive()`, ABORT or the
 /// end of the response becomes `http.disconnect`, and the output goes
 /// through the same coalescing writer as a WSGI response.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 async fn handle_asgi_request(
     reader: &mut Reader,
     writer: &mut Writer,
     head: pb::RequestHead,
+    uploads: Vec<OwnedFd>,
     request_end: bool,
     shared: &Arc<Shared>,
     asgi: &asgi::Asgi,
@@ -735,11 +776,14 @@ async fn handle_asgi_request(
     let done = tokio::sync::Notify::new();
 
     // The task starts on the loop now; the channel is how the two sides
-    // of this function reach it.
+    // of this function reach it. The uploads stay open until this
+    // function returns, when the request has ended.
 
     let (request_id, _interrupt) = shared.request_started(&head);
+    let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
+    let _uploads = uploads;
 
-    let channel = match asgi::start(shared, asgi, &runner, &head, out_tx, request_id) {
+    let channel = match asgi::start(shared, asgi, &runner, &head, &fds, out_tx, request_id) {
         Ok(channel) => channel,
         Err(error) => {
             shared.request_finished(request_id);

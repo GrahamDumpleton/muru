@@ -19,10 +19,12 @@ precisely than the status, appears in the access log line as
 | Status | Reason | When |
 | --- | --- | --- |
 | 400 | `malformed` | The request body could not be read: a broken chunked encoding, or the connection failed mid-body |
+| 400 | `upload_malformed` | An [upload route](../howto/uploads.md) received a multipart form it could not parse |
 | 401, 403, 3xx | `auth_denied` | The route's [authentication handler](../howto/auth-subrequests.md) refused or redirected the request; the response is the handler's own, unless a page for `401:auth_denied` or `403:auth_denied` is configured |
 | 404 | `internal_only` | The route or mount is reachable only through an internal redirect (see the [internal redirects guide](../howto/internal-redirects.md)) |
 | 408 | `client_timeout` | The client paused for longer than the body idle timeout while sending a body |
-| 413 | `body_too_large` | The declared or actual body is over the limit in force; the page names the limit and the setting. Declared lengths are refused before the body is read |
+| 413 | `body_too_large` | The declared or actual body is over the limit in force; the page names the limit and the setting. Declared lengths are refused before the body is read. On an upload route, also a form whose fields other than files hold more than 10MB |
+| 413 | `upload_too_large`, `too_many_files` | A file of an [upload](../howto/uploads.md) is over the route's `max_file_size`, or the form has more files than its `max_files` |
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
 | 500 | `redirect_loop` | The application redirected internally more than 5 times for one request |
 | 502 | `upstream_failed` | No address of the [HTTP upstream](../howto/upstreams.md) could be reached, or the one that took the request did not answer it, or a WebSocket upgrade was asked of an HTTP/2 upstream |
@@ -33,6 +35,7 @@ precisely than the status, appears in the access log line as
 | 503 | `queue_full` | Every worker thread was busy for longer than the queue timeout, with `Retry-After: 1` |
 | 504 | `deadline` | The application or upstream did not produce a response head within the request deadline |
 | 504 | `soft_timeout` | The request ran past the soft timeout and was interrupted in the worker before it produced a response head; development mode includes the traceback of where it was (see the [timeouts guide](../howto/timeouts.md)) |
+| 507 | `upload_spool_full` | Storing an [upload](../howto/uploads.md) would take its application past the route's `spool_quota`, or every application past the daemon's, or the spool's disk is full |
 | any | `error_override` | The application's own response had a status that `error_override` lists, and the edge replaced it with the error page; the status is the application's |
 
 The HTTP parser answers a few things itself, before a request exists: a

@@ -65,6 +65,20 @@ by [internal redirect](../howto/internal-redirects.md): `True` when a
 WSGI environ carries `muru.internal`, or an ASGI scope's
 `extensions["muru"]` carries `internal`. Outside Muru it is `False`.
 
+## `muru.uploads`
+
+The files the edge stored for a request on an
+[upload route](../howto/uploads.md). `uploads.files(environ_or_scope)`
+lists them in the order they arrived, `uploads.get(environ_or_scope,
+ref)` finds the one a form's `FIELD.ref` value names, and
+`uploads.is_precheck(environ_or_scope)` says whether the request is a
+precheck, sent with its headers alone. Each `Upload` has `field`,
+`name`, `content_type`, `size`, `ref`, `sha256` and `digests`, `open()`
+for a readable, seekable file, `save(dest, overwrite=False)` to give the
+file a permanent name, and `path` for libraries that need one. Outside
+Muru `files()` is empty, `get()` is `None` and `is_precheck()` is
+`False`.
+
 ## `muru.RequestTimeout`
 
 The exception the soft timeout raises in the thread of a request that

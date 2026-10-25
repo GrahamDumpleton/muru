@@ -505,6 +505,8 @@ message Route {
   string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route (section 4.16)
   string upstream = 12;             // the upstream that takes the requests (section 4.13), for an upstream route
   string fallback_upstream = 13;    // the upstream behind a static route, when there is one
+  string upload = 14;               // multipart or raw when the edge receives uploads (section 4.11), with ", precheck"
+  string max_body_size = 15;        // the route's own body limit, as configured (section 4.6)
 }
 
 message ListUpstreamsRequest {}

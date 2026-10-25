@@ -317,7 +317,7 @@ redirecting response's Content-Disposition, Cache-Control, Expires,
 Set-Cookie, Vary and non-empty Content-Type carry over; a chain stops
 after 5 hops with 500 redirect_loop under the client's deadline, with
 one access log line naming every hop; and a client's X-Muru-* request
-headers are stripped at the edge. Still to come: upload offloading.
+headers are stripped at the edge.
 
 File hints (sections 4.9, 5.7 and 6.5) are in, in both forms. By
 descriptor: a `wsgi.file_wrapper` object returned as the iterable with
@@ -333,6 +333,23 @@ outside is 500 sendfile_refused and logged, a missing one 404
 sendfile_missing. Trusted upstreams and managed servers give path hints
 too, and `muructl deploy --sendfile-root` and `--sendfile-header`,
 `apply` and `config export` know the keys.
+
+Upload offloading (section 4.11) is in: a route with `upload =
+'multipart'` or `'raw'` makes the edge receive the body first and store
+each file in the spool as an unnamed file (a named one where the file
+system has no O_TMPFILE, macOS among them), hashing it as it arrives,
+and pass the files to the worker by descriptor on the REQUEST frame. A
+multipart form reaches the application with each file field replaced by
+`FIELD.name`, `content_type`, `size`, a digest field per algorithm and
+`ref`, a raw upload with an empty body, and `muru.uploads.files()` and
+`get()` give upload objects whose `open()`, `save()` (a link where it
+can, a copy otherwise) and `path` reach the files. `max_body_size` on a
+route, `max_file_size`, `max_files`, `hash` and a `spool_quota` per
+application and for the node answer 413 `upload_too_large`,
+`too_many_files` and 507 `upload_spool_full` at the edge, and `precheck
+= true` asks the application with the headers alone before the body is
+read. Recipes for Flask, Starlette and Django turn the files into each
+framework's own upload objects, and the test fixtures run all three.
 
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as

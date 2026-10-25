@@ -47,6 +47,8 @@ pub struct EdgeSpec {
     pub access_log: Option<PathBuf>,
     /// The limits the edge enforces.
     pub limits: muru_edge::Limits,
+    /// Where upload routes store files (section 4.11).
+    pub spool: PathBuf,
     /// Whom the edge runs as, when the daemon is root (ADR 0026): the
     /// service user, never root.
     pub identity: Option<crate::host::Identity>,
@@ -113,6 +115,7 @@ impl EdgeProcess {
         log: PathBuf,
         access_log: Option<PathBuf>,
         limits: muru_edge::Limits,
+        spool: PathBuf,
         identity: Option<crate::host::Identity>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::host::alive(pid), "the edge process {pid} is gone");
@@ -154,6 +157,7 @@ impl EdgeProcess {
                 log,
                 access_log,
                 limits,
+                spool,
                 identity,
             },
             process: Process::Adopted(pid),
@@ -503,7 +507,11 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg("--max-requests-per-connection")
         .arg(spec.limits.max_requests_per_connection.to_string())
         .arg("--http2-max-concurrent-streams")
-        .arg(spec.limits.http2_max_concurrent_streams.to_string());
+        .arg(spec.limits.http2_max_concurrent_streams.to_string())
+        .arg("--spool")
+        .arg(&spec.spool)
+        .arg("--spool-quota")
+        .arg(spec.limits.spool_quota.to_string());
     for (name, duration) in [
         ("queue", spec.limits.queue_timeout),
         ("deadline", spec.limits.request_deadline),

@@ -301,6 +301,8 @@ pub(crate) struct Return {
     client_stalled: AtomicBool,
     /// Set once the response direction has ended, intact or not.
     ended: AtomicBool,
+    /// The request's stored uploads (section 4.11), dropped with it.
+    uploads: Mutex<Option<crate::uploads::Received>>,
 }
 
 struct ReturnState {
@@ -328,7 +330,13 @@ impl Return {
             proceeded: AtomicBool::new(false),
             client_stalled: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            uploads: Mutex::new(None),
         })
+    }
+
+    /// Keep the request's stored uploads until the request ends.
+    fn hold(&self, uploads: crate::uploads::Received) {
+        *self.uploads.lock().expect("uploads poisoned") = Some(uploads);
     }
 
     /// Tell the body pump, if it is still running, to send ABORT and stop.
@@ -485,6 +493,11 @@ pub struct Context<'a> {
     /// errors are never replaced, and it is logged as a hop of the
     /// request it serves.
     pub handler: Option<Duration>,
+    /// How the route's uploads are received (section 4.11); none for a
+    /// route without uploads and for any request but a client's own.
+    pub upload: Option<Arc<crate::uploads::Policy>>,
+    /// Where uploads are stored.
+    pub spool: Option<Arc<crate::uploads::Spool>>,
 }
 
 impl<'a> Context<'a> {
@@ -525,6 +538,8 @@ impl<'a> Context<'a> {
             hops: self.hops.clone(),
             errors: errors::Chain::default(),
             handler: Some(budget),
+            upload: None,
+            spool: self.spool.clone(),
         }
     }
 }
@@ -795,8 +810,49 @@ pub async fn handle(
     context: &Context<'_>,
     flags: RedirectFlags,
 ) -> Handled {
+    // Section 4.11: an upload route with precheck asks the application
+    // with the headers alone before the body is read, and anything but a
+    // 2xx is the answer; the client is told to send its body only after.
+
+    if let Some(policy) = &context.upload
+        && policy.precheck
+        && buffered.is_none()
+        && body.as_ref().is_some_and(|body| !body.is_end_stream())
+    {
+        let mut redirected = None;
+        let response = handle_inner(
+            parts,
+            None,
+            None,
+            Arc::clone(&pool),
+            context,
+            flags,
+            true,
+            &mut redirected,
+        )
+        .await;
+
+        if let Some(redirect) = redirected {
+            return Handled::Redirect(redirect);
+        }
+
+        if !response.status().is_success() {
+            return Handled::Response(response);
+        }
+    }
+
     let mut redirected = None;
-    let response = handle_inner(parts, body, buffered, pool, context, flags, &mut redirected).await;
+    let response = handle_inner(
+        parts,
+        body,
+        buffered,
+        pool,
+        context,
+        flags,
+        false,
+        &mut redirected,
+    )
+    .await;
 
     match redirected {
         Some(redirect) => Handled::Redirect(redirect),
@@ -805,8 +861,9 @@ pub async fn handle(
 }
 
 /// `handle` itself: a redirect is reported through `redirected`, with a
-/// placeholder response the caller discards.
-#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
+/// placeholder response the caller discards. A `precheck` request goes
+/// with the headers alone and is logged as a hop when it is allowed.
+#[allow(clippy::too_many_arguments)] // two call sites; each argument is a distinct part of the request
 async fn handle_inner(
     parts: &mut http::request::Parts,
     mut body: Option<Incoming>,
@@ -814,17 +871,23 @@ async fn handle_inner(
     pool: Arc<LinkPool>,
     context: &Context<'_>,
     flags: RedirectFlags,
+    precheck: bool,
     redirected: &mut Option<Box<Redirect>>,
 ) -> Response<ResponseBody> {
     let upgrade = crate::websocket::detect(parts);
     let mut head = request_head(parts, context);
     let limits = &context.limits;
 
+    if precheck {
+        head.precheck = true;
+        head.expect_continue = false;
+    }
+
     // Sections 4.12 and 4.16: an application asked for an error page or
     // an authorisation decision gets the handler's budget out of what is
     // left of the deadline, queueing included.
 
-    let (deadline, queue_timeout) = if let Some(budget) = context.handler {
+    let (mut deadline, queue_timeout) = if let Some(budget) = context.handler {
         (
             (context.arrived + limits.request_deadline).min(Instant::now() + budget),
             limits.queue_timeout.min(budget),
@@ -835,14 +898,7 @@ async fn handle_inner(
             limits.queue_timeout,
         )
     };
-    head.deadline_unix_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64)
-        .saturating_add(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64,
-        );
+    head.deadline_unix_ms = unix_deadline(deadline);
     let mut recording = Recording::new(context, parts);
     let failing = Failing {
         request_id: context.request_id,
@@ -875,6 +931,78 @@ async fn handle_inner(
     if let Some(data) = &buffered {
         head.content_length = Some(data.len() as u64);
         head.body_buffered = true;
+    }
+
+    // Section 4.11: an upload route receives the body into the spool
+    // first. The application sees the rewritten form, or an empty body
+    // for a raw upload, with the files by descriptor, and the request
+    // deadline runs from when the upload has arrived.
+
+    let mut received: Option<crate::uploads::Received> = None;
+
+    if !precheck
+        && buffered.is_none()
+        && let Some(policy) = context.upload.as_ref()
+        && let Some(incoming) = body.as_mut()
+        && !incoming.is_end_stream()
+    {
+        let outcome = match context.spool.as_ref() {
+            Some(spool) => {
+                crate::uploads::receive(
+                    policy,
+                    spool,
+                    &context.app,
+                    &parts.headers,
+                    incoming,
+                    limits.max_body_size,
+                    limits.body_idle_timeout,
+                )
+                .await
+            }
+            None => Err(crate::uploads::Refusal::SpoolFull(Some(
+                std::io::Error::other("the edge has no spool directory"),
+            ))),
+        };
+
+        match outcome {
+            Ok(Some(upload)) => {
+                let length = upload.body.len() as u64;
+                set_content_length(&mut head, length);
+                head.content_length = Some(length);
+                head.body_buffered = true;
+                head.expect_continue = false;
+                head.uploads = upload.refs();
+                buffered = Some(upload.body.clone());
+                received = Some(upload);
+                deadline = Instant::now() + limits.request_deadline;
+                head.deadline_unix_ms = unix_deadline(deadline);
+            }
+            Ok(None) => {}
+            Err(crate::uploads::Refusal::BodyTooLarge) => {
+                *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                return failing.too_large();
+            }
+            Err(refusal) => {
+                match &refusal {
+                    crate::uploads::Refusal::SpoolFull(Some(error)) => {
+                        tracing::warn!(%error, app = %context.app, "storing an upload failed");
+                    }
+                    crate::uploads::Refusal::SpoolFull(None) => {
+                        tracing::warn!(app = %context.app, "an upload was refused: the spool quota is reached");
+                    }
+                    crate::uploads::Refusal::Malformed(error) => {
+                        tracing::debug!(%error, "a multipart upload could not be parsed");
+                    }
+                    _ => {}
+                }
+
+                let problem = refusal
+                    .problem()
+                    .expect("only a body over max_body_size has none");
+                *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                return failing.close(problem);
+            }
+        }
     }
 
     if buffered.is_none()
@@ -966,20 +1094,40 @@ async fn handle_inner(
     let kept = buffered.clone();
     let frame_flags = if end { flag::END } else { 0 };
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
-    if let Err(error) = frame::write(
-        &mut writer,
-        kind::REQUEST,
-        frame_flags,
-        head.encode_to_vec().into(),
-    )
-    .await
-    {
+
+    // Section 5.7: stored uploads go with the request head, attached to
+    // its first bytes.
+
+    let written = match &received {
+        Some(upload) if !upload.files.is_empty() => {
+            let encoded = frame::encode(kind::REQUEST, frame_flags, &head.encode_to_vec());
+            muru_proto::descriptors::write_with_fds(&mut writer, &encoded, &upload.fds()).await
+        }
+        _ => {
+            frame::write(
+                &mut writer,
+                kind::REQUEST,
+                frame_flags,
+                head.encode_to_vec().into(),
+            )
+            .await
+        }
+    };
+
+    if let Err(error) = written {
         tracing::warn!(%error, "writing the request head failed");
         drop(permit);
         return failing.worker_crashed("The worker is not available.");
     }
 
     let back = Return::new(pool, worker, permit);
+
+    // The stored files stay until the request ends: an unnamed one
+    // vanishes with its last descriptor, a named one is removed.
+
+    if let Some(upload) = received {
+        back.hold(upload);
+    }
 
     match buffered {
         _ if upgrade.is_some() => back.give_writer(Some(writer)),
@@ -1073,6 +1221,11 @@ async fn handle_inner(
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
+
+        // Section 4.11: a precheck the application allows is a hop of the
+        // request that follows it; one it refuses is the answer.
+
+        recording.silent |= precheck && (200..300).contains(&recording.record.status);
     }
 
     // Section 4.10: an internal redirect is not a response for the client
@@ -1611,6 +1764,28 @@ pub(crate) enum BodyError {
 }
 
 /// Read a request body in full, up to the size limit.
+/// A deadline as Unix milliseconds, for the request head.
+fn unix_deadline(deadline: Instant) -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+        .saturating_add(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        )
+}
+
+/// Replace the head's Content-Length with the body the application gets.
+fn set_content_length(head: &mut pb::RequestHead, length: u64) {
+    head.headers
+        .retain(|header| header.name.as_ref() != b"content-length");
+    head.headers.push(pb::Header {
+        name: Bytes::from_static(b"content-length"),
+        value: Bytes::from(length.to_string()),
+    });
+}
+
 pub(crate) async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
 

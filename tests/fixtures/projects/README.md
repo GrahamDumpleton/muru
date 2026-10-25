@@ -17,5 +17,9 @@ sections 6.8 and 13.1):
 - `files/`: a module whose WSGI default, ASGI, compatibility and Starlette
   mounts hand files to the edge (section 4.9); the tests write its
   muru.toml, since `sendfile_roots` names a directory they create.
+- `uploads/`: a WSGI module and an ASGI callable that report the files the
+  edge stored for upload routes (section 4.11), with the Flask, Starlette
+  and Django recipes from the uploads guide as mounts; the tests write its
+  muru.toml.
 
 Run one directly with `muructl run tests/fixtures/projects/shop`.

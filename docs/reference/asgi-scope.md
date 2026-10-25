@@ -42,6 +42,8 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | --- | --- |
 | `request_id` | The request identifier, also in `X-Request-ID` and the access log |
 | `max_body_size` | The body size limit in force, in bytes |
+| `uploads` | Only on an [upload route](../howto/uploads.md) whose request brought files: their descriptions, which `muru.uploads.files(scope)` turns into upload objects |
+| `precheck` | `True` on an upload route's precheck, the request's headers sent before its body |
 | `tls` | Over HTTPS only: a dictionary with `version`, `cipher`, `server_name` and `alpn` |
 | `proxy_addr` | Only when a trusted proxy forwarded the request: the address of the proxy that connected, while `client` is the client it forwarded |
 | `internal`, `redirect_url`, `redirect_query_string`, `redirect_status` | Only on a request that arrived by [internal redirect](../howto/internal-redirects.md): `True`, the path and query the client asked for, and the status the redirecting application answered; `muru.is_internal(scope)` reads them |

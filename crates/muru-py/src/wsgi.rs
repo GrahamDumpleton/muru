@@ -8,6 +8,7 @@
 //! races against the request's interrupt, so the soft timeout (section
 //! 7.6) wakes a thread blocked in the bridge at once.
 
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -763,6 +764,7 @@ fn build_environ<'py>(
     py: Python<'py>,
     shared: &Shared,
     head: &pb::RequestHead,
+    uploads: &[RawFd],
     input: Bound<'py, Input>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let environ = PyDict::new(py);
@@ -865,6 +867,20 @@ fn build_environ<'py>(
         environ.set_item(intern!(py, "muru.max_body_size"), head.max_body_size)?;
     }
 
+    // Section 4.11: the files the edge stored, read through
+    // muru.uploads.files(), and the precheck that comes before them.
+
+    if !head.uploads.is_empty() {
+        environ.set_item(
+            intern!(py, "muru.uploads"),
+            crate::uploads::describe(py, &head.uploads, uploads)?,
+        )?;
+    }
+
+    if head.precheck {
+        environ.set_item(intern!(py, "muru.precheck"), true)?;
+    }
+
     // Section 4.10: a request that arrived by internal redirect carries
     // the CGI REDIRECT_* variables for what the client asked for.
 
@@ -921,6 +937,7 @@ pub fn run(
     request: u64,
     app: &Py<PyAny>,
     head: pb::RequestHead,
+    uploads: &[RawFd],
     body_rx: mpsc::Receiver<Bytes>,
     tx: mpsc::Sender<Outgoing>,
     cancelled: Arc<AtomicBool>,
@@ -943,6 +960,7 @@ pub fn run(
         shared,
         app,
         &head,
+        uploads,
         body_rx,
         announce,
         &start_response,
@@ -1009,6 +1027,7 @@ fn run_app<'py>(
     shared: &Shared,
     app: &Py<PyAny>,
     head: &pb::RequestHead,
+    uploads: &[RawFd],
     body_rx: mpsc::Receiver<Bytes>,
     announce: Option<mpsc::Sender<Outgoing>>,
     start_response: &Bound<'py, StartResponse>,
@@ -1016,7 +1035,7 @@ fn run_app<'py>(
     interrupt: Arc<Interrupt>,
 ) -> PyResult<()> {
     let input = Bound::new(py, Input::new(body_rx, announce, interrupt))?;
-    let environ = build_environ(py, shared, head, input)?;
+    let environ = build_environ(py, shared, head, uploads, input)?;
     let result = app.bind(py).call1((environ, start_response))?;
 
     // Section 6.5: a file the edge can send itself goes by descriptor;

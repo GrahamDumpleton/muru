@@ -78,6 +78,14 @@ pub struct EdgeRunArgs {
     #[arg(long = "worker-socket", value_name = "PATH")]
     worker_sockets: Vec<PathBuf>,
 
+    /// Where upload routes store files (section 4.11).
+    #[arg(long, value_name = "PATH")]
+    spool: Option<PathBuf>,
+
+    /// What stored uploads may hold at once, in bytes; 0 for no limit.
+    #[arg(long, value_name = "BYTES")]
+    spool_quota: Option<u64>,
+
     /// A Unix socket on which the listener is handed to whoever connects:
     /// a daemon that restarted without it (section 2.3).
     #[arg(long, value_name = "PATH")]
@@ -114,6 +122,10 @@ impl EdgeRunArgs {
 
         if let Some(count) = self.http2_max_concurrent_streams {
             limits.http2_max_concurrent_streams = count;
+        }
+
+        if let Some(bytes) = self.spool_quota {
+            limits.spool_quota = bytes;
         }
 
         crate::apply_timeouts(&mut limits, &self.timeouts);
@@ -169,6 +181,22 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    // Section 4.11: without a usable spool, upload routes answer 507.
+
+    let limits = args.limits();
+    let spool = args.spool.as_ref().and_then(|path| {
+        let quota = (limits.spool_quota > 0).then_some(limits.spool_quota);
+
+        muru_edge::uploads::Spool::new(path.clone(), quota)
+            .map_err(|error| {
+                eprintln!(
+                    "muru: the upload spool {} is unusable: {error}",
+                    path.display()
+                );
+            })
+            .ok()
+    });
+
     let access_log = muru_edge::access::Config {
         destination: match args.access_log.as_str() {
             "off" => muru_edge::access::Destination::Off,
@@ -192,9 +220,10 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
             development: false,
             access_log,
-            limits: args.limits(),
+            limits,
             compression: muru_edge::compression::Compression::default(),
             https: None,
+            spool,
         },
         inherited,
         Arc::clone(&resolver),

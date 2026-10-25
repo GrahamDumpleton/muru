@@ -58,7 +58,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
 | max_body_size, buffer_body, chunked_body, buffer_response | route and wider | 10MB, off, buffer, on | 4.6 |
 | max_header_bytes, max_headers, header_read_timeout | listener, host | 64KiB, 100, 30s | 4.6 |
-| upload, max_file_size, max_files, hash, precheck, spool quota | route | off, unlimited, 100, sha256, false, 10GB per application | 4.11 |
+| upload, max_file_size, max_files, hash, precheck, spool_quota | route (spool_quota also in the daemon's [limits], for every application together) | off, unlimited, 100 (at most 500), [sha256], false, 10GB per application (none for the node) | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache | route | none | 4.9 |
 | sendfile_roots, sendfile_header | release, mount, upstream | none, none | 4.9 |
 | error_pages, error_override | global, host, application (release), route | built-in, off | 4.12 |
@@ -87,9 +87,9 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 
 | Status | Reasons |
 | --- | --- |
-| 400, 414, 431 | malformed, uri_too_long, headers_too_large |
+| 400, 414, 431 | malformed, upload_malformed, uri_too_long, headers_too_large |
 | 404 | no_route, internal_only, sendfile_missing |
-| 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, misdirected, upgrade_not_allowed |
+| 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, upgrade_not_allowed |
 | 429 | rate_limited |
 | 500 | app_error, redirect_loop, sendfile_refused |
 | 502 | worker_crashed, upstream_failed |

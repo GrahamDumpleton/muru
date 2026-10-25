@@ -40,6 +40,7 @@ pub mod proxy;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
+pub mod uploads;
 pub mod upstream;
 pub mod websocket;
 
@@ -83,6 +84,9 @@ pub struct Config {
     pub compression: compression::Compression,
     /// The HTTPS listener, when TLS is on.
     pub https: Option<Https>,
+    /// Where upload routes store files (section 4.11); a route that
+    /// takes uploads without one passes its bodies through.
+    pub spool: Option<Arc<uploads::Spool>>,
 }
 
 /// An HTTPS listener next to the HTTP one (section 13.1 in development).
@@ -142,6 +146,9 @@ pub struct Limits {
     pub max_requests_per_connection: u64,
     /// Concurrent streams per HTTP/2 connection.
     pub http2_max_concurrent_streams: u32,
+    /// What stored uploads may hold at once across every application
+    /// (section 4.11), else 507 upload_spool_full; 0 for no limit.
+    pub spool_quota: u64,
 }
 
 impl Default for Limits {
@@ -164,6 +171,7 @@ impl Default for Limits {
             websocket_max_message_size: 1024 * 1024,
             websocket_ping_interval: Duration::from_secs(30),
             websocket_idle_timeout: Duration::from_secs(300),
+            spool_quota: 0,
         }
     }
 }
@@ -235,6 +243,8 @@ struct Shared {
     /// Each listener's connection counts and limits (section 4.18), in
     /// listener order.
     admission: Vec<Arc<connections::Connections>>,
+    /// Where upload routes store files (section 4.11).
+    spool: Option<Arc<uploads::Spool>>,
 }
 
 /// Stops an edge accepting and lets its connections finish (section
@@ -422,6 +432,7 @@ impl Edge {
                 draining: tokio::sync::watch::channel(false).0,
                 connections: Arc::new(()),
                 admission,
+                spool: config.spool,
             }),
         })
     }
@@ -454,7 +465,8 @@ pub struct ConnectionCounts {
 }
 
 impl ConnectionCounts {
-    /// Every listener's connection samples (section 4.18).
+    /// Every listener's connection samples (section 4.18), with what the
+    /// upload spool holds (section 4.11).
     pub fn samples(&self) -> Vec<metrics::Sample> {
         self.shared.connection_samples()
     }
@@ -462,10 +474,17 @@ impl ConnectionCounts {
 
 impl Shared {
     fn connection_samples(&self) -> Vec<metrics::Sample> {
-        self.admission
+        let mut samples: Vec<metrics::Sample> = self
+            .admission
             .iter()
             .flat_map(|connections| connections.samples())
-            .collect()
+            .collect();
+
+        if let Some(spool) = &self.spool {
+            samples.extend(spool.samples());
+        }
+
+        samples
     }
 }
 
@@ -794,6 +813,8 @@ async fn serve<I>(
                     hops: hops.clone(),
                     errors,
                     handler: handling.as_ref().map(|_| link::HANDLER_TIMEOUT),
+                    upload: None,
+                    spool: shared.spool.clone(),
                 };
 
                 // Section 4.16: a guarded route is served only once its
@@ -895,6 +916,8 @@ async fn serve<I>(
                             server_name,
                             cookies,
                             auth: _,
+                            upload,
+                            max_body_size,
                         },
                     ) => {
                         // Section 4.12: an application does not serve its
@@ -929,6 +952,21 @@ async fn serve<I>(
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
                             context.sendfile = selection.sendfile;
+
+                            // Sections 4.6 and 4.11: the route's body limit
+                            // and uploads apply to a client's own request,
+                            // whose body has not been read yet.
+
+                            if origin.is_none() {
+                                if let Some(size) = max_body_size {
+                                    let mut limits = (*context.limits).clone();
+                                    limits.max_body_size = size;
+                                    context.limits = Arc::new(limits);
+                                }
+
+                                context.upload = upload;
+                            }
+
                             dispatch(
                                 &mut parts,
                                 body.take(),

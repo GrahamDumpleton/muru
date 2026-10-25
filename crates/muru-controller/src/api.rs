@@ -851,6 +851,12 @@ impl Admin for Service {
                         .as_ref()
                         .map(|auth| format!("{} {}", config::auth_handler(auth), auth.path))
                         .unwrap_or_default(),
+                    upload: match (&route.upload, route.precheck) {
+                        (Some(mode), Some(true)) => format!("{mode}, precheck"),
+                        (Some(mode), _) => mode.clone(),
+                        (None, _) => String::new(),
+                    },
+                    max_body_size: route.max_body_size.clone().unwrap_or_default(),
                     host: route.host,
                     path: route.path,
                     app: route.app,

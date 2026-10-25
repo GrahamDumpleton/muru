@@ -46,6 +46,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "c
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "webpki-tokio"] }
 libc = "0.2"
 mime_guess = "2"
+multer = "3.1"
 muru-common = { path = "crates/muru-common" }
 muru-dashboard = { path = "crates/muru-dashboard" }
 muru-config = { path = "crates/muru-config" }

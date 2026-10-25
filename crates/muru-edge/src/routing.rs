@@ -118,6 +118,10 @@ struct Route {
     errors: Arc<ErrorPolicy>,
     /// The decision asked for before the route is served (section 4.16).
     auth: Option<Arc<crate::auth::Auth>>,
+    /// How uploads are received before dispatch (section 4.11).
+    upload: Option<Arc<crate::uploads::Policy>>,
+    /// The route's body limit, in place of the edge's (section 4.6).
+    max_body_size: Option<u64>,
 }
 
 impl Route {
@@ -823,6 +827,10 @@ pub enum Decision {
         cookies: Vec<String>,
         /// The check the route asks for first (section 4.16).
         auth: Option<Arc<crate::auth::Auth>>,
+        /// How the route's uploads are received (section 4.11).
+        upload: Option<Arc<crate::uploads::Policy>>,
+        /// The route's body limit, in place of the edge's (section 4.6).
+        max_body_size: Option<u64>,
     },
     /// Redirected to HTTPS: the host insists on it.
     Redirect,
@@ -1100,6 +1108,11 @@ impl Routing {
                     accept_redirects_from: route.accept_redirects_from.clone(),
                     errors: Arc::new(errors),
                     auth,
+                    upload: route
+                        .upload
+                        .as_ref()
+                        .and_then(crate::uploads::Policy::from_message),
+                    max_body_size: (route.max_body_size > 0).then_some(route.max_body_size),
                 });
             }
         }
@@ -1247,6 +1260,8 @@ impl Routing {
                     server_name: None,
                     cookies: Vec::new(),
                     auth: None,
+                    upload: None,
+                    max_body_size: None,
                 },
                 None => Decision::InternalOnly,
             };
@@ -1347,6 +1362,8 @@ impl Routing {
             server_name,
             cookies,
             auth: route.auth.clone(),
+            upload: route.upload.clone(),
+            max_body_size: route.max_body_size,
         }
     }
 

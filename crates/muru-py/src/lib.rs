@@ -10,6 +10,7 @@ mod asgi;
 mod link;
 mod memory;
 mod pool;
+mod uploads;
 mod wsgi;
 
 use std::sync::Arc;

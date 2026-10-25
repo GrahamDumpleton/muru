@@ -6,9 +6,10 @@ applications can use it unconditionally.
 
 ``muru.context()`` says where the code runs, ``muru.logging`` holds the
 platform logging defaults, ``muru.RequestTimeout`` is what the soft
-timeout raises and ``muru.is_internal()`` tells a request that arrived
-by internal redirect; the rest of the API in section 6.9 of the design
-specification arrives with the features it belongs to.
+timeout raises, ``muru.is_internal()`` tells a request that arrived
+by internal redirect and ``muru.uploads`` reaches the files the edge
+stored for an upload route; the rest of the API in section 6.9 of the
+design specification arrives with the features it belongs to.
 """
 
 from __future__ import annotations
@@ -17,10 +18,18 @@ from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
-from muru import logging
+from muru import logging, uploads
 from muru._context import Context, context
 
-__all__ = ["Context", "RequestTimeout", "__version__", "context", "is_internal", "logging"]
+__all__ = [
+    "Context",
+    "RequestTimeout",
+    "__version__",
+    "context",
+    "is_internal",
+    "logging",
+    "uploads",
+]
 
 
 def is_internal(request: Mapping[str, Any]) -> bool:

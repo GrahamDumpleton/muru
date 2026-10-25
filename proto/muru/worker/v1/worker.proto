@@ -99,8 +99,17 @@ message InternalContext {
   string original_host = 10;        // the host it asked for, as muru.original_host
 }
 
+// Section 4.11: a file the edge received and stored for the request,
+// whose descriptor is attached to the REQUEST frame; the descriptors are
+// matched to these by order.
 message UploadRef {
-  string ref = 1;
+  string ref = 1;                   // unique within the request, as the form's FIELD.ref
+  string field = 2;                 // the form field; empty for a raw upload
+  string filename = 3;              // the client's file name; may be empty
+  string content_type = 4;          // as the client declared it; may be empty
+  uint64 size = 5;                  // bytes received
+  map<string, string> digests = 6;  // hex digests by algorithm, such as sha256
+  string path = 7;                  // the spool file's name where it has one (not on Linux); empty otherwise
 }
 
 // Payload of a FILE frame (section 5.7): the response body, or the next

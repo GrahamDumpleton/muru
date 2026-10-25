@@ -11,6 +11,7 @@
 //! future only when the writer is behind and the application must wait.
 
 use std::collections::VecDeque;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1030,7 +1031,11 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
 }
 
 /// Build the http scope (Appendix D.2) from the request head.
-fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'py, PyDict>> {
+fn build_scope<'py>(
+    py: Python<'py>,
+    head: &pb::RequestHead,
+    uploads: &[RawFd],
+) -> PyResult<Bound<'py, PyDict>> {
     let websocket = head.scope == pb::Scope::Websocket as i32;
     let scope = PyDict::new(py);
     scope.set_item("type", if websocket { "websocket" } else { "http" })?;
@@ -1142,6 +1147,20 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         muru.set_item("max_body_size", head.max_body_size)?;
     }
 
+    // Section 4.11: the files the edge stored, read through
+    // muru.uploads.files(), and the precheck that comes before them.
+
+    if !head.uploads.is_empty() {
+        muru.set_item(
+            "uploads",
+            crate::uploads::describe(py, &head.uploads, uploads)?,
+        )?;
+    }
+
+    if head.precheck {
+        muru.set_item("precheck", true)?;
+    }
+
     // Section 4.10: a request that arrived by internal redirect says so,
     // with what the client asked for.
 
@@ -1208,6 +1227,7 @@ pub fn start(
     asgi: &Asgi,
     runner: &Py<PyAny>,
     head: &pb::RequestHead,
+    uploads: &[RawFd],
     tx: mpsc::Sender<Outgoing>,
     request: u64,
 ) -> Result<Py<Channel>, String> {
@@ -1215,7 +1235,7 @@ pub fn start(
         let channel = Channel::new(py, asgi, tx, head, Arc::clone(shared), request);
         let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
         shared.request_channel(request, channel.clone().unbind());
-        let scope = build_scope(py, head).map_err(|error| error.to_string())?;
+        let scope = build_scope(py, head, uploads).map_err(|error| error.to_string())?;
 
         asgi.event_loop
             .bind(py)

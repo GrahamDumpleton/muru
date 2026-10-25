@@ -34,6 +34,7 @@ mounts
 https
 static-files
 file-hints
+uploads
 internal-redirects
 error-pages
 auth-subrequests

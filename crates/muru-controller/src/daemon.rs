@@ -656,6 +656,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     let edge_log = locations.logs.path.join("edge.log");
 
+    // Section 4.11: the upload spool is the edge's own, in the state
+    // directory rather than the run directory, which may be memory.
+
+    let spool = locations.state.path.join("spool");
+    prepare_spool(&spool, service)
+        .with_context(|| format!("preparing the upload spool {}", spool.display()))?;
+
     let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
         Some(record) => EdgeProcess::adopt(
             record.pid,
@@ -671,6 +678,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             edge_log.clone(),
             config.access_log.clone(),
             config.limits.clone(),
+            spool.clone(),
             service,
         )
         .await
@@ -705,6 +713,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 log: edge_log,
                 access_log: config.access_log,
                 limits: config.limits,
+                spool,
                 identity: service,
             })
             .await?
@@ -1076,6 +1085,37 @@ fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::I
         "the edge and applications run as the service user"
     );
     Ok(Some(identity))
+}
+
+/// Section 4.11: a route's upload settings for the edge, with their
+/// defaults in place. Apply has checked the keys, so a route that fails
+/// them here takes no uploads.
+fn upload_message(route: &muru_config::Route) -> Option<pb::Upload> {
+    let settings = muru_config::check_upload(route).ok().flatten()?;
+
+    Some(pb::Upload {
+        mode: settings.mode,
+        max_file_size: settings.max_file_size.unwrap_or(0),
+        max_files: settings.max_files,
+        hash: settings.hash,
+        precheck: settings.precheck,
+        spool_quota: settings.spool_quota,
+    })
+}
+
+/// The upload spool, open to the edge's user alone: the service user
+/// under a root daemon. The edge makes each application's directory in
+/// it.
+fn prepare_spool(directory: &Path, service: Option<crate::host::Identity>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(directory)?;
+
+    if let Some(service) = service {
+        std::os::unix::fs::chown(directory, Some(service.uid), Some(service.gid))?;
+    }
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Give a release's socket directory to the application's user with the
@@ -2861,6 +2901,12 @@ impl Daemon {
         let routes = routes
             .into_iter()
             .map(|route| pb::Route {
+                upload: upload_message(&route),
+                max_body_size: route
+                    .max_body_size
+                    .as_deref()
+                    .and_then(|size| muru_config::parse_size(size).ok())
+                    .unwrap_or(0),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 host: route.host,
                 path: route.path,

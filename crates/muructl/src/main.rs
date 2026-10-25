@@ -277,6 +277,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         limits: muru_edge::Limits::default(),
         compression: compression.clone(),
         https: None,
+        spool: None,
     })
     .await
     .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
@@ -1353,6 +1354,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             http2: Some(muru_config::Http2Limits {
                 max_concurrent_streams: Some(limits.http2_max_concurrent_streams),
             }),
+            spool_quota: None,
         }),
         app: std::collections::BTreeMap::from([(
             name,
@@ -1719,6 +1721,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             muru_edge::compression::Compression::default()
         },
         https: tls.as_ref().map(|tls| tls.https.clone()),
+        spool: None,
     })
     .await
     {

@@ -687,6 +687,25 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }
         }
 
+        // Sections 4.6 and 4.11: the body limit, and the upload keys, which
+        // need an application to hand the files to.
+
+        match muru_config::check_upload(route) {
+            Ok(Some(_)) if route.app.is_empty() => {
+                plan.errors.push(format!(
+                    "route {} {}: upload needs an application; static and upstream routes take none",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                plan.errors
+                    .push(format!("route {} {}: {error}", route.host, route.path));
+                valid = false;
+            }
+        }
+
         // Section 9.4: a traffic policy names releases of the route's
         // application that exist or are declared, with shares that fit.
 

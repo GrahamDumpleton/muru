@@ -156,6 +156,18 @@ message Route {
   Auth auth = 18;                       // section 4.16: the decision asked for before the route is served
   string upstream = 19;                 // section 4.13: the upstream that takes the requests, instead of an application
   string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
+  Upload upload = 21;                   // section 4.11: uploads received and stored by the edge; off when absent
+  uint64 max_body_size = 22;            // section 4.6: the route's body limit; the edge's own when 0
+}
+
+// Section 4.11: how a route's uploads are received before dispatch.
+message Upload {
+  string mode = 1;                      // multipart or raw
+  uint64 max_file_size = 2;             // bytes per file; no limit when 0
+  uint32 max_files = 3;                 // files per request; 100 when 0
+  repeated string hash = 4;             // digests computed while receiving: sha256, sha384, sha512 or sha1; none when empty
+  bool precheck = 5;                    // ask the application with the headers alone first
+  uint64 spool_quota = 6;               // bytes the application's stored uploads may hold at once; no limit when 0
 }
 
 // A route's authentication sub-request (section 4.16): a bodiless GET to

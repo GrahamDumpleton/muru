@@ -138,7 +138,7 @@ File descriptors travel on the link itself, attached with SCM_RIGHTS to the fram
 
 - **Worker to edge:** FILE frames for wsgi.file_wrapper and the ASGI pathsend and zerocopysend extensions (sections 4.9 and 6.5). The worker sends a duplicate of the open descriptor with an offset and length, closes its own copy, and the application thread is free. The edge sends the range to the client itself.
 
-- **Edge to worker:** offloaded upload files (section 4.11) attached to the REQUEST frame, matched to the upload references in the head by order.
+- **Edge to worker:** offloaded upload files (section 4.11) attached to the REQUEST frame, matched to the upload references in the head by order. Each UploadRef carries the ref, the form field (empty for a raw upload), the client's file name and content type, the size, the digests by algorithm and, where the spool file has a name, its path. One message carries at most 64 descriptors, so a request with more spreads them over its first bytes, one message each.
 
 The channel works across container boundaries because both sides share the kernel. Log pipes are passed by the daemon when it spawns the host, not on the link.
 
