@@ -39,19 +39,40 @@ class Daemon:
     log_path: Path
     listeners: list[tuple[int, bool]]
 
-    def muructl(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        """Run a muructl command against this daemon."""
+    def muructl(
+        self, *arguments: str, check: bool = True, stdin: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a muructl command against this daemon, with `stdin` as its input.
+
+        Commands that work from the daemon's files rather than its socket
+        (the secret commands) get the daemon's locations instead.
+        """
 
         muructl = support.muructl_path()
         assert muructl is not None
 
+        if arguments and arguments[0] == "secret":
+            where = [
+                "--config",
+                str(self.base / "muru.toml"),
+                "--state-dir",
+                str(self.base / "state"),
+                "--run-dir",
+                str(self.run_dir),
+                "--log-dir",
+                str(self.base / "logs"),
+            ]
+        else:
+            where = ["--socket", str(self.run_dir / "admin.sock")]
+
         try:
             completed = subprocess.run(
-                [str(muructl), *arguments, "--socket", str(self.run_dir / "admin.sock")],
+                [str(muructl), *arguments, *where],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=180,
+                input=stdin,
             )
         except subprocess.TimeoutExpired as error:
             listing = subprocess.run(

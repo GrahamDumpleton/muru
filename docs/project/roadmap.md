@@ -190,5 +190,10 @@ Connection: close, `http2.max_concurrent_streams`, and the open and
 refused counts as metrics, from the `[limits]` table or run flags
 (eviction of idle connections under pressure, shrinking idle timeouts,
 per-listener settings, HTTP/2 idle closure and Unix socket listeners
-later). Next from phase 2: secrets and per-application users, then log
-rotation and the dashboard's charts.
+later). Secrets (section 10.8) are in: `[secrets.store.NAME]` tables of
+the file, env and exec kinds, references from a release's `[env]` table
+or `deploy --secret`, resolved when the release starts and delivered as
+variables or as files named by NAME_FILE, never recorded, exported or
+printed, and `muructl secret set`, `list` and `remove` for file stores
+with the value read from standard input. Next from phase 2:
+per-application users, then log rotation and the dashboard's charts.

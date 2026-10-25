@@ -53,6 +53,13 @@ def exchange(sock: socket.socket, path: str = "/") -> bytes:
     return head + b"\r\n\r\n" + body
 
 
+def settled(server: support.Server) -> support.Server:
+    """Give the connections the start-up probe opened a moment to be let go."""
+
+    time.sleep(0.5)
+    return server
+
+
 def closed(sock: socket.socket) -> bool:
     """Whether the server has closed the connection."""
 
@@ -66,8 +73,13 @@ def closed(sock: socket.socket) -> bool:
 
 
 def test_a_client_over_its_share_of_connections_is_closed() -> None:
-    server = support.start(
-        "plain_wsgi:application", workers=1, threads=2, args=["--max-connections-per-client", "2"]
+    server = settled(
+        support.start(
+            "plain_wsgi:application",
+            workers=1,
+            threads=2,
+            args=["--max-connections-per-client", "2"],
+        )
     )
 
     try:
@@ -91,11 +103,13 @@ def test_a_client_over_its_share_of_connections_is_closed() -> None:
 
 
 def test_a_full_listener_answers_503_edge_overloaded() -> None:
-    server = support.start(
-        "plain_wsgi:application",
-        workers=1,
-        threads=2,
-        args=["--max-connections", "2", "--max-connections-per-client", "0"],
+    server = settled(
+        support.start(
+            "plain_wsgi:application",
+            workers=1,
+            threads=2,
+            args=["--max-connections", "2", "--max-connections-per-client", "0"],
+        )
     )
 
     try:

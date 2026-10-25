@@ -313,6 +313,9 @@ pub struct HostSpec {
     pub shutdown_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
+    /// Environment variables for the host and its workers (section
+    /// 10.8), secret values already resolved.
+    pub env: Vec<(String, String)>,
 }
 
 /// A named mount, as the host loads it.
@@ -542,6 +545,8 @@ impl HostProcess {
         if let Some(dir) = &spec.chdir {
             command.current_dir(dir);
         }
+
+        command.envs(spec.env.iter().map(|(name, value)| (name, value)));
 
         let mut child = command
             .spawn()

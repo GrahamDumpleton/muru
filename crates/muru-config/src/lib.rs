@@ -355,6 +355,10 @@ pub struct Release {
     /// The memory policy for the workers (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// Environment variables for the workers (section 10.8): a value, or
+    /// a secret reference resolved when the release starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
 }
 
 /// The `[memory]` table of a release or a `[tool.muru]` table (section
@@ -383,6 +387,68 @@ pub struct Memory {
     /// How often memory is measured (default 5s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_interval: Option<String>,
+}
+
+/// A value in an `[env]` table (section 10.8): the text itself, or a
+/// reference to a secret in a store, delivered as the variable or, with
+/// `as = 'file'`, as a file whose path is in `NAME_FILE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnvValue {
+    /// The value as written.
+    Plain(String),
+    /// A secret reference.
+    Secret(SecretValue),
+}
+
+/// A secret reference in an `[env]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretValue {
+    /// The store and key.
+    pub secret: SecretRef,
+    /// `file` to deliver the value as a file instead of the variable.
+    #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+    pub deliver: Option<String>,
+}
+
+/// Which secret: a store declared in the daemon's file, and a key in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    /// The store's name.
+    pub store: String,
+    /// The key within the store.
+    pub key: String,
+}
+
+/// The `[secrets]` table of the daemon's file (section 10.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Secrets {
+    /// Stores by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub store: BTreeMap<String, SecretStore>,
+}
+
+/// One `[secrets.store.NAME]` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretStore {
+    /// `file`, `env` or `exec`.
+    #[serde(default)]
+    pub kind: String,
+    /// For a file store, the directory; the daemon's secrets directory
+    /// under the store's name otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// For an exec store, the command and arguments, with `{key}` where
+    /// the key goes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// For an exec store, how long the command may take (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
 }
 
 /// The `[timeouts]` table of a release or a `[tool.muru]` table (section
@@ -795,6 +861,9 @@ pub struct Document {
     /// How responses are compressed (section 4.17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<Compression>,
+    /// Secret stores (section 10.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Secrets>,
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
@@ -940,6 +1009,10 @@ pub struct ToolMuru {
     /// The memory policy for the workers (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// Environment variables for the workers (section 10.8): a value, or
+    /// a secret reference resolved when the release starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
 }
 
 /// Why a project's configuration could not be read.

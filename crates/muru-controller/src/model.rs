@@ -179,6 +179,43 @@ pub struct ReleaseSpec {
     /// The memory policy for the workers (section 7.7).
     #[serde(default)]
     pub memory: MemoryPolicy,
+    /// Environment variables for the workers (section 10.8), in name
+    /// order; secret values are never recorded, only their references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvSpec>,
+}
+
+/// One environment variable of a release (section 10.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvSpec {
+    /// The variable's name.
+    pub name: String,
+    /// Its value as written, when it is not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The store a secret value comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_store: Option<String>,
+    /// The key of the secret in its store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<String>,
+    /// Whether the secret is delivered as a file named by NAME_FILE.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_file: bool,
+}
+
+impl EnvSpec {
+    /// The variable as a phrase that never shows a secret's value.
+    pub fn describe(&self) -> String {
+        match (&self.secret_store, &self.secret_key) {
+            (Some(store), Some(key)) => format!(
+                "{}=secret {store}/{key}{}",
+                self.name,
+                if self.as_file { " as file" } else { "" }
+            ),
+            _ => format!("{}={}", self.name, self.value.clone().unwrap_or_default()),
+        }
+    }
 }
 
 /// The memory policy of a release's workers (section 7.7), in bytes and
@@ -331,6 +368,19 @@ pub fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && !name.starts_with('-')
         && !name.ends_with('-')
+}
+
+/// Whether a string is an environment variable name: letters, digits and
+/// underscores, not starting with a digit.
+pub fn valid_env_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+
+    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Now, as Unix milliseconds.

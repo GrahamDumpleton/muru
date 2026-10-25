@@ -116,6 +116,12 @@ enum Command {
         command: admin::ConfigCommand,
     },
 
+    /// Manage the file secret stores (section 10.8).
+    Secret {
+        #[command(subcommand)]
+        command: admin::SecretCommand,
+    },
+
     /// Look into a release's workers: status, stacks, tasks, inspect.
     Debug {
         #[command(subcommand)]
@@ -663,6 +669,7 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
         Command::App { command } => runtime.block_on(async move {
@@ -1000,6 +1007,8 @@ struct Resolved {
     timeouts: Option<muru_config::Timeouts>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
+    /// Environment variables from the table (section 10.8).
+    env: std::collections::BTreeMap<String, muru_config::EnvValue>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1127,6 +1136,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         },
         timeouts: table.timeouts,
         memory: table.memory,
+        env: table.env,
     })
 }
 
@@ -1173,6 +1183,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         logging: resolved.logging.clone(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
+        env: resolved.env.clone(),
         timeouts: {
             let (hard, grace, shutdown) =
                 worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
@@ -1477,6 +1488,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         hard_drain_grace,
         shutdown_timeout,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
+        env: resolved
+            .env
+            .iter()
+            .map(|(name, value)| match value {
+                muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
+                muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
+                    "[tool.muru.env] {name}: secrets are resolved by the daemon; a development \
+                     run cannot deliver them"
+                )),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
     };
 
     let logs = Logs::default();

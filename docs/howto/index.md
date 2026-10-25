@@ -23,6 +23,7 @@ flask-and-django
 asgi
 starlette-and-fastapi
 daemon
+secrets
 virtual-hosts
 behind-a-proxy
 worker-groups

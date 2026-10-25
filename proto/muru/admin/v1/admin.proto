@@ -140,6 +140,16 @@ message DeployRequest {
   optional bool memory_reclaim_first = 25;
   optional uint64 memory_hard_limit = 26;   // bytes; over it the worker is replaced at once
   optional uint64 memory_check_interval_ms = 27;
+  repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
+}
+
+// One environment variable: a value, or a secret reference.
+message EnvEntry {
+  string name = 1;
+  string value = 2;                 // the value, when not a secret
+  string secret_store = 3;          // the store, for a secret
+  string secret_key = 4;            // the key, for a secret
+  bool as_file = 5;                 // deliver the secret as a file named by NAME_FILE
 }
 
 message ListReleasesRequest {

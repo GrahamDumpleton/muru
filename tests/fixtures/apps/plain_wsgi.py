@@ -92,6 +92,23 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
         return generate()
 
+    if path == "/env":
+        name = query.get("name", "")
+        file_path = os.environ.get(f"{name}_FILE")
+        content = None
+
+        if file_path:
+            with open(file_path, encoding="utf-8") as handle:
+                content = handle.read()
+
+        body = json.dumps(
+            {"value": os.environ.get(name), "file": file_path, "content": content}
+        ).encode()
+        start_response(
+            "200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        )
+        return [body]
+
     if path == "/text":
         body = (b"The quick brown fox jumps over the lazy dog. " * 100)[:4096]
         headers = [

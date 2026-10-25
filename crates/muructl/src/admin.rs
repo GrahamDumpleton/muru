@@ -236,12 +236,17 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
             location.rule
         );
     }
+    let secrets = muru_controller::secrets::Store::from_document(
+        &document,
+        &locations.state.path.join("secrets"),
+    )?;
     muru_controller::daemon::run(muru_controller::daemon::Config {
         locations,
         listeners,
         limits,
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
+        secrets,
         access_log,
         metrics,
         dashboard,
@@ -1106,8 +1111,194 @@ pub struct DeployArgs {
     #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = crate::parse_memory_setting)]
     memory: Vec<(String, String)>,
 
+    /// An environment variable for the workers as NAME=VALUE, over the
+    /// source's [tool.muru.env] table. Repeatable.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env_setting)]
+    env: Vec<(String, String)>,
+
+    /// A secret for the workers as NAME=STORE:KEY, delivered as the
+    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE
+    /// (section 10.8). Repeatable.
+    #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
+    secrets: Vec<(String, String, String, bool)>,
+
     #[command(flatten)]
     socket: SocketArgs,
+}
+
+/// Parse NAME=VALUE for --env.
+fn parse_env_setting(text: &str) -> Result<(String, String), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=VALUE"))?;
+
+    if !muru_controller::model::valid_env_name(name) {
+        return Err(format!("{name:?} is not a variable name"));
+    }
+
+    Ok((name.to_owned(), value.to_owned()))
+}
+
+/// Parse NAME=STORE:KEY[:file] for --secret.
+fn parse_secret_setting(text: &str) -> Result<(String, String, String, bool), String> {
+    let (name, reference) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=STORE:KEY"))?;
+
+    if !muru_controller::model::valid_env_name(name) {
+        return Err(format!("{name:?} is not a variable name"));
+    }
+
+    let (store, rest) = reference
+        .split_once(':')
+        .ok_or_else(|| format!("{reference:?} is not STORE:KEY"))?;
+
+    let (key, as_file) = match rest.rsplit_once(':') {
+        Some((key, "file")) => (key, true),
+        Some((key, "env")) => (key, false),
+        _ => (rest, false),
+    };
+
+    if store.is_empty() || key.is_empty() {
+        return Err(format!("{reference:?} is not STORE:KEY"));
+    }
+
+    Ok((name.to_owned(), store.to_owned(), key.to_owned(), as_file))
+}
+
+/// The secret subcommands (section 10.8): the file stores the daemon's
+/// configuration declares, managed without the daemon.
+#[derive(Subcommand)]
+pub enum SecretCommand {
+    /// Store a value read from standard input under a key.
+    Set {
+        /// The file store, as [secrets.store.NAME] names it.
+        store: String,
+
+        /// The key.
+        key: String,
+
+        #[command(flatten)]
+        locations: LocationArgs,
+    },
+
+    /// List the keys of a file store; values are never shown.
+    List {
+        /// The file store.
+        store: String,
+
+        #[command(flatten)]
+        locations: LocationArgs,
+    },
+
+    /// Remove a key from a file store.
+    Remove {
+        /// The file store.
+        store: String,
+
+        /// The key.
+        key: String,
+
+        #[command(flatten)]
+        locations: LocationArgs,
+    },
+}
+
+/// Manage a file secret store.
+pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
+    let (store, locations) = match &command {
+        SecretCommand::Set {
+            store, locations, ..
+        }
+        | SecretCommand::List { store, locations }
+        | SecretCommand::Remove {
+            store, locations, ..
+        } => (store.clone(), locations.resolve()),
+    };
+
+    let document = read_config(&locations.config.path)?;
+    let stores = muru_controller::secrets::Store::from_document(
+        &document,
+        &locations.state.path.join("secrets"),
+    )?;
+
+    let directory = match stores.iter().find(|candidate| candidate.name == store) {
+        Some(muru_controller::secrets::Store {
+            kind: muru_controller::secrets::Kind::File(directory),
+            ..
+        }) => directory.clone(),
+        Some(_) => anyhow::bail!("secret store {store} is not a file store"),
+        None => anyhow::bail!(
+            "no secret store named {store} in {}",
+            locations.config.path.display()
+        ),
+    };
+
+    match command {
+        SecretCommand::Set { key, .. } => {
+            anyhow::ensure!(
+                !key.is_empty() && !key.contains('/') && !key.starts_with('.'),
+                "{key:?} is not a valid key"
+            );
+            let mut value = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)
+                .context("reading the value from standard input")?;
+            let value = value.trim_end_matches(['\n', '\r']);
+            anyhow::ensure!(!value.is_empty(), "no value was given on standard input");
+            std::fs::create_dir_all(&directory)
+                .with_context(|| format!("creating {}", directory.display()))?;
+            std::fs::set_permissions(
+                &directory,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
+            let path = directory.join(&key);
+            let _ = std::fs::remove_file(&path);
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                file.write_all(value.as_bytes())?;
+            }
+            println!("muru: secret {store}/{key} set");
+        }
+        SecretCommand::List { .. } => {
+            let mut keys: Vec<String> = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| !name.starts_with('.'))
+                    .collect(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(error).context(format!("reading {}", directory.display()));
+                }
+            };
+
+            keys.sort();
+
+            if keys.is_empty() {
+                println!("no secrets in {store}");
+            }
+
+            for key in keys {
+                println!("{key}");
+            }
+        }
+        SecretCommand::Remove { key, .. } => {
+            let path = directory.join(&key);
+            std::fs::remove_file(&path)
+                .with_context(|| format!("secret {store}/{key} does not exist"))?;
+            println!("muru: secret {store}/{key} removed");
+        }
+    }
+
+    Ok(())
 }
 
 /// The last value given for a memory setting.
@@ -1200,6 +1391,26 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         memory_check_interval_ms: memory_setting(&args.memory, "check_interval")
             .and_then(|text| muru_config::parse_duration(&text).ok())
             .map(|duration| duration.as_millis() as u64),
+        env: args
+            .env
+            .iter()
+            .map(|(name, value)| pb::EnvEntry {
+                name: name.clone(),
+                value: value.clone(),
+                ..Default::default()
+            })
+            .chain(
+                args.secrets
+                    .iter()
+                    .map(|(name, store, key, as_file)| pb::EnvEntry {
+                        name: name.clone(),
+                        secret_store: store.clone(),
+                        secret_key: key.clone(),
+                        as_file: *as_file,
+                        ..Default::default()
+                    }),
+            )
+            .collect(),
     };
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 

@@ -17,7 +17,7 @@ use muru_config::{
 };
 use muru_proto::admin::v1 as pb;
 
-use crate::model::{GroupSpec, MountSpec, ReleaseSpec, valid_name};
+use crate::model::{EnvSpec, GroupSpec, MountSpec, ReleaseSpec, valid_name};
 use crate::store::{Store, StoreError};
 
 /// What an apply does to one object.
@@ -938,6 +938,41 @@ pub fn resolve_spec(
         return Err("memory.check_interval must be longer than nothing".to_owned());
     }
 
+    // Section 10.8: the environment, the table's entries with the
+    // request's over them, references kept as references.
+
+    let mut env_table: BTreeMap<String, EnvSpec> = BTreeMap::new();
+
+    for (name, value) in &table.env {
+        env_table.insert(name.clone(), env_spec_from_table(name, value)?);
+    }
+
+    for entry in &request.env {
+        if !crate::model::valid_env_name(&entry.name) {
+            return Err(format!("env: {:?} is not a variable name", entry.name));
+        }
+
+        if entry.secret_store.is_empty() != entry.secret_key.is_empty() {
+            return Err(format!(
+                "env {}: a secret needs both a store and a key",
+                entry.name
+            ));
+        }
+
+        env_table.insert(
+            entry.name.clone(),
+            EnvSpec {
+                name: entry.name.clone(),
+                value: entry.secret_store.is_empty().then(|| entry.value.clone()),
+                secret_store: (!entry.secret_store.is_empty()).then(|| entry.secret_store.clone()),
+                secret_key: (!entry.secret_key.is_empty()).then(|| entry.secret_key.clone()),
+                as_file: entry.as_file && !entry.secret_store.is_empty(),
+            },
+        );
+    }
+
+    let env: Vec<EnvSpec> = env_table.into_values().collect();
+
     if request.max_requests == Some(0)
         || (request.max_requests.is_none() && table.max_requests == Some(0))
     {
@@ -978,6 +1013,7 @@ pub fn resolve_spec(
         max_lifetime_ms,
         timeouts,
         memory,
+        env,
     })
 }
 
@@ -1011,6 +1047,44 @@ fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
 
     text.parse()
         .map_err(|error: muru_config::ParseError| error.to_string())
+}
+
+/// One variable of an `[env]` table as the spec records it.
+fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvSpec, String> {
+    if !crate::model::valid_env_name(name) {
+        return Err(format!("env: {name:?} is not a variable name"));
+    }
+
+    Ok(match value {
+        muru_config::EnvValue::Plain(text) => EnvSpec {
+            name: name.to_owned(),
+            value: Some(text.clone()),
+            secret_store: None,
+            secret_key: None,
+            as_file: false,
+        },
+        muru_config::EnvValue::Secret(secret) => {
+            if secret.secret.store.is_empty() || secret.secret.key.is_empty() {
+                return Err(format!("env {name}: a secret needs a store and a key"));
+            }
+
+            let as_file = match secret.deliver.as_deref() {
+                None | Some("env") => false,
+                Some("file") => true,
+                Some(other) => {
+                    return Err(format!("env {name}: as must be file or env, not {other:?}"));
+                }
+            };
+
+            EnvSpec {
+                name: name.to_owned(),
+                value: None,
+                secret_store: Some(secret.secret.store.clone()),
+                secret_key: Some(secret.secret.key.clone()),
+                as_file,
+            }
+        }
+    })
 }
 
 /// A declared release as the deploy request it stands for.
@@ -1077,6 +1151,24 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|m| m.check_interval.as_ref()),
         ),
+        env: table
+            .env
+            .iter()
+            .map(|(name, value)| match value {
+                muru_config::EnvValue::Plain(text) => pb::EnvEntry {
+                    name: name.clone(),
+                    value: text.clone(),
+                    ..Default::default()
+                },
+                muru_config::EnvValue::Secret(secret) => pb::EnvEntry {
+                    name: name.clone(),
+                    secret_store: secret.secret.store.clone(),
+                    secret_key: secret.secret.key.clone(),
+                    as_file: secret.deliver.as_deref() == Some("file"),
+                    ..Default::default()
+                },
+            })
+            .collect(),
     }
 }
 
@@ -1164,6 +1256,26 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
             }
         }),
+        env: spec
+            .env
+            .iter()
+            .map(|entry| {
+                let value = match (&entry.secret_store, &entry.secret_key) {
+                    (Some(store), Some(key)) => {
+                        muru_config::EnvValue::Secret(muru_config::SecretValue {
+                            secret: muru_config::SecretRef {
+                                store: store.clone(),
+                                key: key.clone(),
+                            },
+                            deliver: entry.as_file.then(|| "file".to_owned()),
+                        })
+                    }
+                    _ => muru_config::EnvValue::Plain(entry.value.clone().unwrap_or_default()),
+                };
+
+                (entry.name.clone(), value)
+            })
+            .collect(),
         memory: (spec.memory != crate::model::MemoryPolicy::default()).then(|| {
             muru_config::Memory {
                 measure: Some(spec.memory.measure),
@@ -1309,8 +1421,26 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_memory(&declared.memory),
         describe_memory(&recorded.memory),
     );
+    compare(
+        "env",
+        describe_env(&declared.env),
+        describe_env(&recorded.env),
+    );
 
     found
+}
+
+/// An environment as one phrase, for the report, never with a secret's
+/// value.
+fn describe_env(env: &[EnvSpec]) -> String {
+    if env.is_empty() {
+        return "none".to_owned();
+    }
+
+    env.iter()
+        .map(EnvSpec::describe)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A memory policy as one phrase, for the report.

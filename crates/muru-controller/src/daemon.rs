@@ -53,6 +53,8 @@ pub struct Config {
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
     pub compression: Option<muru_config::Compression>,
+    /// The secret stores (section 10.8).
+    pub secrets: Vec<crate::secrets::Store>,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
     /// Where the Prometheus exposition is served, or nowhere.
@@ -298,6 +300,8 @@ struct Daemon {
     proxy: Option<pb::Proxy>,
     /// The [compression] table, for every snapshot.
     compression: pb::Compression,
+    /// The secret stores releases may refer to (section 10.8).
+    secrets: Vec<crate::secrets::Store>,
     running: HashMap<(String, String), Running>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
@@ -514,6 +518,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         logs: Logs::default(),
         proxy,
         compression,
+        secrets: config.secrets.clone(),
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
@@ -667,6 +672,44 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     outcome
+}
+
+/// Section 10.8: the environment a release's host starts with, its
+/// secrets resolved from the stores; a secret delivered as a file is
+/// written under `secrets_dir` and the variable NAME_FILE names it.
+async fn resolve_env(
+    stores: &[crate::secrets::Store],
+    env: &[crate::model::EnvSpec],
+    secrets_dir: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let mut resolved = Vec::with_capacity(env.len());
+
+    for entry in env {
+        let (Some(store_name), Some(key)) = (&entry.secret_store, &entry.secret_key) else {
+            resolved.push((entry.name.clone(), entry.value.clone().unwrap_or_default()));
+            continue;
+        };
+        let store = stores
+            .iter()
+            .find(|store| &store.name == store_name)
+            .ok_or_else(|| format!("env {}: no secret store named {store_name}", entry.name))?;
+        let value = store.resolve(key).await?;
+
+        if entry.as_file {
+            let path = secrets_dir.join(&entry.name);
+            crate::secrets::write_private(&path, &value).map_err(|error| {
+                format!(
+                    "env {}: writing the secret file failed: {error}",
+                    entry.name
+                )
+            })?;
+            resolved.push((format!("{}_FILE", entry.name), path.display().to_string()));
+        } else {
+            resolved.push((entry.name.clone(), value));
+        }
+    }
+
+    Ok(resolved)
 }
 
 /// Write the edge's record for the next daemon.
@@ -1482,6 +1525,21 @@ impl Daemon {
 
         self.set_state(&release, ReleaseState::Starting, "starting the host");
         let spec = &release.spec;
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+
+        // Section 10.8: secrets are resolved now, for this start, and
+        // delivered as variables or as files only the host can read.
+
+        let env = match resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await {
+            Ok(env) => env,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
         let host_spec = HostSpec {
             python: spec.python.clone(),
             app: spec.entrypoint.clone(),
@@ -1504,6 +1562,7 @@ impl Daemon {
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
             memory: spec.memory.clone(),
+            env,
             groups: spec
                 .groups
                 .iter()
@@ -1526,7 +1585,6 @@ impl Daemon {
                 })
                 .collect(),
         };
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let started = Instant::now();
 
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {

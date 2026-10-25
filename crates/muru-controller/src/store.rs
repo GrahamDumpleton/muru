@@ -558,6 +558,7 @@ mod tests {
             max_lifetime_ms: None,
             timeouts: Default::default(),
             memory: Default::default(),
+            env: Vec::new(),
         }
     }
 
