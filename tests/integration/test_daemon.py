@@ -133,12 +133,21 @@ def test_settings_come_from_the_table_and_flags(daemon: Daemon) -> None:
 
 
 def test_release_wait_and_no_wait(daemon: Daemon) -> None:
-    line = daemon.deploy("shop", SHOP, "--no-wait")
-    assert line.startswith("muru: release shop@r1 recorded")
+    # A release is ready only once the edge has it, so the first request
+    # after the wait reaches the new release. Several deploys give the
+    # window between the workers being ready and the edge being told a
+    # chance to show.
 
-    waited = daemon.muructl("release", "wait", "shop@r1", "--timeout", "60").stdout.strip()
-    assert waited == "muru: release shop@r1 is ready"
-    assert daemon.get("/").status == 200
+    for number in range(1, 5):
+        line = daemon.deploy("shop", SHOP, "--no-wait", "--processes", "1")
+        assert line.startswith(f"muru: release shop@r{number} recorded")
+
+        waited = daemon.muructl("release", "wait", f"shop@r{number}", "--timeout", "60")
+        assert waited.stdout.strip() == f"muru: release shop@r{number} is ready"
+
+        response = daemon.get("/info")
+        assert response.status == 200
+        assert json.loads(response.body)["release"] == f"r{number}"
 
 
 def test_a_dead_host_is_started_again(daemon: Daemon) -> None:

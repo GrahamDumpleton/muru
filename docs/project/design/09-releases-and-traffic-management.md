@@ -40,6 +40,8 @@ stateDiagram-v2
 
 Superseded releases stay warm for a retention window (default 30 minutes, or the deploy's retain setting), so rollback avoids a cold start; one release per application is retained, and a release superseded again is stopped. Once drained, a retained release scales down to a warm floor: its preloaded host plus retain_workers per required worker group (default 1). Because workers fork from the preloaded host, scaling back up takes seconds at most. If the node goes over its memory budget, retained releases drop to the host alone, and are stopped, oldest first, if that is still not enough. These defaults are provisional and flagged for review (section 19.2). Readiness requires every required worker group, in every variant, to have its minimum ready workers and the release checks of section 9.11 to pass.
 
+- **Details fixed by the implementation.** A release whose workers are all ready stays warming until the daemon has pushed the snapshot that gives it to the edge, as the serving release, a held release, a canary candidate or a release a traffic policy names, and is ready only then, so `muructl release wait` never answers before a request can reach it. The `release.ready` event marks the workers' readiness, with the time they took, and comes before `traffic.switched`.
+
 ## 9.2 Strategies
 
 | Strategy | Mechanism |

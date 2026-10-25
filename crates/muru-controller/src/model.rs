@@ -19,9 +19,11 @@ pub enum ReleaseState {
     Pending,
     /// The host is starting and preloading.
     Starting,
-    /// Workers are forking and not yet all ready.
+    /// Workers are forking and not yet all ready, or all are ready and
+    /// the edge has not yet been given the release.
     Warming,
-    /// Every worker is ready; the release can take traffic.
+    /// Every worker is ready and the edge has the release, so it can
+    /// take traffic.
     Ready,
     /// Removed from traffic; requests in flight are finishing.
     Draining,
