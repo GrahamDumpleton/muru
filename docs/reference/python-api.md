@@ -58,6 +58,13 @@ no fork, so `pre_fork` does not run.
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
 
+## `muru.is_internal()`
+
+`muru.is_internal(environ_or_scope)` returns whether the request arrived
+by [internal redirect](../howto/internal-redirects.md): `True` when a
+WSGI environ carries `muru.internal`, or an ASGI scope's
+`extensions["muru"]` carries `internal`. Outside Muru it is `False`.
+
 ## `muru.RequestTimeout`
 
 The exception the soft timeout raises in the thread of a request that

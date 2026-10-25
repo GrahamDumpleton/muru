@@ -640,6 +640,19 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }
         }
 
+        // Section 4.10: the applications a route accepts redirects from
+        // must exist.
+
+        for app in &route.accept_redirects_from {
+            if !known_app(app) {
+                plan.errors.push(format!(
+                    "route {} {}: accept_redirects_from names {app}, which is not an application",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+        }
+
         if seen.contains(&key) {
             plan.errors.push(format!(
                 "route {} {} is declared twice",
@@ -661,11 +674,26 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                     route: Box::new(route.clone()),
                     new: recorded.is_none(),
                 },
-                detail: match &route.traffic {
-                    Some(traffic) => {
-                        format!("to {}, {}", route.app, describe_traffic(Some(traffic)))
+                detail: {
+                    let mut detail = match &route.traffic {
+                        Some(traffic) => {
+                            format!("to {}, {}", route.app, describe_traffic(Some(traffic)))
+                        }
+                        None => format!("to {}", route.app),
+                    };
+
+                    if route.internal == Some(true) {
+                        detail.push_str(", internal");
                     }
-                    None => format!("to {}", route.app),
+
+                    if !route.accept_redirects_from.is_empty() {
+                        detail.push_str(&format!(
+                            ", redirects from {}",
+                            route.accept_redirects_from.join(", ")
+                        ));
+                    }
+
+                    detail
                 },
             }),
         }
@@ -978,6 +1006,14 @@ pub fn resolve_spec(
     // two share a path.
 
     let mut resolved_mounts: Vec<MountSpec> = Vec::new();
+    let accel_redirect = request
+        .accel_redirect
+        .or(table.accel_redirect)
+        .unwrap_or(false);
+    let cgi_local_redirect = request
+        .cgi_local_redirect
+        .or(table.cgi_local_redirect)
+        .unwrap_or(false);
 
     for (name, mount) in mounts.unwrap_or(&table.mounts) {
         if !crate::model::valid_name(name) {
@@ -1003,11 +1039,18 @@ pub fn resolve_spec(
             return Err(format!("mount {name}: another mount has the path {path}"));
         }
 
+        // Section 4.10: a mount's redirect settings, with the release's
+        // as the defaults.
+
         resolved_mounts.push(MountSpec {
             name: name.clone(),
             path,
             entrypoint: mount.entrypoint.clone(),
             interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+            internal: mount.internal.unwrap_or(false),
+            accept_redirects_from: mount.accept_redirects_from.clone(),
+            accel_redirect: mount.accel_redirect.unwrap_or(accel_redirect),
+            cgi_local_redirect: mount.cgi_local_redirect.unwrap_or(cgi_local_redirect),
         });
     }
 
@@ -1193,6 +1236,8 @@ pub fn resolve_spec(
         factory,
         groups: resolved_groups,
         mounts: resolved_mounts,
+        accel_redirect,
+        cgi_local_redirect,
         logging: logging
             .or(table.logging.as_ref())
             .and_then(|logging| logging.python.clone())
@@ -1486,6 +1531,8 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         hold: false,
         max_requests: table.max_requests,
         max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
+        accel_redirect: table.accel_redirect,
+        cgi_local_redirect: table.cgi_local_redirect,
         soft_timeout_ms: duration_field(
             table
                 .timeouts
@@ -1606,6 +1653,12 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         path: mount.path.clone(),
                         entrypoint: mount.entrypoint.clone(),
                         interface: Some(mount.interface),
+                        internal: mount.internal.then_some(true),
+                        accept_redirects_from: mount.accept_redirects_from.clone(),
+                        accel_redirect: (mount.accel_redirect != spec.accel_redirect)
+                            .then_some(mount.accel_redirect),
+                        cgi_local_redirect: (mount.cgi_local_redirect != spec.cgi_local_redirect)
+                            .then_some(mount.cgi_local_redirect),
                     },
                 )
             })
@@ -1671,6 +1724,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
             }
         }),
+        accel_redirect: spec.accel_redirect.then_some(true),
+        cgi_local_redirect: spec.cgi_local_redirect.then_some(true),
     }
 }
 
@@ -1787,6 +1842,16 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "mounts",
         describe_mounts(&declared.mounts),
         describe_mounts(&recorded.mounts),
+    );
+    compare(
+        "accel_redirect",
+        declared.accel_redirect.to_string(),
+        recorded.accel_redirect.to_string(),
+    );
+    compare(
+        "cgi_local_redirect",
+        declared.cgi_local_redirect.to_string(),
+        recorded.cgi_local_redirect.to_string(),
     );
     compare(
         "max_requests",
@@ -1916,7 +1981,38 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
     mounts
         .iter()
-        .map(|mount| format!("{} {} at {}", mount.name, mount.entrypoint, mount.path))
+        .map(|mount| {
+            let mut flags = Vec::new();
+
+            if mount.internal {
+                flags.push("internal".to_owned());
+            }
+
+            if !mount.accept_redirects_from.is_empty() {
+                flags.push(format!(
+                    "redirects from {}",
+                    mount.accept_redirects_from.join(", ")
+                ));
+            }
+
+            if mount.accel_redirect {
+                flags.push("accel_redirect".to_owned());
+            }
+
+            if mount.cgi_local_redirect {
+                flags.push("cgi_local_redirect".to_owned());
+            }
+
+            let flags = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", flags.join(", "))
+            };
+            format!(
+                "{} {} at {}{flags}",
+                mount.name, mount.entrypoint, mount.path
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }

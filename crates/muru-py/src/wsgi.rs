@@ -812,6 +812,22 @@ fn build_environ<'py>(
         environ.set_item(intern!(py, "muru.max_body_size"), head.max_body_size)?;
     }
 
+    // Section 4.10: a request that arrived by internal redirect carries
+    // the CGI REDIRECT_* variables for what the client asked for.
+
+    if let Some(internal) = &head.internal {
+        environ.set_item(intern!(py, "muru.internal"), true)?;
+        environ.set_item(intern!(py, "REDIRECT_URL"), &internal.redirect_url)?;
+        environ.set_item(
+            intern!(py, "REDIRECT_QUERY_STRING"),
+            &internal.redirect_query_string,
+        )?;
+        environ.set_item(
+            intern!(py, "REDIRECT_STATUS"),
+            internal.redirect_status.to_string(),
+        )?;
+    }
+
     // Section 4.7: behind a trusted proxy, REMOTE_ADDR is the resolved
     // client and the peer that actually connected is kept beside it.
 

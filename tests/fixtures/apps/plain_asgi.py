@@ -323,6 +323,19 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
         await stream(query, send)
     elif path == "/events":
         await events(query, send)
+    elif path == "/redirect-to":
+        # Section 4.10: an internal redirect, with trusted headers for
+        # the target.
+
+        headers = [(b"x-muru-redirect", query.get("path", "/info").encode())]
+
+        for item in query.get("header", "").split(","):
+            if ":" in item:
+                name, value = item.split(":", 1)
+                headers.append((f"x-muru-redirect-header-{name}".encode(), value.encode()))
+
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": b"redirect\n"})
     elif path == "/sleep":
         await asyncio.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"slept\n")

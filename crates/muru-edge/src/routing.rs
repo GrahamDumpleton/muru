@@ -44,6 +44,50 @@ struct Route {
     fallback_app: String,
     /// How the application's releases share the requests (section 9.4).
     traffic: Option<Policy>,
+    /// Reachable only through internal redirects (section 4.10).
+    internal: bool,
+    /// Applications other than the route's own whose redirects may
+    /// reach it.
+    accept_redirects_from: Vec<String>,
+}
+
+impl Route {
+    /// The application the route belongs to: its own, or a static
+    /// route's fallback; empty for a static route with none.
+    fn owner(&self) -> &str {
+        if self.app.is_empty() {
+            &self.fallback_app
+        } else {
+            &self.app
+        }
+    }
+
+    /// Whether a redirect issued by `app` may reach the route (section
+    /// 4.10): its own application's always may, another's when listed.
+    fn accepts(&self, app: &str) -> bool {
+        self.owner() == app || self.accept_redirects_from.iter().any(|name| name == app)
+    }
+}
+
+/// The application and release that issued an internal redirect (section
+/// 4.10): what the sub-request's routing is judged against, and the
+/// release a redirect back into the same application is pinned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The application that redirected.
+    pub app: String,
+    /// The release that redirected.
+    pub release: String,
+}
+
+/// Which response forms a mount treats as internal redirects (section
+/// 4.10), beyond X-Muru-Redirect, which always is one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedirectFlags {
+    /// X-Accel-Redirect is honoured.
+    pub accel_redirect: bool,
+    /// A 200 with a Location starting with `/` and no body is a redirect.
+    pub cgi_local_redirect: bool,
 }
 
 /// The worker sockets of one group of a release, as a snapshot or a
@@ -65,6 +109,15 @@ pub struct MountPath {
     pub name: String,
     /// The path prefix it serves.
     pub path: String,
+    /// Reachable only through internal redirects (section 4.10).
+    pub internal: bool,
+    /// Other applications whose redirects may reach the mount when it is
+    /// internal; the release's own always may.
+    pub accept_redirects_from: Vec<String>,
+    /// X-Accel-Redirect from the mount is an internal redirect.
+    pub accel_redirect: bool,
+    /// A 200 with a local Location and no body is an internal redirect.
+    pub cgi_local_redirect: bool,
 }
 
 /// Where a request goes within an application: the group's pool and the
@@ -82,6 +135,8 @@ pub struct Selection {
     pub mount: String,
     /// The mount's path, empty for the default mount.
     pub script_name: String,
+    /// Which response forms from the mount are internal redirects.
+    pub redirects: RedirectFlags,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -307,17 +362,22 @@ pub struct AppPools {
     /// A group path prefix, the group's name and its pool.
     groups: Vec<(String, String, Arc<LinkPool>)>,
     mounts: Vec<MountPath>,
+    /// The default mount's redirect forms (section 4.10).
+    redirects: RedirectFlags,
 }
 
 impl AppPools {
     /// Connect the default workers and each group's. `app` and `release`
-    /// label the requests served in the access log.
+    /// label the requests served in the access log; `redirects` says
+    /// which response forms from the default mount are internal
+    /// redirects.
     pub async fn connect(
         app: &str,
         release: &str,
         default: &[std::path::PathBuf],
         groups: &[GroupSockets],
         mounts: &[MountPath],
+        redirects: RedirectFlags,
     ) -> anyhow::Result<Self> {
         let default = Arc::new(LinkPool::connect(default).await?);
         let mut connected = Vec::new();
@@ -336,6 +396,10 @@ impl AppPools {
             .map(|mount| MountPath {
                 name: mount.name.clone(),
                 path: group_prefix(&mount.path),
+                internal: mount.internal,
+                accept_redirects_from: mount.accept_redirects_from.clone(),
+                accel_redirect: mount.accel_redirect,
+                cgi_local_redirect: mount.cgi_local_redirect,
             })
             .collect();
         mounts.sort_by_key(|mount| std::cmp::Reverse(mount.path.len()));
@@ -346,6 +410,7 @@ impl AppPools {
             default,
             groups: connected,
             mounts,
+            redirects,
         })
     }
 
@@ -357,13 +422,17 @@ impl AppPools {
             default: Arc::new(pool),
             groups: Vec::new(),
             mounts: Vec::new(),
+            redirects: RedirectFlags::default(),
         }
     }
 
     /// Where a path goes: the most specific group path's pool, else the
     /// default group's, and the longest mount prefix, else the default
-    /// mount (section 6.7).
-    pub fn select(&self, path: &str) -> Selection {
+    /// mount (section 6.7). An internal mount (section 4.10) is reached
+    /// only by a redirect from the release's own application, or from
+    /// one it accepts: a client's request for it, or an unaccepted
+    /// redirect, gets nothing.
+    pub fn select(&self, path: &str, origin: Option<&Origin>) -> Option<Selection> {
         let (group, pool) = self
             .groups
             .iter()
@@ -375,14 +444,34 @@ impl AppPools {
             .iter()
             .find(|mount| prefix_matches(&mount.path, path));
 
-        Selection {
+        if let Some(mount) = mount
+            && mount.internal
+        {
+            let accepted = origin.is_some_and(|origin| {
+                origin.app == self.app
+                    || mount
+                        .accept_redirects_from
+                        .iter()
+                        .any(|name| name == &origin.app)
+            });
+
+            if !accepted {
+                return None;
+            }
+        }
+
+        Some(Selection {
             pool,
             app: self.app.clone(),
             release: self.release.clone(),
             group,
             mount: mount.map(|mount| mount.name.clone()).unwrap_or_default(),
             script_name: mount.map(|mount| mount.path.clone()).unwrap_or_default(),
-        }
+            redirects: mount.map_or(self.redirects, |mount| RedirectFlags {
+                accel_redirect: mount.accel_redirect,
+                cgi_local_redirect: mount.cgi_local_redirect,
+            }),
+        })
     }
 
     /// The default group's pool.
@@ -464,6 +553,16 @@ pub enum Decision {
     Misdirected,
     /// The host has no route for the path (404).
     NoRoute,
+    /// The route or mount is internal (section 4.10) and the request
+    /// did not arrive by a redirect that may reach it (404).
+    InternalOnly,
+    /// A redirect from another application that the route does not
+    /// accept (section 4.10), treated as no route; `app` is the one that
+    /// redirected, for the log.
+    NotAccepted {
+        /// The application that redirected.
+        app: String,
+    },
     /// To a directory of files (section 4.9), with the application that
     /// takes what no file answers, when the route names one.
     Static {
@@ -511,6 +610,10 @@ impl Routing {
                     &paths(&app.sockets),
                     &groups_of(app),
                     &mounts_of(app),
+                    RedirectFlags {
+                        accel_redirect: app.accel_redirect,
+                        cgi_local_redirect: app.cgi_local_redirect,
+                    },
                 )
                 .await?,
             );
@@ -636,6 +739,8 @@ impl Routing {
                     static_route,
                     fallback_app: route.fallback_app.clone(),
                     traffic,
+                    internal: route.internal,
+                    accept_redirects_from: route.accept_redirects_from.clone(),
                 });
             }
         }
@@ -699,7 +804,11 @@ impl Routing {
 
     /// Where a request goes, from the host the client asked for, the
     /// path, the listener it arrived on, whether that was over TLS, and
-    /// what the request brings to the release choice.
+    /// what the request brings to the release choice. With an `origin`
+    /// the request is an internal redirect (section 4.10): internal
+    /// routes and mounts open to it, a route of another application only
+    /// when it accepts the origin's, and a route back into the origin's
+    /// application is pinned to its release.
     pub fn select(
         &self,
         name: Option<&str>,
@@ -707,21 +816,32 @@ impl Routing {
         listener: &str,
         tls: bool,
         client: &Client<'_>,
+        origin: Option<&Origin>,
     ) -> Decision {
         if self.hosts.is_empty() {
-            return Decision::Serve {
-                selection: self.default.select(path),
-                server_name: None,
-                cookies: Vec::new(),
+            return match self.default.select(path, origin) {
+                Some(selection) => Decision::Serve {
+                    selection,
+                    server_name: None,
+                    cookies: Vec::new(),
+                },
+                None => Decision::InternalOnly,
             };
         }
 
-        let Some(index) = self.host_for(name, listener) else {
+        // A redirect may name a host by its configured name as well as
+        // by one of the names clients use.
+
+        let Some(index) = self.host_for(name, listener).or_else(|| {
+            origin.and_then(|_| {
+                name.and_then(|name| self.hosts.iter().position(|host| host.name == name))
+            })
+        }) else {
             return Decision::Misdirected;
         };
         let host = &self.hosts[index];
 
-        if host.https_redirect && !tls {
+        if host.https_redirect && !tls && origin.is_none() {
             return Decision::Redirect;
         }
 
@@ -732,18 +852,31 @@ impl Routing {
             return Decision::NoRoute;
         };
 
+        match origin {
+            None if route.internal => return Decision::InternalOnly,
+            Some(origin) if !route.accepts(&origin.app) => {
+                return Decision::NotAccepted {
+                    app: origin.app.clone(),
+                };
+            }
+            _ => {}
+        }
+
         let mut cookies = Vec::new();
 
         if let Some(static_route) = &route.static_route {
-            let fallback = (!route.fallback_app.is_empty()).then(|| {
+            let fallback = if route.fallback_app.is_empty() {
+                None
+            } else {
                 self.selection_for(
                     &route.fallback_app,
                     route.traffic.as_ref(),
                     path,
                     client,
                     &mut cookies,
+                    origin,
                 )
-            });
+            };
             return Decision::Static {
                 route: Arc::clone(static_route),
                 prefix: route.path.clone(),
@@ -757,13 +890,16 @@ impl Routing {
             };
         }
 
-        let selection = self.selection_for(
+        let Some(selection) = self.selection_for(
             &route.app,
             route.traffic.as_ref(),
             path,
             client,
             &mut cookies,
-        );
+            origin,
+        ) else {
+            return Decision::InternalOnly;
+        };
 
         // SERVER_NAME is the name the request matched with, or the
         // canonical name when the host says so (section 4.3).
@@ -782,9 +918,12 @@ impl Routing {
     }
 
     /// The workers of an application for a request: the release the
-    /// route's policy and the request choose, and within it the group and
-    /// mount for the path. An application the snapshot does not name has
-    /// no workers, and the request fails as unavailable.
+    /// route's policy and the request choose, or the origin's own release
+    /// for a redirect back into its application (section 4.10), and
+    /// within it the group and mount for the path. An application the
+    /// snapshot does not name has no workers, and the request fails as
+    /// unavailable. None when the path's mount is internal and the
+    /// request may not reach it.
     fn selection_for(
         &self,
         app: &str,
@@ -792,17 +931,28 @@ impl Routing {
         path: &str,
         client: &Client<'_>,
         cookies: &mut Vec<String>,
-    ) -> Selection {
+        origin: Option<&Origin>,
+    ) -> Option<Selection> {
         match self.apps.get(app) {
-            Some(releases) => choose(releases, policy, client, cookies).select(path),
-            None => Selection {
+            Some(releases) => {
+                let pinned = origin
+                    .filter(|origin| origin.app == app)
+                    .and_then(|origin| releases.releases.get(&origin.release));
+
+                match pinned {
+                    Some(pools) => pools.select(path, origin),
+                    None => choose(releases, policy, client, cookies).select(path, origin),
+                }
+            }
+            None => Some(Selection {
                 pool: Arc::new(LinkPool::empty()),
                 app: app.to_owned(),
                 release: String::new(),
                 group: DEFAULT_GROUP.to_owned(),
                 mount: String::new(),
                 script_name: String::new(),
-            },
+                redirects: RedirectFlags::default(),
+            }),
         }
     }
 
@@ -840,6 +990,10 @@ fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {
         .map(|mount| MountPath {
             name: mount.name.clone(),
             path: mount.path.clone(),
+            internal: mount.internal,
+            accept_redirects_from: mount.accept_redirects_from.clone(),
+            accel_redirect: mount.accel_redirect,
+            cgi_local_redirect: mount.cgi_local_redirect,
         })
         .collect()
 }
@@ -988,7 +1142,7 @@ mod tests {
     ) -> Decision {
         let headers = HeaderMap::new();
         let ids = crate::errors::RequestIds::new();
-        routing.select(name, path, listener, tls, &client(&headers, &ids))
+        routing.select(name, path, listener, tls, &client(&headers, &ids), None)
     }
 
     fn serves(decision: Decision) -> Option<String> {
@@ -997,6 +1151,8 @@ mod tests {
             Decision::Redirect => Some("redirect".to_owned()),
             Decision::Misdirected => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
+            Decision::InternalOnly => Some("internal".to_owned()),
+            Decision::NotAccepted { .. } => Some("not accepted".to_owned()),
             Decision::Static { server_name, .. } => server_name,
         }
     }
@@ -1214,6 +1370,7 @@ mod tests {
                 "127.0.0.1:8080",
                 true,
                 &client(&headers, &ids),
+                None,
             ));
             assert!(cookies.is_empty(), "a client with an id gets no cookie");
             seen.insert(release);
@@ -1228,6 +1385,7 @@ mod tests {
             "127.0.0.1:8080",
             true,
             &client(&headers, &ids),
+            None,
         ));
         assert_eq!(cookies.len(), 1);
         assert!(
@@ -1256,6 +1414,7 @@ mod tests {
             plain,
             true,
             &client(&headers, &ids),
+            None,
         ));
         assert_eq!(
             (release.as_str(), cookies.len()),
@@ -1275,6 +1434,7 @@ mod tests {
             plain,
             true,
             &client(&headers, &ids),
+            None,
         ));
         assert_ne!(release, "r9", "an unknown release is ignored");
 
@@ -1289,6 +1449,7 @@ mod tests {
             plain,
             true,
             &client(&headers, &ids),
+            None,
         ));
         assert_eq!(
             (release.as_str(), cookies.len()),
@@ -1307,6 +1468,7 @@ mod tests {
             plain,
             true,
             &client(&headers, &ids),
+            None,
         ));
         assert_eq!(cookies.len(), 1, "{cookies:?}");
         assert!(
@@ -1319,6 +1481,7 @@ mod tests {
             plain,
             true,
             &client(&headers, &ids),
+            None,
         ));
         assert_eq!(first, again);
     }

@@ -757,6 +757,8 @@ mod tests {
             memory: Default::default(),
             env: Vec::new(),
             scaling: ScalingSpec::default(),
+            accel_redirect: false,
+            cgi_local_redirect: false,
         }
     }
 

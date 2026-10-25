@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use bytes::{Bytes, BytesMut};
-use http::{Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::body::{Body, Frame, Incoming};
@@ -40,6 +40,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::access::{AccessLog, Record};
 use crate::errors::{self, Negotiation, Problem};
+use crate::routing::RedirectFlags;
 use crate::{BoxError, Limits, ResponseBody, close_after, request_head};
 
 /// After the response has ended, this much of an unread request body is
@@ -461,7 +462,70 @@ pub struct Context<'a> {
     pub mount: String,
     /// The mount's path, joined to SCRIPT_NAME.
     pub mount_path: String,
+    /// How the request arrived by internal redirect (section 4.10), for
+    /// the request head; none for a client's own request.
+    pub internal: Option<Internal>,
+    /// When the client's request arrived: the request deadline bounds
+    /// the whole redirect chain from here.
+    pub arrived: Instant,
+    /// The target the client asked for, on a redirect hop, so the one
+    /// access log entry for the chain names it.
+    pub client_target: Option<String>,
+    /// The targets the request has been redirected to so far.
+    pub hops: Vec<String>,
 }
+
+/// What a redirected sub-request's application learns about the request
+/// it stands in for (section 4.10): REDIRECT_URL, REDIRECT_QUERY_STRING
+/// and REDIRECT_STATUS, the trusted headers the redirecting application
+/// added, and which hop this is.
+#[derive(Debug, Clone)]
+pub struct Internal {
+    /// The path the client asked for.
+    pub redirect_url: String,
+    /// Its query string.
+    pub redirect_query_string: String,
+    /// The status the redirecting application answered.
+    pub redirect_status: u16,
+    /// Headers added with X-Muru-Redirect-Header-NAME, by name.
+    pub headers: Vec<(String, Bytes)>,
+    /// 1 for the first redirect.
+    pub hop: u32,
+}
+
+/// What handling a request produced: a response for the client, or an
+/// internal redirect to route afresh (section 4.10).
+pub enum Handled {
+    /// The response to send.
+    Response(Response<ResponseBody>),
+    /// The application redirected internally.
+    Redirect(Box<Redirect>),
+}
+
+/// An internal redirect an application answered with (section 4.10).
+#[derive(Debug)]
+pub struct Redirect {
+    /// The path, with its query, to route the sub-request to.
+    pub target: String,
+    /// Another configured host to route it under, when named.
+    pub host: Option<String>,
+    /// The status the application answered with, for REDIRECT_STATUS.
+    pub status: u16,
+    /// Keep the method, and the body when it was buffered, rather than
+    /// turning the sub-request into a GET.
+    pub preserve_method: bool,
+    /// Trusted headers for the target, from X-Muru-Redirect-Header-NAME.
+    pub headers: Vec<(String, Bytes)>,
+    /// The redirecting response's headers that carry over to the final
+    /// response: Content-Disposition, Cache-Control, Expires, Set-Cookie,
+    /// Vary and a non-empty Content-Type.
+    pub merged: HeaderMap,
+    /// The buffered request body, for a preserved method.
+    pub body: Option<Bytes>,
+}
+
+/// The most hops an internal redirect chain may take.
+pub const MAX_REDIRECT_HOPS: usize = 5;
 
 /// The host the client asked for, without its port, from the Host header
 /// or the request target.
@@ -519,10 +583,12 @@ impl Recording {
                 },
                 snapshot: context.snapshot,
                 method: parts.method.as_str().to_owned(),
-                target: parts
-                    .uri
-                    .path_and_query()
-                    .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string()),
+                target: context.client_target.clone().unwrap_or_else(|| {
+                    parts
+                        .uri
+                        .path_and_query()
+                        .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string())
+                }),
                 version: format!("{:?}", parts.version),
                 status: 0,
                 reason: String::new(),
@@ -531,9 +597,19 @@ impl Recording {
                 queue: Duration::ZERO,
                 application: Duration::ZERO,
                 total: Duration::ZERO,
+                redirects: context.hops.clone(),
             },
             started: Instant::now(),
         }
+    }
+
+    /// Section 4.10: the request went on by internal redirect. The hop
+    /// counts in the metrics of the application that answered it; the
+    /// line is written once the chain ends.
+    fn hop(mut self, status: u16) {
+        self.record.status = status;
+        self.record.total = self.started.elapsed();
+        self.log.record_hop(&self.record);
     }
 
     pub(crate) fn complete(mut self, status: u16, reason: &str, bytes: u64) {
@@ -551,12 +627,11 @@ impl Recording {
 /// Answer a request the routing tables refuse (421 or 404), recording it
 /// in the access log like any other edge-generated response.
 pub(crate) fn reject(
-    request: http::Request<Incoming>,
+    parts: &http::request::Parts,
     context: &Context<'_>,
     problem: Problem,
 ) -> Response<ResponseBody> {
-    let (parts, _body) = request.into_parts();
-    let recording = Recording::new(context, &parts);
+    let recording = Recording::new(context, parts);
     let failing = Failing {
         request_id: context.request_id,
         max_body_size: context.limits.max_body_size,
@@ -569,12 +644,11 @@ pub(crate) fn reject(
 }
 
 pub(crate) fn redirect_to_https(
-    request: http::Request<Incoming>,
+    parts: &http::request::Parts,
     context: &Context<'_>,
     to: SocketAddr,
 ) -> Response<ResponseBody> {
-    let (parts, _body) = request.into_parts();
-    let recording = Recording::new(context, &parts);
+    let recording = Recording::new(context, parts);
     let host = parts
         .headers
         .get(http::header::HOST)
@@ -609,24 +683,52 @@ pub(crate) fn redirect_to_https(
     response
 }
 
-/// A Host header value without its port: `shop.localhost:8080` becomes
-/// `shop.localhost` and `[::1]:8080` becomes `[::1]`.
+/// Send a request to a worker of the pool and relay its response. `body`
+/// is the client's body, or none for a redirected sub-request, whose
+/// preserved body, if any, is `buffered`; `flags` say which response
+/// forms from the mount count as internal redirects (section 4.10).
 pub async fn handle(
-    request: http::Request<Incoming>,
+    parts: &mut http::request::Parts,
+    body: Option<Incoming>,
+    buffered: Option<Bytes>,
     pool: Arc<LinkPool>,
     context: &Context<'_>,
+    flags: RedirectFlags,
+) -> Handled {
+    let mut redirected = None;
+    let response = handle_inner(parts, body, buffered, pool, context, flags, &mut redirected).await;
+
+    match redirected {
+        Some(redirect) => Handled::Redirect(redirect),
+        None => Handled::Response(response),
+    }
+}
+
+/// `handle` itself: a redirect is reported through `redirected`, with a
+/// placeholder response the caller discards.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
+async fn handle_inner(
+    parts: &mut http::request::Parts,
+    mut body: Option<Incoming>,
+    buffered: Option<Bytes>,
+    pool: Arc<LinkPool>,
+    context: &Context<'_>,
+    flags: RedirectFlags,
+    redirected: &mut Option<Box<Redirect>>,
 ) -> Response<ResponseBody> {
-    let (mut parts, mut body) = request.into_parts();
-    let upgrade = crate::websocket::detect(&mut parts);
-    let mut head = request_head(&parts, context);
+    let upgrade = crate::websocket::detect(parts);
+    let mut head = request_head(parts, context);
     let limits = &context.limits;
-    let arrived = Instant::now();
-    let deadline = arrived + limits.request_deadline;
+    let deadline = context.arrived + limits.request_deadline;
     head.deadline_unix_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
-        .saturating_add(limits.request_deadline.as_millis() as u64);
-    let mut recording = Recording::new(context, &parts);
+        .saturating_add(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        );
+    let mut recording = Recording::new(context, parts);
     let failing = Failing {
         request_id: context.request_id,
         max_body_size: limits.max_body_size,
@@ -647,12 +749,22 @@ pub async fn handle(
     // Section 4.6: a body without a declared length is read in full first,
     // so that the application sees CONTENT_LENGTH and no worker slot is
     // held while it arrives. Polling the body is also what makes hyper
-    // send 100 Continue to a client that is waiting for it.
+    // send 100 Continue to a client that is waiting for it. A redirected
+    // sub-request brings its body already buffered, or none.
 
-    let mut buffered: Option<Bytes> = None;
+    let mut buffered: Option<Bytes> = buffered;
 
-    if !body.is_end_stream() && head.content_length.is_none() {
-        match read_body(&mut body, limits.max_body_size).await {
+    if let Some(data) = &buffered {
+        head.content_length = Some(data.len() as u64);
+        head.body_buffered = true;
+    }
+
+    if buffered.is_none()
+        && let Some(incoming) = body.as_mut()
+        && !incoming.is_end_stream()
+        && head.content_length.is_none()
+    {
+        match read_body(incoming, limits.max_body_size).await {
             Ok(data) => {
                 head.content_length = Some(data.len() as u64);
                 head.body_buffered = true;
@@ -729,15 +841,17 @@ pub async fn handle(
     }
 
     let end = upgrade.is_some()
-        || buffered
-            .as_ref()
-            .map_or_else(|| body.is_end_stream(), Bytes::is_empty);
-    let flags = if end { flag::END } else { 0 };
+        || buffered.as_ref().map_or_else(
+            || body.as_ref().is_none_or(|body| body.is_end_stream()),
+            Bytes::is_empty,
+        );
+    let kept = buffered.clone();
+    let frame_flags = if end { flag::END } else { 0 };
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
     if let Err(error) = frame::write(
         &mut writer,
         kind::REQUEST,
-        flags,
+        frame_flags,
         head.encode_to_vec().into(),
     )
     .await
@@ -762,15 +876,18 @@ pub async fn handle(
         }
         Some(_) => back.give_writer(Some(writer)),
         None if end => back.give_writer(Some(writer)),
-        None => {
-            tokio::spawn(pump_body(
-                body,
-                writer,
-                Arc::clone(&back),
-                expect_continue,
-                limits.body_idle_timeout,
-            ));
-        }
+        None => match body.take() {
+            Some(body) => {
+                tokio::spawn(pump_body(
+                    body,
+                    writer,
+                    Arc::clone(&back),
+                    expect_continue,
+                    limits.body_idle_timeout,
+                ));
+            }
+            None => back.give_writer(Some(writer)),
+        },
     }
 
     let response = loop {
@@ -838,6 +955,33 @@ pub async fn handle(
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
+    }
+
+    // Section 4.10: an internal redirect is not a response for the client
+    // but a request to route afresh. The rest of the worker's response
+    // is drained so the connection goes back to the pool, and the hop
+    // is counted for the application that answered it.
+
+    if upgrade.is_none()
+        && let Some(redirect) = redirect_from(&head, response_end, flags, kept)
+    {
+        if response_end {
+            back.give_reader(Some(reader));
+            back.abort_request();
+        } else {
+            drain_response(reader, &back, limits.response_idle_timeout).await;
+        }
+
+        if let Some(recording) = recording.take() {
+            recording.hop(u16::try_from(head.status).unwrap_or(500));
+        }
+
+        *redirected = Some(Box::new(redirect));
+        return failing.respond(Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "redirect",
+            "The application redirected internally.",
+        ));
     }
 
     // The worker accepted the WebSocket: finish the handshake and relay
@@ -925,6 +1069,115 @@ pub async fn handle(
         close_after(response, failing.version)
     } else {
         response
+    }
+}
+
+/// The internal redirect a response head carries, if any (section 4.10):
+/// X-Muru-Redirect always, X-Accel-Redirect and the CGI local redirect (a
+/// 200 with a Location starting with `/` and no body) when the mount
+/// opts in. The target must be an absolute path on this server. `body`
+/// is the buffered request body, kept for a preserved method.
+fn redirect_from(
+    head: &pb::ResponseHead,
+    response_end: bool,
+    flags: RedirectFlags,
+    body: Option<Bytes>,
+) -> Option<Redirect> {
+    const HEADER_PREFIX: &str = "x-muru-redirect-header-";
+    let mut target: Option<String> = None;
+    let mut accel: Option<String> = None;
+    let mut location: Option<String> = None;
+    let mut host = None;
+    let mut preserve = false;
+    let mut empty_body = response_end;
+    let mut headers = Vec::new();
+    let mut merged = HeaderMap::new();
+
+    for header in &head.headers {
+        let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
+        let value = String::from_utf8_lossy(&header.value).trim().to_owned();
+
+        match name.as_str() {
+            "x-muru-redirect" => target = Some(value),
+            "x-accel-redirect" => accel = Some(value),
+            "x-muru-redirect-host" => host = Some(value),
+            "x-muru-redirect-method" => preserve = value.eq_ignore_ascii_case("preserve"),
+            "location" => location = Some(value),
+            "content-length" => empty_body |= value == "0",
+            "content-disposition" | "cache-control" | "expires" | "set-cookie" | "vary" => {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_bytes(&header.value),
+                ) {
+                    merged.append(name, value);
+                }
+            }
+            "content-type" if !value.is_empty() => {
+                if let Ok(value) = HeaderValue::from_bytes(&header.value) {
+                    merged.insert(http::header::CONTENT_TYPE, value);
+                }
+            }
+            name => {
+                if let Some(added) = name.strip_prefix(HEADER_PREFIX)
+                    && !added.is_empty()
+                {
+                    headers.push((added.to_owned(), header.value.clone()));
+                }
+            }
+        }
+    }
+
+    if target.is_none() && flags.accel_redirect {
+        target = accel;
+    }
+
+    if target.is_none()
+        && flags.cgi_local_redirect
+        && head.status == 200
+        && empty_body
+        && location
+            .as_deref()
+            .is_some_and(|location| location.starts_with('/'))
+    {
+        target = location;
+    }
+
+    let target = target?;
+
+    if !target.starts_with('/') || target.starts_with("//") {
+        tracing::warn!(%target, "an internal redirect must name an absolute path on this server; the response is sent as it is");
+        return None;
+    }
+
+    Some(Redirect {
+        target,
+        host: host.filter(|name| !name.is_empty()),
+        status: u16::try_from(head.status).unwrap_or(500),
+        preserve_method: preserve,
+        headers,
+        merged,
+        body,
+    })
+}
+
+/// Read the rest of a response the edge has no use for, so the worker
+/// connection goes back to the pool intact (section 4.10).
+async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Duration) {
+    loop {
+        match tokio::time::timeout(idle_timeout, frame::read(&mut reader)).await {
+            Ok(Ok(Some(next))) if next.kind == kind::CONTINUE => back.continue_request(),
+            Ok(Ok(Some(next))) if next.kind == kind::BODY && !next.is_end() => {}
+            Ok(Ok(Some(next))) if next.kind == kind::BODY || next.kind == kind::END => {
+                back.give_reader(Some(reader));
+                back.abort_request();
+                return;
+            }
+            _ => {
+                back.give_reader(None);
+                back.abort_request();
+                return;
+            }
+        }
     }
 }
 

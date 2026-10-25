@@ -24,6 +24,7 @@ it adds.
 | `CONTENT_TYPE`, `CONTENT_LENGTH` | From the headers. A body sent without `Content-Length` (chunked) is buffered by the edge, so `CONTENT_LENGTH` is set for it too |
 | `HTTP_*` | Every other header, upper-cased with dashes as underscores. Hop-by-hop headers (`Connection`, `Transfer-Encoding`, `Upgrade` and the others) never appear, and neither does a header whose name contains an underscore, since it could masquerade as another header's key |
 | `HTTPS` | `on` over HTTPS, absent otherwise |
+| `REDIRECT_URL`, `REDIRECT_QUERY_STRING`, `REDIRECT_STATUS` | Present on a request that arrived by [internal redirect](../howto/internal-redirects.md): the path and query the client asked for, and the status the redirecting application answered |
 | `wsgi.version` | `(1, 0)` |
 | `wsgi.url_scheme` | `http` or `https` |
 | `wsgi.input` | A Rust-backed stream: `read`, `readline`, `readlines` and iteration return an empty value at the end of the body and never block past it |
@@ -41,6 +42,7 @@ it adds.
 | `muru.request_id` | The request id, a 26-character ULID. The same value is in the `X-Request-ID` response header, the access log line and the error page |
 | `muru.max_body_size` | The body limit in force, in bytes: 100 MB in development, 10 MB with `--allow-public`, or what `--max-body-size` set |
 | `muru.proxy_addr` | Present only when a trusted proxy forwarded the request (see [behind a proxy](../howto/behind-a-proxy.md)): the address of the proxy that connected, while `REMOTE_ADDR` is the client it forwarded |
+| `muru.internal` | `True` on a request that arrived by internal redirect, absent otherwise; `muru.is_internal(environ)` reads it |
 | `muru.tls` | Present over HTTPS only: a dictionary with `version` (`TLSv1.3` or `TLSv1.2`), `cipher` (the negotiated suite, for example `TLS13_AES_256_GCM_SHA384`), `server_name` (the name the client asked for, empty when it connected by address) and `alpn` (`h2`, `http/1.1`, or empty when the client offered none) |
 
 ## Rules worth knowing

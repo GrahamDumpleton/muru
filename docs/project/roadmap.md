@@ -300,3 +300,23 @@ one by 5 s, checked on `muructl run`, `deploy` and `apply`. Still to
 come: the loop stall timeout, the host's stack capture attached to the
 event when a request passes the soft timeout (section 11.7), and
 `muru.deadline` in the environ.
+
+Internal redirects (section 4.10) are in: an application's response with
+`X-Muru-Redirect` (always), `X-Accel-Redirect` or a CGI local redirect
+(where the release or mount opts in) is drained and the request routed
+afresh as a GET (HEAD stays HEAD) with the client's headers, or with its
+method and buffered body when `X-Muru-Redirect-Method: preserve` asks;
+`X-Muru-Redirect-Host` picks another host and `X-Muru-Redirect-Header-*`
+adds trusted headers; a redirect back into the same application is
+pinned to the release that redirected, another application's route takes
+it only when `accept_redirects_from` names the redirecting application,
+and routes and mounts marked `internal` answer 404 to clients; the
+target sees REDIRECT_URL, REDIRECT_QUERY_STRING and REDIRECT_STATUS (in
+the ASGI scope's muru extension too) and `muru.is_internal()`; the
+redirecting response's Content-Disposition, Cache-Control, Expires,
+Set-Cookie, Vary and non-empty Content-Type carry over; a chain stops
+after 5 hops with 500 redirect_loop under the client's deadline, with
+one access log line naming every hop; and a client's X-Muru-* request
+headers are stripped at the edge. Still to come: upload offloading, the
+file hints (X-Muru-Sendfile) the same directory serving backs, and error
+page handlers reached by internal path.

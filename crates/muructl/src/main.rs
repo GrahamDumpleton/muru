@@ -255,6 +255,8 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         sockets: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
+        accel_redirect: false,
+        cgi_local_redirect: false,
         development: true,
         access_log,
         limits: muru_edge::Limits::default(),
@@ -1067,6 +1069,9 @@ struct Resolved {
     max_lifetime: Option<Duration>,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
+    /// Section 4.10: the default mount's redirect settings from the table.
+    accel_redirect: bool,
+    cgi_local_redirect: bool,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
     /// Environment variables from the table (section 10.8).
@@ -1189,6 +1194,8 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         source,
         groups: table.groups,
         mounts: table.mounts,
+        accel_redirect: table.accel_redirect.unwrap_or(false),
+        cgi_local_redirect: table.cgi_local_redirect.unwrap_or(false),
         logging: table.logging,
         max_requests: args.max_requests.or(table.max_requests),
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
@@ -1246,6 +1253,8 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         hooks: resolved.hooks.clone(),
         groups: resolved.groups.clone(),
         mounts: resolved.mounts.clone(),
+        accel_redirect: resolved.accel_redirect.then_some(true),
+        cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
         logging: resolved.logging.clone(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
@@ -1364,15 +1373,21 @@ async fn host_control(
     }
 }
 
-/// The named mounts as the edge selects them.
-fn mount_paths(
-    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
-) -> Vec<muru_edge::routing::MountPath> {
-    mounts
+/// The named mounts as the edge selects them, with their redirect
+/// settings (section 4.10), the release's where a mount is silent.
+fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
+    resolved
+        .mounts
         .iter()
         .map(|(name, mount)| muru_edge::routing::MountPath {
             name: name.clone(),
             path: mount.path.clone(),
+            internal: mount.internal.unwrap_or(false),
+            accept_redirects_from: mount.accept_redirects_from.clone(),
+            accel_redirect: mount.accel_redirect.unwrap_or(resolved.accel_redirect),
+            cgi_local_redirect: mount
+                .cgi_local_redirect
+                .unwrap_or(resolved.cgi_local_redirect),
         })
         .collect()
 }
@@ -1579,7 +1594,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let logs = Logs::default();
     let group_tables = resolved.groups.clone();
-    let mount_tables = resolved.mounts.clone();
+    let mounts = mount_paths(&resolved);
+    let redirect_flags = muru_edge::routing::RedirectFlags {
+        accel_redirect: resolved.accel_redirect,
+        cgi_local_redirect: resolved.cgi_local_redirect,
+    };
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -1600,7 +1619,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         release: "r1".to_owned(),
         sockets: current.default_sockets(),
         groups: group_sockets(&current, &resolved.groups),
-        mounts: mount_paths(&resolved.mounts),
+        mounts: mounts.clone(),
+        accel_redirect: resolved.accel_redirect,
+        cgi_local_redirect: resolved.cgi_local_redirect,
         development,
         access_log,
         limits: limits(&args),
@@ -1760,7 +1781,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             &format!("r{}", current.release),
                             &sockets,
                             &group_sockets_from(&groups, &group_tables),
-                            &mount_paths(&mount_tables),
+                            &mounts,
+                            redirect_flags,
                         )
                         .await;
 
@@ -1808,7 +1830,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     &format!("r{release}"),
                                     &next.default_sockets(),
                                     &group_sockets(&next, &group_tables),
-                                &mount_paths(&mount_tables),
+                                    &mounts,
+                                    redirect_flags,
                                 )
                                 .await;
 

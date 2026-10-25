@@ -780,6 +780,8 @@ impl Admin for Service {
                         .as_ref()
                         .and_then(|traffic| traffic.hash_key.clone())
                         .unwrap_or_default(),
+                    internal: route.internal == Some(true),
+                    accept_redirects_from: route.accept_redirects_from,
                     host: route.host,
                     path: route.path,
                     app: route.app,

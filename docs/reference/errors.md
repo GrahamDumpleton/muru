@@ -19,9 +19,11 @@ precisely than the status, appears in the access log line as
 | Status | Reason | When |
 | --- | --- | --- |
 | 400 | `malformed` | The request body could not be read: a broken chunked encoding, or the connection failed mid-body |
+| 404 | `internal_only` | The route or mount is reachable only through an internal redirect (see the [internal redirects guide](../howto/internal-redirects.md)) |
 | 408 | `client_timeout` | The client paused for longer than the body idle timeout while sending a body |
 | 413 | `body_too_large` | The declared or actual body is over the limit in force; the page names the limit and the setting. Declared lengths are refused before the body is read |
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
+| 500 | `redirect_loop` | The application redirected internally more than 5 times for one request |
 | 502 | `worker_crashed` | The worker's connection ended before a response head, or it sent something invalid |
 | 503 | `no_workers` | No worker is available at all, with `Retry-After: 1` |
 | 503 | `queue_full` | Every worker thread was busy for longer than the queue timeout, with `Retry-After: 1` |

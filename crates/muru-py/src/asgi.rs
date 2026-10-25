@@ -1010,6 +1010,16 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         muru.set_item("max_body_size", head.max_body_size)?;
     }
 
+    // Section 4.10: a request that arrived by internal redirect says so,
+    // with what the client asked for.
+
+    if let Some(internal) = &head.internal {
+        muru.set_item("internal", true)?;
+        muru.set_item("redirect_url", &internal.redirect_url)?;
+        muru.set_item("redirect_query_string", &internal.redirect_query_string)?;
+        muru.set_item("redirect_status", internal.redirect_status)?;
+    }
+
     if let Some(proxy) = &head.proxy {
         muru.set_item("proxy_addr", &proxy.address)?;
     }

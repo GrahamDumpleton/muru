@@ -2256,10 +2256,22 @@ impl Daemon {
                                 .map(|mount| pb::Mount {
                                     name: mount.name.clone(),
                                     path: mount.path.clone(),
+                                    internal: mount.internal,
+                                    accept_redirects_from: mount.accept_redirects_from.clone(),
+                                    accel_redirect: mount.accel_redirect,
+                                    cgi_local_redirect: mount.cgi_local_redirect,
                                 })
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    accel_redirect: self
+                        .store
+                        .release(name, id)
+                        .is_ok_and(|release| release.spec.accel_redirect),
+                    cgi_local_redirect: self
+                        .store
+                        .release(name, id)
+                        .is_ok_and(|release| release.spec.cgi_local_redirect),
                 });
             }
         }
@@ -2349,6 +2361,8 @@ impl Daemon {
                     .unwrap_or_default(),
                 no_redirect_slash: route.redirect_slash == Some(false),
                 case_insensitive: route.case.as_deref() == Some("insensitive"),
+                internal: route.internal == Some(true),
+                accept_redirects_from: route.accept_redirects_from,
             })
             .collect();
 

@@ -47,7 +47,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | processes, threads, sync_threads | release, group, mount | 2, 8 for WSGI, 1 loop for ASGI | 6.4 |
 | hooks | release | none | 6.3 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |
-| path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount | none, false, false, false, 1000, 1000 | 6.7, 4.10 |
+| path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none, false, false, false, 1000, 1000 | 6.7, 4.10 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |
@@ -60,7 +60,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | upload, max_file_size, max_files, hash, precheck, spool quota | route | off, unlimited, 100, sha256, false, 10GB per application | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache, sendfile_roots | route, mount | none | 4.9 |
 | error_pages, error_override | global, host, application, route | built-in, off | 4.12 |
-| accept_redirects_from | route, mount | none | 4.10 |
+| accept_redirects_from, internal | route, mount | none, false | 4.10 |
 | names, listeners, tls, canonical, https_redirect, use_canonical_name | host | none, all, none, none, false, false | 4.3 |
 | traffic: split, sticky, hash_key, salt, sticky_grace | route | 100% to newest ready release, off, cookie, per route, 10m | 9.4 |
 | retention of superseded releases | application | 30m | 9.1 |

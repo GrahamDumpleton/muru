@@ -1457,6 +1457,8 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             .max_lifetime
             .map(|lifetime| lifetime.as_millis() as u64),
         soft_timeout_ms: timeout_ms(&args.timeouts, "soft"),
+        accel_redirect: None,
+        cgi_local_redirect: None,
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
@@ -2145,6 +2147,20 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
             }
 
             target = format!("{target} ({})", parts.join(", "));
+        }
+
+        // Section 4.10: reachable by internal redirect only, and from
+        // which other applications.
+
+        if route.internal {
+            target.push_str(" [internal]");
+        }
+
+        if !route.accept_redirects_from.is_empty() {
+            target.push_str(&format!(
+                " [redirects from {}]",
+                route.accept_redirects_from.join(", ")
+            ));
         }
 
         println!("{:<16} {:<24} {target}", route.host, route.path);

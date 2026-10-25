@@ -613,6 +613,7 @@ mod tests {
             queue: Duration::from_millis(1),
             application: Duration::from_millis(total_ms / 2),
             total: Duration::from_millis(total_ms),
+            redirects: Vec::new(),
         }
     }
 

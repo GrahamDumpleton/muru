@@ -260,6 +260,23 @@ pub struct Mount {
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Interface>,
+    /// Reachable only through internal redirects (section 4.10): a
+    /// client's request for its path is answered 404 (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+    /// Other applications whose internal redirects may reach the mount
+    /// when it is internal; the release's own always may.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_redirects_from: Vec<String>,
+    /// Treat an `X-Accel-Redirect` response header from the mount as an
+    /// internal redirect (default the release's setting, else false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_redirect: Option<bool>,
+    /// Treat a 200 response with a `Location` starting with `/` and no
+    /// body as an internal redirect, the CGI convention (default the
+    /// release's setting, else false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgi_local_redirect: Option<bool>,
 }
 
 /// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
@@ -366,6 +383,15 @@ pub struct Release {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
+    /// Treat an `X-Accel-Redirect` response header as an internal
+    /// redirect (section 4.10), for the default mount and any mount that
+    /// does not say otherwise (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_redirect: Option<bool>,
+    /// Treat a 200 response with a `Location` starting with `/` and no
+    /// body as an internal redirect, the CGI convention (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgi_local_redirect: Option<bool>,
 }
 
 /// How a worker group is scaled (section 7.2).
@@ -927,6 +953,15 @@ pub struct Route {
     /// release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic: Option<Traffic>,
+    /// Reachable only through internal redirects (section 4.10): a
+    /// client's request for the path is answered 404 (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+    /// Applications other than the route's own (or a static route's
+    /// fallback) whose internal redirects may reach the route. A static
+    /// route with no fallback needs it for any redirect to reach it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_redirects_from: Vec<String>,
 }
 
 /// A route's traffic policy (section 9.4): the share of requests each
@@ -1216,6 +1251,15 @@ pub struct ToolMuru {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
+    /// Treat an `X-Accel-Redirect` response header as an internal
+    /// redirect (section 4.10), for the default mount and any mount that
+    /// does not say otherwise (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_redirect: Option<bool>,
+    /// Treat a 200 response with a `Location` starting with `/` and no
+    /// body as an internal redirect, the CGI convention (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgi_local_redirect: Option<bool>,
 }
 
 /// Why a project's configuration could not be read.
@@ -1396,6 +1440,8 @@ mod tests {
             cache: None,
             redirect_slash: None,
             case: None,
+            internal: None,
+            accept_redirects_from: Vec::new(),
             traffic: Some(Traffic {
                 split: BTreeMap::from([("r2".to_owned(), 10)]),
                 sticky: Some(true),

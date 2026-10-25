@@ -85,6 +85,8 @@ message Route {
   bool no_redirect_slash = 11;          // do not redirect a directory to its slash form
   bool case_insensitive = 12;           // accept names that differ from the file's on disk
   Traffic traffic = 13;                 // how the application's releases share the requests (section 9.4)
+  bool internal = 14;                   // reachable only through internal redirects; 404 to clients (section 4.10)
+  repeated string accept_redirects_from = 15; // applications other than the route's own whose redirects may reach it
 }
 
 // A route's traffic policy (section 9.4). Buckets run from 0 to 9999;
@@ -113,11 +115,17 @@ message AppWorkers {
   repeated Mount mounts = 4;            // named mounts of the release (section 6.7)
   string release = 5;                   // the release, for the access log and traffic policies
   bool serving = 6;                     // the application's serving release, which takes what no policy assigns
+  bool accel_redirect = 7;              // the default mount honours X-Accel-Redirect (section 4.10)
+  bool cgi_local_redirect = 8;          // the default mount treats a 200 with a local Location and no body as a redirect
 }
 
 message Mount {
   string name = 1;
   string path = 2;                      // the prefix; the default mount is at /
+  bool internal = 3;                    // reachable only through internal redirects (section 4.10)
+  repeated string accept_redirects_from = 4; // other applications whose redirects may reach an internal mount
+  bool accel_redirect = 5;              // X-Accel-Redirect from the mount is an internal redirect
+  bool cgi_local_redirect = 6;          // a 200 with a local Location and no body is an internal redirect
 }
 
 message Group {

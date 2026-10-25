@@ -162,6 +162,8 @@ message DeployRequest {
   repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
   bool hold = 29;                           // start the release but leave traffic where it is, for a preview or a rollout
   optional uint64 soft_timeout_ms = 30;     // how long a request may run before it is interrupted (section 7.6)
+  optional bool accel_redirect = 31;        // X-Accel-Redirect from the default mount is an internal redirect (section 4.10)
+  optional bool cgi_local_redirect = 32;    // a 200 with a local Location and no body is an internal redirect
 }
 
 // One environment variable: a value, or a secret reference.
@@ -466,6 +468,8 @@ message Route {
   repeated TrafficShare traffic = 6; // the traffic policy's shares (section 9.4), empty without one
   bool sticky = 7;
   string hash_key = 8;              // the policy's key, when it names one
+  bool internal = 9;                // reachable only through internal redirects (section 4.10)
+  repeated string accept_redirects_from = 10; // other applications whose redirects may reach the route
 }
 
 // One release's share of a route's requests, in percent.

@@ -112,6 +112,19 @@ pub struct MountSpec {
     pub entrypoint: String,
     /// The interface, auto when detected.
     pub interface: Interface,
+    /// Reachable only through internal redirects (section 4.10).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
+    /// Other applications whose redirects may reach the mount when it is
+    /// internal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_redirects_from: Vec<String>,
+    /// X-Accel-Redirect from the mount is an internal redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accel_redirect: bool,
+    /// A 200 with a local Location and no body is an internal redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cgi_local_redirect: bool,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -189,6 +202,13 @@ pub struct ReleaseSpec {
     /// How the default group is scaled (sections 7.2 and 7.4).
     #[serde(default)]
     pub scaling: ScalingSpec,
+    /// The default mount honours X-Accel-Redirect (section 4.10).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accel_redirect: bool,
+    /// The default mount treats a 200 with a local Location and no body
+    /// as an internal redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cgi_local_redirect: bool,
 }
 
 /// One environment variable of a release (section 10.8).
