@@ -307,6 +307,116 @@ fn default_shutdown_timeout_ms() -> u64 {
     5_000
 }
 
+/// Section 9.3: where a rollout is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutState {
+    /// Shifting traffic step by step.
+    Running,
+    /// Held where it is by hand; resume continues.
+    Paused,
+    /// The next step waits for approval (resume).
+    AwaitingApproval,
+    /// The candidate serves everything; the rollout is over.
+    Promoted,
+    /// The candidate was taken out of traffic; the rollout is over.
+    RolledBack,
+}
+
+impl RolloutState {
+    /// The name as the API and the CLI show it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RolloutState::Running => "running",
+            RolloutState::Paused => "paused",
+            RolloutState::AwaitingApproval => "awaiting_approval",
+            RolloutState::Promoted => "promoted",
+            RolloutState::RolledBack => "rolled_back",
+        }
+    }
+
+    /// Whether the rollout still shapes traffic.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            RolloutState::Running | RolloutState::Paused | RolloutState::AwaitingApproval
+        )
+    }
+}
+
+/// One step of a rollout: the candidate's share and how long it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutStep {
+    /// Percent of the application's requests.
+    pub percent: u32,
+    /// How long the step lasts before the gates decide.
+    pub hold_ms: u64,
+}
+
+/// Section 9.3: what the candidate must not exceed over a step, judged
+/// against the baseline over the same window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutGates {
+    /// The 5xx ratio.
+    pub max_error_rate: f64,
+    /// The 95th percentile of total request time, when set.
+    pub max_p95_ms: Option<u64>,
+    /// Requests the candidate must have served before the gates judge.
+    pub min_requests: u64,
+}
+
+/// A rollout record (section 9.3): a candidate release taking a growing
+/// share of its application's traffic from the baseline, step by step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rollout {
+    /// The application.
+    pub app: String,
+    /// The id, unique within the application.
+    pub id: String,
+    /// The release gaining traffic.
+    pub candidate: String,
+    /// The release that served when the rollout began.
+    pub baseline: String,
+    /// The steps, in order; the last one passing promotes the candidate.
+    pub steps: Vec<RolloutStep>,
+    /// The gates.
+    pub gates: RolloutGates,
+    /// Whether each step after the first waits for approval.
+    pub approve_each_step: bool,
+    /// Where it is.
+    pub state: RolloutState,
+    /// The current step's index.
+    pub step: usize,
+    /// When the current step began, Unix milliseconds.
+    pub step_started_unix_ms: u64,
+    /// What it is doing, or why it ended.
+    pub message: String,
+    /// When it was created, Unix milliseconds.
+    pub created_unix_ms: u64,
+    /// When it last changed, Unix milliseconds.
+    pub updated_unix_ms: u64,
+}
+
+impl Rollout {
+    /// The candidate's share in force: the current step's while running
+    /// or paused, the step before while the next awaits approval, all of
+    /// it once promoted and none once rolled back.
+    pub fn percent(&self) -> u32 {
+        match self.state {
+            RolloutState::Promoted => 100,
+            RolloutState::RolledBack => 0,
+            RolloutState::AwaitingApproval => self
+                .step
+                .checked_sub(1)
+                .and_then(|index| self.steps.get(index))
+                .map_or(0, |step| step.percent),
+            RolloutState::Running | RolloutState::Paused => {
+                self.steps.get(self.step).map_or(0, |step| step.percent)
+            }
+        }
+    }
+}
+
 /// A release record: its spec, where it is in section 9.1, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {

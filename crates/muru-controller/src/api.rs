@@ -13,8 +13,10 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::config::{self, Action, Change, Plan};
-use crate::daemon::{Command, Handle};
-use crate::model::{Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
+use crate::daemon::{Command, Handle, RolloutAction};
+use crate::model::{
+    Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
+};
 
 /// Serve the API on the socket until the returned future ends.
 pub async fn serve(
@@ -145,6 +147,7 @@ impl Admin for Service {
                 retain: request
                     .retain_ms
                     .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                hold: request.hold,
                 created: created_tx,
                 done: done_tx,
             })
@@ -552,6 +555,134 @@ impl Admin for Service {
         Ok(Response::new(pb::ShutdownResponse {}))
     }
 
+    async fn start_rollout(
+        &self,
+        request: Request<pb::StartRolloutRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        let request = request.into_inner();
+        let steps = request
+            .steps
+            .iter()
+            .map(|step| RolloutStep {
+                percent: step.percent,
+                hold_ms: step.hold_ms,
+            })
+            .collect();
+        let gates = RolloutGates {
+            max_error_rate: if request.max_error_rate > 0.0 {
+                request.max_error_rate
+            } else {
+                0.01
+            },
+            max_p95_ms: (request.max_p95_ms > 0).then_some(request.max_p95_ms),
+            min_requests: if request.min_requests > 0 {
+                request.min_requests
+            } else {
+                100
+            },
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::StartRollout {
+                app: request.app,
+                release: request.release,
+                steps,
+                gates,
+                approve_each_step: request.approve_each_step,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rollout = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(rollout_message(&rollout)))
+    }
+
+    async fn get_rollout(
+        &self,
+        request: Request<pb::GetRolloutRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        let request = request.into_inner();
+        let rollout = self
+            .handle
+            .store
+            .rollout(&request.app, &request.rollout)
+            .map_err(not_found)?;
+        Ok(Response::new(rollout_message(&rollout)))
+    }
+
+    async fn list_rollouts(
+        &self,
+        request: Request<pb::ListRolloutsRequest>,
+    ) -> Result<Response<pb::ListRolloutsResponse>, Status> {
+        let request = request.into_inner();
+        let rollouts = self
+            .handle
+            .store
+            .rollouts((!request.app.is_empty()).then_some(request.app.as_str()))
+            .map_err(internal)?;
+        Ok(Response::new(pb::ListRolloutsResponse {
+            rollouts: rollouts.iter().map(rollout_message).collect(),
+        }))
+    }
+
+    async fn pause_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Pause)
+            .await
+    }
+
+    async fn resume_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Resume)
+            .await
+    }
+
+    async fn promote_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Promote)
+            .await
+    }
+
+    async fn abort_rollout(
+        &self,
+        request: Request<pb::RolloutControlRequest>,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        self.control_rollout(request.into_inner().app, RolloutAction::Abort)
+            .await
+    }
+
+    async fn promote_release(
+        &self,
+        request: Request<pb::PromoteReleaseRequest>,
+    ) -> Result<Response<pb::Release>, Status> {
+        let request = request.into_inner();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::PromoteRelease {
+                app: request.app,
+                id: request.release,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let release = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(release_message(release, &self.handle)))
+    }
+
     async fn list_hosts(
         &self,
         _: Request<pb::ListHostsRequest>,
@@ -803,6 +934,7 @@ impl Service {
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
                 retain: crate::daemon::RETENTION,
+                hold: false,
                 created: created_tx,
                 done: done_tx,
             })
@@ -912,6 +1044,59 @@ fn app_message(app: crate::model::App) -> pb::App {
         user: app.user.unwrap_or_default(),
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
+    }
+}
+
+impl Service {
+    /// Send a rollout action to the daemon and answer with the rollout.
+    async fn control_rollout(
+        &self,
+        app: String,
+        action: RolloutAction,
+    ) -> Result<Response<pb::Rollout>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::ControlRollout {
+                app,
+                action,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let rollout = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(rollout_message(&rollout)))
+    }
+}
+
+/// A rollout record as the API shows it.
+fn rollout_message(rollout: &Rollout) -> pb::Rollout {
+    pb::Rollout {
+        app: rollout.app.clone(),
+        id: rollout.id.clone(),
+        candidate: rollout.candidate.clone(),
+        baseline: rollout.baseline.clone(),
+        steps: rollout
+            .steps
+            .iter()
+            .map(|step| pb::RolloutStep {
+                percent: step.percent,
+                hold_ms: step.hold_ms,
+            })
+            .collect(),
+        state: rollout.state.as_str().to_owned(),
+        step: rollout.step as u32,
+        percent: rollout.percent(),
+        message: rollout.message.clone(),
+        created_unix_ms: rollout.created_unix_ms,
+        updated_unix_ms: rollout.updated_unix_ms,
+        max_error_rate: rollout.gates.max_error_rate,
+        max_p95_ms: rollout.gates.max_p95_ms.unwrap_or(0),
+        min_requests: rollout.gates.min_requests,
+        approve_each_step: rollout.approve_each_step,
     }
 }
 

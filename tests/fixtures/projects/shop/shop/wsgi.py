@@ -19,6 +19,10 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     """
 
     print(f"shop: served {environ['PATH_INFO']}", flush=True)
+
+    if environ["PATH_INFO"] == "/error":
+        raise RuntimeError("deliberate failure")
+
     body = json.dumps(
         {
             "pid": os.getpid(),

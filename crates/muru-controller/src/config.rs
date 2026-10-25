@@ -1282,6 +1282,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         release: String::new(),
         wait: true,
         retain_ms: None,
+        hold: false,
         max_requests: table.max_requests,
         max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
         hard_timeout_ms: duration_field(

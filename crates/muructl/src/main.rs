@@ -101,6 +101,12 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
+    /// Run and control rollouts: canaries with gates, and blue/green.
+    Rollout {
+        #[command(subcommand)]
+        command: admin::RolloutCommand,
+    },
+
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
@@ -700,6 +706,7 @@ fn main() -> anyhow::Result<()> {
         } => runtime.block_on(admin::route_list(socket)),
         Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
+        Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {

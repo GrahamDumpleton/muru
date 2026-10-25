@@ -113,3 +113,7 @@ cannot start records `traffic_policy.release_unavailable`.
 The response to every request names the release that served it in the
 access log, and an application can read its own release id from
 `muru.context().release`.
+
+A canary rollout (see [rollouts](rollouts.md)) applies a growing share of
+the application's requests to a candidate release on top of whatever
+policy a route declares, judged by gates at each step.

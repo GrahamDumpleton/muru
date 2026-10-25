@@ -19,6 +19,7 @@ pub mod logs;
 pub mod metrics;
 pub mod model;
 pub mod notify;
+pub mod rollouts;
 pub mod rotation;
 pub mod secrets;
 pub mod sinks;

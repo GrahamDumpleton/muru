@@ -33,6 +33,17 @@ service Admin {
   // Drain a release: no new traffic, requests in flight finish, then stop.
   rpc DrainRelease(DrainReleaseRequest) returns (Release);
 
+  // Section 9.3: shift an application's traffic to a release step by step,
+  // with gates, and control the rollout; or move all of it at once.
+  rpc StartRollout(StartRolloutRequest) returns (Rollout);
+  rpc GetRollout(GetRolloutRequest) returns (Rollout);
+  rpc ListRollouts(ListRolloutsRequest) returns (ListRolloutsResponse);
+  rpc PauseRollout(RolloutControlRequest) returns (Rollout);
+  rpc ResumeRollout(RolloutControlRequest) returns (Rollout);
+  rpc PromoteRollout(RolloutControlRequest) returns (Rollout);
+  rpc AbortRollout(RolloutControlRequest) returns (Rollout);
+  rpc PromoteRelease(PromoteReleaseRequest) returns (Release);
+
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
@@ -144,6 +155,7 @@ message DeployRequest {
   optional uint64 memory_hard_limit = 26;   // bytes; over it the worker is replaced at once
   optional uint64 memory_check_interval_ms = 27;
   repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
+  bool hold = 29;                           // start the release but leave traffic where it is, for a preview or a rollout
 }
 
 // One environment variable: a value, or a secret reference.
@@ -180,6 +192,64 @@ message RollbackRequest {
 }
 
 message DrainReleaseRequest {
+  string app = 1;
+  string release = 2;
+}
+
+// Section 9.3: a canary rollout of a candidate release against the
+// baseline that serves.
+message StartRolloutRequest {
+  string app = 1;
+  string release = 2;               // the candidate
+  repeated RolloutStep steps = 3;   // in order; the last step passing promotes the candidate
+  double max_error_rate = 4;        // a gate: the candidate's 5xx ratio over the step, 0.01 when 0
+  uint64 max_p95_ms = 5;            // a gate: the candidate's p95 over the step; none when 0
+  uint64 min_requests = 6;          // requests before the gates judge, 100 when 0
+  bool approve_each_step = 7;       // wait for ResumeRollout before each step after the first
+}
+
+message RolloutStep {
+  uint32 percent = 1;               // of the application's requests
+  uint64 hold_ms = 2;               // how long the step lasts before the gates decide
+}
+
+message Rollout {
+  string app = 1;
+  string id = 2;
+  string candidate = 3;
+  string baseline = 4;
+  repeated RolloutStep steps = 5;
+  string state = 6;                 // running, paused, awaiting_approval, promoted or rolled_back
+  uint32 step = 7;                  // the current step, from 0
+  uint32 percent = 8;               // the candidate's share in force
+  string message = 9;
+  uint64 created_unix_ms = 10;
+  uint64 updated_unix_ms = 11;
+  double max_error_rate = 12;
+  uint64 max_p95_ms = 13;
+  uint64 min_requests = 14;
+  bool approve_each_step = 15;
+}
+
+message GetRolloutRequest {
+  string app = 1;
+  string rollout = 2;               // the latest when empty
+}
+
+message ListRolloutsRequest {
+  string app = 1;                   // all applications when empty
+}
+
+message ListRolloutsResponse {
+  repeated Rollout rollouts = 1;
+}
+
+message RolloutControlRequest {
+  string app = 1;                   // the application's active rollout
+}
+
+// Blue/green (section 9.2): move all traffic to the release now.
+message PromoteReleaseRequest {
   string app = 1;
   string release = 2;
 }

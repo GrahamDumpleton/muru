@@ -1146,6 +1146,11 @@ pub struct DeployArgs {
     #[arg(long)]
     no_wait: bool,
 
+    /// Start the release but leave traffic where it is, for a preview
+    /// with the Muru-Preview header or a rollout (section 9.2).
+    #[arg(long)]
+    hold: bool,
+
     /// How long the release this one replaces stays warm for an instant
     /// rollback (default 30m; 0 stops it as soon as it has drained).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -1444,6 +1449,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         factory_phase: String::new(),
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
+        hold: args.hold,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         max_requests: args.max_requests,
         max_lifetime_ms: args
@@ -1499,10 +1505,325 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             release.app,
             release.id,
             release.state,
-            if release.serving { " and serving" } else { "" }
+            if release.serving {
+                " and serving"
+            } else if args.hold {
+                " and held: not serving"
+            } else {
+                ""
+            }
         );
     }
     Ok(())
+}
+
+/// The rollout subcommands (section 9.3).
+#[derive(Subcommand)]
+pub enum RolloutCommand {
+    /// Shift the application's traffic to a release step by step, each
+    /// step judged by gates against the release that serves; the last
+    /// step passing promotes the release, a failing gate rolls back.
+    Canary {
+        /// The candidate, as app@release.
+        release: String,
+
+        /// The steps, as percentages of the application's requests.
+        #[arg(long, value_delimiter = ',', default_value = "10,50")]
+        steps: Vec<u32>,
+
+        /// How long each step holds before its gates decide.
+        #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = muru_config::parse_duration)]
+        hold: Duration,
+
+        /// The 5xx rate the candidate may not exceed, as a percentage.
+        #[arg(long = "max-error-rate", value_name = "PERCENT", default_value = "1")]
+        max_error_rate: f64,
+
+        /// The 95th percentile request time the candidate may not exceed.
+        #[arg(long = "max-p95", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        max_p95: Option<Duration>,
+
+        /// Requests the candidate must serve in a step before the gates
+        /// judge it.
+        #[arg(long = "min-requests", value_name = "COUNT", default_value = "100")]
+        min_requests: u64,
+
+        /// Wait for `rollout resume` before each step after the first.
+        #[arg(long)]
+        approve_each_step: bool,
+
+        /// Stay until the rollout is promoted or rolled back.
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Move all of the application's traffic to a release now and drain
+    /// the one that served (blue/green).
+    Bluegreen {
+        /// The release, as app@release.
+        release: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Show the rollouts, of one application or of all.
+    Status {
+        /// The application.
+        app: Option<String>,
+
+        /// Stay until the application's rollout is promoted or rolled
+        /// back.
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Hold the application's rollout at its current step.
+    Pause {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Continue a paused rollout, or approve its next step.
+    Resume {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Give the candidate all the traffic now and end the rollout.
+    Promote {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Take the candidate out of traffic now and end the rollout.
+    Abort {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Run a rollout subcommand.
+pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
+    match command {
+        RolloutCommand::Canary {
+            release,
+            steps,
+            hold,
+            max_error_rate,
+            max_p95,
+            min_requests,
+            approve_each_step,
+            wait,
+            socket,
+        } => {
+            let (app, id) = split_release(&release)?;
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .start_rollout(pb::StartRolloutRequest {
+                    app: app.to_owned(),
+                    release: id.to_owned(),
+                    steps: steps
+                        .iter()
+                        .map(|percent| pb::RolloutStep {
+                            percent: *percent,
+                            hold_ms: hold.as_millis() as u64,
+                        })
+                        .collect(),
+                    max_error_rate: max_error_rate / 100.0,
+                    max_p95_ms: max_p95.map_or(0, |p95| p95.as_millis() as u64),
+                    min_requests,
+                    approve_each_step,
+                })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} of {}@{} started against {}: {}",
+                rollout.id, rollout.app, rollout.candidate, rollout.baseline, rollout.message
+            );
+
+            if wait {
+                let finished = wait_rollout(&mut client, app, &rollout.id).await?;
+                println!(
+                    "muru: rollout {} {}: {}",
+                    finished.id, finished.state, finished.message
+                );
+            }
+
+            Ok(())
+        }
+        RolloutCommand::Bluegreen { release, socket } => {
+            let (app, id) = split_release(&release)?;
+            let mut client = client::connect(&socket.socket()).await?;
+            let release = client
+                .promote_release(pb::PromoteReleaseRequest {
+                    app: app.to_owned(),
+                    release: id.to_owned(),
+                })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: release {}@{} is {} and serving",
+                release.app, release.id, release.state
+            );
+            Ok(())
+        }
+        RolloutCommand::Status { app, wait, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+
+            if wait {
+                let Some(app) = app else {
+                    anyhow::bail!("--wait needs an application");
+                };
+                let finished = wait_rollout(&mut client, &app, "").await?;
+                println!(
+                    "muru: rollout {} {}: {}",
+                    finished.id, finished.state, finished.message
+                );
+                return Ok(());
+            }
+
+            let rollouts = client
+                .list_rollouts(pb::ListRolloutsRequest {
+                    app: app.unwrap_or_default(),
+                })
+                .await
+                .map_err(explain)?
+                .into_inner()
+                .rollouts;
+
+            if rollouts.is_empty() {
+                println!("no rollouts");
+                return Ok(());
+            }
+
+            println!(
+                "{:<16} {:<8} {:<12} {:<12} {:<18} {:<8} MESSAGE",
+                "APP", "ROLLOUT", "CANDIDATE", "BASELINE", "STATE", "TRAFFIC"
+            );
+
+            for rollout in rollouts {
+                println!(
+                    "{:<16} {:<8} {:<12} {:<12} {:<18} {:<8} {}",
+                    rollout.app,
+                    rollout.id,
+                    rollout.candidate,
+                    rollout.baseline,
+                    rollout.state,
+                    format!("{}%", rollout.percent),
+                    rollout.message
+                );
+            }
+
+            Ok(())
+        }
+        RolloutCommand::Pause { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .pause_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+        RolloutCommand::Resume { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .resume_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+        RolloutCommand::Promote { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .promote_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+        RolloutCommand::Abort { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .abort_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Poll a rollout until it is promoted or rolled back, printing each
+/// change of step or state on the way.
+async fn wait_rollout(
+    client: &mut pb::admin_client::AdminClient<tonic::transport::Channel>,
+    app: &str,
+    id: &str,
+) -> anyhow::Result<pb::Rollout> {
+    let mut last = String::new();
+
+    loop {
+        let rollout = client
+            .get_rollout(pb::GetRolloutRequest {
+                app: app.to_owned(),
+                rollout: id.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if matches!(rollout.state.as_str(), "promoted" | "rolled_back") {
+            return Ok(rollout);
+        }
+
+        let line = format!("{} {}", rollout.state, rollout.message);
+
+        if line != last {
+            println!("muru: rollout {} {line}", rollout.id);
+            last = line;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// The application subcommands.

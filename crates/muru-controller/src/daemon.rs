@@ -25,7 +25,11 @@ use crate::host::{HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
-use crate::model::{Release, ReleaseSpec, ReleaseState, valid_name};
+use crate::model::{
+    Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState, RolloutStep,
+    now_unix_ms, valid_name,
+};
+use crate::rollouts::{Counters, Verdict, judge};
 use crate::store::Store;
 
 /// How long a release may take from its host starting to every worker
@@ -96,6 +100,29 @@ pub struct Upgrade {
     pub version: String,
 }
 
+/// What to do with an active rollout (section 9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutAction {
+    /// Hold the current step until resumed.
+    Pause,
+    /// Continue: from a pause, or into a step awaiting approval.
+    Resume,
+    /// Give the candidate all the traffic now.
+    Promote,
+    /// Take the candidate out of traffic now.
+    Abort,
+}
+
+/// Where a rollout's current step started from: the releases' counters
+/// at that moment, so the gates judge the step alone.
+#[derive(Debug, Clone)]
+struct RolloutRun {
+    rollout: String,
+    step: usize,
+    candidate: Counters,
+    baseline: Counters,
+}
+
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
     /// Everything the dashboard shows (section 10.7).
@@ -119,6 +146,8 @@ pub enum Command {
         id: Option<String>,
         /// How long the superseded release stays warm; zero stops it.
         retain: Duration,
+        /// Start the release but leave traffic where it is (section 9.2).
+        hold: bool,
         /// Where the release record goes as soon as it exists.
         created: oneshot::Sender<Result<Release, String>>,
         /// Where the outcome goes once the release serves or has failed.
@@ -128,6 +157,40 @@ pub enum Command {
     Rollback {
         /// The application.
         app: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<Release, String>>,
+    },
+    /// Section 9.3: start a rollout of a release against the one serving.
+    StartRollout {
+        /// The application.
+        app: String,
+        /// The candidate release.
+        release: String,
+        /// The steps, in order.
+        steps: Vec<RolloutStep>,
+        /// The gates.
+        gates: RolloutGates,
+        /// Whether each step after the first waits for approval.
+        approve_each_step: bool,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<Rollout, String>>,
+    },
+    /// Pause, resume, promote or abort the application's active rollout.
+    ControlRollout {
+        /// The application.
+        app: String,
+        /// What to do.
+        action: RolloutAction,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<Rollout, String>>,
+    },
+    /// Blue/green (section 9.2): move all of an application's traffic to a
+    /// release now and drain the one that served.
+    PromoteRelease {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
@@ -300,6 +363,10 @@ struct Running {
     /// reachable by sticky cookie until the instant, when it drains with
     /// the retention given.
     sticky_until: Option<(Instant, Duration)>,
+    /// Deployed with hold (section 9.2): running and reachable by preview,
+    /// taking no traffic until a rollout or a promotion, and left alone
+    /// by the traffic reconciliation.
+    held: bool,
     /// The host's control connection, once it is up.
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
@@ -330,6 +397,9 @@ struct Daemon {
     /// Turns the edge's counters into those points.
     sampler: muru_dashboard::Sampler,
     running: HashMap<(String, String), Running>,
+    /// Section 9.3: the counters each running rollout's current step
+    /// started from, by application.
+    rollout_runs: HashMap<String, RolloutRun>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
@@ -575,6 +645,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         history,
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
+        rollout_runs: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
         owns_log,
@@ -654,7 +725,17 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
-                daemon.sample_history().await;
+
+                let samples = match daemon.edge.metrics().await {
+                    Ok(samples) => Some(samples),
+                    Err(error) => {
+                        tracing::debug!(%error, "the edge's metrics could not be read");
+                        None
+                    }
+                };
+
+                daemon.sample_history(samples.as_deref()).await;
+                daemon.advance_rollouts(samples.as_deref()).await;
             }
         }
     };
@@ -1440,6 +1521,7 @@ impl Daemon {
                         groups: record.groups.clone(),
                         retained_until,
                         sticky_until: None,
+                        held: false,
                         control: None,
                         status: Vec::new(),
                     },
@@ -1476,14 +1558,34 @@ impl Daemon {
                 spec,
                 id,
                 retain,
+                hold,
                 created,
                 done,
             } => {
-                let outcome = self.deploy(&app, *spec, id, retain, created).await;
+                let outcome = self.deploy(&app, *spec, id, retain, hold, created).await;
                 let _ = done.send(outcome);
             }
             Command::Rollback { app, done } => {
                 let _ = done.send(self.rollback(&app).await);
+            }
+            Command::StartRollout {
+                app,
+                release,
+                steps,
+                gates,
+                approve_each_step,
+                done,
+            } => {
+                let outcome = self
+                    .start_rollout(&app, &release, steps, gates, approve_each_step)
+                    .await;
+                let _ = done.send(outcome);
+            }
+            Command::ControlRollout { app, action, done } => {
+                let _ = done.send(self.control_rollout(&app, action).await);
+            }
+            Command::PromoteRelease { app, id, done } => {
+                let _ = done.send(self.promote_release(&app, &id).await);
             }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
@@ -1550,6 +1652,7 @@ impl Daemon {
         spec: ReleaseSpec,
         id: Option<String>,
         retain: Duration,
+        hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
         let record = self.create(app, spec, id);
@@ -1572,6 +1675,26 @@ impl Daemon {
         );
 
         self.start(app, &release.id).await?;
+
+        // Section 9.2: held, the release runs and can be previewed, and
+        // traffic stays where it is until a rollout or a promotion.
+
+        if hold {
+            if let Some(running) = self.running.get_mut(&(app.to_owned(), release.id.clone())) {
+                running.held = true;
+            }
+
+            self.set_state(&release, ReleaseState::Ready, "held: not serving");
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a held release failed");
+            }
+
+            return self
+                .store
+                .release(app, &release.id)
+                .map_err(|error| error.to_string());
+        }
 
         // Traffic moves, then the previous release drains.
 
@@ -1872,6 +1995,7 @@ impl Daemon {
                 groups,
                 retained_until: None,
                 sticky_until: None,
+                held: false,
                 control: None,
                 status: Vec::new(),
             },
@@ -1904,6 +2028,10 @@ impl Daemon {
         self.serving.insert(app.to_owned(), id.to_owned());
         self.default_app = Some(app.to_owned());
 
+        if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
+            running.held = false;
+        }
+
         match self.push_snapshot().await {
             Ok(()) => {
                 self.events.emit(
@@ -1932,7 +2060,19 @@ impl Daemon {
     fn build_snapshot(&mut self) -> pb::Snapshot {
         let mut apps = Vec::new();
         let routes = self.store.routes().unwrap_or_default();
-        let referenced = referenced_in(&routes);
+        let rollouts: Vec<Rollout> = self
+            .store
+            .rollouts(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rollout| rollout.state.is_active())
+            .collect();
+        let mut referenced = referenced_in(&routes);
+        referenced.extend(
+            rollouts
+                .iter()
+                .map(|rollout| (rollout.app.clone(), rollout.candidate.clone())),
+        );
 
         // Section 9.4: an application's serving release takes requests,
         // and so do the releases its routes' policies name and a release
@@ -1945,6 +2085,7 @@ impl Daemon {
             .filter(|((app, id), running)| {
                 self.serving.get(app) == Some(id)
                     || running.sticky_until.is_some()
+                    || running.held
                     || (running.retained_until.is_none()
                         && referenced.contains(&((*app).clone(), (*id).clone())))
             })
@@ -2050,10 +2191,7 @@ impl Daemon {
         let routes = routes
             .into_iter()
             .map(|route| pb::Route {
-                traffic: route
-                    .traffic
-                    .as_ref()
-                    .map(|traffic| self.traffic_message(&route, traffic, &included)),
+                traffic: self.route_traffic(&route, &included, &rollouts),
                 host: route.host,
                 path: route.path,
                 app: route.app,
@@ -2237,6 +2375,451 @@ impl Daemon {
             .emit("release.stopped", &subject, "info", "stopped");
     }
 
+    /// Section 9.3: begin a rollout of `candidate` against the release that
+    /// serves. The candidate is started if it is not running, takes the
+    /// first step's share at once, and the ticks move it along.
+    async fn start_rollout(
+        &mut self,
+        app: &str,
+        candidate: &str,
+        steps: Vec<RolloutStep>,
+        gates: RolloutGates,
+        approve_each_step: bool,
+    ) -> Result<Rollout, String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let Some(baseline) = record.current.clone() else {
+            return Err(format!("{app} has no serving release to roll out against"));
+        };
+
+        if baseline == candidate {
+            return Err(format!("{app}@{candidate} already serves"));
+        }
+
+        self.store
+            .release(app, candidate)
+            .map_err(|error| error.to_string())?;
+
+        if let Some(active) = self
+            .store
+            .active_rollout(app)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "{app} has rollout {} under way ({}); promote or abort it first",
+                active.id,
+                active.state.as_str()
+            ));
+        }
+
+        if steps.is_empty() {
+            return Err("a rollout needs at least one step".to_owned());
+        }
+
+        for (index, step) in steps.iter().enumerate() {
+            if step.percent == 0 || step.percent > 100 {
+                return Err(format!(
+                    "step {}: the share must be 1 to 100 percent",
+                    index + 1
+                ));
+            }
+
+            if index > 0 && step.percent <= steps[index - 1].percent {
+                return Err(format!("step {}: the shares must increase", index + 1));
+            }
+        }
+
+        self.start(app, candidate).await?;
+
+        if let Some(running) = self
+            .running
+            .get_mut(&(app.to_owned(), candidate.to_owned()))
+        {
+            running.held = false;
+        }
+
+        let now = now_unix_ms();
+        let rollout = Rollout {
+            app: app.to_owned(),
+            id: self
+                .store
+                .next_rollout_id(app)
+                .map_err(|error| error.to_string())?,
+            candidate: candidate.to_owned(),
+            baseline: baseline.clone(),
+            message: step_message(&steps, 0),
+            steps,
+            gates,
+            approve_each_step,
+            state: RolloutState::Running,
+            step: 0,
+            step_started_unix_ms: now,
+            created_unix_ms: now,
+            updated_unix_ms: now,
+        };
+        self.store
+            .put_rollout(&rollout)
+            .map_err(|error| error.to_string())?;
+        self.events.emit(
+            "rollout.started",
+            &format!("{app}@{candidate}"),
+            "notice",
+            &format!(
+                "rollout {} against {baseline}: {}",
+                rollout.id,
+                describe_steps(&rollout.steps)
+            ),
+        );
+        self.push_snapshot().await?;
+        self.begin_rollout_run(&rollout).await;
+        Ok(rollout)
+    }
+
+    /// Section 9.3: mark where a rollout's current step starts from, once
+    /// its share is in force, so the gates judge the requests served under
+    /// this step alone. Without the edge's counters the first tick marks
+    /// it instead.
+    async fn begin_rollout_run(&mut self, rollout: &Rollout) {
+        match self.edge.metrics().await {
+            Ok(samples) => {
+                self.rollout_runs.insert(
+                    rollout.app.clone(),
+                    RolloutRun {
+                        rollout: rollout.id.clone(),
+                        step: rollout.step,
+                        candidate: Counters::from_samples(
+                            &samples,
+                            &rollout.app,
+                            &rollout.candidate,
+                        ),
+                        baseline: Counters::from_samples(&samples, &rollout.app, &rollout.baseline),
+                    },
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, "the edge's metrics could not be read for the rollout");
+                self.rollout_runs.remove(&rollout.app);
+            }
+        }
+    }
+
+    /// Pause, resume, promote or abort the application's active rollout.
+    async fn control_rollout(
+        &mut self,
+        app: &str,
+        action: RolloutAction,
+    ) -> Result<Rollout, String> {
+        let Some(mut rollout) = self
+            .store
+            .active_rollout(app)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(format!("{app} has no rollout under way"));
+        };
+
+        let subject = format!("{app}@{}", rollout.candidate);
+        let percent = rollout.percent();
+
+        match action {
+            RolloutAction::Pause => {
+                if rollout.state != RolloutState::Running {
+                    return Err(format!(
+                        "rollout {} is {}",
+                        rollout.id,
+                        rollout.state.as_str()
+                    ));
+                }
+
+                rollout.state = RolloutState::Paused;
+                rollout.message = format!("paused at {percent}%");
+                self.events
+                    .emit("rollout.paused", &subject, "notice", &rollout.message);
+            }
+            RolloutAction::Resume => {
+                let approved = match rollout.state {
+                    RolloutState::Paused => false,
+                    RolloutState::AwaitingApproval => true,
+                    RolloutState::Running => {
+                        return Err(format!("rollout {} is running", rollout.id));
+                    }
+                    RolloutState::Promoted | RolloutState::RolledBack => unreachable!(),
+                };
+
+                rollout.state = RolloutState::Running;
+                rollout.step_started_unix_ms = now_unix_ms();
+                rollout.message = step_message(&rollout.steps, rollout.step);
+
+                if approved {
+                    self.events.emit(
+                        "rollout.step",
+                        &subject,
+                        "notice",
+                        &format!("approved: {}", rollout.message),
+                    );
+                    self.store
+                        .put_rollout(&rollout)
+                        .map_err(|error| error.to_string())?;
+                    self.push_snapshot().await?;
+                } else {
+                    self.events
+                        .emit("rollout.resumed", &subject, "notice", &rollout.message);
+                }
+
+                self.begin_rollout_run(&rollout).await;
+            }
+            RolloutAction::Promote => {
+                self.finish_rollout(
+                    &mut rollout,
+                    RolloutState::Promoted,
+                    &format!("promoted by hand at {percent}%"),
+                )
+                .await?;
+            }
+            RolloutAction::Abort => {
+                self.finish_rollout(
+                    &mut rollout,
+                    RolloutState::RolledBack,
+                    &format!("aborted by hand at {percent}%"),
+                )
+                .await?;
+            }
+        }
+
+        rollout.updated_unix_ms = now_unix_ms();
+        self.store
+            .put_rollout(&rollout)
+            .map_err(|error| error.to_string())?;
+        Ok(rollout)
+    }
+
+    /// End a rollout. Promoted, the candidate takes all the traffic and
+    /// the baseline drains before the record says so; rolled back, the
+    /// candidate leaves traffic and is kept warm, so it can be looked at.
+    async fn finish_rollout(
+        &mut self,
+        rollout: &mut Rollout,
+        state: RolloutState,
+        message: &str,
+    ) -> Result<(), String> {
+        let subject = format!("{}@{}", rollout.app, rollout.candidate);
+        self.rollout_runs.remove(&rollout.app);
+
+        let record = |rollout: &mut Rollout, store: &Store| -> Result<(), String> {
+            rollout.state = state;
+            rollout.message = message.to_owned();
+            rollout.updated_unix_ms = now_unix_ms();
+            store
+                .put_rollout(rollout)
+                .map_err(|error| error.to_string())
+        };
+
+        match state {
+            RolloutState::Promoted => {
+                self.promote_release(&rollout.app, &rollout.candidate)
+                    .await?;
+                record(rollout, &self.store)?;
+                self.push_snapshot().await?;
+                self.events.emit(
+                    "rollout.completed",
+                    &subject,
+                    "notice",
+                    &format!("rollout {}: {message}", rollout.id),
+                );
+            }
+            _ => {
+                record(rollout, &self.store)?;
+                self.push_snapshot().await?;
+                self.events.emit(
+                    "rollout.rolled_back",
+                    &subject,
+                    "warning",
+                    &format!(
+                        "rollout {}: {message}; the candidate is kept warm",
+                        rollout.id
+                    ),
+                );
+                let candidate = (rollout.app.clone(), rollout.candidate.clone());
+
+                if !self.referenced_releases().contains(&candidate)
+                    && self.serving.get(&rollout.app) != Some(&rollout.candidate)
+                {
+                    self.drain(&rollout.app, &rollout.candidate, RETENTION)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Blue/green (section 9.2): all of the application's traffic to the
+    /// release now, which is started if it is not running, and the release
+    /// that served drains unless a policy names it.
+    async fn promote_release(&mut self, app: &str, id: &str) -> Result<Release, String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let current = record.current.clone();
+
+        if current.as_deref() == Some(id) {
+            return Err(format!("{app}@{id} already serves"));
+        }
+
+        self.start(app, id).await?;
+        self.switch_to(app, id).await;
+        self.store
+            .set_app_releases(app, Some(id), current.as_deref())
+            .map_err(|error| error.to_string())?;
+
+        if let Some(previous) = current.filter(|previous| previous != id)
+            && !self
+                .referenced_releases()
+                .contains(&(app.to_owned(), previous.clone()))
+        {
+            self.drain(app, &previous, RETENTION).await;
+        }
+
+        self.store
+            .release(app, id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.3: move every running rollout along. The current step is
+    /// judged by its gates against the baseline over the same window; a
+    /// failing gate rolls back at once; once the hold has passed with the
+    /// gates satisfied, the next step begins, or waits for approval, or
+    /// the last step promotes the candidate. Without enough requests to
+    /// judge, the step holds until there are.
+    async fn advance_rollouts(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
+        };
+        let running: Vec<Rollout> = self
+            .store
+            .rollouts(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rollout| rollout.state == RolloutState::Running)
+            .collect();
+
+        for mut rollout in running {
+            let app = rollout.app.clone();
+            let subject = format!("{app}@{}", rollout.candidate);
+            let now = now_unix_ms();
+
+            let run = match self.rollout_runs.get(&app) {
+                Some(run) if run.rollout == rollout.id && run.step == rollout.step => run.clone(),
+                _ => {
+                    let run = RolloutRun {
+                        rollout: rollout.id.clone(),
+                        step: rollout.step,
+                        candidate: Counters::from_samples(samples, &app, &rollout.candidate),
+                        baseline: Counters::from_samples(samples, &app, &rollout.baseline),
+                    };
+                    rollout.step_started_unix_ms = now;
+                    let _ = self.store.put_rollout(&rollout);
+                    self.rollout_runs.insert(app.clone(), run.clone());
+                    run
+                }
+            };
+
+            let candidate =
+                Counters::from_samples(samples, &app, &rollout.candidate).since(&run.candidate);
+            let baseline =
+                Counters::from_samples(samples, &app, &rollout.baseline).since(&run.baseline);
+            let verdict = judge(&candidate, &baseline, &rollout.gates);
+            let percent = rollout.percent();
+
+            if let Verdict::Fail(reason) = verdict {
+                self.events.emit(
+                    "rollout.gate_failed",
+                    &subject,
+                    "warning",
+                    &format!("step {} at {percent}%: {reason}", rollout.step + 1),
+                );
+
+                if let Err(error) = self
+                    .finish_rollout(
+                        &mut rollout,
+                        RolloutState::RolledBack,
+                        &format!("gate failed at {percent}%: {reason}"),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "rolling back a rollout failed");
+                }
+
+                continue;
+            }
+
+            let hold = rollout
+                .steps
+                .get(rollout.step)
+                .map_or(0, |step| step.hold_ms);
+
+            if now < rollout.step_started_unix_ms + hold {
+                continue;
+            }
+
+            if verdict == Verdict::Insufficient {
+                let message = format!(
+                    "step {} at {percent}%: holding for {} requests to judge, {} so far",
+                    rollout.step + 1,
+                    rollout.gates.min_requests,
+                    candidate.total as u64
+                );
+
+                if rollout.message != message {
+                    rollout.message = message;
+                    rollout.updated_unix_ms = now;
+                    let _ = self.store.put_rollout(&rollout);
+                }
+
+                continue;
+            }
+
+            if rollout.step + 1 >= rollout.steps.len() {
+                if let Err(error) = self
+                    .finish_rollout(
+                        &mut rollout,
+                        RolloutState::Promoted,
+                        "every step passed its gates",
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "promoting a rollout failed");
+                }
+
+                continue;
+            }
+
+            rollout.step += 1;
+            rollout.step_started_unix_ms = now;
+            rollout.updated_unix_ms = now;
+            self.rollout_runs.remove(&app);
+
+            if rollout.approve_each_step {
+                rollout.state = RolloutState::AwaitingApproval;
+                rollout.message = format!(
+                    "{} awaits approval: muructl rollout resume {app}",
+                    step_message(&rollout.steps, rollout.step)
+                );
+                let _ = self.store.put_rollout(&rollout);
+                self.events
+                    .emit("rollout.step", &subject, "notice", &rollout.message);
+                continue;
+            }
+
+            rollout.message = step_message(&rollout.steps, rollout.step);
+            let _ = self.store.put_rollout(&rollout);
+            self.events
+                .emit("rollout.step", &subject, "notice", &rollout.message);
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a rollout step failed");
+            }
+
+            self.begin_rollout_run(&rollout).await;
+        }
+    }
+
     /// Section 9.4: the releases whose sticky grace has passed leave the
     /// snapshot and drain.
     async fn expire_sticky(&mut self) {
@@ -2301,6 +2884,7 @@ impl Daemon {
             .filter(|((app, id), running)| {
                 running.retained_until.is_none()
                     && running.sticky_until.is_none()
+                    && !running.held
                     && self.serving.get(app) != Some(id)
                     && !referenced.contains(&((*app).clone(), (*id).clone()))
             })
@@ -2312,9 +2896,19 @@ impl Daemon {
         }
     }
 
-    /// The releases the route policies name, by application.
+    /// The releases the route policies name and the candidates of the
+    /// rollouts under way, by application.
     fn referenced_releases(&self) -> BTreeSet<(String, String)> {
-        referenced_in(&self.store.routes().unwrap_or_default())
+        let mut referenced = referenced_in(&self.store.routes().unwrap_or_default());
+        referenced.extend(
+            self.store
+                .rollouts(None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|rollout| rollout.state.is_active())
+                .map(|rollout| (rollout.app, rollout.candidate)),
+        );
+        referenced
     }
 
     /// Section 9.4: the longest sticky grace among the application's
@@ -2332,20 +2926,39 @@ impl Daemon {
             .max()
     }
 
-    /// A route's traffic policy for the edge: the shares of the releases
-    /// the snapshot carries, newest first so the newest release's buckets
-    /// are at the top (section 9.4), with the key, salt and stickiness.
-    fn traffic_message(
+    /// A route's traffic policy for the edge, when it has one or its
+    /// application has a rollout under way: the rollout's candidate share
+    /// first, then the policy's shares of the releases the snapshot
+    /// carries, newest first so the newest release's buckets are at the
+    /// top (section 9.4), with the key, salt and stickiness.
+    fn route_traffic(
         &self,
         route: &muru_config::Route,
-        traffic: &muru_config::Traffic,
         included: &BTreeSet<(String, String)>,
-    ) -> pb::Traffic {
+        rollouts: &[Rollout],
+    ) -> Option<pb::Traffic> {
         let app = route_apps(route).first().copied().unwrap_or_default();
-        let mut shares: Vec<(u64, &String, u32)> = traffic
+        let rollout = rollouts.iter().find(|rollout| {
+            rollout.app == app && included.contains(&(app.to_owned(), rollout.candidate.clone()))
+        });
+
+        if route.traffic.is_none() && rollout.is_none() {
+            return None;
+        }
+
+        let mut shares: Vec<pb::Share> = rollout
+            .map(|rollout| pb::Share {
+                release: rollout.candidate.clone(),
+                weight: rollout.percent().min(100) * 100,
+            })
+            .into_iter()
+            .collect();
+        let traffic = route.traffic.clone().unwrap_or_default();
+        let mut declared: Vec<(u64, &String, u32)> = traffic
             .split
             .iter()
             .filter(|(id, _)| included.contains(&(app.to_owned(), (*id).clone())))
+            .filter(|(id, _)| rollout.is_none_or(|rollout| &rollout.candidate != *id))
             .map(|(id, percent)| {
                 let created = self
                     .store
@@ -2355,24 +2968,22 @@ impl Daemon {
                 (created, id, *percent)
             })
             .collect();
-        shares.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        declared.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        shares.extend(declared.into_iter().map(|(_, release, percent)| pb::Share {
+            release: release.clone(),
+            weight: percent.min(100) * 100,
+        }));
 
-        pb::Traffic {
-            shares: shares
-                .into_iter()
-                .map(|(_, release, percent)| pb::Share {
-                    release: release.clone(),
-                    weight: percent.min(100) * 100,
-                })
-                .collect(),
+        Some(pb::Traffic {
+            shares,
             hash_key: traffic.hash_key.clone().unwrap_or_default(),
             salt: traffic
                 .salt
                 .clone()
                 .unwrap_or_else(|| format!("{} {}", route.host, route.path)),
             sticky: traffic.sticky.unwrap_or(false),
-            sticky_grace_s: sticky_grace_of(traffic).as_secs(),
-        }
+            sticky_grace_s: sticky_grace_of(&traffic).as_secs(),
+        })
     }
 
     /// Stop the retained releases whose window has passed.
@@ -2738,13 +3349,9 @@ impl Daemon {
     /// files the application opened itself.
     /// Section 10.7: one point of history a second, from the edge's
     /// counters.
-    async fn sample_history(&mut self) {
-        let samples = match self.edge.metrics().await {
-            Ok(samples) => samples,
-            Err(error) => {
-                tracing::debug!(%error, "the edge's metrics could not be read for the history");
-                return;
-            }
+    async fn sample_history(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
         };
 
         let workers = self
@@ -2759,7 +3366,7 @@ impl Daemon {
                         .sum::<usize>()
             })
             .sum::<usize>() as u64;
-        let reading = crate::dashboard::reading(&samples, workers);
+        let reading = crate::dashboard::reading(samples, workers);
         let now = crate::model::now_unix_ms() / 1000;
 
         if let Some(point) = self.sampler.observe(now, reading) {
@@ -2978,4 +3585,33 @@ fn sticky_grace_of(traffic: &muru_config::Traffic) -> Duration {
         .as_deref()
         .and_then(|text| muru_config::parse_duration(text).ok())
         .unwrap_or(STICKY_GRACE)
+}
+
+/// A rollout's steps in words: "10% for 2m, 50% for 2m".
+fn describe_steps(steps: &[RolloutStep]) -> String {
+    steps
+        .iter()
+        .map(|step| {
+            format!(
+                "{}% for {}",
+                step.percent,
+                muru_config::format_duration(Duration::from_millis(step.hold_ms))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What a rollout at this step is doing: "step 2 of 3: 50% for 2m".
+fn step_message(steps: &[RolloutStep], step: usize) -> String {
+    match steps.get(step) {
+        Some(current) => format!(
+            "step {} of {}: {}% for {}",
+            step + 1,
+            steps.len(),
+            current.percent,
+            muru_config::format_duration(Duration::from_millis(current.hold_ms))
+        ),
+        None => format!("step {} of {}", step + 1, steps.len()),
+    }
 }

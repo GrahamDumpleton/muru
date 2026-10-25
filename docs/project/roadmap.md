@@ -246,5 +246,20 @@ names, and leaves a superseded release a policy still names in place;
 `muructl route list` shows the policy and a change records
 `traffic_policy.changed`. The host now tells the runtime library its
 application name and release id, so `muru.context()` reports them.
-Rollouts with steps and gates, bucketing by header matches and the
-remaining strategies of section 9.2 come next.
+Rollouts (sections 9.2 and 9.3) are in: `muructl deploy --hold` starts a
+release without traffic, reachable by preview; `muructl rollout canary`
+gives it a growing share of the application's requests step by step, the
+share applied on top of the routes' declared policies, each step judged
+every second once the candidate has served enough requests, on its 5xx
+rate and 95th percentile against the baseline over the same window, so a
+fault both releases share does not roll back; a failing gate rolls back
+at once and keeps the candidate warm, the last step passing promotes it,
+steps can wait for approval, and `rollout status`, `pause`, `resume`,
+`promote` and `abort` follow and control the rollout; `muructl rollout
+bluegreen` moves all traffic at once; every change is a `rollout.*`
+event, and a daemon restart continues a rollout with its current step
+starting afresh. Still to
+come in this part of the phase: A/B cohorts by header and cookie
+matches, per-route policies for one application, probe URL and worker
+crash gates, scheduled freezes, `config export --resolve-rollouts`, and
+rollouts for an application reached as the default with no route.

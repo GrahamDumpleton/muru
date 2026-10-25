@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use muru_config::{Host as VirtualHost, Route};
 
-use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
+use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms};
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS routes (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (host, path)
+);
+CREATE TABLE IF NOT EXISTS rollouts (
+    app TEXT NOT NULL,
+    id TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (app, id)
 );
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,6 +382,84 @@ impl Store {
                 params![route.host, route.path, encoded],
             )?;
             Ok(())
+        })
+    }
+
+    /// The rollouts of one application, or of all, oldest first (section
+    /// 9.3).
+    pub fn rollouts(&self, app: Option<&str>) -> Result<Vec<Rollout>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT spec FROM rollouts WHERE (?1 = '' OR app = ?1) ORDER BY app, created",
+            )?;
+            let rows = statement.query_map([app.unwrap_or("")], |row| row.get::<_, String>(0))?;
+            let mut rollouts = Vec::new();
+
+            for row in rows {
+                rollouts.push(decode(&row?)?);
+            }
+
+            Ok(rollouts)
+        })
+    }
+
+    /// One rollout by id, or the application's latest when `id` is empty.
+    pub fn rollout(&self, app: &str, id: &str) -> Result<Rollout, StoreError> {
+        self.with(|connection| {
+            let encoded: Option<String> = connection
+                .query_row(
+                    "SELECT spec FROM rollouts WHERE app = ?1 AND (?2 = '' OR id = ?2) \
+                     ORDER BY created DESC LIMIT 1",
+                    params![app, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            match encoded {
+                Some(encoded) => decode(&encoded),
+                None => Err(StoreError::NotFound(format!("rollout {app}/{id}"))),
+            }
+        })
+    }
+
+    /// The application's rollout that still shapes traffic, if any.
+    pub fn active_rollout(&self, app: &str) -> Result<Option<Rollout>, StoreError> {
+        Ok(self
+            .rollouts(Some(app))?
+            .into_iter()
+            .find(|rollout| rollout.state.is_active()))
+    }
+
+    /// Create or replace a rollout record.
+    pub fn put_rollout(&self, rollout: &Rollout) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(rollout).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO rollouts (app, id, spec, state, created) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(app, id) DO UPDATE SET spec = excluded.spec, \
+                 state = excluded.state, resource_version = resource_version + 1",
+                params![
+                    rollout.app,
+                    rollout.id,
+                    encoded,
+                    rollout.state.as_str(),
+                    rollout.created_unix_ms as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The next rollout id for an application: 1, 2, and so on.
+    pub fn next_rollout_id(&self, app: &str) -> Result<String, StoreError> {
+        self.with(|connection| {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM rollouts WHERE app = ?1",
+                [app],
+                |row| row.get(0),
+            )?;
+            Ok((count + 1).to_string())
         })
     }
 

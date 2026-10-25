@@ -27,6 +27,7 @@ secrets
 users
 virtual-hosts
 traffic
+rollouts
 behind-a-proxy
 worker-groups
 mounts
