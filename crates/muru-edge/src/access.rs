@@ -101,6 +101,9 @@ pub struct Record {
     pub application: Duration,
     /// Time from arrival until the response was complete.
     pub total: Duration,
+    /// The targets the request was redirected to internally (section
+    /// 4.10), in order; empty when it was served where it arrived.
+    pub redirects: Vec<String>,
 }
 
 impl Record {
@@ -195,6 +198,13 @@ impl AccessLog {
             app: app.to_owned(),
             release: release.to_owned(),
         }
+    }
+
+    /// Count a redirect hop (section 4.10) in the metrics of the
+    /// application that answered it, without a line of its own: the
+    /// final response's record carries every hop.
+    pub fn record_hop(&self, record: &Record) {
+        self.metrics.observe(record);
     }
 
     /// Keep a record and write it where the configuration says.
@@ -359,6 +369,10 @@ fn text_line(record: &Record) -> String {
         let _ = write!(line, " reason={}", record.reason);
     }
 
+    if !record.redirects.is_empty() {
+        let _ = write!(line, " redirects={}", record.redirects.join(","));
+    }
+
     if !record.group.is_empty() && record.group != DEFAULT {
         let _ = write!(line, " group={}", record.group);
     }
@@ -381,7 +395,7 @@ fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}]}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -402,6 +416,12 @@ fn json_line(record: &Record) -> String {
         millis_f64(record.application),
         millis_f64(record.total),
         record.snapshot,
+        record
+            .redirects
+            .iter()
+            .map(|target| json_string(target))
+            .collect::<Vec<_>>()
+            .join(","),
     );
     line.push('\n');
     line
@@ -574,6 +594,7 @@ mod tests {
             queue: Duration::ZERO,
             application: Duration::ZERO,
             total,
+            redirects: Vec::new(),
         };
         assert!(!log.shows(&record(200, "/", Duration::from_millis(10))));
         assert!(log.shows(&record(500, "/", Duration::from_millis(10))));

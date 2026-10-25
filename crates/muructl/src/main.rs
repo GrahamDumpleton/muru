@@ -83,6 +83,12 @@ enum Command {
         command: admin::RouteCommand,
     },
 
+    /// Manage HTTP upstreams.
+    Upstream {
+        #[command(subcommand)]
+        command: admin::UpstreamCommand,
+    },
+
     /// Restore traffic to an application's previous release.
     Rollback {
         /// The application.
@@ -99,6 +105,22 @@ enum Command {
 
         #[command(flatten)]
         socket: admin::SocketArgs,
+    },
+
+    /// Run and control rollouts: canaries with gates, and blue/green.
+    Rollout {
+        #[command(subcommand)]
+        command: admin::RolloutCommand,
+    },
+
+    /// Pin a worker group's count, or show the autoscaler's state.
+    Scale(admin::ScaleArgs),
+
+    /// Serve an application's maintenance page at the edge, or serve it
+    /// as usual again.
+    Maintenance {
+        #[command(subcommand)]
+        command: admin::MaintenanceCommand,
     },
 
     /// Show the daemon's status.
@@ -246,6 +268,10 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         sockets: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
+        accel_redirect: false,
+        cgi_local_redirect: false,
+        sendfile: Arc::default(),
+        errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
         access_log,
         limits: muru_edge::Limits::default(),
@@ -371,9 +397,10 @@ struct RunArgs {
 
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s), response_idle (60s),
-    /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; hard
-    /// (off), hard_drain_grace (10s) or shutdown (5s) in the host, which
-    /// replaces a worker whose request runs past the hard timeout.
+    /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
+    /// (off), hard (off), hard_drain_grace (10s) or shutdown (5s) in the
+    /// host, which interrupts a request that runs past the soft timeout
+    /// and replaces a worker whose request runs past the hard timeout.
     /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
@@ -698,8 +725,14 @@ fn main() -> anyhow::Result<()> {
         Command::Route {
             command: admin::RouteCommand::List { socket },
         } => runtime.block_on(admin::route_list(socket)),
+        Command::Upstream {
+            command: admin::UpstreamCommand::List { socket },
+        } => runtime.block_on(admin::upstream_list(socket)),
         Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
+        Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
+        Command::Scale(args) => runtime.block_on(admin::scale(args)),
+        Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
@@ -763,6 +796,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "response_idle",
         "keep_alive",
         "keep_alive_proxy",
+        "soft",
         "hard",
         "hard_drain_grace",
         "shutdown",
@@ -771,7 +805,8 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
-             response_idle, keep_alive, keep_alive_proxy, hard, hard_drain_grace or shutdown"
+             response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace or \
+             shutdown"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -898,13 +933,37 @@ pub(crate) fn memory_policy(
     Ok(policy)
 }
 
-/// The host's timeouts from --timeout and a project table (section 7.6):
-/// the hard timeout, the grace for a replaced worker's other requests
-/// and the time before a stopping worker is killed.
+/// The host's timeouts (section 7.6), resolved from --timeout and a
+/// project table.
+pub(crate) struct HostTimeouts {
+    /// How long a request may run before it is interrupted; off when absent.
+    pub soft: Option<Duration>,
+    /// How long a request may run before its worker is replaced; off
+    /// when absent.
+    pub hard: Option<Duration>,
+    /// The grace for a replaced worker's other requests.
+    pub hard_drain_grace: Duration,
+    /// The time before a stopping worker is killed.
+    pub shutdown: Duration,
+}
+
+impl HostTimeouts {
+    /// The timeouts as a `[timeouts]` table, for --print-config.
+    pub fn table(&self) -> muru_config::Timeouts {
+        muru_config::Timeouts {
+            soft_timeout: self.soft.map(muru_config::format_duration),
+            hard_timeout: self.hard.map(muru_config::format_duration),
+            hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
+            shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
+        }
+    }
+}
+
+/// The host's timeouts from --timeout and a project table (section 7.6).
 pub(crate) fn worker_timeouts(
     timeouts: &[(String, Duration)],
     table: Option<&muru_config::Timeouts>,
-) -> anyhow::Result<(Option<Duration>, Duration, Duration)> {
+) -> anyhow::Result<HostTimeouts> {
     let parse = |text: &Option<String>, name: &str| -> anyhow::Result<Option<Duration>> {
         match text {
             Some(text) => muru_config::parse_duration(text)
@@ -913,6 +972,7 @@ pub(crate) fn worker_timeouts(
             None => Ok(None),
         }
     };
+    let mut soft = table.map_or(Ok(None), |table| parse(&table.soft_timeout, "soft_timeout"))?;
     let mut hard = table.map_or(Ok(None), |table| parse(&table.hard_timeout, "hard_timeout"))?;
     let mut grace = table
         .map_or(Ok(None), |table| {
@@ -927,6 +987,7 @@ pub(crate) fn worker_timeouts(
 
     for (name, duration) in timeouts {
         match name.as_str() {
+            "soft" => soft = Some(*duration),
             "hard" => hard = Some(*duration),
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
@@ -934,7 +995,27 @@ pub(crate) fn worker_timeouts(
         }
     }
 
-    Ok((hard, grace, shutdown))
+    // Section 7.6: the hard timeout backs the soft one up, so it must
+    // come later.
+
+    anyhow::ensure!(
+        soft != Some(Duration::ZERO),
+        "soft_timeout must be longer than nothing"
+    );
+
+    if let (Some(soft), Some(hard)) = (soft, hard) {
+        anyhow::ensure!(
+            hard >= soft + Duration::from_secs(5),
+            "hard_timeout must exceed soft_timeout by at least 5s"
+        );
+    }
+
+    Ok(HostTimeouts {
+        soft,
+        hard,
+        hard_drain_grace: grace,
+        shutdown,
+    })
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -1007,10 +1088,24 @@ struct Resolved {
     max_lifetime: Option<Duration>,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
+    /// Section 4.10: the default mount's redirect settings from the table.
+    accel_redirect: bool,
+    cgi_local_redirect: bool,
+    /// Section 4.9: the default mount's file hints by path from the table.
+    sendfile_roots: Vec<String>,
+    sendfile_header: Option<String>,
+    /// Section 4.12: the error pages, override and maintenance
+    /// exemptions from the table.
+    error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    error_override: Option<muru_config::ErrorOverride>,
+    maintenance: Option<muru_config::Maintenance>,
     /// The memory table (section 7.7).
     memory: Option<muru_config::Memory>,
     /// Environment variables from the table (section 10.8).
     env: std::collections::BTreeMap<String, muru_config::EnvValue>,
+    /// The scaling table (sections 7.2 and 7.4), written out by
+    /// --print-config; a development run never scales.
+    scaling: Option<muru_config::Scaling>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1126,6 +1221,13 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         source,
         groups: table.groups,
         mounts: table.mounts,
+        accel_redirect: table.accel_redirect.unwrap_or(false),
+        cgi_local_redirect: table.cgi_local_redirect.unwrap_or(false),
+        sendfile_roots: table.sendfile_roots,
+        sendfile_header: table.sendfile_header,
+        error_pages: table.error_pages,
+        error_override: table.error_override,
+        maintenance: table.maintenance,
         logging: table.logging,
         max_requests: args.max_requests.or(table.max_requests),
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
@@ -1139,6 +1241,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         timeouts: table.timeouts,
         memory: table.memory,
         env: table.env,
+        scaling: table.scaling,
     })
 }
 
@@ -1163,6 +1266,14 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     }
 
     let release = Release {
+        kind: None,
+        profile: None,
+        command: Vec::new(),
+        cwd: None,
+        bind: None,
+        instances: None,
+        readiness: None,
+        stop_signal: None,
         source: Some(resolved.project.display().to_string()),
         entrypoint: resolved.entrypoint.clone(),
         interface: (resolved.interface != muru_config::Interface::Auto)
@@ -1182,18 +1293,22 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         hooks: resolved.hooks.clone(),
         groups: resolved.groups.clone(),
         mounts: resolved.mounts.clone(),
+        accel_redirect: resolved.accel_redirect.then_some(true),
+        cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
+        sendfile_roots: resolved.sendfile_roots.clone(),
+        sendfile_header: resolved.sendfile_header.clone(),
+        error_pages: resolved.error_pages.clone(),
+        error_override: resolved.error_override.clone(),
+        maintenance: resolved.maintenance.clone(),
         logging: resolved.logging.clone(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
         env: resolved.env.clone(),
+        scaling: resolved.scaling.clone(),
         timeouts: {
-            let (hard, grace, shutdown) =
-                worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
-            (hard.is_some() || resolved.timeouts.is_some()).then(|| muru_config::Timeouts {
-                hard_timeout: hard.map(muru_config::format_duration),
-                hard_drain_grace: Some(muru_config::format_duration(grace)),
-                shutdown_timeout: Some(muru_config::format_duration(shutdown)),
-            })
+            let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+            (timeouts.soft.is_some() || timeouts.hard.is_some() || resolved.timeouts.is_some())
+                .then(|| timeouts.table())
         },
         memory: {
             let policy = memory_policy(&args.memory, resolved.memory.as_ref())?;
@@ -1303,15 +1418,32 @@ async fn host_control(
     }
 }
 
-/// The named mounts as the edge selects them.
-fn mount_paths(
-    mounts: &std::collections::BTreeMap<String, muru_config::Mount>,
-) -> Vec<muru_edge::routing::MountPath> {
-    mounts
+/// The named mounts as the edge selects them, with their redirect
+/// settings (section 4.10), the release's where a mount is silent.
+fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
+    resolved
+        .mounts
         .iter()
         .map(|(name, mount)| muru_edge::routing::MountPath {
             name: name.clone(),
             path: mount.path.clone(),
+            internal: mount.internal.unwrap_or(false),
+            accept_redirects_from: mount.accept_redirects_from.clone(),
+            accel_redirect: mount.accel_redirect.unwrap_or(resolved.accel_redirect),
+            cgi_local_redirect: mount
+                .cgi_local_redirect
+                .unwrap_or(resolved.cgi_local_redirect),
+            sendfile: muru_edge::routing::Sendfile::new(
+                mount
+                    .sendfile_roots
+                    .as_deref()
+                    .unwrap_or(&resolved.sendfile_roots),
+                mount
+                    .sendfile_header
+                    .as_deref()
+                    .or(resolved.sendfile_header.as_deref())
+                    .unwrap_or_default(),
+            ),
         })
         .collect()
 }
@@ -1451,11 +1583,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
-    let (hard_timeout, hard_drain_grace, shutdown_timeout) =
-        worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
+        name: None,
+        release: None,
         interface: resolved.interface,
         factory: resolved.factory,
         processes: resolved.processes,
@@ -1496,9 +1629,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime,
-        hard_timeout,
-        hard_drain_grace,
-        shutdown_timeout,
+        soft_timeout: timeouts.soft,
+        hard_timeout: timeouts.hard,
+        hard_drain_grace: timeouts.hard_drain_grace,
+        shutdown_timeout: timeouts.shutdown,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
         env: resolved
             .env
@@ -1516,7 +1650,41 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let logs = Logs::default();
     let group_tables = resolved.groups.clone();
-    let mount_tables = resolved.mounts.clone();
+    let mounts = mount_paths(&resolved);
+    let redirect_flags = muru_edge::routing::RedirectFlags {
+        accel_redirect: resolved.accel_redirect,
+        cgi_local_redirect: resolved.cgi_local_redirect,
+    };
+    let sendfile = muru_edge::routing::Sendfile::new(
+        &resolved.sendfile_roots,
+        resolved.sendfile_header.as_deref().unwrap_or_default(),
+    );
+
+    // Section 4.12: the project's error pages, with files under it.
+
+    muru_config::check_error_pages(&resolved.error_pages, true)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    if let Some(table) = &resolved.error_override {
+        muru_config::check_error_override(table)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    }
+
+    let error_policy = Arc::new(
+        muru_edge::errors::ErrorPolicy::load(
+            &muru_controller::daemon::error_pages_message(
+                &resolved.error_pages,
+                Some(&resolved.project),
+            ),
+            resolved
+                .error_override
+                .as_ref()
+                .map(muru_controller::daemon::error_override_message)
+                .as_ref(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
+    );
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -1537,7 +1705,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         release: "r1".to_owned(),
         sockets: current.default_sockets(),
         groups: group_sockets(&current, &resolved.groups),
-        mounts: mount_paths(&resolved.mounts),
+        mounts: mounts.clone(),
+        accel_redirect: resolved.accel_redirect,
+        cgi_local_redirect: resolved.cgi_local_redirect,
+        sendfile: Arc::clone(&sendfile),
+        errors: Arc::clone(&error_policy),
         development,
         access_log,
         limits: limits(&args),
@@ -1697,9 +1869,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             &format!("r{}", current.release),
                             &sockets,
                             &group_sockets_from(&groups, &group_tables),
-                            &mount_paths(&mount_tables),
+                            &mounts,
+                            redirect_flags,
                         )
-                        .await;
+                        .await
+                        .map(|pools| {
+                            pools
+                                .with_errors(Arc::clone(&error_policy))
+                                .with_sendfile(Arc::clone(&sendfile))
+                        });
 
                         match connected {
                             Ok(connected) => {
@@ -1745,9 +1923,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     &format!("r{release}"),
                                     &next.default_sockets(),
                                     &group_sockets(&next, &group_tables),
-                                &mount_paths(&mount_tables),
+                                    &mounts,
+                                    redirect_flags,
                                 )
-                                .await;
+                                .await
+                                .map(|pools| {
+                                    pools
+                                        .with_errors(Arc::clone(&error_policy))
+                                        .with_sendfile(Arc::clone(&sendfile))
+                                });
 
                                 match connected {
                                     Ok(connected) => pools.replace(connected),

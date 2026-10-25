@@ -25,8 +25,10 @@ fixtures = [
     "django>=5.2",
     "fastapi>=0.115",
     "flask>=3.1",
+    "gunicorn>=23.0",
     "python-multipart>=0.0.20",
     "starlette>=0.45",
+    "uvicorn>=0.34",
     "websockets>=15",
 ]
 bench = [

@@ -67,7 +67,11 @@ def test_client_server_and_state(server: Server) -> None:
     assert isinstance(report["client"][1], int)
     assert report["server"] == ["127.0.0.1", server.port]
     assert report["state"]["pid"]
-    assert report["extensions"] == ["muru"]
+    assert report["extensions"] == [
+        "http.response.pathsend",
+        "http.response.zerocopysend",
+        "muru",
+    ]
     assert report["muru"]["request_id"]
     assert report["muru"]["max_body_size"] > 0
 

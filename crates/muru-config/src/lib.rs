@@ -104,6 +104,72 @@ words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
 
+/// What a release runs (section 9.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseKind {
+    /// Muru's own workers, from an entrypoint.
+    Workers,
+    /// An HTTP server Muru starts and supervises, from a command.
+    Http,
+}
+
+/// The server a managed HTTP release runs (section 9.9), which fixes
+/// how it binds and how it is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerProfile {
+    /// gunicorn: `--bind unix:PATH` or `--bind HOST:PORT`, stopped by TERM.
+    Gunicorn,
+    /// uvicorn: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM.
+    Uvicorn,
+    /// Granian: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM.
+    Granian,
+    /// mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM.
+    #[serde(rename = "mod_wsgi-express")]
+    ModWsgiExpress,
+    /// Any server: the command binds through `{bind}` and `stop_signal`
+    /// says how it is stopped.
+    Generic,
+}
+
+/// How a managed HTTP release's instances bind (section 9.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerBind {
+    /// A Unix socket per instance under the release's run directory.
+    Unix,
+    /// A free loopback port per instance.
+    Port,
+}
+
+words!(ReleaseKind { Workers => "workers", Http => "http" });
+words!(ServerProfile {
+    Gunicorn => "gunicorn",
+    Uvicorn => "uvicorn",
+    Granian => "granian",
+    ModWsgiExpress => "mod_wsgi-express",
+    Generic => "generic",
+});
+words!(ServerBind { Unix => "unix", Port => "port" });
+
+/// The signals a `stop_signal` may name.
+pub const STOP_SIGNALS: [&str; 7] = ["TERM", "INT", "QUIT", "HUP", "USR1", "USR2", "WINCH"];
+
+/// The `readiness` table of a managed HTTP release (section 9.9): how
+/// an instance is known to be ready.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Readiness {
+    /// The path probed with a GET until it answers 2xx or 3xx; without
+    /// it, any HTTP response makes the instance ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How long the instances get to become ready (default 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
 /// A Python logging level (section 11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -260,13 +326,39 @@ pub struct Mount {
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Interface>,
+    /// Reachable only through internal redirects (section 4.10): a
+    /// client's request for its path is answered 404 (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+    /// Other applications whose internal redirects may reach the mount
+    /// when it is internal; the release's own always may.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_redirects_from: Vec<String>,
+    /// Treat an `X-Accel-Redirect` response header from the mount as an
+    /// internal redirect (default the release's setting, else false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_redirect: Option<bool>,
+    /// Treat a 200 response with a `Location` starting with `/` and no
+    /// body as an internal redirect, the CGI convention (default the
+    /// release's setting, else false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgi_local_redirect: Option<bool>,
+    /// Directories a path in an `X-Muru-Sendfile` response header must
+    /// lie in for the edge to serve the file (section 4.9); the
+    /// release's when absent, and an empty list refuses every hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_roots: Option<Vec<String>>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile` (default the release's setting, else none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
 }
 
 /// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
 /// `[tool.muru.groups.NAME]` table (section 7.1): the paths it serves
 /// and its own sizes. Paths not claimed by a group go to the default
 /// group, which is the release's own settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     /// Path prefixes, with an optional trailing `*`; the most specific
@@ -285,17 +377,52 @@ pub struct Group {
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// How the group is scaled (sections 7.2 and 7.4); static when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<Scaling>,
 }
 
 /// A release definition, the `[app.NAME.release.ID]` table (appendix C):
 /// the keys a deploy takes. `muructl run --print-config` writes one so a
 /// laptop setup can become a declared release, and `muructl apply` reads
 /// them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
+    /// What the release runs (section 9.9): `workers` from an entrypoint,
+    /// the default, or `http`, an HTTP server started from `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ReleaseKind>,
+    /// The server an `http` release runs: gunicorn, uvicorn, granian,
+    /// mod_wsgi-express or generic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ServerProfile>,
+    /// The command an `http` release runs, with `{bind}` where the
+    /// server takes its address; without `{bind}` the profile adds the
+    /// server's own flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// The directory an `http` release's command runs in; `source` when
+    /// absent, and one of the two is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// How an `http` release's instances bind: `unix` (the default) or
+    /// `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<ServerBind>,
+    /// How many instances of the command an `http` release runs (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    /// How an `http` release's instances are known to be ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Readiness>,
+    /// The signal that stops an `http` release's instance gracefully:
+    /// TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic
+    /// profile; the other profiles know their server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
     /// The source directory. A relative path is taken from the file's
-    /// directory. Required by `muructl apply`.
+    /// directory. Required by `muructl apply` for a `workers` release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// The application as module:callable, else from the source's
@@ -326,6 +453,10 @@ pub struct Release {
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// How the default group is scaled (sections 7.2 and 7.4); static
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<Scaling>,
     /// The preload mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<Preload>,
@@ -359,6 +490,122 @@ pub struct Release {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
+    /// Treat an `X-Accel-Redirect` response header as an internal
+    /// redirect (section 4.10), for the default mount and any mount that
+    /// does not say otherwise (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_redirect: Option<bool>,
+    /// Treat a 200 response with a `Location` starting with `/` and no
+    /// body as an internal redirect, the CGI convention (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgi_local_redirect: Option<bool>,
+    /// Directories a path in an `X-Muru-Sendfile` response header must
+    /// lie in for the edge to serve the file (section 4.9), for the
+    /// default mount and any mount that does not say otherwise; with
+    /// none every hint is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile` for the frameworks that send that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
+    /// What maintenance mode lets through (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
+}
+
+/// How a worker group is scaled (section 7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScalingMode {
+    /// A fixed worker count, the default.
+    Static,
+    /// Keep between min_spare and max_spare idle workers, Apache-style.
+    Spare,
+    /// Track a slot utilization and a queue wait target.
+    Target,
+}
+
+impl ScalingMode {
+    /// The mode as the configuration spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Spare => "spare",
+            Self::Target => "target",
+        }
+    }
+}
+
+/// The `scaling` table of a release, a worker group or a `[tool.muru]`
+/// table (sections 7.2 and 7.4): the mode, the bounds, and the windows
+/// and budgets that keep the autoscaler from churning. The release's
+/// own table is the default group's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scaling {
+    /// static (the default), spare or target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ScalingMode>,
+    /// The fewest workers (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workers: Option<usize>,
+    /// The most workers; required by the spare and target modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<usize>,
+    /// Spare mode: scale out when fewer idle workers than this remain
+    /// (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_spare: Option<usize>,
+    /// Spare mode: scale in while more idle workers than this remain
+    /// (default the larger of 3 and a quarter of max_workers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spare: Option<usize>,
+    /// Target mode: the share of slots to keep busy, between 0 and 1
+    /// (default 0.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_utilization: Option<f64>,
+    /// Target mode: scale out while the p95 queue wait is over this,
+    /// for example 100ms; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_p95: Option<String>,
+    /// How long a scale-out condition must hold (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_out_window: Option<String>,
+    /// How long every scale-in condition must hold (default 10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_in_window: Option<String>,
+    /// No scale-in this long after a scale-out (default 5m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_after_growth: Option<String>,
+    /// At most one worker reaped per this interval (default 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reap_interval: Option<String>,
+    /// A group wholly idle this long scales in without waiting for the
+    /// scale-in window (default 10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reap_after: Option<String>,
+    /// No worker younger than this is reaped (default the larger of 15m
+    /// and 30 times the measured time to ready).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_lifetime: Option<String>,
+    /// The most workers one scale-out adds (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_step_up: Option<usize>,
+    /// Reaps allowed per hour per release before scale-in is suspended
+    /// (default 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub churn_budget: Option<usize>,
+    /// Decide and report without acting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<bool>,
 }
 
 /// The `[memory]` table of a release or a `[tool.muru]` table (section
@@ -492,8 +739,14 @@ pub struct SecretStore {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
+    /// How long a request may run in a worker before it is interrupted
+    /// by raising `muru.RequestTimeout` in its thread, for example 30s;
+    /// off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout: Option<String>,
     /// How long a request may run in a worker before the worker is
-    /// replaced, for example 60s; off when absent.
+    /// replaced, for example 60s; off when absent. Must exceed the soft
+    /// timeout by at least 5s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_timeout: Option<String>,
     /// How long a worker being replaced is given to finish its other
@@ -773,6 +1026,13 @@ pub struct Host {
     /// otherwise refused with 421.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
@@ -797,9 +1057,13 @@ pub struct Route {
     #[serde(default = "root_path")]
     pub path: String,
     /// The application whose serving release takes the requests; empty
-    /// for a static route.
+    /// for a static or upstream route.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app: String,
+    /// The HTTP upstream (section 4.13) that takes the requests, instead
+    /// of an application.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream: String,
     /// The directory served by the edge (section 4.9), instead of an
     /// application.
     #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
@@ -822,6 +1086,101 @@ pub struct Route {
     /// or `insensitive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case: Option<String>,
+    /// How requests are shared between the application's releases
+    /// (section 9.4); without it every request goes to the serving
+    /// release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<Traffic>,
+    /// Reachable only through internal redirects (section 4.10): a
+    /// client's request for the path is answered 404 (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+    /// Applications other than the route's own (or a static route's
+    /// fallback) whose internal redirects may reach the route. A static
+    /// route with no fallback needs it for any redirect to reach it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_redirects_from: Vec<String>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
+    /// An authorisation decision the edge asks an application for before
+    /// it serves the route (section 4.16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Auth>,
+}
+
+/// A route's authentication sub-request (section 4.16): the edge sends a
+/// bodiless GET to an application path and serves the route only when
+/// that answers 2xx.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// The application that decides; empty when an upstream does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    /// The HTTP upstream (section 4.13) that decides, instead of an
+    /// application.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream: String,
+    /// The path asked, usually of an internal mount or route.
+    pub path: String,
+    /// How long the handler has, queueing included, for example 2s (the
+    /// default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Response headers of an allowing answer added to the request as
+    /// trusted headers; a client's own copies are always removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy_headers: Vec<String>,
+    /// Remember allowing decisions for a while (off without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<AuthCache>,
+}
+
+/// How long and by what an allowing decision is remembered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCache {
+    /// How long a decision stands, for example 30s.
+    pub ttl: String,
+    /// What a decision is keyed by: `cookie:NAME` and `header:NAME`
+    /// entries. A request with none of them present is never served
+    /// from the cache.
+    pub key: Vec<String>,
+}
+
+/// A route's traffic policy (section 9.4): the share of requests each
+/// release takes, the key requests are bucketed by, and stickiness.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Traffic {
+    /// Percent of requests to each release, by id; the application's
+    /// serving release takes the rest. A release at 0 is reached only by
+    /// preview or by a sticky cookie.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub split: BTreeMap<String, u32>,
+    /// What a request is bucketed by: `cookie` (the default, an anonymous
+    /// id cookie the edge issues), `header:NAME`, `cookie:NAME`, or
+    /// `client` (the client address). A missing header or cookie falls
+    /// back to the client address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_key: Option<String>,
+    /// Mixed into the hash, so two routes split the same users
+    /// differently; the route's host and path by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// Whether a client keeps the release it first got, through a cookie
+    /// (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<bool>,
+    /// How long sticky clients keep a release that is leaving the route
+    /// alive, for example 10m (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky_grace: Option<String>,
 }
 
 /// A static route's fallback (section 4.9): an application, or a file
@@ -832,6 +1191,9 @@ pub struct Fallback {
     /// The application that takes requests no file answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// The HTTP upstream (section 4.13) that takes them instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
     /// The file served for paths with no file of their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
@@ -857,8 +1219,659 @@ fn root_path() -> String {
     "/".to_owned()
 }
 
-/// An application's table and its releases.
+/// A custom error page (section 4.12): one entry of an `error_pages`
+/// table, keyed by status (`404`) or status and reason
+/// (`"503:maintenance"`). Exactly one of `file`, `template` and `path`
+/// is given.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorPage {
+    /// A file sent as the body, with the content type its name implies.
+    /// A release's page may be a path relative to its source directory;
+    /// elsewhere the path is absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// A template the edge renders, with `{status}`, `{title}`,
+    /// `{reason}`, `{description}`, `{request_id}`, `{retry_after}`,
+    /// `{host}` and `{path}` filled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// An application path the edge asks for the page, as an internal
+    /// sub-request that sees `REDIRECT_STATUS` and `muru.error_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The content type of a template (default `text/html;
+    /// charset=utf-8`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+/// Replacing an application's own error responses with error pages
+/// (section 4.12), the `error_override` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorOverride {
+    /// The statuses replaced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<u16>,
+    /// When a listed response is replaced: `all` (the default),
+    /// `empty_body`, `not_json` or `html_only`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
+/// What maintenance mode lets through (section 4.12), the `maintenance`
+/// table of a release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Maintenance {
+    /// Path prefixes served as usual while the application is in
+    /// maintenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_paths: Vec<String>,
+    /// Client addresses, or ranges in CIDR form, served as usual.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_addresses: Vec<String>,
+    /// A `name=value` cookie that lets a client through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_cookie: Option<String>,
+    /// The `Retry-After` the maintenance page carries, for example 5m
+    /// (default 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+}
+
+/// Check an `error_pages` table: the keys name a status, with a reason
+/// after a colon or not, and each page is exactly one of a file, a
+/// template or a path. With `relative_files` a file may be a relative
+/// path, which a release resolves against its source.
+pub fn check_error_pages(
+    pages: &BTreeMap<String, ErrorPage>,
+    relative_files: bool,
+) -> Result<(), String> {
+    for (key, page) in pages {
+        let (status, reason) = match key.split_once(':') {
+            Some((status, reason)) => (status, Some(reason)),
+            None => (key.as_str(), None),
+        };
+
+        let status: u16 = status.parse().unwrap_or(0);
+
+        if !(400..=599).contains(&status) {
+            return Err(format!(
+                "error_pages: {key:?} is not a status from 400 to 599, or STATUS:reason"
+            ));
+        }
+
+        if reason.is_some_and(|reason| {
+            reason.is_empty()
+                || !reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }) {
+            return Err(format!(
+                "error_pages: {key:?} does not name a reason such as no_route"
+            ));
+        }
+
+        let given = [
+            page.file.is_some(),
+            page.template.is_some(),
+            page.path.is_some(),
+        ]
+        .into_iter()
+        .filter(|given| *given)
+        .count();
+
+        if given != 1 {
+            return Err(format!(
+                "error_pages: {key} needs exactly one of file, template and path"
+            ));
+        }
+
+        if let Some(path) = &page.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("error_pages: {key}: path must start with /"));
+        }
+
+        if let Some(file) = &page.file
+            && !relative_files
+            && !file.starts_with('/')
+        {
+            return Err(format!(
+                "error_pages: {key}: file must be an absolute path here"
+            ));
+        }
+
+        if page.content_type.is_some() && page.template.is_none() {
+            return Err(format!(
+                "error_pages: {key}: content_type goes with a template"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check an `error_override` table: statuses from 400 to 599, and a
+/// known `when`.
+pub fn check_error_override(table: &ErrorOverride) -> Result<(), String> {
+    if table.statuses.is_empty() {
+        return Err("error_override: statuses names nothing".to_owned());
+    }
+
+    if let Some(status) = table
+        .statuses
+        .iter()
+        .find(|status| !(400..=599).contains(*status))
+    {
+        return Err(format!(
+            "error_override: {status} is not a status from 400 to 599"
+        ));
+    }
+
+    if let Some(when) = table.when.as_deref()
+        && !matches!(when, "all" | "empty_body" | "not_json" | "html_only")
+    {
+        return Err(format!(
+            "error_override: when must be all, empty_body, not_json or html_only, not {when:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check a route's `auth` table: the application and path, the timeout,
+/// the header names and the cache.
+pub fn check_auth(table: &Auth) -> Result<(), String> {
+    if table.app.is_empty() && table.upstream.is_empty() {
+        return Err("auth: app names no application".to_owned());
+    }
+
+    if !table.app.is_empty() && !table.upstream.is_empty() {
+        return Err("auth: names both an application and an upstream".to_owned());
+    }
+
+    if !table.path.starts_with('/') {
+        return Err(format!("auth: path {:?} must start with /", table.path));
+    }
+
+    if let Some(text) = &table.timeout
+        && let Err(error) = parse_duration(text)
+    {
+        return Err(format!("auth: timeout: {error}"));
+    }
+
+    if let Some(name) = table.copy_headers.iter().find(|name| {
+        name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err(format!("auth: copy_headers: {name:?} is not a header name"));
+    }
+
+    if let Some(name) = table
+        .copy_headers
+        .iter()
+        .find(|name| name.to_ascii_lowercase().starts_with("x-muru-"))
+    {
+        return Err(format!(
+            "auth: copy_headers: {name:?} starts with X-Muru-, which the edge keeps for itself"
+        ));
+    }
+
+    if let Some(cache) = &table.cache {
+        if let Err(error) = parse_duration(&cache.ttl) {
+            return Err(format!("auth: cache.ttl: {error}"));
+        }
+
+        if cache.key.is_empty() {
+            return Err("auth: cache.key names nothing".to_owned());
+        }
+
+        if let Some(key) = cache.key.iter().find(|key| {
+            !matches!(
+                key.split_once(':'),
+                Some(("cookie" | "header", name)) if !name.is_empty()
+            )
+        }) {
+            return Err(format!(
+                "auth: cache.key: {key:?} must be cookie:NAME or header:NAME"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check a `maintenance` table: paths, addresses, the cookie and the
+/// retry period.
+pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
+    if let Some(path) = table
+        .exempt_paths
+        .iter()
+        .find(|path| !path.starts_with('/'))
+    {
+        return Err(format!(
+            "maintenance: exempt_paths: {path:?} must start with /"
+        ));
+    }
+
+    for address in &table.exempt_addresses {
+        let (network, prefix) = match address.split_once('/') {
+            Some((network, prefix)) => (network, Some(prefix)),
+            None => (address.as_str(), None),
+        };
+
+        let parsed: Option<std::net::IpAddr> = network.parse().ok();
+        let bits = parsed.map_or(0, |address| if address.is_ipv4() { 32 } else { 128 });
+        let prefix_ok = prefix.is_none_or(|prefix| prefix.parse::<u8>().is_ok_and(|n| n <= bits));
+
+        if parsed.is_none() || !prefix_ok {
+            return Err(format!(
+                "maintenance: exempt_addresses: {address:?} is not an address or a CIDR range"
+            ));
+        }
+    }
+
+    if let Some(cookie) = &table.bypass_cookie
+        && !matches!(cookie.split_once('='), Some((name, value)) if !name.is_empty() && !value.is_empty())
+    {
+        return Err("maintenance: bypass_cookie must be name=value".to_owned());
+    }
+
+    if let Some(text) = &table.retry_after
+        && let Err(error) = parse_duration(text)
+    {
+        return Err(format!("maintenance: retry_after: {error}"));
+    }
+
+    Ok(())
+}
+
+/// An HTTP upstream (section 4.13), one of the `[upstream.NAME]` tables:
+/// an unmanaged HTTP server that routes, fallbacks, traffic shares and
+/// authentication sub-requests can target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upstream {
+    /// Where the server listens: `host:port` entries, or `unix:/path`
+    /// for a Unix socket. Requests take the addresses in turn, and one
+    /// that fails is set aside for a while.
+    pub addresses: Vec<String>,
+    /// `http1` (the default), `h2c` (HTTP/2 in the clear, by prior
+    /// knowledge) or `h2` (HTTP/2 over TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Connect with TLS; `h2` implies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<UpstreamTls>,
+    /// Active health checks and passive ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<UpstreamHealth>,
+    /// Honour X-Muru-Redirect from the upstream, as from an application
+    /// (default false): its X-Muru-* response headers are otherwise
+    /// removed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_muru_headers: bool,
+    /// Directories a path in a trusted `X-Muru-Sendfile` response header
+    /// must lie in for the edge to serve the file (section 4.9); with
+    /// none every hint is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
+    /// How long a connection may take to open, for example 5s (the
+    /// default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<String>,
+}
+
+/// How an upstream's TLS connections are made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTls {
+    /// A PEM file of the certificates trusted, by absolute path; the
+    /// public roots without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// The name the certificate must carry, sent as SNI; the address's
+    /// host without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// Check the certificate (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
+}
+
+/// An upstream's health checks (section 4.13): probes of each address,
+/// and the ejection of one whose requests fail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamHealth {
+    /// The path probed with a GET, healthy on 2xx or 3xx; without it a
+    /// connection that opens is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How often each address is probed, for example 10s (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    /// How long a probe may take, for example 2s (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Failed probes in a row before an address is unhealthy (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unhealthy_after: Option<u32>,
+    /// Successful probes in a row before it is healthy again (default 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthy_after: Option<u32>,
+    /// Failed requests in a row before an address is ejected (default
+    /// 3); 0 never ejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eject_after: Option<u32>,
+    /// How long an ejected address is left out before a request tries it
+    /// again, for example 30s (the default); doubled each time the trial
+    /// fails, up to ten times as long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eject_for: Option<String>,
+}
+
+/// An upstream address as written: `host:port`, or `unix:/path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAddress {
+    /// A TCP address, by host name or IP address and port.
+    Tcp(String, u16),
+    /// A Unix socket, by absolute path.
+    Unix(PathBuf),
+}
+
+/// Parse an upstream address.
+pub fn parse_upstream_address(text: &str) -> Result<UpstreamAddress, String> {
+    if let Some(path) = text.strip_prefix("unix:") {
+        if !path.starts_with('/') {
+            return Err(format!("{text:?}: a Unix socket path must be absolute"));
+        }
+
+        return Ok(UpstreamAddress::Unix(PathBuf::from(path)));
+    }
+
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{text:?} is not host:port or unix:/path"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("{text:?}: the port must be a number from 1 to 65535"))?;
+
+    if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
+        return Err(format!("{text:?}: the host must be a name or an address"));
+    }
+
+    Ok(UpstreamAddress::Tcp(host.to_owned(), port))
+}
+
+/// The protocols an upstream speaks.
+pub const UPSTREAM_PROTOCOLS: [&str; 3] = ["http1", "h2c", "h2"];
+
+/// Check a release table's keys against its kind (section 9.9): a
+/// managed HTTP release needs its server and command and takes none of
+/// the worker settings, and a workers release takes none of the server
+/// ones.
+pub fn check_release_kind(table: &Release) -> Result<(), String> {
+    let server_keys: [(&str, bool); 7] = [
+        ("profile", table.profile.is_some()),
+        ("command", !table.command.is_empty()),
+        ("cwd", table.cwd.is_some()),
+        ("bind", table.bind.is_some()),
+        ("instances", table.instances.is_some()),
+        ("readiness", table.readiness.is_some()),
+        ("stop_signal", table.stop_signal.is_some()),
+    ];
+
+    if table.kind != Some(ReleaseKind::Http) {
+        if let Some((key, _)) = server_keys.iter().find(|(_, set)| *set) {
+            return Err(format!(
+                "{key} applies to a managed HTTP release (kind = 'http')"
+            ));
+        }
+
+        return Ok(());
+    }
+
+    let timeouts = table.timeouts.as_ref();
+    let worker_keys: [(&str, bool); 21] = [
+        ("entrypoint", !table.entrypoint.is_empty()),
+        ("interface", table.interface.is_some()),
+        ("factory", table.factory.is_some()),
+        ("factory_phase", table.factory_phase.is_some()),
+        ("python", table.python.is_some()),
+        ("processes", table.processes.is_some()),
+        ("threads", table.threads.is_some()),
+        ("sync_threads", table.sync_threads.is_some()),
+        ("concurrency", table.concurrency.is_some()),
+        ("scaling", table.scaling.is_some()),
+        ("preload", table.preload.is_some()),
+        ("hooks", table.hooks.is_some()),
+        ("groups", !table.groups.is_empty()),
+        ("mounts", !table.mounts.is_empty()),
+        ("logging", table.logging.is_some()),
+        ("max_requests", table.max_requests.is_some()),
+        ("max_lifetime", table.max_lifetime.is_some()),
+        ("memory", table.memory.is_some()),
+        ("accel_redirect", table.accel_redirect.is_some()),
+        ("cgi_local_redirect", table.cgi_local_redirect.is_some()),
+        (
+            "timeouts",
+            timeouts.is_some_and(|timeouts| {
+                timeouts.soft_timeout.is_some()
+                    || timeouts.hard_timeout.is_some()
+                    || timeouts.hard_drain_grace.is_some()
+            }),
+        ),
+    ];
+
+    if let Some((key, _)) = worker_keys.iter().find(|(_, set)| *set) {
+        return Err(format!(
+            "{key} does not apply to a managed HTTP release; only shutdown_timeout of the timeouts does"
+        ));
+    }
+
+    let Some(profile) = table.profile else {
+        return Err(
+            "profile: a managed HTTP release names its server: gunicorn, uvicorn, granian, \
+             mod_wsgi-express or generic"
+                .to_owned(),
+        );
+    };
+
+    if table.command.is_empty() {
+        return Err(
+            "command: a managed HTTP release needs the command that runs the server".to_owned(),
+        );
+    }
+
+    if table.source.is_none() && table.cwd.is_none() {
+        return Err(
+            "cwd: a managed HTTP release needs the directory its command runs in".to_owned(),
+        );
+    }
+
+    if table.instances == Some(0) {
+        return Err("instances must be at least 1".to_owned());
+    }
+
+    let bind = table.bind.unwrap_or(ServerBind::Unix);
+
+    if profile == ServerProfile::ModWsgiExpress && bind == ServerBind::Unix {
+        return Err("bind: mod_wsgi-express binds a port only; set bind = 'port'".to_owned());
+    }
+
+    if bind == ServerBind::Unix
+        && let Some(argument) = table
+            .command
+            .iter()
+            .find(|argument| argument.contains("{port}"))
+    {
+        return Err(format!(
+            "command: {argument:?} uses {{port}}, which needs bind = 'port'"
+        ));
+    }
+
+    if bind == ServerBind::Port
+        && let Some(argument) = table
+            .command
+            .iter()
+            .find(|argument| argument.contains("{socket}"))
+    {
+        return Err(format!(
+            "command: {argument:?} uses {{socket}}, which needs bind = 'unix'"
+        ));
+    }
+
+    if let Some(readiness) = &table.readiness {
+        if let Some(path) = &readiness.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("readiness.path {path:?} must start with /"));
+        }
+
+        if let Some(timeout) = &readiness.timeout {
+            let duration =
+                parse_duration(timeout).map_err(|error| format!("readiness.timeout: {error}"))?;
+
+            if duration.is_zero() {
+                return Err("readiness.timeout must be longer than nothing".to_owned());
+            }
+        }
+    }
+
+    match &table.stop_signal {
+        Some(signal) if !STOP_SIGNALS.contains(&signal.as_str()) => {
+            return Err(format!(
+                "stop_signal must be one of {}, not {signal:?}",
+                STOP_SIGNALS.join(", ")
+            ));
+        }
+        None if profile == ServerProfile::Generic => {
+            return Err(format!(
+                "stop_signal: the generic profile needs the signal that stops the server: {}",
+                STOP_SIGNALS.join(", ")
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Check a mount's, release's or upstream's file hint keys (section
+/// 4.9): absolute roots and a header name.
+pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), String> {
+    for root in roots {
+        if !root.starts_with('/') {
+            return Err(format!("sendfile_roots: {root:?} must be an absolute path"));
+        }
+    }
+
+    if let Some(header) = header {
+        let token = !header.is_empty()
+            && header
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+
+        if !token {
+            return Err(format!("sendfile_header: {header:?} is not a header name"));
+        }
+
+        if header.to_ascii_lowercase().starts_with("x-muru-") {
+            return Err(
+                "sendfile_header: X-Muru-Sendfile is always honoured; name the other header"
+                    .to_owned(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Check an `[upstream.NAME]` table: the addresses, the protocol, the
+/// TLS and health settings and the durations. Whether the CA file is
+/// readable is for the daemon to check.
+pub fn check_upstream(table: &Upstream) -> Result<(), String> {
+    if table.addresses.is_empty() {
+        return Err("addresses names nowhere".to_owned());
+    }
+
+    check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
+
+    for address in &table.addresses {
+        parse_upstream_address(address).map_err(|error| format!("addresses: {error}"))?;
+    }
+
+    let protocol = table.protocol.as_deref().unwrap_or("http1");
+
+    if !UPSTREAM_PROTOCOLS.contains(&protocol) {
+        return Err(format!(
+            "protocol must be http1, h2c or h2, not {protocol:?}"
+        ));
+    }
+
+    if protocol == "h2c" && table.tls.is_some() {
+        return Err("h2c is HTTP/2 in the clear; use h2 with tls".to_owned());
+    }
+
+    if let Some(ca) = table.tls.as_ref().and_then(|tls| tls.ca.as_deref())
+        && !ca.starts_with('/')
+    {
+        return Err(format!("tls.ca: {ca:?} must be an absolute path"));
+    }
+
+    if let Some(text) = &table.connect_timeout
+        && let Err(error) = parse_duration(text)
+    {
+        return Err(format!("connect_timeout: {error}"));
+    }
+
+    if let Some(health) = &table.health {
+        if let Some(path) = &health.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("health.path {path:?} must start with /"));
+        }
+
+        for (name, text) in [
+            ("interval", &health.interval),
+            ("timeout", &health.timeout),
+            ("eject_for", &health.eject_for),
+        ] {
+            if let Some(text) = text
+                && let Err(error) = parse_duration(text)
+            {
+                return Err(format!("health.{name}: {error}"));
+            }
+        }
+
+        for (name, count) in [
+            ("unhealthy_after", health.unhealthy_after),
+            ("healthy_after", health.healthy_after),
+        ] {
+            if count == Some(0) {
+                return Err(format!("health.{name} must be at least 1"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// An application's table and its releases.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct App {
     /// Releases by identifier.
@@ -891,7 +1904,7 @@ pub struct Metrics {
 /// `muructl config export` writes it (section 10.4): listeners and limits,
 /// which belong to the daemon's own file, and applications with their
 /// releases.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
     /// How the daemon itself runs (ADR 0026).
@@ -909,6 +1922,13 @@ pub struct Document {
     /// How responses are compressed (section 4.17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<Compression>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
     /// Secret stores (section 10.8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Secrets>,
@@ -930,6 +1950,9 @@ pub struct Document {
     /// Routes, in the order written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<Route>,
+    /// HTTP upstreams by name (section 4.13).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstream: BTreeMap<String, Upstream>,
     /// Applications by name.
     #[serde(default)]
     pub app: BTreeMap<String, App>,
@@ -987,6 +2010,14 @@ impl Document {
             self.host.insert(name, host);
         }
 
+        for (name, upstream) in other.upstream {
+            if self.upstream.contains_key(&name) {
+                return Err(format!("upstream {name} is declared twice"));
+            }
+
+            self.upstream.insert(name, upstream);
+        }
+
         for (name, app) in other.app {
             let entry = self.app.entry(name.clone()).or_default();
 
@@ -1015,7 +2046,7 @@ impl Document {
 /// The `[tool.muru]` table: defaults an application ships with (section
 /// 6.8). Every field is optional; what a command line or a release
 /// definition sets takes precedence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolMuru {
     /// The application as module:callable.
@@ -1043,6 +2074,10 @@ pub struct ToolMuru {
     /// Requests an ASGI worker's event loop takes at once (section 6.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// How the default group is scaled (sections 7.2 and 7.4); static
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<Scaling>,
     /// The preload mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<Preload>,
@@ -1077,6 +2112,35 @@ pub struct ToolMuru {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
+    /// Treat an `X-Accel-Redirect` response header as an internal
+    /// redirect (section 4.10), for the default mount and any mount that
+    /// does not say otherwise (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_redirect: Option<bool>,
+    /// Treat a 200 response with a `Location` starting with `/` and no
+    /// body as an internal redirect, the CGI convention (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgi_local_redirect: Option<bool>,
+    /// Directories a path in an `X-Muru-Sendfile` response header must
+    /// lie in for the edge to serve the file (section 4.9), for the
+    /// default mount and any mount that does not say otherwise; with
+    /// none every hint is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile` for the frameworks that send that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
+    /// Custom error pages (section 4.12), by status or status:reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub error_pages: BTreeMap<String, ErrorPage>,
+    /// Replace the application's own error responses with error pages
+    /// (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_override: Option<ErrorOverride>,
+    /// What maintenance mode lets through (section 4.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
 }
 
 /// Why a project's configuration could not be read.
@@ -1221,6 +2285,11 @@ mod tests {
                         entrypoint: "shop.wsgi:application".to_owned(),
                         processes: Some(2),
                         preload: Some(Preload::Auto),
+                        scaling: Some(Scaling {
+                            mode: Some(ScalingMode::Spare),
+                            max_workers: Some(8),
+                            ..Scaling::default()
+                        }),
                         ..Release::default()
                     },
                 )]),
@@ -1246,15 +2315,30 @@ mod tests {
             host: "shop".to_owned(),
             path: "/".to_owned(),
             app: "shop".to_owned(),
+            upstream: String::new(),
             static_dir: None,
             index: Vec::new(),
             fallback: None,
             cache: None,
             redirect_slash: None,
             case: None,
+            internal: None,
+            accept_redirects_from: Vec::new(),
+            error_pages: BTreeMap::new(),
+            error_override: None,
+            auth: None,
+            traffic: Some(Traffic {
+                split: BTreeMap::from([("r2".to_owned(), 10)]),
+                sticky: Some(true),
+                ..Traffic::default()
+            }),
         });
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
+        assert!(text.contains("[app.shop.release.r1.scaling]"), "{text}");
+        assert!(text.contains("mode = \"spare\""), "{text}");
+        assert!(text.contains("[route.traffic]"), "{text}");
+        assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");
         assert!(text.contains("[[route]]"), "{text}");
         assert!(
@@ -1335,6 +2419,39 @@ mod tests {
         let error = Document::parse("[[events.sink]]\nname = 'ops'\nurl = 'x'\nkind = 'pigeon'\n")
             .unwrap_err();
         assert!(error.contains("pigeon"), "{error}");
+    }
+
+    #[test]
+    fn upstream_tables_are_checked() {
+        let document = Document::parse(
+            "[upstream.legacy]\naddresses = ['127.0.0.1:8080', 'unix:/run/legacy.sock']\nprotocol = 'h2c'\nhealth = { path = '/healthz', interval = '5s' }\n",
+        )
+        .unwrap();
+        let legacy = &document.upstream["legacy"];
+        assert_eq!(check_upstream(legacy), Ok(()));
+        assert_eq!(
+            parse_upstream_address("unix:/run/legacy.sock"),
+            Ok(UpstreamAddress::Unix(PathBuf::from("/run/legacy.sock")))
+        );
+        assert_eq!(
+            parse_upstream_address("[::1]:8080"),
+            Ok(UpstreamAddress::Tcp("::1".to_owned(), 8080))
+        );
+        let refused = |text: &str| check_upstream(&toml::from_str(text).unwrap()).unwrap_err();
+        assert!(refused("addresses = []").contains("nowhere"));
+        assert!(refused("addresses = ['nowhere']").contains("host:port"));
+        assert!(refused("addresses = ['unix:relative']").contains("absolute"));
+        assert!(refused("addresses = ['a:0']").contains("port"));
+        assert!(refused("addresses = ['a:1']\nprotocol = 'spdy'").contains("http1, h2c or h2"));
+        assert!(refused("addresses = ['a:1']\nprotocol = 'h2c'\ntls = {}").contains("h2 with tls"));
+        assert!(refused("addresses = ['a:1']\ntls = { ca = 'ca.pem' }").contains("absolute"));
+        assert!(refused("addresses = ['a:1']\nhealth = { path = 'x' }").contains("start with /"));
+        assert!(
+            refused("addresses = ['a:1']\nhealth = { unhealthy_after = 0 }").contains("at least 1")
+        );
+        assert!(
+            refused("addresses = ['a:1']\nconnect_timeout = 'soon'").contains("connect_timeout")
+        );
     }
 
     #[test]

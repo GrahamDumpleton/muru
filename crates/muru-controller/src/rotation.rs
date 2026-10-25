@@ -141,12 +141,29 @@ impl Rotator {
     /// the background, and keep only the newest archives. Returns the
     /// archive's path, before compression.
     pub fn rotate(&self, path: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
-        let stamp = stamp(now);
-        let mut archive = path.as_os_str().to_owned();
-        archive.push(format!(".{stamp}"));
-        let archive = PathBuf::from(archive);
+        let archive = archive_path(path, now);
         std::fs::rename(path, &archive)?;
         recreate(path, &archive)?;
+        self.finish(path, archive)
+    }
+
+    /// Rotate a file whose writers cannot reopen it (section 9.9: the
+    /// instances of a managed HTTP server): the contents are copied to
+    /// the archive and the file truncated in place, which a writer with
+    /// the file open in append mode carries on into. Lines written
+    /// between the copy and the truncation are lost.
+    pub fn rotate_in_place(&self, path: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+        let archive = archive_path(path, now);
+        std::fs::copy(path, &archive)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        self.finish(path, archive)
+    }
+
+    /// Compress an archive in the background and prune the old ones.
+    fn finish(&self, path: &Path, archive: PathBuf) -> std::io::Result<PathBuf> {
         let policy = self.policy.clone();
         let base = path.to_path_buf();
         let renamed = archive.clone();
@@ -159,6 +176,13 @@ impl Rotator {
         });
         Ok(archive)
     }
+}
+
+/// Where a file rotated now is archived: the file's path with a stamp.
+fn archive_path(path: &Path, now: SystemTime) -> PathBuf {
+    let mut archive = path.as_os_str().to_owned();
+    archive.push(format!(".{}", stamp(now)));
+    PathBuf::from(archive)
 }
 
 /// Create the log afresh with the archive's mode and owner, so a writer

@@ -56,7 +56,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import _asgi, _inspect, preload
+from muru import RequestTimeout, _asgi, _inspect, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -437,6 +437,10 @@ class Replacement:
     kill_at: float | None = None
     killed: bool = False
 
+    # Section 7.4: a retirement, which stops the worker without a successor.
+
+    retire: bool = False
+
 
 class Host:
     """Preload once, fork workers, and keep them running until told to stop."""
@@ -457,6 +461,7 @@ class Host:
         control: str | None = None,
         max_requests: int | None = None,
         max_lifetime: float | None = None,
+        soft_timeout: float | None = None,
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
@@ -473,6 +478,7 @@ class Host:
         self.concurrency = concurrency
         self.max_requests = max_requests
         self.max_lifetime = max_lifetime
+        self.soft_timeout = soft_timeout
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
@@ -529,6 +535,12 @@ class Host:
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
+
+        # Section 7.4: indices forked by a scale-out and not yet ready, and
+        # indices a scale-in emptied, to be used again by the next one.
+
+        self.starting: set[int] = set()
+        self.retired: set[int] = set()
 
         # Section 5.9: the control socket the supervisor connects to, on
         # which the host announces its worker sockets as they change and
@@ -855,6 +867,17 @@ class Host:
         if loop is not None and lifespan is not None:
             asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
 
+        # Section 7.6: the soft timeout interrupts a request by raising
+        # muru.RequestTimeout in its thread, or cancelling its task.
+
+        timeout_arguments: dict[str, Any] = {}
+
+        if self.soft_timeout is not None:
+            timeout_arguments = {
+                "soft_timeout_ms": int(self.soft_timeout * 1000),
+                "timeout_error": RequestTimeout,
+            }
+
         try:
             _native.serve(
                 path or self.socket_path(index),
@@ -875,6 +898,7 @@ class Host:
                     line, active, loop.loop if loop is not None else None, names
                 ),
                 **asgi_arguments,
+                **timeout_arguments,
             )
         except Exception as error:
             log(f"worker {index} failed: {error}")
@@ -1116,6 +1140,10 @@ class Host:
             if state.ready and not state.replaced and (wanted is None or state.index == wanted)
         }
 
+        if op == "scale":
+            self.scale_group(request_id, args)
+            return
+
         if op == "status":
             self.send_to_supervisor(
                 {
@@ -1158,6 +1186,97 @@ class Host:
                 }
 
         self.finish_if_answered(pending)
+
+    # Section 7.4: the supervisor's scaling of one group, carried out by
+    # forking workers at new indices or draining the group's youngest.
+
+    def scale_group(self, request_id: int, args: dict[str, Any]) -> None:
+        """Bring a group to the worker count the supervisor asks for."""
+
+        name = str(args.get("group", "default"))
+        wanted = int(args.get("processes", 0))
+        group = next((candidate for candidate in self.groups if candidate.name == name), None)
+        error = ""
+
+        if group is None:
+            error = f"no worker group {name}"
+        elif wanted < 1:
+            error = "processes must be at least 1"
+
+        if error:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": error}
+            )
+            return
+
+        assert group is not None
+        current = len(self.active_indices(group))
+
+        for _ in range(current, wanted):
+            self.add_worker(group)
+
+        for _ in range(wanted, current):
+            self.retire_worker(group)
+
+        self.send_to_supervisor({"type": "response", "id": request_id, "workers": []})
+
+    def active_indices(self, group: Group) -> list[int]:
+        """Return the group's indices with a worker that serves or is starting, in order."""
+
+        return [
+            index
+            for index, (placed, _within) in enumerate(self.placement)
+            if placed is group
+            and index not in self.retired
+            and not (index in self.replacing and self.replacing[index].retire)
+        ]
+
+    def add_worker(self, group: Group) -> int:
+        """Fork one more worker for the group; it enters routing once ready.
+
+        A retired index of the group is used again, on a socket of the
+        next generation so it never collides with the old worker's.
+        """
+
+        retired = sorted(index for index in self.retired if self.placement[index][0] is group)
+
+        if retired:
+            index = retired[0]
+            self.retired.discard(index)
+            self.generation[index] = self.generation.get(index, 0) + 1
+        else:
+            index = len(self.placement)
+            within = sum(1 for placed, _within in self.placement if placed is group)
+            self.placement.append((group, within))
+            self.worker_count = len(self.placement)
+
+        self.starting.add(index)
+        self.spawn(index, replacing=True)
+        return index
+
+    def retire_worker(self, group: Group) -> None:
+        """Take the group's youngest worker out of routing and then stop it."""
+
+        candidates = [
+            state
+            for state in self.states.values()
+            if state.ready
+            and not state.replaced
+            and state.index not in self.replacing
+            and self.placement[state.index][0] is group
+        ]
+
+        if not candidates:
+            return
+
+        state = max(candidates, key=lambda candidate: candidate.started_at)
+        state.replaced = True
+        retirement = Replacement(state.index, state.pid, "scaled in", "worker.exited", retire=True)
+        self.replacing[state.index] = retirement
+        self.routed[state.index] = None
+        retirement.announced = self.announce()
+        retirement.announced_at = time.monotonic()
+        log(f"worker {state.index} (pid {state.pid}) leaves routing: scaled in")
 
     def status_of(self, state: WorkerState) -> dict[str, Any]:
         """One worker's state as the host knows it."""
@@ -1434,6 +1553,10 @@ class Host:
             self.routed[state.index] = state.path
             replacement.announced = self.announce()
             replacement.announced_at = time.monotonic()
+        elif state.index in self.starting:
+            self.starting.discard(state.index)
+            self.routed[state.index] = state.path
+            self.announce()
 
     def check_requests(self, state: WorkerState) -> None:
         """Replace a worker that has served its share of requests."""
@@ -1653,6 +1776,12 @@ class Host:
 
             replacement = self.replacing.get(index)
 
+            if replacement is not None and replacement.old_pid == pid and replacement.retire:
+                del self.replacing[index]
+                self.retired.add(index)
+                self.emit("worker.exited", "info", f"worker {index} (pid {pid}) stopped: scaled in")
+                continue
+
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
                 level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
@@ -1715,7 +1844,7 @@ class Host:
         for index, when in list(self.restart_after.items()):
             if when <= now:
                 del self.restart_after[index]
-                self.spawn(index)
+                self.spawn(index, replacing=index in self.starting)
 
     def terminate_all(self) -> None:
         """Stop every worker: SIGTERM, a grace period, then SIGKILL."""
@@ -1824,6 +1953,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(prog="python -m muru.host", description=__doc__)
     parser.add_argument("--app", required=True, help="application as module:callable")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="the application's name for muru.context(); the entrypoint's module otherwise",
+    )
+    parser.add_argument(
+        "--release", default=None, help="the release's id for muru.context(); dev otherwise"
+    )
     parser.add_argument("--socket-dir", required=True, help="directory for the worker sockets")
     parser.add_argument("--processes", type=int, default=1, help="worker processes to fork")
     parser.add_argument(
@@ -1951,6 +2088,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="replace a worker after this long, with jitter (section 7.7)",
     )
     parser.add_argument(
+        "--soft-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="interrupt a request that has run this long with muru.RequestTimeout (section 7.6)",
+    )
+    parser.add_argument(
         "--hard-timeout",
         type=float,
         default=None,
@@ -2059,7 +2203,11 @@ def main(argv: list[str] | None = None) -> int:
         print("--processes must be at least 1", file=sys.stderr)
         return 2
 
-    context = Context(app=app_name(args.app), process_model=process_model(args.threads))
+    context = Context(
+        app=args.name or app_name(args.app),
+        release=args.release or "dev",
+        process_model=process_model(args.threads),
+    )
     set_context(context)
     release = Release(
         args.app,
@@ -2156,6 +2304,7 @@ def main(argv: list[str] | None = None) -> int:
         control=args.control,
         max_requests=args.max_requests,
         max_lifetime=args.max_lifetime,
+        soft_timeout=args.soft_timeout,
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,

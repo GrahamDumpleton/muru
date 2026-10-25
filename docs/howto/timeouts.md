@@ -3,9 +3,9 @@
 ```{admonition} Status
 :class: note
 
-The edge's timeouts and the hard timeout, which replaces a worker whose
-request runs too long. The soft timeout, which interrupts the request
-itself, and the loop stall timeout are still to come.
+The edge's timeouts, the soft timeout, which interrupts a request that
+runs too long, and the hard timeout, which replaces a worker whose
+request never returns. The loop stall timeout is still to come.
 ```
 
 Every timeout has a name, a default, and a response the client sees when
@@ -32,11 +32,59 @@ load balancers and clients handle better than slow successes. `deadline`
 bounds the slowest acceptable request; the access log shows `app=` time per
 request, so the right value is the slowest legitimate one plus margin.
 
-The deadline is also passed to the application: `muru.deadline` in the
-environ is planned, and in phase 3 a soft timeout can interrupt the
-application thread itself. Until then a request past its deadline keeps
-running in the worker after the client has been answered, which is what
-the hard timeout is for.
+A request past its deadline keeps running in the worker after the client
+has been answered, unless a soft timeout interrupts it or a hard timeout
+replaces its worker. Both are off by default.
+
+## The soft timeout
+
+The soft timeout interrupts a request where it is. A watchdog in each
+worker checks its requests in flight every 100 ms and, when one has run
+past the timeout, raises `muru.RequestTimeout` in the thread serving it,
+or cancels the task of an ASGI request. The exception is raised at the
+next line of Python the thread runs: a thread waiting in `wsgi.input`
+for the request body is woken at once, and one inside a C call, such as
+a database driver waiting for a row, sees it when the call returns. The
+worker writes the traceback to its log, which shows where the request
+was when it was interrupted, and answers 504 `soft_timeout` unless the
+response had already started, in which case the response is cut off.
+The worker goes on serving.
+
+`muru.RequestTimeout` is a `BaseException`, not an `Exception`, so a
+handler that catches `Exception` to log and carry on does not swallow
+it. An application that wants to answer for itself catches it by name:
+
+```python
+import muru
+
+def application(environ, start_response):
+    try:
+        rows = run_report()
+    except muru.RequestTimeout:
+        start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+        return [b"the report took too long; try a narrower date range\n"]
+    ...
+```
+
+For an ASGI application the task is cancelled, so the application sees
+`asyncio.CancelledError` at its next `await`, and its `finally` blocks
+and context managers run as they do for any cancellation.
+
+| Name | Default | Measured | When it fires |
+| --- | --- | --- | --- |
+| `soft` | off | from the request reaching the worker | the request is interrupted and answered 504 `soft_timeout` |
+
+```
+muructl run app:application --timeout soft=30s
+muructl deploy shop /srv/shop --timeout soft=30s --timeout hard=60s
+```
+
+Streaming responses and WebSockets are exempt: once a response head goes
+out with `Content-Type: text/event-stream` or `X-Accel-Buffering: no`,
+or a WebSocket is accepted, the request runs as long as it needs to and
+counts toward neither the soft nor the hard timeout. The
+[connections guide](connections.md) covers the idle timeouts that bound
+those instead.
 
 ## The hard timeout
 
@@ -67,6 +115,7 @@ In a project's `[tool.muru]` table or a declared release they are the
 
 ```toml
 [tool.muru.timeouts]
+soft_timeout = "30s"
 hard_timeout = "60s"
 hard_drain_grace = "10s"
 shutdown_timeout = "5s"
@@ -74,8 +123,12 @@ shutdown_timeout = "5s"
 
 Set the hard timeout above the edge's `deadline`, so that a slow request
 is answered 504 by the edge first and only a request that never returns
-costs a worker. The [worker recycling guide](recycling.md) describes the
-replacement itself, which is the same path a recycled worker takes.
+costs a worker, and at least 5 seconds above the soft timeout, which
+`muructl` and `muructl apply` check: the hard timeout is the backstop for
+a request the soft timeout could not interrupt, such as one stuck in a C
+call that never returns. The [worker recycling guide](recycling.md)
+describes the replacement itself, which is the same path a recycled
+worker takes.
 
 The body size limit is a limit rather than a timeout, but lives beside
 them: `--max-body-size 100MB` (the development default; 10 MB with

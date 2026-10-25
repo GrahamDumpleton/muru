@@ -4,8 +4,8 @@
 :class: note
 
 Named mounts at path prefixes, any mix of WSGI and ASGI in the same
-workers, in development mode and under the daemon. Per-mount thread
-pools and connection limits, internal mounts, gRPC mounts and the groups
+workers, in development mode and under the daemon, and internal mounts.
+Per-mount thread pools and connection limits, gRPC mounts and the groups
 `mounts` subset are still to come.
 ```
 
@@ -45,6 +45,13 @@ below `/`, an `entrypoint` as `module:callable`, and an optional
 mounts share a path. The longest mount path wins, matched on segment
 boundaries like routes: `/reports` covers `/reports` and `/reports/daily`
 and not `/reportsx`, and everything unclaimed goes to the default mount.
+
+A mount may also carry the [internal redirect](internal-redirects.md)
+settings: `internal = true` keeps clients out of it, so only a redirect
+from the release's own application, or from one its
+`accept_redirects_from` names, reaches it; `accel_redirect` and
+`cgi_local_redirect` say which redirect forms its responses may use,
+with the release's own setting as the default.
 
 ## What the application sees
 

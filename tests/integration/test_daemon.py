@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -249,6 +250,37 @@ def test_a_relative_interpreter_path_is_resolved_where_the_command_runs(
     assert deployed.stdout.strip() == "muru: release shop@r1 is ready and serving"
     inspected = daemon.muructl("debug", "inspect", "shop").stdout
     assert f"at {os.path.abspath(relative)}," in inspected, inspected
+
+
+def test_daemon_stop_gives_up_on_a_silent_socket(tmp_path: Path) -> None:
+    """A socket that accepts connections and never answers cannot hold
+    daemon stop past its timeout: every exchange is bounded."""
+
+    muructl = support.muructl_path()
+    if muructl is None:
+        support.unavailable("muructl is not built")
+    run_dir = Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    path = run_dir / "admin.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)
+
+    try:
+        started = time.monotonic()
+        stopped = subprocess.run(
+            [str(muructl), "daemon", "stop", "--timeout", "2s", "--socket", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        listener.close()
+
+    assert stopped.returncode != 0
+    assert "did not answer within 2 seconds" in stopped.stderr, stopped.stderr
+    assert elapsed < 20, elapsed
 
 
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:

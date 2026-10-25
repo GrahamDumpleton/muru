@@ -4,9 +4,10 @@
 :class: note
 
 Named groups with their own process and thread counts, selected by path
-prefix, in development mode and under the daemon. Scaling modes, per-group
-timeouts and memory policy, match lists with host and method conditions,
-optional groups and the `mounts` subset are still to come.
+prefix, in development mode and under the daemon, each with its own
+scaling policy (see [scaling](scaling.md)). Per-group timeouts and memory
+policy, match lists with host and method conditions, optional groups and
+the `mounts` subset are still to come.
 ```
 
 A release can split its paths across named worker groups, all forked from

@@ -37,6 +37,68 @@ message Snapshot {
   repeated AppWorkers apps = 5;
   Proxy proxy = 6;                      // trusted proxies; nothing trusted when absent
   Compression compression = 7;          // section 4.17; the defaults when absent
+  repeated ErrorPage error_pages = 8;   // section 4.12: the node-wide pages
+  ErrorOverride error_override = 9;     // the node-wide override; off when absent
+  repeated Upstream upstreams = 10;     // section 4.13: the HTTP upstreams routes may name
+  string default_app = 11;              // the application the default workers belong to; found by sockets when empty
+  string default_release = 12;          // and its release
+}
+
+// Section 4.13: an unmanaged HTTP server that routes, fallbacks, traffic
+// shares and authentication sub-requests can target.
+message Upstream {
+  string name = 1;
+  repeated string addresses = 2;        // host:port, or unix:/path
+  string protocol = 3;                  // http1, h2c or h2; http1 when empty
+  bool tls = 4;                         // connect with TLS (always for h2)
+  string tls_ca_pem = 5;                // the certificates trusted; the public roots when empty
+  string tls_server_name = 6;           // the name checked and sent as SNI; the address's host when empty
+  bool tls_insecure = 7;                // the certificate is not checked
+  bool trust_muru_headers = 8;          // X-Muru-Redirect from the upstream is honoured
+  uint64 connect_timeout_ms = 9;        // 5000 when 0
+  UpstreamProbe probe = 10;             // active health checks; none when absent
+  uint32 eject_after = 11;              // failed requests in a row before an address is set aside; never when 0
+  uint64 eject_for_ms = 12;             // how long it is set aside; 30000 when 0
+  repeated string sendfile_roots = 13;  // section 4.9: directories an X-Muru-Sendfile path must lie in, when trusted
+  string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is, such as X-Sendfile; none when empty
+}
+
+// How an upstream's addresses are probed.
+message UpstreamProbe {
+  string path = 1;                      // GET this, healthy on 2xx or 3xx; a connection that opens when empty
+  uint64 interval_ms = 2;               // 10000 when 0
+  uint64 timeout_ms = 3;                // 2000 when 0
+  uint32 unhealthy_after = 4;           // failed probes in a row; 3 when 0
+  uint32 healthy_after = 5;             // successful probes in a row; 2 when 0
+}
+
+// Section 4.12: a custom error page for a status, or for a status and
+// reason, at one level: the node, a host, a release or a route. The most
+// specific level that has a page for the status wins, and within a level
+// a status:reason entry beats the status's.
+message ErrorPage {
+  string key = 1;                       // 404, or 503:maintenance
+  string file = 2;                      // a file sent as the body, by absolute path
+  string template = 3;                  // a template the edge renders
+  string path = 4;                      // an application path asked for the page as a sub-request
+  string content_type = 5;              // the type of a template; text/html when empty
+}
+
+// Section 4.12: which of an application's own error responses the edge
+// replaces with error pages.
+message ErrorOverride {
+  repeated uint32 statuses = 1;
+  string when = 2;                      // all, empty_body, not_json or html_only; all when empty
+}
+
+// Section 4.12: maintenance mode for an application, and what it lets
+// through.
+message Maintenance {
+  bool on = 1;
+  repeated string exempt_paths = 2;     // path prefixes served as usual
+  repeated string exempt_addresses = 3; // client addresses or CIDR ranges served as usual
+  string bypass_cookie = 4;             // name=value; a client sending it is served as usual
+  uint64 retry_after_s = 5;             // Retry-After on the page; 60 when 0
 }
 
 // Section 4.17: how responses are compressed for clients.
@@ -67,6 +129,8 @@ message Host {
   string canonical = 7;
   bool use_canonical_name = 8;          // SERVER_NAME is the canonical name
   bool default = 9;                     // answers requests whose host matches no host
+  repeated ErrorPage error_pages = 10;  // section 4.12: the host's pages
+  ErrorOverride error_override = 11;
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -84,21 +148,74 @@ message Route {
   repeated string cache_except = 10;    // patterns of files that get no-cache instead
   bool no_redirect_slash = 11;          // do not redirect a directory to its slash form
   bool case_insensitive = 12;           // accept names that differ from the file's on disk
+  Traffic traffic = 13;                 // how the application's releases share the requests (section 9.4)
+  bool internal = 14;                   // reachable only through internal redirects; 404 to clients (section 4.10)
+  repeated string accept_redirects_from = 15; // applications other than the route's own whose redirects may reach it
+  repeated ErrorPage error_pages = 16;  // section 4.12: the route's pages
+  ErrorOverride error_override = 17;
+  Auth auth = 18;                       // section 4.16: the decision asked for before the route is served
+  string upstream = 19;                 // section 4.13: the upstream that takes the requests, instead of an application
+  string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
 }
 
-// The worker sockets of an application's serving release: the default
+// A route's authentication sub-request (section 4.16): a bodiless GET to
+// an application path, which allows the request with 2xx.
+message Auth {
+  string app = 1;                       // the application asked; empty when an upstream is
+  string path = 2;                      // the path asked
+  uint64 timeout_ms = 3;                // the handler's budget, queueing included; 2000 when 0
+  repeated string copy_headers = 4;     // headers of an allowing answer added to the request
+  uint64 cache_ttl_ms = 5;              // how long an allowing decision is remembered; not at all when 0
+  repeated string cache_key = 6;        // cookie:NAME and header:NAME entries the decision is keyed by
+  string upstream = 7;                  // the upstream asked, instead of an application (section 4.13)
+}
+
+// A route's traffic policy (section 9.4). Buckets run from 0 to 9999;
+// the shares take theirs from the top in the order listed, newest release
+// first, and the application's serving release takes the rest.
+message Traffic {
+  repeated Share shares = 1;
+  string hash_key = 2;                  // cookie, header:NAME, cookie:NAME or client
+  string salt = 3;
+  bool sticky = 4;                      // a cookie keeps a client on the release it first got
+  uint64 sticky_grace_s = 5;
+}
+
+message Share {
+  string release = 1;                   // the release, or empty for an upstream's share
+  uint32 weight = 2;                    // buckets of the 10000
+  string upstream = 3;                  // section 4.13: the upstream that takes the share
+}
+
+// The worker sockets of one release of an application: the default
 // group's, and each named group's with the paths it serves (section 7.1).
+// An application has one entry per release that may take requests.
 message AppWorkers {
   string app = 1;
   repeated string sockets = 2;
   repeated Group groups = 3;
-  repeated Mount mounts = 4;            // named mounts of the serving release (section 6.7)
-  string release = 5;                   // the release, for the access log
+  repeated Mount mounts = 4;            // named mounts of the release (section 6.7)
+  string release = 5;                   // the release, for the access log and traffic policies
+  bool serving = 6;                     // the application's serving release, which takes what no policy assigns
+  bool accel_redirect = 7;              // the default mount honours X-Accel-Redirect (section 4.10)
+  bool cgi_local_redirect = 8;          // the default mount treats a 200 with a local Location and no body as a redirect
+  repeated ErrorPage error_pages = 9;   // section 4.12: the release's pages, the application level
+  ErrorOverride error_override = 10;
+  Maintenance maintenance = 11;         // maintenance mode and its exemptions; off when absent
+  Upstream server = 12;                 // section 9.9: a managed HTTP release's instances, routed as an upstream; no sockets then
+  repeated string sendfile_roots = 13;  // section 4.9: directories the default mount's X-Muru-Sendfile paths must lie in
+  string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
 }
 
 message Mount {
   string name = 1;
   string path = 2;                      // the prefix; the default mount is at /
+  bool internal = 3;                    // reachable only through internal redirects (section 4.10)
+  repeated string accept_redirects_from = 4; // other applications whose redirects may reach an internal mount
+  bool accel_redirect = 5;              // X-Accel-Redirect from the mount is an internal redirect
+  bool cgi_local_redirect = 6;          // a 200 with a local Location and no body is an internal redirect
+  repeated string sendfile_roots = 7;   // section 4.9: directories the mount's X-Muru-Sendfile paths must lie in
+  string sendfile_header = 8;           // a second header honoured as X-Muru-Sendfile is; none when empty
 }
 
 message Group {

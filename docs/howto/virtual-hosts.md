@@ -82,8 +82,10 @@ Routes belong to a host and name a path prefix and an application. The
 longest prefix wins, matched on segment boundaries: `/api` covers `/api`
 and `/api/users` and not `/apiary`; `/` covers everything. A request
 whose host has no route for its path gets 404 with the reason `no_route`.
-The application's serving release takes the request; while the
-application has no release serving, the answer is 503 `no_workers`.
+The application's serving release takes the request, unless the route
+has a `traffic` table sharing its requests between releases (see
+[traffic between releases](traffic.md)); while the application has no
+release serving, the answer is 503 `no_workers`.
 
 The application sees the name the request matched with as `SERVER_NAME`
 (ASGI: the `server` tuple), or the host's `canonical` name when

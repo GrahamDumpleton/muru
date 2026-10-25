@@ -24,6 +24,7 @@ it adds.
 | `CONTENT_TYPE`, `CONTENT_LENGTH` | From the headers. A body sent without `Content-Length` (chunked) is buffered by the edge, so `CONTENT_LENGTH` is set for it too |
 | `HTTP_*` | Every other header, upper-cased with dashes as underscores. Hop-by-hop headers (`Connection`, `Transfer-Encoding`, `Upgrade` and the others) never appear, and neither does a header whose name contains an underscore, since it could masquerade as another header's key |
 | `HTTPS` | `on` over HTTPS, absent otherwise |
+| `REDIRECT_URL`, `REDIRECT_QUERY_STRING`, `REDIRECT_STATUS` | Present on a request that arrived by [internal redirect](../howto/internal-redirects.md): the path and query the client asked for, and the status the redirecting application answered |
 | `wsgi.version` | `(1, 0)` |
 | `wsgi.url_scheme` | `http` or `https` |
 | `wsgi.input` | A Rust-backed stream: `read`, `readline`, `readlines` and iteration return an empty value at the end of the body and never block past it |
@@ -32,7 +33,7 @@ it adds.
 | `wsgi.multithread` | `True` when the worker has more than one application thread |
 | `wsgi.multiprocess` | `True`, except for a single-process `muructl run`, where it is `False` |
 | `wsgi.run_once` | `False` |
-| `wsgi.file_wrapper` | `muru._native.FileWrapper`: iterates a file in blocks, with `close()` closing the file. Passing the descriptor to the edge is phase 2 |
+| `wsgi.file_wrapper` | `muru._native.FileWrapper`: returned as the iterable itself with a regular file behind it, a duplicate of the descriptor goes to the edge, which sends the range from the file's position (the [file hints](../howto/file-hints.md) page); otherwise it iterates the file in blocks. `close()` closes the file |
 
 ## Keys Muru adds
 
@@ -41,6 +42,9 @@ it adds.
 | `muru.request_id` | The request id, a 26-character ULID. The same value is in the `X-Request-ID` response header, the access log line and the error page |
 | `muru.max_body_size` | The body limit in force, in bytes: 100 MB in development, 10 MB with `--allow-public`, or what `--max-body-size` set |
 | `muru.proxy_addr` | Present only when a trusted proxy forwarded the request (see [behind a proxy](../howto/behind-a-proxy.md)): the address of the proxy that connected, while `REMOTE_ADDR` is the client it forwarded |
+| `muru.internal` | `True` on a request that arrived by internal redirect, absent otherwise; `muru.is_internal(environ)` reads it |
+| `muru.error_reason` | Present only when the edge asked the application for an [error page](../howto/error-pages.md): the error's reason, for example `app_error`, while `REDIRECT_STATUS` is its status |
+| `muru.auth_request`, `muru.original_method`, `muru.original_uri`, `muru.original_host` | Present only on an [authentication sub-request](../howto/auth-subrequests.md): `True`, and the method, path and query, and host of the request being decided about. `muru.internal` is `True` too, and the `REDIRECT_*` keys are absent |
 | `muru.tls` | Present over HTTPS only: a dictionary with `version` (`TLSv1.3` or `TLSv1.2`), `cipher` (the negotiated suite, for example `TLS13_AES_256_GCM_SHA384`), `server_name` (the name the client asked for, empty when it connected by address) and `alpn` (`h2`, `http/1.1`, or empty when the client offered none) |
 
 ## Rules worth knowing

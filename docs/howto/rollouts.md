@@ -1,0 +1,116 @@
+# Rollouts
+
+A deploy moves traffic to the new release as soon as it is ready. A
+rollout does it in stages: the release is started without traffic, gets a
+share of the application's requests step by step, is judged at each step
+against the release that still serves, and is promoted when every step
+passes or rolled back when one fails. Rollouts need a route to the
+application, since the shares are applied on the application's routes
+(see [virtual hosts](virtual-hosts.md)).
+
+## Holding a release
+
+```console
+$ muructl deploy shop /srv/shop --hold
+muru: release shop@r2 is ready and held: not serving
+```
+
+With `--hold` the release is started and left running without traffic.
+It can be checked through a preview, with the `Muru-Preview: r2` header
+or a `muru_preview=r2` cookie, which routes a request to it whatever the
+traffic policy says (see [traffic between releases](traffic.md)). A held
+release stays until a rollout or a promotion takes it, or `muructl drain`
+stops it.
+
+## Blue/green
+
+```console
+$ muructl rollout bluegreen shop@r2
+muru: release shop@r2 is ready and serving
+```
+
+All of the application's traffic moves to the release at once, and the
+release that served drains and is kept warm, as after a deploy. This is
+the deploy's own strategy, available separately so a held release can be
+checked first.
+
+## Canary
+
+```console
+$ muructl rollout canary shop@r2 --steps 10,50 --hold 5m --wait
+muru: rollout 1 of shop@r2 started against r1: step 1 of 2: 10% for 5m
+muru: rollout 1 running step 2 of 2: 50% for 5m
+muru: rollout 1 promoted: every step passed its gates
+```
+
+The candidate takes each step's share of the application's requests in
+turn, with clients spread as a traffic policy spreads them: hashed to
+stable buckets by the anonymous id cookie the edge issues, so a client in
+the canary at 10% is still in it at 50%. Each step holds for `--hold`,
+and when the hold has passed with the gates satisfied the next step
+begins. When the last step passes, the candidate is promoted: it takes all
+the traffic, and the baseline drains and is kept warm. Without `--wait`
+the command returns at once and `muructl rollout status` follows the
+rollout.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--steps` | `10,50` | The candidate's shares, in percent, increasing |
+| `--hold` | `2m` | How long each step lasts before its gates decide |
+| `--max-error-rate` | `1` | The candidate's 5xx rate over the step, in percent |
+| `--max-p95` | none | The candidate's 95th percentile request time over the step |
+| `--min-requests` | `100` | Requests the candidate must serve in a step before the gates judge |
+| `--approve-each-step` | off | Wait for `rollout resume` before each step after the first |
+
+## Gates
+
+A step is judged on the requests served under it alone, counted from
+the moment its share took effect, and the candidate is compared with the
+baseline over the same window. A gate fails only when the candidate is
+both over its limit and worse than the baseline, so a fault both releases
+share, such as a database outage, does not roll the candidate back. A
+baseline with fewer than `--min-requests` requests in the window is not
+compared, and the limits alone apply.
+
+The gates are checked every second once the candidate has served
+`--min-requests` requests in the step. A failing gate rolls back at once,
+without waiting for the hold to end: the candidate leaves traffic and is
+kept warm, so its logs and workers can be looked at, and the rollout
+records why:
+
+```console
+$ muructl rollout status shop
+APP              ROLLOUT  CANDIDATE    BASELINE     STATE              TRAFFIC  MESSAGE
+shop             1        r2           r1           rolled_back        0%       gate failed at 10%: 5xx rate 4.00% over the limit of 1.00% (baseline 0.00%)
+```
+
+A step whose hold has passed with too few requests to judge holds on
+until there are enough, saying so in its message. A quiet application can
+be promoted by hand instead.
+
+## Controlling a rollout
+
+| Command | Effect |
+| --- | --- |
+| `muructl rollout status [APP] [--wait]` | The rollouts, or one application's; with `--wait`, follow the application's rollout until it ends |
+| `muructl rollout pause APP` | Hold the current step and its share; the gates stop judging |
+| `muructl rollout resume APP` | Continue a paused rollout, or approve a step that awaits approval; the step's hold and window start afresh |
+| `muructl rollout promote APP` | Give the candidate all the traffic now and end the rollout |
+| `muructl rollout abort APP` | Take the candidate out of traffic now, keep it warm and end the rollout |
+
+With `--approve-each-step`, the rollout stops before each step after the
+first with the state `awaiting_approval` and the previous step's share
+still in force, until `rollout resume` approves it.
+
+An application has at most one rollout under way. A rollout's candidate
+is kept running while the rollout lasts, a deploy or rollback that would
+drain it leaves it in place, and `muructl config export` does not include
+its share, which is live state rather than declared configuration.
+
+## Events
+
+Every change is an event: `rollout.started`, `rollout.step` for each new
+step or one awaiting approval, `rollout.paused` and `rollout.resumed`,
+`rollout.gate_failed` with the gate and the numbers, `rollout.completed`
+when the candidate is promoted and `rollout.rolled_back` when it is taken
+out, by a gate or by hand.

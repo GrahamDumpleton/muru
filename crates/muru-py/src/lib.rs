@@ -51,12 +51,15 @@ fn version() -> &'static str {
 /// `control` is the worker's end of its control connection to the host
 /// (section 11.7) and `on_control` answers each request line on it,
 /// called with the line, the requests in flight and the runtime's thread
-/// names by identifier.
+/// names by identifier. `soft_timeout_ms` is the soft timeout (section
+/// 7.6), after which a request is interrupted by raising `timeout_error`
+/// (the `muru.RequestTimeout` class) in its thread, or by cancelling its
+/// task; both are needed for the timeout to be on.
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -76,8 +79,23 @@ fn serve(
     memory_interval_ms: u64,
     control: Option<i32>,
     on_control: Option<Py<PyAny>>,
+    soft_timeout_ms: Option<u64>,
+    timeout_error: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
+
+    let soft_timeout = match (soft_timeout_ms.filter(|&ms| ms > 0), timeout_error) {
+        (Some(ms), Some(error)) => Some(pool::SoftTimeout {
+            after: std::time::Duration::from_millis(ms),
+            error,
+        }),
+        (Some(_), None) => {
+            return Err(PyTypeError::new_err(
+                "a soft_timeout_ms needs the timeout_error to raise",
+            ));
+        }
+        (None, _) => None,
+    };
 
     // A runner needs the loop; the loop alone serves ASGI mounts beside a
     // WSGI default.
@@ -109,8 +127,16 @@ fn serve(
         named.insert(name, pool::Mount { app, runner });
     }
 
-    let shared = pool::Shared::new(app, named, errors, threads, multiprocess, asgi)
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let shared = pool::Shared::new(
+        app,
+        named,
+        errors,
+        threads,
+        multiprocess,
+        asgi,
+        soft_timeout,
+    )
+    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let shared = Arc::new(shared);
     let lifecycle = link::Lifecycle {
         on_drain,

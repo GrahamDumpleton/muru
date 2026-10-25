@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +25,13 @@ use crate::host::{HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
-use crate::model::{Release, ReleaseSpec, ReleaseState, valid_name};
+use crate::model::{
+    Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState, RolloutStep,
+    now_unix_ms, valid_name,
+};
+use crate::rollouts::{Counters, Verdict, judge};
+use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
+use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
 /// How long a release may take from its host starting to every worker
@@ -39,6 +45,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a superseded release stays warm (section 9.1), provisional
 /// (section 19.2).
 pub const RETENTION: Duration = Duration::from_secs(30 * 60);
+
+/// Section 9.4: how long sticky clients keep a release that is leaving
+/// traffic, unless the policy says otherwise.
+pub const STICKY_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The account a root daemon runs the edge and the applications as when
 /// none is named (ADR 0026).
@@ -61,6 +71,11 @@ pub struct Config {
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
     pub compression: Option<muru_config::Compression>,
+    /// The node-wide error pages (section 4.12), by status or
+    /// status:reason.
+    pub error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    /// The node-wide error override (section 4.12).
+    pub error_override: Option<muru_config::ErrorOverride>,
     /// The secret stores (section 10.8).
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
@@ -92,6 +107,29 @@ pub struct Upgrade {
     pub version: String,
 }
 
+/// What to do with an active rollout (section 9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutAction {
+    /// Hold the current step until resumed.
+    Pause,
+    /// Continue: from a pause, or into a step awaiting approval.
+    Resume,
+    /// Give the candidate all the traffic now.
+    Promote,
+    /// Take the candidate out of traffic now.
+    Abort,
+}
+
+/// Where a rollout's current step started from: the releases' counters
+/// at that moment, so the gates judge the step alone.
+#[derive(Debug, Clone)]
+struct RolloutRun {
+    rollout: String,
+    step: usize,
+    candidate: Counters,
+    baseline: Counters,
+}
+
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
     /// Everything the dashboard shows (section 10.7).
@@ -115,6 +153,8 @@ pub enum Command {
         id: Option<String>,
         /// How long the superseded release stays warm; zero stops it.
         retain: Duration,
+        /// Start the release but leave traffic where it is (section 9.2).
+        hold: bool,
         /// Where the release record goes as soon as it exists.
         created: oneshot::Sender<Result<Release, String>>,
         /// Where the outcome goes once the release serves or has failed.
@@ -124,6 +164,75 @@ pub enum Command {
     Rollback {
         /// The application.
         app: String,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<Release, String>>,
+    },
+    /// Section 9.3: start a rollout of a release against the one serving.
+    StartRollout {
+        /// The application.
+        app: String,
+        /// The candidate release.
+        release: String,
+        /// The steps, in order.
+        steps: Vec<RolloutStep>,
+        /// The gates.
+        gates: RolloutGates,
+        /// Whether each step after the first waits for approval.
+        approve_each_step: bool,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<Rollout, String>>,
+    },
+    /// Pause, resume, promote or abort the application's active rollout.
+    ControlRollout {
+        /// The application.
+        app: String,
+        /// What to do.
+        action: RolloutAction,
+        /// Where the outcome goes.
+        done: oneshot::Sender<Result<Rollout, String>>,
+    },
+    /// Section 7.4: pin a worker group's count, or let the autoscaler
+    /// decide again.
+    SetScale {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The worker group.
+        group: String,
+        /// The count to pin.
+        processes: Option<u32>,
+        /// Let the autoscaler decide again.
+        unpin: bool,
+        /// Where the groups' states go.
+        done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
+    },
+    /// The autoscaler's state for each group of a release.
+    GetScaleStatus {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Where the groups' states go.
+        done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
+    },
+    /// Section 4.12: serve the maintenance page for an application, or
+    /// serve it as usual again.
+    SetMaintenance {
+        /// The application.
+        app: String,
+        /// On or off.
+        on: bool,
+        /// Answered with when maintenance began, or none when it is off.
+        done: oneshot::Sender<Result<Option<u64>, String>>,
+    },
+    /// Blue/green (section 9.2): move all of an application's traffic to a
+    /// release now and drain the one that served.
+    PromoteRelease {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Release, String>>,
     },
@@ -245,6 +354,19 @@ struct GroupRecord {
     sockets: Vec<PathBuf>,
 }
 
+/// Section 7.4: one worker group's autoscaler and what was last asked of
+/// the host for it.
+struct GroupScaling {
+    name: String,
+    scaler: Scaler,
+    /// Slots a worker offers before any is routed to: its threads, or
+    /// its event loop's concurrency.
+    slots_per_worker: f64,
+    /// The count last asked of the host, so a count the host has not
+    /// reached yet is not asked for again every second.
+    requested: Option<u32>,
+}
+
 /// What the API needs to talk to a running daemon.
 #[derive(Clone)]
 pub struct Handle {
@@ -283,19 +405,133 @@ pub struct Reopened {
     pub hosts: u32,
 }
 
+/// What runs a release: a host with Muru's workers, or the instances of
+/// a managed HTTP server (section 9.9).
+enum Backend {
+    Host(HostProcess),
+    Servers(Servers),
+}
+
+impl Backend {
+    /// The host, for a release with workers.
+    fn host(&self) -> Option<&HostProcess> {
+        match self {
+            Self::Host(host) => Some(host),
+            Self::Servers(_) => None,
+        }
+    }
+
+    /// The managed server's instances, for a release that runs one.
+    fn servers(&self) -> Option<&Servers> {
+        match self {
+            Self::Servers(servers) => Some(servers),
+            Self::Host(_) => None,
+        }
+    }
+
+    /// Whether the host has exited on its own: a sentence saying how.
+    /// Instances look after themselves (check_hosts starts them again).
+    fn try_exited(&mut self) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Host(host) => host.try_exited(),
+            Self::Servers(_) => Ok(None),
+        }
+    }
+
+    /// The record a previous daemon reads to take the release over.
+    fn record_path(&self, run_dir: &Path) -> PathBuf {
+        match self {
+            Self::Host(_) => run_dir.join("host.toml"),
+            Self::Servers(_) => run_dir.join("servers.toml"),
+        }
+    }
+
+    /// Stop the processes; `grace` is what a managed server's instances
+    /// get before SIGKILL.
+    async fn stop(self, grace: Duration) {
+        match self {
+            Self::Host(host) => host.stop().await,
+            Self::Servers(servers) => servers.stop(grace).await,
+        }
+    }
+
+    /// Leave the processes running for the next daemon.
+    fn release(self) {
+        match self {
+            Self::Host(host) => host.release(),
+            Self::Servers(servers) => servers.release(),
+        }
+    }
+
+    /// Send the host a signal; a managed server's instances take none,
+    /// since the daemon writes their log lines itself.
+    fn signal(&self, signal: i32) -> bool {
+        match self {
+            Self::Host(host) => host.signal(signal),
+            Self::Servers(_) => false,
+        }
+    }
+
+    /// Section 9.9: a managed server's instances as the upstream that
+    /// stands in for the release's workers in the snapshot.
+    fn server_message(&self, app: &str, id: &str) -> Option<pb::Upstream> {
+        self.servers().map(|servers| pb::Upstream {
+            name: format!("{app}@{id}"),
+            addresses: servers.addresses(),
+            protocol: "http1".to_owned(),
+            trust_muru_headers: true,
+            eject_after: 3,
+            eject_for_ms: 5_000,
+            ..Default::default()
+        })
+    }
+}
+
 /// A running release: its host and the sockets its workers listen on,
-/// and, once superseded, when its retention ends.
+/// or the instances of its managed server, and, once superseded, when
+/// its retention ends.
 struct Running {
-    host: HostProcess,
+    backend: Backend,
     /// The default group's sockets.
     sockets: Vec<PathBuf>,
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// Section 9.4: while set, the release is leaving traffic but stays
+    /// reachable by sticky cookie until the instant, when it drains with
+    /// the retention given.
+    sticky_until: Option<(Instant, Duration)>,
+    /// Deployed with hold (section 9.2): running and reachable by preview,
+    /// taking no traffic until a rollout or a promotion, and left alone
+    /// by the traffic reconciliation.
+    held: bool,
     /// The host's control connection, once it is up.
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// Section 7.4: each worker group's autoscaler, the default first.
+    scalers: Vec<GroupScaling>,
+    /// When each worker socket entered routing, for the age of the
+    /// youngest worker.
+    ready_at: HashMap<PathBuf, Instant>,
+}
+
+impl Running {
+    /// The processes serving: workers in every group, or a managed
+    /// server's instances.
+    fn workers(&self) -> usize {
+        match &self.backend {
+            Backend::Servers(servers) => servers.running(),
+            Backend::Host(_) => {
+                self.sockets.len()
+                    + self
+                        .groups
+                        .iter()
+                        .map(|group| group.sockets.len())
+                        .sum::<usize>()
+            }
+        }
+    }
 }
 
 /// The daemon's state while it runs.
@@ -310,6 +546,13 @@ struct Daemon {
     proxy: Option<pb::Proxy>,
     /// The [compression] table, for every snapshot.
     compression: pb::Compression,
+    /// The node-wide [error_pages] and [error_override] tables (section
+    /// 4.12), for every snapshot.
+    error_pages: Vec<pb::ErrorPage>,
+    error_override: Option<pb::ErrorOverride>,
+    /// The applications in maintenance mode (section 4.12), with when
+    /// each was put there.
+    maintenance: HashMap<String, u64>,
     /// The secret stores releases may refer to (section 10.8).
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
@@ -322,6 +565,9 @@ struct Daemon {
     /// Turns the edge's counters into those points.
     sampler: muru_dashboard::Sampler,
     running: HashMap<(String, String), Running>,
+    /// Section 9.3: the counters each running rollout's current step
+    /// started from, by application.
+    rollout_runs: HashMap<String, RolloutRun>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
@@ -356,6 +602,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     let compression = compression_message(config.compression.as_ref())
         .map_err(|error| anyhow::anyhow!("[compression]: {error}"))?;
+    let (error_pages, error_override) =
+        error_tables_message(&config.error_pages, config.error_override.as_ref())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
@@ -561,12 +810,16 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         logs: Logs::default(),
         proxy,
         compression,
+        error_pages,
+        error_override,
+        maintenance: HashMap::new(),
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
         history,
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
+        rollout_runs: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
         owns_log,
@@ -575,6 +828,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         last_request: 0,
     };
     daemon.restore().await;
+    daemon.reconcile_traffic().await;
 
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
@@ -597,6 +851,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    // The once-a-second work keeps its own clock, so a stream of commands
+    // arriving faster than that never starves it.
+
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
 
     let outcome = loop {
         tokio::select! {
@@ -639,12 +900,24 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            _ = tick.tick() => {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
+                daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
-                daemon.sample_history().await;
+
+                let samples = match daemon.edge.metrics().await {
+                    Ok(samples) => Some(samples),
+                    Err(error) => {
+                        tracing::debug!(%error, "the edge's metrics could not be read");
+                        None
+                    }
+                };
+
+                daemon.sample_history(samples.as_deref()).await;
+                daemon.advance_rollouts(samples.as_deref()).await;
+                daemon.autoscale(samples.as_deref()).await;
             }
         }
     };
@@ -681,10 +954,20 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     // The API answers the Shutdown call that brought the daemon here
-    // before the socket goes.
+    // before the socket goes. A client holding a connection open would
+    // keep the server from finishing, so after a grace period it is
+    // aborted, which closes the listener and every connection before the
+    // socket is unlinked; a stop command polling the socket then gets a
+    // refusal straight away instead of waiting on a silent connection.
 
     let _ = api_stop.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(5), &mut api).await;
+
+    if tokio::time::timeout(Duration::from_secs(5), &mut api)
+        .await
+        .is_err()
+    {
+        api.abort();
+    }
 
     if let Some(scraper) = scraper {
         scraper.abort();
@@ -924,6 +1207,103 @@ fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
     }
 }
 
+/// The node-wide error pages and override as the snapshot carries them
+/// (section 4.12), checked; a page file must be an absolute path.
+fn error_tables_message(
+    pages: &std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    override_: Option<&muru_config::ErrorOverride>,
+) -> Result<(Vec<pb::ErrorPage>, Option<pb::ErrorOverride>), String> {
+    muru_config::check_error_pages(pages, false).map_err(|error| format!("[{error}]"))?;
+
+    if let Some(table) = override_ {
+        muru_config::check_error_override(table).map_err(|error| format!("[{error}]"))?;
+    }
+
+    Ok((
+        error_pages_message(pages, None),
+        override_.map(error_override_message),
+    ))
+}
+
+/// Error pages as the snapshot carries them, a relative file resolved
+/// against `base`.
+pub fn error_pages_message(
+    pages: &std::collections::BTreeMap<String, muru_config::ErrorPage>,
+    base: Option<&Path>,
+) -> Vec<pb::ErrorPage> {
+    pages
+        .iter()
+        .map(|(key, page)| pb::ErrorPage {
+            key: key.clone(),
+            file: page
+                .file
+                .as_ref()
+                .map(|file| match base {
+                    Some(base) => base.join(file).display().to_string(),
+                    None => file.clone(),
+                })
+                .unwrap_or_default(),
+            template: page.template.clone().unwrap_or_default(),
+            path: page.path.clone().unwrap_or_default(),
+            content_type: page.content_type.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// An error override as the snapshot carries it.
+pub fn error_override_message(table: &muru_config::ErrorOverride) -> pb::ErrorOverride {
+    pb::ErrorOverride {
+        statuses: table
+            .statuses
+            .iter()
+            .map(|status| u32::from(*status))
+            .collect(),
+        when: table.when.clone().unwrap_or_default(),
+    }
+}
+
+/// A route's authentication sub-request as the snapshot carries it
+/// (section 4.16). The table was checked when it was applied.
+pub fn auth_message(table: &muru_config::Auth) -> pb::Auth {
+    let millis = |text: Option<&str>| {
+        text.and_then(|text| muru_config::parse_duration(text).ok())
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    };
+
+    pb::Auth {
+        app: table.app.clone(),
+        upstream: table.upstream.clone(),
+        path: table.path.clone(),
+        timeout_ms: millis(table.timeout.as_deref()),
+        copy_headers: table.copy_headers.clone(),
+        cache_ttl_ms: millis(table.cache.as_ref().map(|cache| cache.ttl.as_str())),
+        cache_key: table
+            .cache
+            .as_ref()
+            .map(|cache| cache.key.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Maintenance mode as the snapshot carries it: whether it is on, and the
+/// release's exemptions.
+fn maintenance_message(on: bool, table: Option<&muru_config::Maintenance>) -> pb::Maintenance {
+    let table = table.cloned().unwrap_or_default();
+    pb::Maintenance {
+        on,
+        exempt_paths: table.exempt_paths,
+        exempt_addresses: table.exempt_addresses,
+        bypass_cookie: table.bypass_cookie.unwrap_or_default(),
+        retry_after_s: table
+            .retry_after
+            .as_deref()
+            .and_then(|text| muru_config::parse_duration(text).ok())
+            .map_or(0, |duration| duration.as_secs()),
+    }
+}
+
 /// The [compression] table as the snapshot carries it, checked: the
 /// defaults of section 4.17 where the table is silent.
 fn compression_message(
@@ -1047,14 +1427,7 @@ impl Daemon {
                 let workers = self
                     .running
                     .get(&(app.name.clone(), release.id.clone()))
-                    .map_or(0, |running| {
-                        running.sockets.len()
-                            + running
-                                .groups
-                                .iter()
-                                .map(|group| group.sockets.len())
-                                .sum::<usize>()
-                    });
+                    .map_or(0, Running::workers);
                 let pools: Vec<&pb::PoolState> = recent
                     .pools
                     .iter()
@@ -1223,16 +1596,23 @@ impl Daemon {
 
         let compression = compression_message(document.compression.as_ref())
             .map_err(|error| format!("[compression]: {error}"))?;
-        let changed = proxy != self.proxy || compression != self.compression;
+        let (error_pages, error_override) =
+            error_tables_message(&document.error_pages, document.error_override.as_ref())?;
+        let changed = proxy != self.proxy
+            || compression != self.compression
+            || error_pages != self.error_pages
+            || error_override != self.error_override;
         self.proxy = proxy;
         self.compression = compression;
+        self.error_pages = error_pages;
+        self.error_override = error_override;
 
         if changed {
             self.push_snapshot().await?;
         }
 
         let message = format!(
-            "reloaded {}: the [proxy] and [compression] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the [proxy], [compression], [error_pages] and [error_override] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
@@ -1257,10 +1637,16 @@ impl Daemon {
         };
 
         for ((app, id), running) in &self.running {
-            let mut groups = vec![(
-                muru_edge::routing::DEFAULT_GROUP.to_owned(),
-                running.sockets.len(),
-            )];
+            let mut groups = match &running.backend {
+                Backend::Servers(servers) => vec![(
+                    muru_edge::routing::SERVER_GROUP.to_owned(),
+                    servers.running(),
+                )],
+                Backend::Host(_) => vec![(
+                    muru_edge::routing::DEFAULT_GROUP.to_owned(),
+                    running.sockets.len(),
+                )],
+            };
 
             for group in &running.groups {
                 groups.push((group.name.clone(), group.sockets.len()));
@@ -1276,6 +1662,40 @@ impl Daemon {
                     ],
                     workers as f64,
                 ));
+            }
+
+            // Section 7.4: what the autoscaler wants and has done.
+
+            for scaling in &running.scalers {
+                let labels = [
+                    ("app", app.as_str()),
+                    ("release", id.as_str()),
+                    ("group", scaling.name.as_str()),
+                ];
+                let (outs, ins) = scaling.scaler.status(Instant::now()).decisions;
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_workers_desired",
+                    &labels,
+                    scaling.scaler.desired() as f64,
+                ));
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_churn_reaps_total",
+                    &labels,
+                    scaling.scaler.reaps() as f64,
+                ));
+
+                for (direction, count) in [("out", outs), ("in", ins)] {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_scaling_decisions_total",
+                        &[
+                            ("app", app.as_str()),
+                            ("release", id.as_str()),
+                            ("group", scaling.name.as_str()),
+                            ("direction", direction),
+                        ],
+                        count as f64,
+                    ));
+                }
             }
 
             // Sections 7.6 and 7.7: what each worker last reported.
@@ -1327,6 +1747,13 @@ impl Daemon {
     /// Re-adopt the hosts a previous daemon left running (section 10.2),
     /// and start again the release that served if its host is gone.
     async fn restore(&mut self) {
+        self.maintenance = self
+            .store
+            .maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         let apps = match self.store.apps() {
             Ok(apps) => apps,
             Err(error) => {
@@ -1342,7 +1769,7 @@ impl Daemon {
 
             if let Ok(releases) = self.store.releases(Some(&app.name)) {
                 for release in releases.iter().filter(|release| release.state.is_running()) {
-                    if self.adopt_host(&release.app, &release.id) {
+                    if self.adopt_host(&release.app, &release.id).await {
                         continue;
                     }
 
@@ -1380,9 +1807,15 @@ impl Daemon {
         }
     }
 
-    /// Take over a release's host from its record, if it is still there.
-    fn adopt_host(&mut self, app: &str, id: &str) -> bool {
+    /// Take over a release's host, or a managed server's instances, from
+    /// its record, if it is still there.
+    async fn adopt_host(&mut self, app: &str, id: &str) -> bool {
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+
+        if let Some(record) = read_record::<ServersRecord>(&run_dir.join("servers.toml")) {
+            return self.adopt_servers(app, id, &run_dir, &record).await;
+        }
+
         let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
             return false;
         };
@@ -1412,15 +1845,31 @@ impl Daemon {
                     Ok(ReleaseState::Retained)
                 )
                 .then(|| Instant::now() + RETENTION);
+                let now = Instant::now();
+                let pins = self.store.scale_pins(app, id).unwrap_or_default();
+                let scalers = self
+                    .store
+                    .release(app, id)
+                    .map(|release| scalers_for(&release.spec, &sockets, &record.groups, &pins, now))
+                    .unwrap_or_default();
+                let ready_at = record
+                    .sockets
+                    .iter()
+                    .map(|socket| (socket.clone(), now))
+                    .collect();
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
-                        host,
+                        backend: Backend::Host(host),
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        sticky_until: None,
+                        held: false,
                         control: None,
                         status: Vec::new(),
+                        scalers,
+                        ready_at,
                     },
                 );
                 self.attach_control(app, id);
@@ -1439,12 +1888,95 @@ impl Daemon {
         }
     }
 
+    /// Section 9.9: take over a managed server's instances from their
+    /// record, with what a restart of one would need resolved again.
+    async fn adopt_servers(
+        &mut self,
+        app: &str,
+        id: &str,
+        run_dir: &Path,
+        record: &ServersRecord,
+    ) -> bool {
+        let Ok(release) = self.store.release(app, id) else {
+            return false;
+        };
+        let Some(http) = release.spec.http.clone() else {
+            return false;
+        };
+
+        let subject = format!("{app}@{id}");
+
+        let identity = match self.resolve_identity(app, &subject) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+
+        let env =
+            match resolve_env(&self.secrets, &release.spec.env, &run_dir.join("secrets")).await {
+                Ok(env) => env,
+                Err(error) => {
+                    tracing::info!(%error, "release {subject} could not be re-adopted");
+                    return false;
+                }
+            };
+        let adopted = Servers::adopt(
+            &http,
+            &run_dir.join("r1"),
+            &release.spec.source,
+            env,
+            identity,
+            &self.host_log(app, id),
+            record,
+        );
+
+        match adopted {
+            Ok(servers) => {
+                let retained_until = matches!(release.state, ReleaseState::Retained)
+                    .then(|| Instant::now() + RETENTION);
+                let pids: Vec<String> = record
+                    .instances
+                    .iter()
+                    .map(|instance| instance.pid.to_string())
+                    .collect();
+                self.running.insert(
+                    (app.to_owned(), id.to_owned()),
+                    Running {
+                        backend: Backend::Servers(servers),
+                        sockets: Vec::new(),
+                        groups: Vec::new(),
+                        retained_until,
+                        sticky_until: None,
+                        held: false,
+                        control: None,
+                        status: Vec::new(),
+                        scalers: Vec::new(),
+                        ready_at: HashMap::new(),
+                    },
+                );
+                self.events.emit(
+                    "release.adopted",
+                    &subject,
+                    "info",
+                    &format!("re-adopted the server instances (pid {})", pids.join(", ")),
+                );
+                true
+            }
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                false
+            }
+        }
+    }
+
     /// Leave every host and the edge running, for the next daemon.
     fn detach(&mut self) {
         let running = std::mem::take(&mut self.running);
 
         for (_, running) in running {
-            running.host.release();
+            running.backend.release();
         }
     }
 
@@ -1455,19 +1987,56 @@ impl Daemon {
                 spec,
                 id,
                 retain,
+                hold,
                 created,
                 done,
             } => {
-                let outcome = self.deploy(&app, *spec, id, retain, created).await;
+                let outcome = self.deploy(&app, *spec, id, retain, hold, created).await;
                 let _ = done.send(outcome);
             }
             Command::Rollback { app, done } => {
                 let _ = done.send(self.rollback(&app).await);
             }
+            Command::StartRollout {
+                app,
+                release,
+                steps,
+                gates,
+                approve_each_step,
+                done,
+            } => {
+                let outcome = self
+                    .start_rollout(&app, &release, steps, gates, approve_each_step)
+                    .await;
+                let _ = done.send(outcome);
+            }
+            Command::ControlRollout { app, action, done } => {
+                let _ = done.send(self.control_rollout(&app, action).await);
+            }
+            Command::PromoteRelease { app, id, done } => {
+                let _ = done.send(self.promote_release(&app, &id).await);
+            }
+            Command::SetScale {
+                app,
+                id,
+                group,
+                processes,
+                unpin,
+                done,
+            } => {
+                let _ = done.send(self.set_scale(&app, &id, &group, processes, unpin));
+            }
+            Command::GetScaleStatus { app, id, done } => {
+                let _ = done.send(self.scale_status(&app, &id));
+            }
+            Command::SetMaintenance { app, on, done } => {
+                let _ = done.send(self.set_maintenance(&app, on).await);
+            }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
             Command::Reconfigure { done } => {
+                self.reconcile_traffic().await;
                 let _ = done.send(self.push_snapshot().await);
             }
             Command::Reload { done } => {
@@ -1528,6 +2097,7 @@ impl Daemon {
         spec: ReleaseSpec,
         id: Option<String>,
         retain: Duration,
+        hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
         let record = self.create(app, spec, id);
@@ -1551,6 +2121,26 @@ impl Daemon {
 
         self.start(app, &release.id).await?;
 
+        // Section 9.2: held, the release runs and can be previewed, and
+        // traffic stays where it is until a rollout or a promotion.
+
+        if hold {
+            if let Some(running) = self.running.get_mut(&(app.to_owned(), release.id.clone())) {
+                running.held = true;
+            }
+
+            self.set_state(&release, ReleaseState::Ready, "held: not serving");
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a held release failed");
+            }
+
+            return self
+                .store
+                .release(app, &release.id)
+                .map_err(|error| error.to_string());
+        }
+
         // Traffic moves, then the previous release drains.
 
         let previous = self
@@ -1563,7 +2153,11 @@ impl Daemon {
             .set_app_releases(app, Some(&release.id), previous.as_deref())
             .map_err(|error| error.to_string())?;
 
-        if let Some(previous) = previous.filter(|previous| previous != &release.id) {
+        if let Some(previous) = previous.filter(|previous| previous != &release.id)
+            && !self
+                .referenced_releases()
+                .contains(&(app.to_owned(), previous.clone()))
+        {
             self.drain(app, &previous, retain).await;
         }
 
@@ -1619,63 +2213,26 @@ impl Daemon {
             return Ok(());
         }
 
-        self.set_state(&release, ReleaseState::Starting, "starting the host");
+        self.set_state(
+            &release,
+            ReleaseState::Starting,
+            if release.spec.http.is_some() {
+                "starting the server"
+            } else {
+                "starting the host"
+            },
+        );
         let spec = &release.spec;
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
 
-        // Section 10.9 and ADR 0026: under a root daemon the host runs as
-        // the application's user, or as the service user when it names
-        // none, and never as root unless the application says so, which
-        // is warned about; otherwise a configured user is reported as
-        // not applied.
-
-        let identity = match self.store.app(app).ok().and_then(|record| {
-            record
-                .user
-                .clone()
-                .map(|user| (user, record.group.clone(), record.umask.clone()))
-        }) {
-            Some((user, group, umask)) if crate::host::Identity::can_switch() => {
-                let mask = umask
-                    .as_deref()
-                    .and_then(|text| u32::from_str_radix(text, 8).ok());
-
-                match crate::host::Identity::lookup(&user, group.as_deref(), mask) {
-                    Ok(identity) => {
-                        if identity.is_root() {
-                            self.events.emit(
-                                "app.user_is_root",
-                                &subject,
-                                "warning",
-                                &format!(
-                                    "user {user}: the release runs as root, which is not \
-                                     recommended; a compromised application would have the \
-                                     node"
-                                ),
-                            );
-                        }
-
-                        Some(identity)
-                    }
-                    Err(error) => {
-                        let message = format!("the application's user cannot be used: {error:#}");
-                        self.set_state(&release, ReleaseState::Failed, &message);
-                        self.events
-                            .emit("release.failed", &subject, "error", &message);
-                        return Err(message);
-                    }
-                }
+        let identity = match self.resolve_identity(app, &subject) {
+            Ok(identity) => identity,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
             }
-            Some((user, _, _)) => {
-                self.events.emit(
-                    "app.user_not_applied",
-                    &subject,
-                    "warning",
-                    &format!("user {user} not applied: the daemon is not root"),
-                );
-                None
-            }
-            None => self.service,
         };
 
         // Section 10.8: secrets are resolved now, for this start, and
@@ -1691,9 +2248,35 @@ impl Daemon {
             }
         };
 
+        let started = Instant::now();
+
+        // The release's directories, its secret files and its log belong
+        // to the user the host runs as, so it can bind its sockets,
+        // read its secrets and reopen its log.
+
+        if let Some(identity) = identity
+            && let Err(message) = self.own_release_dirs(identity, &run_dir, app, id)
+        {
+            self.set_state(&release, ReleaseState::Failed, &message);
+            self.events
+                .emit("release.failed", &subject, "error", &message);
+            return Err(message);
+        }
+
+        // Section 9.9: a managed HTTP release runs its server's
+        // instances instead of a host.
+
+        if let Some(http) = spec.http.clone() {
+            return self
+                .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
+                .await;
+        }
+
         let host_spec = HostSpec {
             python: spec.python.clone(),
             app: spec.entrypoint.clone(),
+            name: Some(app.to_owned()),
+            release: Some(id.to_owned()),
             interface: spec.interface,
             factory: spec.factory,
             processes: spec.processes as usize,
@@ -1709,6 +2292,7 @@ impl Daemon {
             logging: spec.logging.clone(),
             max_requests: spec.max_requests,
             max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
+            soft_timeout: spec.timeouts.soft_timeout_ms.map(Duration::from_millis),
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
@@ -1737,59 +2321,6 @@ impl Daemon {
                 })
                 .collect(),
         };
-        let started = Instant::now();
-
-        // The release's directories, its secret files and its log belong
-        // to the user the host runs as, so it can bind its sockets,
-        // read its secrets and reopen its log.
-
-        if let Some(identity) = identity {
-            let owned = [run_dir.clone(), run_dir.join("r1"), run_dir.join("secrets")];
-
-            for path in &owned {
-                let _ = std::fs::create_dir_all(path);
-            }
-
-            let mut paths: Vec<PathBuf> = owned.to_vec();
-
-            if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
-                paths.extend(entries.flatten().map(|entry| entry.path()));
-            }
-
-            let log = self.host_log(app, id);
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log);
-            paths.push(log);
-
-            for path in paths {
-                if let Err(error) = identity.own(&path) {
-                    let message = format!(
-                        "giving {} to the application's user failed: {error}",
-                        path.display()
-                    );
-                    self.set_state(&release, ReleaseState::Failed, &message);
-                    self.events
-                        .emit("release.failed", &subject, "error", &message);
-                    return Err(message);
-                }
-            }
-
-            // The socket directory carries the edge's group, which new
-            // sockets inherit, and opens to that group alone (section
-            // 10.9): the edge reaches the workers without being root.
-
-            if let Some(service) = self.service
-                && let Err(error) = share_sockets(&run_dir.join("r1"), identity, service)
-            {
-                let message = format!("sharing the socket directory with the edge failed: {error}");
-                self.set_state(&release, ReleaseState::Failed, &message);
-                self.events
-                    .emit("release.failed", &subject, "error", &message);
-                return Err(message);
-            }
-        }
 
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
@@ -1836,15 +2367,27 @@ impl Daemon {
                 groups: groups.clone(),
             },
         );
+        let now = Instant::now();
+        let pins = self.store.scale_pins(app, id).unwrap_or_default();
+        let scalers = scalers_for(spec, &sockets, &groups, &pins, now);
+        let ready_at = host
+            .sockets
+            .iter()
+            .map(|socket| (socket.clone(), now))
+            .collect();
         self.running.insert(
             (app.to_owned(), id.to_owned()),
             Running {
-                host,
+                backend: Backend::Host(host),
                 sockets,
                 groups,
                 retained_until: None,
+                sticky_until: None,
+                held: false,
                 control: None,
                 status: Vec::new(),
+                scalers,
+                ready_at,
             },
         );
         self.attach_control(app, id);
@@ -1856,6 +2399,191 @@ impl Daemon {
             &format!(
                 "{} workers ready in {:.1} s",
                 spec.processes + spec.groups.iter().map(|group| group.processes).sum::<u32>(),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        Ok(())
+    }
+
+    /// Section 10.9 and ADR 0026: whom a release runs as. Under a root
+    /// daemon that is the application's user, or the service user when
+    /// it names none, and never root unless the application says so,
+    /// which is warned about; a daemon that is not root reports a
+    /// configured user as not applied.
+    fn resolve_identity(
+        &self,
+        app: &str,
+        subject: &str,
+    ) -> Result<Option<crate::host::Identity>, String> {
+        let named = self.store.app(app).ok().and_then(|record| {
+            record
+                .user
+                .clone()
+                .map(|user| (user, record.group.clone(), record.umask.clone()))
+        });
+
+        match named {
+            Some((user, group, umask)) if crate::host::Identity::can_switch() => {
+                let mask = umask
+                    .as_deref()
+                    .and_then(|text| u32::from_str_radix(text, 8).ok());
+                let identity = crate::host::Identity::lookup(&user, group.as_deref(), mask)
+                    .map_err(|error| format!("the application's user cannot be used: {error:#}"))?;
+
+                if identity.is_root() {
+                    self.events.emit(
+                        "app.user_is_root",
+                        subject,
+                        "warning",
+                        &format!(
+                            "user {user}: the release runs as root, which is not \
+                             recommended; a compromised application would have the \
+                             node"
+                        ),
+                    );
+                }
+
+                Ok(Some(identity))
+            }
+            Some((user, _, _)) => {
+                self.events.emit(
+                    "app.user_not_applied",
+                    subject,
+                    "warning",
+                    &format!("user {user} not applied: the daemon is not root"),
+                );
+                Ok(None)
+            }
+            None => Ok(self.service),
+        }
+    }
+
+    /// Give a release's directories, secret files and log to the user
+    /// its processes run as, and open its socket directory to the edge's
+    /// group alone (section 10.9), so the edge reaches the sockets
+    /// without being root.
+    fn own_release_dirs(
+        &self,
+        identity: crate::host::Identity,
+        run_dir: &Path,
+        app: &str,
+        id: &str,
+    ) -> Result<(), String> {
+        let owned = [
+            run_dir.to_path_buf(),
+            run_dir.join("r1"),
+            run_dir.join("secrets"),
+        ];
+
+        for path in &owned {
+            let _ = std::fs::create_dir_all(path);
+        }
+
+        let mut paths: Vec<PathBuf> = owned.to_vec();
+
+        if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
+            paths.extend(entries.flatten().map(|entry| entry.path()));
+        }
+
+        let log = self.host_log(app, id);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log);
+        paths.push(log);
+
+        for path in paths {
+            identity.own(&path).map_err(|error| {
+                format!(
+                    "giving {} to the application's user failed: {error}",
+                    path.display()
+                )
+            })?;
+        }
+
+        if let Some(service) = self.service {
+            share_sockets(&run_dir.join("r1"), identity, service).map_err(|error| {
+                format!("sharing the socket directory with the edge failed: {error}")
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Section 9.9: start a managed HTTP release's instances and wait
+    /// for their readiness probes, then route to them as an upstream.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_servers(
+        &mut self,
+        app: &str,
+        id: &str,
+        release: &Release,
+        http: &crate::model::HttpServerSpec,
+        env: Vec<(String, String)>,
+        identity: Option<crate::host::Identity>,
+        run_dir: &Path,
+        started: Instant,
+    ) -> Result<(), String> {
+        let subject = format!("{app}@{id}");
+        let log = self.host_log(app, id);
+        let mut servers = match Servers::start(
+            http,
+            &run_dir.join("r1"),
+            &release.spec.source,
+            env,
+            identity,
+            &log,
+        ) {
+            Ok(servers) => servers,
+            Err(error) => {
+                let message = format!("the server could not be started: {error:#}");
+                self.set_state(release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
+        self.set_state(release, ReleaseState::Warming, "waiting for the instances");
+        let timeout = Duration::from_millis(http.readiness_timeout_ms);
+
+        if let Err(error) = servers.wait_ready(timeout).await {
+            let message = format!("{error:#}");
+            servers
+                .stop(Duration::from_millis(
+                    release.spec.timeouts.shutdown_timeout_ms,
+                ))
+                .await;
+            self.set_state(release, ReleaseState::Failed, &message);
+            self.events
+                .emit("release.failed", &subject, "error", &message);
+            return Err(message);
+        }
+
+        write_record(&run_dir.join("servers.toml"), &servers.record());
+        self.running.insert(
+            (app.to_owned(), id.to_owned()),
+            Running {
+                backend: Backend::Servers(servers),
+                sockets: Vec::new(),
+                groups: Vec::new(),
+                retained_until: None,
+                sticky_until: None,
+                held: false,
+                control: None,
+                status: Vec::new(),
+                scalers: Vec::new(),
+                ready_at: HashMap::new(),
+            },
+        );
+        self.set_state(release, ReleaseState::Ready, "");
+        self.events.emit(
+            "release.ready",
+            &subject,
+            "info",
+            &format!(
+                "{} ready in {:.1} s",
+                http.describe(),
                 started.elapsed().as_secs_f64()
             ),
         );
@@ -1874,6 +2602,10 @@ impl Daemon {
 
         self.serving.insert(app.to_owned(), id.to_owned());
         self.default_app = Some(app.to_owned());
+
+        if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
+            running.held = false;
+        }
 
         match self.push_snapshot().await {
             Ok(()) => {
@@ -1902,14 +2634,50 @@ impl Daemon {
     /// workers are those of the application traffic was last switched to.
     fn build_snapshot(&mut self) -> pb::Snapshot {
         let mut apps = Vec::new();
-        let mut serving: Vec<(&String, &String)> = self.serving.iter().collect();
-        serving.sort();
+        let routes = self.store.routes().unwrap_or_default();
+        let rollouts: Vec<Rollout> = self
+            .store
+            .rollouts(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rollout| rollout.state.is_active())
+            .collect();
+        let mut referenced = referenced_in(&routes);
+        referenced.extend(
+            rollouts
+                .iter()
+                .map(|rollout| (rollout.app.clone(), rollout.candidate.clone())),
+        );
 
-        for (name, id) in serving {
+        // Section 9.4: an application's serving release takes requests,
+        // and so do the releases its routes' policies name and a release
+        // sticky clients may still reach, while they run and are not
+        // merely kept warm.
+
+        let mut routable: Vec<(&String, &String)> = self
+            .running
+            .iter()
+            .filter(|((app, id), running)| {
+                self.serving.get(app) == Some(id)
+                    || running.sticky_until.is_some()
+                    || running.held
+                    || (running.retained_until.is_none()
+                        && referenced.contains(&((*app).clone(), (*id).clone())))
+            })
+            .map(|((app, id), _)| (app, id))
+            .collect();
+        routable.sort();
+        let included: BTreeSet<(String, String)> = routable
+            .iter()
+            .map(|(app, id)| ((*app).clone(), (*id).clone()))
+            .collect();
+
+        for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 apps.push(pb::AppWorkers {
                     app: name.clone(),
                     release: id.clone(),
+                    serving: self.serving.get(name) == Some(id),
                     sockets: running
                         .sockets
                         .iter()
@@ -1939,10 +2707,74 @@ impl Daemon {
                                 .map(|mount| pb::Mount {
                                     name: mount.name.clone(),
                                     path: mount.path.clone(),
+                                    internal: mount.internal,
+                                    accept_redirects_from: mount.accept_redirects_from.clone(),
+                                    accel_redirect: mount.accel_redirect,
+                                    cgi_local_redirect: mount.cgi_local_redirect,
+                                    sendfile_roots: mount.sendfile_roots.clone(),
+                                    sendfile_header: mount
+                                        .sendfile_header
+                                        .clone()
+                                        .unwrap_or_default(),
                                 })
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    accel_redirect: self
+                        .store
+                        .release(name, id)
+                        .is_ok_and(|release| release.spec.accel_redirect),
+                    cgi_local_redirect: self
+                        .store
+                        .release(name, id)
+                        .is_ok_and(|release| release.spec.cgi_local_redirect),
+                    sendfile_roots: self
+                        .store
+                        .release(name, id)
+                        .map(|release| release.spec.sendfile_roots.clone())
+                        .unwrap_or_default(),
+                    sendfile_header: self
+                        .store
+                        .release(name, id)
+                        .ok()
+                        .and_then(|release| release.spec.sendfile_header.clone())
+                        .unwrap_or_default(),
+                    error_pages: self
+                        .store
+                        .release(name, id)
+                        .map(|release| {
+                            error_pages_message(
+                                &release.spec.error_pages,
+                                Some(&release.spec.source),
+                            )
+                        })
+                        .unwrap_or_default(),
+                    error_override: self
+                        .store
+                        .release(name, id)
+                        .ok()
+                        .and_then(|release| release.spec.error_override)
+                        .map(|table| error_override_message(&table)),
+                    maintenance: Some(maintenance_message(
+                        self.maintenance.contains_key(name),
+                        self.store
+                            .release(name, id)
+                            .ok()
+                            .and_then(|release| release.spec.maintenance)
+                            .as_ref(),
+                    )),
+                    server: running.backend.server_message(name, id).map(|mut server| {
+                        // Section 4.9: the release's file hint keys apply
+                        // to the server's responses, which are trusted.
+
+                        if let Ok(release) = self.store.release(name, id) {
+                            server.sendfile_roots = release.spec.sendfile_roots.clone();
+                            server.sendfile_header =
+                                release.spec.sendfile_header.clone().unwrap_or_default();
+                        }
+
+                        server
+                    }),
                 });
             }
         }
@@ -1960,6 +2792,8 @@ impl Daemon {
             .and_then(|name| apps.iter().find(|app| &app.app == name))
             .or_else(|| apps.first());
         let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
+        let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
+        let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
 
         let mut hosts = Vec::new();
 
@@ -1992,18 +2826,38 @@ impl Daemon {
                 canonical: host.canonical.unwrap_or_default(),
                 use_canonical_name: host.use_canonical_name,
                 default: host.default,
+                error_pages: error_pages_message(&host.error_pages, None),
+                error_override: host.error_override.as_ref().map(error_override_message),
             });
         }
 
-        let routes = self
-            .store
-            .routes()
-            .unwrap_or_default()
+        let mut upstreams = Vec::new();
+
+        for (name, upstream) in self.store.upstreams().unwrap_or_default() {
+            match upstream_message(&name, &upstream) {
+                Ok(message) => upstreams.push(message),
+                Err(error) => self.events.emit(
+                    "upstream.unusable",
+                    &format!("upstream {name}"),
+                    "error",
+                    &format!("{error:#}; routes to it answer 502 until it is applied again"),
+                ),
+            }
+        }
+
+        let routes = routes
             .into_iter()
             .map(|route| pb::Route {
+                traffic: self.route_traffic(&route, &included, &rollouts),
                 host: route.host,
                 path: route.path,
                 app: route.app,
+                upstream: route.upstream,
+                fallback_upstream: route
+                    .fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.upstream.clone())
+                    .unwrap_or_default(),
                 static_dir: route.static_dir.unwrap_or_default(),
                 index: route.index,
                 fallback_app: route
@@ -2034,6 +2888,11 @@ impl Daemon {
                     .unwrap_or_default(),
                 no_redirect_slash: route.redirect_slash == Some(false),
                 case_insensitive: route.case.as_deref() == Some("insensitive"),
+                internal: route.internal == Some(true),
+                accept_redirects_from: route.accept_redirects_from,
+                error_pages: error_pages_message(&route.error_pages, None),
+                error_override: route.error_override.as_ref().map(error_override_message),
+                auth: route.auth.as_ref().map(auth_message),
             })
             .collect();
 
@@ -2045,6 +2904,11 @@ impl Daemon {
             apps,
             proxy: self.proxy.clone(),
             compression: Some(self.compression.clone()),
+            error_pages: self.error_pages.clone(),
+            error_override: self.error_override.clone(),
+            upstreams,
+            default_app,
+            default_release,
         }
     }
 
@@ -2073,6 +2937,41 @@ impl Daemon {
 
             return;
         }
+
+        // Section 9.4: with a sticky policy on the application's routes,
+        // clients whose cookie names the release keep reaching it for the
+        // grace period; it drains when that passes (expire_sticky).
+
+        if let Some(grace) = self.sticky_grace(app)
+            && let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned()))
+            && running.sticky_until.is_none()
+        {
+            running.sticky_until = Some((Instant::now() + grace, retain));
+            let message = format!(
+                "sticky clients keep it for {}",
+                muru_config::format_duration(grace)
+            );
+            self.set_state(&release, ReleaseState::Draining, &message);
+            self.events
+                .emit("release.draining", &subject, "info", &message);
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a sticky drain failed");
+            }
+
+            return;
+        }
+
+        self.drain_now(app, id, retain).await;
+    }
+
+    /// Drain a release that is out of the snapshot: wait for its requests
+    /// in flight, then keep it warm for `retain` or stop it.
+    async fn drain_now(&mut self, app: &str, id: &str, retain: Duration) {
+        let subject = format!("{app}@{id}");
+        let Ok(release) = self.store.release(app, id) else {
+            return;
+        };
 
         // The previous pool is gone from the edge, so what is in flight on
         // these workers is what the edge had already dispatched; a short
@@ -2135,18 +3034,929 @@ impl Daemon {
             return;
         };
 
-        self.set_state(&release, ReleaseState::Stopping, "stopping the host");
-        let record = running.host.run_dir().join("..").join("host.toml");
-        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
+        self.set_state(
+            &release,
+            ReleaseState::Stopping,
+            if running.backend.servers().is_some() {
+                "stopping the instances"
+            } else {
+                "stopping the host"
+            },
+        );
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let record = running.backend.record_path(&run_dir);
+        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
+        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
 
         if stopped.is_err() {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
         }
 
         let _ = std::fs::remove_file(record);
+        let _ = self.store.remove_scale_pins(app, id, None);
         self.set_state(&release, ReleaseState::Stopped, why);
         self.events
             .emit("release.stopped", &subject, "info", "stopped");
+    }
+
+    /// Section 9.3: begin a rollout of `candidate` against the release that
+    /// serves. The candidate is started if it is not running, takes the
+    /// first step's share at once, and the ticks move it along.
+    async fn start_rollout(
+        &mut self,
+        app: &str,
+        candidate: &str,
+        steps: Vec<RolloutStep>,
+        gates: RolloutGates,
+        approve_each_step: bool,
+    ) -> Result<Rollout, String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let Some(baseline) = record.current.clone() else {
+            return Err(format!("{app} has no serving release to roll out against"));
+        };
+
+        if baseline == candidate {
+            return Err(format!("{app}@{candidate} already serves"));
+        }
+
+        self.store
+            .release(app, candidate)
+            .map_err(|error| error.to_string())?;
+
+        if let Some(active) = self
+            .store
+            .active_rollout(app)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "{app} has rollout {} under way ({}); promote or abort it first",
+                active.id,
+                active.state.as_str()
+            ));
+        }
+
+        if steps.is_empty() {
+            return Err("a rollout needs at least one step".to_owned());
+        }
+
+        for (index, step) in steps.iter().enumerate() {
+            if step.percent == 0 || step.percent > 100 {
+                return Err(format!(
+                    "step {}: the share must be 1 to 100 percent",
+                    index + 1
+                ));
+            }
+
+            if index > 0 && step.percent <= steps[index - 1].percent {
+                return Err(format!("step {}: the shares must increase", index + 1));
+            }
+        }
+
+        self.start(app, candidate).await?;
+
+        if let Some(running) = self
+            .running
+            .get_mut(&(app.to_owned(), candidate.to_owned()))
+        {
+            running.held = false;
+        }
+
+        let now = now_unix_ms();
+        let rollout = Rollout {
+            app: app.to_owned(),
+            id: self
+                .store
+                .next_rollout_id(app)
+                .map_err(|error| error.to_string())?,
+            candidate: candidate.to_owned(),
+            baseline: baseline.clone(),
+            message: step_message(&steps, 0),
+            steps,
+            gates,
+            approve_each_step,
+            state: RolloutState::Running,
+            step: 0,
+            step_started_unix_ms: now,
+            created_unix_ms: now,
+            updated_unix_ms: now,
+        };
+        self.store
+            .put_rollout(&rollout)
+            .map_err(|error| error.to_string())?;
+        self.events.emit(
+            "rollout.started",
+            &format!("{app}@{candidate}"),
+            "notice",
+            &format!(
+                "rollout {} against {baseline}: {}",
+                rollout.id,
+                describe_steps(&rollout.steps)
+            ),
+        );
+        self.push_snapshot().await?;
+        self.begin_rollout_run(&rollout).await;
+        Ok(rollout)
+    }
+
+    /// Section 9.3: mark where a rollout's current step starts from, once
+    /// its share is in force, so the gates judge the requests served under
+    /// this step alone. Without the edge's counters the first tick marks
+    /// it instead.
+    async fn begin_rollout_run(&mut self, rollout: &Rollout) {
+        match self.edge.metrics().await {
+            Ok(samples) => {
+                self.rollout_runs.insert(
+                    rollout.app.clone(),
+                    RolloutRun {
+                        rollout: rollout.id.clone(),
+                        step: rollout.step,
+                        candidate: Counters::from_samples(
+                            &samples,
+                            &rollout.app,
+                            &rollout.candidate,
+                        ),
+                        baseline: Counters::from_samples(&samples, &rollout.app, &rollout.baseline),
+                    },
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, "the edge's metrics could not be read for the rollout");
+                self.rollout_runs.remove(&rollout.app);
+            }
+        }
+    }
+
+    /// Pause, resume, promote or abort the application's active rollout.
+    async fn control_rollout(
+        &mut self,
+        app: &str,
+        action: RolloutAction,
+    ) -> Result<Rollout, String> {
+        let Some(mut rollout) = self
+            .store
+            .active_rollout(app)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(format!("{app} has no rollout under way"));
+        };
+
+        let subject = format!("{app}@{}", rollout.candidate);
+        let percent = rollout.percent();
+
+        match action {
+            RolloutAction::Pause => {
+                if rollout.state != RolloutState::Running {
+                    return Err(format!(
+                        "rollout {} is {}",
+                        rollout.id,
+                        rollout.state.as_str()
+                    ));
+                }
+
+                rollout.state = RolloutState::Paused;
+                rollout.message = format!("paused at {percent}%");
+                self.events
+                    .emit("rollout.paused", &subject, "notice", &rollout.message);
+            }
+            RolloutAction::Resume => {
+                let approved = match rollout.state {
+                    RolloutState::Paused => false,
+                    RolloutState::AwaitingApproval => true,
+                    RolloutState::Running => {
+                        return Err(format!("rollout {} is running", rollout.id));
+                    }
+                    RolloutState::Promoted | RolloutState::RolledBack => unreachable!(),
+                };
+
+                rollout.state = RolloutState::Running;
+                rollout.step_started_unix_ms = now_unix_ms();
+                rollout.message = step_message(&rollout.steps, rollout.step);
+
+                if approved {
+                    self.events.emit(
+                        "rollout.step",
+                        &subject,
+                        "notice",
+                        &format!("approved: {}", rollout.message),
+                    );
+                    self.store
+                        .put_rollout(&rollout)
+                        .map_err(|error| error.to_string())?;
+                    self.push_snapshot().await?;
+                } else {
+                    self.events
+                        .emit("rollout.resumed", &subject, "notice", &rollout.message);
+                }
+
+                self.begin_rollout_run(&rollout).await;
+            }
+            RolloutAction::Promote => {
+                self.finish_rollout(
+                    &mut rollout,
+                    RolloutState::Promoted,
+                    &format!("promoted by hand at {percent}%"),
+                )
+                .await?;
+            }
+            RolloutAction::Abort => {
+                self.finish_rollout(
+                    &mut rollout,
+                    RolloutState::RolledBack,
+                    &format!("aborted by hand at {percent}%"),
+                )
+                .await?;
+            }
+        }
+
+        rollout.updated_unix_ms = now_unix_ms();
+        self.store
+            .put_rollout(&rollout)
+            .map_err(|error| error.to_string())?;
+        Ok(rollout)
+    }
+
+    /// End a rollout. Promoted, the candidate takes all the traffic and
+    /// the baseline drains before the record says so; rolled back, the
+    /// candidate leaves traffic and is kept warm, so it can be looked at.
+    async fn finish_rollout(
+        &mut self,
+        rollout: &mut Rollout,
+        state: RolloutState,
+        message: &str,
+    ) -> Result<(), String> {
+        let subject = format!("{}@{}", rollout.app, rollout.candidate);
+        self.rollout_runs.remove(&rollout.app);
+
+        let record = |rollout: &mut Rollout, store: &Store| -> Result<(), String> {
+            rollout.state = state;
+            rollout.message = message.to_owned();
+            rollout.updated_unix_ms = now_unix_ms();
+            store
+                .put_rollout(rollout)
+                .map_err(|error| error.to_string())
+        };
+
+        match state {
+            RolloutState::Promoted => {
+                self.promote_release(&rollout.app, &rollout.candidate)
+                    .await?;
+                record(rollout, &self.store)?;
+                self.push_snapshot().await?;
+                self.events.emit(
+                    "rollout.completed",
+                    &subject,
+                    "notice",
+                    &format!("rollout {}: {message}", rollout.id),
+                );
+            }
+            _ => {
+                record(rollout, &self.store)?;
+                self.push_snapshot().await?;
+                self.events.emit(
+                    "rollout.rolled_back",
+                    &subject,
+                    "warning",
+                    &format!(
+                        "rollout {}: {message}; the candidate is kept warm",
+                        rollout.id
+                    ),
+                );
+                let candidate = (rollout.app.clone(), rollout.candidate.clone());
+
+                if !self.referenced_releases().contains(&candidate)
+                    && self.serving.get(&rollout.app) != Some(&rollout.candidate)
+                {
+                    self.drain(&rollout.app, &rollout.candidate, RETENTION)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Blue/green (section 9.2): all of the application's traffic to the
+    /// release now, which is started if it is not running, and the release
+    /// that served drains unless a policy names it.
+    async fn promote_release(&mut self, app: &str, id: &str) -> Result<Release, String> {
+        let record = self.store.app(app).map_err(|error| error.to_string())?;
+        let current = record.current.clone();
+
+        if current.as_deref() == Some(id) {
+            return Err(format!("{app}@{id} already serves"));
+        }
+
+        self.start(app, id).await?;
+        self.switch_to(app, id).await;
+        self.store
+            .set_app_releases(app, Some(id), current.as_deref())
+            .map_err(|error| error.to_string())?;
+
+        if let Some(previous) = current.filter(|previous| previous != id)
+            && !self
+                .referenced_releases()
+                .contains(&(app.to_owned(), previous.clone()))
+        {
+            self.drain(app, &previous, RETENTION).await;
+        }
+
+        self.store
+            .release(app, id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Section 9.3: move every running rollout along. The current step is
+    /// judged by its gates against the baseline over the same window; a
+    /// failing gate rolls back at once; once the hold has passed with the
+    /// gates satisfied, the next step begins, or waits for approval, or
+    /// the last step promotes the candidate. Without enough requests to
+    /// judge, the step holds until there are.
+    async fn advance_rollouts(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
+        };
+        let running: Vec<Rollout> = self
+            .store
+            .rollouts(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rollout| rollout.state == RolloutState::Running)
+            .collect();
+
+        for mut rollout in running {
+            let app = rollout.app.clone();
+            let subject = format!("{app}@{}", rollout.candidate);
+            let now = now_unix_ms();
+
+            let run = match self.rollout_runs.get(&app) {
+                Some(run) if run.rollout == rollout.id && run.step == rollout.step => run.clone(),
+                _ => {
+                    let run = RolloutRun {
+                        rollout: rollout.id.clone(),
+                        step: rollout.step,
+                        candidate: Counters::from_samples(samples, &app, &rollout.candidate),
+                        baseline: Counters::from_samples(samples, &app, &rollout.baseline),
+                    };
+                    rollout.step_started_unix_ms = now;
+                    let _ = self.store.put_rollout(&rollout);
+                    self.rollout_runs.insert(app.clone(), run.clone());
+                    run
+                }
+            };
+
+            let candidate =
+                Counters::from_samples(samples, &app, &rollout.candidate).since(&run.candidate);
+            let baseline =
+                Counters::from_samples(samples, &app, &rollout.baseline).since(&run.baseline);
+            let verdict = judge(&candidate, &baseline, &rollout.gates);
+            let percent = rollout.percent();
+
+            if let Verdict::Fail(reason) = verdict {
+                self.events.emit(
+                    "rollout.gate_failed",
+                    &subject,
+                    "warning",
+                    &format!("step {} at {percent}%: {reason}", rollout.step + 1),
+                );
+
+                if let Err(error) = self
+                    .finish_rollout(
+                        &mut rollout,
+                        RolloutState::RolledBack,
+                        &format!("gate failed at {percent}%: {reason}"),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "rolling back a rollout failed");
+                }
+
+                continue;
+            }
+
+            let hold = rollout
+                .steps
+                .get(rollout.step)
+                .map_or(0, |step| step.hold_ms);
+
+            if now < rollout.step_started_unix_ms + hold {
+                continue;
+            }
+
+            if verdict == Verdict::Insufficient {
+                let message = format!(
+                    "step {} at {percent}%: holding for {} requests to judge, {} so far",
+                    rollout.step + 1,
+                    rollout.gates.min_requests,
+                    candidate.total as u64
+                );
+
+                if rollout.message != message {
+                    rollout.message = message;
+                    rollout.updated_unix_ms = now;
+                    let _ = self.store.put_rollout(&rollout);
+                }
+
+                continue;
+            }
+
+            if rollout.step + 1 >= rollout.steps.len() {
+                if let Err(error) = self
+                    .finish_rollout(
+                        &mut rollout,
+                        RolloutState::Promoted,
+                        "every step passed its gates",
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "promoting a rollout failed");
+                }
+
+                continue;
+            }
+
+            rollout.step += 1;
+            rollout.step_started_unix_ms = now;
+            rollout.updated_unix_ms = now;
+            self.rollout_runs.remove(&app);
+
+            if rollout.approve_each_step {
+                rollout.state = RolloutState::AwaitingApproval;
+                rollout.message = format!(
+                    "{} awaits approval: muructl rollout resume {app}",
+                    step_message(&rollout.steps, rollout.step)
+                );
+                let _ = self.store.put_rollout(&rollout);
+                self.events
+                    .emit("rollout.step", &subject, "notice", &rollout.message);
+                continue;
+            }
+
+            rollout.message = step_message(&rollout.steps, rollout.step);
+            let _ = self.store.put_rollout(&rollout);
+            self.events
+                .emit("rollout.step", &subject, "notice", &rollout.message);
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a rollout step failed");
+            }
+
+            self.begin_rollout_run(&rollout).await;
+        }
+    }
+
+    /// Section 9.4: the releases whose sticky grace has passed leave the
+    /// snapshot and drain.
+    async fn expire_sticky(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(String, String, Duration)> = self
+            .running
+            .iter()
+            .filter_map(|((app, id), running)| {
+                let (until, retain) = running.sticky_until?;
+                (until <= now).then(|| (app.clone(), id.clone(), retain))
+            })
+            .collect();
+
+        for (app, id, retain) in expired {
+            if let Some(running) = self.running.get_mut(&(app.clone(), id.clone())) {
+                running.sticky_until = None;
+            }
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot after a sticky grace failed");
+            }
+
+            self.drain_now(&app, &id, retain).await;
+        }
+    }
+
+    /// Section 9.4: the releases the route policies name must run, and a
+    /// release that only a policy kept in traffic drains once no policy
+    /// names it. Called after the configuration changes and at start.
+    async fn reconcile_traffic(&mut self) {
+        let referenced = self.referenced_releases();
+
+        for (app, id) in &referenced {
+            let key = (app.clone(), id.clone());
+
+            let needs_start = match self.running.get(&key) {
+                None => true,
+                Some(running) => running.retained_until.is_some() || running.sticky_until.is_some(),
+            };
+
+            if !needs_start || self.store.release(app, id).is_err() {
+                continue;
+            }
+
+            if let Some(running) = self.running.get_mut(&key) {
+                running.sticky_until = None;
+            }
+
+            if let Err(error) = self.start(app, id).await {
+                self.events.emit(
+                    "traffic_policy.release_unavailable",
+                    &format!("{app}@{id}"),
+                    "warning",
+                    &format!("a traffic policy names the release but it cannot start: {error}"),
+                );
+            }
+        }
+
+        let unreferenced: Vec<(String, String)> = self
+            .running
+            .iter()
+            .filter(|((app, id), running)| {
+                running.retained_until.is_none()
+                    && running.sticky_until.is_none()
+                    && !running.held
+                    && self.serving.get(app) != Some(id)
+                    && !referenced.contains(&((*app).clone(), (*id).clone()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for (app, id) in unreferenced {
+            self.drain(&app, &id, RETENTION).await;
+        }
+    }
+
+    /// Section 7.4: feed every running release's scalers what the edge
+    /// reports and carry out their decisions, each one an event with its
+    /// reasons. A group whose count is not what its scaler wants, after a
+    /// restart or a restored pin, is asked for again.
+    async fn autoscale(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
+        };
+        let now = Instant::now();
+        let mut requests: Vec<(String, String, String, u32)> = Vec::new();
+        let mut emitted: Vec<(&'static str, String, &'static str, String)> = Vec::new();
+
+        for ((app, id), running) in &mut self.running {
+            // A retained release is at its warm floor (section 9.1), not
+            // the autoscaler's to size.
+
+            if running.retained_until.is_some() || running.control.is_none() {
+                continue;
+            }
+
+            let subject = format!("{app}@{id}");
+
+            for group in &mut running.scalers {
+                let sockets = if group.name == muru_edge::routing::DEFAULT_GROUP {
+                    &running.sockets
+                } else {
+                    match running
+                        .groups
+                        .iter()
+                        .find(|record| record.name == group.name)
+                    {
+                        Some(record) => &record.sockets,
+                        None => continue,
+                    }
+                };
+                let ready = sockets.len() as u32;
+                let youngest = sockets
+                    .iter()
+                    .filter_map(|socket| running.ready_at.get(socket))
+                    .max()
+                    .map(|at| now.saturating_duration_since(*at));
+                let advisory = group.scaler.spec().advisory;
+
+                if advisory {
+                    group.scaler.sync(ready);
+                }
+
+                let signals = Signals::from_samples(
+                    samples,
+                    app,
+                    id,
+                    &group.name,
+                    ready,
+                    group.slots_per_worker,
+                    youngest,
+                );
+
+                match group.scaler.observe(now, signals) {
+                    Some(Decision::ScaleOut { to, reason }) => {
+                        emitted.push((
+                            "scaling.decision",
+                            subject.clone(),
+                            "info",
+                            decision_message(&group.name, ready, to, &reason, advisory),
+                        ));
+                    }
+                    Some(Decision::ScaleIn { to, reason }) => {
+                        emitted.push((
+                            "scaling.decision",
+                            subject.clone(),
+                            "info",
+                            decision_message(&group.name, ready, to, &reason, advisory),
+                        ));
+                    }
+                    Some(Decision::Suspended { reason }) => {
+                        emitted.push((
+                            "churn_budget.exhausted",
+                            subject.clone(),
+                            "warning",
+                            format!("{}: {reason}", group.name),
+                        ));
+                    }
+                    None => {}
+                }
+
+                let desired = group.scaler.desired();
+
+                if !advisory && desired != ready && group.requested != Some(desired) {
+                    group.requested = Some(desired);
+                    requests.push((app.clone(), id.clone(), group.name.clone(), desired));
+                }
+            }
+        }
+
+        for (kind, subject, level, message) in emitted {
+            self.events.emit(kind, &subject, level, &message);
+        }
+
+        for (app, id, group, processes) in requests {
+            self.ask_scale(&app, &id, &group, processes);
+        }
+    }
+
+    /// Ask a release's host to bring a group to a worker count; the host
+    /// announces the sockets as they change.
+    fn ask_scale(&mut self, app: &str, id: &str, group: &str, processes: u32) {
+        let Some(control) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.control.as_ref())
+        else {
+            return;
+        };
+
+        self.last_request += 1;
+        control.request(
+            self.last_request,
+            "scale",
+            None,
+            &serde_json::json!({ "group": group, "processes": processes }),
+        );
+    }
+
+    /// Section 7.4: pin a group's worker count, so the autoscaler stands
+    /// aside, or let it decide again; the pin outlives the daemon.
+    fn set_scale(
+        &mut self,
+        app: &str,
+        id: &str,
+        group: &str,
+        processes: Option<u32>,
+        unpin: bool,
+    ) -> Result<Vec<(String, ScaleStatus)>, String> {
+        let now = Instant::now();
+        let key = (app.to_owned(), id.to_owned());
+        let Some(running) = self.running.get_mut(&key) else {
+            return Err(format!("release {app}@{id} is not running"));
+        };
+
+        if running.backend.servers().is_some() {
+            return Err(format!(
+                "release {app}@{id} runs a managed HTTP server, whose instance count is fixed"
+            ));
+        }
+
+        let Some(scaling) = running
+            .scalers
+            .iter_mut()
+            .find(|scaling| scaling.name == group)
+        else {
+            return Err(format!("release {app}@{id} has no worker group {group}"));
+        };
+
+        let subject = format!("{app}@{id}");
+
+        if unpin {
+            if scaling.scaler.pinned().is_none() {
+                return Err(format!("{group} is not pinned"));
+            }
+
+            scaling.scaler.unpin(now);
+            self.store
+                .remove_scale_pins(app, id, Some(group))
+                .map_err(|error| error.to_string())?;
+            self.events.emit(
+                "scaling.decision",
+                &subject,
+                "notice",
+                &format!(
+                    "{group}: unpinned; the autoscaler decides again from {} workers",
+                    scaling.scaler.desired()
+                ),
+            );
+        } else {
+            let Some(count) = processes else {
+                return Err("give --processes COUNT or --unpin".to_owned());
+            };
+            let spec = scaling.scaler.spec();
+
+            if count == 0 {
+                return Err("processes must be at least 1".to_owned());
+            }
+
+            if !spec.is_static() && count > spec.max_workers {
+                return Err(format!(
+                    "{count} is over the group's max_workers of {}",
+                    spec.max_workers
+                ));
+            }
+
+            scaling.scaler.pin(count, now);
+            scaling.requested = Some(count);
+            self.store
+                .put_scale_pin(app, id, group, count)
+                .map_err(|error| error.to_string())?;
+            self.events.emit(
+                "scaling.decision",
+                &subject,
+                "notice",
+                &format!("{group}: pinned to {count} workers by an operator"),
+            );
+            self.ask_scale(app, id, group, count);
+        }
+
+        self.scale_status(app, id)
+    }
+
+    /// Section 4.12: put an application into maintenance mode or take it
+    /// out, recorded so a daemon restart keeps it, announced as an event,
+    /// and pushed to the edge.
+    async fn set_maintenance(&mut self, app: &str, on: bool) -> Result<Option<u64>, String> {
+        self.store.app(app).map_err(|error| error.to_string())?;
+        let was = self.maintenance.get(app).copied();
+
+        match (on, was) {
+            (true, Some(since)) => return Ok(Some(since)),
+            (false, None) => return Ok(None),
+            (true, None) => {
+                let since = crate::model::now_unix_ms();
+                self.store
+                    .set_maintenance(app, Some(since))
+                    .map_err(|error| error.to_string())?;
+                self.maintenance.insert(app.to_owned(), since);
+                self.events.emit(
+                    "maintenance.changed",
+                    app,
+                    "notice",
+                    "maintenance on: the edge serves the maintenance page",
+                );
+            }
+            (false, Some(_)) => {
+                self.store
+                    .set_maintenance(app, None)
+                    .map_err(|error| error.to_string())?;
+                self.maintenance.remove(app);
+                self.events.emit(
+                    "maintenance.changed",
+                    app,
+                    "notice",
+                    "maintenance off: the application serves again",
+                );
+            }
+        }
+
+        self.push_snapshot().await?;
+        Ok(self.maintenance.get(app).copied())
+    }
+
+    /// The autoscaler's state for each group of a running release.
+    fn scale_status(&self, app: &str, id: &str) -> Result<Vec<(String, ScaleStatus)>, String> {
+        let now = Instant::now();
+        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+            return Err(format!("release {app}@{id} is not running"));
+        };
+        Ok(running
+            .scalers
+            .iter()
+            .map(|scaling| (scaling.name.clone(), scaling.scaler.status(now)))
+            .collect())
+    }
+
+    /// Whether the edge routes to the release at all: it serves, keeps
+    /// sticky clients, is held, or a policy or rollout refers to it.
+    fn routable(&self, app: &str, id: &str) -> bool {
+        let key = (app.to_owned(), id.to_owned());
+        let Some(running) = self.running.get(&key) else {
+            return false;
+        };
+        self.serving.get(app) == Some(&id.to_owned())
+            || running.sticky_until.is_some()
+            || running.held
+            || (running.retained_until.is_none() && self.referenced_releases().contains(&key))
+    }
+
+    /// The releases the route policies name and the candidates of the
+    /// rollouts under way, by application.
+    fn referenced_releases(&self) -> BTreeSet<(String, String)> {
+        let mut referenced = referenced_in(&self.store.routes().unwrap_or_default());
+        referenced.extend(
+            self.store
+                .rollouts(None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|rollout| rollout.state.is_active())
+                .map(|rollout| (rollout.app, rollout.candidate)),
+        );
+        referenced
+    }
+
+    /// Section 9.4: the longest sticky grace among the application's
+    /// routes with a sticky policy, or none when no route is sticky.
+    fn sticky_grace(&self, app: &str) -> Option<Duration> {
+        self.store
+            .routes()
+            .unwrap_or_default()
+            .iter()
+            .filter(|route| route_apps(route).contains(&app))
+            .filter_map(|route| route.traffic.as_ref())
+            .filter(|traffic| traffic.sticky == Some(true))
+            .map(sticky_grace_of)
+            .filter(|grace| !grace.is_zero())
+            .max()
+    }
+
+    /// A route's traffic policy for the edge, when it has one or its
+    /// application has a rollout under way: the rollout's candidate share
+    /// first, then the policy's shares of the releases the snapshot
+    /// carries, newest first so the newest release's buckets are at the
+    /// top (section 9.4), with the key, salt and stickiness.
+    fn route_traffic(
+        &self,
+        route: &muru_config::Route,
+        included: &BTreeSet<(String, String)>,
+        rollouts: &[Rollout],
+    ) -> Option<pb::Traffic> {
+        let app = route_apps(route).first().copied().unwrap_or_default();
+        let rollout = rollouts.iter().find(|rollout| {
+            rollout.app == app && included.contains(&(app.to_owned(), rollout.candidate.clone()))
+        });
+
+        if route.traffic.is_none() && rollout.is_none() {
+            return None;
+        }
+
+        let mut shares: Vec<pb::Share> = rollout
+            .map(|rollout| pb::Share {
+                release: rollout.candidate.clone(),
+                weight: rollout.percent().min(100) * 100,
+                upstream: String::new(),
+            })
+            .into_iter()
+            .collect();
+        let traffic = route.traffic.clone().unwrap_or_default();
+        let mut declared: Vec<(u64, &String, u32)> = traffic
+            .split
+            .iter()
+            .filter(|(id, _)| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
+            .filter(|(id, _)| included.contains(&(app.to_owned(), (*id).clone())))
+            .filter(|(id, _)| rollout.is_none_or(|rollout| &rollout.candidate != *id))
+            .map(|(id, percent)| {
+                let created = self
+                    .store
+                    .release(app, id)
+                    .map(|release| release.created_unix_ms)
+                    .unwrap_or(0);
+                (created, id, *percent)
+            })
+            .collect();
+        declared.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        shares.extend(declared.into_iter().map(|(_, release, percent)| pb::Share {
+            release: release.clone(),
+            weight: percent.min(100) * 100,
+            upstream: String::new(),
+        }));
+
+        // Section 4.13: shares to upstreams come after the releases', in
+        // name order.
+
+        shares.extend(traffic.split.iter().filter_map(|(id, percent)| {
+            let upstream = id.strip_prefix(muru_edge::routing::UPSTREAM_PREFIX)?;
+            Some(pb::Share {
+                release: String::new(),
+                weight: (*percent).min(100) * 100,
+                upstream: upstream.to_owned(),
+            })
+        }));
+
+        Some(pb::Traffic {
+            shares,
+            hash_key: traffic.hash_key.clone().unwrap_or_default(),
+            salt: traffic
+                .salt
+                .clone()
+                .unwrap_or_else(|| format!("{} {}", route.host, route.path)),
+            sticky: traffic.sticky.unwrap_or(false),
+            sticky_grace_s: sticky_grace_of(&traffic).as_secs(),
+        })
     }
 
     /// Stop the retained releases whose window has passed.
@@ -2186,7 +3996,11 @@ impl Daemon {
             &format!("rolled back to {previous}"),
         );
 
-        if let Some(current) = current.filter(|current| current != &previous) {
+        if let Some(current) = current.filter(|current| current != &previous)
+            && !self
+                .referenced_releases()
+                .contains(&(app.to_owned(), current.clone()))
+        {
             self.drain(app, &current, RETENTION).await;
         }
 
@@ -2222,11 +4036,42 @@ impl Daemon {
     /// serves is started again once.
     async fn check_hosts(&mut self) {
         let mut exited = Vec::new();
+        let mut reports = Vec::new();
 
         for (key, running) in &mut self.running {
-            if let Ok(Some(how)) = running.host.try_exited() {
+            // Section 9.9: a managed server's instances are started
+            // again where they crash; the release stays up.
+
+            if let Backend::Servers(servers) = &mut running.backend {
+                let changes = servers.check();
+
+                if !changes.is_empty() {
+                    let run_dir = self
+                        .locations
+                        .run
+                        .path
+                        .join("apps")
+                        .join(&key.0)
+                        .join(&key.1);
+                    write_record(&run_dir.join("servers.toml"), &servers.record());
+                }
+
+                reports.extend(changes.into_iter().map(|report| (key.clone(), report)));
+                continue;
+            }
+
+            if let Ok(Some(how)) = running.backend.try_exited() {
                 exited.push((key.clone(), how));
             }
+        }
+
+        for ((app, id), report) in reports {
+            self.events.emit(
+                report.kind,
+                &format!("{app}@{id}"),
+                report.level,
+                &report.message,
+            );
         }
 
         for ((app, id), how) in exited {
@@ -2303,10 +4148,15 @@ impl Daemon {
     /// Section 5.9: connect to a running host's control socket in the
     /// background and feed what it says into the daemon's inbox.
     fn attach_control(&self, app: &str, id: &str) {
-        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+        let Some(host) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.backend.host())
+        else {
             return;
         };
-        let path = running.host.control_path();
+
+        let path = host.control_path();
         let commands = self.commands.clone();
         let (app, id) = (app.to_owned(), id.to_owned());
 
@@ -2362,6 +4212,14 @@ impl Daemon {
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+                let Some((record, pid)) = running.backend.host().map(|host| {
+                    (
+                        host.run_dir().join("..").join("host.toml"),
+                        host.pid().unwrap_or(0),
+                    )
+                }) else {
+                    return;
+                };
                 running.sockets = sockets;
 
                 for (name, group_sockets) in groups {
@@ -2377,16 +4235,26 @@ impl Daemon {
                     all.extend(group.sockets.iter().cloned());
                 }
 
+                // Section 7.4: a socket new to the routing is a worker
+                // that just became ready.
+
+                let now = Instant::now();
+                running.ready_at.retain(|socket, _| all.contains(socket));
+
+                for socket in &all {
+                    running.ready_at.entry(socket.clone()).or_insert(now);
+                }
+
                 write_record(
-                    &running.host.run_dir().join("..").join("host.toml"),
+                    &record,
                     &HostRecord {
-                        pid: running.host.pid().unwrap_or(0),
+                        pid,
                         sockets: all,
                         groups: running.groups.clone(),
                     },
                 );
 
-                if self.serving.get(app) == Some(&id.to_owned())
+                if self.routable(app, id)
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::error!(%error, "pushing the snapshot after a worker change failed");
@@ -2481,7 +4349,12 @@ impl Daemon {
                 self.set_state(&release, ReleaseState::Stopping, "the daemon is stopping");
             }
 
-            let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
+            let grace = self
+                .store
+                .release(&app, &id)
+                .map(|release| Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms))
+                .unwrap_or(DRAIN_TIMEOUT);
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
 
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
@@ -2508,13 +4381,9 @@ impl Daemon {
     /// files the application opened itself.
     /// Section 10.7: one point of history a second, from the edge's
     /// counters.
-    async fn sample_history(&mut self) {
-        let samples = match self.edge.metrics().await {
-            Ok(samples) => samples,
-            Err(error) => {
-                tracing::debug!(%error, "the edge's metrics could not be read for the history");
-                return;
-            }
+    async fn sample_history(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
         };
 
         let workers = self
@@ -2529,7 +4398,7 @@ impl Daemon {
                         .sum::<usize>()
             })
             .sum::<usize>() as u64;
-        let reading = crate::dashboard::reading(&samples, workers);
+        let reading = crate::dashboard::reading(samples, workers);
         let now = crate::model::now_unix_ms() / 1000;
 
         if let Some(point) = self.sampler.observe(now, reading) {
@@ -2545,26 +4414,38 @@ impl Daemon {
         };
         let now = std::time::SystemTime::now();
         let mut candidates = vec![
-            self.locations.access_log(),
-            self.locations.logs.path.join("edge.log"),
+            (self.locations.access_log(), false),
+            (self.locations.logs.path.join("edge.log"), false),
         ];
 
         if self.owns_log {
-            candidates.push(self.locations.daemon_log());
+            candidates.push((self.locations.daemon_log(), false));
         }
 
-        for (app, id) in self.running.keys() {
-            candidates.push(self.locations.release_log(app, id));
+        // Section 9.9: a managed server writes its log itself and cannot
+        // be told to reopen it, so its log is rotated in place.
+
+        for ((app, id), running) in &self.running {
+            candidates.push((
+                self.locations.release_log(app, id),
+                running.backend.servers().is_some(),
+            ));
         }
 
         let mut rotated = Vec::new();
 
-        for path in candidates {
+        for (path, in_place) in candidates {
             if !path.is_file() || !rotator.due(&path, now) {
                 continue;
             }
 
-            match rotator.rotate(&path, now) {
+            let outcome = if in_place {
+                rotator.rotate_in_place(&path, now)
+            } else {
+                rotator.rotate(&path, now)
+            };
+
+            match outcome {
                 Ok(archive) => rotated.push(archive),
                 Err(error) => {
                     tracing::warn!(%error, path = %path.display(), "rotating a log failed");
@@ -2583,7 +4464,7 @@ impl Daemon {
         self.edge.signal(libc::SIGUSR1);
 
         for running in self.running.values() {
-            running.host.signal(libc::SIGUSR1);
+            running.backend.signal(libc::SIGUSR1);
         }
 
         let names: Vec<String> = rotated
@@ -2613,12 +4494,12 @@ impl Daemon {
         let mut hosts = 0;
 
         for running in self.running.values() {
-            if running.host.signal(libc::SIGUSR1) {
+            if running.backend.signal(libc::SIGUSR1) {
                 hosts += 1;
             }
 
             if workers {
-                running.host.signal(libc::SIGUSR2);
+                running.backend.signal(libc::SIGUSR2);
             }
         }
 
@@ -2701,5 +4582,187 @@ fn reopen_own_log(path: &std::path::Path) {
     unsafe {
         libc::dup2(log.as_raw_fd(), 1);
         libc::dup2(log.as_raw_fd(), 2);
+    }
+}
+
+/// Section 7.4: the scaling state of each group of a release that is
+/// starting or adopted, from its spec, the workers it has and the pins
+/// an operator left on it.
+fn scalers_for(
+    spec: &ReleaseSpec,
+    sockets: &[PathBuf],
+    groups: &[GroupRecord],
+    pins: &[(String, u32)],
+    now: Instant,
+) -> Vec<GroupScaling> {
+    let asgi = spec.interface == muru_config::Interface::Asgi;
+    let slots = |threads: u32, concurrency: u32| {
+        if asgi {
+            concurrency as f64
+        } else {
+            threads as f64
+        }
+    };
+    let mut scalers = vec![GroupScaling {
+        name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
+        scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
+        slots_per_worker: slots(spec.threads, spec.concurrency),
+        requested: None,
+    }];
+
+    for group in &spec.groups {
+        let current = groups
+            .iter()
+            .find(|record| record.name == group.name)
+            .map_or(group.processes as usize, |record| record.sockets.len());
+        scalers.push(GroupScaling {
+            name: group.name.clone(),
+            scaler: Scaler::new(group.scaling.clone(), current as u32),
+            slots_per_worker: slots(group.threads, group.concurrency),
+            requested: None,
+        });
+    }
+
+    for (name, count) in pins {
+        if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {
+            scaling.scaler.pin(*count, now);
+        }
+    }
+
+    scalers
+}
+
+/// A scaling decision as its event says it.
+fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
+    let verb = if to > from { "scale out" } else { "scale in" };
+
+    if advisory {
+        format!("advisory: would {verb} {group} from {from} to {to} workers: {reason}")
+    } else {
+        format!("{group}: {verb} from {from} to {to} workers: {reason}")
+    }
+}
+
+/// The applications a route sends requests to: the application, or a
+/// static route's fallback.
+fn route_apps(route: &muru_config::Route) -> Vec<&str> {
+    let mut apps = Vec::new();
+
+    if !route.app.is_empty() {
+        apps.push(route.app.as_str());
+    }
+
+    if let Some(app) = route
+        .fallback
+        .as_ref()
+        .and_then(|fallback| fallback.app.as_deref())
+    {
+        apps.push(app);
+    }
+
+    apps
+}
+
+/// The releases the routes' traffic policies name, as (application,
+/// release) pairs (section 9.4).
+fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
+    routes
+        .iter()
+        .filter_map(|route| route.traffic.as_ref().map(|traffic| (route, traffic)))
+        .flat_map(|(route, traffic)| {
+            route_apps(route).into_iter().flat_map(move |app| {
+                traffic
+                    .split
+                    .keys()
+                    .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
+                    .map(move |id| (app.to_owned(), id.clone()))
+            })
+        })
+        .collect()
+}
+
+/// Section 4.13: an upstream as the edge takes it, with its CA file read
+/// now so a replaced file takes effect with the next snapshot.
+fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result<pb::Upstream> {
+    let millis = |text: Option<&str>| {
+        text.and_then(|text| muru_config::parse_duration(text).ok())
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    };
+
+    let tls_ca_pem = match table.tls.as_ref().and_then(|tls| tls.ca.as_deref()) {
+        Some(ca) => std::fs::read_to_string(ca).with_context(|| format!("reading {ca}"))?,
+        None => String::new(),
+    };
+
+    let health = table.health.as_ref();
+
+    Ok(pb::Upstream {
+        name: name.to_owned(),
+        addresses: table.addresses.clone(),
+        protocol: table.protocol.clone().unwrap_or_default(),
+        tls: table.tls.is_some(),
+        tls_ca_pem,
+        tls_server_name: table
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.server_name.clone())
+            .unwrap_or_default(),
+        tls_insecure: table
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.verify == Some(false)),
+        trust_muru_headers: table.trust_muru_headers,
+        sendfile_roots: table.sendfile_roots.clone(),
+        sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
+        connect_timeout_ms: millis(table.connect_timeout.as_deref()),
+        probe: health.map(|health| pb::UpstreamProbe {
+            path: health.path.clone().unwrap_or_default(),
+            interval_ms: millis(health.interval.as_deref()),
+            timeout_ms: millis(health.timeout.as_deref()),
+            unhealthy_after: health.unhealthy_after.unwrap_or(0),
+            healthy_after: health.healthy_after.unwrap_or(0),
+        }),
+        eject_after: health.and_then(|health| health.eject_after).unwrap_or(3),
+        eject_for_ms: millis(health.and_then(|health| health.eject_for.as_deref())),
+    })
+}
+
+/// A policy's sticky grace: what it says, or 10 minutes.
+fn sticky_grace_of(traffic: &muru_config::Traffic) -> Duration {
+    traffic
+        .sticky_grace
+        .as_deref()
+        .and_then(|text| muru_config::parse_duration(text).ok())
+        .unwrap_or(STICKY_GRACE)
+}
+
+/// A rollout's steps in words: "10% for 2m, 50% for 2m".
+fn describe_steps(steps: &[RolloutStep]) -> String {
+    steps
+        .iter()
+        .map(|step| {
+            format!(
+                "{}% for {}",
+                step.percent,
+                muru_config::format_duration(Duration::from_millis(step.hold_ms))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What a rollout at this step is doing: "step 2 of 3: 50% for 2m".
+fn step_message(steps: &[RolloutStep], step: usize) -> String {
+    match steps.get(step) {
+        Some(current) => format!(
+            "step {} of {}: {}% for {}",
+            step + 1,
+            steps.len(),
+            current.percent,
+            muru_config::format_duration(Duration::from_millis(current.hold_ms))
+        ),
+        None => format!("step {} of {}", step + 1, steps.len()),
     }
 }

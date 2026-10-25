@@ -71,11 +71,14 @@ def test_recycling_and_host_timeouts_are_written() -> None:
         "2h",
         "--timeout",
         "hard=45s",
+        "--timeout",
+        "soft=30s",
     )
     release = document["app"]["shop"]["release"]["r1"]  # type: ignore[index]
     assert release["max_requests"] == 500
     assert release["max_lifetime"] == "7200s"
     assert release["timeouts"] == {
+        "soft_timeout": "30s",
         "hard_timeout": "45s",
         "hard_drain_grace": "10s",
         "shutdown_timeout": "5s",

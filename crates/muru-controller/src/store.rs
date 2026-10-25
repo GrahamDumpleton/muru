@@ -8,9 +8,9 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use muru_config::{Host as VirtualHost, Route};
+use muru_config::{Host as VirtualHost, Route, Upstream};
 
-use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, now_unix_ms};
+use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms};
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS routes (
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (host, path)
 );
+CREATE TABLE IF NOT EXISTS rollouts (
+    app TEXT NOT NULL,
+    id TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (app, id)
+);
+CREATE TABLE IF NOT EXISTS scale_pins (
+    app TEXT NOT NULL,
+    release TEXT NOT NULL,
+    grp TEXT NOT NULL,
+    processes INTEGER NOT NULL,
+    PRIMARY KEY (app, release, grp)
+);
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     time_unix_ms INTEGER NOT NULL,
@@ -70,13 +86,22 @@ CREATE TABLE IF NOT EXISTS event_sinks (
     name TEXT PRIMARY KEY,
     delivered INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS maintenance (
+    app TEXT PRIMARY KEY,
+    since_unix_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS upstreams (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The store.
 pub struct Store {
@@ -97,7 +122,8 @@ impl Store {
         // added hosts and routes and version 3 the event sink cursors,
         // which the CREATE statements above supply to an older store;
         // version 4 added the application's user, group and umask, which
-        // are added to an older table here.
+        // are added to an older table here; version 5 added the
+        // applications in maintenance mode (section 4.12).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -298,7 +324,42 @@ impl Store {
     pub fn delete_app(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM releases WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Section 4.12: the applications in maintenance mode, each with when
+    /// it was turned on.
+    pub fn maintenance(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT app, since_unix_ms FROM maintenance ORDER BY app")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Put an application into maintenance mode, or take it out.
+    pub fn set_maintenance(&self, app: &str, since_unix_ms: Option<u64>) -> Result<(), StoreError> {
+        self.with(|connection| {
+            match since_unix_ms {
+                Some(since) => {
+                    connection.execute(
+                        "INSERT INTO maintenance (app, since_unix_ms) VALUES (?1, ?2) \
+                         ON CONFLICT(app) DO NOTHING",
+                        params![app, since as i64],
+                    )?;
+                }
+                None => {
+                    connection.execute("DELETE FROM maintenance WHERE app = ?1", [app])?;
+                }
+            }
+
             Ok(())
         })
     }
@@ -345,6 +406,48 @@ impl Store {
         })
     }
 
+    /// Every HTTP upstream, by name (section 4.13).
+    pub fn upstreams(&self) -> Result<Vec<(String, Upstream)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM upstreams ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut upstreams = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                upstreams.push((name, decode(&encoded)?));
+            }
+
+            Ok(upstreams)
+        })
+    }
+
+    /// Create or replace an HTTP upstream.
+    pub fn put_upstream(&self, name: &str, upstream: &Upstream) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(upstream).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO upstreams (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove an HTTP upstream.
+    pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
     /// Every route, by host then path.
     pub fn routes(&self) -> Result<Vec<Route>, StoreError> {
         self.with(|connection| {
@@ -373,6 +476,139 @@ impl Store {
                 params![route.host, route.path, encoded],
             )?;
             Ok(())
+        })
+    }
+
+    /// The rollouts of one application, or of all, oldest first (section
+    /// 9.3).
+    pub fn rollouts(&self, app: Option<&str>) -> Result<Vec<Rollout>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT spec FROM rollouts WHERE (?1 = '' OR app = ?1) ORDER BY app, created",
+            )?;
+            let rows = statement.query_map([app.unwrap_or("")], |row| row.get::<_, String>(0))?;
+            let mut rollouts = Vec::new();
+
+            for row in rows {
+                rollouts.push(decode(&row?)?);
+            }
+
+            Ok(rollouts)
+        })
+    }
+
+    /// One rollout by id, or the application's latest when `id` is empty.
+    pub fn rollout(&self, app: &str, id: &str) -> Result<Rollout, StoreError> {
+        self.with(|connection| {
+            let encoded: Option<String> = connection
+                .query_row(
+                    "SELECT spec FROM rollouts WHERE app = ?1 AND (?2 = '' OR id = ?2) \
+                     ORDER BY created DESC LIMIT 1",
+                    params![app, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            match encoded {
+                Some(encoded) => decode(&encoded),
+                None => Err(StoreError::NotFound(format!("rollout {app}/{id}"))),
+            }
+        })
+    }
+
+    /// The application's rollout that still shapes traffic, if any.
+    pub fn active_rollout(&self, app: &str) -> Result<Option<Rollout>, StoreError> {
+        Ok(self
+            .rollouts(Some(app))?
+            .into_iter()
+            .find(|rollout| rollout.state.is_active()))
+    }
+
+    /// Create or replace a rollout record.
+    pub fn put_rollout(&self, rollout: &Rollout) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(rollout).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO rollouts (app, id, spec, state, created) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(app, id) DO UPDATE SET spec = excluded.spec, \
+                 state = excluded.state, resource_version = resource_version + 1",
+                params![
+                    rollout.app,
+                    rollout.id,
+                    encoded,
+                    rollout.state.as_str(),
+                    rollout.created_unix_ms as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Section 7.4: the worker counts an operator pinned on a release's
+    /// groups, by group name.
+    pub fn scale_pins(&self, app: &str, release: &str) -> Result<Vec<(String, u32)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT grp, processes FROM scale_pins WHERE app = ?1 AND release = ?2 ORDER BY grp",
+            )?;
+            let rows = statement.query_map(params![app, release], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+            })?;
+            let mut pins = Vec::new();
+
+            for row in rows {
+                pins.push(row?);
+            }
+
+            Ok(pins)
+        })
+    }
+
+    /// Pin a group's worker count, replacing any earlier pin.
+    pub fn put_scale_pin(
+        &self,
+        app: &str,
+        release: &str,
+        group: &str,
+        processes: u32,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO scale_pins (app, release, grp, processes) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(app, release, grp) DO UPDATE SET processes = excluded.processes",
+                params![app, release, group, processes as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a group's pin, or every pin of the release when no group is
+    /// named.
+    pub fn remove_scale_pins(
+        &self,
+        app: &str,
+        release: &str,
+        group: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM scale_pins WHERE app = ?1 AND release = ?2 AND (?3 = '' OR grp = ?3)",
+                params![app, release, group.unwrap_or("")],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The next rollout id for an application: 1, 2, and so on.
+    pub fn next_rollout_id(&self, app: &str) -> Result<String, StoreError> {
+        self.with(|connection| {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM rollouts WHERE app = ?1",
+                [app],
+                |row| row.get(0),
+            )?;
+            Ok((count + 1).to_string())
         })
     }
 
@@ -583,6 +819,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::model::ScalingSpec;
     use muru_config::{Interface, Preload};
 
     fn spec() -> ReleaseSpec {
@@ -606,6 +843,15 @@ mod tests {
             timeouts: Default::default(),
             memory: Default::default(),
             env: Vec::new(),
+            scaling: ScalingSpec::default(),
+            accel_redirect: false,
+            cgi_local_redirect: false,
+            sendfile_roots: Vec::new(),
+            sendfile_header: None,
+            error_pages: Default::default(),
+            error_override: None,
+            maintenance: None,
+            http: None,
         }
     }
 

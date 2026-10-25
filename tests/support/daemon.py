@@ -65,9 +65,18 @@ class Daemon:
         else:
             where = ["--socket", str(self.run_dir / "admin.sock")]
 
+        # A command after -- belongs to the server a deploy runs, so the
+        # daemon's own options go before it.
+
+        if "--" in arguments:
+            split = arguments.index("--")
+            full = [*arguments[:split], *where, *arguments[split:]]
+        else:
+            full = [*arguments, *where]
+
         try:
             completed = subprocess.run(
-                [str(muructl), *arguments, *where],
+                [str(muructl), *full],
                 capture_output=True,
                 text=True,
                 check=False,

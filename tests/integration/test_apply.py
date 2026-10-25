@@ -258,7 +258,7 @@ def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_pa
     config = tmp_path / "shop.toml"
     config.write_text(
         release("shop", "r1", max_requests=250, max_lifetime="1h")
-        + "[app.shop.release.r1.timeouts]\nhard_timeout = '30s'\n"
+        + "[app.shop.release.r1.timeouts]\nsoft_timeout = '20s'\nhard_timeout = '30s'\n"
     )
     applied = apply(daemon, config)
     assert applied.returncode == 0, applied.stdout + applied.stderr
@@ -267,6 +267,7 @@ def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_pa
     written = exported["app"]["shop"]["release"]["r1"]
     assert written["max_requests"] == 250
     assert written["max_lifetime"] == "3600s"
+    assert written["timeouts"]["soft_timeout"] == "20s"
     assert written["timeouts"]["hard_timeout"] == "30s"
     assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
 

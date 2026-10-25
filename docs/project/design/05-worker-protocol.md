@@ -60,7 +60,7 @@ The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
 - **Abort:** a reason, for logs.
 
-- **Close:** a WebSocket close code (1000 when the application gave none) and reason. **FileHint:** offset and length within the attached descriptor. **Detach:** which side the request moved to. The last two are defined when their frames are implemented.
+- **Close:** a WebSocket close code (1000 when the application gave none) and reason. **FileHint:** offset and length within the attached descriptor; the END flag on the frame ends the body with the range, otherwise body frames follow it. **Detach:** which side the request moved to, defined when its frame is implemented.
 
 Phase 0 implements HELLO, REQUEST, BODY, RESPONSE, END and ABORT. The others are reserved so that kind numbers are fixed now.
 

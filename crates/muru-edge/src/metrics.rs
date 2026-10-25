@@ -109,6 +109,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests the edge has taken and not yet answered.",
     },
     Family {
+        name: "muru_auth_requests_total",
+        kind: Kind::Counter,
+        help: "Authentication sub-requests, by result: allowed, cached, denied or unavailable.",
+    },
+    Family {
         name: "muru_queue_depth",
         kind: Kind::Gauge,
         help: "Requests waiting for a worker slot.",
@@ -124,9 +129,29 @@ pub const FAMILIES: &[Family] = &[
         help: "Worker slots across the workers: threads, or the event loop's concurrency.",
     },
     Family {
+        name: "muru_upstream_health",
+        kind: Kind::Gauge,
+        help: "Whether an upstream address takes requests: 1 in service, 0 unhealthy or ejected.",
+    },
+    Family {
         name: "muru_workers_ready",
         kind: Kind::Gauge,
         help: "Workers listening for requests.",
+    },
+    Family {
+        name: "muru_workers_desired",
+        kind: Kind::Gauge,
+        help: "Workers the autoscaler is bringing each group to, by application, release and group.",
+    },
+    Family {
+        name: "muru_scaling_decisions_total",
+        kind: Kind::Counter,
+        help: "Autoscaler decisions, by application, release, group and direction.",
+    },
+    Family {
+        name: "muru_churn_reaps_total",
+        kind: Kind::Counter,
+        help: "Workers the autoscaler reaped in the last hour, by application, release and group.",
     },
     Family {
         name: "muru_worker_requests_total",
@@ -259,7 +284,25 @@ impl ReleaseKey {
     }
 }
 
-/// A release's three request histograms.
+/// The labels of a group's request histograms.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DurationKey {
+    app: String,
+    release: String,
+    group: String,
+}
+
+impl DurationKey {
+    fn labels(&self) -> Vec<(String, String)> {
+        vec![
+            ("app".to_owned(), self.app.clone()),
+            ("release".to_owned(), self.release.clone()),
+            ("group".to_owned(), self.group.clone()),
+        ]
+    }
+}
+
+/// A group's three request histograms.
 #[derive(Debug, Default, Clone)]
 struct Durations {
     queue: Histogram,
@@ -270,8 +313,10 @@ struct Durations {
 #[derive(Debug, Default)]
 struct Inner {
     requests: BTreeMap<RequestKey, u64>,
-    durations: BTreeMap<ReleaseKey, Durations>,
+    durations: BTreeMap<DurationKey, Durations>,
     in_flight: BTreeMap<ReleaseKey, i64>,
+    /// Authentication sub-requests by result (section 4.16).
+    auth: BTreeMap<String, u64>,
 }
 
 /// The request metrics of one edge, fed by the access log as each request
@@ -316,7 +361,11 @@ impl Metrics {
         *inner.requests.entry(key).or_default() += 1;
         let durations = inner
             .durations
-            .entry(release_key(&record.app, &record.release))
+            .entry(DurationKey {
+                app: record.app.clone(),
+                release: record.release.clone(),
+                group: record.group.clone(),
+            })
             .or_default();
         durations.total.observe(record.total);
 
@@ -324,6 +373,13 @@ impl Metrics {
             durations.queue.observe(record.queue);
             durations.application.observe(record.application);
         }
+    }
+
+    /// Count an authentication sub-request (section 4.16) by its result:
+    /// allowed, cached, denied or unavailable.
+    pub fn count_auth(&self, result: &str) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        *inner.auth.entry(result.to_owned()).or_default() += 1;
     }
 
     /// Every sample of the request metrics.
@@ -366,6 +422,14 @@ impl Metrics {
             });
         }
 
+        for (result, count) in &inner.auth {
+            samples.push(Sample {
+                name: "muru_auth_requests_total".to_owned(),
+                labels: vec![("result".to_owned(), result.clone())],
+                value: *count as f64,
+            });
+        }
+
         samples
     }
 }
@@ -384,6 +448,13 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
 
     for pools in routing.app_pools() {
         let (app, release) = pools.labels();
+
+        // A managed HTTP release (section 9.9) has instances, reported
+        // by their health below, and no slots.
+
+        if pools.server().is_some() {
+            continue;
+        }
 
         for (group, pool) in pools.pools() {
             let labels = [
@@ -408,6 +479,14 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
                 workers.iter().map(|worker| worker.slots).sum::<usize>() as f64,
             ));
         }
+    }
+
+    for upstream in routing.upstreams() {
+        samples.extend(upstream.samples());
+    }
+
+    for server in routing.servers() {
+        samples.extend(server.samples());
     }
 
     samples.push(Sample::new(
@@ -576,6 +655,7 @@ mod tests {
             queue: Duration::from_millis(1),
             application: Duration::from_millis(total_ms / 2),
             total: Duration::from_millis(total_ms),
+            redirects: Vec::new(),
         }
     }
 
@@ -614,7 +694,7 @@ mod tests {
         let text = render(&metrics.samples());
         let line = |phase: &str, le: &str| {
             format!(
-                "muru_request_duration_seconds_bucket{{app=\"shop\",release=\"r1\",phase=\"{phase}\",le=\"{le}\"}}"
+                "muru_request_duration_seconds_bucket{{app=\"shop\",release=\"r1\",group=\"default\",phase=\"{phase}\",le=\"{le}\"}}"
             )
         };
         assert!(
@@ -634,7 +714,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("muru_request_duration_seconds_count{app=\"shop\",release=\"r1\",phase=\"application\"} 2\n"),
+            text.contains("muru_request_duration_seconds_count{app=\"shop\",release=\"r1\",group=\"default\",phase=\"application\"} 2\n"),
             "{text}"
         );
 

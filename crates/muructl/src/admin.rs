@@ -260,6 +260,8 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         service_user,
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
+        error_pages: document.error_pages.clone(),
+        error_override: document.error_override.clone(),
         secrets,
         rotation: muru_controller::rotation::Policy::from_table(document.logs.as_ref())?,
         access_log,
@@ -360,37 +362,76 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     )
 }
 
+/// How long one exchange with a daemon that is being stopped may take
+/// before it counts as not answering.
+const STOP_EXCHANGE: Duration = Duration::from_secs(5);
+
+/// Ask the daemon at `path` for its status, within `bound`. None when
+/// there is no daemon there, it refused, or it did not answer in time.
+async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
+    let exchange = async {
+        let mut client = client::connect(path).await.ok()?;
+        client
+            .get_status(pb::GetStatusRequest {})
+            .await
+            .ok()
+            .map(|status| status.into_inner())
+    };
+
+    tokio::time::timeout(bound, exchange).await.ok().flatten()
+}
+
 /// Stop the daemon through its API and wait for its process to go.
+///
+/// Every exchange with the daemon is bounded, so a daemon that accepts a
+/// connection and then never answers, or one that lingers after it has
+/// logged its exit, cannot hold the command past `timeout`.
 pub async fn daemon_stop(
     socket: SocketArgs,
     shutdown: bool,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let path = socket.socket();
-    let mut client = client::connect(&path).await?;
-    let status = client
-        .get_status(pb::GetStatusRequest {})
-        .await?
+    let started = Instant::now();
+    let bound = timeout.min(STOP_EXCHANGE);
+    let connected = tokio::time::timeout(bound, client::connect(&path)).await;
+
+    let mut client = match connected {
+        Ok(client) => client?,
+        Err(_) => anyhow::bail!(
+            "the daemon at {} did not complete a connection within {} seconds",
+            path.display(),
+            bound.as_secs()
+        ),
+    };
+
+    let status = tokio::time::timeout(bound, client.get_status(pb::GetStatusRequest {}))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the daemon at {} did not answer within {} seconds",
+                path.display(),
+                bound.as_secs()
+            )
+        })??
         .into_inner();
 
-    // The daemon may close the connection as it exits; whether it did
-    // exit is checked below either way.
+    // The daemon may close the connection as it exits, or take its time
+    // answering; whether it did exit is checked below either way.
 
-    let _ = client
-        .shutdown(pb::ShutdownRequest { drain: shutdown })
-        .await;
+    let _ = tokio::time::timeout(
+        bound,
+        client.shutdown(pb::ShutdownRequest { drain: shutdown }),
+    )
+    .await;
 
     // The daemon removes its socket as it exits; a process that has exited
     // but not been reaped would still answer kill(0), so the socket is the
     // signal to wait for.
 
-    let started = Instant::now();
-
     while started.elapsed() < timeout {
-        let answering = match client::connect(&path).await {
-            Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.is_ok(),
-            Err(_) => false,
-        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let answering = status_within(&path, remaining.min(bound)).await.is_some();
 
         if !answering && (!path.exists() || !process_alive(status.pid)) {
             if shutdown {
@@ -404,7 +445,12 @@ pub async fn daemon_stop(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    anyhow::bail!("the daemon (pid {}) did not exit", status.pid)
+    anyhow::bail!(
+        "the daemon (pid {}) did not exit within {} seconds; see {}",
+        status.pid,
+        timeout.as_secs(),
+        socket.locations.resolve().daemon_log().display()
+    )
 }
 
 /// Re-execute the daemon from the installed binary and wait until it
@@ -433,11 +479,8 @@ pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Re
     let mut latest = None;
 
     while started.elapsed() < timeout {
-        let status = match client::connect(&path).await {
-            Ok(mut client) => client.get_status(pb::GetStatusRequest {}).await.ok(),
-            Err(_) => None,
-        }
-        .map(|status| status.into_inner());
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let status = status_within(&path, remaining.min(STOP_EXCHANGE)).await;
 
         if let Some(status) = status {
             if status.started_unix_ms != before.started_unix_ms
@@ -1105,6 +1148,11 @@ pub struct DeployArgs {
     #[arg(long)]
     no_wait: bool,
 
+    /// Start the release but leave traffic where it is, for a preview
+    /// with the Muru-Preview header or a rollout (section 9.2).
+    #[arg(long)]
+    hold: bool,
+
     /// How long the release this one replaces stays warm for an instant
     /// rollback (default 30m; 0 stops it as soon as it has drained).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -1118,9 +1166,10 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
 
-    /// A host timeout as NAME=DURATION: hard (replace a worker whose
-    /// request runs this long; off), hard_drain_grace (10s) or
-    /// shutdown (5s). Repeatable.
+    /// A host timeout as NAME=DURATION: soft (interrupt a request that
+    /// runs this long; off), hard (replace a worker whose request runs
+    /// this long; off), hard_drain_grace (10s) or shutdown (5s).
+    /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -1141,8 +1190,53 @@ pub struct DeployArgs {
     #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
     secrets: Vec<(String, String, String, bool)>,
 
+    /// Run an HTTP server of this profile instead of workers (section
+    /// 9.9): gunicorn, uvicorn, granian, mod_wsgi-express or generic,
+    /// with its command after `--`.
+    #[arg(long, value_name = "PROFILE")]
+    server: Option<muru_config::ServerProfile>,
+
+    /// How a managed server's instances bind: unix (the default) or port.
+    #[arg(long, value_name = "MODE")]
+    bind: Option<muru_config::ServerBind>,
+
+    /// How many instances of a managed server's command run (default 1).
+    #[arg(long, value_name = "N")]
+    instances: Option<u32>,
+
+    /// The path probed until a managed server's instance answers 2xx or
+    /// 3xx; any answer makes it ready without one.
+    #[arg(long, value_name = "PATH")]
+    readiness: Option<String>,
+
+    /// How long a managed server's instances get to be ready (default 60s).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    readiness_timeout: Option<Duration>,
+
+    /// The signal that stops a managed server's instance gracefully
+    /// (TERM, INT, QUIT, HUP, USR1, USR2 or WINCH); required by the
+    /// generic profile, the other profiles know their server's.
+    #[arg(long, value_name = "NAME")]
+    stop_signal: Option<String>,
+
+    /// A directory a path in an X-Muru-Sendfile response header must lie
+    /// in for the edge to serve the file; repeatable (default the table's).
+    #[arg(long = "sendfile-root", value_name = "DIR")]
+    sendfile_roots: Vec<String>,
+
+    /// A second response header honoured as X-Muru-Sendfile is, such as
+    /// X-Sendfile.
+    #[arg(long, value_name = "NAME")]
+    sendfile_header: Option<String>,
+
     #[command(flatten)]
     socket: SocketArgs,
+
+    /// The command of a managed server, after `--`, with `{bind}` where
+    /// it takes its address; without `{bind}` the profile adds the
+    /// server's own flags.
+    #[arg(last = true, value_name = "COMMAND")]
+    command: Vec<String>,
 }
 
 /// Parse NAME=VALUE for --env.
@@ -1345,9 +1439,9 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example hard=60s"))?;
     let name = name.trim();
 
-    if !["hard", "hard_drain_grace", "shutdown"].contains(&name) {
+    if !["soft", "hard", "hard_drain_grace", "shutdown"].contains(&name) {
         return Err(format!(
-            "{name:?} is not a host timeout name: hard, hard_drain_grace or shutdown"
+            "{name:?} is not a host timeout name: soft, hard, hard_drain_grace or shutdown"
         ));
     }
 
@@ -1376,11 +1470,32 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("{} does not exist", source.display()))?;
+
+    if args.server.is_none() && !args.command.is_empty() {
+        anyhow::bail!("a command after -- needs --server PROFILE");
+    }
+
     let mut client = client::connect(&args.socket.socket()).await?;
 
     let request = pb::DeployRequest {
         app: args.app.clone(),
         source: source.display().to_string(),
+        kind: args.server.map(|_| "http".to_owned()).unwrap_or_default(),
+        profile: args
+            .server
+            .map(|profile| profile.as_str().to_owned())
+            .unwrap_or_default(),
+        command: args.command.clone(),
+        bind: args
+            .bind
+            .map(|bind| bind.as_str().to_owned())
+            .unwrap_or_default(),
+        instances: args.instances,
+        readiness_path: args.readiness.unwrap_or_default(),
+        readiness_timeout_ms: args
+            .readiness_timeout
+            .map(|timeout| timeout.as_millis() as u64),
+        stop_signal: args.stop_signal.unwrap_or_default(),
         entrypoint: args.entrypoint.unwrap_or_default(),
         interface: args
             .interface
@@ -1403,11 +1518,17 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         factory_phase: String::new(),
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
+        hold: args.hold,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         max_requests: args.max_requests,
         max_lifetime_ms: args
             .max_lifetime
             .map(|lifetime| lifetime.as_millis() as u64),
+        soft_timeout_ms: timeout_ms(&args.timeouts, "soft"),
+        accel_redirect: None,
+        cgi_local_redirect: None,
+        sendfile_roots: args.sendfile_roots,
+        sendfile_header: args.sendfile_header,
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
@@ -1458,10 +1579,487 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             release.app,
             release.id,
             release.state,
-            if release.serving { " and serving" } else { "" }
+            if release.serving {
+                " and serving"
+            } else if args.hold {
+                " and held: not serving"
+            } else {
+                ""
+            }
         );
     }
     Ok(())
+}
+
+/// The rollout subcommands (section 9.3).
+#[derive(Subcommand)]
+pub enum RolloutCommand {
+    /// Shift the application's traffic to a release step by step, each
+    /// step judged by gates against the release that serves; the last
+    /// step passing promotes the release, a failing gate rolls back.
+    Canary {
+        /// The candidate, as app@release.
+        release: String,
+
+        /// The steps, as percentages of the application's requests.
+        #[arg(long, value_delimiter = ',', default_value = "10,50")]
+        steps: Vec<u32>,
+
+        /// How long each step holds before its gates decide.
+        #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = muru_config::parse_duration)]
+        hold: Duration,
+
+        /// The 5xx rate the candidate may not exceed, as a percentage.
+        #[arg(long = "max-error-rate", value_name = "PERCENT", default_value = "1")]
+        max_error_rate: f64,
+
+        /// The 95th percentile request time the candidate may not exceed.
+        #[arg(long = "max-p95", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        max_p95: Option<Duration>,
+
+        /// Requests the candidate must serve in a step before the gates
+        /// judge it.
+        #[arg(long = "min-requests", value_name = "COUNT", default_value = "100")]
+        min_requests: u64,
+
+        /// Wait for `rollout resume` before each step after the first.
+        #[arg(long)]
+        approve_each_step: bool,
+
+        /// Stay until the rollout is promoted or rolled back.
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Move all of the application's traffic to a release now and drain
+    /// the one that served (blue/green).
+    Bluegreen {
+        /// The release, as app@release.
+        release: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Show the rollouts, of one application or of all.
+    Status {
+        /// The application.
+        app: Option<String>,
+
+        /// Stay until the application's rollout is promoted or rolled
+        /// back.
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Hold the application's rollout at its current step.
+    Pause {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Continue a paused rollout, or approve its next step.
+    Resume {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Give the candidate all the traffic now and end the rollout.
+    Promote {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Take the candidate out of traffic now and end the rollout.
+    Abort {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// What `muructl scale` takes: a group's count to pin or release, or
+/// `scale status` for the autoscaler's state (sections 7.3 and 7.4).
+#[derive(Args, Clone)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct ScaleArgs {
+    #[command(subcommand)]
+    pub command: Option<ScaleCommand>,
+
+    /// The release as app@release, or an application for its serving
+    /// release.
+    #[arg(value_name = "APP[@RELEASE]", required = true)]
+    target: Option<String>,
+
+    /// The worker group.
+    #[arg(long, default_value = "default", value_name = "NAME")]
+    group: String,
+
+    /// Pin the group to this many workers; the autoscaler stands aside
+    /// until --unpin.
+    #[arg(long, value_name = "COUNT", conflicts_with = "unpin")]
+    processes: Option<u32>,
+
+    /// Let the autoscaler decide the group's count again.
+    #[arg(long)]
+    unpin: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// The `muructl scale` subcommands.
+#[derive(Subcommand, Clone)]
+pub enum ScaleCommand {
+    /// Show each worker group's policy, workers, signals, last decision
+    /// and churn.
+    Status {
+        /// The release as app@release, or an application for its serving
+        /// release.
+        #[arg(value_name = "APP[@RELEASE]")]
+        target: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Pin or release a group's count, or show the autoscaler's state.
+pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
+    if let Some(ScaleCommand::Status { target, socket }) = args.command {
+        let (app, release) = split_target(&target)?;
+        let mut client = client::connect(&socket.socket()).await?;
+        let status = client
+            .get_scale_status(pb::GetScaleStatusRequest {
+                app: app.to_owned(),
+                release: release.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+        print_scale_status(&status);
+        return Ok(());
+    }
+
+    let target = args.target.unwrap_or_default();
+    let (app, release) = split_target(&target)?;
+
+    if args.processes.is_none() && !args.unpin {
+        anyhow::bail!(
+            "give --processes COUNT to pin the group, or --unpin; `scale status` shows the state"
+        );
+    }
+
+    let mut client = client::connect(&args.socket.socket()).await?;
+    let status = client
+        .set_scale(pb::SetScaleRequest {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            group: args.group.clone(),
+            processes: args.processes,
+            unpin: args.unpin,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    match args.processes {
+        Some(count) => println!(
+            "muru: {}@{} {} pinned to {count} workers",
+            status.app, status.release, args.group
+        ),
+        None => println!(
+            "muru: {}@{} {} unpinned; the autoscaler decides again",
+            status.app, status.release, args.group
+        ),
+    }
+
+    Ok(())
+}
+
+/// An application, or app@release; an empty release means the serving one.
+fn split_target(text: &str) -> anyhow::Result<(&str, &str)> {
+    match text.split_once('@') {
+        Some((app, release)) if !app.is_empty() && !release.is_empty() => Ok((app, release)),
+        Some(_) => anyhow::bail!("{text:?} is not a release: expected app@release"),
+        None if text.is_empty() => anyhow::bail!("name an application or a release"),
+        None => Ok((text, "")),
+    }
+}
+
+/// The autoscaler's state, a row per group with its last decision below.
+fn print_scale_status(status: &pb::ScaleStatus) {
+    println!("{}@{}", status.app, status.release);
+    println!(
+        "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} POLICY",
+        "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE P95", "REAPS"
+    );
+
+    for group in &status.groups {
+        let workers = if group.pinned {
+            format!("{} pinned", group.desired)
+        } else if group.desired != group.ready {
+            format!("{} -> {}", group.ready, group.desired)
+        } else {
+            group.ready.to_string()
+        };
+
+        let reaps = if group.mode == "static" {
+            "-".to_owned()
+        } else if group.suspended {
+            format!("{}/{} halt", group.reaps_last_hour, group.churn_budget)
+        } else {
+            format!("{}/{}", group.reaps_last_hour, group.churn_budget)
+        };
+
+        let p95 = match group.queue_wait_p95_ms {
+            Some(ms) => format!("{ms:.0} ms"),
+            None => "-".to_owned(),
+        };
+
+        println!(
+            "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} {}",
+            group.group,
+            workers,
+            format!("{:.0}/{:.0}", group.slots_busy, group.slots_total),
+            format!("{:.1}", group.idle_workers),
+            p95,
+            reaps,
+            group.policy
+        );
+
+        if !group.last_decision.is_empty() {
+            println!(
+                "  last: {} ({} ago)",
+                group.last_decision,
+                muru_config::format_duration(Duration::from_secs(
+                    group.last_decision_age_ms / 1000
+                ))
+            );
+        }
+    }
+}
+
+/// Run a rollout subcommand.
+pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
+    match command {
+        RolloutCommand::Canary {
+            release,
+            steps,
+            hold,
+            max_error_rate,
+            max_p95,
+            min_requests,
+            approve_each_step,
+            wait,
+            socket,
+        } => {
+            let (app, id) = split_release(&release)?;
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .start_rollout(pb::StartRolloutRequest {
+                    app: app.to_owned(),
+                    release: id.to_owned(),
+                    steps: steps
+                        .iter()
+                        .map(|percent| pb::RolloutStep {
+                            percent: *percent,
+                            hold_ms: hold.as_millis() as u64,
+                        })
+                        .collect(),
+                    max_error_rate: max_error_rate / 100.0,
+                    max_p95_ms: max_p95.map_or(0, |p95| p95.as_millis() as u64),
+                    min_requests,
+                    approve_each_step,
+                })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} of {}@{} started against {}: {}",
+                rollout.id, rollout.app, rollout.candidate, rollout.baseline, rollout.message
+            );
+
+            if wait {
+                let finished = wait_rollout(&mut client, app, &rollout.id).await?;
+                println!(
+                    "muru: rollout {} {}: {}",
+                    finished.id, finished.state, finished.message
+                );
+            }
+
+            Ok(())
+        }
+        RolloutCommand::Bluegreen { release, socket } => {
+            let (app, id) = split_release(&release)?;
+            let mut client = client::connect(&socket.socket()).await?;
+            let release = client
+                .promote_release(pb::PromoteReleaseRequest {
+                    app: app.to_owned(),
+                    release: id.to_owned(),
+                })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: release {}@{} is {} and serving",
+                release.app, release.id, release.state
+            );
+            Ok(())
+        }
+        RolloutCommand::Status { app, wait, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+
+            if wait {
+                let Some(app) = app else {
+                    anyhow::bail!("--wait needs an application");
+                };
+                let finished = wait_rollout(&mut client, &app, "").await?;
+                println!(
+                    "muru: rollout {} {}: {}",
+                    finished.id, finished.state, finished.message
+                );
+                return Ok(());
+            }
+
+            let rollouts = client
+                .list_rollouts(pb::ListRolloutsRequest {
+                    app: app.unwrap_or_default(),
+                })
+                .await
+                .map_err(explain)?
+                .into_inner()
+                .rollouts;
+
+            if rollouts.is_empty() {
+                println!("no rollouts");
+                return Ok(());
+            }
+
+            println!(
+                "{:<16} {:<8} {:<12} {:<12} {:<18} {:<8} MESSAGE",
+                "APP", "ROLLOUT", "CANDIDATE", "BASELINE", "STATE", "TRAFFIC"
+            );
+
+            for rollout in rollouts {
+                println!(
+                    "{:<16} {:<8} {:<12} {:<12} {:<18} {:<8} {}",
+                    rollout.app,
+                    rollout.id,
+                    rollout.candidate,
+                    rollout.baseline,
+                    rollout.state,
+                    format!("{}%", rollout.percent),
+                    rollout.message
+                );
+            }
+
+            Ok(())
+        }
+        RolloutCommand::Pause { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .pause_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+        RolloutCommand::Resume { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .resume_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+        RolloutCommand::Promote { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .promote_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+        RolloutCommand::Abort { app, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let rollout = client
+                .abort_rollout(pb::RolloutControlRequest { app })
+                .await
+                .map_err(explain)?
+                .into_inner();
+            println!(
+                "muru: rollout {} {}: {}",
+                rollout.id, rollout.state, rollout.message
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Poll a rollout until it is promoted or rolled back, printing each
+/// change of step or state on the way.
+async fn wait_rollout(
+    client: &mut pb::admin_client::AdminClient<tonic::transport::Channel>,
+    app: &str,
+    id: &str,
+) -> anyhow::Result<pb::Rollout> {
+    let mut last = String::new();
+
+    loop {
+        let rollout = client
+            .get_rollout(pb::GetRolloutRequest {
+                app: app.to_owned(),
+                rollout: id.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if matches!(rollout.state.as_str(), "promoted" | "rolled_back") {
+            return Ok(rollout);
+        }
+
+        let line = format!("{} {}", rollout.state, rollout.message);
+
+        if line != last {
+            println!("muru: rollout {} {line}", rollout.id);
+            last = line;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// The application subcommands.
@@ -1499,7 +2097,7 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             format!("{}:{}", app.user, app.group)
         };
         println!(
-            "{:<20} {:<12} {:<12} {user}{}",
+            "{:<20} {:<12} {:<12} {user}{}{}",
             app.name,
             or_dash(&app.current_release),
             or_dash(&app.previous_release),
@@ -1507,8 +2105,62 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
                 String::new()
             } else {
                 format!(" umask {}", app.umask)
+            },
+            if app.maintenance {
+                " [maintenance]"
+            } else {
+                ""
             }
         );
+    }
+
+    Ok(())
+}
+
+/// The `muructl maintenance` subcommands (section 4.12).
+#[derive(Subcommand)]
+pub enum MaintenanceCommand {
+    /// Serve the application's maintenance page at the edge: 503
+    /// maintenance, except for what its exemptions let through.
+    On {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Serve the application as usual again.
+    Off {
+        /// The application.
+        app: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Turn maintenance mode on or off.
+pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
+    let (app, on, socket) = match command {
+        MaintenanceCommand::On { app, socket } => (app, true, socket),
+        MaintenanceCommand::Off { app, socket } => (app, false, socket),
+    };
+
+    let mut client = client::connect(&socket.socket()).await?;
+    let status = client
+        .set_maintenance(pb::SetMaintenanceRequest { app, on })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if status.on {
+        println!(
+            "muru: {} is in maintenance: clients get 503 maintenance until `muructl maintenance off {}`",
+            status.app, status.app
+        );
+    } else {
+        println!("muru: {} serves as usual again", status.app);
     }
 
     Ok(())
@@ -1566,6 +2218,57 @@ pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The upstream subcommands (section 4.13).
+#[derive(Subcommand)]
+pub enum UpstreamCommand {
+    /// List the HTTP upstreams.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// List HTTP upstreams.
+pub async fn upstream_list(socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let upstreams = client
+        .list_upstreams(pb::ListUpstreamsRequest {})
+        .await?
+        .into_inner()
+        .upstreams;
+
+    if upstreams.is_empty() {
+        println!("no upstreams");
+        return Ok(());
+    }
+
+    println!(
+        "{:<16} {:<8} {:<6} ADDRESSES",
+        "UPSTREAM", "PROTOCOL", "TLS"
+    );
+
+    for upstream in upstreams {
+        let mut addresses = upstream.addresses.join(", ");
+
+        if !upstream.health_path.is_empty() {
+            addresses.push_str(&format!(" [probing {}]", upstream.health_path));
+        }
+
+        if upstream.trust_muru_headers {
+            addresses.push_str(" [trusts X-Muru headers]");
+        }
+
+        println!(
+            "{:<16} {:<8} {:<6} {addresses}",
+            upstream.name,
+            upstream.protocol,
+            if upstream.tls { "yes" } else { "" }
+        );
+    }
+
+    Ok(())
+}
+
 /// The route subcommands.
 #[derive(Subcommand)]
 pub enum RouteCommand {
@@ -1593,13 +2296,63 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
     println!("{:<16} {:<24} TARGET", "HOST", "PATH");
 
     for route in routes {
-        let target = if route.static_dir.is_empty() {
+        // Section 4.13: an upstream as the target, or behind the files.
+
+        let mut target = if !route.upstream.is_empty() {
+            format!("upstream {}", route.upstream)
+        } else if route.static_dir.is_empty() {
             route.app
+        } else if !route.fallback_upstream.is_empty() {
+            format!(
+                "static {}, else upstream {}",
+                route.static_dir, route.fallback_upstream
+            )
         } else if route.fallback_app.is_empty() {
             format!("static {}", route.static_dir)
         } else {
             format!("static {}, else {}", route.static_dir, route.fallback_app)
         };
+
+        // Section 9.4: the policy, when the route has one.
+
+        if !route.traffic.is_empty() || route.sticky || !route.hash_key.is_empty() {
+            let mut parts: Vec<String> = route
+                .traffic
+                .iter()
+                .map(|share| format!("{} {}%", share.release, share.percent))
+                .collect();
+
+            if route.sticky {
+                parts.push("sticky".to_owned());
+            }
+
+            if !route.hash_key.is_empty() {
+                parts.push(format!("by {}", route.hash_key));
+            }
+
+            target = format!("{target} ({})", parts.join(", "));
+        }
+
+        // Section 4.10: reachable by internal redirect only, and from
+        // which other applications.
+
+        if route.internal {
+            target.push_str(" [internal]");
+        }
+
+        if !route.accept_redirects_from.is_empty() {
+            target.push_str(&format!(
+                " [redirects from {}]",
+                route.accept_redirects_from.join(", ")
+            ));
+        }
+
+        // Section 4.16: the handler asked before the route is served.
+
+        if !route.auth.is_empty() {
+            target.push_str(&format!(" [auth by {}]", route.auth));
+        }
+
         println!("{:<16} {:<24} {target}", route.host, route.path);
     }
 
@@ -1663,7 +2416,11 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
-            format!("{}x{}", release.processes, release.threads),
+            if release.kind == "http" {
+                format!("{} {}", release.instances, release.profile)
+            } else {
+                format!("{}x{}", release.processes, release.threads)
+            },
             release.source
         );
 

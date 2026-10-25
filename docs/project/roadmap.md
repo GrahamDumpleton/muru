@@ -13,7 +13,8 @@ criteria. The full table, with scope and exit criteria, is in
 | 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 2 complete, phase 3 next. Phase 0 landed the
+Current position: phase 3 in progress, its first half released as
+0.1.0a5. Phase 0 landed the
 framed worker link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a
 fixed pool of long-lived application threads and the benchmark harness.
 Phase 1, released as 0.1.0a2, is development mode for one WSGI application:
@@ -180,8 +181,7 @@ to an application or a file, never a hidden file, a path that climbs
 out, a symbolic link leaving the directory or a name that differs from
 the file's on disk, declared through apply and exported, and `muructl
 serve-static DIR` serves a directory with the same code (listings,
-release static files, file hints, internal redirects and the metadata
-cache later). Connection limits (section 4.18) have their first slice:
+release static files and the metadata cache later). Connection limits (section 4.18) have their first slice:
 `max_connections` per listener with a fast 503 edge_overloaded within
 the overload reserve and a close beyond it, `max_connections_per_client`
 by address (IPv6 by /64) applied first with trusted proxies exempt,
@@ -230,3 +230,168 @@ the next step on that path and is still to come. That completes the
 phase 2 scope: the exit runs passed in the virtual machine, deploys and
 rollbacks under sustained load and daemon and edge restarts and upgrades
 with no failed request, and 0.1.0a4 is the release.
+
+Phase 3 has started with traffic policies (section 9.4), which canaries
+and the rest of the phase's traffic management build on: a route's
+`traffic` table shares its requests between an application's releases by
+percentage, each client hashed to one of 10,000 buckets by an anonymous
+id cookie the edge issues, a header, a cookie or the client address, with
+a salt per route and the newest release's buckets at the top so a client
+stays in a growing share; `sticky` keeps a client on its release through
+a cookie, with a grace period during which a release leaving the route
+stays reachable by cookie alone before it drains; the `Muru-Preview`
+header or `muru_preview` cookie pins a release, including one at 0%; the
+daemon keeps every release a policy names running, drains one no policy
+names, and leaves a superseded release a policy still names in place;
+`muructl route list` shows the policy and a change records
+`traffic_policy.changed`. The host now tells the runtime library its
+application name and release id, so `muru.context()` reports them.
+Rollouts (sections 9.2 and 9.3) are in: `muructl deploy --hold` starts a
+release without traffic, reachable by preview; `muructl rollout canary`
+gives it a growing share of the application's requests step by step, the
+share applied on top of the routes' declared policies, each step judged
+every second once the candidate has served enough requests, on its 5xx
+rate and 95th percentile against the baseline over the same window, so a
+fault both releases share does not roll back; a failing gate rolls back
+at once and keeps the candidate warm, the last step passing promotes it,
+steps can wait for approval, and `rollout status`, `pause`, `resume`,
+`promote` and `abort` follow and control the rollout; `muructl rollout
+bluegreen` moves all traffic at once; every change is a `rollout.*`
+event, and a daemon restart continues a rollout with its current step
+starting afresh. Still to
+come in this part of the phase: A/B cohorts by header and cookie
+matches, per-route policies for one application, probe URL and worker
+crash gates, scheduled freezes, `config export --resolve-rollouts`, and
+rollouts for an application reached as the default with no route.
+
+The autoscaler (sections 7.2 to 7.4) followed: a `scaling` table on a
+release or a worker group gives the group a policy, spare mode keeping
+idle worker equivalents between `min_spare` and `max_spare` and target
+mode tracking slot utilization and the p95 queue wait; the daemon reads
+the edge's slot and queue gauges and the group's queue wait histogram
+each second, forks workers through a new `scale` operation on the host
+(workers enter routing once ready, and a drained worker leaves routing
+before it is told to stop) and reaps slowly, one per interval, after the
+scale-in window, never within the hold after growth, never below the
+floor, never a worker younger than its minimum lifetime, and never past
+the churn budget, which suspends scale-in and doubles the window when
+spent; every decision is a `scaling.decision` event with its reasons,
+`muructl scale status` shows the policy, workers, signals and churn,
+`muructl scale --processes` pins a group's count through daemon restarts
+and `--unpin` hands it back, and `advisory = true` reports without
+acting. The decision engine is a module with an injectable clock, driven
+through step, ramp, sawtooth, bursty and budget scenarios in unit tests.
+Still to come: scheduled capacity, the node budget manager across
+applications, the worker CPU, GIL wait and loop lag signals with the
+diagnosis table, scale to zero, and the floor divided by traffic share
+during canaries.
+
+The soft timeout (section 7.6) is in: `soft_timeout` in the `timeouts`
+table or `--timeout soft=` starts a watchdog thread in each worker that
+raises `muru.RequestTimeout` in the thread of a WSGI request past the
+timeout, waking a thread blocked in the bridge for the request body or
+for room in the response, and cancels the task of an ASGI request; the
+bridge logs the traceback and answers 504 `soft_timeout` unless the
+application catches the exception and answers for itself, an injection
+the request outruns is withdrawn before its thread serves again, and
+streaming responses and WebSockets are exempt from the soft and the hard
+timeout once their head goes out. The hard timeout must exceed the soft
+one by 5 s, checked on `muructl run`, `deploy` and `apply`. Still to
+come: the loop stall timeout, the host's stack capture attached to the
+event when a request passes the soft timeout (section 11.7), and
+`muru.deadline` in the environ.
+
+Internal redirects (section 4.10) are in: an application's response with
+`X-Muru-Redirect` (always), `X-Accel-Redirect` or a CGI local redirect
+(where the release or mount opts in) is drained and the request routed
+afresh as a GET (HEAD stays HEAD) with the client's headers, or with its
+method and buffered body when `X-Muru-Redirect-Method: preserve` asks;
+`X-Muru-Redirect-Host` picks another host and `X-Muru-Redirect-Header-*`
+adds trusted headers; a redirect back into the same application is
+pinned to the release that redirected, another application's route takes
+it only when `accept_redirects_from` names the redirecting application,
+and routes and mounts marked `internal` answer 404 to clients; the
+target sees REDIRECT_URL, REDIRECT_QUERY_STRING and REDIRECT_STATUS (in
+the ASGI scope's muru extension too) and `muru.is_internal()`; the
+redirecting response's Content-Disposition, Cache-Control, Expires,
+Set-Cookie, Vary and non-empty Content-Type carry over; a chain stops
+after 5 hops with 500 redirect_loop under the client's deadline, with
+one access log line naming every hop; and a client's X-Muru-* request
+headers are stripped at the edge. Still to come: upload offloading.
+
+File hints (sections 4.9, 5.7 and 6.5) are in, in both forms. By
+descriptor: a `wsgi.file_wrapper` object returned as the iterable with
+a regular file behind it, and the ASGI `pathsend` and `zerocopysend`
+extensions advertised in the scope, pass a duplicate of the descriptor
+on a FILE frame with an offset and length, and the edge sends the range
+while the application's file is already closed. By path: an
+`X-Muru-Sendfile` header, or the second header a release's, mount's or
+upstream's `sendfile_header` names, makes the edge serve a file inside
+`sendfile_roots`, checked by canonical path, with static-file
+behaviour and the application's status and headers around it; a path
+outside is 500 sendfile_refused and logged, a missing one 404
+sendfile_missing. Trusted upstreams and managed servers give path hints
+too, and `muructl deploy --sendfile-root` and `--sendfile-header`,
+`apply` and `config export` know the keys.
+
+Custom error pages and maintenance mode (section 4.12) are in: pages by
+status or status:reason at the route, release, host and node levels, as
+a file read when the snapshot is compiled, a template the edge renders
+with the status, title, reason, description, request id, Retry-After,
+host and path, or an application path the edge asks for the page as an
+internal sub-request (2 s, never for a capacity failure of the same
+application, never recursing, the error's own status and headers kept);
+`error_override` with `when` = all, empty_body, not_json or html_only
+and the `X-Muru-Error-Override: off` opt-out; `muructl maintenance on`
+and `off` over SetMaintenance, serving 503 maintenance at the edge with
+exemptions by path, address and bypass cookie, recorded in the store,
+announced as `maintenance.changed` and marked in `muructl app list`; and
+`muru.error_reason` for handlers. Still to come: the dashboard's
+maintenance control.
+
+Authentication sub-requests (section 4.16) are in: a route's `auth`
+table names an application path the edge asks, with a bodiless GET
+carrying the client's headers, before it serves the route, be it an
+application, a static directory or a WebSocket upgrade; 2xx allows the
+request and adds the `copy_headers` of the answer to it as trusted
+headers, 401, 403 and redirects go back to the client as the handler
+answered, and anything else, a failure, an internal redirect or a
+timeout is 503 `auth_unavailable`; the handler sees
+`muru.auth_request` and the original method, URI and host (as
+`X-Original-*` headers too); allowing decisions can be cached for a
+`ttl` by listed cookies and headers; `muru_auth_requests_total` counts
+decisions by result, and `muructl route list` shows the handler.
+
+HTTP upstreams (section 4.13) are in: an `[upstream.NAME]` table names
+an unmanaged HTTP server by `host:port` or `unix:/path` addresses, over
+`http1`, `h2c` or `h2` with TLS (`ca`, `server_name`, `verify`), that a
+route, a static route's `fallback`, a traffic share named
+`upstream:NAME` or an authentication sub-request can target; requests
+are re-serialised with forwarding headers and re-framed bodies (ADR
+0027 on messages with both Content-Length and Transfer-Encoding),
+addresses take requests in turn with a request that was never sent
+moving to the next, failed requests eject an address for a growing
+period and a `health` table probes a path; `muru_upstream_health`
+reports each address, `trust_muru_headers` lets an upstream redirect
+internally, WebSockets are relayed to `http1` upstreams, and `muructl
+upstream list`, `route list`, `apply` and `config export` know the
+tables, and a trusted upstream's `X-Muru-Sendfile` is served within its
+`sendfile_roots`.
+
+Managed HTTP server releases (section 9.9) are in: a release with
+`kind = 'http'` runs a `command` such as the gunicorn, uvicorn, Granian
+or mod_wsgi-express an existing deployment already uses (or any server,
+with the `generic` profile and a `stop_signal`), in `cwd`, as one or
+more instances each bound to a Unix socket or a loopback port the daemon
+allocates and substitutes for `{bind}` or passes through the profile's
+own flags; the daemon waits for a readiness probe, starts an instance
+again when it exits with a doubling backoff, stops the instances with
+the profile's signal and SIGKILL after the grace period, and re-adopts
+them after a detach or an upgrade; the edge routes to the release as an
+upstream named after it, so traffic policies, canaries, previews, sticky
+sessions, drains, warm retention and rollbacks work between it and native
+releases of the same application, which is the cutover the phase's exit
+criterion asks for; `muructl deploy --server`, the release tables of
+`apply` and `config export`, `release list`, the release log and
+`muru_upstream_health` know them. Still to come: instance autoscaling
+and socket activation (section 20.1).
