@@ -940,9 +940,13 @@ pub struct Route {
     #[serde(default = "root_path")]
     pub path: String,
     /// The application whose serving release takes the requests; empty
-    /// for a static route.
+    /// for a static or upstream route.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app: String,
+    /// The HTTP upstream (section 4.13) that takes the requests, instead
+    /// of an application.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream: String,
     /// The directory served by the edge (section 4.9), instead of an
     /// application.
     #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
@@ -998,8 +1002,13 @@ pub struct Route {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
-    /// The application that decides.
+    /// The application that decides; empty when an upstream does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app: String,
+    /// The HTTP upstream (section 4.13) that decides, instead of an
+    /// application.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upstream: String,
     /// The path asked, usually of an internal mount or route.
     pub path: String,
     /// How long the handler has, queueing included, for example 2s (the
@@ -1065,6 +1074,9 @@ pub struct Fallback {
     /// The application that takes requests no file answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// The HTTP upstream (section 4.13) that takes them instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
     /// The file served for paths with no file of their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
@@ -1256,8 +1268,12 @@ pub fn check_error_override(table: &ErrorOverride) -> Result<(), String> {
 /// Check a route's `auth` table: the application and path, the timeout,
 /// the header names and the cache.
 pub fn check_auth(table: &Auth) -> Result<(), String> {
-    if table.app.is_empty() {
+    if table.app.is_empty() && table.upstream.is_empty() {
         return Err("auth: app names no application".to_owned());
+    }
+
+    if !table.app.is_empty() && !table.upstream.is_empty() {
+        return Err("auth: names both an application and an upstream".to_owned());
     }
 
     if !table.path.starts_with('/') {
@@ -1358,6 +1374,193 @@ pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
     Ok(())
 }
 
+/// An HTTP upstream (section 4.13), one of the `[upstream.NAME]` tables:
+/// an unmanaged HTTP server that routes, fallbacks, traffic shares and
+/// authentication sub-requests can target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upstream {
+    /// Where the server listens: `host:port` entries, or `unix:/path`
+    /// for a Unix socket. Requests take the addresses in turn, and one
+    /// that fails is set aside for a while.
+    pub addresses: Vec<String>,
+    /// `http1` (the default), `h2c` (HTTP/2 in the clear, by prior
+    /// knowledge) or `h2` (HTTP/2 over TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Connect with TLS; `h2` implies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<UpstreamTls>,
+    /// Active health checks and passive ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<UpstreamHealth>,
+    /// Honour X-Muru-Redirect from the upstream, as from an application
+    /// (default false): its X-Muru-* response headers are otherwise
+    /// removed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_muru_headers: bool,
+    /// How long a connection may take to open, for example 5s (the
+    /// default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<String>,
+}
+
+/// How an upstream's TLS connections are made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTls {
+    /// A PEM file of the certificates trusted, by absolute path; the
+    /// public roots without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// The name the certificate must carry, sent as SNI; the address's
+    /// host without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// Check the certificate (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
+}
+
+/// An upstream's health checks (section 4.13): probes of each address,
+/// and the ejection of one whose requests fail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamHealth {
+    /// The path probed with a GET, healthy on 2xx or 3xx; without it a
+    /// connection that opens is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How often each address is probed, for example 10s (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    /// How long a probe may take, for example 2s (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Failed probes in a row before an address is unhealthy (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unhealthy_after: Option<u32>,
+    /// Successful probes in a row before it is healthy again (default 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthy_after: Option<u32>,
+    /// Failed requests in a row before an address is ejected (default
+    /// 3); 0 never ejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eject_after: Option<u32>,
+    /// How long an ejected address is left out before a request tries it
+    /// again, for example 30s (the default); doubled each time the trial
+    /// fails, up to ten times as long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eject_for: Option<String>,
+}
+
+/// An upstream address as written: `host:port`, or `unix:/path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAddress {
+    /// A TCP address, by host name or IP address and port.
+    Tcp(String, u16),
+    /// A Unix socket, by absolute path.
+    Unix(PathBuf),
+}
+
+/// Parse an upstream address.
+pub fn parse_upstream_address(text: &str) -> Result<UpstreamAddress, String> {
+    if let Some(path) = text.strip_prefix("unix:") {
+        if !path.starts_with('/') {
+            return Err(format!("{text:?}: a Unix socket path must be absolute"));
+        }
+
+        return Ok(UpstreamAddress::Unix(PathBuf::from(path)));
+    }
+
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{text:?} is not host:port or unix:/path"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("{text:?}: the port must be a number from 1 to 65535"))?;
+
+    if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
+        return Err(format!("{text:?}: the host must be a name or an address"));
+    }
+
+    Ok(UpstreamAddress::Tcp(host.to_owned(), port))
+}
+
+/// The protocols an upstream speaks.
+pub const UPSTREAM_PROTOCOLS: [&str; 3] = ["http1", "h2c", "h2"];
+
+/// Check an `[upstream.NAME]` table: the addresses, the protocol, the
+/// TLS and health settings and the durations. Whether the CA file is
+/// readable is for the daemon to check.
+pub fn check_upstream(table: &Upstream) -> Result<(), String> {
+    if table.addresses.is_empty() {
+        return Err("addresses names nowhere".to_owned());
+    }
+
+    for address in &table.addresses {
+        parse_upstream_address(address).map_err(|error| format!("addresses: {error}"))?;
+    }
+
+    let protocol = table.protocol.as_deref().unwrap_or("http1");
+
+    if !UPSTREAM_PROTOCOLS.contains(&protocol) {
+        return Err(format!(
+            "protocol must be http1, h2c or h2, not {protocol:?}"
+        ));
+    }
+
+    if protocol == "h2c" && table.tls.is_some() {
+        return Err("h2c is HTTP/2 in the clear; use h2 with tls".to_owned());
+    }
+
+    if let Some(ca) = table.tls.as_ref().and_then(|tls| tls.ca.as_deref())
+        && !ca.starts_with('/')
+    {
+        return Err(format!("tls.ca: {ca:?} must be an absolute path"));
+    }
+
+    if let Some(text) = &table.connect_timeout
+        && let Err(error) = parse_duration(text)
+    {
+        return Err(format!("connect_timeout: {error}"));
+    }
+
+    if let Some(health) = &table.health {
+        if let Some(path) = &health.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("health.path {path:?} must start with /"));
+        }
+
+        for (name, text) in [
+            ("interval", &health.interval),
+            ("timeout", &health.timeout),
+            ("eject_for", &health.eject_for),
+        ] {
+            if let Some(text) = text
+                && let Err(error) = parse_duration(text)
+            {
+                return Err(format!("health.{name}: {error}"));
+            }
+        }
+
+        for (name, count) in [
+            ("unhealthy_after", health.unhealthy_after),
+            ("healthy_after", health.healthy_after),
+        ] {
+            if count == Some(0) {
+                return Err(format!("health.{name} must be at least 1"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// An application's table and its releases.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1438,6 +1641,9 @@ pub struct Document {
     /// Routes, in the order written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<Route>,
+    /// HTTP upstreams by name (section 4.13).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstream: BTreeMap<String, Upstream>,
     /// Applications by name.
     #[serde(default)]
     pub app: BTreeMap<String, App>,
@@ -1493,6 +1699,14 @@ impl Document {
             }
 
             self.host.insert(name, host);
+        }
+
+        for (name, upstream) in other.upstream {
+            if self.upstream.contains_key(&name) {
+                return Err(format!("upstream {name} is declared twice"));
+            }
+
+            self.upstream.insert(name, upstream);
         }
 
         for (name, app) in other.app {
@@ -1782,6 +1996,7 @@ mod tests {
             host: "shop".to_owned(),
             path: "/".to_owned(),
             app: "shop".to_owned(),
+            upstream: String::new(),
             static_dir: None,
             index: Vec::new(),
             fallback: None,
@@ -1885,6 +2100,39 @@ mod tests {
         let error = Document::parse("[[events.sink]]\nname = 'ops'\nurl = 'x'\nkind = 'pigeon'\n")
             .unwrap_err();
         assert!(error.contains("pigeon"), "{error}");
+    }
+
+    #[test]
+    fn upstream_tables_are_checked() {
+        let document = Document::parse(
+            "[upstream.legacy]\naddresses = ['127.0.0.1:8080', 'unix:/run/legacy.sock']\nprotocol = 'h2c'\nhealth = { path = '/healthz', interval = '5s' }\n",
+        )
+        .unwrap();
+        let legacy = &document.upstream["legacy"];
+        assert_eq!(check_upstream(legacy), Ok(()));
+        assert_eq!(
+            parse_upstream_address("unix:/run/legacy.sock"),
+            Ok(UpstreamAddress::Unix(PathBuf::from("/run/legacy.sock")))
+        );
+        assert_eq!(
+            parse_upstream_address("[::1]:8080"),
+            Ok(UpstreamAddress::Tcp("::1".to_owned(), 8080))
+        );
+        let refused = |text: &str| check_upstream(&toml::from_str(text).unwrap()).unwrap_err();
+        assert!(refused("addresses = []").contains("nowhere"));
+        assert!(refused("addresses = ['nowhere']").contains("host:port"));
+        assert!(refused("addresses = ['unix:relative']").contains("absolute"));
+        assert!(refused("addresses = ['a:0']").contains("port"));
+        assert!(refused("addresses = ['a:1']\nprotocol = 'spdy'").contains("http1, h2c or h2"));
+        assert!(refused("addresses = ['a:1']\nprotocol = 'h2c'\ntls = {}").contains("h2 with tls"));
+        assert!(refused("addresses = ['a:1']\ntls = { ca = 'ca.pem' }").contains("absolute"));
+        assert!(refused("addresses = ['a:1']\nhealth = { path = 'x' }").contains("start with /"));
+        assert!(
+            refused("addresses = ['a:1']\nhealth = { unhealthy_after = 0 }").contains("at least 1")
+        );
+        assert!(
+            refused("addresses = ['a:1']\nconnect_timeout = 'soon'").contains("connect_timeout")
+        );
     }
 
     #[test]

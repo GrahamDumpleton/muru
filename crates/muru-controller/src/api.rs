@@ -788,6 +788,29 @@ impl Admin for Service {
         }))
     }
 
+    async fn list_upstreams(
+        &self,
+        _: Request<pb::ListUpstreamsRequest>,
+    ) -> Result<Response<pb::ListUpstreamsResponse>, Status> {
+        let upstreams = self.handle.store.upstreams().map_err(internal)?;
+        Ok(Response::new(pb::ListUpstreamsResponse {
+            upstreams: upstreams
+                .into_iter()
+                .map(|(name, upstream)| pb::Upstream {
+                    name,
+                    addresses: upstream.addresses,
+                    protocol: upstream.protocol.unwrap_or_else(|| "http1".to_owned()),
+                    tls: upstream.tls.is_some(),
+                    health_path: upstream
+                        .health
+                        .and_then(|health| health.path)
+                        .unwrap_or_default(),
+                    trust_muru_headers: upstream.trust_muru_headers,
+                })
+                .collect(),
+        }))
+    }
+
     async fn list_routes(
         &self,
         _: Request<pb::ListRoutesRequest>,
@@ -826,15 +849,21 @@ impl Admin for Service {
                     auth: route
                         .auth
                         .as_ref()
-                        .map(|auth| format!("{} {}", auth.app, auth.path))
+                        .map(|auth| format!("{} {}", config::auth_handler(auth), auth.path))
                         .unwrap_or_default(),
                     host: route.host,
                     path: route.path,
                     app: route.app,
+                    upstream: route.upstream,
                     static_dir: route.static_dir.unwrap_or_default(),
                     fallback_app: route
                         .fallback
-                        .and_then(|fallback| fallback.app)
+                        .as_ref()
+                        .and_then(|fallback| fallback.app.clone())
+                        .unwrap_or_default(),
+                    fallback_upstream: route
+                        .fallback
+                        .and_then(|fallback| fallback.upstream)
                         .unwrap_or_default(),
                 })
                 .collect(),
@@ -999,6 +1028,18 @@ impl Service {
             }
             Action::RemoveRoute { host, path } => store
                 .delete_route(host, path)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutUpstream {
+                name,
+                upstream,
+                new,
+            } => store
+                .put_upstream(name, upstream)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveUpstream { name } => store
+                .delete_upstream(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
         };

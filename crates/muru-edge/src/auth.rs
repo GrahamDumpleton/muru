@@ -50,8 +50,10 @@ pub static X_ORIGINAL_HOST: HeaderName = HeaderName::from_static("x-original-hos
 /// A route's compiled check.
 #[derive(Debug)]
 pub struct Auth {
-    /// The application asked.
+    /// The application asked; empty when an upstream is.
     pub app: String,
+    /// The upstream asked (section 4.13), instead of an application.
+    pub upstream: String,
     /// The path asked.
     pub path: String,
     /// The handler's budget, queueing included.
@@ -100,7 +102,8 @@ pub enum Outcome {
 impl Auth {
     /// Compile a route's check from the snapshot.
     pub fn from_message(message: &pb::Auth) -> Result<Self, String> {
-        if message.app.is_empty() || !message.path.starts_with('/') {
+        if (message.app.is_empty() && message.upstream.is_empty()) || !message.path.starts_with('/')
+        {
             return Err("auth: an application and a path starting with / are needed".to_owned());
         }
 
@@ -145,6 +148,7 @@ impl Auth {
 
         Ok(Self {
             app: message.app.clone(),
+            upstream: message.upstream.clone(),
             path: message.path.clone(),
             timeout: if message.timeout_ms == 0 {
                 DEFAULT_TIMEOUT
@@ -275,10 +279,14 @@ pub async fn check(auth: &Auth, check: Check<'_>) -> Outcome {
         };
     }
 
-    let Some(selection) = check
-        .routing
-        .select_app(&auth.app, &auth.path, check.client)
-    else {
+    let selection = if auth.upstream.is_empty() {
+        check
+            .routing
+            .select_app(&auth.app, &auth.path, check.client)
+    } else {
+        check.routing.select_upstream(&auth.upstream)
+    };
+    let Some(selection) = selection else {
         return Outcome::Unavailable(format!("{}: the path's mount is not reachable", auth.path));
     };
 
@@ -345,11 +353,12 @@ pub async fn check(auth: &Auth, check: Check<'_>) -> Outcome {
     context.mount = selection.mount;
     context.mount_path = selection.script_name;
 
-    let handled = link::handle(
+    let handled = crate::dispatch(
         &mut sub,
         None,
         None,
         selection.pool,
+        selection.upstream,
         &context,
         RedirectFlags::default(),
     )
@@ -477,6 +486,7 @@ mod tests {
             copy_headers: vec!["X-Auth-User".to_owned()],
             cache_ttl_ms,
             cache_key: cache_key.iter().map(|key| (*key).to_owned()).collect(),
+            upstream: String::new(),
         })
         .expect("a valid check")
     }

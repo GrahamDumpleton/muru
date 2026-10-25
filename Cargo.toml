@@ -70,6 +70,7 @@ time = "0.3"
 toml = "1.1"
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal", "process", "fs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "channel", "router"] }

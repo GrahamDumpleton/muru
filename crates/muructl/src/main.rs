@@ -83,6 +83,12 @@ enum Command {
         command: admin::RouteCommand,
     },
 
+    /// Manage HTTP upstreams.
+    Upstream {
+        #[command(subcommand)]
+        command: admin::UpstreamCommand,
+    },
+
     /// Restore traffic to an application's previous release.
     Rollback {
         /// The application.
@@ -718,6 +724,9 @@ fn main() -> anyhow::Result<()> {
         Command::Route {
             command: admin::RouteCommand::List { socket },
         } => runtime.block_on(admin::route_list(socket)),
+        Command::Upstream {
+            command: admin::UpstreamCommand::List { socket },
+        } => runtime.block_on(admin::upstream_list(socket)),
         Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),

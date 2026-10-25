@@ -39,6 +39,33 @@ message Snapshot {
   Compression compression = 7;          // section 4.17; the defaults when absent
   repeated ErrorPage error_pages = 8;   // section 4.12: the node-wide pages
   ErrorOverride error_override = 9;     // the node-wide override; off when absent
+  repeated Upstream upstreams = 10;     // section 4.13: the HTTP upstreams routes may name
+}
+
+// Section 4.13: an unmanaged HTTP server that routes, fallbacks, traffic
+// shares and authentication sub-requests can target.
+message Upstream {
+  string name = 1;
+  repeated string addresses = 2;        // host:port, or unix:/path
+  string protocol = 3;                  // http1, h2c or h2; http1 when empty
+  bool tls = 4;                         // connect with TLS (always for h2)
+  string tls_ca_pem = 5;                // the certificates trusted; the public roots when empty
+  string tls_server_name = 6;           // the name checked and sent as SNI; the address's host when empty
+  bool tls_insecure = 7;                // the certificate is not checked
+  bool trust_muru_headers = 8;          // X-Muru-Redirect from the upstream is honoured
+  uint64 connect_timeout_ms = 9;        // 5000 when 0
+  UpstreamProbe probe = 10;             // active health checks; none when absent
+  uint32 eject_after = 11;              // failed requests in a row before an address is set aside; never when 0
+  uint64 eject_for_ms = 12;             // how long it is set aside; 30000 when 0
+}
+
+// How an upstream's addresses are probed.
+message UpstreamProbe {
+  string path = 1;                      // GET this, healthy on 2xx or 3xx; a connection that opens when empty
+  uint64 interval_ms = 2;               // 10000 when 0
+  uint64 timeout_ms = 3;                // 2000 when 0
+  uint32 unhealthy_after = 4;           // failed probes in a row; 3 when 0
+  uint32 healthy_after = 5;             // successful probes in a row; 2 when 0
 }
 
 // Section 4.12: a custom error page for a status, or for a status and
@@ -123,17 +150,20 @@ message Route {
   repeated ErrorPage error_pages = 16;  // section 4.12: the route's pages
   ErrorOverride error_override = 17;
   Auth auth = 18;                       // section 4.16: the decision asked for before the route is served
+  string upstream = 19;                 // section 4.13: the upstream that takes the requests, instead of an application
+  string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
 }
 
 // A route's authentication sub-request (section 4.16): a bodiless GET to
 // an application path, which allows the request with 2xx.
 message Auth {
-  string app = 1;                       // the application asked
+  string app = 1;                       // the application asked; empty when an upstream is
   string path = 2;                      // the path asked
   uint64 timeout_ms = 3;                // the handler's budget, queueing included; 2000 when 0
   repeated string copy_headers = 4;     // headers of an allowing answer added to the request
   uint64 cache_ttl_ms = 5;              // how long an allowing decision is remembered; not at all when 0
   repeated string cache_key = 6;        // cookie:NAME and header:NAME entries the decision is keyed by
+  string upstream = 7;                  // the upstream asked, instead of an application (section 4.13)
 }
 
 // A route's traffic policy (section 9.4). Buckets run from 0 to 9999;
@@ -148,8 +178,9 @@ message Traffic {
 }
 
 message Share {
-  string release = 1;
+  string release = 1;                   // the release, or empty for an upstream's share
   uint32 weight = 2;                    // buckets of the 10000
+  string upstream = 3;                  // section 4.13: the upstream that takes the share
 }
 
 // The worker sockets of one release of an application: the default

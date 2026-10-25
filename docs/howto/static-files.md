@@ -27,7 +27,7 @@ cache = { max_age = '1y', immutable = true }
 | --- | --- | --- |
 | `static` | | the directory served |
 | `index` | `['index.html']` | the files tried, in order, when a directory is requested |
-| `fallback` | none | `{ app = 'name' }` sends what no file answers to the application; `{ file = 'index.html' }` serves that file instead, for a single-page application |
+| `fallback` | none | `{ app = 'name' }` sends what no file answers to the application, `{ upstream = 'name' }` to an [HTTP upstream](upstreams.md); `{ file = 'index.html' }` serves that file instead, for a single-page application |
 | `cache` | none | `max_age` (for example `1y` or `1h`), `immutable`, and `except`, patterns of files that get `no-cache` instead |
 | `redirect_slash` | `true` | redirect a directory asked for without a trailing slash (301) to the slash form, so relative links resolve |
 | `case` | `strict` | `insensitive` accepts names that differ from the file's on disk in case |

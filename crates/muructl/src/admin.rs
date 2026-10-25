@@ -2150,6 +2150,57 @@ pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The upstream subcommands (section 4.13).
+#[derive(Subcommand)]
+pub enum UpstreamCommand {
+    /// List the HTTP upstreams.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// List HTTP upstreams.
+pub async fn upstream_list(socket: SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let upstreams = client
+        .list_upstreams(pb::ListUpstreamsRequest {})
+        .await?
+        .into_inner()
+        .upstreams;
+
+    if upstreams.is_empty() {
+        println!("no upstreams");
+        return Ok(());
+    }
+
+    println!(
+        "{:<16} {:<8} {:<6} ADDRESSES",
+        "UPSTREAM", "PROTOCOL", "TLS"
+    );
+
+    for upstream in upstreams {
+        let mut addresses = upstream.addresses.join(", ");
+
+        if !upstream.health_path.is_empty() {
+            addresses.push_str(&format!(" [probing {}]", upstream.health_path));
+        }
+
+        if upstream.trust_muru_headers {
+            addresses.push_str(" [trusts X-Muru headers]");
+        }
+
+        println!(
+            "{:<16} {:<8} {:<6} {addresses}",
+            upstream.name,
+            upstream.protocol,
+            if upstream.tls { "yes" } else { "" }
+        );
+    }
+
+    Ok(())
+}
+
 /// The route subcommands.
 #[derive(Subcommand)]
 pub enum RouteCommand {
@@ -2177,8 +2228,17 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
     println!("{:<16} {:<24} TARGET", "HOST", "PATH");
 
     for route in routes {
-        let mut target = if route.static_dir.is_empty() {
+        // Section 4.13: an upstream as the target, or behind the files.
+
+        let mut target = if !route.upstream.is_empty() {
+            format!("upstream {}", route.upstream)
+        } else if route.static_dir.is_empty() {
             route.app
+        } else if !route.fallback_upstream.is_empty() {
+            format!(
+                "static {}, else upstream {}",
+                route.static_dir, route.fallback_upstream
+            )
         } else if route.fallback_app.is_empty() {
             format!("static {}", route.static_dir)
         } else {

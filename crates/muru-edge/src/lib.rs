@@ -40,6 +40,7 @@ pub mod proxy;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
+pub mod upstream;
 pub mod websocket;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -923,11 +924,12 @@ async fn serve<I>(
                             context.group = selection.group;
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
-                            link::handle(
+                            dispatch(
                                 &mut parts,
                                 body.take(),
                                 buffered.take(),
                                 selection.pool,
+                                selection.upstream,
                                 &context,
                                 selection.redirects,
                             )
@@ -1034,11 +1036,12 @@ async fn serve<I>(
                                 context.group = selection.group.clone();
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
-                                link::handle(
+                                dispatch(
                                     &mut parts,
                                     body.take(),
                                     buffered.take(),
                                     selection.pool,
+                                    selection.upstream,
                                     &context,
                                     selection.redirects,
                                 )
@@ -1310,6 +1313,24 @@ async fn serve<I>(
     drop(guard);
 }
 
+/// Send a request where its selection says: to the workers of the pool,
+/// or to an HTTP upstream (section 4.13).
+#[allow(clippy::too_many_arguments)] // each argument is a distinct part of the request
+pub(crate) async fn dispatch(
+    parts: &mut http::request::Parts,
+    body: Option<Incoming>,
+    buffered: Option<Bytes>,
+    pool: Arc<link::LinkPool>,
+    upstream: Option<Arc<upstream::Upstream>>,
+    context: &link::Context<'_>,
+    flags: routing::RedirectFlags,
+) -> link::Handled {
+    match upstream {
+        Some(upstream) => upstream::handle(parts, body, buffered, upstream, context).await,
+        None => link::handle(parts, body, buffered, pool, context, flags).await,
+    }
+}
+
 /// An error page being asked of an application (section 4.12): the page
 /// it is for, the built-in page to send if the handler fails, and the
 /// application that failed.
@@ -1378,7 +1399,7 @@ const HOP_BY_HOP: [&str; 7] = [
     "upgrade",
 ];
 
-fn is_hop_by_hop(name: &str, named_in_connection: &[String]) -> bool {
+pub(crate) fn is_hop_by_hop(name: &str, named_in_connection: &[String]) -> bool {
     HOP_BY_HOP.contains(&name) || named_in_connection.iter().any(|named| named == name)
 }
 

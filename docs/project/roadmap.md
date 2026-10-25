@@ -346,5 +346,20 @@ timeout is 503 `auth_unavailable`; the handler sees
 `muru.auth_request` and the original method, URI and host (as
 `X-Original-*` headers too); allowing decisions can be cached for a
 `ttl` by listed cookies and headers; `muru_auth_requests_total` counts
-decisions by result, and `muructl route list` shows the handler. Still
-to come: HTTP upstreams as handlers or targets.
+decisions by result, and `muructl route list` shows the handler.
+
+HTTP upstreams (section 4.13) are in: an `[upstream.NAME]` table names
+an unmanaged HTTP server by `host:port` or `unix:/path` addresses, over
+`http1`, `h2c` or `h2` with TLS (`ca`, `server_name`, `verify`), that a
+route, a static route's `fallback`, a traffic share named
+`upstream:NAME` or an authentication sub-request can target; requests
+are re-serialised with forwarding headers and re-framed bodies (ADR
+0027 on messages with both Content-Length and Transfer-Encoding),
+addresses take requests in turn with a request that was never sent
+moving to the next, failed requests eject an address for a growing
+period and a `health` table probes a path; `muru_upstream_health`
+reports each address, `trust_muru_headers` lets an upstream redirect
+internally, WebSockets are relayed to `http1` upstreams, and `muructl
+upstream list`, `route list`, `apply` and `config export` know the
+tables. Still to come: managed HTTP server releases (section 9.9) and
+`X-Muru-Sendfile` from an upstream.

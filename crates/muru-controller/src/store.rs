@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use muru_config::{Host as VirtualHost, Route};
+use muru_config::{Host as VirtualHost, Route, Upstream};
 
 use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms};
 
@@ -90,13 +90,18 @@ CREATE TABLE IF NOT EXISTS maintenance (
     app TEXT PRIMARY KEY,
     since_unix_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS upstreams (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The store.
 pub struct Store {
@@ -397,6 +402,48 @@ impl Store {
         self.with(|connection| {
             connection.execute("DELETE FROM routes WHERE host = ?1", [name])?;
             connection.execute("DELETE FROM hosts WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Every HTTP upstream, by name (section 4.13).
+    pub fn upstreams(&self) -> Result<Vec<(String, Upstream)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM upstreams ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut upstreams = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                upstreams.push((name, decode(&encoded)?));
+            }
+
+            Ok(upstreams)
+        })
+    }
+
+    /// Create or replace an HTTP upstream.
+    pub fn put_upstream(&self, name: &str, upstream: &Upstream) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(upstream).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO upstreams (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove an HTTP upstream.
+    pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
             Ok(())
         })
     }

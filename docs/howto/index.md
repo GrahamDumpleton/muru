@@ -36,6 +36,7 @@ static-files
 internal-redirects
 error-pages
 auth-subrequests
+upstreams
 compression
 timeouts
 connections

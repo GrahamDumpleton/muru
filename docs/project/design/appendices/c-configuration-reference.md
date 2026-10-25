@@ -73,7 +73,9 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | readiness, liveness (path, timeout, expect, required, interval, failures), checks | mount, release | none (built-in signals only) | 9.11 |
 | compression (enabled, encodings, min_size, types, level), decompress_requests | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default, false | 4.17 |
 | max_connections, max_connections_per_client, high_water, min_idle_timeout, overload_reserve, keep_alive_timeout, keep_alive_timeout_proxy, max_requests_per_connection, `http2.*`, `websocket.*` | listener, mount | see 4.18 | 4.18 |
-| auth (app, path, timeout, copy_headers, cache) | route | none | 4.16 |
+| auth (app or upstream, path, timeout, copy_headers, cache) | route | none | 4.16 |
+| upstream (route target), fallback.upstream, traffic.split upstream:NAME | route | none | 4.13 |
+| addresses, protocol, tls (ca, server_name, verify), health (path, interval, timeout, unhealthy_after, healthy_after, eject_after, eject_for), trust_muru_headers, connect_timeout | upstream | required, http1, none, none (ejection after 3 failures for 30s), false, 5s | 4.13 |
 | response_headers (add, remove), request_headers (add, remove) | host, route | none | 4.3 |
 | user, group, umask, limits | application | daemon's user, none | 10.9 |
 | `[secrets.store.NAME]` (kind, command, timeout), env values with secret = { store, key } and optional as = 'file' | daemon, release | file store in the secrets directory | 10.8 |
@@ -105,6 +107,6 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened |
-| Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy |
+| Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |

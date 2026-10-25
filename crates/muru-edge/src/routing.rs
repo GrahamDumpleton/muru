@@ -22,6 +22,7 @@ use muru_proto::edge::v1 as pb;
 use crate::errors::{Chain, ErrorPolicy};
 use crate::link::LinkPool;
 use crate::proxy::{Network, Trust};
+use crate::upstream::Upstream;
 
 /// What the snapshot says about one virtual host.
 #[derive(Debug, Clone)]
@@ -97,10 +98,15 @@ impl Maintenance {
 struct Route {
     path: String,
     app: String,
+    /// The upstream that takes the requests (section 4.13), instead of
+    /// an application.
+    upstream: Option<Arc<Upstream>>,
     /// The directory served, for a static route (section 4.9).
     static_route: Option<Arc<crate::static_files::StaticRoute>>,
     /// The application that takes what no file answers.
     fallback_app: String,
+    /// The upstream that takes what no file answers, when one does.
+    fallback_upstream: Option<Arc<Upstream>>,
     /// How the application's releases share the requests (section 9.4).
     traffic: Option<Policy>,
     /// Reachable only through internal redirects (section 4.10).
@@ -207,6 +213,9 @@ pub struct Selection {
     pub redirects: RedirectFlags,
     /// Maintenance mode, when the application is in it (section 4.12).
     pub maintenance: Option<Arc<Maintenance>>,
+    /// The upstream that takes the request instead of workers (section
+    /// 4.13); `pool` is then empty.
+    pub upstream: Option<Arc<Upstream>>,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -250,9 +259,9 @@ pub const PREVIEW_HEADER: &str = "muru-preview";
 /// A route's compiled traffic policy (section 9.4).
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Each share's release and bucket range, low inclusive, high
+    /// Each share's target and bucket range, low inclusive, high
     /// exclusive, from the top down.
-    shares: Vec<(String, u32, u32)>,
+    shares: Vec<(Target, u32, u32)>,
     key: Key,
     salt: String,
     sticky: bool,
@@ -298,7 +307,13 @@ impl Policy {
             let low = top
                 .checked_sub(share.weight)
                 .ok_or_else(|| "the shares add up to more than the whole".to_owned())?;
-            shares.push((share.release.clone(), low, top));
+
+            let target = if share.upstream.is_empty() {
+                Target::Release(share.release.clone())
+            } else {
+                Target::Upstream(share.upstream.clone())
+            };
+            shares.push((target, low, top));
             top = low;
         }
 
@@ -324,12 +339,94 @@ impl Policy {
         (hash % u64::from(BUCKETS)) as u32
     }
 
-    /// The release whose share a bucket falls in, if any.
-    fn share_for(&self, bucket: u32) -> Option<&str> {
+    /// The target whose share a bucket falls in, if any.
+    fn share_for(&self, bucket: u32) -> Option<&Target> {
         self.shares
             .iter()
             .find(|(_, low, high)| (*low..*high).contains(&bucket))
-            .map(|(release, _, _)| release.as_str())
+            .map(|(target, _, _)| target)
+    }
+}
+
+/// What takes a share of a route's requests: a release of the route's
+/// application, or an upstream (section 4.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A release, by id.
+    Release(String),
+    /// An upstream, by name.
+    Upstream(String),
+}
+
+impl Target {
+    /// The release id or the upstream's name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Release(name) | Self::Upstream(name) => name,
+        }
+    }
+
+    /// The target as a preview or sticky cookie names it: the release
+    /// id, or `upstream:NAME`.
+    fn label(&self) -> String {
+        match self {
+            Self::Release(name) => name.clone(),
+            Self::Upstream(name) => format!("{UPSTREAM_PREFIX}{name}"),
+        }
+    }
+}
+
+/// How a preview or sticky cookie names an upstream rather than a
+/// release.
+pub const UPSTREAM_PREFIX: &str = "upstream:";
+
+/// What the release choice picked.
+enum Chosen<'a> {
+    Pools(&'a Arc<AppPools>),
+    Upstream(Arc<Upstream>),
+}
+
+impl Chosen<'_> {
+    /// The target by its cookie label.
+    fn named<'a>(
+        name: &str,
+        app: &'a AppReleases,
+        upstreams: &HashMap<String, Arc<Upstream>>,
+    ) -> Option<Chosen<'a>> {
+        match name.strip_prefix(UPSTREAM_PREFIX) {
+            Some(upstream) => upstreams.get(upstream).cloned().map(Chosen::Upstream),
+            None => app.releases.get(name).map(Chosen::Pools),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Pools(pools) => pools.labels().1.to_owned(),
+            Self::Upstream(upstream) => format!("{UPSTREAM_PREFIX}{}", upstream.name()),
+        }
+    }
+
+    fn select(self, path: &str, origin: Option<&Origin>) -> Option<Selection> {
+        match self {
+            Self::Pools(pools) => pools.select(path, origin),
+            Self::Upstream(upstream) => Some(upstream_selection(&upstream)),
+        }
+    }
+}
+
+/// Where a request to an upstream goes: no workers, the upstream's name
+/// as the application's for the access log, and `upstream` as its group.
+fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
+    Selection {
+        pool: Arc::new(LinkPool::empty()),
+        app: upstream.name().to_owned(),
+        release: String::new(),
+        group: crate::upstream::GROUP.to_owned(),
+        mount: String::new(),
+        script_name: String::new(),
+        redirects: RedirectFlags::default(),
+        maintenance: None,
+        upstream: Some(Arc::clone(upstream)),
     }
 }
 
@@ -343,7 +440,8 @@ fn choose<'a>(
     policy: Option<&Policy>,
     client: &Client<'_>,
     cookies: &mut Vec<String>,
-) -> &'a Arc<AppPools> {
+    upstreams: &HashMap<String, Arc<Upstream>>,
+) -> Chosen<'a> {
     let preview = client
         .headers
         .get(PREVIEW_HEADER)
@@ -351,22 +449,22 @@ fn choose<'a>(
         .map(str::to_owned)
         .or_else(|| cookie(client.headers, PREVIEW_COOKIE));
 
-    if let Some(release) = preview
+    if let Some(chosen) = preview
         .as_deref()
-        .and_then(|release| app.releases.get(release))
+        .and_then(|name| Chosen::named(name, app, upstreams))
     {
-        return release;
+        return chosen;
     }
 
     let Some(policy) = policy else {
-        return &app.serving;
+        return Chosen::Pools(&app.serving);
     };
 
     if policy.sticky
-        && let Some(release) =
-            cookie(client.headers, STICKY_COOKIE).and_then(|release| app.releases.get(&release))
+        && let Some(chosen) = cookie(client.headers, STICKY_COOKIE)
+            .and_then(|name| Chosen::named(&name, app, upstreams))
     {
-        return release;
+        return chosen;
     }
 
     let secure = if client.secure { "; Secure" } else { "" };
@@ -397,13 +495,13 @@ fn choose<'a>(
     let bucket = Policy::bucket(&policy.salt, &key);
     let chosen = policy
         .share_for(bucket)
-        .and_then(|release| app.releases.get(release))
-        .unwrap_or(&app.serving);
+        .and_then(|target| Chosen::named(&target.label(), app, upstreams))
+        .unwrap_or(Chosen::Pools(&app.serving));
 
     if policy.sticky {
         cookies.push(format!(
             "{STICKY_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax{secure}",
-            chosen.labels().1
+            chosen.label()
         ));
     }
 
@@ -563,6 +661,7 @@ impl AppPools {
                 cgi_local_redirect: mount.cgi_local_redirect,
             }),
             maintenance: self.maintenance.clone(),
+            upstream: None,
         })
     }
 
@@ -626,6 +725,8 @@ pub struct Routing {
     routes: Vec<Vec<Route>>,
     /// The node's error pages and override (section 4.12).
     errors: Arc<ErrorPolicy>,
+    /// The HTTP upstreams by name (section 4.13).
+    upstreams: HashMap<String, Arc<Upstream>>,
 }
 
 /// Where a request goes.
@@ -693,6 +794,7 @@ impl Routing {
             default_host: None,
             routes: Vec::new(),
             errors: Arc::new(ErrorPolicy::default()),
+            upstreams: HashMap::new(),
         }
     }
 
@@ -700,6 +802,28 @@ impl Routing {
     /// a snapshot that cannot be reached is refused whole.
     pub async fn from_snapshot(snapshot: &pb::Snapshot) -> anyhow::Result<Self> {
         let mut apps: HashMap<String, AppReleases> = HashMap::new();
+        let mut upstreams: HashMap<String, Arc<Upstream>> = HashMap::new();
+
+        for message in &snapshot.upstreams {
+            let upstream = Upstream::from_message(message)
+                .map_err(|error| anyhow::anyhow!("upstream {}: {error}", message.name))?;
+            upstreams.insert(message.name.clone(), Arc::new(upstream));
+        }
+
+        let upstream_named =
+            |name: &str, route: &pb::Route| -> anyhow::Result<Option<Arc<Upstream>>> {
+                if name.is_empty() {
+                    return Ok(None);
+                }
+
+                upstreams.get(name).cloned().map(Some).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "route {} {}: no upstream named {name}",
+                        route.host,
+                        route.path
+                    )
+                })
+            };
 
         for app in &snapshot.apps {
             let errors = ErrorPolicy::load(&app.error_pages, app.error_override.as_ref())
@@ -788,6 +912,7 @@ impl Routing {
             default_host: None,
             routes: Vec::new(),
             errors: Arc::new(errors),
+            upstreams: upstreams.clone(),
         };
 
         for host in &snapshot.hosts {
@@ -871,8 +996,10 @@ impl Routing {
                 routing.routes[index].push(Route {
                     path: route.path.clone(),
                     app: route.app.clone(),
+                    upstream: upstream_named(&route.upstream, route)?,
                     static_route,
                     fallback_app: route.fallback_app.clone(),
+                    fallback_upstream: upstream_named(&route.fallback_upstream, route)?,
                     traffic,
                     internal: route.internal,
                     accept_redirects_from: route.accept_redirects_from.clone(),
@@ -892,6 +1019,11 @@ impl Routing {
     /// The snapshot's version.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// The upstreams, for their health gauges.
+    pub fn upstreams(&self) -> Vec<Arc<Upstream>> {
+        self.upstreams.values().cloned().collect()
     }
 
     /// The error pages and override in force for a request (section
@@ -1049,7 +1181,9 @@ impl Routing {
         let mut cookies = Vec::new();
 
         if let Some(static_route) = &route.static_route {
-            let fallback = if route.fallback_app.is_empty() {
+            let fallback = if let Some(upstream) = &route.fallback_upstream {
+                Some(upstream_selection(upstream))
+            } else if route.fallback_app.is_empty() {
                 None
             } else {
                 self.selection_for(
@@ -1075,15 +1209,21 @@ impl Routing {
             };
         }
 
-        let Some(selection) = self.selection_for(
-            &route.app,
-            route.traffic.as_ref(),
-            path,
-            client,
-            &mut cookies,
-            origin,
-        ) else {
-            return Decision::InternalOnly;
+        let selection = match &route.upstream {
+            Some(upstream) => upstream_selection(upstream),
+            None => {
+                let Some(selection) = self.selection_for(
+                    &route.app,
+                    route.traffic.as_ref(),
+                    path,
+                    client,
+                    &mut cookies,
+                    origin,
+                ) else {
+                    return Decision::InternalOnly;
+                };
+                selection
+            }
         };
 
         // SERVER_NAME is the name the request matched with, or the
@@ -1123,6 +1263,12 @@ impl Routing {
         self.selection_for(app, None, path, client, &mut cookies, Some(&origin))
     }
 
+    /// An upstream for a sub-request the edge makes for itself (section
+    /// 4.16), by name.
+    pub fn select_upstream(&self, name: &str) -> Option<Selection> {
+        self.upstreams.get(name).map(upstream_selection)
+    }
+
     /// The workers of an application for a request: the release the
     /// route's policy and the request choose, or the origin's own release
     /// for a redirect back into its application (section 4.10), and
@@ -1147,7 +1293,8 @@ impl Routing {
 
                 match pinned {
                     Some(pools) => pools.select(path, origin),
-                    None => choose(releases, policy, client, cookies).select(path, origin),
+                    None => choose(releases, policy, client, cookies, &self.upstreams)
+                        .select(path, origin),
                 }
             }
             None => Some(Selection {
@@ -1159,6 +1306,7 @@ impl Routing {
                 script_name: String::new(),
                 redirects: RedirectFlags::default(),
                 maintenance: None,
+                upstream: None,
             }),
         }
     }
@@ -1321,6 +1469,7 @@ mod tests {
             proxy: None,
             error_pages: Vec::new(),
             error_override: None,
+            upstreams: Vec::new(),
         }
     }
 
@@ -1485,6 +1634,7 @@ mod tests {
             shares: vec![pb::Share {
                 release: "r2".to_owned(),
                 weight: 2500,
+                upstream: String::new(),
             }],
             hash_key: hash_key.to_owned(),
             salt: "shop /".to_owned(),
@@ -1510,24 +1660,23 @@ mod tests {
                 pb::Share {
                     release: "r3".to_owned(),
                     weight: 1000,
+                    upstream: String::new(),
                 },
                 pb::Share {
                     release: "r2".to_owned(),
                     weight: 2500,
+                    upstream: String::new(),
                 },
             ],
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(policy.share_for(9999), Some("r3"));
-        assert_eq!(policy.share_for(9000), Some("r3"));
-        assert_eq!(policy.share_for(8999), Some("r2"));
-        assert_eq!(policy.share_for(6500), Some("r2"));
-        assert_eq!(
-            policy.share_for(6499),
-            None,
-            "the rest is the serving release's"
-        );
+        let share_for = |bucket: u32| policy.share_for(bucket).map(Target::name);
+        assert_eq!(share_for(9999), Some("r3"));
+        assert_eq!(share_for(9000), Some("r3"));
+        assert_eq!(share_for(8999), Some("r2"));
+        assert_eq!(share_for(6500), Some("r2"));
+        assert_eq!(share_for(6499), None, "the rest is the serving release's");
         assert_eq!(
             Policy::bucket("shop /", "user-42"),
             Policy::bucket("shop /", "user-42"),
@@ -1543,6 +1692,7 @@ mod tests {
                 shares: vec![pb::Share {
                     release: "r2".to_owned(),
                     weight: 10_001,
+                    upstream: String::new(),
                 }],
                 ..Default::default()
             })

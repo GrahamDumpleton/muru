@@ -248,8 +248,9 @@ def test_accept_redirects_from_must_name_an_application(site: Daemon, tmp_path: 
     )
     refused = site.muructl("apply", "-f", str(config), check=False)
     assert refused.returncode == 1
-    assert "accept_redirects_from names nobody, which is not an application" in (
-        refused.stdout + refused.stderr
+    assert (
+        "accept_redirects_from names nobody, which is neither an application nor an upstream"
+        in (refused.stdout + refused.stderr)
     )
 
 

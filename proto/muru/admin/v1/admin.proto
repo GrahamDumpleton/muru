@@ -63,6 +63,9 @@ service Admin {
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
   rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
 
+  // HTTP upstreams (section 4.13), as applied.
+  rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);
+
   // Declarative configuration (section 10.4): apply a document, compare
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
@@ -486,6 +489,24 @@ message Route {
   bool internal = 9;                // reachable only through internal redirects (section 4.10)
   repeated string accept_redirects_from = 10; // other applications whose redirects may reach the route
   string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route (section 4.16)
+  string upstream = 12;             // the upstream that takes the requests (section 4.13), for an upstream route
+  string fallback_upstream = 13;    // the upstream behind a static route, when there is one
+}
+
+message ListUpstreamsRequest {}
+
+message ListUpstreamsResponse {
+  repeated Upstream upstreams = 1;
+}
+
+// An HTTP upstream (section 4.13), as applied.
+message Upstream {
+  string name = 1;
+  repeated string addresses = 2;
+  string protocol = 3;              // http1, h2c or h2
+  bool tls = 4;
+  string health_path = 5;           // the path probed, when one is
+  bool trust_muru_headers = 6;
 }
 
 // One release's share of a route's requests, in percent.

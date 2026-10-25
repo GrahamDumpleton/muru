@@ -37,6 +37,10 @@ policy stops naming a release that is not the serving one, the release
 drains and is retained as it would be after a deploy. A deploy or rollback
 that would drain a release some policy still names leaves it running.
 
+A share can go to an [HTTP upstream](upstreams.md) instead of a release,
+named `upstream:NAME` in `split`. Its buckets sit below the releases'
+ranges, and the sticky and preview cookies name it the same way.
+
 ## The key
 
 What a client is hashed by is the `hash_key`:

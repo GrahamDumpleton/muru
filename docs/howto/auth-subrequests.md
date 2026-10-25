@@ -5,8 +5,8 @@
 
 A route's `auth` table: the handler sub-request, the allow, deny,
 redirect and fail-closed outcomes, copied headers, the decision cache,
-and guarded static directories and WebSocket upgrades. HTTP upstreams
-as handlers or targets arrive with upstreams.
+guarded static directories, WebSocket upgrades and upstream routes, and
+[HTTP upstreams](upstreams.md) as handlers.
 ```
 
 A route can require a decision from an application before the edge

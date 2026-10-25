@@ -1172,6 +1172,7 @@ pub fn auth_message(table: &muru_config::Auth) -> pb::Auth {
 
     pb::Auth {
         app: table.app.clone(),
+        upstream: table.upstream.clone(),
         path: table.path.clone(),
         timeout_ms: millis(table.timeout.as_deref()),
         copy_headers: table.copy_headers.clone(),
@@ -2491,6 +2492,20 @@ impl Daemon {
             });
         }
 
+        let mut upstreams = Vec::new();
+
+        for (name, upstream) in self.store.upstreams().unwrap_or_default() {
+            match upstream_message(&name, &upstream) {
+                Ok(message) => upstreams.push(message),
+                Err(error) => self.events.emit(
+                    "upstream.unusable",
+                    &format!("upstream {name}"),
+                    "error",
+                    &format!("{error:#}; routes to it answer 502 until it is applied again"),
+                ),
+            }
+        }
+
         let routes = routes
             .into_iter()
             .map(|route| pb::Route {
@@ -2498,6 +2513,12 @@ impl Daemon {
                 host: route.host,
                 path: route.path,
                 app: route.app,
+                upstream: route.upstream,
+                fallback_upstream: route
+                    .fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.upstream.clone())
+                    .unwrap_or_default(),
                 static_dir: route.static_dir.unwrap_or_default(),
                 index: route.index,
                 fallback_app: route
@@ -2546,6 +2567,7 @@ impl Daemon {
             compression: Some(self.compression.clone()),
             error_pages: self.error_pages.clone(),
             error_override: self.error_override.clone(),
+            upstreams,
         }
     }
 
@@ -3528,6 +3550,7 @@ impl Daemon {
             .map(|rollout| pb::Share {
                 release: rollout.candidate.clone(),
                 weight: rollout.percent().min(100) * 100,
+                upstream: String::new(),
             })
             .into_iter()
             .collect();
@@ -3535,6 +3558,7 @@ impl Daemon {
         let mut declared: Vec<(u64, &String, u32)> = traffic
             .split
             .iter()
+            .filter(|(id, _)| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
             .filter(|(id, _)| included.contains(&(app.to_owned(), (*id).clone())))
             .filter(|(id, _)| rollout.is_none_or(|rollout| &rollout.candidate != *id))
             .map(|(id, percent)| {
@@ -3550,6 +3574,19 @@ impl Daemon {
         shares.extend(declared.into_iter().map(|(_, release, percent)| pb::Share {
             release: release.clone(),
             weight: percent.min(100) * 100,
+            upstream: String::new(),
+        }));
+
+        // Section 4.13: shares to upstreams come after the releases', in
+        // name order.
+
+        shares.extend(traffic.split.iter().filter_map(|(id, percent)| {
+            let upstream = id.strip_prefix(muru_edge::routing::UPSTREAM_PREFIX)?;
+            Some(pb::Share {
+                release: String::new(),
+                weight: (*percent).min(100) * 100,
+                upstream: upstream.to_owned(),
+            })
         }));
 
         Some(pb::Traffic {
@@ -4218,10 +4255,57 @@ fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
                 traffic
                     .split
                     .keys()
+                    .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
                     .map(move |id| (app.to_owned(), id.clone()))
             })
         })
         .collect()
+}
+
+/// Section 4.13: an upstream as the edge takes it, with its CA file read
+/// now so a replaced file takes effect with the next snapshot.
+fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result<pb::Upstream> {
+    let millis = |text: Option<&str>| {
+        text.and_then(|text| muru_config::parse_duration(text).ok())
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    };
+
+    let tls_ca_pem = match table.tls.as_ref().and_then(|tls| tls.ca.as_deref()) {
+        Some(ca) => std::fs::read_to_string(ca).with_context(|| format!("reading {ca}"))?,
+        None => String::new(),
+    };
+
+    let health = table.health.as_ref();
+
+    Ok(pb::Upstream {
+        name: name.to_owned(),
+        addresses: table.addresses.clone(),
+        protocol: table.protocol.clone().unwrap_or_default(),
+        tls: table.tls.is_some(),
+        tls_ca_pem,
+        tls_server_name: table
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.server_name.clone())
+            .unwrap_or_default(),
+        tls_insecure: table
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.verify == Some(false)),
+        trust_muru_headers: table.trust_muru_headers,
+        connect_timeout_ms: millis(table.connect_timeout.as_deref()),
+        probe: health.map(|health| pb::UpstreamProbe {
+            path: health.path.clone().unwrap_or_default(),
+            interval_ms: millis(health.interval.as_deref()),
+            timeout_ms: millis(health.timeout.as_deref()),
+            unhealthy_after: health.unhealthy_after.unwrap_or(0),
+            healthy_after: health.healthy_after.unwrap_or(0),
+        }),
+        eject_after: health.and_then(|health| health.eject_after).unwrap_or(3),
+        eject_for_ms: millis(health.and_then(|health| health.eject_for.as_deref())),
+    })
 }
 
 /// A policy's sticky grace: what it says, or 10 minutes.

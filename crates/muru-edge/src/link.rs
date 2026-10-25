@@ -616,7 +616,7 @@ pub(crate) struct Recording {
     log: Arc<AccessLog>,
     /// Logged as a hop rather than a line of its own (section 4.12).
     silent: bool,
-    record: Record,
+    pub(crate) record: Record,
     started: Instant,
     /// Counted as in flight until the recording is dropped.
     _in_flight: crate::access::InFlight,
@@ -635,7 +635,7 @@ pub(crate) fn record(
 }
 
 impl Recording {
-    fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
+    pub(crate) fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
         Self {
             log: Arc::clone(&context.access_log),
             silent: context.handler.is_some(),
@@ -681,7 +681,7 @@ impl Recording {
     /// Section 4.10: the request went on by internal redirect. The hop
     /// counts in the metrics of the application that answered it; the
     /// line is written once the chain ends.
-    fn hop(mut self, status: u16) {
+    pub(crate) fn hop(mut self, status: u16) {
         self.record.status = status;
         self.record.total = self.started.elapsed();
         self.log.record_hop(&self.record);
@@ -716,18 +716,26 @@ pub(crate) fn reject(
     problem: Problem,
 ) -> Response<ResponseBody> {
     let recording = Recording::new(context, parts);
-    let failing = Failing {
+    failing(context, parts, Some(recording)).respond(problem)
+}
+
+/// How a request's failures are answered, with `recording` completed by
+/// the first failure answered.
+pub(crate) fn failing<'a>(
+    context: &'a Context<'_>,
+    parts: &http::request::Parts,
+    recording: Option<Recording>,
+) -> Failing<'a> {
+    Failing {
         request_id: context.request_id,
         max_body_size: context.limits.max_body_size,
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
         version: parts.version,
-        recording: Mutex::new(Some(recording)),
+        recording: Mutex::new(recording),
         errors: &context.errors,
         host: requested_host(parts),
         path: parts.uri.path().to_owned(),
-    };
-
-    failing.respond(problem)
+    }
 }
 
 pub(crate) fn redirect_to_https(
@@ -1202,7 +1210,7 @@ async fn handle_inner(
 /// 200 with a Location starting with `/` and no body) when the mount
 /// opts in. The target must be an absolute path on this server. `body`
 /// is the buffered request body, kept for a preserved method.
-fn redirect_from(
+pub(crate) fn redirect_from(
     head: &pb::ResponseHead,
     response_end: bool,
     flags: RedirectFlags,
@@ -1309,7 +1317,7 @@ async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Du
 /// How this request's failures are answered: with the error pages of
 /// section 4.12, in the client's preferred format, and a record in the
 /// access log.
-struct Failing<'a> {
+pub(crate) struct Failing<'a> {
     request_id: &'a str,
     max_body_size: u64,
     negotiation: Negotiation,
@@ -1323,7 +1331,22 @@ struct Failing<'a> {
 }
 
 impl Failing<'_> {
-    fn respond(&self, problem: Problem) -> Response<ResponseBody> {
+    /// The recording, for the response that is not a failure.
+    pub(crate) fn take_recording(&self) -> Option<Recording> {
+        self.recording.lock().expect("recording poisoned").take()
+    }
+
+    /// Hand the recording back, for a failure found after all.
+    pub(crate) fn put_recording(&self, recording: Option<Recording>) {
+        *self.recording.lock().expect("recording poisoned") = recording;
+    }
+
+    /// The client's preferred error format.
+    pub(crate) fn negotiation(&self) -> &Negotiation {
+        &self.negotiation
+    }
+
+    pub(crate) fn respond(&self, problem: Problem) -> Response<ResponseBody> {
         let response = errors::respond(
             &problem,
             &errors::Rendering {
@@ -1348,11 +1371,11 @@ impl Failing<'_> {
     }
 
     /// Respond and close an HTTP/1.1 connection, whose state is suspect.
-    fn close(&self, problem: Problem) -> Response<ResponseBody> {
+    pub(crate) fn close(&self, problem: Problem) -> Response<ResponseBody> {
         close_after(self.respond(problem), self.version)
     }
 
-    fn too_large(&self) -> Response<ResponseBody> {
+    pub(crate) fn too_large(&self) -> Response<ResponseBody> {
         self.close(Problem::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body_too_large",
@@ -1404,7 +1427,7 @@ impl Failing<'_> {
 /// (section 4.12), if the status is listed, the condition holds and the
 /// application did not opt out with X-Muru-Error-Override: off. The
 /// response's Retry-After, WWW-Authenticate and Allow are kept.
-fn override_from(
+pub(crate) fn override_from(
     head: &pb::ResponseHead,
     response_end: bool,
     negotiation: &Negotiation,
@@ -1479,13 +1502,16 @@ fn capitalise(sentence: &str) -> String {
     out
 }
 
-enum BodyError {
+/// Why a request body could not be read whole.
+pub(crate) enum BodyError {
+    /// It is larger than max_body_size.
     TooLarge,
+    /// The client's connection failed.
     Read(hyper::Error),
 }
 
 /// Read a request body in full, up to the size limit.
-async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
+pub(crate) async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
 
     while let Some(next) = body.frame().await {

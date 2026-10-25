@@ -39,6 +39,14 @@ pub(crate) struct Upgrade {
     on_upgrade: OnUpgrade,
 }
 
+impl Upgrade {
+    /// Where hyper hands over the client's connection, for a relay of raw
+    /// bytes to an upstream (section 4.13).
+    pub(crate) fn into_on_upgrade(self) -> OnUpgrade {
+        self.on_upgrade
+    }
+}
+
 /// Recognise a WebSocket upgrade: the HTTP/1.1 Upgrade dance, or the
 /// extended CONNECT of RFC 8441 over HTTP/2. Takes the upgrade handle out
 /// of the request so the relay can use it.

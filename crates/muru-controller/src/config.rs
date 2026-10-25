@@ -3,7 +3,8 @@
 //! out, and the export of desired state as a document that applies back
 //! without changes.
 //!
-//! This covers applications, releases, virtual hosts and routes.
+//! This covers applications, releases, virtual hosts, routes and HTTP
+//! upstreams.
 //! Listeners and limits belong to the daemon's own file and are reported,
 //! not applied.
 
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use muru_config::{
     App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
-    Release as ReleaseTable, Route as RouteTable, ScalingMode,
+    Release as ReleaseTable, Route as RouteTable, ScalingMode, Upstream as UpstreamTable,
 };
 use muru_proto::admin::v1 as pb;
 
@@ -89,6 +90,20 @@ pub enum Action {
         /// The path prefix.
         path: String,
     },
+    /// Create or replace an HTTP upstream (section 4.13).
+    PutUpstream {
+        /// The upstream's name.
+        name: String,
+        /// Its definition.
+        upstream: Box<UpstreamTable>,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop an HTTP upstream (prune).
+    RemoveUpstream {
+        /// The upstream's name.
+        name: String,
+    },
 }
 
 impl Action {
@@ -106,6 +121,9 @@ impl Action {
             Action::PutRoute { new: true, .. } => "create-route",
             Action::PutRoute { new: false, .. } => "update-route",
             Action::RemoveRoute { .. } => "remove-route",
+            Action::PutUpstream { new: true, .. } => "create-upstream",
+            Action::PutUpstream { new: false, .. } => "update-upstream",
+            Action::RemoveUpstream { .. } => "remove-upstream",
         }
     }
 
@@ -117,6 +135,8 @@ impl Action {
                 | Action::RemoveHost { .. }
                 | Action::PutRoute { .. }
                 | Action::RemoveRoute { .. }
+                | Action::PutUpstream { .. }
+                | Action::RemoveUpstream { .. }
         )
     }
 }
@@ -144,6 +164,9 @@ impl Change {
             Action::PutHost { name, .. } | Action::RemoveHost { name } => format!("host {name}"),
             Action::PutRoute { route, .. } => format!("route {} {}", route.host, route.path),
             Action::RemoveRoute { host, path } => format!("route {host} {path}"),
+            Action::PutUpstream { name, .. } | Action::RemoveUpstream { name } => {
+                format!("upstream {name}")
+            }
         }
     }
 }
@@ -227,6 +250,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
     }
 
     plan_hosts(store, document, &mut plan);
+    plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, &mut plan);
 
     if prune {
@@ -481,6 +505,15 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
         .into_iter()
         .map(|app| app.name)
         .collect();
+    let stored_upstreams: Vec<String> = store
+        .upstreams()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let known_upstream = |name: &str| {
+        document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
+    };
     let mut seen = Vec::new();
 
     for route in &document.route {
@@ -514,20 +547,75 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
         let known_app =
             |app: &str| document.app.contains_key(app) || stored_apps.iter().any(|a| a == app);
 
+        // Section 4.13: an upstream is a target like an application, and
+        // a static route may fall back to one.
+
+        let fallback_upstream = route
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.upstream.as_deref());
+        let targets = usize::from(!route.app.is_empty())
+            + usize::from(!route.upstream.is_empty())
+            + usize::from(route.static_dir.is_some());
+
+        if targets > 1 {
+            plan.errors.push(format!(
+                "route {} {}: names more than one of an application, an upstream and a static directory",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        if !route.upstream.is_empty() && !known_upstream(&route.upstream) {
+            plan.errors.push(format!(
+                "route {} {}: no upstream named {}",
+                route.host, route.path, route.upstream
+            ));
+            valid = false;
+        }
+
+        if let Some(upstream) = fallback_upstream
+            && !known_upstream(upstream)
+        {
+            plan.errors.push(format!(
+                "route {} {}: no upstream named {upstream} for the fallback",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        if fallback_app.is_some() && fallback_upstream.is_some() {
+            plan.errors.push(format!(
+                "route {} {}: the fallback names both an application and an upstream",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
         match (&route.static_dir, route.app.is_empty()) {
-            (Some(_), false) => {
+            (Some(_), false) => {}
+            (None, true) if route.upstream.is_empty() => {
                 plan.errors.push(format!(
-                    "route {} {}: names both an application and a static directory",
+                    "route {} {}: names neither an application, an upstream nor a static directory",
                     route.host, route.path
                 ));
                 valid = false;
             }
             (None, true) => {
-                plan.errors.push(format!(
-                    "route {} {}: names neither an application nor a static directory",
-                    route.host, route.path
-                ));
-                valid = false;
+                if route.fallback.is_some() || route.cache.is_some() || !route.index.is_empty() {
+                    plan.warnings.push(format!(
+                        "route {} {}: index, fallback and cache apply to static routes only",
+                        route.host, route.path
+                    ));
+                }
+
+                if route.traffic.is_some() {
+                    plan.errors.push(format!(
+                        "route {} {}: traffic needs an application; an upstream route has no releases to share",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
             }
             (Some(directory), true) => {
                 if !Path::new(directory).is_dir() {
@@ -609,6 +697,21 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                 }
                 Some(app) => {
                     for id in traffic.split.keys() {
+                        // Section 4.13: a share may go to an upstream.
+
+                        if let Some(upstream) = id.strip_prefix(muru_edge::routing::UPSTREAM_PREFIX)
+                        {
+                            if !known_upstream(upstream) {
+                                plan.errors.push(format!(
+                                    "route {} {}: traffic.split names upstream {upstream}, which does not exist",
+                                    route.host, route.path
+                                ));
+                                valid = false;
+                            }
+
+                            continue;
+                        }
+
                         let declared = document
                             .app
                             .get(app)
@@ -671,22 +774,28 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                 plan.errors
                     .push(format!("route {} {}: {error}", route.host, route.path));
                 valid = false;
-            } else if !known_app(&auth.app) {
+            } else if !auth.app.is_empty() && !known_app(&auth.app) {
                 plan.errors.push(format!(
                     "route {} {}: auth.app names {}, which is not an application",
                     route.host, route.path, auth.app
                 ));
                 valid = false;
+            } else if !auth.upstream.is_empty() && !known_upstream(&auth.upstream) {
+                plan.errors.push(format!(
+                    "route {} {}: auth.upstream names {}, which is not an upstream",
+                    route.host, route.path, auth.upstream
+                ));
+                valid = false;
             }
         }
 
-        // Section 4.10: the applications a route accepts redirects from
-        // must exist.
+        // Section 4.10: the applications, or trusted upstreams (section
+        // 4.13), a route accepts redirects from must exist.
 
         for app in &route.accept_redirects_from {
-            if !known_app(app) {
+            if !known_app(app) && !known_upstream(app) {
                 plan.errors.push(format!(
-                    "route {} {}: accept_redirects_from names {app}, which is not an application",
+                    "route {} {}: accept_redirects_from names {app}, which is neither an application nor an upstream",
                     route.host, route.path
                 ));
                 valid = false;
@@ -715,11 +824,17 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                     new: recorded.is_none(),
                 },
                 detail: {
+                    let target = if route.upstream.is_empty() {
+                        route.app.clone()
+                    } else {
+                        format!("upstream {}", route.upstream)
+                    };
+
                     let mut detail = match &route.traffic {
                         Some(traffic) => {
-                            format!("to {}, {}", route.app, describe_traffic(Some(traffic)))
+                            format!("to {target}, {}", describe_traffic(Some(traffic)))
                         }
-                        None => format!("to {}", route.app),
+                        None => format!("to {target}"),
                     };
 
                     if route.internal == Some(true) {
@@ -734,7 +849,7 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                     }
 
                     if let Some(auth) = &route.auth {
-                        detail.push_str(&format!(", auth by {} {}", auth.app, auth.path));
+                        detail.push_str(&format!(", auth by {} {}", auth_handler(auth), auth.path));
                     }
 
                     detail
@@ -742,6 +857,90 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }),
         }
     }
+}
+
+/// The handler of a check as plans and listings name it: the
+/// application, or `upstream NAME`.
+pub fn auth_handler(auth: &muru_config::Auth) -> String {
+    if auth.upstream.is_empty() {
+        auth.app.clone()
+    } else {
+        format!("upstream {}", auth.upstream)
+    }
+}
+
+/// The changes the document's HTTP upstreams imply (section 4.13).
+fn plan_upstreams(store: &Store, document: &Document, plan: &mut Plan) {
+    let stored: BTreeMap<String, UpstreamTable> =
+        store.upstreams().unwrap_or_default().into_iter().collect();
+
+    for (name, upstream) in &document.upstream {
+        if !valid_name(name) {
+            plan.errors
+                .push(format!("upstream {name:?} is not a valid name"));
+            continue;
+        }
+
+        let mut valid = true;
+
+        if let Err(error) = muru_config::check_upstream(upstream) {
+            plan.errors.push(format!("upstream {name}: {error}"));
+            valid = false;
+        }
+
+        if let Some(ca) = upstream.tls.as_ref().and_then(|tls| tls.ca.as_deref())
+            && let Err(error) = std::fs::read_to_string(ca)
+        {
+            plan.errors
+                .push(format!("upstream {name}: tls.ca: reading {ca}: {error}"));
+            valid = false;
+        }
+
+        if !valid {
+            continue;
+        }
+
+        match stored.get(name) {
+            Some(recorded) if recorded == upstream => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutUpstream {
+                    name: name.clone(),
+                    upstream: Box::new(upstream.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: describe_upstream(upstream),
+            }),
+        }
+    }
+}
+
+/// An upstream for the report: its addresses, protocol and checks.
+fn describe_upstream(upstream: &UpstreamTable) -> String {
+    let mut parts = vec![
+        upstream.addresses.join(", "),
+        upstream
+            .protocol
+            .clone()
+            .unwrap_or_else(|| "http1".to_owned()),
+    ];
+
+    if upstream.tls.is_some() {
+        parts.push("with TLS".to_owned());
+    }
+
+    if let Some(path) = upstream
+        .health
+        .as_ref()
+        .and_then(|health| health.path.as_deref())
+    {
+        parts.push(format!("probing {path}"));
+    }
+
+    if upstream.trust_muru_headers {
+        parts.push("trusting X-Muru headers".to_owned());
+    }
+
+    parts.join(", ")
 }
 
 /// Section 4.12: a host's or route's error pages and override, whose
@@ -810,6 +1009,15 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         if !document.host.contains_key(&name) {
             plan.changes.push(Change {
                 action: Action::RemoveHost { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
+    for (name, _) in store.upstreams().unwrap_or_default() {
+        if !document.upstream.contains_key(&name) {
+            plan.changes.push(Change {
+                action: Action::RemoveUpstream { name },
                 detail: "not declared".to_owned(),
             });
         }
@@ -903,6 +1111,32 @@ pub fn export(
 
         if app.is_none() || routed {
             document.host.insert(name, host);
+        }
+    }
+
+    // Upstreams are node-wide too; with one application asked for, those
+    // its routes name come along.
+
+    for (name, upstream) in store.upstreams()? {
+        let share = format!("{}{name}", muru_edge::routing::UPSTREAM_PREFIX);
+        let named = document.route.iter().any(|route| {
+            route.upstream == name
+                || route
+                    .fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.upstream.as_deref() == Some(&name))
+                || route
+                    .traffic
+                    .as_ref()
+                    .is_some_and(|traffic| traffic.split.contains_key(&share))
+                || route
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.upstream == name)
+        });
+
+        if app.is_none() || named {
+            document.upstream.insert(name, upstream);
         }
     }
 

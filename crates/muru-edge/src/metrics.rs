@@ -129,6 +129,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Worker slots across the workers: threads, or the event loop's concurrency.",
     },
     Family {
+        name: "muru_upstream_health",
+        kind: Kind::Gauge,
+        help: "Whether an upstream address takes requests: 1 in service, 0 unhealthy or ejected.",
+    },
+    Family {
         name: "muru_workers_ready",
         kind: Kind::Gauge,
         help: "Workers listening for requests.",
@@ -467,6 +472,10 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
                 workers.iter().map(|worker| worker.slots).sum::<usize>() as f64,
             ));
         }
+    }
+
+    for upstream in routing.upstreams() {
+        samples.extend(upstream.samples());
     }
 
     samples.push(Sample::new(
