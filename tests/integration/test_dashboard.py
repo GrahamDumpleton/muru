@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import http.client
+import json
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -102,3 +104,30 @@ def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, in
     ), text
     assert 'muru_slots_total{app="wsgi-conformance",release="r1",group="default"} ' in text, text
     assert "muru_snapshot_version 0\n" in text, text
+
+
+def test_the_development_dashboard_serves_the_history(
+    dashboard: tuple[support.Server, int],
+) -> None:
+    server, port = dashboard
+
+    # Points are differences between readings a second apart, so requests
+    # keep flowing while the first ones are waited for.
+
+    def recorded() -> bool:
+        for _ in range(10):
+            assert server.get("/response/list").status == 200
+
+        body = json.loads(fetch(port, "/v1/history?range=1h")[2])
+        return sum(point[1] for point in body["points"]) > 0
+
+    deadline = time.monotonic() + 15
+
+    while not recorded():
+        assert time.monotonic() < deadline, "no history point with requests"
+        time.sleep(0.2)
+
+    status, _headers, body = fetch(port, "/")
+    assert status == 200
+    assert 'id="charts"' in body.decode() and "/static/charts.js" in body.decode()
+    assert fetch(port, "/static/uplot.min.js")[0] == 200

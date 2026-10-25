@@ -306,6 +306,10 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// The points the dashboard's charts draw, one a second.
+    history: Arc<muru_dashboard::History>,
+    /// Turns the edge's counters into those points.
+    sampler: muru_dashboard::Sampler,
     running: HashMap<(String, String), Running>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
@@ -466,7 +470,11 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
-    // The dashboard and gateway (section 10.7), on an internal address.
+    // The dashboard and gateway (section 10.7), on an internal address,
+    // with the history the reconciler records every second for its
+    // charts.
+
+    let history = Arc::new(muru_dashboard::History::new());
 
     let pages = match dashboard {
         Some(address) => {
@@ -476,6 +484,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             Some(tokio::spawn(crate::dashboard::serve(
                 listener,
                 handle.commands.clone(),
+                Arc::clone(&history),
+                events.clone(),
             )))
         }
         None => None,
@@ -524,6 +534,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         compression,
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
+        history,
+        sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
@@ -602,6 +614,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.check_hosts().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
+                daemon.sample_history().await;
             }
         }
     };
@@ -2308,6 +2321,37 @@ impl Daemon {
     /// and each host its release log on SIGUSR1; SIGUSR2 makes a host
     /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
     /// files the application opened itself.
+    /// Section 10.7: one point of history a second, from the edge's
+    /// counters.
+    async fn sample_history(&mut self) {
+        let samples = match self.edge.metrics().await {
+            Ok(samples) => samples,
+            Err(error) => {
+                tracing::debug!(%error, "the edge's metrics could not be read for the history");
+                return;
+            }
+        };
+
+        let workers = self
+            .running
+            .values()
+            .map(|running| {
+                running.sockets.len()
+                    + running
+                        .groups
+                        .iter()
+                        .map(|group| group.sockets.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>() as u64;
+        let reading = crate::dashboard::reading(&samples, workers);
+        let now = crate::model::now_unix_ms() / 1000;
+
+        if let Some(point) = self.sampler.observe(now, reading) {
+            self.history.record(point);
+        }
+    }
+
     /// Section 11.3: rotate the log files that are due, by size or by the
     /// clock, then have every writer reopen its file by name.
     fn rotate_logs(&mut self) {
@@ -2413,9 +2457,8 @@ impl Daemon {
     }
 }
 
-/// A wall clock time as HH:MM UTC, for messages.
 /// A Unix time as HH:MM:SS, UTC.
-fn clock_hms(unix_ms: u64) -> String {
+pub(crate) fn clock_hms(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!(
         "{:02}:{:02}:{:02}",

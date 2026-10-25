@@ -1116,6 +1116,7 @@ dependencies = [
  "anyhow",
  "askama",
  "bytes",
+ "futures",
  "http",
  "http-body-util",
  "hyper",

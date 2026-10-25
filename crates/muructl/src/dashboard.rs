@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use muru_dashboard::{Data, MetricsSource, RequestRow, Source, Summary, Worker};
+use muru_dashboard::{Data, History, MetricsSource, RequestRow, Sampler, Source, Summary, Worker};
 use muru_edge::Pools;
 use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
 use muru_edge::metrics::{aggregate, pool_samples, render};
@@ -69,9 +69,41 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
             .chain(connections.samples());
         render(&aggregate(samples))
     });
+
+    // Section 10.7: a point of history a second for the charts, from
+    // the same counters the metrics show.
+
+    let history = Arc::new(History::new());
+    let recorder = Arc::clone(&history);
+    let sampled_pools = Arc::clone(&inputs.pools);
+    let sampled_log = Arc::clone(&inputs.access_log);
+    tokio::spawn(async move {
+        let mut sampler = Sampler::default();
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+
+        loop {
+            ticks.tick().await;
+            let routing = sampled_pools.current();
+            let samples: Vec<_> = sampled_log
+                .metrics()
+                .samples()
+                .into_iter()
+                .chain(pool_samples(&routing))
+                .collect();
+            let workers = routing.default_pool().workers().len() as u64;
+            let reading = muru_controller::dashboard::reading(&samples, workers);
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs());
+
+            if let Some(point) = sampler.observe(now, reading) {
+                recorder.record(point);
+            }
+        }
+    });
     let source: Source = Arc::new(move || collect(&inputs));
     tokio::spawn(async move {
-        if let Err(error) = muru_dashboard::serve(listener, source, metrics).await {
+        if let Err(error) = muru_dashboard::serve(listener, source, metrics, history).await {
             tracing::warn!(%error, "the dashboard stopped");
         }
     });

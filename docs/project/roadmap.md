@@ -202,5 +202,14 @@ hourly or weekly, in UTC) or a size is reached, has every writer reopen
 by name, compresses the archive in the background with zstd or gzip and
 keeps the newest `keep` archives, from the `[logs]` table, with
 `rotate = 'external'` leaving it to logrotate (reopen_on_rename,
-on_overflow and journald later). Next from phase 2: per-application
-users, then the dashboard's charts.
+on_overflow and journald later). The dashboard (section 10.7) has its
+charts and streams: the daemon records a point a second from the edge's
+counters (requests and errors per second, the median and 95th
+percentile from the histogram, in flight, workers) for an hour at one
+second and a day at one minute, serves them on `/v1/history` and as
+Server-Sent Events on `/v1/history/stream`, streams events as rendered
+rows and JSON on `/v1/events/stream`, and the pages draw the charts with
+uPlot and take live events through the htmx SSE extension, both
+vendored; a development run has the same charts (worker inspection
+views and mutating actions later). Next from phase 2: per-application
+users.
