@@ -475,10 +475,53 @@ pub struct Context<'a> {
     pub hops: Vec<String>,
     /// The error pages and override in force (section 4.12).
     pub errors: errors::Chain,
-    /// This hop asks an application for an error page (section 4.12):
-    /// it gets 2 s, its own errors are never replaced, and it is logged
-    /// as a hop of the request that failed.
-    pub handler: bool,
+    /// This hop is a sub-request the edge makes for itself: for an error
+    /// page (section 4.12) or an authorisation decision (section 4.16).
+    /// The value is the handler's budget, queueing included; its own
+    /// errors are never replaced, and it is logged as a hop of the
+    /// request it serves.
+    pub handler: Option<Duration>,
+}
+
+impl<'a> Context<'a> {
+    /// The context of a sub-request the edge makes for itself (section
+    /// 4.16), under this request: the same client and connection, the
+    /// hops so far, and no application until the handler is selected.
+    pub(crate) fn sub_request(
+        &self,
+        request_id: &'a str,
+        budget: Duration,
+        internal: Internal,
+        target: String,
+    ) -> Context<'a> {
+        Context {
+            request_id,
+            peer: self.peer,
+            proxy: self.proxy,
+            local: self.local,
+            scheme: self.scheme,
+            tls: self.tls,
+            development: self.development,
+            access_log: Arc::clone(&self.access_log),
+            limits: Arc::clone(&self.limits),
+            server_name: self.server_name.clone(),
+            app: String::new(),
+            release: String::new(),
+            group: String::new(),
+            snapshot: self.snapshot,
+            mount: String::new(),
+            mount_path: String::new(),
+            forwarded_host: self.forwarded_host.clone(),
+            forwarded_port: self.forwarded_port,
+            prefix: self.prefix.clone(),
+            internal: Some(internal),
+            arrived: self.arrived,
+            client_target: Some(target),
+            hops: self.hops.clone(),
+            errors: errors::Chain::default(),
+            handler: Some(budget),
+        }
+    }
 }
 
 /// How long an application gets to produce an error page (section 4.12).
@@ -503,6 +546,23 @@ pub struct Internal {
     /// For an error page sub-request (section 4.12), the reason of the
     /// error, as muru.error_reason; empty for a redirect.
     pub error_reason: String,
+    /// For an authentication sub-request (section 4.16), the request it
+    /// decides about; the application then sees muru.auth_request and
+    /// the original request rather than REDIRECT_* keys.
+    pub original: Option<Original>,
+}
+
+/// The request an authentication sub-request decides about (section
+/// 4.16), as muru.original_method, muru.original_uri and
+/// muru.original_host.
+#[derive(Debug, Clone)]
+pub struct Original {
+    /// Its method.
+    pub method: String,
+    /// Its path and query.
+    pub uri: String,
+    /// The host it asked for.
+    pub host: String,
 }
 
 /// What handling a request produced: a response for the client, or an
@@ -541,7 +601,7 @@ pub const MAX_REDIRECT_HOPS: usize = 5;
 
 /// The host the client asked for, without its port, from the Host header
 /// or the request target.
-fn requested_host(parts: &http::request::Parts) -> String {
+pub(crate) fn requested_host(parts: &http::request::Parts) -> String {
     let header = parts
         .headers
         .get(http::header::HOST)
@@ -578,7 +638,7 @@ impl Recording {
     fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
         Self {
             log: Arc::clone(&context.access_log),
-            silent: context.handler,
+            silent: context.handler.is_some(),
             _in_flight: context.access_log.begin(&context.app, &context.release),
             record: Record {
                 started: SystemTime::now(),
@@ -747,13 +807,14 @@ async fn handle_inner(
     let mut head = request_head(parts, context);
     let limits = &context.limits;
 
-    // Section 4.12: an application asked for an error page gets 2 s of
-    // what is left of the deadline, queueing included.
+    // Sections 4.12 and 4.16: an application asked for an error page or
+    // an authorisation decision gets the handler's budget out of what is
+    // left of the deadline, queueing included.
 
-    let (deadline, queue_timeout) = if context.handler {
+    let (deadline, queue_timeout) = if let Some(budget) = context.handler {
         (
-            (context.arrived + limits.request_deadline).min(Instant::now() + HANDLER_TIMEOUT),
-            limits.queue_timeout.min(HANDLER_TIMEOUT),
+            (context.arrived + limits.request_deadline).min(Instant::now() + budget),
+            limits.queue_timeout.min(budget),
         )
     } else {
         (
@@ -1033,7 +1094,7 @@ async fn handle_inner(
     // out. The rest of the response is drained as for a redirect.
 
     if upgrade.is_none()
-        && !context.handler
+        && context.handler.is_none()
         && let Some(problem) =
             override_from(&head, response_end, &failing.negotiation, &context.errors)
     {

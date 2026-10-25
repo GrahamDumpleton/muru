@@ -110,6 +110,8 @@ struct Route {
     accept_redirects_from: Vec<String>,
     /// The route's error pages and override (section 4.12).
     errors: Arc<ErrorPolicy>,
+    /// The decision asked for before the route is served (section 4.16).
+    auth: Option<Arc<crate::auth::Auth>>,
 }
 
 impl Route {
@@ -409,7 +411,7 @@ fn choose<'a>(
 }
 
 /// The value of a cookie among the request's Cookie headers.
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(http::header::COOKIE)
         .iter()
@@ -638,6 +640,8 @@ pub enum Decision {
         /// Set-Cookie values the edge issues with the response: the
         /// anonymous id and the sticky release (section 9.4).
         cookies: Vec<String>,
+        /// The check the route asks for first (section 4.16).
+        auth: Option<Arc<crate::auth::Auth>>,
     },
     /// Redirected to HTTPS: the host insists on it.
     Redirect,
@@ -668,6 +672,8 @@ pub enum Decision {
         server_name: Option<String>,
         /// Set-Cookie values the edge issues with the response.
         cookies: Vec<String>,
+        /// The check the route asks for first (section 4.16).
+        auth: Option<Arc<crate::auth::Auth>>,
     },
 }
 
@@ -853,6 +859,15 @@ impl Routing {
                     .map_err(|error| {
                         anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
                     })?;
+                let auth = route
+                    .auth
+                    .as_ref()
+                    .map(crate::auth::Auth::from_message)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
+                    })?
+                    .map(Arc::new);
                 routing.routes[index].push(Route {
                     path: route.path.clone(),
                     app: route.app.clone(),
@@ -862,6 +877,7 @@ impl Routing {
                     internal: route.internal,
                     accept_redirects_from: route.accept_redirects_from.clone(),
                     errors: Arc::new(errors),
+                    auth,
                 });
             }
         }
@@ -991,6 +1007,7 @@ impl Routing {
                     selection,
                     server_name: None,
                     cookies: Vec::new(),
+                    auth: None,
                 },
                 None => Decision::InternalOnly,
             };
@@ -1054,6 +1071,7 @@ impl Routing {
                     host.server_name.clone()
                 }),
                 cookies,
+                auth: route.auth.clone(),
             };
         }
 
@@ -1081,7 +1099,28 @@ impl Routing {
             selection,
             server_name,
             cookies,
+            auth: route.auth.clone(),
         }
+    }
+
+    /// The workers of an application for a sub-request the edge makes
+    /// for itself (section 4.16): the application's serving release, or
+    /// the one a preview or sticky cookie picks, and within it the mount
+    /// for the path, internal ones included, since the operator named
+    /// the path. None when the application has no mount for it.
+    pub fn select_app(&self, app: &str, path: &str, client: &Client<'_>) -> Option<Selection> {
+        let origin = Origin {
+            app: String::new(),
+            release: String::new(),
+            privileged: true,
+        };
+
+        if self.hosts.is_empty() {
+            return self.default.select(path, Some(&origin));
+        }
+
+        let mut cookies = Vec::new();
+        self.selection_for(app, None, path, client, &mut cookies, Some(&origin))
     }
 
     /// The workers of an application for a request: the release the

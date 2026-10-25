@@ -2219,6 +2219,12 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
             ));
         }
 
+        // Section 4.16: the handler asked before the route is served.
+
+        if !route.auth.is_empty() {
+            target.push_str(&format!(" [auth by {}]", route.auth));
+        }
+
         println!("{:<16} {:<24} {target}", route.host, route.path);
     }
 

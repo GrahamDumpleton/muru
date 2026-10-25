@@ -115,6 +115,85 @@ def redirecting(
         start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "4")])
         return [b"late"]
 
+    # Section 4.16: authentication handlers. The session cookie decides:
+    # ok allows with headers for the target, expired redirects to the
+    # login page, banned is forbidden, nothing is unauthorised; one
+    # handler fails and one is too slow.
+
+    if name == "auth-check":
+        cookies = dict(
+            pair.strip().split("=", 1)
+            for pair in environ.get("HTTP_COOKIE", "").split(";")
+            if "=" in pair
+        )
+        session = cookies.get("session")
+        seen = json.dumps(
+            {
+                "auth_request": environ.get("muru.auth_request"),
+                "internal": is_internal(environ),
+                "method": environ["REQUEST_METHOD"],
+                "original_method": environ.get("muru.original_method"),
+                "original_uri": environ.get("muru.original_uri"),
+                "original_host": environ.get("muru.original_host"),
+                "x_original_uri": environ.get("HTTP_X_ORIGINAL_URI"),
+                "redirect_url": environ.get("REDIRECT_URL"),
+                "request_id": environ.get("muru.request_id"),
+                "content_length": environ.get("CONTENT_LENGTH"),
+                "body": environ["wsgi.input"].read().decode(),
+            }
+        )
+
+        if session == "ok":
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", "8"),
+                    ("X-Auth-User", "alice"),
+                    ("X-Auth-Groups", "staff"),
+                    ("X-Auth-Seen", seen),
+                    ("X-Auth-Secret", "not copied"),
+                ],
+            )
+            return [b"allowed\n"]
+
+        if session == "expired":
+            start_response("302 Found", [("Location", "/login?next=/"), ("Content-Length", "0")])
+            return [b""]
+
+        if session == "banned":
+            body = b"<h1>banned</h1>\n"
+            start_response(
+                "403 Forbidden",
+                [
+                    ("Content-Type", "text/html"),
+                    ("Content-Length", str(len(body))),
+                    ("Set-Cookie", "notice=banned; Path=/"),
+                ],
+            )
+            return [body]
+
+        if session == "broken":
+            raise RuntimeError("the handler failed")
+
+        if session == "slow":
+            time.sleep(3)
+
+        if session == "teapot":
+            start_response("418 Teapot", [("Content-Length", "0")])
+            return [b""]
+
+        body = b"who are you\n"
+        start_response(
+            "401 Unauthorized",
+            [
+                ("Content-Type", "text/plain"),
+                ("Content-Length", str(len(body))),
+                ("WWW-Authenticate", 'Bearer realm="shop"'),
+            ],
+        )
+        return [body]
+
     if name == "internal-info":
         body = json.dumps(
             {
@@ -128,6 +207,9 @@ def redirecting(
                 "redirect_status": environ.get("REDIRECT_STATUS"),
                 "x_user": environ.get("HTTP_X_USER"),
                 "x_muru_secret": environ.get("HTTP_X_MURU_SECRET"),
+                "auth_headers": {
+                    key: value for key, value in environ.items() if key.startswith("HTTP_X_AUTH_")
+                },
                 "request_id": environ.get("muru.request_id"),
                 "body": environ["wsgi.input"].read().decode(),
             }

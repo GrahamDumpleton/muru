@@ -485,6 +485,7 @@ message Route {
   string hash_key = 8;              // the policy's key, when it names one
   bool internal = 9;                // reachable only through internal redirects (section 4.10)
   repeated string accept_redirects_from = 10; // other applications whose redirects may reach the route
+  string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route (section 4.16)
 }
 
 // One release's share of a route's requests, in percent.

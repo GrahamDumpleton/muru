@@ -244,6 +244,15 @@ impl Chain {
         self.0.iter().find_map(|level| level.page(status, reason))
     }
 
+    /// The page configured for exactly this status and reason, at any
+    /// level; a page for the status alone does not count.
+    pub fn reason_page(&self, status: u16, reason: &str) -> Option<Arc<Page>> {
+        let key = format!("{status}:{reason}");
+        self.0
+            .iter()
+            .find_map(|level| level.pages.get(&key).cloned())
+    }
+
     /// Whether, and when, an application's response with this status is
     /// replaced: the most specific level with an override decides.
     pub fn override_for(&self, status: u16) -> Option<When> {

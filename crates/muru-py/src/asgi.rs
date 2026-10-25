@@ -1015,9 +1015,20 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 
     if let Some(internal) = &head.internal {
         muru.set_item("internal", true)?;
-        muru.set_item("redirect_url", &internal.redirect_url)?;
-        muru.set_item("redirect_query_string", &internal.redirect_query_string)?;
-        muru.set_item("redirect_status", internal.redirect_status)?;
+
+        // Section 4.16: an authentication sub-request describes the
+        // request it decides about instead.
+
+        if internal.auth_request {
+            muru.set_item("auth_request", true)?;
+            muru.set_item("original_method", &internal.original_method)?;
+            muru.set_item("original_uri", &internal.original_uri)?;
+            muru.set_item("original_host", &internal.original_host)?;
+        } else {
+            muru.set_item("redirect_url", &internal.redirect_url)?;
+            muru.set_item("redirect_query_string", &internal.redirect_query_string)?;
+            muru.set_item("redirect_status", internal.redirect_status)?;
+        }
 
         if !internal.error_reason.is_empty() {
             muru.set_item("error_reason", &internal.error_reason)?;

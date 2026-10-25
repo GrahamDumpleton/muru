@@ -823,6 +823,11 @@ impl Admin for Service {
                         .unwrap_or_default(),
                     internal: route.internal == Some(true),
                     accept_redirects_from: route.accept_redirects_from,
+                    auth: route
+                        .auth
+                        .as_ref()
+                        .map(|auth| format!("{} {}", auth.app, auth.path))
+                        .unwrap_or_default(),
                     host: route.host,
                     path: route.path,
                     app: route.app,

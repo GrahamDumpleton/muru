@@ -663,6 +663,23 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             valid = false;
         }
 
+        // Section 4.16: the check's handler must be an application, and
+        // the table well formed.
+
+        if let Some(auth) = &route.auth {
+            if let Err(error) = muru_config::check_auth(auth) {
+                plan.errors
+                    .push(format!("route {} {}: {error}", route.host, route.path));
+                valid = false;
+            } else if !known_app(&auth.app) {
+                plan.errors.push(format!(
+                    "route {} {}: auth.app names {}, which is not an application",
+                    route.host, route.path, auth.app
+                ));
+                valid = false;
+            }
+        }
+
         // Section 4.10: the applications a route accepts redirects from
         // must exist.
 
@@ -714,6 +731,10 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                             ", redirects from {}",
                             route.accept_redirects_from.join(", ")
                         ));
+                    }
+
+                    if let Some(auth) = &route.auth {
+                        detail.push_str(&format!(", auth by {} {}", auth.app, auth.path));
                     }
 
                     detail

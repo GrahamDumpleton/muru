@@ -334,3 +334,17 @@ exemptions by path, address and bypass cookie, recorded in the store,
 announced as `maintenance.changed` and marked in `muructl app list`; and
 `muru.error_reason` for handlers. Still to come: the dashboard's
 maintenance control.
+
+Authentication sub-requests (section 4.16) are in: a route's `auth`
+table names an application path the edge asks, with a bodiless GET
+carrying the client's headers, before it serves the route, be it an
+application, a static directory or a WebSocket upgrade; 2xx allows the
+request and adds the `copy_headers` of the answer to it as trusted
+headers, 401, 403 and redirects go back to the client as the handler
+answered, and anything else, a failure, an internal redirect or a
+timeout is 503 `auth_unavailable`; the handler sees
+`muru.auth_request` and the original method, URI and host (as
+`X-Original-*` headers too); allowing decisions can be cached for a
+`ttl` by listed cookies and headers; `muru_auth_requests_total` counts
+decisions by result, and `muructl route list` shows the handler. Still
+to come: HTTP upstreams as handlers or targets.

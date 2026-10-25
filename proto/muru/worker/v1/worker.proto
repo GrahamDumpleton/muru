@@ -93,6 +93,10 @@ message InternalContext {
   repeated Header headers = 4;      // headers added with X-Muru-Redirect-Header-NAME
   uint32 hop = 5;                   // 1 for the first redirect, up to the limit
   string error_reason = 6;          // for an error page sub-request (section 4.12): the reason of the error, as muru.error_reason
+  bool auth_request = 7;            // an authentication sub-request (section 4.16): muru.auth_request, with the original request below and no REDIRECT_* keys
+  string original_method = 8;       // the protected request's method, as muru.original_method
+  string original_uri = 9;          // its path and query, as muru.original_uri
+  string original_host = 10;        // the host it asked for, as muru.original_host
 }
 
 message UploadRef {

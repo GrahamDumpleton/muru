@@ -1160,6 +1160,30 @@ pub fn error_override_message(table: &muru_config::ErrorOverride) -> pb::ErrorOv
     }
 }
 
+/// A route's authentication sub-request as the snapshot carries it
+/// (section 4.16). The table was checked when it was applied.
+pub fn auth_message(table: &muru_config::Auth) -> pb::Auth {
+    let millis = |text: Option<&str>| {
+        text.and_then(|text| muru_config::parse_duration(text).ok())
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    };
+
+    pb::Auth {
+        app: table.app.clone(),
+        path: table.path.clone(),
+        timeout_ms: millis(table.timeout.as_deref()),
+        copy_headers: table.copy_headers.clone(),
+        cache_ttl_ms: millis(table.cache.as_ref().map(|cache| cache.ttl.as_str())),
+        cache_key: table
+            .cache
+            .as_ref()
+            .map(|cache| cache.key.clone())
+            .unwrap_or_default(),
+    }
+}
+
 /// Maintenance mode as the snapshot carries it: whether it is on, and the
 /// release's exemptions.
 fn maintenance_message(on: bool, table: Option<&muru_config::Maintenance>) -> pb::Maintenance {
@@ -2508,6 +2532,7 @@ impl Daemon {
                 accept_redirects_from: route.accept_redirects_from,
                 error_pages: error_pages_message(&route.error_pages, None),
                 error_override: route.error_override.as_ref().map(error_override_message),
+                auth: route.auth.as_ref().map(auth_message),
             })
             .collect();
 

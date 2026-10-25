@@ -54,6 +54,7 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_requests_total` | counter | app, release, group, mount, status, reason | requests completed; `status` is the class (`2xx`) and `reason` is present when Muru generated the response, with the values the [error responses](../reference/errors.md) page lists |
 | `muru_request_duration_seconds` | histogram | app, release, phase | time in the `queue` (waiting for a worker slot), in the `application` (until the response head arrived) and in `total`; the first two only for requests a worker served |
 | `muru_requests_in_flight` | gauge | app, release | requests taken and not yet answered |
+| `muru_auth_requests_total` | counter | result | [authentication sub-requests](auth-subrequests.md) by result: `allowed`, `cached`, `denied` or `unavailable` |
 | `muru_queue_depth` | gauge | app, release, group | requests waiting for a slot |
 | `muru_slots_busy` | gauge | app, release, group | slots handling a request |
 | `muru_slots_total` | gauge | app, release, group | slots across the workers: threads, or the event loop's concurrency |

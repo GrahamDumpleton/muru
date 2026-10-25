@@ -122,6 +122,18 @@ message Route {
   repeated string accept_redirects_from = 15; // applications other than the route's own whose redirects may reach it
   repeated ErrorPage error_pages = 16;  // section 4.12: the route's pages
   ErrorOverride error_override = 17;
+  Auth auth = 18;                       // section 4.16: the decision asked for before the route is served
+}
+
+// A route's authentication sub-request (section 4.16): a bodiless GET to
+// an application path, which allows the request with 2xx.
+message Auth {
+  string app = 1;                       // the application asked
+  string path = 2;                      // the path asked
+  uint64 timeout_ms = 3;                // the handler's budget, queueing included; 2000 when 0
+  repeated string copy_headers = 4;     // headers of an allowing answer added to the request
+  uint64 cache_ttl_ms = 5;              // how long an allowing decision is remembered; not at all when 0
+  repeated string cache_key = 6;        // cookie:NAME and header:NAME entries the decision is keyed by
 }
 
 // A route's traffic policy (section 9.4). Buckets run from 0 to 9999;

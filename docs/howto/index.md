@@ -35,6 +35,7 @@ https
 static-files
 internal-redirects
 error-pages
+auth-subrequests
 compression
 timeouts
 connections

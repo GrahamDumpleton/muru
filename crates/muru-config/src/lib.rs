@@ -986,6 +986,45 @@ pub struct Route {
     /// (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_override: Option<ErrorOverride>,
+    /// An authorisation decision the edge asks an application for before
+    /// it serves the route (section 4.16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Auth>,
+}
+
+/// A route's authentication sub-request (section 4.16): the edge sends a
+/// bodiless GET to an application path and serves the route only when
+/// that answers 2xx.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// The application that decides.
+    pub app: String,
+    /// The path asked, usually of an internal mount or route.
+    pub path: String,
+    /// How long the handler has, queueing included, for example 2s (the
+    /// default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Response headers of an allowing answer added to the request as
+    /// trusted headers; a client's own copies are always removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy_headers: Vec<String>,
+    /// Remember allowing decisions for a while (off without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<AuthCache>,
+}
+
+/// How long and by what an allowing decision is remembered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCache {
+    /// How long a decision stands, for example 30s.
+    pub ttl: String,
+    /// What a decision is keyed by: `cookie:NAME` and `header:NAME`
+    /// entries. A request with none of them present is never served
+    /// from the cache.
+    pub key: Vec<String>,
 }
 
 /// A route's traffic policy (section 9.4): the share of requests each
@@ -1209,6 +1248,66 @@ pub fn check_error_override(table: &ErrorOverride) -> Result<(), String> {
         return Err(format!(
             "error_override: when must be all, empty_body, not_json or html_only, not {when:?}"
         ));
+    }
+
+    Ok(())
+}
+
+/// Check a route's `auth` table: the application and path, the timeout,
+/// the header names and the cache.
+pub fn check_auth(table: &Auth) -> Result<(), String> {
+    if table.app.is_empty() {
+        return Err("auth: app names no application".to_owned());
+    }
+
+    if !table.path.starts_with('/') {
+        return Err(format!("auth: path {:?} must start with /", table.path));
+    }
+
+    if let Some(text) = &table.timeout
+        && let Err(error) = parse_duration(text)
+    {
+        return Err(format!("auth: timeout: {error}"));
+    }
+
+    if let Some(name) = table.copy_headers.iter().find(|name| {
+        name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err(format!("auth: copy_headers: {name:?} is not a header name"));
+    }
+
+    if let Some(name) = table
+        .copy_headers
+        .iter()
+        .find(|name| name.to_ascii_lowercase().starts_with("x-muru-"))
+    {
+        return Err(format!(
+            "auth: copy_headers: {name:?} starts with X-Muru-, which the edge keeps for itself"
+        ));
+    }
+
+    if let Some(cache) = &table.cache {
+        if let Err(error) = parse_duration(&cache.ttl) {
+            return Err(format!("auth: cache.ttl: {error}"));
+        }
+
+        if cache.key.is_empty() {
+            return Err("auth: cache.key names nothing".to_owned());
+        }
+
+        if let Some(key) = cache.key.iter().find(|key| {
+            !matches!(
+                key.split_once(':'),
+                Some(("cookie" | "header", name)) if !name.is_empty()
+            )
+        }) {
+            return Err(format!(
+                "auth: cache.key: {key:?} must be cookie:NAME or header:NAME"
+            ));
+        }
     }
 
     Ok(())
@@ -1693,6 +1792,7 @@ mod tests {
             accept_redirects_from: Vec::new(),
             error_pages: BTreeMap::new(),
             error_override: None,
+            auth: None,
             traffic: Some(Traffic {
                 split: BTreeMap::from([("r2".to_owned(), 10)]),
                 sticky: Some(true),

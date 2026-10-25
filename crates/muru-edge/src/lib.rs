@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 pub mod access;
+pub mod auth;
 pub mod compression;
 pub mod connections;
 pub mod errors;
@@ -728,6 +729,7 @@ async fn serve<I>(
             let mut request_id = base_id.clone();
             let mut issued: Vec<String> = Vec::new();
             let mut handling: Option<Handling> = None;
+            let mut checks = 0usize;
 
             let response = loop {
                 let decision = routing.select(
@@ -786,8 +788,96 @@ async fn serve<I>(
                     client_target: (!hops.is_empty()).then(|| client_target.clone()),
                     hops: hops.clone(),
                     errors,
-                    handler: handling.is_some(),
+                    handler: handling.as_ref().map(|_| link::HANDLER_TIMEOUT),
                 };
+
+                // Section 4.16: a guarded route is served only once its
+                // handler allows the client's request; a sub-request of
+                // the edge's own is not checked again.
+
+                let guard = match &decision {
+                    routing::Decision::Serve {
+                        auth: Some(auth), ..
+                    }
+                    | routing::Decision::Static {
+                        auth: Some(auth), ..
+                    } if origin.is_none() && redirect_to.is_none() => Some(Arc::clone(auth)),
+                    _ => None,
+                };
+
+                if let Some(auth) = guard {
+                    auth.strip(&mut parts.headers);
+                    let hop = hops.len() as u32 + 1;
+                    let sub_id = format!("{base_id}-{hop}");
+                    hops.push(auth.path.clone());
+                    checks += 1;
+                    context.hops = hops.clone();
+                    let outcome = auth::check(
+                        &auth,
+                        auth::Check {
+                            routing: &routing,
+                            parts: &parts,
+                            context: &context,
+                            request_id: &sub_id,
+                            client: &routing::Client {
+                                headers: &parts.headers,
+                                peer: client.ip(),
+                                secure,
+                                ids: &shared.request_ids,
+                            },
+                        },
+                    )
+                    .await;
+
+                    match outcome {
+                        auth::Outcome::Allowed { copied, result } => {
+                            shared.access_log.metrics().count_auth(result);
+
+                            for (name, value) in copied {
+                                parts.headers.append(name, value);
+                            }
+                        }
+                        auth::Outcome::Denied(response) => {
+                            shared.access_log.metrics().count_auth("denied");
+                            let status = response.status();
+
+                            // A page configured for the status and the
+                            // reason replaces the handler's body.
+
+                            if context
+                                .errors
+                                .reason_page(status.as_u16(), auth::DENIED_REASON)
+                                .is_some()
+                            {
+                                let problem = auth::denied(status, response.headers());
+                                break link::reject(&parts, &context, problem);
+                            }
+
+                            let bytes = response
+                                .headers()
+                                .get(CONTENT_LENGTH)
+                                .and_then(|value| value.to_str().ok()?.parse().ok())
+                                .unwrap_or(0);
+                            link::record(
+                                &context,
+                                &parts,
+                                status.as_u16(),
+                                auth::DENIED_REASON,
+                                bytes,
+                            );
+                            break response;
+                        }
+                        auth::Outcome::Unavailable(detail) => {
+                            shared.access_log.metrics().count_auth("unavailable");
+                            tracing::warn!(
+                                app = %auth.app,
+                                target = %parts.uri.path(),
+                                "authentication sub-request failed: {detail}"
+                            );
+                            break link::reject(&parts, &context, auth::unavailable());
+                        }
+                    }
+                }
 
                 let handled = match (redirect_to, decision) {
                     (Some(to), _) => {
@@ -799,6 +889,7 @@ async fn serve<I>(
                             selection,
                             server_name,
                             cookies,
+                            auth: _,
                         },
                     ) => {
                         // Section 4.12: an application does not serve its
@@ -897,6 +988,7 @@ async fn serve<I>(
                             fallback,
                             server_name,
                             cookies,
+                            auth: _,
                         },
                     ) => {
                         // Section 4.9: the file, or the fallback application
@@ -1006,6 +1098,7 @@ async fn serve<I>(
                                     headers: Vec::new(),
                                     hop,
                                     error_reason: handler.reason.to_owned(),
+                                    original: None,
                                 });
                                 origin = Some(routing::Origin {
                                     app: context.app.clone(),
@@ -1049,7 +1142,7 @@ async fn serve<I>(
 
                 hops.push(redirect.target.clone());
 
-                if hops.len() > link::MAX_REDIRECT_HOPS {
+                if hops.len() - checks > link::MAX_REDIRECT_HOPS {
                     break link::reject(
                         &parts,
                         &context,
@@ -1074,6 +1167,7 @@ async fn serve<I>(
                     headers: redirect.headers.clone(),
                     hop,
                     error_reason: String::new(),
+                    original: None,
                 });
                 origin = Some(routing::Origin {
                     app: context.app.clone(),
@@ -1434,6 +1528,22 @@ pub(crate) fn request_head(
                     .collect(),
                 hop: internal.hop,
                 error_reason: internal.error_reason.clone(),
+                auth_request: internal.original.is_some(),
+                original_method: internal
+                    .original
+                    .as_ref()
+                    .map(|original| original.method.clone())
+                    .unwrap_or_default(),
+                original_uri: internal
+                    .original
+                    .as_ref()
+                    .map(|original| original.uri.clone())
+                    .unwrap_or_default(),
+                original_host: internal
+                    .original
+                    .as_ref()
+                    .map(|original| original.host.clone())
+                    .unwrap_or_default(),
             }),
         ..Default::default()
     }

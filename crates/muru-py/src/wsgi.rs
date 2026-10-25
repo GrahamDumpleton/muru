@@ -817,15 +817,29 @@ fn build_environ<'py>(
 
     if let Some(internal) = &head.internal {
         environ.set_item(intern!(py, "muru.internal"), true)?;
-        environ.set_item(intern!(py, "REDIRECT_URL"), &internal.redirect_url)?;
-        environ.set_item(
-            intern!(py, "REDIRECT_QUERY_STRING"),
-            &internal.redirect_query_string,
-        )?;
-        environ.set_item(
-            intern!(py, "REDIRECT_STATUS"),
-            internal.redirect_status.to_string(),
-        )?;
+
+        // Section 4.16: an authentication sub-request describes the
+        // request it decides about instead.
+
+        if internal.auth_request {
+            environ.set_item(intern!(py, "muru.auth_request"), true)?;
+            environ.set_item(
+                intern!(py, "muru.original_method"),
+                &internal.original_method,
+            )?;
+            environ.set_item(intern!(py, "muru.original_uri"), &internal.original_uri)?;
+            environ.set_item(intern!(py, "muru.original_host"), &internal.original_host)?;
+        } else {
+            environ.set_item(intern!(py, "REDIRECT_URL"), &internal.redirect_url)?;
+            environ.set_item(
+                intern!(py, "REDIRECT_QUERY_STRING"),
+                &internal.redirect_query_string,
+            )?;
+            environ.set_item(
+                intern!(py, "REDIRECT_STATUS"),
+                internal.redirect_status.to_string(),
+            )?;
+        }
 
         // Section 4.12: an error page sub-request says which error.
 

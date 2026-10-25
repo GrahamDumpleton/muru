@@ -94,6 +94,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | 507 | upload_spool_full |
 | 403, 405 | blocked (client class or rule), method_not_allowed |
 | any | error_override (an application response the override replaced, with its own status) |
+| 401, 403, 3xx | auth_denied (an authentication handler's own refusal or redirect, with its status) |
 
 ## C.4 Event types
 

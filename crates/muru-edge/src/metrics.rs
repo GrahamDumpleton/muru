@@ -109,6 +109,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests the edge has taken and not yet answered.",
     },
     Family {
+        name: "muru_auth_requests_total",
+        kind: Kind::Counter,
+        help: "Authentication sub-requests, by result: allowed, cached, denied or unavailable.",
+    },
+    Family {
         name: "muru_queue_depth",
         kind: Kind::Gauge,
         help: "Requests waiting for a worker slot.",
@@ -305,6 +310,8 @@ struct Inner {
     requests: BTreeMap<RequestKey, u64>,
     durations: BTreeMap<DurationKey, Durations>,
     in_flight: BTreeMap<ReleaseKey, i64>,
+    /// Authentication sub-requests by result (section 4.16).
+    auth: BTreeMap<String, u64>,
 }
 
 /// The request metrics of one edge, fed by the access log as each request
@@ -363,6 +370,13 @@ impl Metrics {
         }
     }
 
+    /// Count an authentication sub-request (section 4.16) by its result:
+    /// allowed, cached, denied or unavailable.
+    pub fn count_auth(&self, result: &str) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        *inner.auth.entry(result.to_owned()).or_default() += 1;
+    }
+
     /// Every sample of the request metrics.
     pub fn samples(&self) -> Vec<Sample> {
         let inner = self.inner.lock().expect("metrics poisoned");
@@ -399,6 +413,14 @@ impl Metrics {
             samples.push(Sample {
                 name: "muru_requests_in_flight".to_owned(),
                 labels: key.labels(),
+                value: *count as f64,
+            });
+        }
+
+        for (result, count) in &inner.auth {
+            samples.push(Sample {
+                name: "muru_auth_requests_total".to_owned(),
+                labels: vec![("result".to_owned(), result.clone())],
                 value: *count as f64,
             });
         }

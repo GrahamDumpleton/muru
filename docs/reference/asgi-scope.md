@@ -46,6 +46,7 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | `proxy_addr` | Only when a trusted proxy forwarded the request: the address of the proxy that connected, while `client` is the client it forwarded |
 | `internal`, `redirect_url`, `redirect_query_string`, `redirect_status` | Only on a request that arrived by [internal redirect](../howto/internal-redirects.md): `True`, the path and query the client asked for, and the status the redirecting application answered; `muru.is_internal(scope)` reads them |
 | `error_reason` | Only when the edge asked the application for an [error page](../howto/error-pages.md): the error's reason, while `redirect_status` is its status |
+| `auth_request`, `original_method`, `original_uri`, `original_host` | Only on an [authentication sub-request](../howto/auth-subrequests.md): `True`, and the method, path and query, and host of the request being decided about; `internal` is `True` too, and the `redirect_*` keys are absent |
 
 A `websocket` scope also advertises `websocket.http.response`, so the
 application may decline the handshake with a response of its own. No
