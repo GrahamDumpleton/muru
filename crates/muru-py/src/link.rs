@@ -129,6 +129,9 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
             .spawn(move || control_thread(fd, handler, control_shared))?;
     }
 
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    let stop_watchdog = Arc::clone(&watchdog_stop);
+
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
@@ -145,6 +148,18 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
         if let Some(fd) = report {
             tokio::spawn(report_loop(fd, Arc::clone(&accepting), memory_interval));
+        }
+
+        // Section 7.6: the watchdog interrupts requests past the soft
+        // timeout, on a thread of its own so that waiting to attach never
+        // holds up the link.
+
+        if let Some(timeout) = accepting.soft_timeout.as_ref().map(|timeout| timeout.after) {
+            let watchdog_shared = Arc::clone(&accepting);
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-watchdog".to_owned())
+                .spawn(move || watchdog_loop(&watchdog_shared, timeout, &stop))?;
         }
 
         loop {
@@ -185,9 +200,35 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         }
     }
 
+    stop_watchdog.store(true, Ordering::Relaxed);
     Lifecycle::call(lifecycle.on_exit.as_ref());
     drop(runtime);
     served
+}
+
+/// How often the watchdog looks for requests past the soft timeout.
+const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Interrupt requests past the soft timeout until told to stop (section
+/// 7.6), logging each one.
+fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(WATCHDOG_INTERVAL);
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let interrupted = Python::attach(|py| shared.interrupt_overdue(py));
+
+        for (request_id, method, path) in interrupted {
+            eprintln!(
+                "muru: request {request_id} {method} {path} ran past the soft timeout of {}, \
+                 interrupting it",
+                wsgi::describe_seconds(timeout)
+            );
+        }
+    }
 }
 
 /// The read end of the host's pipe: readable only at end of file, when
@@ -572,7 +613,7 @@ async fn handle_request(
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
-    let request_id = shared.request_started(&head);
+    let (request_id, interrupt) = shared.request_started(&head);
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
@@ -580,11 +621,13 @@ async fn handle_request(
         wsgi::run(
             py,
             &worker_shared,
+            request_id,
             &app,
             head,
             body_rx,
             out_tx,
             worker_cancelled,
+            interrupt,
         );
         worker_shared.request_finished(request_id);
     }));
@@ -693,9 +736,9 @@ async fn handle_asgi_request(
     // The task starts on the loop now; the channel is how the two sides
     // of this function reach it.
 
-    let request_id = shared.request_started(&head);
+    let (request_id, _interrupt) = shared.request_started(&head);
 
-    let channel = match asgi::start(shared, asgi, &runner, &head, out_tx) {
+    let channel = match asgi::start(shared, asgi, &runner, &head, out_tx, request_id) {
         Ok(channel) => channel,
         Err(error) => {
             shared.request_finished(request_id);

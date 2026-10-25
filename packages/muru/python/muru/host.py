@@ -56,7 +56,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import _asgi, _inspect, preload
+from muru import RequestTimeout, _asgi, _inspect, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -461,6 +461,7 @@ class Host:
         control: str | None = None,
         max_requests: int | None = None,
         max_lifetime: float | None = None,
+        soft_timeout: float | None = None,
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
@@ -477,6 +478,7 @@ class Host:
         self.concurrency = concurrency
         self.max_requests = max_requests
         self.max_lifetime = max_lifetime
+        self.soft_timeout = soft_timeout
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
@@ -865,6 +867,17 @@ class Host:
         if loop is not None and lifespan is not None:
             asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
 
+        # Section 7.6: the soft timeout interrupts a request by raising
+        # muru.RequestTimeout in its thread, or cancelling its task.
+
+        timeout_arguments: dict[str, Any] = {}
+
+        if self.soft_timeout is not None:
+            timeout_arguments = {
+                "soft_timeout_ms": int(self.soft_timeout * 1000),
+                "timeout_error": RequestTimeout,
+            }
+
         try:
             _native.serve(
                 path or self.socket_path(index),
@@ -885,6 +898,7 @@ class Host:
                     line, active, loop.loop if loop is not None else None, names
                 ),
                 **asgi_arguments,
+                **timeout_arguments,
             )
         except Exception as error:
             log(f"worker {index} failed: {error}")
@@ -2074,6 +2088,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="replace a worker after this long, with jitter (section 7.7)",
     )
     parser.add_argument(
+        "--soft-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="interrupt a request that has run this long with muru.RequestTimeout (section 7.6)",
+    )
+    parser.add_argument(
         "--hard-timeout",
         type=float,
         default=None,
@@ -2283,6 +2304,7 @@ def main(argv: list[str] | None = None) -> int:
         control=args.control,
         max_requests=args.max_requests,
         max_lifetime=args.max_lifetime,
+        soft_timeout=args.soft_timeout,
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,

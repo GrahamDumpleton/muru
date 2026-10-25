@@ -1164,9 +1164,10 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
 
-    /// A host timeout as NAME=DURATION: hard (replace a worker whose
-    /// request runs this long; off), hard_drain_grace (10s) or
-    /// shutdown (5s). Repeatable.
+    /// A host timeout as NAME=DURATION: soft (interrupt a request that
+    /// runs this long; off), hard (replace a worker whose request runs
+    /// this long; off), hard_drain_grace (10s) or shutdown (5s).
+    /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -1391,9 +1392,9 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example hard=60s"))?;
     let name = name.trim();
 
-    if !["hard", "hard_drain_grace", "shutdown"].contains(&name) {
+    if !["soft", "hard", "hard_drain_grace", "shutdown"].contains(&name) {
         return Err(format!(
-            "{name:?} is not a host timeout name: hard, hard_drain_grace or shutdown"
+            "{name:?} is not a host timeout name: soft, hard, hard_drain_grace or shutdown"
         ));
     }
 
@@ -1455,6 +1456,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         max_lifetime_ms: args
             .max_lifetime
             .map(|lifetime| lifetime.as_millis() as u64),
+        soft_timeout_ms: timeout_ms(&args.timeouts, "soft"),
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),

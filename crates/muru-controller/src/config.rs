@@ -1031,6 +1031,11 @@ pub fn resolve_spec(
         "max_lifetime",
     )?;
     let timeouts = crate::model::WorkerTimeouts {
+        soft_timeout_ms: duration_ms(
+            request.soft_timeout_ms,
+            table_timeouts.soft_timeout.as_ref(),
+            "soft_timeout",
+        )?,
         hard_timeout_ms: duration_ms(
             request.hard_timeout_ms,
             table_timeouts.hard_timeout.as_ref(),
@@ -1053,6 +1058,8 @@ pub fn resolve_spec(
     if max_lifetime_ms == Some(0) {
         return Err("max_lifetime must be longer than nothing".to_owned());
     }
+
+    check_timeouts(&timeouts)?;
 
     // Section 7.7: the memory policy, the same way.
 
@@ -1479,6 +1486,12 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         hold: false,
         max_requests: table.max_requests,
         max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
+        soft_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.soft_timeout.as_ref()),
+        ),
         hard_timeout_ms: duration_field(
             table
                 .timeouts
@@ -1608,6 +1621,10 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
             .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
         timeouts: (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
             muru_config::Timeouts {
+                soft_timeout: spec
+                    .timeouts
+                    .soft_timeout_ms
+                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
                 hard_timeout: spec
                     .timeouts
                     .hard_timeout_ms
@@ -1655,6 +1672,23 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
             }
         }),
     }
+}
+
+/// Section 7.6: a soft timeout is a duration, and the hard timeout, the
+/// backstop for a request the soft timeout could not interrupt, must
+/// exceed it by at least 5 s.
+pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
+    if timeouts.soft_timeout_ms == Some(0) {
+        return Err("soft_timeout must be longer than nothing".to_owned());
+    }
+
+    if let (Some(soft), Some(hard)) = (timeouts.soft_timeout_ms, timeouts.hard_timeout_ms)
+        && hard < soft + 5_000
+    {
+        return Err("hard_timeout must exceed soft_timeout by at least 5s".to_owned());
+    }
+
+    Ok(())
 }
 
 /// What a release runs, for the report: entrypoint, processes by threads
@@ -1769,6 +1803,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "max_lifetime",
         describe_ms(declared.max_lifetime_ms),
         describe_ms(recorded.max_lifetime_ms),
+    );
+    compare(
+        "soft_timeout",
+        describe_ms(declared.timeouts.soft_timeout_ms),
+        describe_ms(recorded.timeouts.soft_timeout_ms),
     );
     compare(
         "hard_timeout",
@@ -2033,6 +2072,29 @@ mod tests {
         let mut ids = vec!["r10", "r2", "blue", "r1"];
         ids.sort_by_key(|id| release_order(id));
         assert_eq!(ids, vec!["r1", "r2", "r10", "blue"]);
+    }
+
+    #[test]
+    fn the_hard_timeout_must_back_the_soft_one_up() {
+        let timeouts = |soft: Option<u64>, hard: Option<u64>| crate::model::WorkerTimeouts {
+            soft_timeout_ms: soft,
+            hard_timeout_ms: hard,
+            ..Default::default()
+        };
+        assert_eq!(check_timeouts(&timeouts(None, None)), Ok(()));
+        assert_eq!(check_timeouts(&timeouts(Some(30_000), None)), Ok(()));
+        assert_eq!(
+            check_timeouts(&timeouts(Some(30_000), Some(35_000))),
+            Ok(())
+        );
+        assert_eq!(
+            check_timeouts(&timeouts(Some(30_000), Some(34_999))),
+            Err("hard_timeout must exceed soft_timeout by at least 5s".to_owned())
+        );
+        assert_eq!(
+            check_timeouts(&timeouts(Some(0), None)),
+            Err("soft_timeout must be longer than nothing".to_owned())
+        );
     }
 
     #[test]

@@ -586,8 +586,14 @@ pub struct SecretStore {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
+    /// How long a request may run in a worker before it is interrupted
+    /// by raising `muru.RequestTimeout` in its thread, for example 30s;
+    /// off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout: Option<String>,
     /// How long a request may run in a worker before the worker is
-    /// replaced, for example 60s; off when absent.
+    /// replaced, for example 60s; off when absent. Must exceed the soft
+    /// timeout by at least 5s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_timeout: Option<String>,
     /// How long a worker being replaced is given to finish its other

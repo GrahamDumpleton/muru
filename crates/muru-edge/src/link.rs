@@ -987,10 +987,17 @@ impl Failing<'_> {
             capitalise(&end.error)
         };
 
-        let mut problem = if end.reason == "app_error" {
-            Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "app_error", description)
-        } else {
-            Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description)
+        // Section 7.6: a request the worker's soft timeout interrupted
+        // is a 504; any other failure the application raised is a 500.
+
+        let mut problem = match end.reason.as_str() {
+            "app_error" => {
+                Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "app_error", description)
+            }
+            "soft_timeout" => {
+                Problem::new(StatusCode::GATEWAY_TIMEOUT, "soft_timeout", description)
+            }
+            _ => Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description),
         };
 
         if !end.detail.is_empty() {

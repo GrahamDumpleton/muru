@@ -382,6 +382,10 @@ fn default_check_interval_ms() -> u64 {
 /// milliseconds; the defaults are those of appendix C.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTimeouts {
+    /// How long a request may run before it is interrupted; off when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout_ms: Option<u64>,
     /// How long a request may run before its worker is replaced; off
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,6 +401,7 @@ pub struct WorkerTimeouts {
 impl Default for WorkerTimeouts {
     fn default() -> Self {
         Self {
+            soft_timeout_ms: None,
             hard_timeout_ms: None,
             hard_drain_grace_ms: default_hard_drain_grace_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),

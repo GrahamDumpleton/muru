@@ -1,0 +1,1 @@
+Streaming responses (`text/event-stream` or `X-Accel-Buffering: no`) and accepted WebSockets no longer count toward the hard timeout, which replaced the worker of a long-lived WebSocket as if its request were stuck.

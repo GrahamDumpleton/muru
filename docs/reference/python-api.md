@@ -4,9 +4,9 @@
 :class: note
 
 This is the runtime library's API as it exists today. The rest of the
-planned API (`muru.loop()`, `muru.asgi`, `muru.uploads`,
-`muru.request_id()` and `muru.RequestTimeout`) arrives with the features
-each belongs to; section 6.9 of the design specification lists them.
+planned API (`muru.loop()`, `muru.asgi`, `muru.uploads` and
+`muru.request_id()`) arrives with the features each belongs to; section
+6.9 of the design specification lists them.
 ```
 
 The `muru` package is installed in the interpreter that runs your
@@ -57,6 +57,15 @@ no fork, so `pre_fork` does not run.
 
 [Preload and fork safety](../explanation/preload.md) explains what the
 hooks are for.
+
+## `muru.RequestTimeout`
+
+The exception the soft timeout raises in the thread of a request that
+has run past it (see the [timeouts guide](../howto/timeouts.md)). It is
+a `BaseException` subclass, so handlers that catch `Exception` do not
+swallow it; catch it by name to answer the request yourself, and use
+`finally` for clean-up. It is never raised outside Muru, or in an ASGI
+application, whose task is cancelled instead.
 
 ## `muru.logging`
 

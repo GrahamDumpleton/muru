@@ -142,7 +142,8 @@ Recurring windows use cron plus duration. Overlapping schedules take the highest
 | loop_stall_timeout | event loop stalled | native watchdog | hard path |
 | idle_timeout | no data moved | edge | for streaming routes and WebSockets, which are exempt from soft and hard timeouts |
 
-- Soft timeout uses PyThreadState_SetAsyncExc with a BaseException subclass. Threads blocked in bridge calls are woken immediately; threads in C calls see it when the call returns. The bridge logs the traceback and returns 504 if no response has started. ASGI uses task cancellation.
+- Soft timeout uses PyThreadState_SetAsyncExc with a BaseException subclass. Threads blocked in bridge calls are woken immediately; threads in C calls see it when the call returns. The bridge logs the traceback and returns 504 if no response has started. ASGI uses task cancellation. A pending injection that the request outruns is withdrawn before the thread serves anything else.
+- A request becomes exempt from the soft and hard timeouts once its response head goes out with immediate flushing (text/event-stream, or X-Accel-Buffering: no) or its WebSocket is accepted; until then a streaming route's request is timed like any other.
 - Hard timeout: the worker is removed from routing, a replacement is forked, other requests get hard_drain_grace, stacks are recorded (faulthandler if the GIL cannot be taken), then SIGTERM and SIGKILL after shutdown_timeout.
 - Failsafe layers: native watchdog, host, edge backstop on dispatch age, daemon watching host heartbeats, SIGKILL. hard_timeout must exceed soft_timeout by at least 5 s. Timeout kills do not use the churn budget.
 

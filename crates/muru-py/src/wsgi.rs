@@ -4,7 +4,9 @@
 //! request head, `wsgi.input` reads body frames from a channel, and the
 //! response head and body chunks go to the coalescing task through another
 //! channel. The thread detaches from the interpreter only when it has to
-//! wait: for a body frame, or for room in the response channel.
+//! wait: for a body frame, or for room in the response channel. Each wait
+//! races against the request's interrupt, so the soft timeout (section
+//! 7.6) wakes a thread blocked in the bridge at once.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,7 +23,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
-use crate::pool::Shared;
+use crate::pool::{Interrupt, Shared};
 
 /// One item of application output on its way to the coalescing task.
 pub enum Outgoing {
@@ -77,15 +79,23 @@ pub enum Outgoing {
 /// when the channel is full.
 struct Sink {
     tx: mpsc::Sender<Outgoing>,
+    interrupt: Arc<Interrupt>,
 }
 
 impl Sink {
+    /// Send an item, waiting for room. An interrupted wait drops the item
+    /// and reports success, so the thread returns to Python, where the
+    /// timeout exception is waiting.
     fn send(&self, py: Python<'_>, item: Outgoing) -> bool {
         match self.tx.try_send(item) {
             Ok(()) => true,
             Err(TrySendError::Full(item)) => {
                 let tx = &self.tx;
-                py.detach(|| tx.blocking_send(item).is_ok())
+                let interrupt = &self.interrupt;
+                py.detach(|| match interrupt.block_on(tx.send(item)) {
+                    Some(sent) => sent.is_ok(),
+                    None => true,
+                })
             }
             Err(TrySendError::Closed(_)) => false,
         }
@@ -104,17 +114,28 @@ struct HeadState {
 pub struct StartResponse {
     state: Mutex<HeadState>,
     sink: Sink,
+    /// The worker's shared state and the request's id in it, so a
+    /// streaming response can be exempted from the timeouts.
+    shared: Arc<Shared>,
+    request: u64,
 }
 
 impl StartResponse {
-    fn new(tx: mpsc::Sender<Outgoing>) -> Self {
+    fn new(
+        tx: mpsc::Sender<Outgoing>,
+        shared: Arc<Shared>,
+        request: u64,
+        interrupt: Arc<Interrupt>,
+    ) -> Self {
         Self {
             state: Mutex::new(HeadState {
                 status: None,
                 headers: Vec::new(),
                 sent: false,
             }),
-            sink: Sink { tx },
+            sink: Sink { tx, interrupt },
+            shared,
+            request,
         }
     }
 
@@ -137,6 +158,13 @@ impl StartResponse {
         let headers = std::mem::take(&mut state.headers);
         drop(state);
         let flush = flush_policy(&headers);
+
+        // Section 7.6: a response that streams runs as long as it needs to.
+
+        if flush == pb::FlushPolicy::Immediate {
+            self.shared.request_exempt(self.request);
+        }
+
         if self.sink.send(
             py,
             Outgoing::Head {
@@ -162,30 +190,23 @@ impl StartResponse {
         }
     }
 
-    /// Reply with a plain 500 when the application failed before any output.
     /// The application failed before any response head: the edge renders
-    /// the error page, with the traceback in development mode.
-    fn fail(&self, py: Python<'_>, detail: String) {
+    /// the error page for the reason, with the traceback in development
+    /// mode.
+    fn fail(&self, py: Python<'_>, message: &str, reason: &str, detail: String) {
         self.state.lock().expect("head state poisoned").sent = true;
-        self.sink.send(
-            py,
-            Outgoing::Abort {
-                error: "the application raised an exception".to_owned(),
-                reason: "app_error".to_owned(),
-                detail,
-            },
-        );
+        self.abort(py, message, reason, detail);
     }
 
     /// The application failed after start_response: the edge reports the
     /// error if no output had reached it yet, and truncates the response
     /// otherwise.
-    fn abort(&self, py: Python<'_>, message: &str, detail: String) {
+    fn abort(&self, py: Python<'_>, message: &str, reason: &str, detail: String) {
         self.sink.send(
             py,
             Outgoing::Abort {
                 error: message.to_owned(),
-                reason: "app_error".to_owned(),
+                reason: reason.to_owned(),
                 detail,
             },
         );
@@ -443,10 +464,14 @@ struct InputState {
     /// Where to announce the first read, when the client is waiting for
     /// 100 Continue before it sends the body (section 5.5).
     announce: Option<mpsc::Sender<Outgoing>>,
+    /// The soft timeout's way out of a wait for the body.
+    interrupt: Arc<Interrupt>,
 }
 
 impl InputState {
-    /// Make sure some data is pending unless the body has ended.
+    /// Make sure some data is pending unless the body has ended. An
+    /// interrupted wait ends the body, so the thread returns to Python,
+    /// where the timeout exception is waiting.
     fn fill(&mut self, py: Python<'_>) -> bool {
         if !self.pending.is_empty() {
             return true;
@@ -459,8 +484,9 @@ impl InputState {
         if let Some(tx) = self.announce.take()
             && let Err(TrySendError::Full(item)) = tx.try_send(Outgoing::Continue)
         {
+            let interrupt = &self.interrupt;
             py.detach(|| {
-                let _ = tx.blocking_send(item);
+                let _ = interrupt.block_on(tx.send(item));
             });
         }
 
@@ -468,7 +494,8 @@ impl InputState {
             Ok(data) => Some(data),
             Err(TryRecvError::Empty) => {
                 let rx = &mut self.rx;
-                py.detach(|| rx.blocking_recv())
+                let interrupt = &self.interrupt;
+                py.detach(|| interrupt.block_on(rx.recv()).flatten())
             }
             Err(TryRecvError::Disconnected) => None,
         };
@@ -535,13 +562,18 @@ pub struct Input {
 }
 
 impl Input {
-    fn new(rx: mpsc::Receiver<Bytes>, announce: Option<mpsc::Sender<Outgoing>>) -> Self {
+    fn new(
+        rx: mpsc::Receiver<Bytes>,
+        announce: Option<mpsc::Sender<Outgoing>>,
+        interrupt: Arc<Interrupt>,
+    ) -> Self {
         Self {
             state: Mutex::new(InputState {
                 rx,
                 pending: Bytes::new(),
                 eof: false,
                 announce,
+                interrupt,
             }),
         }
     }
@@ -790,20 +822,26 @@ fn build_environ<'py>(
     Ok(environ)
 }
 
-/// Run one request through the application on the current, attached thread.
+/// Run one request through the application on the current, attached
+/// thread. `request` is the request's id in the shared state and
+/// `interrupt` the soft timeout's way out of the bridge's waits.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 pub fn run(
     py: Python<'_>,
-    shared: &Shared,
+    shared: &Arc<Shared>,
+    request: u64,
     app: &Py<PyAny>,
     head: pb::RequestHead,
     body_rx: mpsc::Receiver<Bytes>,
     tx: mpsc::Sender<Outgoing>,
     cancelled: Arc<AtomicBool>,
+    interrupt: Arc<Interrupt>,
 ) {
     let announce = head.expect_continue.then(|| tx.clone());
     let finished = tx.clone();
+    let started = StartResponse::new(tx, Arc::clone(shared), request, Arc::clone(&interrupt));
 
-    let start_response = match Bound::new(py, StartResponse::new(tx)) {
+    let start_response = match Bound::new(py, started) {
         Ok(start_response) => start_response,
         Err(error) => {
             error.print(py);
@@ -820,6 +858,7 @@ pub fn run(
         announce,
         &start_response,
         &cancelled,
+        Arc::clone(&interrupt),
     ) {
         let broken_pipe = error.is_instance_of::<PyBrokenPipeError>(py);
 
@@ -827,20 +866,52 @@ pub fn run(
             report(py, &error);
         }
 
+        // Section 7.6: the timeout exception, raised in this thread by
+        // the watchdog, is a 504 rather than a 500.
+
+        let timed_out = shared
+            .soft_timeout
+            .as_ref()
+            .filter(|timeout| error.is_instance(py, timeout.error.bind(py)));
+
+        let (message, reason) = match timed_out {
+            Some(timeout) => (
+                format!(
+                    "the request ran past the soft timeout of {}",
+                    describe_seconds(timeout.after)
+                ),
+                "soft_timeout",
+            ),
+            None => (
+                "the application raised an exception".to_owned(),
+                "app_error",
+            ),
+        };
+
         let start_response = start_response.get();
 
         if !start_response.head_sent() {
-            start_response.fail(py, describe(py, &error));
+            start_response.fail(py, &message, reason, describe(py, &error));
         } else if !broken_pipe {
-            start_response.abort(
-                py,
-                "the application raised an exception",
-                describe(py, &error),
-            );
+            start_response.abort(py, &message, reason, describe(py, &error));
         }
     }
-    let sink = Sink { tx: finished };
+    let sink = Sink {
+        tx: finished,
+        interrupt,
+    };
     sink.send(py, Outgoing::Finished);
+}
+
+/// A duration in seconds, as the log shows it: `2 s` or `1.5 s`.
+pub(crate) fn describe_seconds(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs_f64();
+
+    if seconds.fract() == 0.0 {
+        format!("{seconds:.0} s")
+    } else {
+        format!("{seconds} s")
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
@@ -853,8 +924,9 @@ fn run_app<'py>(
     announce: Option<mpsc::Sender<Outgoing>>,
     start_response: &Bound<'py, StartResponse>,
     cancelled: &AtomicBool,
+    interrupt: Arc<Interrupt>,
 ) -> PyResult<()> {
-    let input = Bound::new(py, Input::new(body_rx, announce))?;
+    let input = Bound::new(py, Input::new(body_rx, announce, interrupt))?;
     let environ = build_environ(py, shared, head, input)?;
     let result = app.bind(py).call1((environ, start_response))?;
     let outcome = iterate(py, &result, start_response.get(), cancelled);

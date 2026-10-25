@@ -24,6 +24,8 @@ def serve(
     memory_interval_ms: int = 5000,
     control: int | None = None,
     on_control: Callable[[str, list[dict[str, Any]], dict[int, str]], str] | None = None,
+    soft_timeout_ms: int | None = None,
+    timeout_error: type[BaseException] | None = None,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -38,6 +40,9 @@ def serve(
     write end the host holds, so a worker never outlives its host. mounts
     are the named mounts as (name, application, runner) tuples, the runner
     None for a WSGI mount; event_loop is needed when any mount is ASGI.
+    soft_timeout_ms is the soft timeout, after which a request is
+    interrupted by raising timeout_error (muru.RequestTimeout) in its
+    thread or cancelling its task.
     """
 
 def resolve_future(future: Any, value: Any) -> None:
@@ -57,6 +62,12 @@ class Channel:
 
     def fail(self, detail: str) -> None:
         """Fail the response because the application raised, with the formatted traceback."""
+
+    def started(self, task: Any) -> None:
+        """Note the task the runner started for this request, so the soft timeout can cancel it."""
+
+    def timed_out(self) -> bool:
+        """Whether the soft timeout has cancelled the request's task."""
 
 class Input:
     """The wsgi.input stream."""

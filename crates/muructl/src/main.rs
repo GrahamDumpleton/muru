@@ -380,9 +380,10 @@ struct RunArgs {
 
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s), response_idle (60s),
-    /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; hard
-    /// (off), hard_drain_grace (10s) or shutdown (5s) in the host, which
-    /// replaces a worker whose request runs past the hard timeout.
+    /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
+    /// (off), hard (off), hard_drain_grace (10s) or shutdown (5s) in the
+    /// host, which interrupts a request that runs past the soft timeout
+    /// and replaces a worker whose request runs past the hard timeout.
     /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
@@ -774,6 +775,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "response_idle",
         "keep_alive",
         "keep_alive_proxy",
+        "soft",
         "hard",
         "hard_drain_grace",
         "shutdown",
@@ -782,7 +784,8 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
-             response_idle, keep_alive, keep_alive_proxy, hard, hard_drain_grace or shutdown"
+             response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace or \
+             shutdown"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -909,13 +912,37 @@ pub(crate) fn memory_policy(
     Ok(policy)
 }
 
-/// The host's timeouts from --timeout and a project table (section 7.6):
-/// the hard timeout, the grace for a replaced worker's other requests
-/// and the time before a stopping worker is killed.
+/// The host's timeouts (section 7.6), resolved from --timeout and a
+/// project table.
+pub(crate) struct HostTimeouts {
+    /// How long a request may run before it is interrupted; off when absent.
+    pub soft: Option<Duration>,
+    /// How long a request may run before its worker is replaced; off
+    /// when absent.
+    pub hard: Option<Duration>,
+    /// The grace for a replaced worker's other requests.
+    pub hard_drain_grace: Duration,
+    /// The time before a stopping worker is killed.
+    pub shutdown: Duration,
+}
+
+impl HostTimeouts {
+    /// The timeouts as a `[timeouts]` table, for --print-config.
+    pub fn table(&self) -> muru_config::Timeouts {
+        muru_config::Timeouts {
+            soft_timeout: self.soft.map(muru_config::format_duration),
+            hard_timeout: self.hard.map(muru_config::format_duration),
+            hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
+            shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
+        }
+    }
+}
+
+/// The host's timeouts from --timeout and a project table (section 7.6).
 pub(crate) fn worker_timeouts(
     timeouts: &[(String, Duration)],
     table: Option<&muru_config::Timeouts>,
-) -> anyhow::Result<(Option<Duration>, Duration, Duration)> {
+) -> anyhow::Result<HostTimeouts> {
     let parse = |text: &Option<String>, name: &str| -> anyhow::Result<Option<Duration>> {
         match text {
             Some(text) => muru_config::parse_duration(text)
@@ -924,6 +951,7 @@ pub(crate) fn worker_timeouts(
             None => Ok(None),
         }
     };
+    let mut soft = table.map_or(Ok(None), |table| parse(&table.soft_timeout, "soft_timeout"))?;
     let mut hard = table.map_or(Ok(None), |table| parse(&table.hard_timeout, "hard_timeout"))?;
     let mut grace = table
         .map_or(Ok(None), |table| {
@@ -938,6 +966,7 @@ pub(crate) fn worker_timeouts(
 
     for (name, duration) in timeouts {
         match name.as_str() {
+            "soft" => soft = Some(*duration),
             "hard" => hard = Some(*duration),
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
@@ -945,7 +974,27 @@ pub(crate) fn worker_timeouts(
         }
     }
 
-    Ok((hard, grace, shutdown))
+    // Section 7.6: the hard timeout backs the soft one up, so it must
+    // come later.
+
+    anyhow::ensure!(
+        soft != Some(Duration::ZERO),
+        "soft_timeout must be longer than nothing"
+    );
+
+    if let (Some(soft), Some(hard)) = (soft, hard) {
+        anyhow::ensure!(
+            hard >= soft + Duration::from_secs(5),
+            "hard_timeout must exceed soft_timeout by at least 5s"
+        );
+    }
+
+    Ok(HostTimeouts {
+        soft,
+        hard,
+        hard_drain_grace: grace,
+        shutdown,
+    })
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -1203,13 +1252,9 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         env: resolved.env.clone(),
         scaling: resolved.scaling.clone(),
         timeouts: {
-            let (hard, grace, shutdown) =
-                worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
-            (hard.is_some() || resolved.timeouts.is_some()).then(|| muru_config::Timeouts {
-                hard_timeout: hard.map(muru_config::format_duration),
-                hard_drain_grace: Some(muru_config::format_duration(grace)),
-                shutdown_timeout: Some(muru_config::format_duration(shutdown)),
-            })
+            let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+            (timeouts.soft.is_some() || timeouts.hard.is_some() || resolved.timeouts.is_some())
+                .then(|| timeouts.table())
         },
         memory: {
             let policy = memory_policy(&args.memory, resolved.memory.as_ref())?;
@@ -1467,8 +1512,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
-    let (hard_timeout, hard_drain_grace, shutdown_timeout) =
-        worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
@@ -1514,9 +1558,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime,
-        hard_timeout,
-        hard_drain_grace,
-        shutdown_timeout,
+        soft_timeout: timeouts.soft,
+        hard_timeout: timeouts.hard,
+        hard_drain_grace: timeouts.hard_drain_grace,
+        shutdown_timeout: timeouts.shutdown,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
         env: resolved
             .env

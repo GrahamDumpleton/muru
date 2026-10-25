@@ -97,6 +97,16 @@ pub struct Channel {
     websocket: bool,
     /// Mirrors `SendState.accepted`, for the link's read side.
     accepted: AtomicBool,
+    /// The worker's shared state and the request's id in it, so a
+    /// streaming response or an accepted WebSocket can be exempted from
+    /// the timeouts (section 7.6).
+    shared: Arc<Shared>,
+    request: u64,
+    /// The application's task, once the runner has started it, which the
+    /// soft timeout cancels.
+    task: Mutex<Option<Py<PyAny>>>,
+    /// The soft timeout has cancelled the task.
+    timed_out: AtomicBool,
 }
 
 impl Channel {
@@ -105,6 +115,8 @@ impl Channel {
         asgi: &Asgi,
         tx: mpsc::Sender<Outgoing>,
         head: &pb::RequestHead,
+        shared: Arc<Shared>,
+        request: u64,
     ) -> Self {
         Self {
             inbox: Mutex::new(Inbox {
@@ -124,12 +136,38 @@ impl Channel {
             announce: AtomicBool::new(head.expect_continue),
             websocket: head.scope == pb::Scope::Websocket as i32,
             accepted: AtomicBool::new(false),
+            shared,
+            request,
+            task: Mutex::new(None),
+            timed_out: AtomicBool::new(false),
         }
     }
 
     /// Whether the application has accepted the WebSocket.
     pub fn accepted(&self) -> bool {
         self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Section 7.6: the request has run past the soft timeout. Cancel the
+    /// application's task on the loop; the runner then fails the response
+    /// as a timeout.
+    pub fn cancel(&self, py: Python<'_>) {
+        self.timed_out.store(true, Ordering::SeqCst);
+        let task = self.task.lock().expect("task poisoned").take();
+
+        let Some(task) = task else {
+            return;
+        };
+
+        let cancelled = task.bind(py).getattr("cancel").and_then(|cancel| {
+            self.event_loop
+                .bind(py)
+                .call_method1("call_soon_threadsafe", (cancel,))
+        });
+
+        if let Err(error) = cancelled {
+            tracing::debug!(%error, "cancelling an ASGI task failed");
+        }
     }
 
     /// Hand the WebSocket's connect event to the application.
@@ -302,11 +340,11 @@ impl Channel {
 
     /// End the response with an error: the edge reports it if no output had
     /// reached it yet, and truncates the response otherwise.
-    fn abort(&self, py: Python<'_>, error: &str, detail: String) {
+    fn abort(&self, py: Python<'_>, error: &str, reason: &str, detail: String) {
         let items = vec![
             Outgoing::Abort {
                 error: error.to_owned(),
-                reason: "app_error".to_owned(),
+                reason: reason.to_owned(),
                 detail,
             },
             Outgoing::Finished,
@@ -353,6 +391,10 @@ impl Channel {
                 state.accepted = true;
                 state.head_sent = true;
                 self.accepted.store(true, Ordering::Relaxed);
+
+                // Section 7.6: a WebSocket runs as long as it needs to.
+
+                self.shared.request_exempt(self.request);
                 let head = Outgoing::Head {
                     status: 101,
                     reason: String::new(),
@@ -576,6 +618,14 @@ impl Channel {
                 state.head_sent = true;
                 drop(state);
                 let flush = wsgi::flush_policy(&headers);
+
+                // Section 7.6: a response that streams runs as long as it
+                // needs to.
+
+                if flush == pb::FlushPolicy::Immediate {
+                    self.shared.request_exempt(self.request);
+                }
+
                 self.enqueue(
                     py,
                     vec![Outgoing::Head {
@@ -674,12 +724,13 @@ impl Channel {
         } else {
             "the application returned without sending a response"
         };
-        self.abort(py, error, String::new());
+        self.abort(py, error, "app_error", String::new());
     }
 
-    /// Fail the response because the application raised. `detail` is the
-    /// formatted traceback, shown by the edge in development mode when no
-    /// output had reached it.
+    /// Fail the response because the application raised, or because the
+    /// soft timeout cancelled it. `detail` is the formatted traceback,
+    /// shown by the edge in development mode when no output had reached
+    /// it.
     fn fail(&self, py: Python<'_>, detail: String) {
         let state = self.state.lock().expect("send state poisoned");
         let (body_ended, accepted, closed) = (state.body_ended, state.accepted, state.closed);
@@ -689,7 +740,8 @@ impl Channel {
             return;
         }
 
-        // An accepted WebSocket ends with 1011; anything else is a 500.
+        // An accepted WebSocket ends with 1011; anything else is a 500,
+        // or a 504 for a timeout.
 
         if accepted {
             let _ = self.enqueue(
@@ -702,7 +754,34 @@ impl Channel {
             return;
         }
 
-        self.abort(py, "the application raised an exception", detail);
+        if self.timed_out()
+            && let Some(timeout) = self.shared.soft_timeout.as_ref()
+        {
+            let message = format!(
+                "the request ran past the soft timeout of {}",
+                wsgi::describe_seconds(timeout.after)
+            );
+            self.abort(py, &message, "soft_timeout", detail);
+            return;
+        }
+
+        self.abort(
+            py,
+            "the application raised an exception",
+            "app_error",
+            detail,
+        );
+    }
+
+    /// Note the task the runner started for this request, so the soft
+    /// timeout can cancel it.
+    fn started(&self, task: Py<PyAny>) {
+        *self.task.lock().expect("task poisoned") = Some(task);
+    }
+
+    /// Whether the soft timeout has cancelled the request's task.
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::SeqCst)
     }
 }
 
@@ -959,19 +1038,21 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
 }
 
 /// Start a request on the event loop: build its scope and channel and
-/// schedule the runner. Fails when the loop is gone, which means the
-/// worker is stopping.
+/// schedule the runner. `request` is the request's id in the shared
+/// state. Fails when the loop is gone, which means the worker is
+/// stopping.
 pub fn start(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     asgi: &Asgi,
     runner: &Py<PyAny>,
     head: &pb::RequestHead,
     tx: mpsc::Sender<Outgoing>,
+    request: u64,
 ) -> Result<Py<Channel>, String> {
-    let _ = shared;
     Python::attach(|py| {
-        let channel =
-            Bound::new(py, Channel::new(py, asgi, tx, head)).map_err(|error| error.to_string())?;
+        let channel = Channel::new(py, asgi, tx, head, Arc::clone(shared), request);
+        let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
+        shared.request_channel(request, channel.clone().unbind());
         let scope = build_scope(py, head).map_err(|error| error.to_string())?;
 
         asgi.event_loop

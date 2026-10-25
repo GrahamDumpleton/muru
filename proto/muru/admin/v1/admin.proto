@@ -161,6 +161,7 @@ message DeployRequest {
   optional uint64 memory_check_interval_ms = 27;
   repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
   bool hold = 29;                           // start the release but leave traffic where it is, for a preview or a rollout
+  optional uint64 soft_timeout_ms = 30;     // how long a request may run before it is interrupted (section 7.6)
 }
 
 // One environment variable: a value, or a secret reference.

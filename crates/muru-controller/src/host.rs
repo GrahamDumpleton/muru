@@ -310,6 +310,9 @@ pub struct HostSpec {
     pub max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     pub max_lifetime: Option<Duration>,
+    /// How long a request may run before it is interrupted (section
+    /// 7.6); off when absent.
+    pub soft_timeout: Option<Duration>,
     /// How long a request may run before its worker is replaced (section
     /// 7.6); off when absent.
     pub hard_timeout: Option<Duration>,
@@ -616,6 +619,12 @@ impl HostProcess {
             command
                 .arg("--max-lifetime")
                 .arg(lifetime.as_secs_f64().to_string());
+        }
+
+        if let Some(timeout) = spec.soft_timeout {
+            command
+                .arg("--soft-timeout")
+                .arg(timeout.as_secs_f64().to_string());
         }
 
         if let Some(timeout) = spec.hard_timeout {

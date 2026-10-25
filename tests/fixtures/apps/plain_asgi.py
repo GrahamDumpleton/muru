@@ -134,6 +134,28 @@ async def stream(query: dict[str, str], send: Send) -> None:
     await send({"type": "http.response.body", "body": b""})
 
 
+async def events(query: dict[str, str], send: Send) -> None:
+    """Answer /events with a server-sent event stream, which is exempt from the timeouts."""
+
+    count = int(query.get("count", "5"))
+    delay = float(query.get("delay", "0.1"))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/event-stream")],
+        }
+    )
+
+    for index in range(count):
+        await send(
+            {"type": "http.response.body", "body": b"data: %d\n\n" % index, "more_body": True}
+        )
+        await asyncio.sleep(delay)
+
+    await send({"type": "http.response.body", "body": b""})
+
+
 async def misbehave(path: str, send: Send) -> None:
     """The routes that break the protocol or fail, for the error tests."""
 
@@ -299,6 +321,8 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
         await respond(send, 200, body, "application/octet-stream")
     elif path == "/stream":
         await stream(query, send)
+    elif path == "/events":
+        await events(query, send)
     elif path == "/sleep":
         await asyncio.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"slept\n")

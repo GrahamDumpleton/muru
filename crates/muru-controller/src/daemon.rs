@@ -1973,6 +1973,7 @@ impl Daemon {
             logging: spec.logging.clone(),
             max_requests: spec.max_requests,
             max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
+            soft_timeout: spec.timeouts.soft_timeout_ms.map(Duration::from_millis),
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),

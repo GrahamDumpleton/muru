@@ -285,3 +285,18 @@ Still to come: scheduled capacity, the node budget manager across
 applications, the worker CPU, GIL wait and loop lag signals with the
 diagnosis table, scale to zero, and the floor divided by traffic share
 during canaries.
+
+The soft timeout (section 7.6) is in: `soft_timeout` in the `timeouts`
+table or `--timeout soft=` starts a watchdog thread in each worker that
+raises `muru.RequestTimeout` in the thread of a WSGI request past the
+timeout, waking a thread blocked in the bridge for the request body or
+for room in the response, and cancels the task of an ASGI request; the
+bridge logs the traceback and answers 504 `soft_timeout` unless the
+application catches the exception and answers for itself, an injection
+the request outruns is withdrawn before its thread serves again, and
+streaming responses and WebSockets are exempt from the soft and the hard
+timeout once their head goes out. The hard timeout must exceed the soft
+one by 5 s, checked on `muructl run`, `deploy` and `apply`. Still to
+come: the loop stall timeout, the host's stack capture attached to the
+event when a request passes the soft timeout (section 11.7), and
+`muru.deadline` in the environ.
