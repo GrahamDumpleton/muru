@@ -40,6 +40,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// (section 19.2).
 pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 
+/// The account a root daemon runs the edge and the applications as when
+/// none is named (ADR 0026).
+pub const SERVICE_USER: &str = "muru";
+
 /// What the daemon runs with.
 pub struct Config {
     /// Where everything lives.
@@ -49,6 +53,10 @@ pub struct Config {
     pub listeners: Vec<(SocketAddr, bool)>,
     /// Timeouts and limits for the edge.
     pub limits: muru_edge::Limits,
+    /// The service user named by the `[daemon]` table or `--user`, whom
+    /// a daemon that runs as root starts the edge and the applications
+    /// that name no user as (ADR 0026); `muru` when none is named.
+    pub service_user: Option<String>,
     /// Trusted proxies and the headers taken from them (section 4.7).
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
@@ -306,6 +314,9 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// The service user (ADR 0026), when this daemon is root: whom the
+    /// edge and the applications that name no user run as.
+    service: Option<crate::host::Identity>,
     /// The points the dashboard's charts draw, one a second.
     history: Arc<muru_dashboard::History>,
     /// Turns the edge's counters into those points.
@@ -356,6 +367,21 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             .with_context(|| format!("creating {}", location.path.display()))?;
     }
 
+    // ADR 0026: a daemon that is root starts everything else as the
+    // service user, and does not start without one.
+
+    let service = service_identity(config.service_user.as_deref())?;
+
+    if let (Some(service), Some(access_log)) = (&service, &config.access_log) {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(access_log);
+        service
+            .own(access_log)
+            .with_context(|| format!("giving {} to the service user", access_log.display()))?;
+    }
+
     let store = Arc::new(Store::open(&locations.state_store())?);
     let events = Events::new(Arc::clone(&store));
 
@@ -396,6 +422,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             edge_log.clone(),
             config.access_log.clone(),
             config.limits.clone(),
+            service,
         )
         .await
         .map_err(|error| tracing::info!(%error, "no edge to re-adopt"))
@@ -418,7 +445,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 listeners.push(crate::edges::Listener { socket, tls: *tls });
             }
 
-            let (control, listener_socket) = crate::edges::socket_paths(&locations.run.path, 1);
+            let (control, listener_socket) =
+                crate::edges::socket_paths(&crate::edges::directory(&locations.run.path), 1);
             EdgeProcess::spawn(EdgeSpec {
                 executable: config.executable.clone(),
                 listeners,
@@ -428,6 +456,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 log: edge_log,
                 access_log: config.access_log,
                 limits: config.limits,
+                identity: service,
             })
             .await?
         }
@@ -534,6 +563,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         compression,
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
+        service,
         history,
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
@@ -732,6 +762,53 @@ async fn resolve_env(
 }
 
 /// Write the edge's record for the next daemon.
+/// The service user (ADR 0026) for a daemon that is root: the one named,
+/// else `muru`, which must exist and must not be root. A daemon that is
+/// not root switches to no one, and says so when a user was named.
+fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::Identity>> {
+    if !crate::host::Identity::can_switch() {
+        if let Some(name) = named {
+            tracing::info!("service user {name} not applied: the daemon is not root");
+        }
+
+        return Ok(None);
+    }
+
+    let name = named.unwrap_or(SERVICE_USER);
+    let identity = crate::host::Identity::lookup(name, None, None).map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}: a daemon that runs as root starts the edge and the applications as a \
+             service user, never as root. Create the account (useradd --system \
+             --no-create-home {name}, or a sysusers.d entry), name another with --user or the \
+             [daemon] table's user, or run the daemon as that user instead"
+        )
+    })?;
+    anyhow::ensure!(
+        !identity.is_root(),
+        "the service user {name} is root: name an unprivileged account with --user or the \
+         [daemon] table's user"
+    );
+    tracing::info!(
+        user = name,
+        "the edge and applications run as the service user"
+    );
+    Ok(Some(identity))
+}
+
+/// Give a release's socket directory to the application's user with the
+/// service user's group, set-group-id so that the sockets bound in it
+/// carry that group, and open to the owner and the group alone.
+fn share_sockets(
+    directory: &Path,
+    owner: crate::host::Identity,
+    service: crate::host::Identity,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::os::unix::fs::chown(directory, Some(owner.uid), Some(service.gid))?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o2750))
+}
+
 fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
     write_record(
         &run_dir.join("edge.toml"),
@@ -1546,9 +1623,11 @@ impl Daemon {
         let spec = &release.spec;
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
 
-        // Section 10.9: under a root daemon the host runs as the
-        // application's user; otherwise a configured user is reported
-        // as not applied.
+        // Section 10.9 and ADR 0026: under a root daemon the host runs as
+        // the application's user, or as the service user when it names
+        // none, and never as root unless the application says so, which
+        // is warned about; otherwise a configured user is reported as
+        // not applied.
 
         let identity = match self.store.app(app).ok().and_then(|record| {
             record
@@ -1562,7 +1641,22 @@ impl Daemon {
                     .and_then(|text| u32::from_str_radix(text, 8).ok());
 
                 match crate::host::Identity::lookup(&user, group.as_deref(), mask) {
-                    Ok(identity) => Some(identity),
+                    Ok(identity) => {
+                        if identity.is_root() {
+                            self.events.emit(
+                                "app.user_is_root",
+                                &subject,
+                                "warning",
+                                &format!(
+                                    "user {user}: the release runs as root, which is not \
+                                     recommended; a compromised application would have the \
+                                     node"
+                                ),
+                            );
+                        }
+
+                        Some(identity)
+                    }
                     Err(error) => {
                         let message = format!("the application's user cannot be used: {error:#}");
                         self.set_state(&release, ReleaseState::Failed, &message);
@@ -1581,7 +1675,7 @@ impl Daemon {
                 );
                 None
             }
-            None => None,
+            None => self.service,
         };
 
         // Section 10.8: secrets are resolved now, for this start, and
@@ -1680,6 +1774,20 @@ impl Daemon {
                         .emit("release.failed", &subject, "error", &message);
                     return Err(message);
                 }
+            }
+
+            // The socket directory carries the edge's group, which new
+            // sockets inherit, and opens to that group alone (section
+            // 10.9): the edge reaches the workers without being root.
+
+            if let Some(service) = self.service
+                && let Err(error) = share_sockets(&run_dir.join("r1"), identity, service)
+            {
+                let message = format!("sharing the socket directory with the edge failed: {error}");
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
             }
         }
 

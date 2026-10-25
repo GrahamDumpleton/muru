@@ -7,6 +7,7 @@
 //! finishing its connections once the new one serves.
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -46,6 +47,9 @@ pub struct EdgeSpec {
     pub access_log: Option<PathBuf>,
     /// The limits the edge enforces.
     pub limits: muru_edge::Limits,
+    /// Whom the edge runs as, when the daemon is root (ADR 0026): the
+    /// service user, never root.
+    pub identity: Option<crate::host::Identity>,
 }
 
 /// The edge process and what it was last told.
@@ -68,12 +72,18 @@ const LISTENER_FD: i32 = 3;
 /// How many listeners an edge can be handed.
 const MAX_LISTENERS: usize = 16;
 
+/// The directory under the runtime directory that holds the edges'
+/// sockets: the edge's own, so that it can bind them as the service user.
+pub fn directory(run_dir: &Path) -> PathBuf {
+    run_dir.join("edge")
+}
+
 /// The control socket and the listener-return socket of an edge of the
-/// given generation, in the runtime directory.
-pub fn socket_paths(run_dir: &Path, generation: u32) -> (PathBuf, PathBuf) {
+/// given generation, in the edges' directory.
+pub fn socket_paths(directory: &Path, generation: u32) -> (PathBuf, PathBuf) {
     (
-        run_dir.join(format!("edge-{generation}.sock")),
-        run_dir.join(format!("edge-{generation}-listener.sock")),
+        directory.join(format!("edge-{generation}.sock")),
+        directory.join(format!("edge-{generation}-listener.sock")),
     )
 }
 
@@ -103,6 +113,7 @@ impl EdgeProcess {
         log: PathBuf,
         access_log: Option<PathBuf>,
         limits: muru_edge::Limits,
+        identity: Option<crate::host::Identity>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::host::alive(pid), "the edge process {pid} is gone");
         let mut client = connect(&control).await?;
@@ -143,6 +154,7 @@ impl EdgeProcess {
                 log,
                 access_log,
                 limits,
+                identity,
             },
             process: Process::Adopted(pid),
             snapshot: pb::Snapshot {
@@ -183,16 +195,23 @@ impl EdgeProcess {
         self.spec.limits.request_deadline + Duration::from_secs(5)
     }
 
-    /// Move the spec's sockets to the next generation.
+    /// Move the spec's sockets to the next generation, into the edges'
+    /// directory: an edge adopted from a daemon that kept its sockets in
+    /// the runtime directory itself moves there with its replacement.
     fn next_generation(&mut self) {
-        let run_dir = self
+        let mut directory = self
             .spec
             .control
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
+
+        if directory.file_name().is_none_or(|name| name != "edge") {
+            directory = self::directory(&directory);
+        }
+
         self.spec.generation += 1;
-        let (control, listener_socket) = socket_paths(&run_dir, self.spec.generation);
+        let (control, listener_socket) = socket_paths(&directory, self.spec.generation);
         self.spec.control = control;
         self.spec.listener_socket = listener_socket;
     }
@@ -434,6 +453,21 @@ async fn finish(mut process: Process, control: PathBuf, listener_socket: PathBuf
 /// on, the workers it serves from the start, and its output appended to
 /// its log.
 fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
+    // The edge binds its sockets in a directory of its own, which belongs
+    // to the user it runs as.
+
+    if let Some(directory) = spec.control.parent() {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+
+        if let Some(identity) = &spec.identity {
+            identity
+                .own(directory)
+                .with_context(|| format!("giving {} to the edge's user", directory.display()))?;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o750))?;
+        }
+    }
+
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -514,10 +548,12 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     }
 
     let count = spec.listeners.len();
+    let identity = spec.identity;
 
-    // SAFETY: dup2, fcntl, close and setsid are async-signal-safe and the
-    // closure runs in the child between fork and exec, where it touches
-    // nothing else and allocates nothing (the arrays are on the stack).
+    // SAFETY: dup2, fcntl, close, setsid, setgroups, setgid and setuid are
+    // async-signal-safe and the closure runs in the child between fork and
+    // exec, where it touches nothing else and allocates nothing (the
+    // arrays are on the stack).
 
     unsafe {
         command.pre_exec(move || {
@@ -542,6 +578,21 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
             }
 
             libc::setsid();
+
+            // ADR 0026: the edge parses client traffic, so it never keeps
+            // the daemon's root.
+
+            if let Some(identity) = identity {
+                let groups = [identity.gid as libc::gid_t];
+
+                if libc::setgroups(1, groups.as_ptr()) != 0
+                    || libc::setgid(identity.gid as libc::gid_t) != 0
+                    || libc::setuid(identity.uid as libc::uid_t) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
             Ok(())
         });
     }

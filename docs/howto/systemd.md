@@ -36,10 +36,20 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
-Install it, put the configuration file at `/etc/muru/muru.toml`, and
-start it:
+The unit runs the daemon as root, which keeps root for itself alone:
+the edge and every application that names no user run as the service
+user, `muru` by default, and the daemon does not start without that
+account. The system packages create it with the sysusers.d entry at
+`packaging/sysusers.d/muru.conf`; an installation by hand creates it
+first, or names another account with `--user` on the `ExecStart` line
+or the `[daemon]` table of the configuration file. The [per-application
+users guide](users.md) says what the account needs to read.
+
+Create the account, install the unit, put the configuration file at
+`/etc/muru/muru.toml`, and start it:
 
 ```
+$ sudo useradd --system --no-create-home --shell /usr/sbin/nologin muru
 $ sudo cp packaging/systemd/muru.service /etc/systemd/system/
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now muru

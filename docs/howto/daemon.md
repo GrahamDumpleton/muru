@@ -168,7 +168,11 @@ JSON gateway](dashboard.md) on a loopback address.
 
 The daemon binds the listening sockets itself and hands them to an edge
 process started from the same executable, which carries the traffic;
-the daemon is never on the request path. If the edge exits, the daemon
+the daemon is never on the request path. A daemon that runs as root
+starts the edge, and the applications that name no user, as the service
+user, `muru` unless `--user` or the `[daemon]` table names another, and
+refuses to start when that account does not exist; the [per-application
+users guide](users.md) has the details. If the edge exits, the daemon
 starts another on the same socket with the same routing, and connections
 made in between wait in the socket's backlog rather than being refused.
 The edge's own output goes to `edge.log` in the log directory, and each

@@ -146,6 +146,7 @@ impl Rotator {
         archive.push(format!(".{stamp}"));
         let archive = PathBuf::from(archive);
         std::fs::rename(path, &archive)?;
+        recreate(path, &archive)?;
         let policy = self.policy.clone();
         let base = path.to_path_buf();
         let renamed = archive.clone();
@@ -158,6 +159,26 @@ impl Rotator {
         });
         Ok(archive)
     }
+}
+
+/// Create the log afresh with the archive's mode and owner, so a writer
+/// that runs as another user (ADR 0026) reopens a file it may write,
+/// in a directory it may not create one in.
+fn recreate(path: &Path, archive: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::metadata(archive)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
+
+    if let Err(error) = std::os::unix::fs::chown(path, Some(metadata.uid()), Some(metadata.gid())) {
+        tracing::debug!(%error, path = %path.display(), "the recreated log keeps this user");
+    }
+
+    Ok(())
 }
 
 /// The period a time falls in, as a key: the hour, the day or the week.
@@ -285,6 +306,32 @@ mod tests {
         assert_ne!(period(Every::Hourly, moment), period(Every::Hourly, later));
         assert_eq!(period(Every::Daily, moment), period(Every::Daily, later));
         assert_eq!(period(Every::Off, moment), "");
+    }
+
+    #[tokio::test]
+    async fn rotating_recreates_the_file_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("muru-recreate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        std::fs::write(&log, "x").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let rotator = Rotator::new(Policy {
+            size: None,
+            every: Every::Daily,
+            keep: 2,
+            compress: Compress::Off,
+        });
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
+        let archive = rotator.rotate(&log, now).unwrap();
+        assert!(archive.is_file());
+        assert_eq!(std::fs::read(&log).unwrap(), b"");
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

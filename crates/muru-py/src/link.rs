@@ -13,6 +13,7 @@
 //! the request.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -131,6 +132,11 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
+
+        // The socket's directory carries the edge's group (section 10.9),
+        // and the socket opens to that group whatever the umask left.
+
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
         let mut signals = Signals::new()?;
         let mut lifeline = Lifeline::new(lifeline)?;
 

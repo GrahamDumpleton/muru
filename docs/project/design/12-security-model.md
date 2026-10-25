@@ -13,7 +13,7 @@ The main assets are the applications' data and the node itself. The main threats
 
 | Concern | Control |
 | --- | --- |
-| Privilege | Only the daemon may run as root, to bind low ports, create cgroups and switch to per-application users. It parses no client traffic and drops capabilities it no longer needs. Edges run unprivileged with listening sockets passed in. Each application runs as its own user or in its own container |
+| Privilege | Only the daemon may run as root, to bind low ports, create cgroups and switch to per-application users. It parses no client traffic and drops capabilities it no longer needs. Edges run unprivileged with listening sockets passed in, as the service user (ADR 0026), which is also what an application that names no user runs as; a root daemon never runs either as root unless an application says `user = 'root'`, and refuses to start without the service user's account. Each application runs as its own user or in its own container |
 | Hostile requests | Strict HTTP parsing in hyper, header and body limits, timeouts, slow-client isolation at the edge, per-pool admission control, 421 for unknown hosts and SNI mismatches |
 | Request smuggling | Typed protocol between edge and workers. For HTTP upstreams, strict normalisation and re-framing (section 4.13) |
 | Header spoofing | Forwarding headers only from configured proxies and types, underscore header names dropped, client X-Muru-* headers stripped, internal headers accepted only on internal requests |

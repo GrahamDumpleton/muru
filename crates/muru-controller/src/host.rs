@@ -376,6 +376,11 @@ impl Identity {
     pub fn own(&self, path: &Path) -> std::io::Result<()> {
         std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid))
     }
+
+    /// Whether this is the superuser.
+    pub fn is_root(&self) -> bool {
+        self.uid == 0
+    }
 }
 
 /// A named mount, as the host loads it.

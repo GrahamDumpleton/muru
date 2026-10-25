@@ -445,6 +445,18 @@ pub struct Logs {
     pub compress: Option<String>,
 }
 
+/// The `[daemon]` table of the daemon's file: how the daemon itself runs
+/// (ADR 0026).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Daemon {
+    /// The service user: whom a daemon that runs as root starts the edge,
+    /// and the applications that name no user of their own, as (default
+    /// `muru`). Never root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
 /// The `[secrets]` table of the daemon's file (section 10.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -882,6 +894,9 @@ pub struct Metrics {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    /// How the daemon itself runs (ADR 0026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<Daemon>,
     /// Listeners.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listener: Vec<Listener>,
@@ -942,6 +957,10 @@ impl Document {
 
         if other.limits.is_some() {
             self.limits = other.limits;
+        }
+
+        if other.daemon.is_some() {
+            self.daemon = other.daemon;
         }
 
         if other.metrics.is_some() {

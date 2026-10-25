@@ -174,6 +174,13 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<SocketAddr>,
 
+    /// The service user a daemon running as root starts the edge, and
+    /// the applications that name no user, as; instead of the [daemon]
+    /// table's user (default muru). The account must exist and must not
+    /// be root.
+    #[arg(long, value_name = "NAME")]
+    user: Option<String>,
+
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// version it ran before.
     #[arg(long, hide = true, value_name = "VERSION")]
@@ -240,10 +247,17 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         &document,
         &locations.state.path.join("secrets"),
     )?;
+    let service_user = args.user.clone().or_else(|| {
+        document
+            .daemon
+            .as_ref()
+            .and_then(|table| table.user.clone())
+    });
     muru_controller::daemon::run(muru_controller::daemon::Config {
         locations,
         listeners,
         limits,
+        service_user,
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
         secrets,
@@ -297,6 +311,10 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
     if let Some(dashboard) = args.dashboard {
         command.arg("--dashboard").arg(dashboard.to_string());
+    }
+
+    if let Some(user) = &args.user {
+        command.arg("--user").arg(user);
     }
 
     command.args(args.locations.as_arguments());

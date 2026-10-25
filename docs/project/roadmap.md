@@ -217,5 +217,14 @@ are recorded, applied and exported, a root daemon gives the release's
 directories, secret files and log to the user and starts the host with
 that identity, and a daemon that is not root records an
 `app.user_not_applied` warning (cgroup limits and the admin group
-later). That completes the phase 2 scope; what remains is the exit
-run under sustained load in the virtual machine and the next alpha.
+later). Nothing but the daemon runs as root (ADR 0026): a root daemon
+starts the edge, and every application that names no user, as the
+service user, `muru` unless `--user` or the `[daemon]` table names
+another, refuses to start without that account, which it never creates,
+and records an `app.user_is_root` warning for an application that names
+root; each release's socket directory opens to the application's user
+and the edge's group alone, and a rotated log is recreated with its
+owner. Dropping the daemon's own capabilities to the few it needs is
+the next step on that path and is still to come. That completes the
+phase 2 scope; the exit run under sustained load in the virtual machine
+has passed, and the next alpha follows.
