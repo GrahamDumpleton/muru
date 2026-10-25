@@ -28,6 +28,10 @@ design specification and are added as the features they cover land:
 - `test_dashboard.py`: the read-only dashboard on loopback, its fragments
   and the embedded htmx.
 
+- `test_load.py`: deploys, rollbacks, drains and a daemon restart under
+  sustained load from `support.load`, with zero failed requests; the
+  minute-long cycle carries the slow marker.
+
 Run with `just test-integration`. Scenarios that need Docker, network, root or
 a long time carry markers and are skipped by default. Helpers for starting
 muructl and talking to it are in `tests/support`.

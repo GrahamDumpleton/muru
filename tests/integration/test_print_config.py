@@ -60,3 +60,38 @@ def test_a_factory_entrypoint_keeps_its_factory_settings() -> None:
     assert release["factory_phase"] == "worker"
     assert release["interface"] == "wsgi"
     assert release["processes"] == 1
+
+
+def test_recycling_and_host_timeouts_are_written() -> None:
+    document = print_config(
+        str(PROJECTS / "shop"),
+        "--max-requests",
+        "500",
+        "--max-lifetime",
+        "2h",
+        "--timeout",
+        "hard=45s",
+    )
+    release = document["app"]["shop"]["release"]["r1"]  # type: ignore[index]
+    assert release["max_requests"] == 500
+    assert release["max_lifetime"] == "7200s"
+    assert release["timeouts"] == {
+        "hard_timeout": "45s",
+        "hard_drain_grace": "10s",
+        "shutdown_timeout": "5s",
+    }
+
+
+def test_memory_settings_are_written() -> None:
+    document = print_config(
+        str(PROJECTS / "shop"), "--memory", "soft_limit=800MB", "--memory", "hard_limit=1200MB"
+    )
+    release = document["app"]["shop"]["release"]["r1"]  # type: ignore[index]
+    assert release["memory"] == {
+        "measure": "uss",
+        "soft_limit": "800MB",
+        "soft_for": "120s",
+        "reclaim_first": True,
+        "hard_limit": "1200MB",
+        "check_interval": "5s",
+    }

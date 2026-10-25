@@ -39,18 +39,50 @@ class Daemon:
     log_path: Path
     listeners: list[tuple[int, bool]]
 
-    def muructl(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        """Run a muructl command against this daemon."""
+    def muructl(
+        self, *arguments: str, check: bool = True, stdin: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a muructl command against this daemon, with `stdin` as its input.
+
+        Commands that work from the daemon's files rather than its socket
+        (the secret commands) get the daemon's locations instead.
+        """
 
         muructl = support.muructl_path()
         assert muructl is not None
-        completed = subprocess.run(
-            [str(muructl), *arguments, "--socket", str(self.run_dir / "admin.sock")],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=180,
-        )
+
+        if arguments and arguments[0] == "secret":
+            where = [
+                "--config",
+                str(self.base / "muru.toml"),
+                "--state-dir",
+                str(self.base / "state"),
+                "--run-dir",
+                str(self.run_dir),
+                "--log-dir",
+                str(self.base / "logs"),
+            ]
+        else:
+            where = ["--socket", str(self.run_dir / "admin.sock")]
+
+        try:
+            completed = subprocess.run(
+                [str(muructl), *arguments, *where],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=180,
+                input=stdin,
+            )
+        except subprocess.TimeoutExpired as error:
+            listing = subprocess.run(
+                ["ps", "-ax", "-o", "pid,ppid,stat,command"], capture_output=True, text=True
+            ).stdout
+            ours = [line for line in listing.splitlines() if "muru" in line]
+            raise RuntimeError(
+                f"muructl {' '.join(arguments)} hung for 180 seconds\n"
+                f"--- daemon log tail\n{self.log()[-4000:]}\n--- processes\n" + "\n".join(ours)
+            ) from error
 
         if check and completed.returncode != 0:
             raise RuntimeError(
@@ -97,6 +129,19 @@ class Daemon:
 
         try:
             connection.request("GET", path, headers=headers)
+            raw = connection.getresponse()
+            return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
+        finally:
+            connection.close()
+
+    @staticmethod
+    def request_static(port: int, path: str = "/") -> support.Response:
+        """One request to a daemon this test did not start, by port."""
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+
+        try:
+            connection.request("GET", path)
             raw = connection.getresponse()
             return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
         finally:

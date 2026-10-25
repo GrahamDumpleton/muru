@@ -11,6 +11,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
+    "brotli>=1.2.1",
     "maturin>=1.8,<2",
     "mypy>=1.14",
     "nox>=2025.2.9",
@@ -18,6 +19,7 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.9",
     "towncrier>=24.8",
+    "zstandard>=0.25.0",
 ]
 fixtures = [
     "django>=5.2",

@@ -484,6 +484,18 @@ pub(crate) struct Recording {
     _in_flight: crate::access::InFlight,
 }
 
+/// Record a response the edge produced itself, such as a static file,
+/// in the access log.
+pub(crate) fn record(
+    context: &Context<'_>,
+    parts: &http::request::Parts,
+    status: u16,
+    reason: &str,
+    bytes: u64,
+) {
+    Recording::new(context, parts).complete(status, reason, bytes);
+}
+
 impl Recording {
     fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
         Self {

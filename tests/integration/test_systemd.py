@@ -2,7 +2,8 @@
 
 The daemon reports readiness and stopping with sd_notify when
 NOTIFY_SOCKET names a socket, detaches on SIGTERM as `muructl daemon stop`
-does, re-reads the [proxy] table on `muructl daemon reload` or SIGHUP, and
+does, re-reads the [proxy] and [compression] tables on `muructl daemon
+reload` or SIGHUP, and
 `daemon stop --timeout` bounds the wait for it to exit.
 """
 
@@ -81,7 +82,9 @@ def test_sigterm_detaches_and_the_next_daemon_readopts(tmp_path: Path) -> None:
     second = None
 
     try:
-        assert first.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        assert first.deploy("shop", SHOP, "--processes", "1") == (
+            "muru: release shop@r1 is ready and serving"
+        )
         pid = json.loads(first.get("/info").body)["pid"]
         os.kill(first.process.pid, signal.SIGTERM)
         first.process.wait(timeout=30)
@@ -120,7 +123,7 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
         # Nothing changed yet, and the daemon says so.
 
         unchanged = daemon.muructl("daemon", "reload").stdout
-        assert "the [proxy] table is unchanged" in unchanged, unchanged
+        assert "the [proxy] and [compression] tables are unchanged" in unchanged, unchanged
 
         # The table appears in the file; a reload hands it to the edge.
 
@@ -128,7 +131,7 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
             handle.write("\n[proxy]\ntrusted = ['loopback']\n")
 
         reloaded = daemon.muructl("daemon", "reload").stdout
-        assert "the [proxy] table changed and the edge has it" in reloaded, reloaded
+        assert "the [proxy] and [compression] tables changed and the edge has them" in reloaded
         environ = json.loads(daemon.request("/info", headers=headers).body)["environ"]
         assert environ["REMOTE_ADDR"] == "203.0.113.5"
         assert daemon.events().count("config.reloaded") == 2

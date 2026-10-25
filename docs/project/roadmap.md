@@ -13,7 +13,7 @@ criteria. The full table, with scope and exit criteria, is in
 | 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 2 in progress. Phase 0 landed the
+Current position: phase 2 complete, phase 3 next. Phase 0 landed the
 framed worker link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a
 fixed pool of long-lived application threads and the benchmark harness.
 Phase 1, released as 0.1.0a2, is development mode for one WSGI application:
@@ -29,7 +29,8 @@ development defaults and the loopback rule of section 13.1,
 `--print-config`, the read-only dashboard in `muructl run`, Flask and Django
 fixtures, and the many-threads stress test of section 6.11 on the
 free-threaded build. Sanitizer builds are a future idea (section 20.10).
-Phase 2 so far, released as 0.1.0a3, has the ASGI bridge: one event loop per worker, lifespan
+Phase 2, released as 0.1.0a3 and completed in 0.1.0a4, has the ASGI
+bridge: one event loop per worker, lifespan
 with its state, the sync thread pool, concurrency declared to the edge in
 HELLO, WebSockets relayed by the edge with the MESSAGE and CLOSE frames of
 section 5.6 and checked by the Autobahn suite, the ASGI conformance suite,
@@ -117,5 +118,115 @@ node, every application's releases with their workers and slots, hosts
 and routes, recent requests and events and each serving release's log
 tail, as htmx-refreshed pages and as JSON on the gateway paths, with
 `/metrics` beside them (charts over time, Server-Sent Events, worker
-inspection and mutating actions later). Next from phase 2: worker
-inspection.
+inspection and mutating actions later). The phase's exit criterion has
+its harness: the sustained-load scenarios of `tests/integration/test_load.py`
+keep clients on kept-alive connections through deploys, warm and cold
+rollbacks, drains and daemon restarts, with every request answered 200.
+The daemon upgrade of section 13.4 is in: `muructl daemon upgrade`
+re-executes the daemon from the installed binary, keeping its pid and
+its children, the new image re-adopts the hosts and the edge from their
+records, then starts an edge of its own version on the same listening
+sockets, gives it the snapshot and tells the old edge to stop accepting,
+finish its connections and exit, under load with zero failed requests
+(each edge's sockets are numbered by generation so a replacement never
+collides with the edge it replaces, and a respawned edge is recorded so
+the next daemon re-adopts it). Worker replacement (sections 7.6 and 7.7)
+has its first slice: each worker reports to its host once a second over
+a pipe (requests served, in flight and the age of the oldest), the host
+serves a control socket on which it announces its worker sockets as they
+change and receives the supervisor's acknowledgement, and the daemon and
+`muructl run` re-point the edge from those announcements, so a worker
+past `max_requests` or `max_lifetime` (both with jitter) is replaced by a
+fresh one on a new socket with no request failed, and a worker whose
+request runs past the hard timeout leaves routing at once, has every
+thread's stack written to the log by faulthandler, is replaced, and is
+stopped after `hard_drain_grace` and killed after `shutdown_timeout`,
+all recorded as `worker.*` events. The memory policy of section 7.7 is
+in: each worker measures its USS, PSS and RSS (from smaps_rollup on
+Linux, the task footprint on macOS) at `check_interval` and reports
+them, a worker over the hard limit is replaced at once through the hard
+path, one over the soft limit for `soft_for` is asked to reclaim
+(gc.collect and malloc_trim on SIGUSR2) and recycled if still over, a
+worker index recycled for memory three times in an hour raises
+`memory.leak_suspected`, and each worker's last report is served as
+`muru_worker_memory_bytes`, `muru_worker_requests_total` and
+`muru_worker_requests_in_flight` (max_surge, per-group settings, the
+node budget, allocator settings, per-request deltas and the request id
+on records later). Worker inspection (section 11.7) has its phase 2
+slice: each worker has a control connection to its host, created at
+fork, on which a thread of the runtime library answers requests after
+attaching to the interpreter, and the daemon's Debug operation reaches
+it through the host's control socket; `muructl debug status`, `stacks`
+(with the request each thread serves, merged across workers showing the
+same stack, and SIGQUIT to faulthandler for a worker that cannot
+answer), `tasks` (the event loop's tasks and lag) and `inspect`, and
+`muructl logging level` for time-limited logger levels. The reading
+from outside the process with PEP 768 is deferred by
+[ADR 0025](adr/0025-in-process-inspection-first.md); profiling, tracing,
+memory tracing, attach, exec and the automatic captures are phase 3.
+Response compression (section 4.17) is in: the edge compresses
+responses the client accepts with br, zstd or gzip in the configured
+preference order, for the listed content types and sizes, chunk by chunk
+for streamed bodies, never for a response already encoded or opted out
+with X-Muru-Compress or Cache-Control: no-transform, from the daemon's
+`[compression]` table (applied on reload) or `muructl run`'s defaults
+(per-host and per-route settings, precompressed static variants and
+request decompression later). Static files (section 4.9) have their
+first slice: a route that names a directory is served by the edge with
+index files, ETag and Last-Modified, conditional requests, single
+ranges, precompressed variants next to the file, cache headers with
+exceptions, a redirect to the slash form of a directory, and a fallback
+to an application or a file, never a hidden file, a path that climbs
+out, a symbolic link leaving the directory or a name that differs from
+the file's on disk, declared through apply and exported, and `muructl
+serve-static DIR` serves a directory with the same code (listings,
+release static files, file hints, internal redirects and the metadata
+cache later). Connection limits (section 4.18) have their first slice:
+`max_connections` per listener with a fast 503 edge_overloaded within
+the overload reserve and a close beyond it, `max_connections_per_client`
+by address (IPv6 by /64) applied first with trusted proxies exempt,
+`keep_alive_timeout` and `keep_alive_timeout_proxy` as the idle timer
+of each connection, `max_requests_per_connection` closing with
+Connection: close, `http2.max_concurrent_streams`, and the open and
+refused counts as metrics, from the `[limits]` table or run flags
+(eviction of idle connections under pressure, shrinking idle timeouts,
+per-listener settings, HTTP/2 idle closure and Unix socket listeners
+later). Secrets (section 10.8) are in: `[secrets.store.NAME]` tables of
+the file, env and exec kinds, references from a release's `[env]` table
+or `deploy --secret`, resolved when the release starts and delivered as
+variables or as files named by NAME_FILE, never recorded, exported or
+printed, and `muructl secret set`, `list` and `remove` for file stores
+with the value read from standard input. Built-in log rotation (section
+11.3) is in: the daemon rotates the access log, the edge's log, each
+release's log and its own when the period changes (daily by default, or
+hourly or weekly, in UTC) or a size is reached, has every writer reopen
+by name, compresses the archive in the background with zstd or gzip and
+keeps the newest `keep` archives, from the `[logs]` table, with
+`rotate = 'external'` leaving it to logrotate (reopen_on_rename,
+on_overflow and journald later). The dashboard (section 10.7) has its
+charts and streams: the daemon records a point a second from the edge's
+counters (requests and errors per second, the median and 95th
+percentile from the histogram, in flight, workers) for an hour at one
+second and a day at one minute, serves them on `/v1/history` and as
+Server-Sent Events on `/v1/history/stream`, streams events as rendered
+rows and JSON on `/v1/events/stream`, and the pages draw the charts with
+uPlot and take live events through the htmx SSE extension, both
+vendored; a development run has the same charts (worker inspection
+views and mutating actions later). Per-application users (section 10.9)
+have their first slice: an application's `user`, `group` and `umask`
+are recorded, applied and exported, a root daemon gives the release's
+directories, secret files and log to the user and starts the host with
+that identity, and a daemon that is not root records an
+`app.user_not_applied` warning (cgroup limits and the admin group
+later). Nothing but the daemon runs as root (ADR 0026): a root daemon
+starts the edge, and every application that names no user, as the
+service user, `muru` unless `--user` or the `[daemon]` table names
+another, refuses to start without that account, which it never creates,
+and records an `app.user_is_root` warning for an application that names
+root; each release's socket directory opens to the application's user
+and the edge's group alone, and a rotated log is recreated with its
+owner. Dropping the daemon's own capabilities to the few it needs is
+the next step on that path and is still to come. That completes the
+phase 2 scope: the exit runs passed in the virtual machine, deploys and
+rollbacks under sustained load and daemon and edge restarts and upgrades
+with no failed request, and 0.1.0a4 is the release.

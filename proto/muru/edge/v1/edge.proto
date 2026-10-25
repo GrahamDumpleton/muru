@@ -36,6 +36,16 @@ message Snapshot {
   repeated Route routes = 4;
   repeated AppWorkers apps = 5;
   Proxy proxy = 6;                      // trusted proxies; nothing trusted when absent
+  Compression compression = 7;          // section 4.17; the defaults when absent
+}
+
+// Section 4.17: how responses are compressed for clients.
+message Compression {
+  bool enabled = 1;
+  repeated string encodings = 2;        // br, zstd, gzip in preference order; the defaults when empty
+  uint64 min_size = 3;                  // bytes; the default when 0
+  repeated string types = 4;            // content types, exact or family/*; the defaults when empty
+  string level = 5;                     // fast, default or best; default when empty
 }
 
 // Section 4.7: which peers may speak for the client, and how.
@@ -59,11 +69,21 @@ message Host {
   bool default = 9;                     // answers requests whose host matches no host
 }
 
-// A route (section 4.5): a path prefix of a host to an application.
+// A route (section 4.5): a path prefix of a host to an application, or
+// to a directory of files (section 4.9).
 message Route {
   string host = 1;
   string path = 2;
-  string app = 3;
+  string app = 3;                       // the application, or empty for a static route
+  string static_dir = 4;                // the directory served, for a static route
+  repeated string index = 5;            // index files tried for a directory; index.html when empty
+  string fallback_app = 6;              // the application that takes requests no file answers
+  string fallback_file = 7;             // the file served for paths with no file of their own
+  uint64 cache_max_age_s = 8;           // Cache-Control max-age; none when 0
+  bool cache_immutable = 9;
+  repeated string cache_except = 10;    // patterns of files that get no-cache instead
+  bool no_redirect_slash = 11;          // do not redirect a directory to its slash form
+  bool case_insensitive = 12;           // accept names that differ from the file's on disk
 }
 
 // The worker sockets of an application's serving release: the default

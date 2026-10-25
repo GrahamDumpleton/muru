@@ -16,15 +16,30 @@ HELLO = b"Hello, world!\n"
 LARGE = b"x" * (1024 * 1024)
 
 LOCAL = threading.local()
+
+# What /grow keeps hold of, so the worker's memory stays up.
+
+GROWN: list[bytes] = []
 REQUEST_MARK: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "request_mark", default=None
 )
+
+
+def umask_of_process() -> int:
+    """Read the file creation mask without changing it for long."""
+
+    current = os.umask(0)
+    os.umask(current)
+    return current
 
 
 def info() -> dict[str, Any]:
     is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
     return {
         "pid": os.getpid(),
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "umask": oct(umask_of_process()),
         "gc_enabled": gc.isenabled(),
         "gc_frozen": gc.get_freeze_count(),
         "threads": threading.active_count(),
@@ -88,12 +103,52 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
         return generate()
 
+    if path == "/env":
+        name = query.get("name", "")
+        file_path = os.environ.get(f"{name}_FILE")
+        content = None
+
+        if file_path:
+            with open(file_path, encoding="utf-8") as handle:
+                content = handle.read()
+
+        body = json.dumps(
+            {"value": os.environ.get(name), "file": file_path, "content": content}
+        ).encode()
+        start_response(
+            "200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        )
+        return [body]
+
+    if path == "/text":
+        body = (b"The quick brown fox jumps over the lazy dog. " * 100)[:4096]
+        headers = [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+        ]
+        if query.get("compress") == "off":
+            headers.append(("X-Muru-Compress", "off"))
+        if query.get("transform") == "no":
+            headers.append(("Cache-Control", "no-transform"))
+        if query.get("encoded") == "yes":
+            headers.append(("Content-Encoding", "identity"))
+        start_response("200 OK", headers)
+        return [body]
+
     if path == "/large":
         start_response(
             "200 OK",
             [("Content-Type", "application/octet-stream"), ("Content-Length", str(len(LARGE)))],
         )
         return [LARGE]
+
+    if path == "/grow":
+        GROWN.append(b"x" * (int(query.get("mb", "1")) * 1024 * 1024))
+        body = str(sum(len(chunk) for chunk in GROWN)).encode()
+        start_response(
+            "200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))]
+        )
+        return [body]
 
     if path == "/sleep":
         time.sleep(float(query.get("seconds", "0.1")))

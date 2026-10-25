@@ -18,7 +18,11 @@ def test_queue_timeout_answers_503_queue_full() -> None:
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             slow = pool.submit(server.get, "/sleep?seconds=3")
-            time.sleep(0.3)
+
+            # Long enough for the slow request to hold the only slot, even
+            # on a busy machine.
+
+            time.sleep(1.0)
             started = time.monotonic()
             queued = server.get("/", headers={"Accept": "application/json"})
             waited = time.monotonic() - started

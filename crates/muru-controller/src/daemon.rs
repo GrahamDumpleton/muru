@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
+use crate::host::{HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
@@ -39,6 +40,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// (section 19.2).
 pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 
+/// The account a root daemon runs the edge and the applications as when
+/// none is named (ADR 0026).
+pub const SERVICE_USER: &str = "muru";
+
 /// What the daemon runs with.
 pub struct Config {
     /// Where everything lives.
@@ -48,8 +53,18 @@ pub struct Config {
     pub listeners: Vec<(SocketAddr, bool)>,
     /// Timeouts and limits for the edge.
     pub limits: muru_edge::Limits,
+    /// The service user named by the `[daemon]` table or `--user`, whom
+    /// a daemon that runs as root starts the edge and the applications
+    /// that name no user as (ADR 0026); `muru` when none is named.
+    pub service_user: Option<String>,
     /// Trusted proxies and the headers taken from them (section 4.7).
     pub proxy: Option<muru_config::Proxy>,
+    /// How responses are compressed (section 4.17).
+    pub compression: Option<muru_config::Compression>,
+    /// The secret stores (section 10.8).
+    pub secrets: Vec<crate::secrets::Store>,
+    /// Log rotation (section 11.3), or none for external rotation.
+    pub rotation: Option<crate::rotation::Policy>,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
     /// Where the Prometheus exposition is served, or nowhere.
@@ -60,6 +75,21 @@ pub struct Config {
     pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
+    /// The arguments to re-execute the daemon with on an upgrade (section
+    /// 13.4): its own, with the flag that names the version it ran before.
+    pub upgrade_arguments: Vec<std::ffi::OsString>,
+    /// The version this daemon ran before it re-executed itself for an
+    /// upgrade, or none when it started afresh.
+    pub upgraded_from: Option<String>,
+}
+
+/// An upgrade the daemon is about to carry out (section 13.4).
+#[derive(Debug, Clone)]
+pub struct Upgrade {
+    /// The installed binary the daemon re-executes from.
+    pub executable: PathBuf,
+    /// The version that binary reports.
+    pub version: String,
 }
 
 /// A request for the reconciler, answered when it has been carried out.
@@ -134,6 +164,46 @@ pub enum Command {
         /// Where the acknowledgement goes, before the daemon exits.
         done: oneshot::Sender<()>,
     },
+    /// Re-execute the daemon from the installed binary and replace the
+    /// edge (section 13.4).
+    Upgrade {
+        /// Answered with what is about to happen, before the daemon
+        /// re-executes, or why it will not.
+        done: oneshot::Sender<Result<Upgrade, String>>,
+    },
+    /// A host's control connection is up (section 5.9).
+    HostAttached {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The connection, for acknowledgements.
+        control: HostControl,
+    },
+    /// A host said something over its control connection.
+    HostMessage {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// What it said.
+        message: HostMessage,
+    },
+    /// Ask a release's workers something (section 11.7).
+    Debug {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The operation: status, stacks, tasks, inspect or logging.
+        op: String,
+        /// One worker, or every worker.
+        worker: Option<u32>,
+        /// The operation's arguments.
+        args: serde_json::Value,
+        /// Answered with each worker's reply, or why none could be asked.
+        done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
+    },
 }
 
 /// What a previous daemon left behind about its edge, for re-adoption
@@ -143,6 +213,8 @@ struct EdgeRecord {
     pid: u32,
     control: PathBuf,
     listener_socket: PathBuf,
+    #[serde(default)]
+    generation: u32,
     #[serde(default)]
     listeners: Vec<ListenerRecord>,
 }
@@ -220,6 +292,10 @@ struct Running {
     /// The named groups' sockets and paths.
     groups: Vec<GroupRecord>,
     retained_until: Option<Instant>,
+    /// The host's control connection, once it is up.
+    control: Option<HostControl>,
+    /// What the workers last reported, for metrics.
+    status: Vec<crate::host::WorkerStatus>,
 }
 
 /// The daemon's state while it runs.
@@ -232,6 +308,19 @@ struct Daemon {
     logs: Logs,
     /// The [proxy] table of the configuration file, for every snapshot.
     proxy: Option<pb::Proxy>,
+    /// The [compression] table, for every snapshot.
+    compression: pb::Compression,
+    /// The secret stores releases may refer to (section 10.8).
+    secrets: Vec<crate::secrets::Store>,
+    /// Built-in log rotation (section 11.3), when it is on.
+    rotation: Option<crate::rotation::Rotator>,
+    /// The service user (ADR 0026), when this daemon is root: whom the
+    /// edge and the applications that name no user run as.
+    service: Option<crate::host::Identity>,
+    /// The points the dashboard's charts draw, one a second.
+    history: Arc<muru_dashboard::History>,
+    /// Turns the edge's counters into those points.
+    sampler: muru_dashboard::Sampler,
     running: HashMap<(String, String), Running>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
@@ -242,6 +331,13 @@ struct Daemon {
     /// Whether this process writes to the daemon log file, as a daemon
     /// started in the background does, so a reopen applies to it too.
     owns_log: bool,
+    /// Where the hosts' control messages are sent, into the same inbox
+    /// as the commands.
+    commands: mpsc::Sender<Command>,
+    /// Requests to hosts awaiting their answers, by request id.
+    asked: HashMap<u64, oneshot::Sender<Result<Vec<WorkerReply>, String>>>,
+    /// The last request id given out.
+    last_request: u64,
 }
 
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
@@ -258,6 +354,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("[proxy]: {error}"))?;
     }
 
+    let compression = compression_message(config.compression.as_ref())
+        .map_err(|error| anyhow::anyhow!("[compression]: {error}"))?;
+
     let metrics = config.metrics;
     let dashboard = config.dashboard;
     let sinks = std::mem::take(&mut config.sinks);
@@ -266,6 +365,21 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     for location in [&locations.state, &locations.run, &locations.logs] {
         std::fs::create_dir_all(&location.path)
             .with_context(|| format!("creating {}", location.path.display()))?;
+    }
+
+    // ADR 0026: a daemon that is root starts everything else as the
+    // service user, and does not start without one.
+
+    let service = service_identity(config.service_user.as_deref())?;
+
+    if let (Some(service), Some(access_log)) = (&service, &config.access_log) {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(access_log);
+        service
+            .own(access_log)
+            .with_context(|| format!("giving {} to the service user", access_log.display()))?;
     }
 
     let store = Arc::new(Store::open(&locations.state_store())?);
@@ -291,8 +405,6 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // connections wait in the backlog; the edge is up before any release,
     // answering 503 until one serves.
 
-    let control = locations.run.path.join("edge.sock");
-    let listener_socket = locations.run.path.join("edge-listener.sock");
     let edge_log = locations.logs.path.join("edge.log");
 
     let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
@@ -301,6 +413,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             config.executable.clone(),
             record.control,
             record.listener_socket,
+            record.generation,
             record
                 .listeners
                 .iter()
@@ -309,6 +422,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             edge_log.clone(),
             config.access_log.clone(),
             config.limits.clone(),
+            service,
         )
         .await
         .map_err(|error| tracing::info!(%error, "no edge to re-adopt"))
@@ -331,39 +445,30 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 listeners.push(crate::edges::Listener { socket, tls: *tls });
             }
 
+            let (control, listener_socket) =
+                crate::edges::socket_paths(&crate::edges::directory(&locations.run.path), 1);
             EdgeProcess::spawn(EdgeSpec {
-                executable: config.executable,
+                executable: config.executable.clone(),
                 listeners,
                 control,
                 listener_socket,
+                generation: 1,
                 log: edge_log,
                 access_log: config.access_log,
                 limits: config.limits,
+                identity: service,
             })
             .await?
         }
     };
 
     let listeners = edge.listeners();
-    write_record(
-        &locations.run.path.join("edge.toml"),
-        &EdgeRecord {
-            pid: edge.pid().unwrap_or(0),
-            control: edge.control().to_path_buf(),
-            listener_socket: edge.listener_socket().to_path_buf(),
-            listeners: listeners
-                .iter()
-                .map(|(address, tls)| ListenerRecord {
-                    address: *address,
-                    tls: *tls,
-                })
-                .collect(),
-        },
-    );
+    write_edge_record(&locations.run.path, &edge);
 
     // The admin API on its socket.
 
-    let (commands, mut inbox) = mpsc::channel::<Command>(16);
+    let (commands, mut inbox) = mpsc::channel::<Command>(64);
+    let handle_commands = commands.clone();
     let info = Arc::new(Info {
         locations: locations.clone(),
         listeners: listeners.clone(),
@@ -394,7 +499,11 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
-    // The dashboard and gateway (section 10.7), on an internal address.
+    // The dashboard and gateway (section 10.7), on an internal address,
+    // with the history the reconciler records every second for its
+    // charts.
+
+    let history = Arc::new(muru_dashboard::History::new());
 
     let pages = match dashboard {
         Some(address) => {
@@ -404,6 +513,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             Some(tokio::spawn(crate::dashboard::serve(
                 listener,
                 handle.commands.clone(),
+                Arc::clone(&history),
+                events.clone(),
             )))
         }
         None => None,
@@ -413,23 +524,31 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let (api_stop, api_stopped) = oneshot::channel();
     let api = crate::api::serve(socket.clone(), handle, api_stopped).await?;
     let mut api = tokio::spawn(api);
-    events.emit(
-        "daemon.started",
-        "daemon",
-        "info",
-        &format!(
-            "serving on {}, admin socket {}",
-            listeners
-                .iter()
-                .map(|(address, tls)| format!(
-                    "{}://{address}",
-                    if *tls { "https" } else { "http" }
-                ))
-                .collect::<Vec<_>>()
-                .join(" and "),
-            socket.display()
+    let serving_on = listeners
+        .iter()
+        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
+        .collect::<Vec<_>>()
+        .join(" and ");
+
+    match &config.upgraded_from {
+        Some(before) => events.emit(
+            "daemon.upgraded",
+            "daemon",
+            "info",
+            &format!(
+                "re-executed as version {} (was {before}) from {}, pid {}; serving on {serving_on}",
+                env!("CARGO_PKG_VERSION"),
+                config.executable.display(),
+                std::process::id()
+            ),
         ),
-    );
+        None => events.emit(
+            "daemon.started",
+            "daemon",
+            "info",
+            &format!("serving on {serving_on}, admin socket {}", socket.display()),
+        ),
+    }
 
     let owns_log = writes_to(&locations.daemon_log());
 
@@ -441,20 +560,31 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         info,
         logs: Logs::default(),
         proxy,
+        compression,
+        secrets: config.secrets.clone(),
+        rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
+        service,
+        history,
+        sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
         owns_log,
+        commands: handle_commands,
+        asked: HashMap::new(),
+        last_request: 0,
     };
     daemon.restore().await;
-    crate::notify::ready(&format!(
-        "serving on {}",
-        listeners
-            .iter()
-            .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
-            .collect::<Vec<_>>()
-            .join(" and ")
-    ));
+
+    // Section 13.4: an upgraded daemon replaces the edge with one from
+    // its own image once the hosts are re-adopted and the snapshot is
+    // whole again.
+
+    if config.upgraded_from.is_some() {
+        daemon.replace_edge().await;
+    }
+
+    crate::notify::ready(&format!("serving on {serving_on}"));
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -462,6 +592,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // SIGHUP reloads the configuration file.
 
     let mut drain_on_exit = true;
+    let mut upgrade_to: Option<Upgrade> = None;
     let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -491,6 +622,17 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                     let _ = done.send(());
                     break Ok(());
                 }
+                Some(Command::Upgrade { done }) => match prepare_upgrade().await {
+                    Ok(upgrade) => {
+                        let _ = done.send(Ok(upgrade.clone()));
+                        upgrade_to = Some(upgrade);
+                        drain_on_exit = false;
+                        break Ok(());
+                    }
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                },
                 Some(command) => daemon.carry_out(command).await,
                 None => break Ok(()),
             },
@@ -501,15 +643,23 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
                 daemon.expire_retained().await;
+                daemon.rotate_logs();
+                daemon.sample_history().await;
             }
         }
     };
 
     // Section 13.3: by default the daemon detaches, leaving hosts and the
     // edge serving for the next daemon to re-adopt; with drain it takes
-    // everything down with it.
+    // everything down with it. For an upgrade (section 13.4) it detaches
+    // the same way and then re-executes itself, so the next daemon is
+    // this process with the installed binary's image.
 
-    crate::notify::stopping();
+    if upgrade_to.is_some() {
+        crate::notify::notify("RELOADING=1\nSTATUS=upgrading");
+    } else {
+        crate::notify::stopping();
+    }
 
     if drain_on_exit {
         daemon.stop_all().await;
@@ -518,7 +668,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         daemon
             .events
             .emit("daemon.stopped", "daemon", "info", "stopped");
-    } else {
+    } else if upgrade_to.is_none() {
         daemon.detach();
         daemon.events.emit(
             "daemon.detached",
@@ -526,6 +676,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             "info",
             "detached; hosts and the edge keep serving",
         );
+    } else {
+        daemon.detach();
     }
 
     // The API answers the Shutdown call that brought the daemon here
@@ -547,7 +699,208 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     let _ = std::fs::remove_file(&socket);
+
+    if let Some(upgrade) = upgrade_to {
+        // exec returns only when it failed; the hosts and the edge are
+        // still serving, so this daemon leaves as a detached one does.
+
+        let error = exec_daemon(&upgrade.executable, &config.upgrade_arguments);
+        daemon.events.emit(
+            "daemon.detached",
+            "daemon",
+            "error",
+            &format!(
+                "re-executing {} failed: {error}; hosts and the edge keep serving",
+                upgrade.executable.display()
+            ),
+        );
+        return Err(anyhow::anyhow!(
+            "re-executing {} failed: {error}",
+            upgrade.executable.display()
+        ));
+    }
+
     outcome
+}
+
+/// Section 10.8: the environment a release's host starts with, its
+/// secrets resolved from the stores; a secret delivered as a file is
+/// written under `secrets_dir` and the variable NAME_FILE names it.
+async fn resolve_env(
+    stores: &[crate::secrets::Store],
+    env: &[crate::model::EnvSpec],
+    secrets_dir: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let mut resolved = Vec::with_capacity(env.len());
+
+    for entry in env {
+        let (Some(store_name), Some(key)) = (&entry.secret_store, &entry.secret_key) else {
+            resolved.push((entry.name.clone(), entry.value.clone().unwrap_or_default()));
+            continue;
+        };
+        let store = stores
+            .iter()
+            .find(|store| &store.name == store_name)
+            .ok_or_else(|| format!("env {}: no secret store named {store_name}", entry.name))?;
+        let value = store.resolve(key).await?;
+
+        if entry.as_file {
+            let path = secrets_dir.join(&entry.name);
+            crate::secrets::write_private(&path, &value).map_err(|error| {
+                format!(
+                    "env {}: writing the secret file failed: {error}",
+                    entry.name
+                )
+            })?;
+            resolved.push((format!("{}_FILE", entry.name), path.display().to_string()));
+        } else {
+            resolved.push((entry.name.clone(), value));
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Write the edge's record for the next daemon.
+/// The service user (ADR 0026) for a daemon that is root: the one named,
+/// else `muru`, which must exist and must not be root. A daemon that is
+/// not root switches to no one, and says so when a user was named.
+fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::Identity>> {
+    if !crate::host::Identity::can_switch() {
+        if let Some(name) = named {
+            tracing::info!("service user {name} not applied: the daemon is not root");
+        }
+
+        return Ok(None);
+    }
+
+    let name = named.unwrap_or(SERVICE_USER);
+    let identity = crate::host::Identity::lookup(name, None, None).map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}: a daemon that runs as root starts the edge and the applications as a \
+             service user, never as root. Create the account (useradd --system \
+             --no-create-home {name}, or a sysusers.d entry), name another with --user or the \
+             [daemon] table's user, or run the daemon as that user instead"
+        )
+    })?;
+    anyhow::ensure!(
+        !identity.is_root(),
+        "the service user {name} is root: name an unprivileged account with --user or the \
+         [daemon] table's user"
+    );
+    tracing::info!(
+        user = name,
+        "the edge and applications run as the service user"
+    );
+    Ok(Some(identity))
+}
+
+/// Give a release's socket directory to the application's user with the
+/// service user's group, set-group-id so that the sockets bound in it
+/// carry that group, and open to the owner and the group alone.
+fn share_sockets(
+    directory: &Path,
+    owner: crate::host::Identity,
+    service: crate::host::Identity,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::os::unix::fs::chown(directory, Some(owner.uid), Some(service.gid))?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o2750))
+}
+
+fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
+    write_record(
+        &run_dir.join("edge.toml"),
+        &EdgeRecord {
+            pid: edge.pid().unwrap_or(0),
+            control: edge.control().to_path_buf(),
+            listener_socket: edge.listener_socket().to_path_buf(),
+            generation: edge.generation(),
+            listeners: edge
+                .listeners()
+                .iter()
+                .map(|(address, tls)| ListenerRecord {
+                    address: *address,
+                    tls: *tls,
+                })
+                .collect(),
+        },
+    );
+}
+
+/// Section 13.4: the binary an upgrade re-executes from. The daemon was
+/// started as `muructl` by name or by path, so the installed binary is
+/// the one that name finds on the PATH or that path names now; what the
+/// kernel reports as the running executable may be a replaced file.
+pub fn installed_executable() -> anyhow::Result<PathBuf> {
+    let name = std::env::args_os()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the daemon has no command name"))?;
+    let name = PathBuf::from(name);
+
+    let found = if name.components().count() > 1 {
+        name.is_file().then_some(name)
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(&name))
+                .find(|candidate| candidate.is_file())
+        })
+    };
+
+    match found {
+        Some(path) => Ok(path),
+        None => std::env::current_exe().context("finding the installed executable"),
+    }
+}
+
+/// Check the installed binary runs, and learn its version, before the
+/// daemon commits to re-executing from it.
+async fn prepare_upgrade() -> Result<Upgrade, String> {
+    let executable = installed_executable().map_err(|error| format!("{error:#}"))?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(&executable)
+            .arg("--version")
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("{} did not report its version", executable.display()))?
+    .map_err(|error| format!("{} cannot be run: {error}", executable.display()))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed to report its version: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .to_owned();
+
+    if version.is_empty() {
+        return Err(format!("{} reported no version", executable.display()));
+    }
+
+    Ok(Upgrade {
+        executable,
+        version,
+    })
+}
+
+/// Replace this process's image with the installed binary, keeping the
+/// pid, the children and the environment. Returns only on failure.
+fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    std::process::Command::new(executable)
+        .args(arguments)
+        .exec()
 }
 
 /// The [proxy] table as the snapshot carries it, with the defaults of
@@ -569,6 +922,36 @@ fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
         recursive: proxy.recursive.unwrap_or(true),
         consume: proxy.forwarded_headers == Some(muru_config::ForwardedHeaders::Consume),
     }
+}
+
+/// The [compression] table as the snapshot carries it, checked: the
+/// defaults of section 4.17 where the table is silent.
+fn compression_message(
+    table: Option<&muru_config::Compression>,
+) -> Result<pb::Compression, String> {
+    let Some(table) = table else {
+        return Ok(muru_edge::compression::Compression::default().to_message());
+    };
+
+    let min_size = match &table.min_size {
+        Some(text) => {
+            muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))?
+        }
+        None => 0,
+    };
+
+    let message = pb::Compression {
+        enabled: table.enabled.unwrap_or(true),
+        encodings: table.encodings.clone(),
+        min_size,
+        types: table.types.clone(),
+        level: table.level.clone().unwrap_or_default(),
+    };
+
+    // Checked the way the edge will read it, so a bad word is refused
+    // here rather than in the edge's log.
+
+    muru_edge::compression::Compression::from_snapshot(&message).map(|policy| policy.to_message())
 }
 
 /// A host's certificate chain and key as PEM text, for the snapshot.
@@ -838,20 +1221,23 @@ impl Daemon {
                 .map_err(|error| format!("[proxy]: {error}"))?;
         }
 
-        let changed = proxy != self.proxy;
+        let compression = compression_message(document.compression.as_ref())
+            .map_err(|error| format!("[compression]: {error}"))?;
+        let changed = proxy != self.proxy || compression != self.compression;
         self.proxy = proxy;
+        self.compression = compression;
 
         if changed {
             self.push_snapshot().await?;
         }
 
         let message = format!(
-            "reloaded {}: the [proxy] table {}; listeners, limits, metrics and event sinks are read at start",
+            "reloaded {}: the [proxy] and [compression] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
-                "changed and the edge has it"
+                "changed and the edge has them"
             } else {
-                "is unchanged"
+                "are unchanged"
             }
         );
         self.events
@@ -890,6 +1276,48 @@ impl Daemon {
                     ],
                     workers as f64,
                 ));
+            }
+
+            // Sections 7.6 and 7.7: what each worker last reported.
+
+            for worker in &running.status {
+                let index = worker.index.to_string();
+                let labels = [
+                    ("app", app.as_str()),
+                    ("release", id.as_str()),
+                    ("group", worker.group.as_str()),
+                    ("worker", index.as_str()),
+                ];
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_worker_requests_total",
+                    &labels,
+                    worker.requests as f64,
+                ));
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_worker_requests_in_flight",
+                    &labels,
+                    worker.in_flight as f64,
+                ));
+
+                for (measure, bytes) in [
+                    ("rss", worker.rss),
+                    ("pss", worker.pss),
+                    ("uss", worker.uss),
+                ] {
+                    if let Some(bytes) = bytes {
+                        samples.push(muru_edge::metrics::Sample::new(
+                            "muru_worker_memory_bytes",
+                            &[
+                                ("app", app.as_str()),
+                                ("release", id.as_str()),
+                                ("group", worker.group.as_str()),
+                                ("worker", index.as_str()),
+                                ("measure", measure),
+                            ],
+                            bytes as f64,
+                        ));
+                    }
+                }
             }
         }
 
@@ -991,8 +1419,11 @@ impl Daemon {
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
+                        control: None,
+                        status: Vec::new(),
                     },
                 );
+                self.attach_control(app, id);
                 self.events.emit(
                     "release.adopted",
                     &format!("{app}@{id}"),
@@ -1051,7 +1482,41 @@ impl Daemon {
             Command::Dashboard { done } => {
                 let _ = done.send(self.dashboard_data().await);
             }
-            Command::Shutdown { .. } => {}
+            Command::HostAttached { app, id, control } => {
+                if let Some(running) = self.running.get_mut(&(app, id)) {
+                    running.control = Some(control);
+                }
+            }
+            Command::HostMessage { app, id, message } => {
+                self.host_message(&app, &id, message).await;
+            }
+            Command::Debug {
+                app,
+                id,
+                op,
+                worker,
+                args,
+                done,
+            } => {
+                let control = self
+                    .running
+                    .get(&(app.clone(), id.clone()))
+                    .and_then(|running| running.control.as_ref());
+
+                match control {
+                    Some(control) => {
+                        self.last_request += 1;
+                        control.request(self.last_request, &op, worker, &args);
+                        self.asked.insert(self.last_request, done);
+                    }
+                    None => {
+                        let _ = done.send(Err(format!(
+                            "release {app}@{id} is not running with a host control connection"
+                        )));
+                    }
+                }
+            }
+            Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
     }
 
@@ -1156,6 +1621,76 @@ impl Daemon {
 
         self.set_state(&release, ReleaseState::Starting, "starting the host");
         let spec = &release.spec;
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+
+        // Section 10.9 and ADR 0026: under a root daemon the host runs as
+        // the application's user, or as the service user when it names
+        // none, and never as root unless the application says so, which
+        // is warned about; otherwise a configured user is reported as
+        // not applied.
+
+        let identity = match self.store.app(app).ok().and_then(|record| {
+            record
+                .user
+                .clone()
+                .map(|user| (user, record.group.clone(), record.umask.clone()))
+        }) {
+            Some((user, group, umask)) if crate::host::Identity::can_switch() => {
+                let mask = umask
+                    .as_deref()
+                    .and_then(|text| u32::from_str_radix(text, 8).ok());
+
+                match crate::host::Identity::lookup(&user, group.as_deref(), mask) {
+                    Ok(identity) => {
+                        if identity.is_root() {
+                            self.events.emit(
+                                "app.user_is_root",
+                                &subject,
+                                "warning",
+                                &format!(
+                                    "user {user}: the release runs as root, which is not \
+                                     recommended; a compromised application would have the \
+                                     node"
+                                ),
+                            );
+                        }
+
+                        Some(identity)
+                    }
+                    Err(error) => {
+                        let message = format!("the application's user cannot be used: {error:#}");
+                        self.set_state(&release, ReleaseState::Failed, &message);
+                        self.events
+                            .emit("release.failed", &subject, "error", &message);
+                        return Err(message);
+                    }
+                }
+            }
+            Some((user, _, _)) => {
+                self.events.emit(
+                    "app.user_not_applied",
+                    &subject,
+                    "warning",
+                    &format!("user {user} not applied: the daemon is not root"),
+                );
+                None
+            }
+            None => self.service,
+        };
+
+        // Section 10.8: secrets are resolved now, for this start, and
+        // delivered as variables or as files only the host can read.
+
+        let env = match resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await {
+            Ok(env) => env,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
         let host_spec = HostSpec {
             python: spec.python.clone(),
             app: spec.entrypoint.clone(),
@@ -1172,6 +1707,14 @@ impl Daemon {
             single: false,
             detach_to: Some(self.host_log(app, id)),
             logging: spec.logging.clone(),
+            max_requests: spec.max_requests,
+            max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
+            hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
+            hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
+            shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
+            memory: spec.memory.clone(),
+            env,
+            identity,
             groups: spec
                 .groups
                 .iter()
@@ -1194,8 +1737,59 @@ impl Daemon {
                 })
                 .collect(),
         };
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let started = Instant::now();
+
+        // The release's directories, its secret files and its log belong
+        // to the user the host runs as, so it can bind its sockets,
+        // read its secrets and reopen its log.
+
+        if let Some(identity) = identity {
+            let owned = [run_dir.clone(), run_dir.join("r1"), run_dir.join("secrets")];
+
+            for path in &owned {
+                let _ = std::fs::create_dir_all(path);
+            }
+
+            let mut paths: Vec<PathBuf> = owned.to_vec();
+
+            if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
+                paths.extend(entries.flatten().map(|entry| entry.path()));
+            }
+
+            let log = self.host_log(app, id);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log);
+            paths.push(log);
+
+            for path in paths {
+                if let Err(error) = identity.own(&path) {
+                    let message = format!(
+                        "giving {} to the application's user failed: {error}",
+                        path.display()
+                    );
+                    self.set_state(&release, ReleaseState::Failed, &message);
+                    self.events
+                        .emit("release.failed", &subject, "error", &message);
+                    return Err(message);
+                }
+            }
+
+            // The socket directory carries the edge's group, which new
+            // sockets inherit, and opens to that group alone (section
+            // 10.9): the edge reaches the workers without being root.
+
+            if let Some(service) = self.service
+                && let Err(error) = share_sockets(&run_dir.join("r1"), identity, service)
+            {
+                let message = format!("sharing the socket directory with the edge failed: {error}");
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        }
 
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
@@ -1249,8 +1843,11 @@ impl Daemon {
                 sockets,
                 groups,
                 retained_until: None,
+                control: None,
+                status: Vec::new(),
             },
         );
+        self.attach_control(app, id);
         self.set_state(&release, ReleaseState::Ready, "");
         self.events.emit(
             "release.ready",
@@ -1407,6 +2004,36 @@ impl Daemon {
                 host: route.host,
                 path: route.path,
                 app: route.app,
+                static_dir: route.static_dir.unwrap_or_default(),
+                index: route.index,
+                fallback_app: route
+                    .fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.app.clone())
+                    .unwrap_or_default(),
+                fallback_file: route
+                    .fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.file.clone())
+                    .unwrap_or_default(),
+                cache_max_age_s: route
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.max_age.as_deref())
+                    .and_then(|text| muru_config::parse_duration(text).ok())
+                    .map_or(0, |duration| duration.as_secs()),
+                cache_immutable: route
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.immutable)
+                    .unwrap_or(false),
+                cache_except: route
+                    .cache
+                    .as_ref()
+                    .map(|cache| cache.except.clone())
+                    .unwrap_or_default(),
+                no_redirect_slash: route.redirect_slash == Some(false),
+                case_insensitive: route.case.as_deref() == Some("insensitive"),
             })
             .collect();
 
@@ -1417,6 +2044,7 @@ impl Daemon {
             routes,
             apps,
             proxy: self.proxy.clone(),
+            compression: Some(self.compression.clone()),
         }
     }
 
@@ -1657,6 +2285,7 @@ impl Daemon {
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                write_edge_record(&self.locations.run.path, &self.edge);
                 self.events.emit(
                     "edge.restarted",
                     "edge",
@@ -1667,6 +2296,173 @@ impl Daemon {
             Err(error) => {
                 self.events
                     .emit("edge.failed", "edge", "error", &format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Section 5.9: connect to a running host's control socket in the
+    /// background and feed what it says into the daemon's inbox.
+    fn attach_control(&self, app: &str, id: &str) {
+        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+            return;
+        };
+        let path = running.host.control_path();
+        let commands = self.commands.clone();
+        let (app, id) = (app.to_owned(), id.to_owned());
+
+        tokio::spawn(async move {
+            let (control, mut messages) = match HostControl::connect(&path).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    tracing::info!(%error, "release {app}@{id}: no host control connection");
+                    return;
+                }
+            };
+
+            if commands
+                .send(Command::HostAttached {
+                    app: app.clone(),
+                    id: id.clone(),
+                    control,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            while let Some(message) = messages.recv().await {
+                let sent = commands
+                    .send(Command::HostMessage {
+                        app: app.clone(),
+                        id: id.clone(),
+                        message,
+                    })
+                    .await;
+
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Act on what a host said: new worker sockets go into the record
+    /// and, when the release serves, into the next snapshot, and are
+    /// acknowledged; events are recorded under the release.
+    async fn host_message(&mut self, app: &str, id: &str, message: HostMessage) {
+        let key = (app.to_owned(), id.to_owned());
+
+        match message {
+            HostMessage::Workers {
+                version,
+                sockets,
+                groups,
+            } => {
+                let Some(running) = self.running.get_mut(&key) else {
+                    return;
+                };
+                running.sockets = sockets;
+
+                for (name, group_sockets) in groups {
+                    if let Some(group) = running.groups.iter_mut().find(|group| group.name == name)
+                    {
+                        group.sockets = group_sockets;
+                    }
+                }
+
+                let mut all = running.sockets.clone();
+
+                for group in &running.groups {
+                    all.extend(group.sockets.iter().cloned());
+                }
+
+                write_record(
+                    &running.host.run_dir().join("..").join("host.toml"),
+                    &HostRecord {
+                        pid: running.host.pid().unwrap_or(0),
+                        sockets: all,
+                        groups: running.groups.clone(),
+                    },
+                );
+
+                if self.serving.get(app) == Some(&id.to_owned())
+                    && let Err(error) = self.push_snapshot().await
+                {
+                    tracing::error!(%error, "pushing the snapshot after a worker change failed");
+                    return;
+                }
+
+                if let Some(control) = self
+                    .running
+                    .get(&key)
+                    .and_then(|running| running.control.as_ref())
+                {
+                    control.acknowledge(version);
+                }
+            }
+            HostMessage::Status { workers } => {
+                if let Some(running) = self.running.get_mut(&key) {
+                    running.status = workers;
+                }
+            }
+            HostMessage::Response { id, workers, error } => {
+                if let Some(done) = self.asked.remove(&id) {
+                    let _ = done.send(if error.is_empty() {
+                        Ok(workers)
+                    } else {
+                        Err(error)
+                    });
+                }
+            }
+            HostMessage::Event {
+                kind,
+                level,
+                message,
+            } => {
+                let level = match level.as_str() {
+                    "error" => "error",
+                    "warning" => "warning",
+                    "notice" => "notice",
+                    _ => "info",
+                };
+
+                self.events
+                    .emit(&kind, &format!("{app}@{id}"), level, &message);
+            }
+        }
+    }
+
+    /// Section 13.4: replace the edge with one started from this image on
+    /// the same listeners; the old one finishes its connections and exits.
+    async fn replace_edge(&mut self) {
+        let grace = self.edge.drain_grace();
+
+        match self.edge.replace(grace).await {
+            Ok(old_pid) => {
+                let pid = self.edge.pid().unwrap_or(0);
+                self.info
+                    .edge_pid
+                    .store(pid, std::sync::atomic::Ordering::Relaxed);
+                write_edge_record(&self.locations.run.path, &self.edge);
+                self.events.emit(
+                    "edge.replaced",
+                    "edge",
+                    "info",
+                    &format!(
+                        "edge pid {old_pid} replaced by pid {pid} on the same listeners; the old edge finishes its connections and exits"
+                    ),
+                );
+            }
+            Err(error) => {
+                self.events.emit(
+                    "edge.failed",
+                    "edge",
+                    "error",
+                    &format!(
+                        "the edge could not be replaced: {error:#}; the old edge keeps serving"
+                    ),
+                );
             }
         }
     }
@@ -1710,6 +2506,104 @@ impl Daemon {
     /// and each host its release log on SIGUSR1; SIGUSR2 makes a host
     /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
     /// files the application opened itself.
+    /// Section 10.7: one point of history a second, from the edge's
+    /// counters.
+    async fn sample_history(&mut self) {
+        let samples = match self.edge.metrics().await {
+            Ok(samples) => samples,
+            Err(error) => {
+                tracing::debug!(%error, "the edge's metrics could not be read for the history");
+                return;
+            }
+        };
+
+        let workers = self
+            .running
+            .values()
+            .map(|running| {
+                running.sockets.len()
+                    + running
+                        .groups
+                        .iter()
+                        .map(|group| group.sockets.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>() as u64;
+        let reading = crate::dashboard::reading(&samples, workers);
+        let now = crate::model::now_unix_ms() / 1000;
+
+        if let Some(point) = self.sampler.observe(now, reading) {
+            self.history.record(point);
+        }
+    }
+
+    /// Section 11.3: rotate the log files that are due, by size or by the
+    /// clock, then have every writer reopen its file by name.
+    fn rotate_logs(&mut self) {
+        let Some(rotator) = self.rotation.as_mut() else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        let mut candidates = vec![
+            self.locations.access_log(),
+            self.locations.logs.path.join("edge.log"),
+        ];
+
+        if self.owns_log {
+            candidates.push(self.locations.daemon_log());
+        }
+
+        for (app, id) in self.running.keys() {
+            candidates.push(self.locations.release_log(app, id));
+        }
+
+        let mut rotated = Vec::new();
+
+        for path in candidates {
+            if !path.is_file() || !rotator.due(&path, now) {
+                continue;
+            }
+
+            match rotator.rotate(&path, now) {
+                Ok(archive) => rotated.push(archive),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "rotating a log failed");
+                }
+            }
+        }
+
+        if rotated.is_empty() {
+            return;
+        }
+
+        if self.owns_log {
+            reopen_own_log(&self.locations.daemon_log());
+        }
+
+        self.edge.signal(libc::SIGUSR1);
+
+        for running in self.running.values() {
+            running.host.signal(libc::SIGUSR1);
+        }
+
+        let names: Vec<String> = rotated
+            .iter()
+            .map(|archive| {
+                archive
+                    .strip_prefix(&self.locations.logs.path)
+                    .unwrap_or(archive)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        self.events.emit(
+            "logs.rotated",
+            "logs",
+            "info",
+            &format!("rotated {}", names.join(", ")),
+        );
+    }
+
     fn reopen_logs(&mut self, workers: bool) -> Reopened {
         if self.owns_log {
             reopen_own_log(&self.locations.daemon_log());
@@ -1748,9 +2642,8 @@ impl Daemon {
     }
 }
 
-/// A wall clock time as HH:MM UTC, for messages.
 /// A Unix time as HH:MM:SS, UTC.
-fn clock_hms(unix_ms: u64) -> String {
+pub(crate) fn clock_hms(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!(
         "{:02}:{:02}:{:02}",

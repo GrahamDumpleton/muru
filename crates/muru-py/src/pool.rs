@@ -14,14 +14,62 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 
 use crate::asgi::Asgi;
 
+/// One request in flight, for the host's hard timeout and for
+/// inspection (sections 7.6 and 11.7).
+pub struct RequestInfo {
+    /// When the worker took it.
+    pub started: Instant,
+    /// The edge's request id.
+    pub request_id: String,
+    /// The method.
+    pub method: String,
+    /// The path, as received.
+    pub path: String,
+    /// The Python thread serving it, once one has picked it up.
+    pub thread: Option<u64>,
+}
+
 /// A unit of work for an application thread.
 pub type Job = Box<dyn for<'py> FnOnce(Python<'py>) + Send + 'static>;
+
+/// The names of the threads the runtime created, by Python thread
+/// identifier, for inspection (section 11.7): Python's threading module
+/// does not know them.
+static THREAD_NAMES: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
+
+/// Record the calling thread's name under its Python identifier.
+pub fn name_this_thread(name: &str) {
+    // SAFETY: PyThread_get_thread_ident reads the calling thread's
+    // identifier and needs no interpreter state.
+
+    let ident = unsafe { ffi::PyThread_get_thread_ident() } as u64;
+    THREAD_NAMES
+        .lock()
+        .expect("thread names poisoned")
+        .get_or_insert_with(HashMap::new)
+        .insert(ident, name.to_owned());
+}
+
+/// The runtime's thread names by Python identifier, as a dict.
+pub fn thread_names(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let names = PyDict::new(py);
+
+    if let Some(known) = THREAD_NAMES.lock().expect("thread names poisoned").as_ref() {
+        for (ident, name) in known {
+            names.set_item(ident, name)?;
+        }
+    }
+
+    Ok(names)
+}
 
 /// One mount of a release (section 6.7): its application and, for an
 /// ASGI mount, the runner scheduled on the loop for each request.
@@ -60,6 +108,10 @@ pub struct Shared {
     pub pool: Pool,
     in_flight: AtomicU32,
     total: AtomicU64,
+    next_id: AtomicU64,
+    /// The requests in flight, by id, for the host's hard timeout
+    /// (section 7.6) and for inspection (section 11.7).
+    active: Mutex<HashMap<u64, RequestInfo>>,
 }
 
 impl Shared {
@@ -83,6 +135,8 @@ impl Shared {
             pool: Pool::start(threads)?,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
+            next_id: AtomicU64::new(1),
+            active: Mutex::new(HashMap::new()),
         })
     }
 
@@ -103,20 +157,110 @@ impl Shared {
             .map(|mount| Python::attach(|py| mount.clone_ref(py)))
     }
 
-    /// Count a request as started.
-    pub fn request_started(&self) {
+    /// Count a request as started, returning its id for when it finishes.
+    pub fn request_started(&self, head: &muru_proto::worker::v1::RequestHead) -> u64 {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .insert(
+                id,
+                RequestInfo {
+                    started: Instant::now(),
+                    request_id: head.request_id.clone(),
+                    method: head.method.clone(),
+                    path: if head.query.is_empty() {
+                        String::from_utf8_lossy(&head.raw_path).into_owned()
+                    } else {
+                        format!(
+                            "{}?{}",
+                            String::from_utf8_lossy(&head.raw_path),
+                            String::from_utf8_lossy(&head.query)
+                        )
+                    },
+                    thread: None,
+                },
+            );
+        id
+    }
+
+    /// Note which Python thread serves a request: the calling one.
+    pub fn request_on_this_thread(&self, id: u64) {
+        // SAFETY: PyThread_get_thread_ident reads the calling thread's
+        // identifier and needs no interpreter state.
+
+        let thread = unsafe { ffi::PyThread_get_thread_ident() };
+
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .get_mut(&id)
+        {
+            info.thread = Some(thread as u64);
+        }
+    }
+
+    /// The requests in flight as Python dicts, for inspection: the
+    /// request id, method, path, elapsed milliseconds and the thread
+    /// serving it.
+    pub fn active_requests<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        let now = Instant::now();
+
+        for info in self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+        {
+            let item = PyDict::new(py);
+            item.set_item("request_id", &info.request_id)?;
+            item.set_item("method", &info.method)?;
+            item.set_item("path", &info.path)?;
+            item.set_item(
+                "elapsed_ms",
+                now.saturating_duration_since(info.started).as_millis() as u64,
+            )?;
+            item.set_item("thread", info.thread)?;
+            list.append(item)?;
+        }
+
+        Ok(list)
     }
 
     /// Count a request as finished.
-    pub fn request_finished(&self) {
+    pub fn request_finished(&self, id: u64) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .remove(&id);
     }
 
     /// Requests started and not yet finished.
     pub fn in_flight(&self) -> u32 {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Requests started since the worker began.
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// How long the longest-running request in flight has been running,
+    /// in milliseconds; zero with none in flight.
+    pub fn oldest_ms(&self) -> u64 {
+        let now = Instant::now();
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+            .map(|info| now.saturating_duration_since(info.started).as_millis() as u64)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -174,6 +318,10 @@ impl Pool {
 
 /// One application thread: attach once, then run jobs until the pool closes.
 fn thread_main(receiver: &Mutex<mpsc::Receiver<Job>>) {
+    if let Some(name) = std::thread::current().name() {
+        name_this_thread(name);
+    }
+
     Python::attach(|py| {
         loop {
             // Wait for work with the interpreter detached. Only one idle

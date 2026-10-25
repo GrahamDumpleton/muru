@@ -8,20 +8,19 @@ restores the previous release, and every state change is an event.
 
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 from support import server as support
 from support.daemon import FACTORY, SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
+from support.load import Load
 
 daemon = daemon_fixture
 
@@ -52,45 +51,14 @@ def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> 
     # connections as real clients use (and so the test does not run out
     # of ephemeral ports).
 
-    results: list[int] = []
-    stop = threading.Event()
-
-    def hammer() -> None:
-        connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
-
-        try:
-            while not stop.is_set():
-                try:
-                    connection.request("GET", "/")
-                    response = connection.getresponse()
-                    response.read()
-                    results.append(response.status)
-                except (OSError, http.client.HTTPException):
-                    results.append(0)
-                    connection.close()
-                    connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=30)
-
-                time.sleep(0.001)
-        finally:
-            connection.close()
-
-    threads = [threading.Thread(target=hammer) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-
-    try:
+    with Load(daemon.port) as load:
         assert (
             daemon.deploy("shop", SHOP, "--processes", "2")
             == "muru: release shop@r2 is ready and serving"
         )
         time.sleep(0.5)
-    finally:
-        stop.set()
-        for thread in threads:
-            thread.join()
 
-    assert results, "no requests were made"
-    assert set(results) == {200}, f"statuses seen during the deploy: {sorted(set(results))}"
+    load.check("the deploy")
     assert json.loads(daemon.get("/info").body)["pid"] != pid_before
     assert daemon.releases("shop") == [
         {"release": "shop@r2", "state": "ready", "serving": "yes"},
@@ -231,7 +199,9 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
     second = None
 
     try:
-        first.deploy("shop", SHOP)
+        # One worker, so that the pid each answer carries is the one worker's.
+
+        first.deploy("shop", SHOP, "--processes", "1")
         pid = json.loads(first.get("/info").body)["pid"]
         edge_pid = edge_pid_of(first)
 
@@ -265,6 +235,20 @@ def test_detached_daemon_leaves_traffic_flowing_and_is_readopted(tmp_path: Path)
         ["ps", "-ax", "-o", "command="], capture_output=True, text=True, check=False
     ).stdout
     assert not any(first.run_dir.name in line for line in listing.splitlines())
+
+
+def test_a_relative_interpreter_path_is_resolved_where_the_command_runs(
+    daemon: Daemon,
+) -> None:
+    # The daemon starts the host elsewhere, so a path relative to the
+    # shell is made absolute by the client; a bare name stays a command.
+
+    relative = os.path.relpath(sys.executable)
+    assert not os.path.isabs(relative) and os.sep in relative
+    deployed = daemon.muructl("deploy", "shop", str(SHOP), "--python", relative)
+    assert deployed.stdout.strip() == "muru: release shop@r1 is ready and serving"
+    inspected = daemon.muructl("debug", "inspect", "shop").stdout
+    assert f"at {os.path.abspath(relative)}," in inspected, inspected
 
 
 def test_background_daemon_start_status_stop(tmp_path: Path) -> None:

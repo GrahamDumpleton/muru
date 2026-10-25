@@ -2,9 +2,12 @@
 //! and ADR 0002): the daemon binds the listening sockets and hands them to
 //! an edge spawned from its own executable, pushes routing snapshots over
 //! the edge's control socket, and respawns the edge with the same sockets
-//! and the last snapshot if it dies, so connections are never refused.
+//! and the last snapshot if it dies, so connections are never refused. An
+//! upgrade (section 13.4) replaces the edge the same way, with the old one
+//! finishing its connections once the new one serves.
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -35,12 +38,18 @@ pub struct EdgeSpec {
     pub control: PathBuf,
     /// Where the edge hands its listener back to a restarted daemon.
     pub listener_socket: PathBuf,
+    /// Numbers the edge's sockets, so those of a replacement never
+    /// collide with those of the edge it replaces.
+    pub generation: u32,
     /// Where the edge's own output goes.
     pub log: PathBuf,
     /// Where the access log goes, or none.
     pub access_log: Option<PathBuf>,
     /// The limits the edge enforces.
     pub limits: muru_edge::Limits,
+    /// Whom the edge runs as, when the daemon is root (ADR 0026): the
+    /// service user, never root.
+    pub identity: Option<crate::host::Identity>,
 }
 
 /// The edge process and what it was last told.
@@ -63,17 +72,30 @@ const LISTENER_FD: i32 = 3;
 /// How many listeners an edge can be handed.
 const MAX_LISTENERS: usize = 16;
 
+/// The directory under the runtime directory that holds the edges'
+/// sockets: the edge's own, so that it can bind them as the service user.
+pub fn directory(run_dir: &Path) -> PathBuf {
+    run_dir.join("edge")
+}
+
+/// The control socket and the listener-return socket of an edge of the
+/// given generation, in the edges' directory.
+pub fn socket_paths(directory: &Path, generation: u32) -> (PathBuf, PathBuf) {
+    (
+        directory.join(format!("edge-{generation}.sock")),
+        directory.join(format!("edge-{generation}-listener.sock")),
+    )
+}
+
 impl EdgeProcess {
     /// Spawn the edge and wait until its control socket answers.
     pub async fn spawn(spec: EdgeSpec) -> anyhow::Result<Self> {
-        let child = start(&spec, &[])?;
-        let mut edge = Self {
+        let child = launch(&spec, &[]).await?;
+        Ok(Self {
             spec,
             process: Process::Child(child),
             snapshot: pb::Snapshot::default(),
-        };
-        edge.wait_ready().await?;
-        Ok(edge)
+        })
     }
 
     /// Take over an edge a previous daemon started: it must answer on its
@@ -86,10 +108,12 @@ impl EdgeProcess {
         executable: PathBuf,
         control: PathBuf,
         listener_socket: PathBuf,
+        generation: u32,
         tls: Vec<bool>,
         log: PathBuf,
         access_log: Option<PathBuf>,
         limits: muru_edge::Limits,
+        identity: Option<crate::host::Identity>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::host::alive(pid), "the edge process {pid} is gone");
         let mut client = connect(&control).await?;
@@ -126,9 +150,11 @@ impl EdgeProcess {
                 listeners,
                 control,
                 listener_socket,
+                generation,
                 log,
                 access_log,
                 limits,
+                identity,
             },
             process: Process::Adopted(pid),
             snapshot: pb::Snapshot {
@@ -154,10 +180,40 @@ impl EdgeProcess {
 
     /// The edge's pid.
     pub fn pid(&self) -> Option<u32> {
-        match &self.process {
-            Process::Child(child) => child.id(),
-            Process::Adopted(pid) => Some(*pid),
+        pid_of(&self.process)
+    }
+
+    /// The generation of the edge's sockets.
+    pub fn generation(&self) -> u32 {
+        self.spec.generation
+    }
+
+    /// How long the edge is given to finish its connections when it is
+    /// replaced: the request deadline, so a response in flight can
+    /// complete, and a little over.
+    pub fn drain_grace(&self) -> Duration {
+        self.spec.limits.request_deadline + Duration::from_secs(5)
+    }
+
+    /// Move the spec's sockets to the next generation, into the edges'
+    /// directory: an edge adopted from a daemon that kept its sockets in
+    /// the runtime directory itself moves there with its replacement.
+    fn next_generation(&mut self) {
+        let mut directory = self
+            .spec
+            .control
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+
+        if directory.file_name().is_none_or(|name| name != "edge") {
+            directory = self::directory(&directory);
         }
+
+        self.spec.generation += 1;
+        let (control, listener_socket) = socket_paths(&directory, self.spec.generation);
+        self.spec.control = control;
+        self.spec.listener_socket = listener_socket;
     }
 
     /// Send the edge a signal. Returns whether it was delivered.
@@ -255,80 +311,163 @@ impl EdgeProcess {
         // snapshot, so a connection that waited in the backlog is served,
         // and takes the whole snapshot again right after.
 
-        self.process = Process::Child(start(&self.spec, &self.snapshot.worker_sockets)?);
-        self.wait_ready().await?;
+        self.next_generation();
+        self.process = Process::Child(launch(&self.spec, &self.snapshot.worker_sockets).await?);
         let snapshot = self.snapshot.clone();
         self.apply(snapshot).await?;
         Ok(true)
     }
 
+    /// Section 13.4: start a new edge on the same listeners, give it the
+    /// current snapshot, and only then tell the old one to stop: it stops
+    /// accepting, finishes its connections and exits, waited for in the
+    /// background for `grace` before it is killed. Returns the old edge's
+    /// pid. If the new edge does not come up or refuses the snapshot, it
+    /// is discarded and the old one keeps serving.
+    pub async fn replace(&mut self, grace: Duration) -> anyhow::Result<u32> {
+        let old_control = self.spec.control.clone();
+        let old_listener_socket = self.spec.listener_socket.clone();
+        let old_generation = self.spec.generation;
+        self.next_generation();
+
+        let next = match launch(&self.spec, &self.snapshot.worker_sockets).await {
+            Ok(child) => child,
+            Err(error) => {
+                self.spec.generation = old_generation;
+                self.spec.control = old_control;
+                self.spec.listener_socket = old_listener_socket;
+                return Err(error);
+            }
+        };
+
+        let old = std::mem::replace(&mut self.process, Process::Child(next));
+        let snapshot = self.snapshot.clone();
+
+        if let Err(error) = self.apply(snapshot).await {
+            let failed = std::mem::replace(&mut self.process, old);
+            let (control, listener_socket) = (
+                std::mem::replace(&mut self.spec.control, old_control),
+                std::mem::replace(&mut self.spec.listener_socket, old_listener_socket),
+            );
+            self.spec.generation = old_generation;
+            tokio::spawn(finish(
+                failed,
+                control,
+                listener_socket,
+                Duration::from_secs(1),
+            ));
+            return Err(error);
+        }
+
+        let old_pid = pid_of(&old).unwrap_or(0);
+        tokio::spawn(finish(old, old_control, old_listener_socket, grace));
+        Ok(old_pid)
+    }
+
     /// Tell the edge to stop and wait for it, killing it after a grace period.
-    pub async fn stop(mut self) {
-        if let Ok(mut client) = connect(&self.spec.control).await {
-            let _ = client.stop(pb::StopRequest {}).await;
-        }
-
-        let grace = Duration::from_secs(10);
-
-        match &mut self.process {
-            Process::Child(child) => {
-                if tokio::time::timeout(grace, child.wait()).await.is_err() {
-                    let _ = child.kill().await;
-                }
-            }
-            Process::Adopted(pid) => {
-                let pid = *pid;
-                let started = Instant::now();
-
-                while crate::host::alive(pid) && started.elapsed() < grace {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-
-                if crate::host::alive(pid) {
-                    // SAFETY: kill(2) with a valid pid and signal has no
-                    // memory-safety preconditions.
-
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
-                }
-            }
-        }
-
-        let _ = std::fs::remove_file(&self.spec.control);
-        let _ = std::fs::remove_file(&self.spec.listener_socket);
-    }
-
-    async fn wait_ready(&mut self) -> anyhow::Result<()> {
-        let started = Instant::now();
-
-        while started.elapsed() < Duration::from_secs(30) {
-            if self.exited()? {
-                anyhow::bail!(
-                    "the edge exited before it was ready; see {}",
-                    self.spec.log.display()
-                );
-            }
-
-            if let Ok(mut client) = connect(&self.spec.control).await
-                && client.get_status(pb::EdgeStatusRequest {}).await.is_ok()
-            {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        anyhow::bail!(
-            "the edge did not answer on {} within 30 seconds",
-            self.spec.control.display()
+    pub async fn stop(self) {
+        finish(
+            self.process,
+            self.spec.control,
+            self.spec.listener_socket,
+            Duration::from_secs(10),
         )
+        .await;
     }
+}
+
+/// A process's pid, if it still has one.
+fn pid_of(process: &Process) -> Option<u32> {
+    match process {
+        Process::Child(child) => child.id(),
+        Process::Adopted(pid) => Some(*pid),
+    }
+}
+
+/// Start an edge from the spec and wait until its control socket answers.
+async fn launch(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
+    let mut child = start(spec, worker_sockets)?;
+    let started = Instant::now();
+
+    while started.elapsed() < Duration::from_secs(30) {
+        if child.try_wait()?.is_some() {
+            anyhow::bail!(
+                "the edge exited before it was ready; see {}",
+                spec.log.display()
+            );
+        }
+
+        if let Ok(mut client) = connect(&spec.control).await
+            && client.get_status(pb::EdgeStatusRequest {}).await.is_ok()
+        {
+            return Ok(child);
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = child.kill().await;
+    anyhow::bail!(
+        "the edge did not answer on {} within 30 seconds",
+        spec.control.display()
+    )
+}
+
+/// Tell an edge to stop and wait for it, killing it after `grace`, then
+/// remove its sockets (which a clean exit removes itself).
+async fn finish(mut process: Process, control: PathBuf, listener_socket: PathBuf, grace: Duration) {
+    if let Ok(mut client) = connect(&control).await {
+        let _ = client.stop(pb::StopRequest {}).await;
+    }
+
+    match &mut process {
+        Process::Child(child) => {
+            if tokio::time::timeout(grace, child.wait()).await.is_err() {
+                let _ = child.kill().await;
+            }
+        }
+        Process::Adopted(pid) => {
+            let pid = *pid;
+            let started = Instant::now();
+
+            while crate::host::alive(pid) && started.elapsed() < grace {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            if crate::host::alive(pid) {
+                // SAFETY: kill(2) with a valid pid and signal has no
+                // memory-safety preconditions.
+
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&control);
+    let _ = std::fs::remove_file(&listener_socket);
 }
 
 /// Start the edge process with the listeners as descriptors 3, 4 and so
 /// on, the workers it serves from the start, and its output appended to
 /// its log.
 fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
+    // The edge binds its sockets in a directory of its own, which belongs
+    // to the user it runs as.
+
+    if let Some(directory) = spec.control.parent() {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+
+        if let Some(identity) = &spec.identity {
+            identity
+                .own(directory)
+                .with_context(|| format!("giving {} to the edge's user", directory.display()))?;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o750))?;
+        }
+    }
+
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -356,13 +495,23 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg("--max-header-bytes")
         .arg(spec.limits.max_header_bytes.to_string())
         .arg("--max-headers")
-        .arg(spec.limits.max_headers.to_string());
+        .arg(spec.limits.max_headers.to_string())
+        .arg("--max-connections")
+        .arg(spec.limits.max_connections.to_string())
+        .arg("--max-connections-per-client")
+        .arg(spec.limits.max_connections_per_client.to_string())
+        .arg("--max-requests-per-connection")
+        .arg(spec.limits.max_requests_per_connection.to_string())
+        .arg("--http2-max-concurrent-streams")
+        .arg(spec.limits.http2_max_concurrent_streams.to_string());
     for (name, duration) in [
         ("queue", spec.limits.queue_timeout),
         ("deadline", spec.limits.request_deadline),
         ("header_read", spec.limits.header_read_timeout),
         ("body_idle", spec.limits.body_idle_timeout),
         ("response_idle", spec.limits.response_idle_timeout),
+        ("keep_alive", spec.limits.keep_alive_timeout),
+        ("keep_alive_proxy", spec.limits.keep_alive_timeout_proxy),
     ] {
         command
             .arg("--timeout")
@@ -399,10 +548,12 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
     }
 
     let count = spec.listeners.len();
+    let identity = spec.identity;
 
-    // SAFETY: dup2, fcntl, close and setsid are async-signal-safe and the
-    // closure runs in the child between fork and exec, where it touches
-    // nothing else and allocates nothing (the arrays are on the stack).
+    // SAFETY: dup2, fcntl, close, setsid, setgroups, setgid and setuid are
+    // async-signal-safe and the closure runs in the child between fork and
+    // exec, where it touches nothing else and allocates nothing (the
+    // arrays are on the stack).
 
     unsafe {
         command.pre_exec(move || {
@@ -427,6 +578,21 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
             }
 
             libc::setsid();
+
+            // ADR 0026: the edge parses client traffic, so it never keeps
+            // the daemon's root.
+
+            if let Some(identity) = identity {
+                let groups = [identity.gid as libc::gid_t];
+
+                if libc::setgroups(1, groups.as_ptr()) != 0
+                    || libc::setgid(identity.gid as libc::gid_t) != 0
+                    || libc::setuid(identity.uid as libc::uid_t) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
             Ok(())
         });
     }

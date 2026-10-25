@@ -168,7 +168,11 @@ JSON gateway](dashboard.md) on a loopback address.
 
 The daemon binds the listening sockets itself and hands them to an edge
 process started from the same executable, which carries the traffic;
-the daemon is never on the request path. If the edge exits, the daemon
+the daemon is never on the request path. A daemon that runs as root
+starts the edge, and the applications that name no user, as the service
+user, `muru` unless `--user` or the `[daemon]` table names another, and
+refuses to start when that account does not exist; the [per-application
+users guide](users.md) has the details. If the edge exits, the daemon
 starts another on the same socket with the same routing, and connections
 made in between wait in the socket's backlog rather than being refused.
 The edge's own output goes to `edge.log` in the log directory, and each
@@ -186,11 +190,33 @@ then exits, for taking a node out of service.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
 its workers with it, and the next daemon starts its release again.
+
+## Upgrading
+
+Installing a new version of Muru changes nothing until `muructl daemon
+upgrade`. The daemon then re-executes itself from the installed `muructl`
+(the one its command name finds on the `PATH`, or the path it was started
+with), keeping its process id and its children, and the new version takes
+the hosts and the edge over from their records, exactly as a restarted
+daemon does. It then starts a new edge from its own version on the same
+listening sockets, gives it the routing in force, and tells the old edge
+to stop accepting: that edge finishes the requests in flight, closes its
+idle keep-alive connections (with GOAWAY on HTTP/2) and exits. No
+connection is refused and no request fails in between; WebSocket
+connections still open on the old edge are closed when it exits. The
+command waits until the upgraded daemon answers with its new edge and
+prints the versions and process ids involved. The daemon checks that the
+installed binary runs before it commits, and the `daemon.upgraded` and
+`edge.replaced` events record what happened.
+
+Releases keep the runtime library they started with; a new release picks
+up the installed one. Under systemd the service's main process is
+unchanged by an upgrade, so no unit restart is involved.
 `muructl daemon run` runs it in the foreground, for a service manager or
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
 daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
-configuration file for the `[proxy]` table. The [systemd
+configuration file for the `[proxy]` and `[compression]` tables. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else the
 socket in the runtime directory.

@@ -116,6 +116,24 @@ enum Command {
         command: admin::ConfigCommand,
     },
 
+    /// Manage the file secret stores (section 10.8).
+    Secret {
+        #[command(subcommand)]
+        command: admin::SecretCommand,
+    },
+
+    /// Look into a release's workers: status, stacks, tasks, inspect.
+    Debug {
+        #[command(subcommand)]
+        command: admin::DebugCommand,
+    },
+
+    /// Change logger levels in a release's workers for a period.
+    Logging {
+        #[command(subcommand)]
+        command: admin::LoggingCommand,
+    },
+
     /// Show or follow the daemon's events.
     Events {
         /// Keep printing events as they happen.
@@ -140,11 +158,138 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
+    /// Serve a directory of files with no configuration (section 4.9),
+    /// for a built front end or a documentation build.
+    ServeStatic(Box<ServeStaticArgs>),
+
     /// Run an edge process (internal, started by the daemon).
     Edge {
         #[command(subcommand)]
         command: edge::EdgeCommand,
     },
+}
+
+/// What `serve-static` takes.
+#[derive(Args)]
+struct ServeStaticArgs {
+    /// The directory to serve.
+    directory: PathBuf,
+
+    /// Address to listen on, as IP or IP:PORT.
+    #[arg(long, default_value = "127.0.0.1", value_parser = parse_bind)]
+    bind: Bind,
+
+    /// Port for HTTP (default 8080), or auto to pick a free port and
+    /// print it.
+    #[arg(long, value_parser = parse_port)]
+    port: Option<Port>,
+
+    /// A file served for a directory, tried in order (default index.html).
+    /// Repeatable.
+    #[arg(long = "index", value_name = "NAME")]
+    index: Vec<String>,
+
+    /// The file served for any path that has no file of its own, for a
+    /// single-page application.
+    #[arg(long, value_name = "NAME")]
+    fallback: Option<String>,
+
+    /// Do not compress responses or serve precompressed variants.
+    #[arg(long)]
+    no_compression: bool,
+
+    /// Where access log lines go: terminal, off, errors or a file path.
+    #[arg(long, default_value = "terminal")]
+    access_log: String,
+}
+
+/// Serve a directory with the edge's static file code and nothing else.
+async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
+    let directory = args
+        .directory
+        .canonicalize()
+        .with_context(|| format!("{} is not a directory", args.directory.display()))?;
+    anyhow::ensure!(
+        directory.is_dir(),
+        "{} is not a directory",
+        directory.display()
+    );
+
+    let port = match args.port {
+        Some(Port::Auto) => 0,
+        Some(Port::Number(port)) => port,
+        None => args.bind.port.unwrap_or(8080),
+    };
+
+    let compression = if args.no_compression {
+        muru_edge::compression::Compression::off()
+    } else {
+        muru_edge::compression::Compression::default()
+    };
+    let access_log = muru_edge::access::Config {
+        destination: match args.access_log.as_str() {
+            "terminal" => muru_edge::access::Destination::Terminal,
+            "off" => muru_edge::access::Destination::Off,
+            "errors" => muru_edge::access::Destination::Errors,
+            path => muru_edge::access::Destination::File(PathBuf::from(path)),
+        },
+        ..muru_edge::access::Config::default()
+    };
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("installing the SIGINT handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    let edge = muru_edge::Edge::bind(muru_edge::Config {
+        listen: SocketAddr::new(args.bind.ip, port),
+        app: "static".to_owned(),
+        release: String::new(),
+        sockets: Vec::new(),
+        groups: Vec::new(),
+        mounts: Vec::new(),
+        development: true,
+        access_log,
+        limits: muru_edge::Limits::default(),
+        compression: compression.clone(),
+        https: None,
+    })
+    .await
+    .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
+
+    // One default host with one static route at /, as a snapshot would
+    // describe it, so the same code serves here and under the daemon.
+
+    let snapshot = muru_proto::edge::v1::Snapshot {
+        version: 1,
+        hosts: vec![muru_proto::edge::v1::Host {
+            name: "static".to_owned(),
+            default: true,
+            ..Default::default()
+        }],
+        routes: vec![muru_proto::edge::v1::Route {
+            host: "static".to_owned(),
+            path: "/".to_owned(),
+            static_dir: directory.display().to_string(),
+            index: args.index.clone(),
+            fallback_file: args.fallback.clone().unwrap_or_default(),
+            ..Default::default()
+        }],
+        compression: Some(compression.to_message()),
+        ..Default::default()
+    };
+    let routing = muru_edge::routing::Routing::from_snapshot(&snapshot).await?;
+    edge.pools().apply(routing);
+    println!(
+        "muru: serving {} on http://{}",
+        directory.display(),
+        edge.local_addr()
+    );
+    let mut serving = tokio::spawn(edge.run());
+
+    tokio::select! {
+        served = &mut serving => served.map_err(anyhow::Error::from).and_then(|result| result),
+        _ = interrupt.recv() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 #[derive(Args)]
@@ -225,15 +370,52 @@ struct RunArgs {
     max_body_size: Option<u64>,
 
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
-    /// header_read (30s), body_idle (60s) or response_idle (60s).
+    /// header_read (30s), body_idle (60s), response_idle (60s),
+    /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; hard
+    /// (off), hard_drain_grace (10s) or shutdown (5s) in the host, which
+    /// replaces a worker whose request runs past the hard timeout.
     /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
+
+    /// Open connections the listener holds at once (default 65536);
+    /// beyond it clients get a fast 503 (section 4.18).
+    #[arg(long, value_name = "N")]
+    max_connections: Option<usize>,
+
+    /// Open connections one client address may hold (default 256; 0 for
+    /// no limit).
+    #[arg(long, value_name = "N")]
+    max_connections_per_client: Option<usize>,
+
+    /// Requests served on one connection before it is closed (default 0,
+    /// no limit).
+    #[arg(long, value_name = "N")]
+    max_requests_per_connection: Option<u64>,
+
+    /// Replace a worker after this many requests, with jitter.
+    #[arg(long, value_name = "N")]
+    max_requests: Option<u64>,
+
+    /// Replace a worker after this long, for example 1h, with jitter.
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    max_lifetime: Option<Duration>,
+
+    /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
+    /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
+    /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
+    #[arg(long = "memory", value_name = "KEY=VALUE", value_parser = parse_memory_setting)]
+    memory: Vec<(String, String)>,
 
     /// Address for the read-only dashboard on loopback, or off. On at
     /// 127.0.0.1:8081 by default, off with --allow-public unless given.
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<String>,
+
+    /// Do not compress responses (section 4.17); they are compressed for
+    /// clients that accept br, zstd or gzip otherwise.
+    #[arg(long)]
+    no_compression: bool,
 
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
@@ -470,6 +652,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
+        Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
@@ -480,10 +663,16 @@ fn main() -> anyhow::Result<()> {
                     socket,
                 } => admin::daemon_stop(socket, shutdown, timeout).await,
                 admin::DaemonCommand::Reload { socket } => admin::daemon_reload(socket).await,
+                admin::DaemonCommand::Upgrade { timeout, socket } => {
+                    admin::daemon_upgrade(socket, timeout).await
+                }
                 admin::DaemonCommand::Status { socket } => admin::daemon_status(socket).await,
             }
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
+        Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Secret { command } => runtime.block_on(admin::secret(command)),
+        Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
@@ -572,14 +761,180 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "header_read",
         "body_idle",
         "response_idle",
+        "keep_alive",
+        "keep_alive_proxy",
+        "hard",
+        "hard_drain_grace",
+        "shutdown",
     ]
     .contains(&name)
     {
         return Err(format!(
-            "{name:?} is not a timeout name: queue, deadline, header_read, body_idle or response_idle"
+            "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
+             response_idle, keep_alive, keep_alive_proxy, hard, hard_drain_grace or shutdown"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
+}
+
+/// Apply the edge's timeouts from --timeout settings to the limits.
+pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String, Duration)]) {
+    for (name, duration) in timeouts {
+        match name.as_str() {
+            "queue" => limits.queue_timeout = *duration,
+            "deadline" => limits.request_deadline = *duration,
+            "header_read" => limits.header_read_timeout = *duration,
+            "body_idle" => limits.body_idle_timeout = *duration,
+            "response_idle" => limits.response_idle_timeout = *duration,
+            "keep_alive" => limits.keep_alive_timeout = *duration,
+            "keep_alive_proxy" => limits.keep_alive_timeout_proxy = *duration,
+            _ => {}
+        }
+    }
+}
+
+/// Parse KEY=VALUE for --memory, checking the key and the value's form.
+pub(crate) fn parse_memory_setting(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not KEY=VALUE, for example soft_limit=800MB"))?;
+    let (key, value) = (key.trim(), value.trim());
+
+    match key {
+        "measure" => {
+            value
+                .parse::<muru_config::Measure>()
+                .map_err(|error| error.to_string())?;
+        }
+        "soft_limit" | "hard_limit" => {
+            muru_config::parse_size(value)?;
+        }
+        "soft_for" | "check_interval" => {
+            muru_config::parse_duration(value)?;
+        }
+        "reclaim_first" => {
+            if !["true", "false"].contains(&value) {
+                return Err(format!(
+                    "reclaim_first must be true or false, not {value:?}"
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{key:?} is not a memory setting: measure, soft_limit, soft_for, reclaim_first, \
+                 hard_limit or check_interval"
+            ));
+        }
+    }
+
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+/// The memory policy from --memory settings over a project table
+/// (section 7.7), with the defaults of appendix C.
+pub(crate) fn memory_policy(
+    settings: &[(String, String)],
+    table: Option<&muru_config::Memory>,
+) -> anyhow::Result<muru_controller::model::MemoryPolicy> {
+    let mut table = table.cloned().unwrap_or_default();
+
+    for (key, value) in settings {
+        match key.as_str() {
+            "measure" => {
+                table.measure = Some(
+                    value
+                        .parse()
+                        .map_err(|e: muru_config::ParseError| anyhow::anyhow!("{e}"))?,
+                )
+            }
+            "soft_limit" => table.soft_limit = Some(value.clone()),
+            "soft_for" => table.soft_for = Some(value.clone()),
+            "reclaim_first" => table.reclaim_first = Some(value == "true"),
+            "hard_limit" => table.hard_limit = Some(value.clone()),
+            "check_interval" => table.check_interval = Some(value.clone()),
+            _ => {}
+        }
+    }
+
+    let defaults = muru_controller::model::MemoryPolicy::default();
+    let size = |text: &Option<String>, name: &str| -> anyhow::Result<Option<u64>> {
+        text.as_ref()
+            .map(|text| {
+                muru_config::parse_size(text)
+                    .map_err(|error| anyhow::anyhow!("memory.{name}: {error}"))
+            })
+            .transpose()
+    };
+    let duration = |text: &Option<String>, name: &str| -> anyhow::Result<Option<u64>> {
+        text.as_ref()
+            .map(|text| {
+                muru_config::parse_duration(text)
+                    .map(|duration| duration.as_millis() as u64)
+                    .map_err(|error| anyhow::anyhow!("memory.{name}: {error}"))
+            })
+            .transpose()
+    };
+    let policy = muru_controller::model::MemoryPolicy {
+        measure: table.measure.unwrap_or(defaults.measure),
+        soft_limit: size(&table.soft_limit, "soft_limit")?,
+        soft_for_ms: duration(&table.soft_for, "soft_for")?.unwrap_or(defaults.soft_for_ms),
+        reclaim_first: table.reclaim_first.unwrap_or(defaults.reclaim_first),
+        hard_limit: size(&table.hard_limit, "hard_limit")?,
+        check_interval_ms: duration(&table.check_interval, "check_interval")?
+            .unwrap_or(defaults.check_interval_ms),
+    };
+
+    if let (Some(soft), Some(hard)) = (policy.soft_limit, policy.hard_limit) {
+        anyhow::ensure!(
+            hard >= soft,
+            "memory.hard_limit must not be below memory.soft_limit"
+        );
+    }
+
+    anyhow::ensure!(
+        policy.check_interval_ms > 0,
+        "memory.check_interval must be longer than nothing"
+    );
+    Ok(policy)
+}
+
+/// The host's timeouts from --timeout and a project table (section 7.6):
+/// the hard timeout, the grace for a replaced worker's other requests
+/// and the time before a stopping worker is killed.
+pub(crate) fn worker_timeouts(
+    timeouts: &[(String, Duration)],
+    table: Option<&muru_config::Timeouts>,
+) -> anyhow::Result<(Option<Duration>, Duration, Duration)> {
+    let parse = |text: &Option<String>, name: &str| -> anyhow::Result<Option<Duration>> {
+        match text {
+            Some(text) => muru_config::parse_duration(text)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("[tool.muru.timeouts] {name}: {error}")),
+            None => Ok(None),
+        }
+    };
+    let mut hard = table.map_or(Ok(None), |table| parse(&table.hard_timeout, "hard_timeout"))?;
+    let mut grace = table
+        .map_or(Ok(None), |table| {
+            parse(&table.hard_drain_grace, "hard_drain_grace")
+        })?
+        .unwrap_or(Duration::from_secs(10));
+    let mut shutdown = table
+        .map_or(Ok(None), |table| {
+            parse(&table.shutdown_timeout, "shutdown_timeout")
+        })?
+        .unwrap_or(Duration::from_secs(5));
+
+    for (name, duration) in timeouts {
+        match name.as_str() {
+            "hard" => hard = Some(*duration),
+            "hard_drain_grace" => grace = *duration,
+            "shutdown" => shutdown = *duration,
+            _ => {}
+        }
+    }
+
+    Ok((hard, grace, shutdown))
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -593,20 +948,16 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
         } else {
             DEVELOPMENT_MAX_BODY_SIZE
         }),
+        max_connections: args.max_connections.unwrap_or(defaults.max_connections),
+        max_connections_per_client: args
+            .max_connections_per_client
+            .unwrap_or(defaults.max_connections_per_client),
+        max_requests_per_connection: args
+            .max_requests_per_connection
+            .unwrap_or(defaults.max_requests_per_connection),
         ..defaults
     };
-
-    for (name, duration) in &args.timeouts {
-        match name.as_str() {
-            "queue" => limits.queue_timeout = *duration,
-            "deadline" => limits.request_deadline = *duration,
-            "header_read" => limits.header_read_timeout = *duration,
-            "body_idle" => limits.body_idle_timeout = *duration,
-            "response_idle" => limits.response_idle_timeout = *duration,
-            _ => {}
-        }
-    }
-
+    apply_timeouts(&mut limits, &args.timeouts);
     limits
 }
 
@@ -650,6 +1001,16 @@ struct Resolved {
     mounts: std::collections::BTreeMap<String, muru_config::Mount>,
     /// Logging defaults from the table (section 11.4).
     logging: Option<muru_config::Logging>,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7).
+    max_lifetime: Option<Duration>,
+    /// The host's timeouts from the table (section 7.6).
+    timeouts: Option<muru_config::Timeouts>,
+    /// The memory table (section 7.7).
+    memory: Option<muru_config::Memory>,
+    /// Environment variables from the table (section 10.8).
+    env: std::collections::BTreeMap<String, muru_config::EnvValue>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -766,6 +1127,18 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         groups: table.groups,
         mounts: table.mounts,
         logging: table.logging,
+        max_requests: args.max_requests.or(table.max_requests),
+        max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
+            (Some(lifetime), _) => Some(lifetime),
+            (None, Some(text)) => Some(
+                muru_config::parse_duration(text)
+                    .map_err(|error| anyhow::anyhow!("[tool.muru] max_lifetime: {error}"))?,
+            ),
+            (None, None) => None,
+        },
+        timeouts: table.timeouts,
+        memory: table.memory,
+        env: table.env,
     })
 }
 
@@ -810,9 +1183,42 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         groups: resolved.groups.clone(),
         mounts: resolved.mounts.clone(),
         logging: resolved.logging.clone(),
+        max_requests: resolved.max_requests,
+        max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
+        env: resolved.env.clone(),
+        timeouts: {
+            let (hard, grace, shutdown) =
+                worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+            (hard.is_some() || resolved.timeouts.is_some()).then(|| muru_config::Timeouts {
+                hard_timeout: hard.map(muru_config::format_duration),
+                hard_drain_grace: Some(muru_config::format_duration(grace)),
+                shutdown_timeout: Some(muru_config::format_duration(shutdown)),
+            })
+        },
+        memory: {
+            let policy = memory_policy(&args.memory, resolved.memory.as_ref())?;
+            (policy != muru_controller::model::MemoryPolicy::default()).then(|| {
+                muru_config::Memory {
+                    measure: Some(policy.measure),
+                    soft_limit: policy.soft_limit.map(muru_config::format_size),
+                    soft_for: Some(muru_config::format_duration(Duration::from_millis(
+                        policy.soft_for_ms,
+                    ))),
+                    reclaim_first: Some(policy.reclaim_first),
+                    hard_limit: policy.hard_limit.map(muru_config::format_size),
+                    check_interval: Some(muru_config::format_duration(Duration::from_millis(
+                        policy.check_interval_ms,
+                    ))),
+                }
+            })
+        },
     };
     let document = Document {
         listener: listeners,
+        compression: args.no_compression.then(|| muru_config::Compression {
+            enabled: Some(false),
+            ..Default::default()
+        }),
         limits: Some(muru_config::Limits {
             max_body_size: Some(muru_config::format_size(limits.max_body_size)),
             max_header_bytes: Some(muru_config::format_size(limits.max_header_bytes as u64)),
@@ -822,11 +1228,22 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             request_deadline: Some(muru_config::format_duration(limits.request_deadline)),
             body_idle_timeout: Some(muru_config::format_duration(limits.body_idle_timeout)),
             response_idle_timeout: Some(muru_config::format_duration(limits.response_idle_timeout)),
+            max_connections: Some(limits.max_connections),
+            max_connections_per_client: Some(limits.max_connections_per_client),
+            keep_alive_timeout: Some(muru_config::format_duration(limits.keep_alive_timeout)),
+            keep_alive_timeout_proxy: Some(muru_config::format_duration(
+                limits.keep_alive_timeout_proxy,
+            )),
+            max_requests_per_connection: Some(limits.max_requests_per_connection),
+            http2: Some(muru_config::Http2Limits {
+                max_concurrent_streams: Some(limits.http2_max_concurrent_streams),
+            }),
         }),
         app: std::collections::BTreeMap::from([(
             name,
             App {
                 release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
+                ..App::default()
             },
         )]),
         ..Document::default()
@@ -845,7 +1262,16 @@ fn group_sockets(
     host: &HostProcess,
     groups: &std::collections::BTreeMap<String, muru_config::Group>,
 ) -> Vec<muru_edge::routing::GroupSockets> {
-    host.group_sockets
+    group_sockets_from(&host.group_sockets, groups)
+}
+
+/// Named groups' sockets, as the host announced them, with the paths
+/// each group serves from the project table.
+fn group_sockets_from(
+    announced: &[(String, Vec<PathBuf>)],
+    groups: &std::collections::BTreeMap<String, muru_config::Group>,
+) -> Vec<muru_edge::routing::GroupSockets> {
+    announced
         .iter()
         .map(|(name, sockets)| muru_edge::routing::GroupSockets {
             name: name.clone(),
@@ -856,6 +1282,25 @@ fn group_sockets(
             sockets: sockets.clone(),
         })
         .collect()
+}
+
+/// Connect to a host's control socket for the run (section 5.9), or,
+/// when the host has none, a receiver that never yields.
+async fn host_control(
+    host: &HostProcess,
+) -> (
+    Option<muru_controller::host::HostControl>,
+    tokio::sync::mpsc::Receiver<muru_controller::host::HostMessage>,
+) {
+    match muru_controller::host::HostControl::connect(&host.control_path()).await {
+        Ok((control, messages)) => (Some(control), messages),
+        Err(error) => {
+            println!("muru: no control connection to the host: {error:#}");
+            let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+            std::mem::forget(_sender);
+            (None, receiver)
+        }
+    }
 }
 
 /// The named mounts as the edge selects them.
@@ -976,6 +1421,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         "--concurrency must be at least 1"
     );
 
+    // The stop signals are caught before the host starts, so that a Ctrl-C
+    // or SIGTERM arriving while the workers are coming up stops the run in
+    // order instead of killing muructl and leaving the host to notice.
+
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("installing the SIGINT handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+
     if args.single {
         resolved.processes = 1;
         resolved.threads = 1;
@@ -997,6 +1451,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
+    let (hard_timeout, hard_drain_grace, shutdown_timeout) =
+        worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
@@ -1038,6 +1494,24 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .as_ref()
             .and_then(|logging| logging.python.clone())
             .unwrap_or_default(),
+        max_requests: resolved.max_requests,
+        max_lifetime: resolved.max_lifetime,
+        hard_timeout,
+        hard_drain_grace,
+        shutdown_timeout,
+        memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
+        env: resolved
+            .env
+            .iter()
+            .map(|(name, value)| match value {
+                muru_config::EnvValue::Plain(text) => Ok((name.clone(), text.clone())),
+                muru_config::EnvValue::Secret(_) => Err(anyhow::anyhow!(
+                    "[tool.muru.env] {name}: secrets are resolved by the daemon; a development \
+                     run cannot deliver them"
+                )),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        identity: None,
     };
 
     let logs = Logs::default();
@@ -1050,6 +1524,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&run_dir);
         return Err(error);
     }
+
+    let (mut control, mut host_messages) = host_control(&current).await;
 
     let (http_address, https_address) = addresses(&args);
 
@@ -1065,6 +1541,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         development,
         access_log,
         limits: limits(&args),
+        compression: if args.no_compression {
+            muru_edge::compression::Compression::off()
+        } else {
+            muru_edge::compression::Compression::default()
+        },
         https: tls.as_ref().map(|tls| tls.https.clone()),
     })
     .await
@@ -1142,6 +1623,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 started: std::time::Instant::now(),
                 release: Arc::clone(&release_number),
                 pools: edge.pools(),
+                connections: edge.connections(),
                 access_log: edge.access_log(),
                 logs: logs.clone(),
             },
@@ -1193,18 +1675,51 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // Ctrl-C and SIGTERM both stop the run in order: the host is told to
     // stop and its workers finish what they are serving.
 
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing the SIGTERM handler")?;
-
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = interrupt.recv() => break Ok(()),
             _ = terminate.recv() => break Ok(()),
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
+            }
+            Some(message) = host_messages.recv() => {
+                // Sections 7.6 and 7.7: the host replaced a worker, so
+                // the edge routes to the new socket, and the host hears
+                // that it does before it stops the old one.
+
+                match message {
+                    muru_controller::host::HostMessage::Workers { version, sockets, groups } => {
+                        let connected = muru_edge::routing::AppPools::connect(
+                            &label,
+                            &format!("r{}", current.release),
+                            &sockets,
+                            &group_sockets_from(&groups, &group_tables),
+                            &mount_paths(&mount_tables),
+                        )
+                        .await;
+
+                        match connected {
+                            Ok(connected) => {
+                                pools.replace(connected);
+
+                                if let Some(control) = &control {
+                                    control.acknowledge(version);
+                                }
+                            }
+                            Err(error) => {
+                                println!("muru: the workers could not be reconnected: {error:#}");
+                            }
+                        }
+                    }
+                    muru_controller::host::HostMessage::Event { kind, message, .. } => {
+                        println!("muru: {kind}: {message}");
+                    }
+                    muru_controller::host::HostMessage::Status { .. }
+                    | muru_controller::host::HostMessage::Response { .. } => {}
+                }
             }
             Some(path) = changed.recv() => {
                 let mut paths = vec![path];
@@ -1247,6 +1762,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop());
+                                (control, host_messages) = host_control(&current).await;
                                 break;
                             }
                             Err(error) => {

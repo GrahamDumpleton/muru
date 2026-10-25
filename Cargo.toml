@@ -18,7 +18,7 @@ default-members = [
 
 [workspace.package]
 # The only place the project version is stated. Change it with `just bump`.
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -30,10 +30,13 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+brotli = "8"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
+flate2 = "1"
 futures = "0.3"
 globset = "0.4"
+httpdate = "1"
 http = "1.3"
 http-body = "1.0"
 http-body-util = "0.1"
@@ -42,12 +45,14 @@ ignore = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client", "client-legacy", "http1", "http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "webpki-tokio"] }
 libc = "0.2"
+mime_guess = "2"
 muru-common = { path = "crates/muru-common" }
 muru-dashboard = { path = "crates/muru-dashboard" }
 muru-config = { path = "crates/muru-config" }
 muru-controller = { path = "crates/muru-controller" }
 muru-edge = { path = "crates/muru-edge" }
 muru-proto = { path = "crates/muru-proto" }
+percent-encoding = "2"
 prost = "0.14"
 protoc-bin-vendored = "3"
 pyo3 = { version = "0.30", features = ["extension-module"] }
@@ -68,6 +73,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "channel", "router"] }
+zstd = "0.13"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tower = "0.5"

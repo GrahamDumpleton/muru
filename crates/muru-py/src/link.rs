@@ -13,6 +13,7 @@
 //! the request.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -62,7 +63,31 @@ pub struct Lifecycle {
     pub on_reopen_logs: Option<Py<PyAny>>,
     /// A descriptor whose end of file means the host is gone.
     pub lifeline: Option<i32>,
+    /// A descriptor the worker writes a status line to every second
+    /// (section 7.6): the host reads it for timeouts and recycling.
+    pub report: Option<i32>,
+    /// Runs on SIGUSR2: the host asks for memory to be given back
+    /// (section 7.7).
+    pub on_reclaim: Option<Py<PyAny>>,
+    /// How often the report carries the worker's memory.
+    pub memory_interval: Duration,
+    /// The worker's end of the control connection to the host (section
+    /// 11.7): a stream socket carrying one JSON request per line.
+    pub control: Option<i32>,
+    /// Answers a control request: called with the request line and the
+    /// requests in flight, returns the response line.
+    pub on_control: Option<Py<PyAny>>,
 }
+
+/// What a signal asks of the worker.
+enum Asked {
+    Stop,
+    ReopenLogs,
+    Reclaim,
+}
+
+/// How often the worker reports to the host.
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Lifecycle {
     /// Call a hook with the interpreter attached, reporting any exception.
@@ -88,12 +113,39 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
     let accepting = Arc::clone(&shared);
     let reopen_logs = lifecycle.on_reopen_logs.as_ref();
+    let reclaim = lifecycle.on_reclaim.as_ref();
     let lifeline = lifecycle.lifeline;
+    let report = lifecycle.report;
+    let memory_interval = lifecycle.memory_interval;
+
+    // Section 11.7: the control thread answers the host's questions,
+    // attaching to the interpreter only to do so.
+
+    if let (Some(fd), Some(handler)) = (lifecycle.control, lifecycle.on_control.as_ref()) {
+        let handler = Python::attach(|py| handler.clone_ref(py));
+        let control_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("muru-control".to_owned())
+            .spawn(move || control_thread(fd, handler, control_shared))?;
+    }
+
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
+
+        // The socket's directory carries the edge's group (section 10.9),
+        // and the socket opens to that group whatever the umask left.
+
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
         let mut signals = Signals::new()?;
         let mut lifeline = Lifeline::new(lifeline)?;
+
+        // The first report says the worker is listening; the rest keep
+        // the host informed of what it is doing.
+
+        if let Some(fd) = report {
+            tokio::spawn(report_loop(fd, Arc::clone(&accepting), memory_interval));
+        }
 
         loop {
             tokio::select! {
@@ -101,13 +153,11 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                     let (stream, _) = accepted?;
                     tokio::spawn(serve_connection(stream, Arc::clone(&accepting)));
                 }
-                stop = signals.next() => {
-                    if stop {
-                        break;
-                    }
-
-                    Lifecycle::call(reopen_logs);
-                }
+                asked = signals.next() => match asked {
+                    Asked::Stop => break,
+                    Asked::ReopenLogs => Lifecycle::call(reopen_logs),
+                    Asked::Reclaim => Lifecycle::call(reclaim),
+                },
                 () = lifeline.gone() => {
                     eprintln!("muru: the host is gone, stopping");
                     break;
@@ -217,12 +267,134 @@ impl Lifeline {
     }
 }
 
+/// Answer control requests from the host, one JSON line each, until the
+/// connection closes: each is handed to the Python handler with the
+/// requests in flight, and its answer written back as one line.
+fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
+    use std::io::{BufRead as _, Write as _};
+
+    // SAFETY: the descriptor was inherited from the host for this
+    // purpose and nothing else in the worker holds it.
+
+    let socket =
+        unsafe { <std::os::unix::net::UnixStream as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    crate::pool::name_this_thread("muru-control");
+    let _ = socket.set_nonblocking(false);
+    let Ok(mut writer) = socket.try_clone() else {
+        return;
+    };
+    let reader = std::io::BufReader::new(socket);
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let answer = Python::attach(|py| {
+            let active = shared.active_requests(py)?;
+            let names = crate::pool::thread_names(py)?;
+            let reply = handler.call1(py, (line.as_str(), active, names))?;
+            reply.extract::<String>(py)
+        });
+
+        let text = match answer {
+            Ok(text) => text,
+            Err(error) => format!(
+                "{{\"ok\":false,\"error\":{}}}",
+                serde_json_string(&error.to_string())
+            ),
+        };
+
+        if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+            break;
+        }
+    }
+}
+
+/// A string as a JSON literal, escaped by hand so the runtime needs no
+/// JSON dependency for one error message.
+fn serde_json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+
+    out.push('"');
+    out
+}
+
+/// Write a status line to the report descriptor every second: requests
+/// in flight, the age of the oldest, and requests served, and every
+/// `memory_interval` the worker's memory too. A write that cannot
+/// complete at once (the host is behind) is skipped.
+async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
+    // SAFETY: fcntl on a descriptor inherited for this purpose, setting
+    // a flag; the descriptor stays open for the life of the worker.
+
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let mut last_measured: Option<Instant> = None;
+
+    loop {
+        let mut line = format!(
+            "{{\"in_flight\":{},\"oldest_ms\":{},\"requests\":{}",
+            shared.in_flight(),
+            shared.oldest_ms(),
+            shared.total()
+        );
+
+        if last_measured.is_none_or(|at| at.elapsed() >= memory_interval) {
+            last_measured = Some(Instant::now());
+
+            if let Some(memory) = crate::memory::measure() {
+                line.push_str(&format!(
+                    ",\"rss\":{},\"pss\":{},\"uss\":{}",
+                    memory.rss, memory.pss, memory.uss
+                ));
+            }
+        }
+
+        line.push_str("}\n");
+
+        // SAFETY: write from a buffer this frame owns, on a descriptor
+        // the host handed over for reports; a short or failed write is
+        // ignored, since the next report replaces it.
+
+        unsafe {
+            libc::write(fd, line.as_ptr().cast(), line.len());
+        }
+
+        tokio::time::sleep(REPORT_INTERVAL).await;
+    }
+}
+
 /// The signals a worker acts on: SIGTERM and SIGINT stop it, SIGUSR1 asks
-/// it to reopen its logs.
+/// it to reopen its logs, SIGUSR2 to give memory back.
 struct Signals {
     term: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
     usr1: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
 }
 
 impl Signals {
@@ -233,15 +405,17 @@ impl Signals {
             term: signal(SignalKind::terminate())?,
             int: signal(SignalKind::interrupt())?,
             usr1: signal(SignalKind::user_defined1())?,
+            usr2: signal(SignalKind::user_defined2())?,
         })
     }
 
-    /// Wait for a signal: true to stop, false to reopen logs.
-    async fn next(&mut self) -> bool {
+    /// Wait for a signal and say what it asks.
+    async fn next(&mut self) -> Asked {
         tokio::select! {
-            _ = self.term.recv() => true,
-            _ = self.int.recv() => true,
-            _ = self.usr1.recv() => false,
+            _ = self.term.recv() => Asked::Stop,
+            _ = self.int.recv() => Asked::Stop,
+            _ = self.usr1.recv() => Asked::ReopenLogs,
+            _ = self.usr2.recv() => Asked::Reclaim,
         }
     }
 }
@@ -398,10 +572,11 @@ async fn handle_request(
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
-    shared.request_started();
+    let request_id = shared.request_started(&head);
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = shared.pool.spawn(Box::new(move |py| {
+        worker_shared.request_on_this_thread(request_id);
         wsgi::run(
             py,
             &worker_shared,
@@ -411,11 +586,11 @@ async fn handle_request(
             out_tx,
             worker_cancelled,
         );
-        worker_shared.request_finished();
+        worker_shared.request_finished(request_id);
     }));
 
     if !queued {
-        shared.request_finished();
+        shared.request_finished(request_id);
         return Err(io::Error::other("the worker is shutting down"));
     }
 
@@ -518,12 +693,12 @@ async fn handle_asgi_request(
     // The task starts on the loop now; the channel is how the two sides
     // of this function reach it.
 
-    shared.request_started();
+    let request_id = shared.request_started(&head);
 
     let channel = match asgi::start(shared, asgi, &runner, &head, out_tx) {
         Ok(channel) => channel,
         Err(error) => {
-            shared.request_finished();
+            shared.request_finished(request_id);
             return Err(io::Error::other(format!(
                 "the worker is shutting down: {error}"
             )));
@@ -533,7 +708,7 @@ async fn handle_asgi_request(
     let channel = channel.get();
 
     if head.scope == pb::Scope::Websocket as i32 {
-        return handle_websocket(reader, writer, out_rx, shared, channel, &done).await;
+        return handle_websocket(reader, writer, out_rx, shared, channel, &done, request_id).await;
     }
 
     let read_side = async {
@@ -606,7 +781,7 @@ async fn handle_asgi_request(
 
     let (read_result, write_result) = tokio::join!(read_side, write_side);
     channel.disconnect();
-    shared.request_finished();
+    shared.request_finished(request_id);
 
     let early = read_result?;
     write_result?;
@@ -625,6 +800,7 @@ async fn handle_websocket(
     shared: &Arc<Shared>,
     channel: &asgi::Channel,
     done: &tokio::sync::Notify,
+    request_id: u64,
 ) -> io::Result<Option<frame::Frame>> {
     use tokio::io::AsyncBufReadExt;
 
@@ -699,7 +875,7 @@ async fn handle_websocket(
 
     let (read_result, write_result) = tokio::join!(read_side, write_side);
     channel.disconnect_with(1006, "the connection ended");
-    shared.request_finished();
+    shared.request_finished(request_id);
 
     let early = read_result?;
     write_result?;

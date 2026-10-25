@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -135,3 +136,105 @@ def test_the_gateway_serves_the_same_figures_as_json(served: tuple[Daemon, int])
 def test_the_dashboard_is_loopback_only(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="loopback"):
         start_daemon(tmp_path, arguments=["--dashboard", "0.0.0.0:0"])
+
+
+def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0, count: int = 1) -> str:
+    """Read a Server-Sent Events stream until `count` messages of `wanted` type
+    have arrived."""
+
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/event-stream"
+        deadline = time.monotonic() + timeout
+        collected = b""
+
+        while time.monotonic() < deadline:
+            chunk = response.read1(4096) if hasattr(response, "read1") else response.read(4096)
+
+            if not chunk:
+                break
+
+            collected += chunk
+
+            complete = collected.rsplit(b"\n\n", 1)[0] + b"\n\n" if b"\n\n" in collected else b""
+
+            if complete.count(f"event: {wanted}\n".encode()) >= count:
+                return collected.decode()
+
+        raise AssertionError(f"no {wanted} event in {collected!r}")
+    finally:
+        connection.close()
+
+
+def test_the_history_grows_and_streams_for_the_charts(served: tuple[Daemon, int]) -> None:
+    daemon, port = served
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+
+    # Points are differences between successive readings a second apart,
+    # so requests keep flowing while the first ones are waited for.
+
+    def recorded() -> bool:
+        for _ in range(20):
+            assert daemon.request("/catalogue").status == 200
+
+        history = fetch_json(port, "/v1/history?range=1h")
+        points = history["points"]
+        return len(points) >= 2 and sum(point[1] for point in points) > 0
+
+    wait_for(recorded)
+    history = fetch_json(port, "/v1/history?range=1h")
+    assert history["range"] == "1h" and history["step_s"] == 1
+    points = history["points"]
+    assert len(points) >= 2
+    assert all(len(point) == 7 for point in points)
+    assert points[-1][0] > points[0][0], "seconds in order"
+    assert any(point[6] == 2 for point in points), "two workers listening"
+    assert fetch_json(port, "/v1/history?range=24h")["step_s"] == 60
+
+    # The stream keeps delivering: one point a second, not just the first.
+
+    stream = read_sse(port, "/v1/history/stream", "point", count=3)
+    assert stream.count("event: point\ndata: [") >= 3
+
+    # The page carries the charts and their script, which the policy
+    # allows alongside the stylesheet.
+
+    status, headers, body = fetch(port, "/")
+    assert status == 200
+    page = body.decode()
+    assert 'id="charts"' in page and "/static/charts.js" in page and "/static/uplot.min.js" in page
+    assert "style-src 'self' 'unsafe-inline'" in headers["content-security-policy"]
+
+    for asset, kind in [
+        ("/static/uplot.min.js", "text/javascript"),
+        ("/static/uplot.min.css", "text/css"),
+        ("/static/sse.js", "text/javascript"),
+        ("/static/charts.js", "text/javascript"),
+    ]:
+        status, headers, body = fetch(port, asset)
+        assert status == 200 and headers["content-type"] == kind and body, asset
+
+
+def test_events_stream_as_rows_and_json(served: tuple[Daemon, int]) -> None:
+    daemon, port = served
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    outcome: list[str] = []
+
+    def listen() -> None:
+        outcome.append(read_sse(port, "/v1/events/stream", "json"))
+
+    listener = threading.Thread(target=listen)
+    listener.start()
+    time.sleep(0.5)
+    assert daemon.muructl("drain", "shop@r1").stdout.strip() == "muru: release shop@r1 is stopped"
+    listener.join(timeout=20)
+    assert outcome, "no event arrived on the stream"
+    text = outcome[0]
+    assert "event: event\ndata: <tr class=" in text
+    assert '"kind":"release.' in text or '"kind":"traffic.' in text
+    page = fetch(port, "/")[2].decode()
+    assert 'sse-connect="/v1/events/stream"' in page and 'id="event-rows"' in page

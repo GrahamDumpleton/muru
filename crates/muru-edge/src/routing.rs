@@ -34,6 +34,10 @@ pub struct Host {
 struct Route {
     path: String,
     app: String,
+    /// The directory served, for a static route (section 4.9).
+    static_route: Option<Arc<crate::static_files::StaticRoute>>,
+    /// The application that takes what no file answers.
+    fallback_app: String,
 }
 
 /// The worker sockets of one group of a release, as a snapshot or a
@@ -212,6 +216,7 @@ fn group_prefix(path: &str) -> String {
 pub struct Routing {
     version: u64,
     trust: Trust,
+    compression: crate::compression::Compression,
     default: Arc<AppPools>,
     apps: HashMap<String, Arc<AppPools>>,
     hosts: Vec<Host>,
@@ -237,6 +242,18 @@ pub enum Decision {
     Misdirected,
     /// The host has no route for the path (404).
     NoRoute,
+    /// To a directory of files (section 4.9), with the application that
+    /// takes what no file answers, when the route names one.
+    Static {
+        /// The route's directory and settings.
+        route: Arc<crate::static_files::StaticRoute>,
+        /// The route's path prefix.
+        prefix: String,
+        /// The fallback application's workers, when there is one.
+        fallback: Option<Selection>,
+        /// The matched or canonical host name.
+        server_name: Option<String>,
+    },
 }
 
 impl Routing {
@@ -246,6 +263,7 @@ impl Routing {
         Self {
             version: 0,
             trust: Trust::default(),
+            compression: crate::compression::Compression::default(),
             default: Arc::new(pools),
             apps: HashMap::new(),
             hosts: Vec::new(),
@@ -298,9 +316,16 @@ impl Routing {
             None => Trust::default(),
         };
 
+        let compression = match &snapshot.compression {
+            Some(message) => crate::compression::Compression::from_snapshot(message)
+                .map_err(|error| anyhow::anyhow!("compression: {error}"))?,
+            None => crate::compression::Compression::default(),
+        };
+
         let mut routing = Self {
             version: snapshot.version,
             trust,
+            compression,
             default,
             apps,
             hosts: Vec::new(),
@@ -357,9 +382,16 @@ impl Routing {
 
         for route in &snapshot.routes {
             if let Some(&index) = by_name.get(route.host.as_str()) {
+                let static_route = crate::static_files::StaticRoute::from_message(route)
+                    .map_err(|error| {
+                        anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
+                    })?
+                    .map(Arc::new);
                 routing.routes[index].push(Route {
                     path: route.path.clone(),
                     app: route.app.clone(),
+                    static_route,
+                    fallback_app: route.fallback_app.clone(),
                 });
             }
         }
@@ -379,6 +411,18 @@ impl Routing {
     /// Which peers may speak for the client (section 4.7).
     pub fn trust(&self) -> &Trust {
         &self.trust
+    }
+
+    /// How responses are compressed (section 4.17).
+    pub fn compression(&self) -> &crate::compression::Compression {
+        &self.compression
+    }
+
+    /// The same tables with this compression policy, for a development
+    /// run, which has no snapshot to carry it.
+    pub fn with_compression(mut self, compression: crate::compression::Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Whether any virtual host is declared.
@@ -431,18 +475,34 @@ impl Routing {
             return Decision::NoRoute;
         };
 
-        let selection = self
-            .apps
-            .get(&route.app)
-            .map(|pools| pools.select(path))
-            .unwrap_or_else(|| Selection {
-                pool: Arc::new(LinkPool::empty()),
-                app: route.app.clone(),
-                release: String::new(),
-                group: DEFAULT_GROUP.to_owned(),
-                mount: String::new(),
-                script_name: String::new(),
-            });
+        let select_app = |app: &str| {
+            self.apps
+                .get(app)
+                .map(|pools| pools.select(path))
+                .unwrap_or_else(|| Selection {
+                    pool: Arc::new(LinkPool::empty()),
+                    app: app.to_owned(),
+                    release: String::new(),
+                    group: DEFAULT_GROUP.to_owned(),
+                    mount: String::new(),
+                    script_name: String::new(),
+                })
+        };
+
+        if let Some(static_route) = &route.static_route {
+            return Decision::Static {
+                route: Arc::clone(static_route),
+                prefix: route.path.clone(),
+                fallback: (!route.fallback_app.is_empty()).then(|| select_app(&route.fallback_app)),
+                server_name: Some(if host.server_name.is_empty() {
+                    name.map(normalise).unwrap_or_default()
+                } else {
+                    host.server_name.clone()
+                }),
+            };
+        }
+
+        let selection = select_app(&route.app);
 
         // SERVER_NAME is the name the request matched with, or the
         // canonical name when the host says so (section 4.3).
@@ -567,6 +627,7 @@ mod tests {
     fn snapshot() -> pb::Snapshot {
         pb::Snapshot {
             version: 7,
+            compression: None,
             worker_sockets: Vec::new(),
             hosts: vec![
                 pb::Host {
@@ -593,16 +654,19 @@ mod tests {
                     host: "shop".to_owned(),
                     path: "/".to_owned(),
                     app: "shop".to_owned(),
+                    ..Default::default()
                 },
                 pb::Route {
                     host: "shop".to_owned(),
                     path: "/api".to_owned(),
                     app: "api".to_owned(),
+                    ..Default::default()
                 },
                 pb::Route {
                     host: "any".to_owned(),
                     path: "/".to_owned(),
                     app: "shop".to_owned(),
+                    ..Default::default()
                 },
             ],
             apps: Vec::new(),
@@ -623,6 +687,7 @@ mod tests {
             Decision::Redirect => Some("redirect".to_owned()),
             Decision::Misdirected => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
+            Decision::Static { server_name, .. } => server_name,
         }
     }
 

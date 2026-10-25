@@ -19,9 +19,11 @@ def test_development_mode_is_announced() -> None:
     server = support.start("plain_wsgi:application", workers=1)
 
     try:
-        log = server.log()
-        assert "muru: development mode: error pages show tracebacks" in log
-        assert "muru: dashboard on http://127.0.0.1:" in log
+        # Both lines are printed once the listeners are up, which can be
+        # a moment after the first request is answered on a busy machine.
+
+        assert server.wait_for_log("muru: development mode: error pages show tracebacks")
+        assert server.wait_for_log("muru: dashboard on http://127.0.0.1:")
         response = server.get("/error", headers={"Accept": "application/json"})
         assert response.status == 500
         assert "Traceback" in json.loads(response.body)["traceback"]

@@ -1,14 +1,22 @@
 # Logging
 
+```{tip}
+`muructl logging level APP NAME=LEVEL --for 10m` changes a logger's level
+in a release's workers for a period, without a restart; the
+[inspecting workers guide](debugging.md) has the details.
+```
+
 ```{admonition} Status
 :class: note
 
 Development mode writes to the terminal, or a file. Under the daemon each
 release and the edge write files in the log directory, `muructl logs`
-shows or follows them, and `muructl logs reopen` works with logrotate.
-Python's `logging` gets a level and format per release. Built-in
-rotation, journald, the request id on log records and runtime log levels
-are still to come.
+shows or follows them, the daemon rotates and compresses them, and
+`muructl logs reopen` works with logrotate.
+Python's `logging` gets a level and format per release, and `muructl
+logging level` changes a logger's level for a period. Journald, the
+request id on log records and daemon-wide logging defaults are still to
+come.
 ```
 
 A development run writes two kinds of lines to the terminal: what your
@@ -152,13 +160,31 @@ $ muructl logs --access --lines 1
 
 ## Rotation
 
-Rotation is external for now: logrotate, or anything else, renames the
-files, then `muructl logs reopen` makes every writer open its file again by
-name, so lines go to the new file and the renamed one is complete. Sending
-SIGUSR1 to the daemon does the same. `muructl logs reopen --workers` also
-runs the `on_reopen_logs` hook in every worker, for log files the
-application opened itself, which is where a `logging` file handler is
-reopened. A logrotate entry for a user-mode daemon:
+The daemon rotates its log files itself: the access log, the edge's own
+log, each release's log and, when it was started in the background, its
+own. A file is rotated when the period changes (daily, at midnight UTC,
+by default) or when it reaches `size`, if one is set: the daemon renames
+it with a timestamp (`access.log.20261025-000000`), has every writer open
+its file again by name, compresses the archive in the background
+(`.zst` by default) and keeps the newest `keep` archives. A
+`logs.rotated` event names what was rotated.
+
+```toml
+[logs]
+every = 'daily'          # off, hourly, daily or weekly, at the period's start in UTC
+size = '100MB'           # also rotate a file that reaches this
+keep = 14                # archives kept per log
+compress = 'zstd'        # zstd, gzip or off
+```
+
+`rotate = 'external'` turns the built-in rotation off for logrotate, or
+anything else that renames the files and then runs `muructl logs reopen`,
+which makes every writer open its file again by name, so lines go to the
+new file and the renamed one is complete. Sending SIGUSR1 to the daemon
+does the same. `muructl logs reopen --workers` also runs the
+`on_reopen_logs` hook in every worker, for log files the application
+opened itself, which is where a `logging` file handler is reopened. A
+logrotate entry for a user-mode daemon:
 
 ```
 /home/app/.local/state/muru/logs/*.log /home/app/.local/state/muru/logs/apps/*/*.log {

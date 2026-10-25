@@ -55,6 +55,11 @@ case "$action" in
         uv pip install -q --python scratch/venv-315t/bin/python \
             -r scratch/requirements-315t.txt scratch/wheels/muru-*cp315t*.whl
         scratch/venv-315t/bin/python -m pytest -p no:cacheprovider -o pythonpath=tests tests/integration tests/conformance "$@"
+        # The scenarios that need root run a daemon through sudo; the
+        # users it switches to must be able to read the source tree and
+        # the interpreter, so the home directory opens to them.
+        chmod o+rx "$HOME"
+        uv run pytest -m requires_root tests/integration
         ;;
     bench)
         cargo build --release -p muructl

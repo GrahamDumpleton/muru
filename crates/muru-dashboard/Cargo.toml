@@ -13,6 +13,7 @@ publish.workspace = true
 anyhow = { workspace = true }
 askama = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

@@ -454,6 +454,86 @@ impl Admin for Service {
         Ok(Response::new(stream))
     }
 
+    async fn debug(
+        &self,
+        request: Request<pb::DebugRequest>,
+    ) -> Result<Response<pb::DebugResponse>, Status> {
+        let request = request.into_inner();
+
+        // The application's current release unless one is named.
+
+        let release = if request.release.is_empty() {
+            let app = self.handle.store.app(&request.app).map_err(not_found)?;
+            app.current.ok_or_else(|| {
+                Status::failed_precondition(format!("{} has no current release", request.app))
+            })?
+        } else {
+            request.release.clone()
+        };
+        self.handle
+            .store
+            .release(&request.app, &release)
+            .map_err(not_found)?;
+
+        let args: serde_json::Value = if request.args_json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&request.args_json)
+                .map_err(|error| Status::invalid_argument(format!("args: {error}")))?
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Debug {
+                app: request.app.clone(),
+                id: release.clone(),
+                op: request.op.clone(),
+                worker: request.worker,
+                args,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let answered = tokio::time::timeout(Duration::from_secs(20), done_rx)
+            .await
+            .map_err(|_| Status::deadline_exceeded("the host did not answer in 20 seconds"))?
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::DebugResponse {
+            workers: answered
+                .into_iter()
+                .map(|reply| pb::WorkerDebug {
+                    index: reply.index,
+                    pid: reply.pid,
+                    ok: reply.ok,
+                    error: reply.error,
+                    result_json: reply.result_json,
+                })
+                .collect(),
+            release,
+        }))
+    }
+
+    async fn upgrade_daemon(
+        &self,
+        _: Request<pb::UpgradeDaemonRequest>,
+    ) -> Result<Response<pb::UpgradeDaemonResponse>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Upgrade { done: done_tx })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let upgrade = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::UpgradeDaemonResponse {
+            executable: upgrade.executable.display().to_string(),
+            version: upgrade.version,
+        }))
+    }
+
     async fn shutdown(
         &self,
         request: Request<pb::ShutdownRequest>,
@@ -507,6 +587,11 @@ impl Admin for Service {
                     host: route.host,
                     path: route.path,
                     app: route.app,
+                    static_dir: route.static_dir.unwrap_or_default(),
+                    fallback_app: route
+                        .fallback
+                        .and_then(|fallback| fallback.app)
+                        .unwrap_or_default(),
                 })
                 .collect(),
         }))
@@ -620,6 +705,15 @@ impl Service {
             Action::CreateApp { app } => store
                 .ensure_app(app)
                 .map(|_| "created".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::SetAppIdentity {
+                app,
+                user,
+                group,
+                umask,
+            } => store
+                .set_app_identity(app, user.as_deref(), group.as_deref(), umask.as_deref())
+                .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
             Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
@@ -771,6 +865,9 @@ fn app_message(app: crate::model::App) -> pb::App {
         previous_release: app.previous.unwrap_or_default(),
         resource_version: app.resource_version,
         created_unix_ms: app.created_unix_ms,
+        user: app.user.unwrap_or_default(),
+        group: app.group.unwrap_or_default(),
+        umask: app.umask.unwrap_or_default(),
     }
 }
 
