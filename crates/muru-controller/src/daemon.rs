@@ -2129,11 +2129,11 @@ impl Daemon {
                 running.held = true;
             }
 
-            self.set_state(&release, ReleaseState::Ready, "held: not serving");
-
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for a held release failed");
             }
+
+            self.mark_ready(app, &release.id, "held: not serving");
 
             return self
                 .store
@@ -2197,7 +2197,9 @@ impl Daemon {
     }
 
     /// Start a release's host and wait until every worker listens
-    /// (pending or stopped to starting, warming, ready; or failed).
+    /// (pending or stopped to starting and warming; or failed). The
+    /// caller marks the release ready once the edge has it, with
+    /// `mark_ready`, so a client told it is ready can reach it.
     async fn start(&mut self, app: &str, id: &str) -> Result<(), String> {
         let release = self
             .store
@@ -2206,10 +2208,10 @@ impl Daemon {
         let subject = format!("{app}@{id}");
 
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
-            // Retained and warm: back to ready without a restart.
+            // Retained and warm: no restart, and ready again once the
+            // caller has given it to the edge.
 
             running.retained_until = None;
-            self.set_state(&release, ReleaseState::Ready, "");
             return Ok(());
         }
 
@@ -2391,7 +2393,11 @@ impl Daemon {
             },
         );
         self.attach_control(app, id);
-        self.set_state(&release, ReleaseState::Ready, "");
+        self.set_state(
+            &release,
+            ReleaseState::Warming,
+            "workers ready, waiting for the edge",
+        );
         self.events.emit(
             "release.ready",
             &subject,
@@ -2576,7 +2582,11 @@ impl Daemon {
                 ready_at: HashMap::new(),
             },
         );
-        self.set_state(release, ReleaseState::Ready, "");
+        self.set_state(
+            release,
+            ReleaseState::Warming,
+            "instances ready, waiting for the edge",
+        );
         self.events.emit(
             "release.ready",
             &subject,
@@ -2607,7 +2617,10 @@ impl Daemon {
             running.held = false;
         }
 
-        match self.push_snapshot().await {
+        let pushed = self.push_snapshot().await;
+        self.mark_ready(app, id, "");
+
+        match pushed {
             Ok(()) => {
                 self.events.emit(
                     "traffic.switched",
@@ -3153,7 +3166,9 @@ impl Daemon {
                 describe_steps(&rollout.steps)
             ),
         );
-        self.push_snapshot().await?;
+        let pushed = self.push_snapshot().await;
+        self.mark_ready(app, candidate, "");
+        pushed?;
         self.begin_rollout_run(&rollout).await;
         Ok(rollout)
     }
@@ -3535,6 +3550,7 @@ impl Daemon {
     /// names it. Called after the configuration changes and at start.
     async fn reconcile_traffic(&mut self) {
         let referenced = self.referenced_releases();
+        let mut started = Vec::new();
 
         for (app, id) in &referenced {
             let key = (app.clone(), id.clone());
@@ -3552,13 +3568,26 @@ impl Daemon {
                 running.sticky_until = None;
             }
 
-            if let Err(error) = self.start(app, id).await {
-                self.events.emit(
-                    "traffic_policy.release_unavailable",
-                    &format!("{app}@{id}"),
-                    "warning",
-                    &format!("a traffic policy names the release but it cannot start: {error}"),
-                );
+            match self.start(app, id).await {
+                Ok(()) => started.push(key),
+                Err(error) => {
+                    self.events.emit(
+                        "traffic_policy.release_unavailable",
+                        &format!("{app}@{id}"),
+                        "warning",
+                        &format!("a traffic policy names the release but it cannot start: {error}"),
+                    );
+                }
+            }
+        }
+
+        if !started.is_empty() {
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a policy's releases failed");
+            }
+
+            for (app, id) in &started {
+                self.mark_ready(app, id, "");
             }
         }
 
@@ -4511,6 +4540,27 @@ impl Daemon {
         );
         self.events.emit("logs.reopened", "logs", "info", &message);
         Reopened { edge, hosts }
+    }
+
+    /// Mark a running release ready, once the snapshot that gives it to
+    /// the edge has been pushed: the state means a request can reach it.
+    /// A release that has meanwhile begun to stop is left as it is.
+    fn mark_ready(&self, app: &str, id: &str, message: &str) {
+        if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return;
+        }
+
+        if let Ok(release) = self.store.release(app, id)
+            && matches!(
+                release.state,
+                ReleaseState::Warming
+                    | ReleaseState::Ready
+                    | ReleaseState::Draining
+                    | ReleaseState::Retained
+            )
+        {
+            self.set_state(&release, ReleaseState::Ready, message);
+        }
     }
 
     fn set_state(&self, release: &Release, state: ReleaseState, message: &str) {
