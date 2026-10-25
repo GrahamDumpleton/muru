@@ -8,7 +8,7 @@ Still to be written, as their features land:
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Uploads and authorised downloads (internal redirects), including upload adapters for Django, Flask and Starlette.
 - Custom error pages and maintenance mode.
-- Scaling, schedules and memory limits.
+- Scaling and schedules.
 - Log rotation.
 - Containers and images.
 - uv and Python versions.
@@ -23,13 +23,21 @@ flask-and-django
 asgi
 starlette-and-fastapi
 daemon
+secrets
+users
 virtual-hosts
 behind-a-proxy
 worker-groups
 mounts
 https
+static-files
+compression
 timeouts
+connections
+recycling
+memory
 logging
+debugging
 metrics
 events
 systemd

@@ -36,10 +36,20 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
-Install it, put the configuration file at `/etc/muru/muru.toml`, and
-start it:
+The unit runs the daemon as root, which keeps root for itself alone:
+the edge and every application that names no user run as the service
+user, `muru` by default, and the daemon does not start without that
+account. The system packages create it with the sysusers.d entry at
+`packaging/sysusers.d/muru.conf`; an installation by hand creates it
+first, or names another account with `--user` on the `ExecStart` line
+or the `[daemon]` table of the configuration file. The [per-application
+users guide](users.md) says what the account needs to read.
+
+Create the account, install the unit, put the configuration file at
+`/etc/muru/muru.toml`, and start it:
 
 ```
+$ sudo useradd --system --no-create-home --shell /usr/sbin/nologin muru
 $ sudo cp packaging/systemd/muru.service /etc/systemd/system/
 $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now muru
@@ -72,13 +82,14 @@ is left.
 treats SIGTERM as `muructl daemon stop` without `--shutdown`, that is it
 detaches, leaving the hosts and the edge serving. `RuntimeDirectoryPreserve`
 keeps their sockets in `/run/muru`, and the next daemon finds them there
-and carries on, so a restart or an upgrade of the daemon costs no
+and carries on, so a restart of the daemon costs no
 request. The [daemon guide](daemon.md) says more about detaching and
 re-adoption.
 
 `systemctl reload` runs `muructl daemon reload`, which re-reads the
 configuration file for what can change while the daemon runs: today the
-`[proxy]` table, which the edge is given at once. Listeners, limits, the
+`[proxy]` and `[compression]` tables, which the edge is given at once.
+Listeners, limits, the
 metrics listener and event sinks are read when the daemon starts, and the
 reload says so. SIGHUP does the same as the command.
 

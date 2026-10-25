@@ -44,6 +44,18 @@ def apply(daemon: Daemon, path: Path, *arguments: str) -> subprocess.CompletedPr
     return daemon.muructl("apply", "-f", str(path), *arguments, check=False)
 
 
+def test_an_interpreter_relative_to_the_file_is_resolved_there(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    config = tmp_path / "shop.toml"
+    relative = os.path.relpath(sys.executable, tmp_path)
+    config.write_text(release("shop", "r1").replace(sys.executable, relative))
+    assert relative in config.read_text() and os.sep in relative
+    assert apply(daemon, config).returncode == 0
+    inspected = daemon.muructl("debug", "inspect", "shop").stdout
+    assert f"at {os.path.normpath(tmp_path / relative)}," in inspected, inspected
+
+
 def test_apply_deploys_declared_releases_and_is_idempotent(daemon: Daemon, tmp_path: Path) -> None:
     config = tmp_path / "shop.toml"
     config.write_text(release("shop", "r1"))
@@ -240,3 +252,50 @@ def test_a_directory_of_files_with_relative_sources(daemon: Daemon, tmp_path: Pa
     warned = apply(daemon, config)
     assert warned.returncode == 0, warned.stdout + warned.stderr
     assert "warning: [[listener]] entries belong in the daemon configuration file" in warned.stdout
+
+
+def test_recycling_and_timeouts_round_trip_through_export(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(
+        release("shop", "r1", max_requests=250, max_lifetime="1h")
+        + "[app.shop.release.r1.timeouts]\nhard_timeout = '30s'\n"
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    written = exported["app"]["shop"]["release"]["r1"]
+    assert written["max_requests"] == 250
+    assert written["max_lifetime"] == "3600s"
+    assert written["timeouts"]["hard_timeout"] == "30s"
+    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+
+    # A declared release that differs on these is immutable like any other.
+
+    config.write_text(release("shop", "r1", max_requests=300))
+    differing = apply(daemon, config)
+    assert differing.returncode == 1
+    assert "max_requests 300, recorded 250" in differing.stdout + differing.stderr
+
+
+def test_a_memory_table_round_trips_through_export(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "shop.toml"
+    config.write_text(
+        release("shop", "r1")
+        + "[app.shop.release.r1.memory]\nmeasure = 'rss'\n"
+        + "hard_limit = '1GB'\nsoft_limit = '800MB'\n"
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    exported = tomllib.loads(daemon.muructl("config", "export").stdout)
+    memory = exported["app"]["shop"]["release"]["r1"]["memory"]
+    assert memory == {
+        "measure": "rss",
+        "soft_limit": "800MB",
+        "soft_for": "120s",
+        "reclaim_first": True,
+        "hard_limit": "1GB",
+        "check_interval": "5s",
+    }
+    assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0

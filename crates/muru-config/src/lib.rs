@@ -39,6 +39,19 @@ pub enum Preload {
     False,
 }
 
+/// How a worker's memory is measured (section 7.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Measure {
+    /// Unique set size: pages no other process shares, the default,
+    /// since preloaded pages are shared copy-on-write.
+    Uss,
+    /// Proportional set size: shared pages counted in proportion.
+    Pss,
+    /// Resident set size: every resident page.
+    Rss,
+}
+
 /// When a factory entrypoint is called (section 6.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +101,7 @@ macro_rules! words {
 
 words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi" });
 words!(Preload { Auto => "auto", True => "true", False => "false" });
+words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
 
 /// A Python logging level (section 11.4).
@@ -167,6 +181,26 @@ pub fn format_size(bytes: u64) -> String {
     bytes.to_string()
 }
 
+/// Write a size for a reader, rounded to the largest unit that keeps a
+/// digit: 1.5GB, 800MB, 12KB.
+pub fn format_size_approx(bytes: u64) -> String {
+    let mut value = bytes as f64;
+
+    for unit in ["B", "KB", "MB", "GB"] {
+        if value < 1024.0 || unit == "GB" {
+            return if unit == "B" || value >= 10.0 {
+                format!("{value:.0}{unit}")
+            } else {
+                format!("{value:.1}{unit}")
+            };
+        }
+
+        value /= 1024.0;
+    }
+
+    bytes.to_string()
+}
+
 /// Parse a duration such as 250ms, 1.5s, 2m, 1h or 2 (seconds), as the
 /// configuration and the command line write them.
 pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
@@ -174,6 +208,10 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
 
     let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
         (number, 0.001)
+    } else if let Some(number) = text.strip_suffix('y') {
+        (number, 365.0 * 86400.0)
+    } else if let Some(number) = text.strip_suffix('d') {
+        (number, 86400.0)
     } else if let Some(number) = text.strip_suffix('h') {
         (number, 3600.0)
     } else if let Some(number) = text.strip_suffix('m') {
@@ -303,6 +341,169 @@ pub struct Release {
     /// Logging defaults (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
+    /// Requests a worker serves before it is replaced (section 7.7),
+    /// with jitter; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7), for
+    /// example 1h, with jitter; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<String>,
+    /// The timeouts the host enforces on its workers (section 7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<Timeouts>,
+    /// The memory policy for the workers (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+    /// Environment variables for the workers (section 10.8): a value, or
+    /// a secret reference resolved when the release starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+}
+
+/// The `[memory]` table of a release or a `[tool.muru]` table (section
+/// 7.7): the limits a worker's memory is held to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Memory {
+    /// What is measured: uss (the default), pss or rss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<Measure>,
+    /// Over this for soft_for, the worker reclaims and then recycles,
+    /// for example 800MB; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limit: Option<String>,
+    /// How long the worker may stay over the soft limit (default 2m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_for: Option<String>,
+    /// Whether to collect garbage and trim the heap before recycling
+    /// over the soft limit (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_first: Option<bool>,
+    /// Over this the worker leaves routing at once and is replaced,
+    /// for example 1200MB; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit: Option<String>,
+    /// How often memory is measured (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_interval: Option<String>,
+}
+
+/// A value in an `[env]` table (section 10.8): the text itself, or a
+/// reference to a secret in a store, delivered as the variable or, with
+/// `as = 'file'`, as a file whose path is in `NAME_FILE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnvValue {
+    /// The value as written.
+    Plain(String),
+    /// A secret reference.
+    Secret(SecretValue),
+}
+
+/// A secret reference in an `[env]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretValue {
+    /// The store and key.
+    pub secret: SecretRef,
+    /// `file` to deliver the value as a file instead of the variable.
+    #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+    pub deliver: Option<String>,
+}
+
+/// Which secret: a store declared in the daemon's file, and a key in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    /// The store's name.
+    pub store: String,
+    /// The key within the store.
+    pub key: String,
+}
+
+/// The `[logs]` table of the daemon's file (section 11.3): how the
+/// daemon rotates the log files it and its processes write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Logs {
+    /// `built-in` (the default) or `external`, for logrotate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<String>,
+    /// Rotate a file that reaches this size, for example 100MB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Rotate by the clock: `off`, `hourly`, `daily` (the default) or
+    /// `weekly`, at the period's start in UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+    /// Archives kept per log (default 14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<usize>,
+    /// How archives are compressed: `zstd` (the default), `gzip` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress: Option<String>,
+}
+
+/// The `[daemon]` table of the daemon's file: how the daemon itself runs
+/// (ADR 0026).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Daemon {
+    /// The service user: whom a daemon that runs as root starts the edge,
+    /// and the applications that name no user of their own, as (default
+    /// `muru`). Never root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// The `[secrets]` table of the daemon's file (section 10.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Secrets {
+    /// Stores by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub store: BTreeMap<String, SecretStore>,
+}
+
+/// One `[secrets.store.NAME]` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretStore {
+    /// `file`, `env` or `exec`.
+    #[serde(default)]
+    pub kind: String,
+    /// For a file store, the directory; the daemon's secrets directory
+    /// under the store's name otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// For an exec store, the command and arguments, with `{key}` where
+    /// the key goes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// For an exec store, how long the command may take (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+/// The `[timeouts]` table of a release or a `[tool.muru]` table (section
+/// 7.6): the timeouts the host enforces on its workers. The edge's own
+/// timeouts are the daemon's `[limits]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Timeouts {
+    /// How long a request may run in a worker before the worker is
+    /// replaced, for example 60s; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout: Option<String>,
+    /// How long a worker being replaced is given to finish its other
+    /// requests before it is told to stop (default 10s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_drain_grace: Option<String>,
+    /// How long a worker told to stop is given before it is killed
+    /// (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -422,6 +623,56 @@ pub struct Limits {
     /// Time a worker may pause mid-response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_idle_timeout: Option<String>,
+    /// Open connections per listener (section 4.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
+    /// Open connections per client address; 0 disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_client: Option<usize>,
+    /// Idle time before a keep-alive connection is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_timeout: Option<String>,
+    /// The same for connections from trusted proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_timeout_proxy: Option<String>,
+    /// Requests served on one connection before it is closed; 0 for no
+    /// limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_connection: Option<u64>,
+    /// HTTP/2 settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2: Option<Http2Limits>,
+}
+
+/// The `[limits.http2]` table (section 4.18).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http2Limits {
+    /// Concurrent streams per connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_streams: Option<u32>,
+}
+
+/// The `[compression]` table (section 4.17): how the edge compresses
+/// responses. Every key is optional, with the defaults of appendix C.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compression {
+    /// Whether responses are compressed at all (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The encodings offered in preference order: br, zstd and gzip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encodings: Vec<String>,
+    /// The smallest body worth compressing, for example 1KB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_size: Option<String>,
+    /// The content types compressed: exact types or a family as text/*.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+    /// How hard to compress: fast, default or best.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
 }
 
 /// A listener, one of the `[[listener]]` entries (appendix C), in the
@@ -545,8 +796,61 @@ pub struct Route {
     /// The path prefix, `/` for everything. The longest prefix wins.
     #[serde(default = "root_path")]
     pub path: String,
-    /// The application whose serving release takes the requests.
+    /// The application whose serving release takes the requests; empty
+    /// for a static route.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app: String,
+    /// The directory served by the edge (section 4.9), instead of an
+    /// application.
+    #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
+    pub static_dir: Option<String>,
+    /// The files tried, in order, when a directory is requested
+    /// (default index.html).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index: Vec<String>,
+    /// What takes a request no file answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Fallback>,
+    /// The cache headers files are sent with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheTable>,
+    /// Whether a directory asked for without a trailing slash is
+    /// redirected to the slash form (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_slash: Option<bool>,
+    /// `strict` (the default), which matches names as they are on disk,
+    /// or `insensitive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
+}
+
+/// A static route's fallback (section 4.9): an application, or a file
+/// within the directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fallback {
+    /// The application that takes requests no file answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// The file served for paths with no file of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+/// A static route's cache headers (section 4.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheTable {
+    /// How long clients may keep a file, for example 1y or 1h.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<String>,
+    /// Whether files are marked immutable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immutable: Option<bool>,
+    /// Files that get no-cache instead, by pattern on their path within
+    /// the route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<String>,
 }
 
 fn root_path() -> String {
@@ -560,6 +864,16 @@ pub struct App {
     /// Releases by identifier.
     #[serde(default)]
     pub release: BTreeMap<String, Release>,
+    /// The user the application's hosts and workers run as, when the
+    /// daemon runs as root (section 10.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The group, else the user's primary group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The file creation mask, in octal, for example 027.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umask: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -580,6 +894,9 @@ pub struct Metrics {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    /// How the daemon itself runs (ADR 0026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<Daemon>,
     /// Listeners.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listener: Vec<Listener>,
@@ -589,6 +906,15 @@ pub struct Document {
     /// Trusted proxies and the headers taken from them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<Proxy>,
+    /// How responses are compressed (section 4.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
+    /// Secret stores (section 10.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Secrets>,
+    /// Log rotation (section 11.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Logs>,
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
@@ -633,6 +959,10 @@ impl Document {
             self.limits = other.limits;
         }
 
+        if other.daemon.is_some() {
+            self.daemon = other.daemon;
+        }
+
         if other.metrics.is_some() {
             self.metrics = other.metrics;
         }
@@ -659,6 +989,15 @@ impl Document {
 
         for (name, app) in other.app {
             let entry = self.app.entry(name.clone()).or_default();
+
+            // The identity (section 10.9) comes along; a later file that
+            // sets it replaces an earlier one's.
+
+            if app.user.is_some() || app.group.is_some() || app.umask.is_some() {
+                entry.user = app.user;
+                entry.group = app.group;
+                entry.umask = app.umask;
+            }
 
             for (id, release) in app.release {
                 if entry.release.contains_key(&id) {
@@ -722,6 +1061,22 @@ pub struct ToolMuru {
     /// Logging defaults (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<String>,
+    /// The timeouts the host enforces on its workers (section 7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<Timeouts>,
+    /// The memory policy for the workers (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+    /// Environment variables for the workers (section 10.8): a value, or
+    /// a secret reference resolved when the release starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
 }
 
 /// Why a project's configuration could not be read.
@@ -869,6 +1224,7 @@ mod tests {
                         ..Release::default()
                     },
                 )]),
+                ..App::default()
             },
         );
         document.host.insert(
@@ -890,6 +1246,12 @@ mod tests {
             host: "shop".to_owned(),
             path: "/".to_owned(),
             app: "shop".to_owned(),
+            static_dir: None,
+            index: Vec::new(),
+            fallback: None,
+            cache: None,
+            redirect_slash: None,
+            case: None,
         });
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");

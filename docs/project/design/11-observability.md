@@ -97,6 +97,8 @@ Every worker has a control connection to its host, and the host to the daemon, s
 - `muructl logging level` (section 11.4) changes a logger's level for a period and reverts on its own.
 - faulthandler is enabled in every worker with its output routed to the log collector, so a crash in a C extension leaves a Python traceback rather than nothing.
 
+**Phase 2 interim.** The first slice (ADR 0025) builds the in-process mechanism: a control thread in the runtime library on a socket pair inherited at fork, the host relaying the daemon's requests, and faulthandler on SIGQUIT for a worker that cannot answer in time. Stacks are taken from inside until the PEP 768 reader is added for Python 3.14 and later.
+
 **Scope and limits.** Every command is an admin-role operation (section 10.6), is recorded in the audit log, and works through the daemon's existing channels, so nothing listens anywhere new. Reading another process needs the right ptrace permissions: the same user suffices on macOS and on Linux with the default ptrace scope, and in a container the host does the reading from inside. Status, stacks, tasks, inspect, logging levels and faulthandler arrive with the daemon in phase 2; profiling, tracing, memory tracing, attach, exec and the automatic captures follow in phase 3 with the soft timeouts and memory policy they build on (section 14.5).
 
 Development mode shows tracebacks in error pages and the terminal, and supports --single for running the whole application in one process under a debugger (section 13.1). The attach command is for what --single cannot cover: a bug that only shows with forked workers or real traffic, or in the release itself.

@@ -167,6 +167,144 @@ pub struct ReleaseSpec {
     /// Python logging defaults (section 11.4).
     #[serde(default)]
     pub logging: muru_config::PythonLogging,
+    /// Requests a worker serves before it is replaced (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime_ms: Option<u64>,
+    /// The timeouts the host enforces on its workers (section 7.6).
+    #[serde(default)]
+    pub timeouts: WorkerTimeouts,
+    /// The memory policy for the workers (section 7.7).
+    #[serde(default)]
+    pub memory: MemoryPolicy,
+    /// Environment variables for the workers (section 10.8), in name
+    /// order; secret values are never recorded, only their references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvSpec>,
+}
+
+/// One environment variable of a release (section 10.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvSpec {
+    /// The variable's name.
+    pub name: String,
+    /// Its value as written, when it is not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The store a secret value comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_store: Option<String>,
+    /// The key of the secret in its store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<String>,
+    /// Whether the secret is delivered as a file named by NAME_FILE.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_file: bool,
+}
+
+impl EnvSpec {
+    /// The variable as a phrase that never shows a secret's value.
+    pub fn describe(&self) -> String {
+        match (&self.secret_store, &self.secret_key) {
+            (Some(store), Some(key)) => format!(
+                "{}=secret {store}/{key}{}",
+                self.name,
+                if self.as_file { " as file" } else { "" }
+            ),
+            _ => format!("{}={}", self.name, self.value.clone().unwrap_or_default()),
+        }
+    }
+}
+
+/// The memory policy of a release's workers (section 7.7), in bytes and
+/// milliseconds; the defaults are those of appendix C.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPolicy {
+    /// What is measured.
+    #[serde(default = "default_measure")]
+    pub measure: muru_config::Measure,
+    /// Over this for `soft_for_ms`, the worker reclaims and then
+    /// recycles; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limit: Option<u64>,
+    /// How long a worker may stay over the soft limit.
+    #[serde(default = "default_soft_for_ms")]
+    pub soft_for_ms: u64,
+    /// Whether to reclaim before recycling over the soft limit.
+    #[serde(default = "default_true")]
+    pub reclaim_first: bool,
+    /// Over this the worker leaves routing at once and is replaced; off
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit: Option<u64>,
+    /// How often memory is measured.
+    #[serde(default = "default_check_interval_ms")]
+    pub check_interval_ms: u64,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            measure: default_measure(),
+            soft_limit: None,
+            soft_for_ms: default_soft_for_ms(),
+            reclaim_first: true,
+            hard_limit: None,
+            check_interval_ms: default_check_interval_ms(),
+        }
+    }
+}
+
+fn default_measure() -> muru_config::Measure {
+    muru_config::Measure::Uss
+}
+
+fn default_soft_for_ms() -> u64 {
+    120_000
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_check_interval_ms() -> u64 {
+    5_000
+}
+
+/// The timeouts a host enforces on its workers (section 7.6), in
+/// milliseconds; the defaults are those of appendix C.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerTimeouts {
+    /// How long a request may run before its worker is replaced; off
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout_ms: Option<u64>,
+    /// How long a replaced worker gets to finish its other requests.
+    #[serde(default = "default_hard_drain_grace_ms")]
+    pub hard_drain_grace_ms: u64,
+    /// How long a worker told to stop gets before it is killed.
+    #[serde(default = "default_shutdown_timeout_ms")]
+    pub shutdown_timeout_ms: u64,
+}
+
+impl Default for WorkerTimeouts {
+    fn default() -> Self {
+        Self {
+            hard_timeout_ms: None,
+            hard_drain_grace_ms: default_hard_drain_grace_ms(),
+            shutdown_timeout_ms: default_shutdown_timeout_ms(),
+        }
+    }
+}
+
+fn default_hard_drain_grace_ms() -> u64 {
+    10_000
+}
+
+fn default_shutdown_timeout_ms() -> u64 {
+    5_000
 }
 
 /// A release record: its spec, where it is in section 9.1, and why.
@@ -201,6 +339,37 @@ pub struct App {
     pub created_unix_ms: u64,
     /// For optimistic concurrency.
     pub resource_version: u64,
+    /// The user its hosts and workers run as, when the daemon is root
+    /// (section 10.9).
+    pub user: Option<String>,
+    /// The group, else the user's primary group.
+    pub group: Option<String>,
+    /// The file creation mask, in octal.
+    pub umask: Option<String>,
+}
+
+impl App {
+    /// The identity as one phrase, or none.
+    pub fn describe_identity(&self) -> Option<String> {
+        let user = self.user.as_ref()?;
+        let mut text = user.clone();
+
+        if let Some(group) = &self.group {
+            text.push(':');
+            text.push_str(group);
+        }
+
+        if let Some(umask) = &self.umask {
+            text.push_str(&format!(" umask {umask}"));
+        }
+
+        Some(text)
+    }
+}
+
+/// Whether a string is an octal file creation mask such as 027.
+pub fn valid_umask(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 4 && text.chars().all(|c| ('0'..='7').contains(&c))
 }
 
 /// One state change (section 11.5).
@@ -230,6 +399,19 @@ pub fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && !name.starts_with('-')
         && !name.ends_with('-')
+}
+
+/// Whether a string is an environment variable name: letters, digits and
+/// underscores, not starting with a digit.
+pub fn valid_env_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+
+    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Now, as Unix milliseconds.

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use muru_config::{
     App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
@@ -16,7 +17,7 @@ use muru_config::{
 };
 use muru_proto::admin::v1 as pb;
 
-use crate::model::{GroupSpec, MountSpec, ReleaseSpec, valid_name};
+use crate::model::{EnvSpec, GroupSpec, MountSpec, ReleaseSpec, valid_name};
 use crate::store::{Store, StoreError};
 
 /// What an apply does to one object.
@@ -27,14 +28,26 @@ pub enum Action {
         /// The application.
         app: String,
     },
+    /// Set the user, group and umask an application's processes run
+    /// with (section 10.9).
+    SetAppIdentity {
+        /// The application.
+        app: String,
+        /// The user, or none for the daemon's.
+        user: Option<String>,
+        /// The group, or none for the user's primary group.
+        group: Option<String>,
+        /// The umask, in octal, or none for the daemon's.
+        umask: Option<String>,
+    },
     /// Create a release with this spec and move traffic to it.
     Deploy {
         /// The application.
         app: String,
         /// The declared release id.
         id: String,
-        /// The resolved spec.
-        spec: ReleaseSpec,
+        /// The resolved spec, boxed to keep the actions small.
+        spec: Box<ReleaseSpec>,
     },
     /// Drain the release if it runs, then drop its record (prune).
     RemoveRelease {
@@ -83,6 +96,7 @@ impl Action {
     pub fn name(&self) -> &'static str {
         match self {
             Action::CreateApp { .. } => "create-app",
+            Action::SetAppIdentity { .. } => "set-identity",
             Action::Deploy { .. } => "deploy",
             Action::RemoveRelease { .. } => "remove-release",
             Action::RemoveApp { .. } => "remove-app",
@@ -121,7 +135,9 @@ impl Change {
     /// route HOST PATH.
     pub fn subject(&self) -> String {
         match &self.action {
-            Action::CreateApp { app } | Action::RemoveApp { app } => app.clone(),
+            Action::CreateApp { app }
+            | Action::RemoveApp { app }
+            | Action::SetAppIdentity { app, .. } => app.clone(),
             Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
                 format!("{app}@{id}")
             }
@@ -221,12 +237,61 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         return;
     }
 
-    if store.app(name).is_err() {
+    let stored = store.app(name).ok();
+
+    if stored.is_none() {
         plan.changes.push(Change {
             action: Action::CreateApp {
                 app: name.to_owned(),
             },
             detail: String::new(),
+        });
+    }
+
+    // Section 10.9: the identity is set whenever the table says
+    // something different from the record.
+
+    if let Some(umask) = &app.umask
+        && !crate::model::valid_umask(umask)
+    {
+        plan.errors.push(format!(
+            "{name}: umask must be octal digits such as 027, not {umask:?}"
+        ));
+        return;
+    }
+
+    if app.group.is_some() && app.user.is_none() {
+        plan.errors
+            .push(format!("{name}: a group needs a user as well"));
+        return;
+    }
+
+    let same = stored.as_ref().is_some_and(|stored| {
+        stored.user == app.user && stored.group == app.group && stored.umask == app.umask
+    });
+
+    if !same && (stored.is_some() || app.user.is_some() || app.umask.is_some()) {
+        plan.changes.push(Change {
+            action: Action::SetAppIdentity {
+                app: name.to_owned(),
+                user: app.user.clone(),
+                group: app.group.clone(),
+                umask: app.umask.clone(),
+            },
+            detail: match &app.user {
+                Some(user) => format!(
+                    "user {user}{}{}",
+                    app.group
+                        .as_ref()
+                        .map(|group| format!(", group {group}"))
+                        .unwrap_or_default(),
+                    app.umask
+                        .as_ref()
+                        .map(|umask| format!(", umask {umask}"))
+                        .unwrap_or_default()
+                ),
+                None => "the daemon's own user".to_owned(),
+            },
         });
     }
 
@@ -277,7 +342,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
                 action: Action::Deploy {
                     app: name.to_owned(),
                     id: id.clone(),
-                    spec,
+                    spec: Box::new(spec),
                 },
             }),
         }
@@ -422,12 +487,90 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             valid = false;
         }
 
-        if !document.app.contains_key(&route.app) && !stored_apps.contains(&route.app) {
-            plan.errors.push(format!(
-                "route {} {}: no application named {}",
-                route.host, route.path, route.app
-            ));
-            valid = false;
+        // Section 4.9: a route names an application or a directory, and
+        // a directory route's settings are checked here, before the edge
+        // sees them.
+
+        let fallback_app = route
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.app.as_deref());
+        let known_app =
+            |app: &str| document.app.contains_key(app) || stored_apps.iter().any(|a| a == app);
+
+        match (&route.static_dir, route.app.is_empty()) {
+            (Some(_), false) => {
+                plan.errors.push(format!(
+                    "route {} {}: names both an application and a static directory",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+            (None, true) => {
+                plan.errors.push(format!(
+                    "route {} {}: names neither an application nor a static directory",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+            (Some(directory), true) => {
+                if !Path::new(directory).is_dir() {
+                    plan.errors.push(format!(
+                        "route {} {}: {directory} is not a directory",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+
+                if let Some(app) = fallback_app
+                    && !known_app(app)
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: no application named {app} for the fallback",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+
+                if let Some(text) = route
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.max_age.as_deref())
+                    && let Err(error) = muru_config::parse_duration(text)
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: cache.max_age: {error}",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+
+                if let Some(case) = route.case.as_deref()
+                    && !["strict", "insensitive"].contains(&case)
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: case must be strict or insensitive, not {case:?}",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+            }
+            (None, false) => {
+                if !known_app(&route.app) {
+                    plan.errors.push(format!(
+                        "route {} {}: no application named {}",
+                        route.host, route.path, route.app
+                    ));
+                    valid = false;
+                }
+
+                if route.fallback.is_some() || route.cache.is_some() || !route.index.is_empty() {
+                    plan.warnings.push(format!(
+                        "route {} {}: index, fallback and cache apply to static routes only",
+                        route.host, route.path
+                    ));
+                }
+            }
         }
 
         if seen.contains(&key) {
@@ -539,7 +682,12 @@ pub fn export(
     for app in apps {
         let mut releases = store.releases(Some(&app.name))?;
         releases.sort_by_key(|release| release_order(&release.id));
-        let mut table = AppTable::default();
+        let mut table = AppTable {
+            user: app.user.clone(),
+            group: app.group.clone(),
+            umask: app.umask.clone(),
+            ..AppTable::default()
+        };
 
         for release in releases {
             let serves = app.current.as_deref() == Some(release.id.as_str());
@@ -757,6 +905,149 @@ pub fn resolve_spec(
         });
     }
 
+    // Section 7.6 and 7.7: the host's own timeouts and recycling, from
+    // the request, else the table, else the defaults of appendix C.
+
+    let table_timeouts = table.timeouts.clone().unwrap_or_default();
+    let duration_ms =
+        |given: Option<u64>, text: Option<&String>, name: &str| -> Result<Option<u64>, String> {
+            match (given, text) {
+                (Some(ms), _) => Ok(Some(ms)),
+                (None, Some(text)) => muru_config::parse_duration(text)
+                    .map(|duration| Some(duration.as_millis() as u64))
+                    .map_err(|error| format!("{name}: {error}")),
+                (None, None) => Ok(None),
+            }
+        };
+    let max_lifetime_ms = duration_ms(
+        request.max_lifetime_ms,
+        table.max_lifetime.as_ref(),
+        "max_lifetime",
+    )?;
+    let timeouts = crate::model::WorkerTimeouts {
+        hard_timeout_ms: duration_ms(
+            request.hard_timeout_ms,
+            table_timeouts.hard_timeout.as_ref(),
+            "hard_timeout",
+        )?,
+        hard_drain_grace_ms: duration_ms(
+            request.hard_drain_grace_ms,
+            table_timeouts.hard_drain_grace.as_ref(),
+            "hard_drain_grace",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().hard_drain_grace_ms),
+        shutdown_timeout_ms: duration_ms(
+            request.shutdown_timeout_ms,
+            table_timeouts.shutdown_timeout.as_ref(),
+            "shutdown_timeout",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
+    };
+
+    if max_lifetime_ms == Some(0) {
+        return Err("max_lifetime must be longer than nothing".to_owned());
+    }
+
+    // Section 7.7: the memory policy, the same way.
+
+    let table_memory = table.memory.clone().unwrap_or_default();
+    let size =
+        |given: Option<u64>, text: Option<&String>, name: &str| -> Result<Option<u64>, String> {
+            match (given, text) {
+                (Some(bytes), _) => Ok(Some(bytes)),
+                (None, Some(text)) => muru_config::parse_size(text)
+                    .map(Some)
+                    .map_err(|error| format!("memory.{name}: {error}")),
+                (None, None) => Ok(None),
+            }
+        };
+    let defaults = crate::model::MemoryPolicy::default();
+    let memory = crate::model::MemoryPolicy {
+        measure: match request.memory_measure.as_str() {
+            "" => table_memory.measure.unwrap_or(defaults.measure),
+            given => given
+                .parse()
+                .map_err(|error: muru_config::ParseError| format!("memory.measure: {error}"))?,
+        },
+        soft_limit: size(
+            request.memory_soft_limit,
+            table_memory.soft_limit.as_ref(),
+            "soft_limit",
+        )?,
+        soft_for_ms: duration_ms(
+            request.memory_soft_for_ms,
+            table_memory.soft_for.as_ref(),
+            "memory.soft_for",
+        )?
+        .unwrap_or(defaults.soft_for_ms),
+        reclaim_first: request
+            .memory_reclaim_first
+            .or(table_memory.reclaim_first)
+            .unwrap_or(defaults.reclaim_first),
+        hard_limit: size(
+            request.memory_hard_limit,
+            table_memory.hard_limit.as_ref(),
+            "hard_limit",
+        )?,
+        check_interval_ms: duration_ms(
+            request.memory_check_interval_ms,
+            table_memory.check_interval.as_ref(),
+            "memory.check_interval",
+        )?
+        .unwrap_or(defaults.check_interval_ms),
+    };
+
+    if let (Some(soft), Some(hard)) = (memory.soft_limit, memory.hard_limit)
+        && hard < soft
+    {
+        return Err("memory.hard_limit must not be below memory.soft_limit".to_owned());
+    }
+
+    if memory.check_interval_ms == 0 {
+        return Err("memory.check_interval must be longer than nothing".to_owned());
+    }
+
+    // Section 10.8: the environment, the table's entries with the
+    // request's over them, references kept as references.
+
+    let mut env_table: BTreeMap<String, EnvSpec> = BTreeMap::new();
+
+    for (name, value) in &table.env {
+        env_table.insert(name.clone(), env_spec_from_table(name, value)?);
+    }
+
+    for entry in &request.env {
+        if !crate::model::valid_env_name(&entry.name) {
+            return Err(format!("env: {:?} is not a variable name", entry.name));
+        }
+
+        if entry.secret_store.is_empty() != entry.secret_key.is_empty() {
+            return Err(format!(
+                "env {}: a secret needs both a store and a key",
+                entry.name
+            ));
+        }
+
+        env_table.insert(
+            entry.name.clone(),
+            EnvSpec {
+                name: entry.name.clone(),
+                value: entry.secret_store.is_empty().then(|| entry.value.clone()),
+                secret_store: (!entry.secret_store.is_empty()).then(|| entry.secret_store.clone()),
+                secret_key: (!entry.secret_key.is_empty()).then(|| entry.secret_key.clone()),
+                as_file: entry.as_file && !entry.secret_store.is_empty(),
+            },
+        );
+    }
+
+    let env: Vec<EnvSpec> = env_table.into_values().collect();
+
+    if request.max_requests == Some(0)
+        || (request.max_requests.is_none() && table.max_requests == Some(0))
+    {
+        return Err("max_requests must be at least 1".to_owned());
+    }
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -787,6 +1078,11 @@ pub fn resolve_spec(
             .or(table.logging.as_ref())
             .and_then(|logging| logging.python.clone())
             .unwrap_or_default(),
+        max_requests: request.max_requests.or(table.max_requests),
+        max_lifetime_ms,
+        timeouts,
+        memory,
+        env,
     })
 }
 
@@ -822,6 +1118,44 @@ fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
         .map_err(|error: muru_config::ParseError| error.to_string())
 }
 
+/// One variable of an `[env]` table as the spec records it.
+fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvSpec, String> {
+    if !crate::model::valid_env_name(name) {
+        return Err(format!("env: {name:?} is not a variable name"));
+    }
+
+    Ok(match value {
+        muru_config::EnvValue::Plain(text) => EnvSpec {
+            name: name.to_owned(),
+            value: Some(text.clone()),
+            secret_store: None,
+            secret_key: None,
+            as_file: false,
+        },
+        muru_config::EnvValue::Secret(secret) => {
+            if secret.secret.store.is_empty() || secret.secret.key.is_empty() {
+                return Err(format!("env {name}: a secret needs a store and a key"));
+            }
+
+            let as_file = match secret.deliver.as_deref() {
+                None | Some("env") => false,
+                Some("file") => true,
+                Some(other) => {
+                    return Err(format!("env {name}: as must be file or env, not {other:?}"));
+                }
+            };
+
+            EnvSpec {
+                name: name.to_owned(),
+                value: None,
+                secret_store: Some(secret.secret.store.clone()),
+                secret_key: Some(secret.secret.key.clone()),
+                as_file,
+            }
+        }
+    })
+}
+
 /// A declared release as the deploy request it stands for.
 fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequest {
     pb::DeployRequest {
@@ -850,7 +1184,76 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         release: String::new(),
         wait: true,
         retain_ms: None,
+        max_requests: table.max_requests,
+        max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
+        hard_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.hard_timeout.as_ref()),
+        ),
+        hard_drain_grace_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.hard_drain_grace.as_ref()),
+        ),
+        shutdown_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.shutdown_timeout.as_ref()),
+        ),
+        memory_measure: table
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.measure)
+            .map(|measure| measure.as_str().to_owned())
+            .unwrap_or_default(),
+        memory_soft_limit: size_field(table.memory.as_ref().and_then(|m| m.soft_limit.as_ref())),
+        memory_soft_for_ms: duration_field(table.memory.as_ref().and_then(|m| m.soft_for.as_ref())),
+        memory_reclaim_first: table.memory.as_ref().and_then(|m| m.reclaim_first),
+        memory_hard_limit: size_field(table.memory.as_ref().and_then(|m| m.hard_limit.as_ref())),
+        memory_check_interval_ms: duration_field(
+            table
+                .memory
+                .as_ref()
+                .and_then(|m| m.check_interval.as_ref()),
+        ),
+        env: table
+            .env
+            .iter()
+            .map(|(name, value)| match value {
+                muru_config::EnvValue::Plain(text) => pb::EnvEntry {
+                    name: name.clone(),
+                    value: text.clone(),
+                    ..Default::default()
+                },
+                muru_config::EnvValue::Secret(secret) => pb::EnvEntry {
+                    name: name.clone(),
+                    secret_store: secret.secret.store.clone(),
+                    secret_key: secret.secret.key.clone(),
+                    as_file: secret.deliver.as_deref() == Some("file"),
+                    ..Default::default()
+                },
+            })
+            .collect(),
     }
+}
+
+/// A size a table writes, as bytes for a request; one that does not
+/// parse is left out, and the validation of the declared release
+/// reports it.
+fn size_field(text: Option<&String>) -> Option<u64> {
+    text.and_then(|text| muru_config::parse_size(text).ok())
+}
+
+/// A duration a table writes, as milliseconds for a request; one that
+/// does not parse is left out, and the validation of the declared
+/// release reports it.
+fn duration_field(text: Option<&String>) -> Option<u64> {
+    text.and_then(|text| muru_config::parse_duration(text).ok())
+        .map(|duration| duration.as_millis() as u64)
 }
 
 /// A recorded spec as the table that declares it, every key written so
@@ -902,6 +1305,58 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         logging: (spec.logging != muru_config::PythonLogging::default()).then(|| {
             muru_config::Logging {
                 python: Some(spec.logging.clone()),
+            }
+        }),
+        max_requests: spec.max_requests,
+        max_lifetime: spec
+            .max_lifetime_ms
+            .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+        timeouts: (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
+            muru_config::Timeouts {
+                hard_timeout: spec
+                    .timeouts
+                    .hard_timeout_ms
+                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                hard_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.hard_drain_grace_ms,
+                ))),
+                shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.shutdown_timeout_ms,
+                ))),
+            }
+        }),
+        env: spec
+            .env
+            .iter()
+            .map(|entry| {
+                let value = match (&entry.secret_store, &entry.secret_key) {
+                    (Some(store), Some(key)) => {
+                        muru_config::EnvValue::Secret(muru_config::SecretValue {
+                            secret: muru_config::SecretRef {
+                                store: store.clone(),
+                                key: key.clone(),
+                            },
+                            deliver: entry.as_file.then(|| "file".to_owned()),
+                        })
+                    }
+                    _ => muru_config::EnvValue::Plain(entry.value.clone().unwrap_or_default()),
+                };
+
+                (entry.name.clone(), value)
+            })
+            .collect(),
+        memory: (spec.memory != crate::model::MemoryPolicy::default()).then(|| {
+            muru_config::Memory {
+                measure: Some(spec.memory.measure),
+                soft_limit: spec.memory.soft_limit.map(muru_config::format_size),
+                soft_for: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.memory.soft_for_ms,
+                ))),
+                reclaim_first: Some(spec.memory.reclaim_first),
+                hard_limit: spec.memory.hard_limit.map(muru_config::format_size),
+                check_interval: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.memory.check_interval_ms,
+                ))),
             }
         }),
     }
@@ -999,8 +1454,88 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_mounts(&declared.mounts),
         describe_mounts(&recorded.mounts),
     );
+    compare(
+        "max_requests",
+        declared
+            .max_requests
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "off".to_owned()),
+        recorded
+            .max_requests
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "off".to_owned()),
+    );
+    compare(
+        "max_lifetime",
+        describe_ms(declared.max_lifetime_ms),
+        describe_ms(recorded.max_lifetime_ms),
+    );
+    compare(
+        "hard_timeout",
+        describe_ms(declared.timeouts.hard_timeout_ms),
+        describe_ms(recorded.timeouts.hard_timeout_ms),
+    );
+    compare(
+        "hard_drain_grace",
+        describe_ms(Some(declared.timeouts.hard_drain_grace_ms)),
+        describe_ms(Some(recorded.timeouts.hard_drain_grace_ms)),
+    );
+    compare(
+        "shutdown_timeout",
+        describe_ms(Some(declared.timeouts.shutdown_timeout_ms)),
+        describe_ms(Some(recorded.timeouts.shutdown_timeout_ms)),
+    );
+    compare(
+        "memory",
+        describe_memory(&declared.memory),
+        describe_memory(&recorded.memory),
+    );
+    compare(
+        "env",
+        describe_env(&declared.env),
+        describe_env(&recorded.env),
+    );
 
     found
+}
+
+/// An environment as one phrase, for the report, never with a secret's
+/// value.
+fn describe_env(env: &[EnvSpec]) -> String {
+    if env.is_empty() {
+        return "none".to_owned();
+    }
+
+    env.iter()
+        .map(EnvSpec::describe)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A memory policy as one phrase, for the report.
+fn describe_memory(memory: &crate::model::MemoryPolicy) -> String {
+    let size = |bytes: Option<u64>| {
+        bytes
+            .map(muru_config::format_size)
+            .unwrap_or_else(|| "off".to_owned())
+    };
+    format!(
+        "{} soft {} for {} (reclaim first {}), hard {}, every {}",
+        memory.measure,
+        size(memory.soft_limit),
+        describe_ms(Some(memory.soft_for_ms)),
+        memory.reclaim_first,
+        size(memory.hard_limit),
+        describe_ms(Some(memory.check_interval_ms)),
+    )
+}
+
+/// A duration in milliseconds as the configuration writes it, or off.
+fn describe_ms(ms: Option<u64>) -> String {
+    match ms {
+        Some(ms) => muru_config::format_duration(Duration::from_millis(ms)),
+        None => "off".to_owned(),
+    }
 }
 
 /// Groups as one phrase, for the report.

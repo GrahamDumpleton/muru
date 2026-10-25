@@ -61,6 +61,17 @@ service Admin {
   // Re-read the daemon's configuration file for what can change while
   // running (section 13.3).
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+
+  // Re-exec the daemon from the installed binary and replace the edge
+  // (section 13.4). The daemon answers, then re-executes; the hosts and
+  // the edge keep serving and the new image takes them over.
+  rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
+
+  // Ask a release's workers something (section 11.7): status, stacks,
+  // tasks, inspect or logging, through the host's control connection.
+  // DumpStacks and SetLogLevel of appendix B are the stacks and logging
+  // operations of this one call.
+  rpc Debug(DebugRequest) returns (DebugResponse);
 }
 
 message GetStatusRequest {}
@@ -96,6 +107,9 @@ message App {
   string previous_release = 3;      // the release a rollback restores, if any
   uint64 resource_version = 4;
   uint64 created_unix_ms = 5;
+  string user = 6;                  // the user its processes run as under a root daemon (section 10.9)
+  string group = 7;
+  string umask = 8;                 // octal
 }
 
 // A deploy names the application (created on first use) and the source.
@@ -118,6 +132,27 @@ message DeployRequest {
   string release = 14;              // a chosen release id, else generated
   bool wait = 15;                   // return once the release serves, or fails
   optional uint64 retain_ms = 16;   // how long the superseded release stays warm; default 30 minutes, 0 to stop it
+  optional uint64 max_requests = 17;        // requests a worker serves before it is replaced (section 7.7)
+  optional uint64 max_lifetime_ms = 18;     // how long a worker lives before it is replaced
+  optional uint64 hard_timeout_ms = 19;     // how long a request may run before its worker is replaced (section 7.6)
+  optional uint64 hard_drain_grace_ms = 20; // how long a replaced worker gets to finish its other requests
+  optional uint64 shutdown_timeout_ms = 21; // how long a worker told to stop gets before it is killed
+  string memory_measure = 22;               // uss, pss or rss (section 7.7); the table's or uss when empty
+  optional uint64 memory_soft_limit = 23;   // bytes; over it for soft_for the worker reclaims, then recycles
+  optional uint64 memory_soft_for_ms = 24;
+  optional bool memory_reclaim_first = 25;
+  optional uint64 memory_hard_limit = 26;   // bytes; over it the worker is replaced at once
+  optional uint64 memory_check_interval_ms = 27;
+  repeated EnvEntry env = 28;               // environment variables (section 10.8), over the table's
+}
+
+// One environment variable: a value, or a secret reference.
+message EnvEntry {
+  string name = 1;
+  string value = 2;                 // the value, when not a secret
+  string secret_store = 3;          // the store, for a secret
+  string secret_key = 4;            // the key, for a secret
+  bool as_file = 5;                 // deliver the secret as a file named by NAME_FILE
 }
 
 message ListReleasesRequest {
@@ -206,6 +241,35 @@ message ShutdownRequest {
 
 message ShutdownResponse {}
 
+message DebugRequest {
+  string app = 1;
+  string release = 2;               // the application's current release when empty
+  string op = 3;                    // status, stacks, tasks, inspect or logging
+  optional uint32 worker = 4;       // one worker, else every worker
+  string args_json = 5;             // the operation's arguments as a JSON object
+}
+
+message DebugResponse {
+  repeated WorkerDebug workers = 1;
+  string release = 2;               // the release asked
+}
+
+// One worker's answer.
+message WorkerDebug {
+  uint32 index = 1;
+  uint32 pid = 2;
+  bool ok = 3;
+  string error = 4;                 // when not ok
+  string result_json = 5;           // the operation's result, when ok
+}
+
+message UpgradeDaemonRequest {}
+
+message UpgradeDaemonResponse {
+  string executable = 1;            // the binary the daemon re-executes from
+  string version = 2;               // the version that binary reports
+}
+
 // A document as muructl apply reads it: TOML with [app.NAME.release.ID]
 // tables, source paths already absolute.
 message ApplyConfigRequest {
@@ -274,7 +338,9 @@ message ListRoutesResponse {
 message Route {
   string host = 1;
   string path = 2;
-  string app = 3;
+  string app = 3;                   // empty for a static route
+  string static_dir = 4;            // the directory, for a static route (section 4.9)
+  string fallback_app = 5;          // the application behind a static route, when there is one
 }
 
 // Which log to show: a release's output (its host's and workers' lines,

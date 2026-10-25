@@ -11,13 +11,20 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+brotli = { workspace = true }
 bytes = { workspace = true }
+flate2 = { workspace = true }
 futures = { workspace = true }
+globset = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
+httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+mime_guess = { workspace = true }
 muru-proto = { workspace = true }
+percent-encoding = { workspace = true }
 prost = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
@@ -26,6 +33,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

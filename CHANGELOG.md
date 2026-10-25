@@ -9,6 +9,81 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a4 (2026-10-25)
+
+### Added
+
+- Added `muructl daemon upgrade`, which re-executes the daemon from the
+  installed binary without interrupting traffic: the daemon keeps its pid,
+  takes its hosts and edge over again, and replaces the edge with one from
+  the new version, the old edge finishing its connections first.
+- Added `muructl debug status`, `stacks`, `tasks` and `inspect`, which ask a
+  release's workers what they are doing through the daemon and the host,
+  and `muructl logging level`, which changes logger levels in the workers
+  for a period.
+- Added built-in log rotation: the daemon rotates the access log, the
+  edge's and each release's log and its own daily or at a size, compresses
+  the archives and keeps the newest, from the `[logs]` table; `rotate =
+  'external'` leaves rotation to logrotate.
+- Added charts over time to the dashboards (requests, errors and latency
+  over the last hour or day), served as JSON on `/v1/history` and streamed
+  with Server-Sent Events, and the daemon's events stream on
+  `/v1/events/stream`, which the page uses to show events as they happen.
+- Added connection limits: `max_connections` per listener with a fast 503
+  when full, `max_connections_per_client`, keep-alive timeouts (longer for
+  trusted proxies), `max_requests_per_connection` and the HTTP/2 stream
+  limit, in the daemon's `[limits]` table or as `muructl run` flags, with
+  the open and refused connections on `/metrics`.
+- Added memory limits for workers: `[tool.muru.memory]` or `--memory
+  KEY=VALUE` set a soft limit, over which a worker reclaims and is then
+  recycled, and a hard limit, over which it is replaced at once, measured
+  as USS, PSS or RSS; each worker's memory and requests are served on
+  `/metrics`.
+- Added per-application users: `[app.NAME]` takes `user`, `group` and
+  `umask`, which a daemon running as root applies to the application's
+  hosts and workers, and a daemon that is not root reports as not applied.
+- Added response compression at the edge: responses the client accepts are
+  compressed with br, zstd or gzip, for the configured content types and
+  sizes, from the daemon's `[compression]` table or by default under
+  `muructl run` (off with `--no-compression`).
+- Added secrets: stores of the file, env and exec kinds in the daemon's
+  configuration, secret references in a release's env table or with
+  `deploy --secret`, delivered as variables or files when the release
+  starts and never recorded or shown, and `muructl secret` for file stores.
+- Added static routes, which serve a directory from the edge with index
+  files, conditional requests, ranges, precompressed variants, cache
+  headers and a fallback to an application or a file, and `muructl
+  serve-static DIR` for serving a directory in development.
+- Added worker recycling and the hard timeout: `max_requests` and
+  `max_lifetime` replace a worker with a fresh one on a new socket with no
+  request failed, and a request past `--timeout hard=DURATION` has its
+  worker taken out of routing, its stacks written to the log and the worker
+  replaced, with `worker.recycled` and `worker.timeout_killed` events.
+
+### Changed
+
+- Changed a daemon that runs as root to start the edge, and every
+  application that names no `user`, as a service user (`muru`, or the one
+  `--user` or the `[daemon]` table names) and never as root; it refuses to
+  start when the account does not exist, and `user = 'root'` on an
+  application is recorded as an `app.user_is_root` warning each time a
+  release starts.
+
+### Fixed
+
+- Fixed `muructl run` and `muructl serve-static` being killed by a Ctrl-C or
+  SIGTERM that arrived while the workers were still starting; the run now stops
+  in order, the workers running their drain and exit hooks, whenever the signal
+  comes.
+- Fixed a relative `--python` for `muructl deploy`, or a relative `python`
+  in a file for `muructl apply`, being resolved where the daemon starts
+  the host rather than where the command ran or the file is; a bare
+  command name is still looked up on the PATH.
+- Fixed the dashboard's history and events streams delivering only their
+  first message after the page loaded, so the charts and the events table
+  stood still until a reload.
+
+
 ## 0.1.0a3 (2026-10-25)
 
 ### Added

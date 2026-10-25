@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Muru: daemon</title>
+<link rel="stylesheet" href="/static/uplot.min.css">
 <style>
 :root { color-scheme: light dark; }
 body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }
@@ -26,6 +27,12 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
 .status-2 { color: #0f6b3a; } .status-3 { color: #946200; } .status-4, .status-5 { color: #b42318; }
 .state-ready { color: #0f6b3a; } .state-failed, .state-stopped { color: #b42318; } .state-draining, .state-retained, .state-starting, .state-warming { color: #946200; }
 .level-warning { color: #946200; } .level-error { color: #b42318; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem; }
+.chart { min-height: 12rem; }
+.ranges { float: right; font-size: 0.8rem; }
+.ranges a { color: #627d98; margin-left: 0.6rem; text-decoration: none; }
+.ranges a.current { font-weight: 600; text-decoration: underline; }
+.u-title { font-size: 0.8rem !important; color: #627d98 !important; }
 @media (prefers-color-scheme: dark) {
   body { color: #d9e2ec; background: #0b1623; }
   section, .tile { background: #112233; border-color: #243b53; }
@@ -45,10 +52,15 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
   <section id="overview" hx-get="/fragment/node/overview" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "node_overview.html" %}
   </section>
+  <section id="charts">
+    <div class="ranges"><a href="/?range=1h" data-range="1h">last hour</a><a href="/?range=24h" data-range="24h">last day</a></div>
+    <h2>Over time</h2>
+    <div class="charts"><div id="chart-rate" class="chart"></div><div id="chart-latency" class="chart"></div></div>
+  </section>
   <section id="requests" hx-get="/fragment/node/requests" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "node_requests.html" %}
   </section>
-  <section id="events" hx-get="/fragment/node/events" hx-trigger="every 2s" hx-swap="innerHTML">
+  <section id="events" hx-ext="sse" sse-connect="/v1/events/stream">
     {% include "node_events.html" %}
   </section>
   <section id="logs" hx-get="/fragment/node/logs" hx-trigger="every 2s" hx-swap="innerHTML">
@@ -56,5 +68,8 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
   </section>
 </main>
 <script src="/static/htmx.min.js"></script>
+<script src="/static/sse.js"></script>
+<script src="/static/uplot.min.js"></script>
+<script src="/static/charts.js"></script>
 </body>
 </html>

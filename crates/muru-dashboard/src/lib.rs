@@ -7,8 +7,13 @@
 //! polling. htmx is vendored and embedded, so building needs only cargo.
 //!
 //! The caller provides a [`Source`] or a [`NodeSource`] that produces
-//! fresh data for each request; this crate knows nothing about how the
+//! fresh data for each request, and a [`History`] it records a point in
+//! every second for the charts; this crate knows nothing about how the
 //! figures are collected.
+
+pub mod history;
+
+pub use history::{History, Point, Reading, Sampler};
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -21,14 +26,26 @@ use askama::Template;
 use bytes::Bytes;
 use http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE};
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
-use hyper::body::Incoming;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 const HTMX: &[u8] = include_bytes!("../static/htmx.min.js");
+const HTMX_SSE: &[u8] = include_bytes!("../static/sse.js");
+const UPLOT_JS: &[u8] = include_bytes!("../static/uPlot.iife.min.js");
+const UPLOT_CSS: &[u8] = include_bytes!("../static/uPlot.min.css");
+const CHARTS_JS: &[u8] = include_bytes!("../static/charts.js");
+
+/// A response body: whole, or a stream for Server-Sent Events.
+type Body = UnsyncBoxBody<Bytes, Infallible>;
+
+/// New events as they happen, for the events stream; the daemon gives
+/// one, a development run has none.
+pub type EventsSource = Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<EventRow> + Send + Sync>;
 
 /// Everything one rendering of the dashboard shows.
 #[derive(Debug, Clone, Default)]
@@ -355,21 +372,31 @@ struct NodeLogsFragment<'a> {
     data: &'a NodeData,
 }
 
+#[derive(Template)]
+#[template(path = "node_event_row.html")]
+struct NodeEventRow<'a> {
+    event: &'a EventRow,
+}
+
 /// Serve the dashboard on a bound listener until the task is dropped.
+/// `history` holds the points the charts draw.
 pub async fn serve(
     listener: TcpListener,
     source: Source,
     metrics: MetricsSource,
+    history: Arc<History>,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let source = Arc::clone(&source);
         let metrics = Arc::clone(&metrics);
+        let history = Arc::clone(&history);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
                 let metrics = Arc::clone(&metrics);
-                async move { Ok::<_, Infallible>(respond(&request, &source, &metrics)) }
+                let history = Arc::clone(&history);
+                async move { Ok::<_, Infallible>(respond(&request, &source, &metrics, &history)) }
             });
             if let Err(error) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -390,14 +417,18 @@ fn respond(
     request: &Request<Incoming>,
     source: &Source,
     metrics: &MetricsSource,
-) -> Response<Full<Bytes>> {
+    history: &Arc<History>,
+) -> Response<Body> {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
 
+    if let Some(response) = shared_paths(request, history) {
+        return response;
+    }
+
     match request.uri().path() {
         "/metrics" => metrics_response(metrics()),
-        "/static/htmx.min.js" => htmx(),
         "/" => page(IndexPage { data: &source() }.render()),
         "/fragment/overview" => page(OverviewFragment { data: &source() }.render()),
         "/fragment/requests" => page(RequestsFragment { data: &source() }.render()),
@@ -406,7 +437,57 @@ fn respond(
     }
 }
 
-fn page(rendered: Result<String, askama::Error>) -> Response<Full<Bytes>> {
+/// The paths both dashboards serve the same way: the embedded assets,
+/// the history and its stream.
+fn shared_paths(request: &Request<Incoming>, history: &Arc<History>) -> Option<Response<Body>> {
+    Some(match request.uri().path() {
+        "/static/htmx.min.js" => asset(HTMX, "text/javascript"),
+        "/static/sse.js" => asset(HTMX_SSE, "text/javascript"),
+        "/static/uplot.min.js" => asset(UPLOT_JS, "text/javascript"),
+        "/static/uplot.min.css" => asset(UPLOT_CSS, "text/css"),
+        "/static/charts.js" => asset(CHARTS_JS, "text/javascript"),
+        "/v1/history" => {
+            let daily = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.split('&').any(|pair| pair == "range=24h"));
+            let points: Vec<serde_json::Value> =
+                history.points(daily).iter().map(Point::to_json).collect();
+            json(&serde_json::json!({
+                "range": if daily { "24h" } else { "1h" },
+                "step_s": if daily { 60 } else { 1 },
+                "points": points,
+            }))
+        }
+        "/v1/history/stream" => {
+            // The receiver is the stream's state, carried from one message
+            // to the next.
+
+            sse(futures::stream::unfold(
+                history.subscribe(),
+                |mut live| async move {
+                    let chunk = loop {
+                        match tokio::time::timeout(Duration::from_secs(15), live.recv()).await {
+                            Ok(Ok(point)) => {
+                                break format!("event: point\ndata: {}\n\n", point.to_json());
+                            }
+                            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                                continue;
+                            }
+                            Ok(Err(_)) => return None,
+                            Err(_) => break ": keep-alive\n\n".to_owned(),
+                        }
+                    };
+
+                    Some((chunk, live))
+                },
+            ))
+        }
+        _ => return None,
+    })
+}
+
+fn page(rendered: Result<String, askama::Error>) -> Response<Body> {
     let body = match rendered {
         Ok(body) => body,
         Err(error) => {
@@ -415,7 +496,7 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Full<Bytes>> {
         }
     };
 
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+    let mut response = Response::new(whole(Bytes::from(body)));
     let headers = response.headers_mut();
     headers.insert(
         CONTENT_TYPE,
@@ -423,20 +504,25 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Full<Bytes>> {
     );
     headers.insert(CACHE_CONTROL, "no-store".parse().expect("static"));
 
-    // Section 10.7: a strict content security policy; the only script is
-    // the embedded htmx, styles are inline.
+    // Section 10.7: a strict content security policy; the only scripts
+    // and stylesheets are the embedded ones, the page's own styles are
+    // inline, and the streams connect back to the same origin.
 
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'"
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'"
             .parse()
             .expect("static"),
     );
     response
 }
 
-fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from_static(text.as_bytes())));
+fn whole(bytes: Bytes) -> Body {
+    Full::new(bytes).boxed_unsync()
+}
+
+fn plain(status: StatusCode, text: &'static str) -> Response<Body> {
+    let mut response = Response::new(whole(Bytes::from_static(text.as_bytes())));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -446,21 +532,32 @@ fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
 }
 
 /// Serve the daemon's dashboard and gateway on a bound listener until
-/// the task is dropped.
+/// the task is dropped. `history` holds the points the charts draw and
+/// `events` gives the events as they happen, for the events stream.
 pub async fn serve_node(
     listener: TcpListener,
     source: NodeSource,
     metrics: NodeMetricsSource,
+    history: Arc<History>,
+    events: EventsSource,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let source = Arc::clone(&source);
         let metrics = Arc::clone(&metrics);
+        let history = Arc::clone(&history);
+        let events = Arc::clone(&events);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
                 let metrics = Arc::clone(&metrics);
-                async move { Ok::<_, Infallible>(respond_node(&request, &source, &metrics).await) }
+                let history = Arc::clone(&history);
+                let events = Arc::clone(&events);
+                async move {
+                    Ok::<_, Infallible>(
+                        respond_node(&request, &source, &metrics, &history, &events).await,
+                    )
+                }
             });
 
             if let Err(error) = http1::Builder::new()
@@ -477,22 +574,51 @@ async fn respond_node(
     request: &Request<Incoming>,
     source: &NodeSource,
     metrics: &NodeMetricsSource,
-) -> Response<Full<Bytes>> {
+    history: &Arc<History>,
+    events: &EventsSource,
+) -> Response<Body> {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
 
-    let path = request.uri().path();
-
-    if path == "/static/htmx.min.js" {
-        return htmx();
+    if let Some(response) = shared_paths(request, history) {
+        return response;
     }
+
+    let path = request.uri().path();
 
     if path == "/metrics" {
         return match metrics().await {
             Some(text) => metrics_response(text),
             None => plain(StatusCode::SERVICE_UNAVAILABLE, "the daemon is stopping\n"),
         };
+    }
+
+    if path == "/v1/events/stream" {
+        // Each event as a rendered row for the page's table, and as JSON
+        // in the same message's `json` field for scripts.
+
+        return sse(futures::stream::unfold(events(), |mut live| async move {
+            let chunk = loop {
+                match tokio::time::timeout(Duration::from_secs(15), live.recv()).await {
+                    Ok(Ok(event)) => {
+                        let row = NodeEventRow { event: &event }
+                            .render()
+                            .unwrap_or_default()
+                            .replace('\n', "");
+                        break format!(
+                            "event: event\ndata: {row}\n\nevent: json\ndata: {}\n\n",
+                            serde_json::to_string(&event).unwrap_or_default()
+                        );
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(_)) => return None,
+                    Err(_) => break ": keep-alive\n\n".to_owned(),
+                }
+            };
+
+            Some((chunk, live))
+        }));
     }
 
     let Some(data) = source().await else {
@@ -533,7 +659,26 @@ async fn respond_node(
     }
 }
 
-fn json<T: serde::Serialize>(value: &T) -> Response<Full<Bytes>> {
+/// A Server-Sent Events response from a stream of messages.
+fn sse<S>(messages: S) -> Response<Body>
+where
+    S: futures::Stream<Item = String> + Send + 'static,
+{
+    use futures::StreamExt as _;
+
+    let frames = messages.map(|message| Ok::<_, Infallible>(Frame::data(Bytes::from(message))));
+    let mut response = Response::new(BodyExt::boxed_unsync(StreamBody::new(frames)));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, "text/event-stream".parse().expect("static"));
+    headers.insert(CACHE_CONTROL, "no-store".parse().expect("static"));
+    headers.insert(
+        http::header::HeaderName::from_static("x-accel-buffering"),
+        "no".parse().expect("static"),
+    );
+    response
+}
+
+fn json<T: serde::Serialize>(value: &T) -> Response<Body> {
     let body = match serde_json::to_vec(value) {
         Ok(body) => body,
         Err(error) => {
@@ -542,18 +687,18 @@ fn json<T: serde::Serialize>(value: &T) -> Response<Full<Bytes>> {
         }
     };
 
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+    let mut response = Response::new(whole(Bytes::from(body)));
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, "application/json".parse().expect("static"));
     headers.insert(CACHE_CONTROL, "no-store".parse().expect("static"));
     response
 }
 
-fn htmx() -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from_static(HTMX)));
+fn asset(bytes: &'static [u8], content_type: &'static str) -> Response<Body> {
+    let mut response = Response::new(whole(Bytes::from_static(bytes)));
     response
         .headers_mut()
-        .insert(CONTENT_TYPE, "text/javascript".parse().expect("static"));
+        .insert(CONTENT_TYPE, content_type.parse().expect("static"));
     response.headers_mut().insert(
         CACHE_CONTROL,
         "public, max-age=86400".parse().expect("static"),
@@ -561,8 +706,8 @@ fn htmx() -> Response<Full<Bytes>> {
     response
 }
 
-fn metrics_response(text: String) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(text)));
+fn metrics_response(text: String) -> Response<Body> {
+    let mut response = Response::new(whole(Bytes::from(text)));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, METRICS_CONTENT_TYPE.parse().expect("static"));

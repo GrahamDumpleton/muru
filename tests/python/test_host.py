@@ -58,3 +58,26 @@ def test_describe_status() -> None:
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX only")
 def test_python_is_posix() -> None:
     assert hasattr(host.os, "fork")
+
+
+def test_socket_paths_carry_the_generation_of_a_replacement(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=2, threads=1)
+    assert instance.socket_path(1) == str(tmp_path / "worker-1.sock")
+    instance.generation[1] = 2
+    assert instance.socket_path(1) == str(tmp_path / "worker-1-g2.sock")
+    assert instance.socket_path(0) == str(tmp_path / "worker-0.sock")
+
+
+def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    api = host.Group("api", 1, 1, 1, 1)
+    instance = host.Host(release, str(tmp_path), workers=2, threads=1, groups=[api])
+    instance.routed = {0: "/a", 1: None, 2: "/api-0"}
+    instance.version = 3
+    assert instance.workers_message() == {
+        "type": "workers",
+        "version": 3,
+        "sockets": ["/a"],
+        "groups": [{"name": "api", "sockets": ["/api-0"]}],
+    }

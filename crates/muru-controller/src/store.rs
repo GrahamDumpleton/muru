@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS event_sinks (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// The store.
 pub struct Store {
@@ -91,11 +91,13 @@ impl Store {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
+        add_identity_columns(&connection)?;
 
         // Version 1 had applications, releases and events; version 2
         // added hosts and routes and version 3 the event sink cursors,
-        // which the CREATE statements above supply to an older store, so
-        // the version only needs recording.
+        // which the CREATE statements above supply to an older store;
+        // version 4 added the application's user, group and umask, which
+        // are added to an older table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -120,6 +122,7 @@ impl Store {
     pub fn in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(SCHEMA)?;
+        add_identity_columns(&connection)?;
         connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
 
         Ok(Self {
@@ -139,8 +142,8 @@ impl Store {
     pub fn apps(&self) -> Result<Vec<App>, StoreError> {
         self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT name, current_release, previous_release, created_unix_ms, resource_version \
-                 FROM apps ORDER BY name",
+                "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
+                 user, grp, umask FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -153,13 +156,37 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT name, current_release, previous_release, created_unix_ms, resource_version \
-                     FROM apps WHERE name = ?1",
+                    "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
+                     user, grp, umask FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
                 .optional()?
                 .ok_or_else(|| StoreError::NotFound(format!("application {name}")))
+        })
+    }
+
+    /// Set the user, group and umask an application's processes run with
+    /// (section 10.9).
+    pub fn set_app_identity(
+        &self,
+        name: &str,
+        user: Option<&str>,
+        group: Option<&str>,
+        umask: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE apps SET user = ?2, grp = ?3, umask = ?4, \
+                 resource_version = resource_version + 1 WHERE name = ?1",
+                params![name, user, group, umask],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("application {name}")));
+            }
+
+            Ok(())
         })
     }
 
@@ -495,7 +522,27 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         previous: row.get(2)?,
         created_unix_ms: row.get::<_, i64>(3)? as u64,
         resource_version: row.get::<_, i64>(4)? as u64,
+        user: row.get(5)?,
+        group: row.get(6)?,
+        umask: row.get(7)?,
     })
+}
+
+/// Add the identity columns of version 4 to an applications table that
+/// predates them.
+fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA table_info(apps)")?;
+    let columns: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for column in ["user", "grp", "umask"] {
+        if !columns.iter().any(|name| name == column) {
+            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+
+    Ok(())
 }
 
 /// A record that cannot be decoded is reported as a conversion failure
@@ -554,6 +601,11 @@ mod tests {
             groups: Vec::new(),
             mounts: Vec::new(),
             logging: Default::default(),
+            max_requests: None,
+            max_lifetime_ms: None,
+            timeouts: Default::default(),
+            memory: Default::default(),
+            env: Vec::new(),
         }
     }
 
