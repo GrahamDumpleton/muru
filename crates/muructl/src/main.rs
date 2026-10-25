@@ -107,6 +107,9 @@ enum Command {
         command: admin::RolloutCommand,
     },
 
+    /// Pin a worker group's count, or show the autoscaler's state.
+    Scale(admin::ScaleArgs),
+
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
@@ -707,6 +710,7 @@ fn main() -> anyhow::Result<()> {
         Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
+        Command::Scale(args) => runtime.block_on(admin::scale(args)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
@@ -1018,6 +1022,9 @@ struct Resolved {
     memory: Option<muru_config::Memory>,
     /// Environment variables from the table (section 10.8).
     env: std::collections::BTreeMap<String, muru_config::EnvValue>,
+    /// The scaling table (sections 7.2 and 7.4), written out by
+    /// --print-config; a development run never scales.
+    scaling: Option<muru_config::Scaling>,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1146,6 +1153,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         timeouts: table.timeouts,
         memory: table.memory,
         env: table.env,
+        scaling: table.scaling,
     })
 }
 
@@ -1193,6 +1201,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime.map(muru_config::format_duration),
         env: resolved.env.clone(),
+        scaling: resolved.scaling.clone(),
         timeouts: {
             let (hard, grace, shutdown) =
                 worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;

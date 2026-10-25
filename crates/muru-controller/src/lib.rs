@@ -21,6 +21,7 @@ pub mod model;
 pub mod notify;
 pub mod rollouts;
 pub mod rotation;
+pub mod scaling;
 pub mod secrets;
 pub mod sinks;
 pub mod store;

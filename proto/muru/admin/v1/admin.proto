@@ -44,6 +44,11 @@ service Admin {
   rpc AbortRollout(RolloutControlRequest) returns (Rollout);
   rpc PromoteRelease(PromoteReleaseRequest) returns (Release);
 
+  // Section 7.4: pin or release a worker group's count, and read the
+  // autoscaler's signals, decisions and churn for a release.
+  rpc SetScale(SetScaleRequest) returns (ScaleStatus);
+  rpc GetScaleStatus(GetScaleStatusRequest) returns (ScaleStatus);
+
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
@@ -252,6 +257,52 @@ message RolloutControlRequest {
 message PromoteReleaseRequest {
   string app = 1;
   string release = 2;
+}
+
+// Section 7.4: pin a group's worker count, so the autoscaler stands
+// aside, or let it decide again.
+message SetScaleRequest {
+  string app = 1;
+  string release = 2;               // the application's serving release when empty
+  string group = 3;                 // default when empty
+  optional uint32 processes = 4;    // the count to pin
+  bool unpin = 5;                   // let the autoscaler decide again
+}
+
+message GetScaleStatusRequest {
+  string app = 1;
+  string release = 2;               // the application's serving release when empty
+}
+
+message ScaleStatus {
+  string app = 1;
+  string release = 2;
+  repeated GroupScale groups = 3;
+}
+
+// One worker group's scaling: the policy, where it stands and what the
+// autoscaler saw and did last (section 7.3 and 7.4).
+message GroupScale {
+  string group = 1;
+  string mode = 2;                  // static, spare or target
+  uint32 min_workers = 3;
+  uint32 max_workers = 4;
+  uint32 desired = 5;               // the count the group is being brought to
+  uint32 ready = 6;                 // workers the edge routes to
+  bool pinned = 7;
+  bool advisory = 8;
+  double slots_busy = 9;
+  double slots_total = 10;
+  double idle_workers = 11;         // idle worker equivalents; negative when short
+  optional double queue_wait_p95_ms = 12;
+  string last_decision = 13;        // what the autoscaler did last and why
+  uint64 last_decision_age_ms = 14;
+  uint32 reaps_last_hour = 15;
+  uint32 churn_budget = 16;
+  bool suspended = 17;              // scale-in suspended by the churn budget
+  string policy = 18;               // the policy as one phrase
+  uint64 scale_outs = 19;
+  uint64 scale_ins = 20;
 }
 
 // Section 9.1: pending, starting, warming, ready, draining, stopping,

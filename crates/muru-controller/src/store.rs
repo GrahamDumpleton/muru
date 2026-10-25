@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS rollouts (
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (app, id)
 );
+CREATE TABLE IF NOT EXISTS scale_pins (
+    app TEXT NOT NULL,
+    release TEXT NOT NULL,
+    grp TEXT NOT NULL,
+    processes INTEGER NOT NULL,
+    PRIMARY KEY (app, release, grp)
+);
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     time_unix_ms INTEGER NOT NULL,
@@ -451,6 +458,61 @@ impl Store {
         })
     }
 
+    /// Section 7.4: the worker counts an operator pinned on a release's
+    /// groups, by group name.
+    pub fn scale_pins(&self, app: &str, release: &str) -> Result<Vec<(String, u32)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT grp, processes FROM scale_pins WHERE app = ?1 AND release = ?2 ORDER BY grp",
+            )?;
+            let rows = statement.query_map(params![app, release], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+            })?;
+            let mut pins = Vec::new();
+
+            for row in rows {
+                pins.push(row?);
+            }
+
+            Ok(pins)
+        })
+    }
+
+    /// Pin a group's worker count, replacing any earlier pin.
+    pub fn put_scale_pin(
+        &self,
+        app: &str,
+        release: &str,
+        group: &str,
+        processes: u32,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO scale_pins (app, release, grp, processes) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(app, release, grp) DO UPDATE SET processes = excluded.processes",
+                params![app, release, group, processes as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a group's pin, or every pin of the release when no group is
+    /// named.
+    pub fn remove_scale_pins(
+        &self,
+        app: &str,
+        release: &str,
+        group: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM scale_pins WHERE app = ?1 AND release = ?2 AND (?3 = '' OR grp = ?3)",
+                params![app, release, group.unwrap_or("")],
+            )?;
+            Ok(())
+        })
+    }
+
     /// The next rollout id for an application: 1, 2, and so on.
     pub fn next_rollout_id(&self, app: &str) -> Result<String, StoreError> {
         self.with(|connection| {
@@ -670,6 +732,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::model::ScalingSpec;
     use muru_config::{Interface, Preload};
 
     fn spec() -> ReleaseSpec {
@@ -693,6 +756,7 @@ mod tests {
             timeouts: Default::default(),
             memory: Default::default(),
             env: Vec::new(),
+            scaling: ScalingSpec::default(),
         }
     }
 

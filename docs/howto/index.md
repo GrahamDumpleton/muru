@@ -30,6 +30,7 @@ traffic
 rollouts
 behind-a-proxy
 worker-groups
+scaling
 mounts
 https
 static-files

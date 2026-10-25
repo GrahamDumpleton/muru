@@ -266,7 +266,7 @@ pub struct Mount {
 /// `[tool.muru.groups.NAME]` table (section 7.1): the paths it serves
 /// and its own sizes. Paths not claimed by a group go to the default
 /// group, which is the release's own settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     /// Path prefixes, with an optional trailing `*`; the most specific
@@ -285,13 +285,16 @@ pub struct Group {
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// How the group is scaled (sections 7.2 and 7.4); static when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<Scaling>,
 }
 
 /// A release definition, the `[app.NAME.release.ID]` table (appendix C):
 /// the keys a deploy takes. `muructl run --print-config` writes one so a
 /// laptop setup can become a declared release, and `muructl apply` reads
 /// them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
     /// The source directory. A relative path is taken from the file's
@@ -326,6 +329,10 @@ pub struct Release {
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// How the default group is scaled (sections 7.2 and 7.4); static
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<Scaling>,
     /// The preload mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<Preload>,
@@ -359,6 +366,93 @@ pub struct Release {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
+}
+
+/// How a worker group is scaled (section 7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScalingMode {
+    /// A fixed worker count, the default.
+    Static,
+    /// Keep between min_spare and max_spare idle workers, Apache-style.
+    Spare,
+    /// Track a slot utilization and a queue wait target.
+    Target,
+}
+
+impl ScalingMode {
+    /// The mode as the configuration spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Spare => "spare",
+            Self::Target => "target",
+        }
+    }
+}
+
+/// The `scaling` table of a release, a worker group or a `[tool.muru]`
+/// table (sections 7.2 and 7.4): the mode, the bounds, and the windows
+/// and budgets that keep the autoscaler from churning. The release's
+/// own table is the default group's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scaling {
+    /// static (the default), spare or target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ScalingMode>,
+    /// The fewest workers (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workers: Option<usize>,
+    /// The most workers; required by the spare and target modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<usize>,
+    /// Spare mode: scale out when fewer idle workers than this remain
+    /// (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_spare: Option<usize>,
+    /// Spare mode: scale in while more idle workers than this remain
+    /// (default the larger of 3 and a quarter of max_workers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spare: Option<usize>,
+    /// Target mode: the share of slots to keep busy, between 0 and 1
+    /// (default 0.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_utilization: Option<f64>,
+    /// Target mode: scale out while the p95 queue wait is over this,
+    /// for example 100ms; off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_p95: Option<String>,
+    /// How long a scale-out condition must hold (default 5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_out_window: Option<String>,
+    /// How long every scale-in condition must hold (default 10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_in_window: Option<String>,
+    /// No scale-in this long after a scale-out (default 5m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_after_growth: Option<String>,
+    /// At most one worker reaped per this interval (default 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reap_interval: Option<String>,
+    /// A group wholly idle this long scales in without waiting for the
+    /// scale-in window (default 10m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reap_after: Option<String>,
+    /// No worker younger than this is reaped (default the larger of 15m
+    /// and 30 times the measured time to ready).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_lifetime: Option<String>,
+    /// The most workers one scale-out adds (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_step_up: Option<usize>,
+    /// Reaps allowed per hour per release before scale-in is suspended
+    /// (default 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub churn_budget: Option<usize>,
+    /// Decide and report without acting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<bool>,
 }
 
 /// The `[memory]` table of a release or a `[tool.muru]` table (section
@@ -893,7 +987,7 @@ fn root_path() -> String {
 }
 
 /// An application's table and its releases.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct App {
     /// Releases by identifier.
@@ -926,7 +1020,7 @@ pub struct Metrics {
 /// `muructl config export` writes it (section 10.4): listeners and limits,
 /// which belong to the daemon's own file, and applications with their
 /// releases.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
     /// How the daemon itself runs (ADR 0026).
@@ -1050,7 +1144,7 @@ impl Document {
 /// The `[tool.muru]` table: defaults an application ships with (section
 /// 6.8). Every field is optional; what a command line or a release
 /// definition sets takes precedence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolMuru {
     /// The application as module:callable.
@@ -1078,6 +1172,10 @@ pub struct ToolMuru {
     /// Requests an ASGI worker's event loop takes at once (section 6.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// How the default group is scaled (sections 7.2 and 7.4); static
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling: Option<Scaling>,
     /// The preload mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<Preload>,
@@ -1256,6 +1354,11 @@ mod tests {
                         entrypoint: "shop.wsgi:application".to_owned(),
                         processes: Some(2),
                         preload: Some(Preload::Auto),
+                        scaling: Some(Scaling {
+                            mode: Some(ScalingMode::Spare),
+                            max_workers: Some(8),
+                            ..Scaling::default()
+                        }),
                         ..Release::default()
                     },
                 )]),
@@ -1295,6 +1398,8 @@ mod tests {
         });
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
+        assert!(text.contains("[app.shop.release.r1.scaling]"), "{text}");
+        assert!(text.contains("mode = \"spare\""), "{text}");
         assert!(text.contains("[route.traffic]"), "{text}");
         assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");

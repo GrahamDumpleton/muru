@@ -129,6 +129,21 @@ pub const FAMILIES: &[Family] = &[
         help: "Workers listening for requests.",
     },
     Family {
+        name: "muru_workers_desired",
+        kind: Kind::Gauge,
+        help: "Workers the autoscaler is bringing each group to, by application, release and group.",
+    },
+    Family {
+        name: "muru_scaling_decisions_total",
+        kind: Kind::Counter,
+        help: "Autoscaler decisions, by application, release, group and direction.",
+    },
+    Family {
+        name: "muru_churn_reaps_total",
+        kind: Kind::Counter,
+        help: "Workers the autoscaler reaped in the last hour, by application, release and group.",
+    },
+    Family {
         name: "muru_worker_requests_total",
         kind: Kind::Counter,
         help: "Requests a worker has served since it started, as it last reported.",
@@ -259,7 +274,25 @@ impl ReleaseKey {
     }
 }
 
-/// A release's three request histograms.
+/// The labels of a group's request histograms.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DurationKey {
+    app: String,
+    release: String,
+    group: String,
+}
+
+impl DurationKey {
+    fn labels(&self) -> Vec<(String, String)> {
+        vec![
+            ("app".to_owned(), self.app.clone()),
+            ("release".to_owned(), self.release.clone()),
+            ("group".to_owned(), self.group.clone()),
+        ]
+    }
+}
+
+/// A group's three request histograms.
 #[derive(Debug, Default, Clone)]
 struct Durations {
     queue: Histogram,
@@ -270,7 +303,7 @@ struct Durations {
 #[derive(Debug, Default)]
 struct Inner {
     requests: BTreeMap<RequestKey, u64>,
-    durations: BTreeMap<ReleaseKey, Durations>,
+    durations: BTreeMap<DurationKey, Durations>,
     in_flight: BTreeMap<ReleaseKey, i64>,
 }
 
@@ -316,7 +349,11 @@ impl Metrics {
         *inner.requests.entry(key).or_default() += 1;
         let durations = inner
             .durations
-            .entry(release_key(&record.app, &record.release))
+            .entry(DurationKey {
+                app: record.app.clone(),
+                release: record.release.clone(),
+                group: record.group.clone(),
+            })
             .or_default();
         durations.total.observe(record.total);
 
@@ -614,7 +651,7 @@ mod tests {
         let text = render(&metrics.samples());
         let line = |phase: &str, le: &str| {
             format!(
-                "muru_request_duration_seconds_bucket{{app=\"shop\",release=\"r1\",phase=\"{phase}\",le=\"{le}\"}}"
+                "muru_request_duration_seconds_bucket{{app=\"shop\",release=\"r1\",group=\"default\",phase=\"{phase}\",le=\"{le}\"}}"
             )
         };
         assert!(
@@ -634,7 +671,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("muru_request_duration_seconds_count{app=\"shop\",release=\"r1\",phase=\"application\"} 2\n"),
+            text.contains("muru_request_duration_seconds_count{app=\"shop\",release=\"r1\",group=\"default\",phase=\"application\"} 2\n"),
             "{text}"
         );
 

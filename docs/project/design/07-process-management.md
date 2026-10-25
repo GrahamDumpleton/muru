@@ -84,8 +84,8 @@ threads = 32
 | Mode | Behaviour |
 | --- | --- |
 | static | Fixed worker count |
-| spare | Apache-style: keep between min_spare and max_spare idle worker equivalents, with a doubling spawn ramp and slow reaping |
-| target | Track targets for chosen signals, with smoothing and stabilisation |
+| spare | Apache-style: keep between min_spare and max_spare idle worker equivalents, with a doubling spawn ramp while requests queue and slow reaping |
+| target | Track targets for chosen signals (slot_utilization, queue_wait_p95), with smoothing and stabilisation |
 
 ## 7.3 Signals
 

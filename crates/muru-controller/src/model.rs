@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use muru_config::{FactoryPhase, Interface, Preload};
+use muru_config::{FactoryPhase, Interface, Preload, ScalingMode};
 use serde::{Deserialize, Serialize};
 
 /// The states of section 9.1.
@@ -130,6 +130,9 @@ pub struct GroupSpec {
     pub sync_threads: u32,
     /// Requests an ASGI worker's event loop takes at once.
     pub concurrency: u32,
+    /// How the group is scaled (sections 7.2 and 7.4).
+    #[serde(default)]
+    pub scaling: ScalingSpec,
 }
 
 /// What a release runs: its source and the settings fixed at creation
@@ -183,6 +186,9 @@ pub struct ReleaseSpec {
     /// order; secret values are never recorded, only their references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvSpec>,
+    /// How the default group is scaled (sections 7.2 and 7.4).
+    #[serde(default)]
+    pub scaling: ScalingSpec,
 }
 
 /// One environment variable of a release (section 10.8).
@@ -214,6 +220,105 @@ impl EnvSpec {
                 if self.as_file { " as file" } else { "" }
             ),
             _ => format!("{}={}", self.name, self.value.clone().unwrap_or_default()),
+        }
+    }
+}
+
+/// How a worker group is scaled (sections 7.2 and 7.4), resolved with
+/// the defaults of appendix C; durations in milliseconds. The default is
+/// a fixed count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalingSpec {
+    /// static, spare or target.
+    pub mode: ScalingMode,
+    /// The fewest workers.
+    pub min_workers: u32,
+    /// The most workers; the fixed count in static mode.
+    pub max_workers: u32,
+    /// Spare mode: scale out below this many idle workers.
+    pub min_spare: u32,
+    /// Spare mode: scale in above this many idle workers.
+    pub max_spare: u32,
+    /// Target mode: the percentage of slots to keep busy.
+    pub slot_utilization_percent: u32,
+    /// Target mode: scale out while the p95 queue wait is over this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_p95_ms: Option<u64>,
+    /// How long a scale-out condition must hold.
+    pub scale_out_window_ms: u64,
+    /// How long every scale-in condition must hold.
+    pub scale_in_window_ms: u64,
+    /// No scale-in this long after a scale-out.
+    pub hold_after_growth_ms: u64,
+    /// At most one worker reaped per this interval.
+    pub reap_interval_ms: u64,
+    /// A wholly idle group scales in after this.
+    pub idle_reap_after_ms: u64,
+    /// No worker younger than this is reaped; from the measured time to
+    /// ready when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_lifetime_ms: Option<u64>,
+    /// The most workers one scale-out adds.
+    pub max_step_up: u32,
+    /// Reaps allowed per hour per release.
+    pub churn_budget: u32,
+    /// Decide and report without acting.
+    pub advisory: bool,
+}
+
+impl Default for ScalingSpec {
+    fn default() -> Self {
+        Self {
+            mode: ScalingMode::Static,
+            min_workers: 1,
+            max_workers: 0,
+            min_spare: 1,
+            max_spare: 3,
+            slot_utilization_percent: 70,
+            queue_wait_p95_ms: None,
+            scale_out_window_ms: 5_000,
+            scale_in_window_ms: 600_000,
+            hold_after_growth_ms: 300_000,
+            reap_interval_ms: 60_000,
+            idle_reap_after_ms: 600_000,
+            min_lifetime_ms: None,
+            max_step_up: 4,
+            churn_budget: 6,
+            advisory: false,
+        }
+    }
+}
+
+impl ScalingSpec {
+    /// Whether the count is fixed.
+    pub fn is_static(&self) -> bool {
+        self.mode == ScalingMode::Static
+    }
+
+    /// The policy as one phrase, for reports: `static`, or the mode with
+    /// its bounds and what makes it move.
+    pub fn describe(&self) -> String {
+        match self.mode {
+            ScalingMode::Static => "static".to_owned(),
+            ScalingMode::Spare => format!(
+                "spare {}-{} workers, {}-{} idle{}",
+                self.min_workers,
+                self.max_workers,
+                self.min_spare,
+                self.max_spare,
+                if self.advisory { ", advisory" } else { "" }
+            ),
+            ScalingMode::Target => format!(
+                "target {}-{} workers, {}% of slots busy{}{}",
+                self.min_workers,
+                self.max_workers,
+                self.slot_utilization_percent,
+                match self.queue_wait_p95_ms {
+                    Some(ms) => format!(", queue wait p95 {ms} ms"),
+                    None => String::new(),
+                },
+                if self.advisory { ", advisory" } else { "" }
+            ),
         }
     }
 }

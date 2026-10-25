@@ -30,6 +30,7 @@ use crate::model::{
     now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
+use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
 use crate::store::Store;
 
 /// How long a release may take from its host starting to every worker
@@ -184,6 +185,31 @@ pub enum Command {
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Rollout, String>>,
     },
+    /// Section 7.4: pin a worker group's count, or let the autoscaler
+    /// decide again.
+    SetScale {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The worker group.
+        group: String,
+        /// The count to pin.
+        processes: Option<u32>,
+        /// Let the autoscaler decide again.
+        unpin: bool,
+        /// Where the groups' states go.
+        done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
+    },
+    /// The autoscaler's state for each group of a release.
+    GetScaleStatus {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// Where the groups' states go.
+        done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
+    },
     /// Blue/green (section 9.2): move all of an application's traffic to a
     /// release now and drain the one that served.
     PromoteRelease {
@@ -312,6 +338,19 @@ struct GroupRecord {
     sockets: Vec<PathBuf>,
 }
 
+/// Section 7.4: one worker group's autoscaler and what was last asked of
+/// the host for it.
+struct GroupScaling {
+    name: String,
+    scaler: Scaler,
+    /// Slots a worker offers before any is routed to: its threads, or
+    /// its event loop's concurrency.
+    slots_per_worker: f64,
+    /// The count last asked of the host, so a count the host has not
+    /// reached yet is not asked for again every second.
+    requested: Option<u32>,
+}
+
 /// What the API needs to talk to a running daemon.
 #[derive(Clone)]
 pub struct Handle {
@@ -371,6 +410,11 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// Section 7.4: each worker group's autoscaler, the default first.
+    scalers: Vec<GroupScaling>,
+    /// When each worker socket entered routing, for the age of the
+    /// youngest worker.
+    ready_at: HashMap<PathBuf, Instant>,
 }
 
 /// The daemon's state while it runs.
@@ -678,6 +722,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    // The once-a-second work keeps its own clock, so a stream of commands
+    // arriving faster than that never starves it.
+
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+
     let outcome = loop {
         tokio::select! {
             _ = reopen.recv() => {
@@ -719,7 +770,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            _ = tick.tick() => {
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
                 daemon.expire_sticky().await;
@@ -736,6 +787,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.advance_rollouts(samples.as_deref()).await;
+                daemon.autoscale(samples.as_deref()).await;
             }
         }
     };
@@ -1379,6 +1431,40 @@ impl Daemon {
                 ));
             }
 
+            // Section 7.4: what the autoscaler wants and has done.
+
+            for scaling in &running.scalers {
+                let labels = [
+                    ("app", app.as_str()),
+                    ("release", id.as_str()),
+                    ("group", scaling.name.as_str()),
+                ];
+                let (outs, ins) = scaling.scaler.status(Instant::now()).decisions;
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_workers_desired",
+                    &labels,
+                    scaling.scaler.desired() as f64,
+                ));
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_churn_reaps_total",
+                    &labels,
+                    scaling.scaler.reaps() as f64,
+                ));
+
+                for (direction, count) in [("out", outs), ("in", ins)] {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_scaling_decisions_total",
+                        &[
+                            ("app", app.as_str()),
+                            ("release", id.as_str()),
+                            ("group", scaling.name.as_str()),
+                            ("direction", direction),
+                        ],
+                        count as f64,
+                    ));
+                }
+            }
+
             // Sections 7.6 and 7.7: what each worker last reported.
 
             for worker in &running.status {
@@ -1513,6 +1599,18 @@ impl Daemon {
                     Ok(ReleaseState::Retained)
                 )
                 .then(|| Instant::now() + RETENTION);
+                let now = Instant::now();
+                let pins = self.store.scale_pins(app, id).unwrap_or_default();
+                let scalers = self
+                    .store
+                    .release(app, id)
+                    .map(|release| scalers_for(&release.spec, &sockets, &record.groups, &pins, now))
+                    .unwrap_or_default();
+                let ready_at = record
+                    .sockets
+                    .iter()
+                    .map(|socket| (socket.clone(), now))
+                    .collect();
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
@@ -1524,6 +1622,8 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        scalers,
+                        ready_at,
                     },
                 );
                 self.attach_control(app, id);
@@ -1586,6 +1686,19 @@ impl Daemon {
             }
             Command::PromoteRelease { app, id, done } => {
                 let _ = done.send(self.promote_release(&app, &id).await);
+            }
+            Command::SetScale {
+                app,
+                id,
+                group,
+                processes,
+                unpin,
+                done,
+            } => {
+                let _ = done.send(self.set_scale(&app, &id, &group, processes, unpin));
+            }
+            Command::GetScaleStatus { app, id, done } => {
+                let _ = done.send(self.scale_status(&app, &id));
             }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
@@ -1987,6 +2100,14 @@ impl Daemon {
                 groups: groups.clone(),
             },
         );
+        let now = Instant::now();
+        let pins = self.store.scale_pins(app, id).unwrap_or_default();
+        let scalers = scalers_for(spec, &sockets, &groups, &pins, now);
+        let ready_at = host
+            .sockets
+            .iter()
+            .map(|socket| (socket.clone(), now))
+            .collect();
         self.running.insert(
             (app.to_owned(), id.to_owned()),
             Running {
@@ -1998,6 +2119,8 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                scalers,
+                ready_at,
             },
         );
         self.attach_control(app, id);
@@ -2370,6 +2493,7 @@ impl Daemon {
         }
 
         let _ = std::fs::remove_file(record);
+        let _ = self.store.remove_scale_pins(app, id, None);
         self.set_state(&release, ReleaseState::Stopped, why);
         self.events
             .emit("release.stopped", &subject, "info", "stopped");
@@ -2896,6 +3020,232 @@ impl Daemon {
         }
     }
 
+    /// Section 7.4: feed every running release's scalers what the edge
+    /// reports and carry out their decisions, each one an event with its
+    /// reasons. A group whose count is not what its scaler wants, after a
+    /// restart or a restored pin, is asked for again.
+    async fn autoscale(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
+        };
+        let now = Instant::now();
+        let mut requests: Vec<(String, String, String, u32)> = Vec::new();
+        let mut emitted: Vec<(&'static str, String, &'static str, String)> = Vec::new();
+
+        for ((app, id), running) in &mut self.running {
+            // A retained release is at its warm floor (section 9.1), not
+            // the autoscaler's to size.
+
+            if running.retained_until.is_some() || running.control.is_none() {
+                continue;
+            }
+
+            let subject = format!("{app}@{id}");
+
+            for group in &mut running.scalers {
+                let sockets = if group.name == muru_edge::routing::DEFAULT_GROUP {
+                    &running.sockets
+                } else {
+                    match running
+                        .groups
+                        .iter()
+                        .find(|record| record.name == group.name)
+                    {
+                        Some(record) => &record.sockets,
+                        None => continue,
+                    }
+                };
+                let ready = sockets.len() as u32;
+                let youngest = sockets
+                    .iter()
+                    .filter_map(|socket| running.ready_at.get(socket))
+                    .max()
+                    .map(|at| now.saturating_duration_since(*at));
+                let advisory = group.scaler.spec().advisory;
+
+                if advisory {
+                    group.scaler.sync(ready);
+                }
+
+                let signals = Signals::from_samples(
+                    samples,
+                    app,
+                    id,
+                    &group.name,
+                    ready,
+                    group.slots_per_worker,
+                    youngest,
+                );
+
+                match group.scaler.observe(now, signals) {
+                    Some(Decision::ScaleOut { to, reason }) => {
+                        emitted.push((
+                            "scaling.decision",
+                            subject.clone(),
+                            "info",
+                            decision_message(&group.name, ready, to, &reason, advisory),
+                        ));
+                    }
+                    Some(Decision::ScaleIn { to, reason }) => {
+                        emitted.push((
+                            "scaling.decision",
+                            subject.clone(),
+                            "info",
+                            decision_message(&group.name, ready, to, &reason, advisory),
+                        ));
+                    }
+                    Some(Decision::Suspended { reason }) => {
+                        emitted.push((
+                            "churn_budget.exhausted",
+                            subject.clone(),
+                            "warning",
+                            format!("{}: {reason}", group.name),
+                        ));
+                    }
+                    None => {}
+                }
+
+                let desired = group.scaler.desired();
+
+                if !advisory && desired != ready && group.requested != Some(desired) {
+                    group.requested = Some(desired);
+                    requests.push((app.clone(), id.clone(), group.name.clone(), desired));
+                }
+            }
+        }
+
+        for (kind, subject, level, message) in emitted {
+            self.events.emit(kind, &subject, level, &message);
+        }
+
+        for (app, id, group, processes) in requests {
+            self.ask_scale(&app, &id, &group, processes);
+        }
+    }
+
+    /// Ask a release's host to bring a group to a worker count; the host
+    /// announces the sockets as they change.
+    fn ask_scale(&mut self, app: &str, id: &str, group: &str, processes: u32) {
+        let Some(control) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.control.as_ref())
+        else {
+            return;
+        };
+
+        self.last_request += 1;
+        control.request(
+            self.last_request,
+            "scale",
+            None,
+            &serde_json::json!({ "group": group, "processes": processes }),
+        );
+    }
+
+    /// Section 7.4: pin a group's worker count, so the autoscaler stands
+    /// aside, or let it decide again; the pin outlives the daemon.
+    fn set_scale(
+        &mut self,
+        app: &str,
+        id: &str,
+        group: &str,
+        processes: Option<u32>,
+        unpin: bool,
+    ) -> Result<Vec<(String, ScaleStatus)>, String> {
+        let now = Instant::now();
+        let key = (app.to_owned(), id.to_owned());
+        let Some(running) = self.running.get_mut(&key) else {
+            return Err(format!("release {app}@{id} is not running"));
+        };
+        let Some(scaling) = running
+            .scalers
+            .iter_mut()
+            .find(|scaling| scaling.name == group)
+        else {
+            return Err(format!("release {app}@{id} has no worker group {group}"));
+        };
+
+        let subject = format!("{app}@{id}");
+
+        if unpin {
+            if scaling.scaler.pinned().is_none() {
+                return Err(format!("{group} is not pinned"));
+            }
+
+            scaling.scaler.unpin(now);
+            self.store
+                .remove_scale_pins(app, id, Some(group))
+                .map_err(|error| error.to_string())?;
+            self.events.emit(
+                "scaling.decision",
+                &subject,
+                "notice",
+                &format!(
+                    "{group}: unpinned; the autoscaler decides again from {} workers",
+                    scaling.scaler.desired()
+                ),
+            );
+        } else {
+            let Some(count) = processes else {
+                return Err("give --processes COUNT or --unpin".to_owned());
+            };
+            let spec = scaling.scaler.spec();
+
+            if count == 0 {
+                return Err("processes must be at least 1".to_owned());
+            }
+
+            if !spec.is_static() && count > spec.max_workers {
+                return Err(format!(
+                    "{count} is over the group's max_workers of {}",
+                    spec.max_workers
+                ));
+            }
+
+            scaling.scaler.pin(count, now);
+            scaling.requested = Some(count);
+            self.store
+                .put_scale_pin(app, id, group, count)
+                .map_err(|error| error.to_string())?;
+            self.events.emit(
+                "scaling.decision",
+                &subject,
+                "notice",
+                &format!("{group}: pinned to {count} workers by an operator"),
+            );
+            self.ask_scale(app, id, group, count);
+        }
+
+        self.scale_status(app, id)
+    }
+
+    /// The autoscaler's state for each group of a running release.
+    fn scale_status(&self, app: &str, id: &str) -> Result<Vec<(String, ScaleStatus)>, String> {
+        let now = Instant::now();
+        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+            return Err(format!("release {app}@{id} is not running"));
+        };
+        Ok(running
+            .scalers
+            .iter()
+            .map(|scaling| (scaling.name.clone(), scaling.scaler.status(now)))
+            .collect())
+    }
+
+    /// Whether the edge routes to the release at all: it serves, keeps
+    /// sticky clients, is held, or a policy or rollout refers to it.
+    fn routable(&self, app: &str, id: &str) -> bool {
+        let key = (app.to_owned(), id.to_owned());
+        let Some(running) = self.running.get(&key) else {
+            return false;
+        };
+        self.serving.get(app) == Some(&id.to_owned())
+            || running.sticky_until.is_some()
+            || running.held
+            || (running.retained_until.is_none() && self.referenced_releases().contains(&key))
+    }
+
     /// The releases the route policies name and the candidates of the
     /// rollouts under way, by application.
     fn referenced_releases(&self) -> BTreeSet<(String, String)> {
@@ -3218,6 +3568,16 @@ impl Daemon {
                     all.extend(group.sockets.iter().cloned());
                 }
 
+                // Section 7.4: a socket new to the routing is a worker
+                // that just became ready.
+
+                let now = Instant::now();
+                running.ready_at.retain(|socket, _| all.contains(socket));
+
+                for socket in &all {
+                    running.ready_at.entry(socket.clone()).or_insert(now);
+                }
+
                 write_record(
                     &running.host.run_dir().join("..").join("host.toml"),
                     &HostRecord {
@@ -3227,7 +3587,7 @@ impl Daemon {
                     },
                 );
 
-                if self.serving.get(app) == Some(&id.to_owned())
+                if self.routable(app, id)
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::error!(%error, "pushing the snapshot after a worker change failed");
@@ -3538,6 +3898,64 @@ fn reopen_own_log(path: &std::path::Path) {
     unsafe {
         libc::dup2(log.as_raw_fd(), 1);
         libc::dup2(log.as_raw_fd(), 2);
+    }
+}
+
+/// Section 7.4: the scaling state of each group of a release that is
+/// starting or adopted, from its spec, the workers it has and the pins
+/// an operator left on it.
+fn scalers_for(
+    spec: &ReleaseSpec,
+    sockets: &[PathBuf],
+    groups: &[GroupRecord],
+    pins: &[(String, u32)],
+    now: Instant,
+) -> Vec<GroupScaling> {
+    let asgi = spec.interface == muru_config::Interface::Asgi;
+    let slots = |threads: u32, concurrency: u32| {
+        if asgi {
+            concurrency as f64
+        } else {
+            threads as f64
+        }
+    };
+    let mut scalers = vec![GroupScaling {
+        name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
+        scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
+        slots_per_worker: slots(spec.threads, spec.concurrency),
+        requested: None,
+    }];
+
+    for group in &spec.groups {
+        let current = groups
+            .iter()
+            .find(|record| record.name == group.name)
+            .map_or(group.processes as usize, |record| record.sockets.len());
+        scalers.push(GroupScaling {
+            name: group.name.clone(),
+            scaler: Scaler::new(group.scaling.clone(), current as u32),
+            slots_per_worker: slots(group.threads, group.concurrency),
+            requested: None,
+        });
+    }
+
+    for (name, count) in pins {
+        if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {
+            scaling.scaler.pin(*count, now);
+        }
+    }
+
+    scalers
+}
+
+/// A scaling decision as its event says it.
+fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
+    let verb = if to > from { "scale out" } else { "scale in" };
+
+    if advisory {
+        format!("advisory: would {verb} {group} from {from} to {to} workers: {reason}")
+    } else {
+        format!("{group}: {verb} from {from} to {to} workers: {reason}")
     }
 }
 

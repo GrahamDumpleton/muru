@@ -263,3 +263,25 @@ come in this part of the phase: A/B cohorts by header and cookie
 matches, per-route policies for one application, probe URL and worker
 crash gates, scheduled freezes, `config export --resolve-rollouts`, and
 rollouts for an application reached as the default with no route.
+
+The autoscaler (sections 7.2 to 7.4) followed: a `scaling` table on a
+release or a worker group gives the group a policy, spare mode keeping
+idle worker equivalents between `min_spare` and `max_spare` and target
+mode tracking slot utilization and the p95 queue wait; the daemon reads
+the edge's slot and queue gauges and the group's queue wait histogram
+each second, forks workers through a new `scale` operation on the host
+(workers enter routing once ready, and a drained worker leaves routing
+before it is told to stop) and reaps slowly, one per interval, after the
+scale-in window, never within the hold after growth, never below the
+floor, never a worker younger than its minimum lifetime, and never past
+the churn budget, which suspends scale-in and doubles the window when
+spent; every decision is a `scaling.decision` event with its reasons,
+`muructl scale status` shows the policy, workers, signals and churn,
+`muructl scale --processes` pins a group's count through daemon restarts
+and `--unpin` hands it back, and `advisory = true` reports without
+acting. The decision engine is a module with an injectable clock, driven
+through step, ramp, sawtooth, bursty and budget scenarios in unit tests.
+Still to come: scheduled capacity, the node budget manager across
+applications, the worker CPU, GIL wait and loop lag signals with the
+diagnosis table, scale to zero, and the floor divided by traffic share
+during canaries.

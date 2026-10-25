@@ -1621,6 +1621,168 @@ pub enum RolloutCommand {
     },
 }
 
+/// What `muructl scale` takes: a group's count to pin or release, or
+/// `scale status` for the autoscaler's state (sections 7.3 and 7.4).
+#[derive(Args, Clone)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct ScaleArgs {
+    #[command(subcommand)]
+    pub command: Option<ScaleCommand>,
+
+    /// The release as app@release, or an application for its serving
+    /// release.
+    #[arg(value_name = "APP[@RELEASE]", required = true)]
+    target: Option<String>,
+
+    /// The worker group.
+    #[arg(long, default_value = "default", value_name = "NAME")]
+    group: String,
+
+    /// Pin the group to this many workers; the autoscaler stands aside
+    /// until --unpin.
+    #[arg(long, value_name = "COUNT", conflicts_with = "unpin")]
+    processes: Option<u32>,
+
+    /// Let the autoscaler decide the group's count again.
+    #[arg(long)]
+    unpin: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// The `muructl scale` subcommands.
+#[derive(Subcommand, Clone)]
+pub enum ScaleCommand {
+    /// Show each worker group's policy, workers, signals, last decision
+    /// and churn.
+    Status {
+        /// The release as app@release, or an application for its serving
+        /// release.
+        #[arg(value_name = "APP[@RELEASE]")]
+        target: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Pin or release a group's count, or show the autoscaler's state.
+pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
+    if let Some(ScaleCommand::Status { target, socket }) = args.command {
+        let (app, release) = split_target(&target)?;
+        let mut client = client::connect(&socket.socket()).await?;
+        let status = client
+            .get_scale_status(pb::GetScaleStatusRequest {
+                app: app.to_owned(),
+                release: release.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+        print_scale_status(&status);
+        return Ok(());
+    }
+
+    let target = args.target.unwrap_or_default();
+    let (app, release) = split_target(&target)?;
+
+    if args.processes.is_none() && !args.unpin {
+        anyhow::bail!(
+            "give --processes COUNT to pin the group, or --unpin; `scale status` shows the state"
+        );
+    }
+
+    let mut client = client::connect(&args.socket.socket()).await?;
+    let status = client
+        .set_scale(pb::SetScaleRequest {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            group: args.group.clone(),
+            processes: args.processes,
+            unpin: args.unpin,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    match args.processes {
+        Some(count) => println!(
+            "muru: {}@{} {} pinned to {count} workers",
+            status.app, status.release, args.group
+        ),
+        None => println!(
+            "muru: {}@{} {} unpinned; the autoscaler decides again",
+            status.app, status.release, args.group
+        ),
+    }
+
+    Ok(())
+}
+
+/// An application, or app@release; an empty release means the serving one.
+fn split_target(text: &str) -> anyhow::Result<(&str, &str)> {
+    match text.split_once('@') {
+        Some((app, release)) if !app.is_empty() && !release.is_empty() => Ok((app, release)),
+        Some(_) => anyhow::bail!("{text:?} is not a release: expected app@release"),
+        None if text.is_empty() => anyhow::bail!("name an application or a release"),
+        None => Ok((text, "")),
+    }
+}
+
+/// The autoscaler's state, a row per group with its last decision below.
+fn print_scale_status(status: &pb::ScaleStatus) {
+    println!("{}@{}", status.app, status.release);
+    println!(
+        "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} POLICY",
+        "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE P95", "REAPS"
+    );
+
+    for group in &status.groups {
+        let workers = if group.pinned {
+            format!("{} pinned", group.desired)
+        } else if group.desired != group.ready {
+            format!("{} -> {}", group.ready, group.desired)
+        } else {
+            group.ready.to_string()
+        };
+
+        let reaps = if group.mode == "static" {
+            "-".to_owned()
+        } else if group.suspended {
+            format!("{}/{} halt", group.reaps_last_hour, group.churn_budget)
+        } else {
+            format!("{}/{}", group.reaps_last_hour, group.churn_budget)
+        };
+
+        let p95 = match group.queue_wait_p95_ms {
+            Some(ms) => format!("{ms:.0} ms"),
+            None => "-".to_owned(),
+        };
+
+        println!(
+            "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} {}",
+            group.group,
+            workers,
+            format!("{:.0}/{:.0}", group.slots_busy, group.slots_total),
+            format!("{:.1}", group.idle_workers),
+            p95,
+            reaps,
+            group.policy
+        );
+
+        if !group.last_decision.is_empty() {
+            println!(
+                "  last: {} ({} ago)",
+                group.last_decision,
+                muru_config::format_duration(Duration::from_secs(
+                    group.last_decision_age_ms / 1000
+                ))
+            );
+        }
+    }
+}
+
 /// Run a rollout subcommand.
 pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
     match command {

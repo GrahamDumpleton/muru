@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use muru_config::{
     App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
-    Release as ReleaseTable, Route as RouteTable,
+    Release as ReleaseTable, Route as RouteTable, ScalingMode,
 };
 use muru_proto::admin::v1 as pb;
 
-use crate::model::{EnvSpec, GroupSpec, MountSpec, ReleaseSpec, valid_name};
+use crate::model::{EnvSpec, GroupSpec, MountSpec, ReleaseSpec, ScalingSpec, valid_name};
 use crate::store::{Store, StoreError};
 
 /// What an apply does to one object.
@@ -323,6 +323,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             groups,
             mounts,
             table.logging.as_ref(),
+            table.scaling.as_ref(),
         ) {
             Ok(spec) => spec,
             Err(error) => {
@@ -849,6 +850,7 @@ pub fn resolve_spec(
     groups: Option<&BTreeMap<String, GroupTable>>,
     mounts: Option<&BTreeMap<String, MountTable>>,
     logging: Option<&muru_config::Logging>,
+    scaling: Option<&muru_config::Scaling>,
 ) -> Result<ReleaseSpec, String> {
     let source = Path::new(&request.source);
 
@@ -953,15 +955,21 @@ pub fn resolve_spec(
             return Err(format!("worker group {name} has no processes"));
         }
 
+        let (group_scaling, group_processes) = resolve_scaling(
+            group.scaling.as_ref(),
+            group.processes.map_or(processes, |value| value as u32),
+            &format!("worker group {name}: scaling"),
+        )?;
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
-            processes: group.processes.map_or(processes, |value| value as u32),
+            processes: group_processes,
             threads: group.threads.map_or(threads, |value| value as u32),
             sync_threads: group
                 .sync_threads
                 .map_or(sync_threads, |value| value as u32),
             concurrency: group.concurrency.map_or(concurrency, |value| value as u32),
+            scaling: group_scaling,
         });
     }
 
@@ -1146,6 +1154,12 @@ pub fn resolve_spec(
         return Err("max_requests must be at least 1".to_owned());
     }
 
+    // Sections 7.2 and 7.4: the default group's scaling, from the
+    // declaration, else the source's own table.
+
+    let (scaling, processes) =
+        resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -1181,6 +1195,186 @@ pub fn resolve_spec(
         timeouts,
         memory,
         env,
+        scaling,
+    })
+}
+
+/// Section 7.2 and 7.4: a scaling table resolved against the defaults of
+/// appendix C, with the initial worker count raised to the floor. The
+/// spare and target modes need a ceiling; static mode takes no other
+/// keys, so a key that does nothing is never written by mistake.
+fn resolve_scaling(
+    table: Option<&muru_config::Scaling>,
+    processes: u32,
+    what: &str,
+) -> Result<(ScalingSpec, u32), String> {
+    let defaults = ScalingSpec::default();
+    let Some(table) = table else {
+        return Ok((
+            ScalingSpec {
+                max_workers: processes,
+                ..defaults
+            },
+            processes,
+        ));
+    };
+    let mode = table.mode.unwrap_or(ScalingMode::Static);
+
+    if mode == ScalingMode::Static {
+        let only_mode = muru_config::Scaling {
+            mode: table.mode,
+            advisory: table.advisory,
+            ..muru_config::Scaling::default()
+        };
+
+        if *table != only_mode {
+            return Err(format!("{what}: mode static takes no other keys"));
+        }
+
+        return Ok((
+            ScalingSpec {
+                max_workers: processes,
+                advisory: table.advisory.unwrap_or(false),
+                ..defaults
+            },
+            processes,
+        ));
+    }
+
+    let Some(max_workers) = table.max_workers else {
+        return Err(format!("{what}: mode {} needs max_workers", mode.as_str()));
+    };
+    let min_workers = table.min_workers.unwrap_or(1);
+
+    if min_workers == 0 {
+        return Err(format!(
+            "{what}: min_workers must be at least 1; scale to zero is not supported yet"
+        ));
+    }
+
+    if max_workers < min_workers {
+        return Err(format!(
+            "{what}: max_workers {max_workers} is below min_workers {min_workers}"
+        ));
+    }
+
+    if processes as usize > max_workers {
+        return Err(format!(
+            "{what}: processes {processes} is over max_workers {max_workers}"
+        ));
+    }
+
+    let min_spare = table.min_spare.unwrap_or(1);
+    let max_spare = table.max_spare.unwrap_or((max_workers / 4).max(3));
+
+    if mode == ScalingMode::Spare && max_spare < min_spare + 2 {
+        return Err(format!(
+            "{what}: max_spare must be at least min_spare + 2, so {}",
+            min_spare + 2
+        ));
+    }
+
+    let slot_utilization = table.slot_utilization.unwrap_or(0.7);
+
+    if !(slot_utilization > 0.0 && slot_utilization <= 1.0) {
+        return Err(format!(
+            "{what}: slot_utilization must be over 0 and at most 1"
+        ));
+    }
+
+    let duration = |name: &str, text: Option<&String>, default: u64| -> Result<u64, String> {
+        match text {
+            Some(text) => muru_config::parse_duration(text)
+                .map(|value| value.as_millis() as u64)
+                .map_err(|error| format!("{what}.{name}: {error}")),
+            None => Ok(default),
+        }
+    };
+    let max_step_up = table.max_step_up.unwrap_or(4);
+    let churn_budget = table.churn_budget.unwrap_or(6);
+
+    if max_step_up == 0 {
+        return Err(format!("{what}: max_step_up must be at least 1"));
+    }
+
+    if churn_budget == 0 {
+        return Err(format!("{what}: churn_budget must be at least 1"));
+    }
+
+    let spec = ScalingSpec {
+        mode,
+        min_workers: min_workers as u32,
+        max_workers: max_workers as u32,
+        min_spare: min_spare as u32,
+        max_spare: max_spare as u32,
+        slot_utilization_percent: (slot_utilization * 100.0).round() as u32,
+        queue_wait_p95_ms: match &table.queue_wait_p95 {
+            Some(text) => Some(duration("queue_wait_p95", Some(text), 0)?),
+            None => None,
+        },
+        scale_out_window_ms: duration(
+            "scale_out_window",
+            table.scale_out_window.as_ref(),
+            defaults.scale_out_window_ms,
+        )?,
+        scale_in_window_ms: duration(
+            "scale_in_window",
+            table.scale_in_window.as_ref(),
+            defaults.scale_in_window_ms,
+        )?,
+        hold_after_growth_ms: duration(
+            "hold_after_growth",
+            table.hold_after_growth.as_ref(),
+            defaults.hold_after_growth_ms,
+        )?,
+        reap_interval_ms: duration(
+            "reap_interval",
+            table.reap_interval.as_ref(),
+            defaults.reap_interval_ms,
+        )?,
+        idle_reap_after_ms: duration(
+            "idle_reap_after",
+            table.idle_reap_after.as_ref(),
+            defaults.idle_reap_after_ms,
+        )?,
+        min_lifetime_ms: match &table.min_lifetime {
+            Some(text) => Some(duration("min_lifetime", Some(text), 0)?),
+            None => None,
+        },
+        max_step_up: max_step_up as u32,
+        churn_budget: churn_budget as u32,
+        advisory: table.advisory.unwrap_or(false),
+    };
+    let initial = processes.max(spec.min_workers);
+    Ok((spec, initial))
+}
+
+/// A resolved scaling spec as the table that declares it, every key
+/// written; none for a fixed count.
+fn scaling_table(spec: &ScalingSpec) -> Option<muru_config::Scaling> {
+    if spec.is_static() {
+        return None;
+    }
+
+    let duration = |ms: u64| Some(muru_config::format_duration(Duration::from_millis(ms)));
+    Some(muru_config::Scaling {
+        mode: Some(spec.mode),
+        min_workers: Some(spec.min_workers as usize),
+        max_workers: Some(spec.max_workers as usize),
+        min_spare: (spec.mode == ScalingMode::Spare).then_some(spec.min_spare as usize),
+        max_spare: (spec.mode == ScalingMode::Spare).then_some(spec.max_spare as usize),
+        slot_utilization: (spec.mode == ScalingMode::Target)
+            .then_some(spec.slot_utilization_percent as f64 / 100.0),
+        queue_wait_p95: spec.queue_wait_p95_ms.and_then(duration),
+        scale_out_window: duration(spec.scale_out_window_ms),
+        scale_in_window: duration(spec.scale_in_window_ms),
+        hold_after_growth: duration(spec.hold_after_growth_ms),
+        reap_interval: duration(spec.reap_interval_ms),
+        idle_reap_after: duration(spec.idle_reap_after_ms),
+        min_lifetime: spec.min_lifetime_ms.and_then(duration),
+        max_step_up: Some(spec.max_step_up as usize),
+        churn_budget: Some(spec.churn_budget as usize),
+        advisory: spec.advisory.then_some(true),
     })
 }
 
@@ -1369,6 +1563,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         threads: Some(spec.threads as usize),
         sync_threads: Some(spec.sync_threads as usize),
         concurrency: Some(spec.concurrency as usize),
+        scaling: scaling_table(&spec.scaling),
         preload: Some(spec.preload),
         hooks: spec.hooks.clone(),
         groups: spec
@@ -1383,6 +1578,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         threads: Some(group.threads as usize),
                         sync_threads: Some(group.sync_threads as usize),
                         concurrency: Some(group.concurrency as usize),
+                        scaling: scaling_table(&group.scaling),
                     },
                 )
             })
@@ -1465,11 +1661,16 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
 /// and the source.
 fn describe(spec: &ReleaseSpec) -> String {
     format!(
-        "{} {}x{} from {}",
+        "{} {}x{} from {}{}",
         spec.entrypoint,
         spec.processes,
         spec.threads,
-        spec.source.display()
+        spec.source.display(),
+        if spec.scaling.is_static() {
+            String::new()
+        } else {
+            format!(", scaling {}", spec.scaling.describe())
+        }
     )
 }
 
@@ -1594,6 +1795,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_env(&declared.env),
         describe_env(&recorded.env),
     );
+    compare(
+        "scaling",
+        declared.scaling.describe(),
+        recorded.scaling.describe(),
+    );
 
     found
 }
@@ -1647,11 +1853,16 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
         .iter()
         .map(|group| {
             format!(
-                "{} {}x{} on {}",
+                "{} {}x{} on {}{}",
                 group.name,
                 group.processes,
                 group.threads,
-                group.paths.join(" ")
+                group.paths.join(" "),
+                if group.scaling.is_static() {
+                    String::new()
+                } else {
+                    format!(" scaling {}", group.scaling.describe())
+                }
             )
         })
         .collect::<Vec<_>>()
@@ -1698,6 +1909,7 @@ mod tests {
                 python: "/usr/bin/python3".to_owned(),
                 ..Default::default()
             },
+            None,
             None,
             None,
             None,
@@ -1821,5 +2033,75 @@ mod tests {
         let mut ids = vec!["r10", "r2", "blue", "r1"];
         ids.sort_by_key(|id| release_order(id));
         assert_eq!(ids, vec!["r1", "r2", "r10", "blue"]);
+    }
+
+    #[test]
+    fn scaling_tables_resolve_with_defaults_and_are_checked() {
+        let (spec, processes) = resolve_scaling(None, 2, "scaling").unwrap();
+        assert!(spec.is_static());
+        assert_eq!((spec.max_workers, processes), (2, 2));
+
+        let table = muru_config::Scaling {
+            mode: Some(ScalingMode::Spare),
+            max_workers: Some(12),
+            min_workers: Some(3),
+            ..muru_config::Scaling::default()
+        };
+        let (spec, processes) = resolve_scaling(Some(&table), 1, "scaling").unwrap();
+        assert_eq!(processes, 3, "raised to the floor");
+        assert_eq!((spec.min_spare, spec.max_spare), (1, 3));
+        assert_eq!(spec.describe(), "spare 3-12 workers, 1-3 idle");
+        assert_eq!(
+            scaling_table(&spec).unwrap().scale_in_window.as_deref(),
+            Some("600s")
+        );
+        assert!(scaling_table(&ScalingSpec::default()).is_none());
+
+        let refused = |table: muru_config::Scaling, processes: u32| {
+            resolve_scaling(Some(&table), processes, "scaling").unwrap_err()
+        };
+        assert!(
+            refused(
+                muru_config::Scaling {
+                    mode: Some(ScalingMode::Target),
+                    ..muru_config::Scaling::default()
+                },
+                1
+            )
+            .contains("needs max_workers")
+        );
+        assert!(
+            refused(
+                muru_config::Scaling {
+                    max_workers: Some(4),
+                    ..muru_config::Scaling::default()
+                },
+                1
+            )
+            .contains("takes no other keys")
+        );
+        assert!(
+            refused(
+                muru_config::Scaling {
+                    mode: Some(ScalingMode::Spare),
+                    max_workers: Some(4),
+                    ..muru_config::Scaling::default()
+                },
+                5
+            )
+            .contains("over max_workers")
+        );
+        assert!(
+            refused(
+                muru_config::Scaling {
+                    mode: Some(ScalingMode::Target),
+                    max_workers: Some(4),
+                    queue_wait_p95: Some("soon".to_owned()),
+                    ..muru_config::Scaling::default()
+                },
+                1
+            )
+            .contains("queue_wait_p95")
+        );
     }
 }

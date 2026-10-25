@@ -134,7 +134,7 @@ impl Admin for Service {
             .and_then(|app| app.current.or(app.previous))
             .and_then(|id| self.handle.store.release(&request.app, &id).ok())
             .map(|release| release.spec);
-        let spec = config::resolve_spec(&request, previous.as_ref(), None, None, None)
+        let spec = config::resolve_spec(&request, previous.as_ref(), None, None, None, None)
             .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -462,21 +462,7 @@ impl Admin for Service {
         request: Request<pb::DebugRequest>,
     ) -> Result<Response<pb::DebugResponse>, Status> {
         let request = request.into_inner();
-
-        // The application's current release unless one is named.
-
-        let release = if request.release.is_empty() {
-            let app = self.handle.store.app(&request.app).map_err(not_found)?;
-            app.current.ok_or_else(|| {
-                Status::failed_precondition(format!("{} has no current release", request.app))
-            })?
-        } else {
-            request.release.clone()
-        };
-        self.handle
-            .store
-            .release(&request.app, &release)
-            .map_err(not_found)?;
+        let release = self.current_release(&request.app, &request.release)?;
 
         let args: serde_json::Value = if request.args_json.trim().is_empty() {
             serde_json::json!({})
@@ -681,6 +667,61 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable(STOPPING))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(release_message(release, &self.handle)))
+    }
+
+    async fn set_scale(
+        &self,
+        request: Request<pb::SetScaleRequest>,
+    ) -> Result<Response<pb::ScaleStatus>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+
+        let group = if request.group.is_empty() {
+            muru_edge::routing::DEFAULT_GROUP.to_owned()
+        } else {
+            request.group.clone()
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::SetScale {
+                app: request.app.clone(),
+                id: release.clone(),
+                group,
+                processes: request.processes,
+                unpin: request.unpin,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let groups = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(scale_message(&request.app, &release, groups)))
+    }
+
+    async fn get_scale_status(
+        &self,
+        request: Request<pb::GetScaleStatusRequest>,
+    ) -> Result<Response<pb::ScaleStatus>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::GetScaleStatus {
+                app: request.app.clone(),
+                id: release.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let groups = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(scale_message(&request.app, &release, groups)))
     }
 
     async fn list_hosts(
@@ -1048,6 +1089,24 @@ fn app_message(app: crate::model::App) -> pb::App {
 }
 
 impl Service {
+    /// The release named, or the application's current release when none
+    /// is; checked to exist.
+    fn current_release(&self, app: &str, release: &str) -> Result<String, Status> {
+        let release = if release.is_empty() {
+            let record = self.handle.store.app(app).map_err(not_found)?;
+            record.current.ok_or_else(|| {
+                Status::failed_precondition(format!("{app} has no current release"))
+            })?
+        } else {
+            release.to_owned()
+        };
+        self.handle
+            .store
+            .release(app, &release)
+            .map_err(not_found)?;
+        Ok(release)
+    }
+
     /// Send a rollout action to the daemon and answer with the rollout.
     async fn control_rollout(
         &self,
@@ -1069,6 +1128,51 @@ impl Service {
             .map_err(|_| Status::unavailable(STOPPING))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(rollout_message(&rollout)))
+    }
+}
+
+/// The scaling state of a release's groups as the API shows it.
+fn scale_message(
+    app: &str,
+    release: &str,
+    groups: Vec<(String, crate::scaling::ScaleStatus)>,
+) -> pb::ScaleStatus {
+    pb::ScaleStatus {
+        app: app.to_owned(),
+        release: release.to_owned(),
+        groups: groups
+            .into_iter()
+            .map(|(group, status)| pb::GroupScale {
+                group,
+                mode: status.spec.mode.as_str().to_owned(),
+                min_workers: status.spec.min_workers,
+                max_workers: status.spec.max_workers,
+                desired: status.desired,
+                ready: status.ready,
+                pinned: status.pinned.is_some(),
+                advisory: status.spec.advisory,
+                slots_busy: status.busy,
+                slots_total: status.total,
+                idle_workers: status.idle,
+                queue_wait_p95_ms: status.queue_wait_p95_ms,
+                last_decision: status
+                    .last
+                    .as_ref()
+                    .map(|(_, what)| what.clone())
+                    .unwrap_or_default(),
+                last_decision_age_ms: status
+                    .last
+                    .as_ref()
+                    .map(|(age, _)| age.as_millis() as u64)
+                    .unwrap_or_default(),
+                reaps_last_hour: status.reaps,
+                churn_budget: status.spec.churn_budget,
+                suspended: status.suspended,
+                policy: status.spec.describe(),
+                scale_outs: status.decisions.0,
+                scale_ins: status.decisions.1,
+            })
+            .collect(),
     }
 }
 

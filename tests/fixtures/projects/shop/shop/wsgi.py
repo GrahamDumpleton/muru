@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -22,6 +23,14 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if environ["PATH_INFO"] == "/error":
         raise RuntimeError("deliberate failure")
+
+    # /slow?ms=N holds the worker's thread for that long, for the scaling
+    # and timeout tests.
+
+    if environ["PATH_INFO"] == "/slow":
+        query = environ.get("QUERY_STRING", "")
+        held_ms = int(query.partition("=")[2] or "500") if query.startswith("ms=") else 500
+        time.sleep(held_ms / 1000)
 
     body = json.dumps(
         {
