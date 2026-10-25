@@ -31,6 +31,7 @@ use crate::model::{
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
+use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
 /// How long a release may take from its host starting to every worker
@@ -404,10 +405,93 @@ pub struct Reopened {
     pub hosts: u32,
 }
 
+/// What runs a release: a host with Muru's workers, or the instances of
+/// a managed HTTP server (section 9.9).
+enum Backend {
+    Host(HostProcess),
+    Servers(Servers),
+}
+
+impl Backend {
+    /// The host, for a release with workers.
+    fn host(&self) -> Option<&HostProcess> {
+        match self {
+            Self::Host(host) => Some(host),
+            Self::Servers(_) => None,
+        }
+    }
+
+    /// The managed server's instances, for a release that runs one.
+    fn servers(&self) -> Option<&Servers> {
+        match self {
+            Self::Servers(servers) => Some(servers),
+            Self::Host(_) => None,
+        }
+    }
+
+    /// Whether the host has exited on its own: a sentence saying how.
+    /// Instances look after themselves (check_hosts starts them again).
+    fn try_exited(&mut self) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Host(host) => host.try_exited(),
+            Self::Servers(_) => Ok(None),
+        }
+    }
+
+    /// The record a previous daemon reads to take the release over.
+    fn record_path(&self, run_dir: &Path) -> PathBuf {
+        match self {
+            Self::Host(_) => run_dir.join("host.toml"),
+            Self::Servers(_) => run_dir.join("servers.toml"),
+        }
+    }
+
+    /// Stop the processes; `grace` is what a managed server's instances
+    /// get before SIGKILL.
+    async fn stop(self, grace: Duration) {
+        match self {
+            Self::Host(host) => host.stop().await,
+            Self::Servers(servers) => servers.stop(grace).await,
+        }
+    }
+
+    /// Leave the processes running for the next daemon.
+    fn release(self) {
+        match self {
+            Self::Host(host) => host.release(),
+            Self::Servers(servers) => servers.release(),
+        }
+    }
+
+    /// Send the host a signal; a managed server's instances take none,
+    /// since the daemon writes their log lines itself.
+    fn signal(&self, signal: i32) -> bool {
+        match self {
+            Self::Host(host) => host.signal(signal),
+            Self::Servers(_) => false,
+        }
+    }
+
+    /// Section 9.9: a managed server's instances as the upstream that
+    /// stands in for the release's workers in the snapshot.
+    fn server_message(&self, app: &str, id: &str) -> Option<pb::Upstream> {
+        self.servers().map(|servers| pb::Upstream {
+            name: format!("{app}@{id}"),
+            addresses: servers.addresses(),
+            protocol: "http1".to_owned(),
+            trust_muru_headers: true,
+            eject_after: 3,
+            eject_for_ms: 5_000,
+            ..Default::default()
+        })
+    }
+}
+
 /// A running release: its host and the sockets its workers listen on,
-/// and, once superseded, when its retention ends.
+/// or the instances of its managed server, and, once superseded, when
+/// its retention ends.
 struct Running {
-    host: HostProcess,
+    backend: Backend,
     /// The default group's sockets.
     sockets: Vec<PathBuf>,
     /// The named groups' sockets and paths.
@@ -430,6 +514,24 @@ struct Running {
     /// When each worker socket entered routing, for the age of the
     /// youngest worker.
     ready_at: HashMap<PathBuf, Instant>,
+}
+
+impl Running {
+    /// The processes serving: workers in every group, or a managed
+    /// server's instances.
+    fn workers(&self) -> usize {
+        match &self.backend {
+            Backend::Servers(servers) => servers.running(),
+            Backend::Host(_) => {
+                self.sockets.len()
+                    + self
+                        .groups
+                        .iter()
+                        .map(|group| group.sockets.len())
+                        .sum::<usize>()
+            }
+        }
+    }
 }
 
 /// The daemon's state while it runs.
@@ -1325,14 +1427,7 @@ impl Daemon {
                 let workers = self
                     .running
                     .get(&(app.name.clone(), release.id.clone()))
-                    .map_or(0, |running| {
-                        running.sockets.len()
-                            + running
-                                .groups
-                                .iter()
-                                .map(|group| group.sockets.len())
-                                .sum::<usize>()
-                    });
+                    .map_or(0, Running::workers);
                 let pools: Vec<&pb::PoolState> = recent
                     .pools
                     .iter()
@@ -1542,10 +1637,16 @@ impl Daemon {
         };
 
         for ((app, id), running) in &self.running {
-            let mut groups = vec![(
-                muru_edge::routing::DEFAULT_GROUP.to_owned(),
-                running.sockets.len(),
-            )];
+            let mut groups = match &running.backend {
+                Backend::Servers(servers) => vec![(
+                    muru_edge::routing::SERVER_GROUP.to_owned(),
+                    servers.running(),
+                )],
+                Backend::Host(_) => vec![(
+                    muru_edge::routing::DEFAULT_GROUP.to_owned(),
+                    running.sockets.len(),
+                )],
+            };
 
             for group in &running.groups {
                 groups.push((group.name.clone(), group.sockets.len()));
@@ -1668,7 +1769,7 @@ impl Daemon {
 
             if let Ok(releases) = self.store.releases(Some(&app.name)) {
                 for release in releases.iter().filter(|release| release.state.is_running()) {
-                    if self.adopt_host(&release.app, &release.id) {
+                    if self.adopt_host(&release.app, &release.id).await {
                         continue;
                     }
 
@@ -1706,9 +1807,15 @@ impl Daemon {
         }
     }
 
-    /// Take over a release's host from its record, if it is still there.
-    fn adopt_host(&mut self, app: &str, id: &str) -> bool {
+    /// Take over a release's host, or a managed server's instances, from
+    /// its record, if it is still there.
+    async fn adopt_host(&mut self, app: &str, id: &str) -> bool {
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+
+        if let Some(record) = read_record::<ServersRecord>(&run_dir.join("servers.toml")) {
+            return self.adopt_servers(app, id, &run_dir, &record).await;
+        }
+
         let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
             return false;
         };
@@ -1753,7 +1860,7 @@ impl Daemon {
                 self.running.insert(
                     (app.to_owned(), id.to_owned()),
                     Running {
-                        host,
+                        backend: Backend::Host(host),
                         sockets,
                         groups: record.groups.clone(),
                         retained_until,
@@ -1781,12 +1888,95 @@ impl Daemon {
         }
     }
 
+    /// Section 9.9: take over a managed server's instances from their
+    /// record, with what a restart of one would need resolved again.
+    async fn adopt_servers(
+        &mut self,
+        app: &str,
+        id: &str,
+        run_dir: &Path,
+        record: &ServersRecord,
+    ) -> bool {
+        let Ok(release) = self.store.release(app, id) else {
+            return false;
+        };
+        let Some(http) = release.spec.http.clone() else {
+            return false;
+        };
+
+        let subject = format!("{app}@{id}");
+
+        let identity = match self.resolve_identity(app, &subject) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
+
+        let env =
+            match resolve_env(&self.secrets, &release.spec.env, &run_dir.join("secrets")).await {
+                Ok(env) => env,
+                Err(error) => {
+                    tracing::info!(%error, "release {subject} could not be re-adopted");
+                    return false;
+                }
+            };
+        let adopted = Servers::adopt(
+            &http,
+            &run_dir.join("r1"),
+            &release.spec.source,
+            env,
+            identity,
+            &self.host_log(app, id),
+            record,
+        );
+
+        match adopted {
+            Ok(servers) => {
+                let retained_until = matches!(release.state, ReleaseState::Retained)
+                    .then(|| Instant::now() + RETENTION);
+                let pids: Vec<String> = record
+                    .instances
+                    .iter()
+                    .map(|instance| instance.pid.to_string())
+                    .collect();
+                self.running.insert(
+                    (app.to_owned(), id.to_owned()),
+                    Running {
+                        backend: Backend::Servers(servers),
+                        sockets: Vec::new(),
+                        groups: Vec::new(),
+                        retained_until,
+                        sticky_until: None,
+                        held: false,
+                        control: None,
+                        status: Vec::new(),
+                        scalers: Vec::new(),
+                        ready_at: HashMap::new(),
+                    },
+                );
+                self.events.emit(
+                    "release.adopted",
+                    &subject,
+                    "info",
+                    &format!("re-adopted the server instances (pid {})", pids.join(", ")),
+                );
+                true
+            }
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                false
+            }
+        }
+    }
+
     /// Leave every host and the edge running, for the next daemon.
     fn detach(&mut self) {
         let running = std::mem::take(&mut self.running);
 
         for (_, running) in running {
-            running.host.release();
+            running.backend.release();
         }
     }
 
@@ -2023,63 +2213,26 @@ impl Daemon {
             return Ok(());
         }
 
-        self.set_state(&release, ReleaseState::Starting, "starting the host");
+        self.set_state(
+            &release,
+            ReleaseState::Starting,
+            if release.spec.http.is_some() {
+                "starting the server"
+            } else {
+                "starting the host"
+            },
+        );
         let spec = &release.spec;
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
 
-        // Section 10.9 and ADR 0026: under a root daemon the host runs as
-        // the application's user, or as the service user when it names
-        // none, and never as root unless the application says so, which
-        // is warned about; otherwise a configured user is reported as
-        // not applied.
-
-        let identity = match self.store.app(app).ok().and_then(|record| {
-            record
-                .user
-                .clone()
-                .map(|user| (user, record.group.clone(), record.umask.clone()))
-        }) {
-            Some((user, group, umask)) if crate::host::Identity::can_switch() => {
-                let mask = umask
-                    .as_deref()
-                    .and_then(|text| u32::from_str_radix(text, 8).ok());
-
-                match crate::host::Identity::lookup(&user, group.as_deref(), mask) {
-                    Ok(identity) => {
-                        if identity.is_root() {
-                            self.events.emit(
-                                "app.user_is_root",
-                                &subject,
-                                "warning",
-                                &format!(
-                                    "user {user}: the release runs as root, which is not \
-                                     recommended; a compromised application would have the \
-                                     node"
-                                ),
-                            );
-                        }
-
-                        Some(identity)
-                    }
-                    Err(error) => {
-                        let message = format!("the application's user cannot be used: {error:#}");
-                        self.set_state(&release, ReleaseState::Failed, &message);
-                        self.events
-                            .emit("release.failed", &subject, "error", &message);
-                        return Err(message);
-                    }
-                }
+        let identity = match self.resolve_identity(app, &subject) {
+            Ok(identity) => identity,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
             }
-            Some((user, _, _)) => {
-                self.events.emit(
-                    "app.user_not_applied",
-                    &subject,
-                    "warning",
-                    &format!("user {user} not applied: the daemon is not root"),
-                );
-                None
-            }
-            None => self.service,
         };
 
         // Section 10.8: secrets are resolved now, for this start, and
@@ -2094,6 +2247,30 @@ impl Daemon {
                 return Err(message);
             }
         };
+
+        let started = Instant::now();
+
+        // The release's directories, its secret files and its log belong
+        // to the user the host runs as, so it can bind its sockets,
+        // read its secrets and reopen its log.
+
+        if let Some(identity) = identity
+            && let Err(message) = self.own_release_dirs(identity, &run_dir, app, id)
+        {
+            self.set_state(&release, ReleaseState::Failed, &message);
+            self.events
+                .emit("release.failed", &subject, "error", &message);
+            return Err(message);
+        }
+
+        // Section 9.9: a managed HTTP release runs its server's
+        // instances instead of a host.
+
+        if let Some(http) = spec.http.clone() {
+            return self
+                .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
+                .await;
+        }
 
         let host_spec = HostSpec {
             python: spec.python.clone(),
@@ -2144,59 +2321,6 @@ impl Daemon {
                 })
                 .collect(),
         };
-        let started = Instant::now();
-
-        // The release's directories, its secret files and its log belong
-        // to the user the host runs as, so it can bind its sockets,
-        // read its secrets and reopen its log.
-
-        if let Some(identity) = identity {
-            let owned = [run_dir.clone(), run_dir.join("r1"), run_dir.join("secrets")];
-
-            for path in &owned {
-                let _ = std::fs::create_dir_all(path);
-            }
-
-            let mut paths: Vec<PathBuf> = owned.to_vec();
-
-            if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
-                paths.extend(entries.flatten().map(|entry| entry.path()));
-            }
-
-            let log = self.host_log(app, id);
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log);
-            paths.push(log);
-
-            for path in paths {
-                if let Err(error) = identity.own(&path) {
-                    let message = format!(
-                        "giving {} to the application's user failed: {error}",
-                        path.display()
-                    );
-                    self.set_state(&release, ReleaseState::Failed, &message);
-                    self.events
-                        .emit("release.failed", &subject, "error", &message);
-                    return Err(message);
-                }
-            }
-
-            // The socket directory carries the edge's group, which new
-            // sockets inherit, and opens to that group alone (section
-            // 10.9): the edge reaches the workers without being root.
-
-            if let Some(service) = self.service
-                && let Err(error) = share_sockets(&run_dir.join("r1"), identity, service)
-            {
-                let message = format!("sharing the socket directory with the edge failed: {error}");
-                self.set_state(&release, ReleaseState::Failed, &message);
-                self.events
-                    .emit("release.failed", &subject, "error", &message);
-                return Err(message);
-            }
-        }
 
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,
@@ -2254,7 +2378,7 @@ impl Daemon {
         self.running.insert(
             (app.to_owned(), id.to_owned()),
             Running {
-                host,
+                backend: Backend::Host(host),
                 sockets,
                 groups,
                 retained_until: None,
@@ -2275,6 +2399,191 @@ impl Daemon {
             &format!(
                 "{} workers ready in {:.1} s",
                 spec.processes + spec.groups.iter().map(|group| group.processes).sum::<u32>(),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        Ok(())
+    }
+
+    /// Section 10.9 and ADR 0026: whom a release runs as. Under a root
+    /// daemon that is the application's user, or the service user when
+    /// it names none, and never root unless the application says so,
+    /// which is warned about; a daemon that is not root reports a
+    /// configured user as not applied.
+    fn resolve_identity(
+        &self,
+        app: &str,
+        subject: &str,
+    ) -> Result<Option<crate::host::Identity>, String> {
+        let named = self.store.app(app).ok().and_then(|record| {
+            record
+                .user
+                .clone()
+                .map(|user| (user, record.group.clone(), record.umask.clone()))
+        });
+
+        match named {
+            Some((user, group, umask)) if crate::host::Identity::can_switch() => {
+                let mask = umask
+                    .as_deref()
+                    .and_then(|text| u32::from_str_radix(text, 8).ok());
+                let identity = crate::host::Identity::lookup(&user, group.as_deref(), mask)
+                    .map_err(|error| format!("the application's user cannot be used: {error:#}"))?;
+
+                if identity.is_root() {
+                    self.events.emit(
+                        "app.user_is_root",
+                        subject,
+                        "warning",
+                        &format!(
+                            "user {user}: the release runs as root, which is not \
+                             recommended; a compromised application would have the \
+                             node"
+                        ),
+                    );
+                }
+
+                Ok(Some(identity))
+            }
+            Some((user, _, _)) => {
+                self.events.emit(
+                    "app.user_not_applied",
+                    subject,
+                    "warning",
+                    &format!("user {user} not applied: the daemon is not root"),
+                );
+                Ok(None)
+            }
+            None => Ok(self.service),
+        }
+    }
+
+    /// Give a release's directories, secret files and log to the user
+    /// its processes run as, and open its socket directory to the edge's
+    /// group alone (section 10.9), so the edge reaches the sockets
+    /// without being root.
+    fn own_release_dirs(
+        &self,
+        identity: crate::host::Identity,
+        run_dir: &Path,
+        app: &str,
+        id: &str,
+    ) -> Result<(), String> {
+        let owned = [
+            run_dir.to_path_buf(),
+            run_dir.join("r1"),
+            run_dir.join("secrets"),
+        ];
+
+        for path in &owned {
+            let _ = std::fs::create_dir_all(path);
+        }
+
+        let mut paths: Vec<PathBuf> = owned.to_vec();
+
+        if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
+            paths.extend(entries.flatten().map(|entry| entry.path()));
+        }
+
+        let log = self.host_log(app, id);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log);
+        paths.push(log);
+
+        for path in paths {
+            identity.own(&path).map_err(|error| {
+                format!(
+                    "giving {} to the application's user failed: {error}",
+                    path.display()
+                )
+            })?;
+        }
+
+        if let Some(service) = self.service {
+            share_sockets(&run_dir.join("r1"), identity, service).map_err(|error| {
+                format!("sharing the socket directory with the edge failed: {error}")
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Section 9.9: start a managed HTTP release's instances and wait
+    /// for their readiness probes, then route to them as an upstream.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_servers(
+        &mut self,
+        app: &str,
+        id: &str,
+        release: &Release,
+        http: &crate::model::HttpServerSpec,
+        env: Vec<(String, String)>,
+        identity: Option<crate::host::Identity>,
+        run_dir: &Path,
+        started: Instant,
+    ) -> Result<(), String> {
+        let subject = format!("{app}@{id}");
+        let log = self.host_log(app, id);
+        let mut servers = match Servers::start(
+            http,
+            &run_dir.join("r1"),
+            &release.spec.source,
+            env,
+            identity,
+            &log,
+        ) {
+            Ok(servers) => servers,
+            Err(error) => {
+                let message = format!("the server could not be started: {error:#}");
+                self.set_state(release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
+        self.set_state(release, ReleaseState::Warming, "waiting for the instances");
+        let timeout = Duration::from_millis(http.readiness_timeout_ms);
+
+        if let Err(error) = servers.wait_ready(timeout).await {
+            let message = format!("{error:#}");
+            servers
+                .stop(Duration::from_millis(
+                    release.spec.timeouts.shutdown_timeout_ms,
+                ))
+                .await;
+            self.set_state(release, ReleaseState::Failed, &message);
+            self.events
+                .emit("release.failed", &subject, "error", &message);
+            return Err(message);
+        }
+
+        write_record(&run_dir.join("servers.toml"), &servers.record());
+        self.running.insert(
+            (app.to_owned(), id.to_owned()),
+            Running {
+                backend: Backend::Servers(servers),
+                sockets: Vec::new(),
+                groups: Vec::new(),
+                retained_until: None,
+                sticky_until: None,
+                held: false,
+                control: None,
+                status: Vec::new(),
+                scalers: Vec::new(),
+                ready_at: HashMap::new(),
+            },
+        );
+        self.set_state(release, ReleaseState::Ready, "");
+        self.events.emit(
+            "release.ready",
+            &subject,
+            "info",
+            &format!(
+                "{} ready in {:.1} s",
+                http.describe(),
                 started.elapsed().as_secs_f64()
             ),
         );
@@ -2438,6 +2747,7 @@ impl Daemon {
                             .and_then(|release| release.spec.maintenance)
                             .as_ref(),
                     )),
+                    server: running.backend.server_message(name, id),
                 });
             }
         }
@@ -2455,6 +2765,8 @@ impl Daemon {
             .and_then(|name| apps.iter().find(|app| &app.app == name))
             .or_else(|| apps.first());
         let worker_sockets = default.map(|app| app.sockets.clone()).unwrap_or_default();
+        let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
+        let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
 
         let mut hosts = Vec::new();
 
@@ -2568,6 +2880,8 @@ impl Daemon {
             error_pages: self.error_pages.clone(),
             error_override: self.error_override.clone(),
             upstreams,
+            default_app,
+            default_release,
         }
     }
 
@@ -2693,9 +3007,19 @@ impl Daemon {
             return;
         };
 
-        self.set_state(&release, ReleaseState::Stopping, "stopping the host");
-        let record = running.host.run_dir().join("..").join("host.toml");
-        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
+        self.set_state(
+            &release,
+            ReleaseState::Stopping,
+            if running.backend.servers().is_some() {
+                "stopping the instances"
+            } else {
+                "stopping the host"
+            },
+        );
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let record = running.backend.record_path(&run_dir);
+        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
+        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
 
         if stopped.is_err() {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
@@ -3367,6 +3691,13 @@ impl Daemon {
         let Some(running) = self.running.get_mut(&key) else {
             return Err(format!("release {app}@{id} is not running"));
         };
+
+        if running.backend.servers().is_some() {
+            return Err(format!(
+                "release {app}@{id} runs a managed HTTP server, whose instance count is fixed"
+            ));
+        }
+
         let Some(scaling) = running
             .scalers
             .iter_mut()
@@ -3678,11 +4009,42 @@ impl Daemon {
     /// serves is started again once.
     async fn check_hosts(&mut self) {
         let mut exited = Vec::new();
+        let mut reports = Vec::new();
 
         for (key, running) in &mut self.running {
-            if let Ok(Some(how)) = running.host.try_exited() {
+            // Section 9.9: a managed server's instances are started
+            // again where they crash; the release stays up.
+
+            if let Backend::Servers(servers) = &mut running.backend {
+                let changes = servers.check();
+
+                if !changes.is_empty() {
+                    let run_dir = self
+                        .locations
+                        .run
+                        .path
+                        .join("apps")
+                        .join(&key.0)
+                        .join(&key.1);
+                    write_record(&run_dir.join("servers.toml"), &servers.record());
+                }
+
+                reports.extend(changes.into_iter().map(|report| (key.clone(), report)));
+                continue;
+            }
+
+            if let Ok(Some(how)) = running.backend.try_exited() {
                 exited.push((key.clone(), how));
             }
+        }
+
+        for ((app, id), report) in reports {
+            self.events.emit(
+                report.kind,
+                &format!("{app}@{id}"),
+                report.level,
+                &report.message,
+            );
         }
 
         for ((app, id), how) in exited {
@@ -3759,10 +4121,15 @@ impl Daemon {
     /// Section 5.9: connect to a running host's control socket in the
     /// background and feed what it says into the daemon's inbox.
     fn attach_control(&self, app: &str, id: &str) {
-        let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
+        let Some(host) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.backend.host())
+        else {
             return;
         };
-        let path = running.host.control_path();
+
+        let path = host.control_path();
         let commands = self.commands.clone();
         let (app, id) = (app.to_owned(), id.to_owned());
 
@@ -3818,6 +4185,14 @@ impl Daemon {
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+                let Some((record, pid)) = running.backend.host().map(|host| {
+                    (
+                        host.run_dir().join("..").join("host.toml"),
+                        host.pid().unwrap_or(0),
+                    )
+                }) else {
+                    return;
+                };
                 running.sockets = sockets;
 
                 for (name, group_sockets) in groups {
@@ -3844,9 +4219,9 @@ impl Daemon {
                 }
 
                 write_record(
-                    &running.host.run_dir().join("..").join("host.toml"),
+                    &record,
                     &HostRecord {
-                        pid: running.host.pid().unwrap_or(0),
+                        pid,
                         sockets: all,
                         groups: running.groups.clone(),
                     },
@@ -3947,7 +4322,12 @@ impl Daemon {
                 self.set_state(&release, ReleaseState::Stopping, "the daemon is stopping");
             }
 
-            let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.host.stop()).await;
+            let grace = self
+                .store
+                .release(&app, &id)
+                .map(|release| Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms))
+                .unwrap_or(DRAIN_TIMEOUT);
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
 
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
@@ -4007,26 +4387,38 @@ impl Daemon {
         };
         let now = std::time::SystemTime::now();
         let mut candidates = vec![
-            self.locations.access_log(),
-            self.locations.logs.path.join("edge.log"),
+            (self.locations.access_log(), false),
+            (self.locations.logs.path.join("edge.log"), false),
         ];
 
         if self.owns_log {
-            candidates.push(self.locations.daemon_log());
+            candidates.push((self.locations.daemon_log(), false));
         }
 
-        for (app, id) in self.running.keys() {
-            candidates.push(self.locations.release_log(app, id));
+        // Section 9.9: a managed server writes its log itself and cannot
+        // be told to reopen it, so its log is rotated in place.
+
+        for ((app, id), running) in &self.running {
+            candidates.push((
+                self.locations.release_log(app, id),
+                running.backend.servers().is_some(),
+            ));
         }
 
         let mut rotated = Vec::new();
 
-        for path in candidates {
+        for (path, in_place) in candidates {
             if !path.is_file() || !rotator.due(&path, now) {
                 continue;
             }
 
-            match rotator.rotate(&path, now) {
+            let outcome = if in_place {
+                rotator.rotate_in_place(&path, now)
+            } else {
+                rotator.rotate(&path, now)
+            };
+
+            match outcome {
                 Ok(archive) => rotated.push(archive),
                 Err(error) => {
                     tracing::warn!(%error, path = %path.display(), "rotating a log failed");
@@ -4045,7 +4437,7 @@ impl Daemon {
         self.edge.signal(libc::SIGUSR1);
 
         for running in self.running.values() {
-            running.host.signal(libc::SIGUSR1);
+            running.backend.signal(libc::SIGUSR1);
         }
 
         let names: Vec<String> = rotated
@@ -4075,12 +4467,12 @@ impl Daemon {
         let mut hosts = 0;
 
         for running in self.running.values() {
-            if running.host.signal(libc::SIGUSR1) {
+            if running.backend.signal(libc::SIGUSR1) {
                 hosts += 1;
             }
 
             if workers {
-                running.host.signal(libc::SIGUSR2);
+                running.backend.signal(libc::SIGUSR2);
             }
         }
 

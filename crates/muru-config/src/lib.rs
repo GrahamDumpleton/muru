@@ -104,6 +104,72 @@ words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
 
+/// What a release runs (section 9.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseKind {
+    /// Muru's own workers, from an entrypoint.
+    Workers,
+    /// An HTTP server Muru starts and supervises, from a command.
+    Http,
+}
+
+/// The server a managed HTTP release runs (section 9.9), which fixes
+/// how it binds and how it is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerProfile {
+    /// gunicorn: `--bind unix:PATH` or `--bind HOST:PORT`, stopped by TERM.
+    Gunicorn,
+    /// uvicorn: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM.
+    Uvicorn,
+    /// Granian: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM.
+    Granian,
+    /// mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM.
+    #[serde(rename = "mod_wsgi-express")]
+    ModWsgiExpress,
+    /// Any server: the command binds through `{bind}` and `stop_signal`
+    /// says how it is stopped.
+    Generic,
+}
+
+/// How a managed HTTP release's instances bind (section 9.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerBind {
+    /// A Unix socket per instance under the release's run directory.
+    Unix,
+    /// A free loopback port per instance.
+    Port,
+}
+
+words!(ReleaseKind { Workers => "workers", Http => "http" });
+words!(ServerProfile {
+    Gunicorn => "gunicorn",
+    Uvicorn => "uvicorn",
+    Granian => "granian",
+    ModWsgiExpress => "mod_wsgi-express",
+    Generic => "generic",
+});
+words!(ServerBind { Unix => "unix", Port => "port" });
+
+/// The signals a `stop_signal` may name.
+pub const STOP_SIGNALS: [&str; 7] = ["TERM", "INT", "QUIT", "HUP", "USR1", "USR2", "WINCH"];
+
+/// The `readiness` table of a managed HTTP release (section 9.9): how
+/// an instance is known to be ready.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Readiness {
+    /// The path probed with a GET until it answers 2xx or 3xx; without
+    /// it, any HTTP response makes the instance ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How long the instances get to become ready (default 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
 /// A Python logging level (section 11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -314,8 +380,40 @@ pub struct Group {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
+    /// What the release runs (section 9.9): `workers` from an entrypoint,
+    /// the default, or `http`, an HTTP server started from `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ReleaseKind>,
+    /// The server an `http` release runs: gunicorn, uvicorn, granian,
+    /// mod_wsgi-express or generic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ServerProfile>,
+    /// The command an `http` release runs, with `{bind}` where the
+    /// server takes its address; without `{bind}` the profile adds the
+    /// server's own flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// The directory an `http` release's command runs in; `source` when
+    /// absent, and one of the two is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// How an `http` release's instances bind: `unix` (the default) or
+    /// `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<ServerBind>,
+    /// How many instances of the command an `http` release runs (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    /// How an `http` release's instances are known to be ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Readiness>,
+    /// The signal that stops an `http` release's instance gracefully:
+    /// TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic
+    /// profile; the other profiles know their server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
     /// The source directory. A relative path is taken from the file's
-    /// directory. Required by `muructl apply`.
+    /// directory. Required by `muructl apply` for a `workers` release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// The application as module:callable, else from the source's
@@ -1492,6 +1590,157 @@ pub fn parse_upstream_address(text: &str) -> Result<UpstreamAddress, String> {
 
 /// The protocols an upstream speaks.
 pub const UPSTREAM_PROTOCOLS: [&str; 3] = ["http1", "h2c", "h2"];
+
+/// Check a release table's keys against its kind (section 9.9): a
+/// managed HTTP release needs its server and command and takes none of
+/// the worker settings, and a workers release takes none of the server
+/// ones.
+pub fn check_release_kind(table: &Release) -> Result<(), String> {
+    let server_keys: [(&str, bool); 7] = [
+        ("profile", table.profile.is_some()),
+        ("command", !table.command.is_empty()),
+        ("cwd", table.cwd.is_some()),
+        ("bind", table.bind.is_some()),
+        ("instances", table.instances.is_some()),
+        ("readiness", table.readiness.is_some()),
+        ("stop_signal", table.stop_signal.is_some()),
+    ];
+
+    if table.kind != Some(ReleaseKind::Http) {
+        if let Some((key, _)) = server_keys.iter().find(|(_, set)| *set) {
+            return Err(format!(
+                "{key} applies to a managed HTTP release (kind = 'http')"
+            ));
+        }
+
+        return Ok(());
+    }
+
+    let timeouts = table.timeouts.as_ref();
+    let worker_keys: [(&str, bool); 21] = [
+        ("entrypoint", !table.entrypoint.is_empty()),
+        ("interface", table.interface.is_some()),
+        ("factory", table.factory.is_some()),
+        ("factory_phase", table.factory_phase.is_some()),
+        ("python", table.python.is_some()),
+        ("processes", table.processes.is_some()),
+        ("threads", table.threads.is_some()),
+        ("sync_threads", table.sync_threads.is_some()),
+        ("concurrency", table.concurrency.is_some()),
+        ("scaling", table.scaling.is_some()),
+        ("preload", table.preload.is_some()),
+        ("hooks", table.hooks.is_some()),
+        ("groups", !table.groups.is_empty()),
+        ("mounts", !table.mounts.is_empty()),
+        ("logging", table.logging.is_some()),
+        ("max_requests", table.max_requests.is_some()),
+        ("max_lifetime", table.max_lifetime.is_some()),
+        ("memory", table.memory.is_some()),
+        ("accel_redirect", table.accel_redirect.is_some()),
+        ("cgi_local_redirect", table.cgi_local_redirect.is_some()),
+        (
+            "timeouts",
+            timeouts.is_some_and(|timeouts| {
+                timeouts.soft_timeout.is_some()
+                    || timeouts.hard_timeout.is_some()
+                    || timeouts.hard_drain_grace.is_some()
+            }),
+        ),
+    ];
+
+    if let Some((key, _)) = worker_keys.iter().find(|(_, set)| *set) {
+        return Err(format!(
+            "{key} does not apply to a managed HTTP release; only shutdown_timeout of the timeouts does"
+        ));
+    }
+
+    let Some(profile) = table.profile else {
+        return Err(
+            "profile: a managed HTTP release names its server: gunicorn, uvicorn, granian, \
+             mod_wsgi-express or generic"
+                .to_owned(),
+        );
+    };
+
+    if table.command.is_empty() {
+        return Err(
+            "command: a managed HTTP release needs the command that runs the server".to_owned(),
+        );
+    }
+
+    if table.source.is_none() && table.cwd.is_none() {
+        return Err(
+            "cwd: a managed HTTP release needs the directory its command runs in".to_owned(),
+        );
+    }
+
+    if table.instances == Some(0) {
+        return Err("instances must be at least 1".to_owned());
+    }
+
+    let bind = table.bind.unwrap_or(ServerBind::Unix);
+
+    if profile == ServerProfile::ModWsgiExpress && bind == ServerBind::Unix {
+        return Err("bind: mod_wsgi-express binds a port only; set bind = 'port'".to_owned());
+    }
+
+    if bind == ServerBind::Unix
+        && let Some(argument) = table
+            .command
+            .iter()
+            .find(|argument| argument.contains("{port}"))
+    {
+        return Err(format!(
+            "command: {argument:?} uses {{port}}, which needs bind = 'port'"
+        ));
+    }
+
+    if bind == ServerBind::Port
+        && let Some(argument) = table
+            .command
+            .iter()
+            .find(|argument| argument.contains("{socket}"))
+    {
+        return Err(format!(
+            "command: {argument:?} uses {{socket}}, which needs bind = 'unix'"
+        ));
+    }
+
+    if let Some(readiness) = &table.readiness {
+        if let Some(path) = &readiness.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("readiness.path {path:?} must start with /"));
+        }
+
+        if let Some(timeout) = &readiness.timeout {
+            let duration =
+                parse_duration(timeout).map_err(|error| format!("readiness.timeout: {error}"))?;
+
+            if duration.is_zero() {
+                return Err("readiness.timeout must be longer than nothing".to_owned());
+            }
+        }
+    }
+
+    match &table.stop_signal {
+        Some(signal) if !STOP_SIGNALS.contains(&signal.as_str()) => {
+            return Err(format!(
+                "stop_signal must be one of {}, not {signal:?}",
+                STOP_SIGNALS.join(", ")
+            ));
+        }
+        None if profile == ServerProfile::Generic => {
+            return Err(format!(
+                "stop_signal: the generic profile needs the signal that stops the server: {}",
+                STOP_SIGNALS.join(", ")
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
 
 /// Check an `[upstream.NAME]` table: the addresses, the protocol, the
 /// TLS and health settings and the durations. Whether the CA file is

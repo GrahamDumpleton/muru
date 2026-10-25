@@ -536,7 +536,14 @@ pub struct AppPools {
     errors: Arc<ErrorPolicy>,
     /// Maintenance mode, when the application is in it.
     maintenance: Option<Arc<Maintenance>>,
+    /// Section 9.9: the instances of a managed HTTP release, which take
+    /// every request in place of workers.
+    server: Option<Arc<Upstream>>,
 }
+
+/// The group name a managed HTTP release's requests are logged under
+/// (section 9.9).
+pub const SERVER_GROUP: &str = "http";
 
 impl AppPools {
     /// Connect the default workers and each group's. `app` and `release`
@@ -585,6 +592,7 @@ impl AppPools {
             redirects,
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
+            server: None,
         })
     }
 
@@ -599,7 +607,20 @@ impl AppPools {
             redirects: RedirectFlags::default(),
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
+            server: None,
         }
+    }
+
+    /// The same release served by the instances of a managed HTTP server
+    /// (section 9.9) instead of workers.
+    pub fn with_server(mut self, server: Arc<Upstream>) -> Self {
+        self.server = Some(server);
+        self
+    }
+
+    /// The instances of a managed HTTP release, when the release is one.
+    pub fn server(&self) -> Option<&Arc<Upstream>> {
+        self.server.as_ref()
     }
 
     /// The same pools with the release's error pages and override
@@ -622,6 +643,20 @@ impl AppPools {
     /// one it accepts: a client's request for it, or an unaccepted
     /// redirect, gets nothing.
     pub fn select(&self, path: &str, origin: Option<&Origin>) -> Option<Selection> {
+        if let Some(server) = &self.server {
+            return Some(Selection {
+                pool: Arc::new(LinkPool::empty()),
+                app: self.app.clone(),
+                release: self.release.clone(),
+                group: SERVER_GROUP.to_owned(),
+                mount: String::new(),
+                script_name: String::new(),
+                redirects: RedirectFlags::default(),
+                maintenance: self.maintenance.clone(),
+                upstream: Some(Arc::clone(server)),
+            });
+        }
+
         let (group, pool) = self
             .groups
             .iter()
@@ -837,22 +872,31 @@ impl Routing {
                 .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?
                 .flatten()
                 .map(Arc::new);
-            let pools = Arc::new(
-                AppPools::connect(
-                    &app.app,
-                    &app.release,
-                    &paths(&app.sockets),
-                    &groups_of(app),
-                    &mounts_of(app),
-                    RedirectFlags {
-                        accel_redirect: app.accel_redirect,
-                        cgi_local_redirect: app.cgi_local_redirect,
-                    },
-                )
-                .await?
-                .with_errors(Arc::new(errors))
-                .with_maintenance(maintenance),
-            );
+            let mut pools = AppPools::connect(
+                &app.app,
+                &app.release,
+                &paths(&app.sockets),
+                &groups_of(app),
+                &mounts_of(app),
+                RedirectFlags {
+                    accel_redirect: app.accel_redirect,
+                    cgi_local_redirect: app.cgi_local_redirect,
+                },
+            )
+            .await?
+            .with_errors(Arc::new(errors))
+            .with_maintenance(maintenance);
+
+            // Section 9.9: a managed HTTP release's instances stand in
+            // for its workers, as an upstream named after the release.
+
+            if let Some(server) = &app.server {
+                let server = Upstream::from_message(server)
+                    .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?;
+                pools = pools.with_server(Arc::new(server));
+            }
+
+            let pools = Arc::new(pools);
             let releases = apps.entry(app.app.clone()).or_insert_with(|| AppReleases {
                 serving: Arc::clone(&pools),
                 releases: HashMap::new(),
@@ -869,11 +913,16 @@ impl Routing {
         // so its groups come along and its pools are shared; without one,
         // a plain pool.
 
-        let default_app = snapshot
-            .apps
-            .iter()
-            .find(|app| app.sockets == snapshot.worker_sockets)
-            .and_then(|app| apps.get(&app.app)?.releases.get(&app.release));
+        let default_app = if snapshot.default_app.is_empty() {
+            snapshot
+                .apps
+                .iter()
+                .find(|app| app.sockets == snapshot.worker_sockets)
+                .and_then(|app| apps.get(&app.app)?.releases.get(&app.release))
+        } else {
+            apps.get(&snapshot.default_app)
+                .and_then(|releases| releases.releases.get(&snapshot.default_release))
+        };
 
         let default = match default_app {
             Some(pools) => Arc::clone(pools),
@@ -1024,6 +1073,18 @@ impl Routing {
     /// The upstreams, for their health gauges.
     pub fn upstreams(&self) -> Vec<Arc<Upstream>> {
         self.upstreams.values().cloned().collect()
+    }
+
+    /// The instances of every managed HTTP release (section 9.9), each
+    /// as the upstream that stands in for the release's workers.
+    pub fn servers(&self) -> Vec<Arc<Upstream>> {
+        let mut servers: Vec<Arc<Upstream>> = self
+            .app_pools()
+            .iter()
+            .filter_map(|pools| pools.server().cloned())
+            .collect();
+        servers.sort_by(|left, right| left.name().cmp(right.name()));
+        servers
     }
 
     /// The error pages and override in force for a request (section
@@ -1425,6 +1486,8 @@ mod tests {
             version: 7,
             compression: None,
             worker_sockets: Vec::new(),
+            default_app: String::new(),
+            default_release: String::new(),
             hosts: vec![
                 pb::Host {
                     name: "shop".to_owned(),

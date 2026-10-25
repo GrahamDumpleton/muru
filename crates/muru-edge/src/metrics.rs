@@ -449,6 +449,13 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
     for pools in routing.app_pools() {
         let (app, release) = pools.labels();
 
+        // A managed HTTP release (section 9.9) has instances, reported
+        // by their health below, and no slots.
+
+        if pools.server().is_some() {
+            continue;
+        }
+
         for (group, pool) in pools.pools() {
             let labels = [
                 ("app", app),
@@ -476,6 +483,10 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
 
     for upstream in routing.upstreams() {
         samples.extend(upstream.samples());
+    }
+
+    for server in routing.servers() {
+        samples.extend(server.samples());
     }
 
     samples.push(Sample::new(

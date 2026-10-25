@@ -6,9 +6,9 @@
 `[upstream.NAME]` tables: routes, static fallbacks, traffic shares and
 authentication handlers that are unmanaged HTTP servers, over HTTP/1.1,
 h2c or HTTP/2 with TLS, by TCP or Unix socket, with active probes and
-passive ejection. Managed HTTP server releases, which Muru starts and
-supervises itself, are still to come, and so is `X-Muru-Sendfile` from
-an upstream.
+passive ejection. Servers Muru starts and supervises itself are
+[managed HTTP servers](managed-servers.md); `X-Muru-Sendfile` from an
+upstream is still to come.
 ```
 
 An upstream is an HTTP server Muru does not run: an existing deployment

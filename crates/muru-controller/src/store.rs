@@ -849,6 +849,7 @@ mod tests {
             error_pages: Default::default(),
             error_override: None,
             maintenance: None,
+            http: None,
         }
     }
 

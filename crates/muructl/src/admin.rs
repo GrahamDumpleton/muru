@@ -1190,8 +1190,43 @@ pub struct DeployArgs {
     #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
     secrets: Vec<(String, String, String, bool)>,
 
+    /// Run an HTTP server of this profile instead of workers (section
+    /// 9.9): gunicorn, uvicorn, granian, mod_wsgi-express or generic,
+    /// with its command after `--`.
+    #[arg(long, value_name = "PROFILE")]
+    server: Option<muru_config::ServerProfile>,
+
+    /// How a managed server's instances bind: unix (the default) or port.
+    #[arg(long, value_name = "MODE")]
+    bind: Option<muru_config::ServerBind>,
+
+    /// How many instances of a managed server's command run (default 1).
+    #[arg(long, value_name = "N")]
+    instances: Option<u32>,
+
+    /// The path probed until a managed server's instance answers 2xx or
+    /// 3xx; any answer makes it ready without one.
+    #[arg(long, value_name = "PATH")]
+    readiness: Option<String>,
+
+    /// How long a managed server's instances get to be ready (default 60s).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    readiness_timeout: Option<Duration>,
+
+    /// The signal that stops a managed server's instance gracefully
+    /// (TERM, INT, QUIT, HUP, USR1, USR2 or WINCH); required by the
+    /// generic profile, the other profiles know their server's.
+    #[arg(long, value_name = "NAME")]
+    stop_signal: Option<String>,
+
     #[command(flatten)]
     socket: SocketArgs,
+
+    /// The command of a managed server, after `--`, with `{bind}` where
+    /// it takes its address; without `{bind}` the profile adds the
+    /// server's own flags.
+    #[arg(last = true, value_name = "COMMAND")]
+    command: Vec<String>,
 }
 
 /// Parse NAME=VALUE for --env.
@@ -1425,11 +1460,32 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("{} does not exist", source.display()))?;
+
+    if args.server.is_none() && !args.command.is_empty() {
+        anyhow::bail!("a command after -- needs --server PROFILE");
+    }
+
     let mut client = client::connect(&args.socket.socket()).await?;
 
     let request = pb::DeployRequest {
         app: args.app.clone(),
         source: source.display().to_string(),
+        kind: args.server.map(|_| "http".to_owned()).unwrap_or_default(),
+        profile: args
+            .server
+            .map(|profile| profile.as_str().to_owned())
+            .unwrap_or_default(),
+        command: args.command.clone(),
+        bind: args
+            .bind
+            .map(|bind| bind.as_str().to_owned())
+            .unwrap_or_default(),
+        instances: args.instances,
+        readiness_path: args.readiness.unwrap_or_default(),
+        readiness_timeout_ms: args
+            .readiness_timeout
+            .map(|timeout| timeout.as_millis() as u64),
+        stop_signal: args.stop_signal.unwrap_or_default(),
         entrypoint: args.entrypoint.unwrap_or_default(),
         interface: args
             .interface
@@ -2348,7 +2404,11 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
             format!("{}@{}", release.app, release.id),
             release.state,
             if release.serving { "yes" } else { "" },
-            format!("{}x{}", release.processes, release.threads),
+            if release.kind == "http" {
+                format!("{} {}", release.instances, release.profile)
+            } else {
+                format!("{}x{}", release.processes, release.threads)
+            },
             release.source
         );
 

@@ -171,6 +171,14 @@ message DeployRequest {
   optional uint64 soft_timeout_ms = 30;     // how long a request may run before it is interrupted (section 7.6)
   optional bool accel_redirect = 31;        // X-Accel-Redirect from the default mount is an internal redirect (section 4.10)
   optional bool cgi_local_redirect = 32;    // a 200 with a local Location and no body is an internal redirect
+  string kind = 33;                         // workers (the default) or http, a managed HTTP server release (section 9.9)
+  string profile = 34;                      // the server of an http release: gunicorn, uvicorn, granian, mod_wsgi-express or generic
+  repeated string command = 35;             // the command of an http release, with {bind} where the server takes its address
+  string bind = 36;                         // how an http release binds: unix (the default) or port
+  optional uint32 instances = 37;           // instances of the command; 1 when absent
+  string readiness_path = 38;               // the path probed until an instance answers 2xx or 3xx; any answer when empty
+  optional uint64 readiness_timeout_ms = 39; // how long the instances get to be ready; 60 s when absent
+  string stop_signal = 40;                  // the signal that stops an instance gracefully; the profile's when empty
 }
 
 // One environment variable: a value, or a secret reference.
@@ -346,6 +354,10 @@ message Release {
   uint64 resource_version = 15;
   repeated Worker workers = 16;
   uint64 retained_until_unix_ms = 17; // for a retained release, when it is stopped
+  string kind = 18;                 // workers or http (section 9.9)
+  string profile = 19;              // the server of an http release
+  uint32 instances = 20;            // instances of an http release's command
+  repeated string command = 21;     // the command of an http release
 }
 
 message Worker {

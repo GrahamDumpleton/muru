@@ -1260,6 +1260,14 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     }
 
     let release = Release {
+        kind: None,
+        profile: None,
+        command: Vec::new(),
+        cwd: None,
+        bind: None,
+        instances: None,
+        readiness: None,
+        stop_signal: None,
         source: Some(resolved.project.display().to_string()),
         entrypoint: resolved.entrypoint.clone(),
         interface: (resolved.interface != muru_config::Interface::Auto)

@@ -46,6 +46,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | preload | release | auto (preload with the import check, falling back to per-worker imports) | 6.1, 6.2 |
 | processes, threads, sync_threads | release, group, mount | 2, 8 for WSGI, 1 loop for ASGI | 6.4 |
 | hooks | release | none | 6.3 |
+| kind, profile, command, cwd, bind, instances, readiness (path, timeout), stop_signal | release | workers, none, none, source, unix, 1, none and 60s, the profile's | 9.9 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |
 | path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none, false, false, false, 1000, 1000 | 6.7, 4.10 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
@@ -104,7 +105,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- |
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
 | Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back |
-| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed |
+| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |

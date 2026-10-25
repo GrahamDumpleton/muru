@@ -1321,6 +1321,24 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         resource_version: release.resource_version,
         workers: Vec::new(),
         retained_until_unix_ms: 0,
+        kind: if release.spec.http.is_some() {
+            "http".to_owned()
+        } else {
+            "workers".to_owned()
+        },
+        profile: release
+            .spec
+            .http
+            .as_ref()
+            .map(|http| http.profile.as_str().to_owned())
+            .unwrap_or_default(),
+        instances: release.spec.http.as_ref().map_or(0, |http| http.instances),
+        command: release
+            .spec
+            .http
+            .as_ref()
+            .map(|http| http.command.clone())
+            .unwrap_or_default(),
     }
 }
 

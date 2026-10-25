@@ -37,6 +37,7 @@ internal-redirects
 error-pages
 auth-subrequests
 upstreams
+managed-servers
 compression
 timeouts
 connections

@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use muru_config::{FactoryPhase, Interface, Preload, ScalingMode};
+use muru_config::{FactoryPhase, Interface, Preload, ScalingMode, ServerBind, ServerProfile};
 use serde::{Deserialize, Serialize};
 
 /// The states of section 9.1.
@@ -221,6 +221,47 @@ pub struct ReleaseSpec {
     /// What maintenance mode lets through (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<muru_config::Maintenance>,
+    /// Section 9.9: the HTTP server the release runs instead of workers,
+    /// when it is a managed HTTP release; `source` is then the directory
+    /// its command runs in, and the worker settings are unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpServerSpec>,
+}
+
+/// Section 9.9: a release that runs an HTTP server of its own instead
+/// of Muru workers, started from a command and routed to as an upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpServerSpec {
+    /// The server, which fixes how it binds and how it is stopped.
+    pub profile: ServerProfile,
+    /// The command, with `{bind}` where the server takes its address.
+    pub command: Vec<String>,
+    /// How each instance binds.
+    pub bind: ServerBind,
+    /// How many instances run.
+    pub instances: u32,
+    /// The path probed until an instance answers 2xx or 3xx; any answer
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_path: Option<String>,
+    /// How long the instances get to be ready, in milliseconds.
+    pub readiness_timeout_ms: u64,
+    /// The signal that stops an instance gracefully, when the release
+    /// names one; the profile's otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+}
+
+impl HttpServerSpec {
+    /// The server and its instances as a phrase: `gunicorn, 2 instances`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, {} instance{}",
+            self.profile.as_str(),
+            self.instances,
+            if self.instances == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// One environment variable of a release (section 10.8).

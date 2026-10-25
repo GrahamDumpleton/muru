@@ -494,38 +494,7 @@ impl HostProcess {
                     .with_context(|| format!("opening {}", log.display()))?;
                 command.stdout(log.try_clone()?).stderr(log);
 
-                // Its own session, so the daemon's signals and terminal do
-                // not reach it, and the application's identity (section
-                // 10.9) when one is set.
-
-                let identity = spec.identity;
-
-                // SAFETY: setsid, setgroups, setgid, setuid and umask are
-                // async-signal-safe and the closure runs in the child
-                // between fork and exec, touching nothing else.
-
-                unsafe {
-                    command.pre_exec(move || {
-                        libc::setsid();
-
-                        if let Some(identity) = identity {
-                            let groups = [identity.gid as libc::gid_t];
-
-                            if libc::setgroups(1, groups.as_ptr()) != 0
-                                || libc::setgid(identity.gid as libc::gid_t) != 0
-                                || libc::setuid(identity.uid as libc::uid_t) != 0
-                            {
-                                return Err(std::io::Error::last_os_error());
-                            }
-
-                            if let Some(mask) = identity.umask {
-                                libc::umask(mask as libc::mode_t);
-                            }
-                        }
-
-                        Ok(())
-                    });
-                }
+                own_session(&mut command, spec.identity);
             }
             None => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -884,6 +853,38 @@ impl HostProcess {
             let _ = child.try_wait();
             std::mem::forget(child);
         }
+    }
+}
+
+/// Run a child in a session of its own, so the daemon's signals and
+/// terminal do not reach it, and as `identity` when one is set (section
+/// 10.9).
+pub(crate) fn own_session(command: &mut Command, identity: Option<Identity>) {
+    // SAFETY: setsid, setgroups, setgid, setuid and umask are
+    // async-signal-safe and the closure runs in the child between fork
+    // and exec, touching nothing else.
+
+    unsafe {
+        command.pre_exec(move || {
+            libc::setsid();
+
+            if let Some(identity) = identity {
+                let groups = [identity.gid as libc::gid_t];
+
+                if libc::setgroups(1, groups.as_ptr()) != 0
+                    || libc::setgid(identity.gid as libc::gid_t) != 0
+                    || libc::setuid(identity.uid as libc::uid_t) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+
+                if let Some(mask) = identity.umask {
+                    libc::umask(mask as libc::mode_t);
+                }
+            }
+
+            Ok(())
+        });
     }
 }
 

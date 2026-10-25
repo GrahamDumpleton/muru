@@ -23,5 +23,6 @@ pub mod rollouts;
 pub mod rotation;
 pub mod scaling;
 pub mod secrets;
+pub mod servers;
 pub mod sinks;
 pub mod store;

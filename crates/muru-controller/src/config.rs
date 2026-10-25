@@ -18,7 +18,9 @@ use muru_config::{
 };
 use muru_proto::admin::v1 as pb;
 
-use crate::model::{EnvSpec, GroupSpec, MountSpec, ReleaseSpec, ScalingSpec, valid_name};
+use crate::model::{
+    EnvSpec, GroupSpec, HttpServerSpec, MountSpec, ReleaseSpec, ScalingSpec, valid_name,
+};
 use crate::store::{Store, StoreError};
 
 /// What an apply does to one object.
@@ -340,7 +342,15 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             continue;
         }
 
-        let Some(source) = &table.source else {
+        if let Err(error) = muru_config::check_release_kind(table) {
+            plan.errors.push(format!("{name}@{id}: {error}"));
+            continue;
+        }
+
+        // Section 9.9: a managed HTTP release runs its command in cwd,
+        // which stands in for the source directory.
+
+        let Some(source) = table.cwd.as_ref().or(table.source.as_ref()) else {
             plan.errors
                 .push(format!("{name}@{id} has no source directory"));
             continue;
@@ -1207,6 +1217,18 @@ pub fn resolve_spec(
     let source = source
         .canonicalize()
         .map_err(|error| format!("{}: {error}", request.source))?;
+
+    // Section 9.9: the request's keys checked against its kind; a
+    // managed HTTP release has a command instead of an entrypoint and
+    // takes nothing from a [tool.muru] table.
+
+    let kind_table = kind_table_from(request)?;
+    muru_config::check_release_kind(&kind_table)?;
+
+    if kind_table.kind == Some(muru_config::ReleaseKind::Http) {
+        return resolve_http_spec(request, &kind_table, source, tables);
+    }
+
     let table = muru_config::load_project(&source)
         .map_err(|error| error.to_string())?
         .map(|(_, table)| table)
@@ -1481,40 +1503,7 @@ pub fn resolve_spec(
         return Err("memory.check_interval must be longer than nothing".to_owned());
     }
 
-    // Section 10.8: the environment, the table's entries with the
-    // request's over them, references kept as references.
-
-    let mut env_table: BTreeMap<String, EnvSpec> = BTreeMap::new();
-
-    for (name, value) in &table.env {
-        env_table.insert(name.clone(), env_spec_from_table(name, value)?);
-    }
-
-    for entry in &request.env {
-        if !crate::model::valid_env_name(&entry.name) {
-            return Err(format!("env: {:?} is not a variable name", entry.name));
-        }
-
-        if entry.secret_store.is_empty() != entry.secret_key.is_empty() {
-            return Err(format!(
-                "env {}: a secret needs both a store and a key",
-                entry.name
-            ));
-        }
-
-        env_table.insert(
-            entry.name.clone(),
-            EnvSpec {
-                name: entry.name.clone(),
-                value: entry.secret_store.is_empty().then(|| entry.value.clone()),
-                secret_store: (!entry.secret_store.is_empty()).then(|| entry.secret_store.clone()),
-                secret_key: (!entry.secret_key.is_empty()).then(|| entry.secret_key.clone()),
-                as_file: entry.as_file && !entry.secret_store.is_empty(),
-            },
-        );
-    }
-
-    let env: Vec<EnvSpec> = env_table.into_values().collect();
+    let env = resolve_env_specs(&table.env, &request.env)?;
 
     if request.max_requests == Some(0)
         || (request.max_requests.is_none() && table.max_requests == Some(0))
@@ -1528,44 +1517,13 @@ pub fn resolve_spec(
     let (scaling, processes) =
         resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
 
-    // Section 4.12: the release's error pages, override and maintenance
-    // exemptions, from the declared table else the source's own; a page
-    // file is checked to exist under the source.
-
-    let error_pages = tables
-        .error_pages
-        .cloned()
-        .unwrap_or_else(|| table.error_pages.clone());
-    muru_config::check_error_pages(&error_pages, true)?;
-
-    for (key, page) in &error_pages {
-        if let Some(file) = &page.file
-            && !source.join(file).is_file()
-        {
-            return Err(format!(
-                "error_pages: {key}: {} is not a file",
-                source.join(file).display()
-            ));
-        }
-    }
-
-    let error_override = tables
-        .error_override
-        .cloned()
-        .or_else(|| table.error_override.clone());
-
-    if let Some(override_) = &error_override {
-        muru_config::check_error_override(override_)?;
-    }
-
-    let maintenance = tables
-        .maintenance
-        .cloned()
-        .or_else(|| table.maintenance.clone());
-
-    if let Some(maintenance) = &maintenance {
-        muru_config::check_maintenance(maintenance)?;
-    }
+    let (error_pages, error_override, maintenance) = resolve_error_tables(
+        tables,
+        &table.error_pages,
+        table.error_override.as_ref(),
+        table.maintenance.as_ref(),
+        &source,
+    )?;
 
     Ok(ReleaseSpec {
         source,
@@ -1608,6 +1566,253 @@ pub fn resolve_spec(
         error_pages,
         error_override,
         maintenance,
+        http: None,
+    })
+}
+
+/// Section 10.8: the environment, the table's entries with the
+/// request's over them, references kept as references.
+fn resolve_env_specs(
+    table: &BTreeMap<String, muru_config::EnvValue>,
+    request: &[pb::EnvEntry],
+) -> Result<Vec<EnvSpec>, String> {
+    let mut env_table: BTreeMap<String, EnvSpec> = BTreeMap::new();
+
+    for (name, value) in table {
+        env_table.insert(name.clone(), env_spec_from_table(name, value)?);
+    }
+
+    for entry in request {
+        if !crate::model::valid_env_name(&entry.name) {
+            return Err(format!("env: {:?} is not a variable name", entry.name));
+        }
+
+        if entry.secret_store.is_empty() != entry.secret_key.is_empty() {
+            return Err(format!(
+                "env {}: a secret needs both a store and a key",
+                entry.name
+            ));
+        }
+
+        env_table.insert(
+            entry.name.clone(),
+            EnvSpec {
+                name: entry.name.clone(),
+                value: entry.secret_store.is_empty().then(|| entry.value.clone()),
+                secret_store: (!entry.secret_store.is_empty()).then(|| entry.secret_store.clone()),
+                secret_key: (!entry.secret_key.is_empty()).then(|| entry.secret_key.clone()),
+                as_file: entry.as_file && !entry.secret_store.is_empty(),
+            },
+        );
+    }
+
+    Ok(env_table.into_values().collect())
+}
+
+/// Section 4.12: the release's error pages, override and maintenance
+/// exemptions, from the declared tables else the fallbacks (the
+/// source's own [tool.muru] table); a page file is checked to exist
+/// under the source.
+type ErrorTables = (
+    BTreeMap<String, muru_config::ErrorPage>,
+    Option<muru_config::ErrorOverride>,
+    Option<muru_config::Maintenance>,
+);
+
+fn resolve_error_tables(
+    tables: &Tables<'_>,
+    fallback_pages: &BTreeMap<String, muru_config::ErrorPage>,
+    fallback_override: Option<&muru_config::ErrorOverride>,
+    fallback_maintenance: Option<&muru_config::Maintenance>,
+    source: &Path,
+) -> Result<ErrorTables, String> {
+    let error_pages = tables
+        .error_pages
+        .cloned()
+        .unwrap_or_else(|| fallback_pages.clone());
+    muru_config::check_error_pages(&error_pages, true)?;
+
+    for (key, page) in &error_pages {
+        if let Some(file) = &page.file
+            && !source.join(file).is_file()
+        {
+            return Err(format!(
+                "error_pages: {key}: {} is not a file",
+                source.join(file).display()
+            ));
+        }
+    }
+
+    let error_override = tables
+        .error_override
+        .cloned()
+        .or_else(|| fallback_override.cloned());
+
+    if let Some(override_) = &error_override {
+        muru_config::check_error_override(override_)?;
+    }
+
+    let maintenance = tables
+        .maintenance
+        .cloned()
+        .or_else(|| fallback_maintenance.cloned());
+
+    if let Some(maintenance) = &maintenance {
+        muru_config::check_maintenance(maintenance)?;
+    }
+
+    Ok((error_pages, error_override, maintenance))
+}
+
+/// A deploy request's keys as the release table they amount to, for the
+/// kind check of section 9.9: which keys are set is what matters.
+fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, String> {
+    let readiness = (!request.readiness_path.is_empty() || request.readiness_timeout_ms.is_some())
+        .then(|| muru_config::Readiness {
+            path: (!request.readiness_path.is_empty()).then(|| request.readiness_path.clone()),
+            timeout: request.readiness_timeout_ms.map(format_ms),
+        });
+    let timeouts_given = request.soft_timeout_ms.is_some()
+        || request.hard_timeout_ms.is_some()
+        || request.hard_drain_grace_ms.is_some()
+        || request.shutdown_timeout_ms.is_some();
+    let memory_given = !request.memory_measure.is_empty()
+        || request.memory_soft_limit.is_some()
+        || request.memory_soft_for_ms.is_some()
+        || request.memory_reclaim_first.is_some()
+        || request.memory_hard_limit.is_some()
+        || request.memory_check_interval_ms.is_some();
+
+    Ok(muru_config::Release {
+        kind: parse_optional(&request.kind)?,
+        profile: parse_optional(&request.profile)?,
+        command: request.command.clone(),
+        cwd: None,
+        bind: parse_optional(&request.bind)?,
+        instances: request.instances,
+        readiness,
+        stop_signal: (!request.stop_signal.is_empty()).then(|| request.stop_signal.clone()),
+        source: Some(request.source.clone()),
+        entrypoint: request.entrypoint.clone(),
+        interface: parse_optional(&request.interface)?,
+        factory: request.factory,
+        factory_phase: parse_optional(&request.factory_phase)?,
+        python: (!request.python.is_empty()).then(|| request.python.clone()),
+        processes: request.processes.map(|value| value as usize),
+        threads: request.threads.map(|value| value as usize),
+        sync_threads: request.sync_threads.map(|value| value as usize),
+        concurrency: request.concurrency.map(|value| value as usize),
+        scaling: None,
+        preload: parse_optional(&request.preload)?,
+        hooks: (!request.hooks.is_empty()).then(|| request.hooks.clone()),
+        groups: BTreeMap::new(),
+        mounts: BTreeMap::new(),
+        logging: None,
+        max_requests: request.max_requests,
+        max_lifetime: request.max_lifetime_ms.map(format_ms),
+        timeouts: timeouts_given.then(|| muru_config::Timeouts {
+            soft_timeout: request.soft_timeout_ms.map(format_ms),
+            hard_timeout: request.hard_timeout_ms.map(format_ms),
+            hard_drain_grace: request.hard_drain_grace_ms.map(format_ms),
+            shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
+        }),
+        memory: memory_given.then(muru_config::Memory::default),
+        env: BTreeMap::new(),
+        accel_redirect: request.accel_redirect,
+        cgi_local_redirect: request.cgi_local_redirect,
+        error_pages: BTreeMap::new(),
+        error_override: None,
+        maintenance: None,
+    })
+}
+
+/// A setting as a request writes it: none when empty, else parsed.
+fn parse_optional<T: std::str::FromStr<Err = muru_config::ParseError>>(
+    text: &str,
+) -> Result<Option<T>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    text.parse()
+        .map(Some)
+        .map_err(|error: muru_config::ParseError| error.to_string())
+}
+
+/// Milliseconds as a duration a table writes.
+fn format_ms(ms: u64) -> String {
+    muru_config::format_duration(Duration::from_millis(ms))
+}
+
+/// Section 9.9: a managed HTTP release's spec from a request already
+/// checked against its kind: the command, the server, how it binds and
+/// is probed, the environment and the error tables, with the worker
+/// settings left at their defaults, unused.
+fn resolve_http_spec(
+    request: &pb::DeployRequest,
+    table: &muru_config::Release,
+    source: PathBuf,
+    tables: &Tables<'_>,
+) -> Result<ReleaseSpec, String> {
+    let readiness_timeout_ms = request
+        .readiness_timeout_ms
+        .unwrap_or(crate::servers::READINESS_TIMEOUT.as_millis() as u64);
+
+    if readiness_timeout_ms == 0 {
+        return Err("readiness.timeout must be longer than nothing".to_owned());
+    }
+
+    let shutdown_timeout_ms = request
+        .shutdown_timeout_ms
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms);
+
+    if shutdown_timeout_ms == 0 {
+        return Err("shutdown_timeout must be longer than nothing".to_owned());
+    }
+
+    let env = resolve_env_specs(&BTreeMap::new(), &request.env)?;
+    let (error_pages, error_override, maintenance) =
+        resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
+
+    Ok(ReleaseSpec {
+        source,
+        entrypoint: String::new(),
+        interface: muru_config::Interface::Auto,
+        python: PathBuf::new(),
+        processes: 0,
+        threads: 0,
+        sync_threads: 0,
+        concurrency: 0,
+        preload: muru_config::Preload::Auto,
+        hooks: None,
+        factory: None,
+        groups: Vec::new(),
+        mounts: Vec::new(),
+        accel_redirect: false,
+        cgi_local_redirect: false,
+        logging: muru_config::PythonLogging::default(),
+        max_requests: None,
+        max_lifetime_ms: None,
+        timeouts: crate::model::WorkerTimeouts {
+            shutdown_timeout_ms,
+            ..crate::model::WorkerTimeouts::default()
+        },
+        memory: crate::model::MemoryPolicy::default(),
+        env,
+        scaling: ScalingSpec::default(),
+        error_pages,
+        error_override,
+        maintenance,
+        http: Some(HttpServerSpec {
+            profile: table.profile.unwrap_or(muru_config::ServerProfile::Generic),
+            command: request.command.clone(),
+            bind: table.bind.unwrap_or(muru_config::ServerBind::Unix),
+            instances: request.instances.unwrap_or(1).max(1),
+            readiness_path: (!request.readiness_path.is_empty())
+                .then(|| request.readiness_path.clone()),
+            readiness_timeout_ms,
+            stop_signal: table.stop_signal.clone(),
+        }),
     })
 }
 
@@ -1865,6 +2070,32 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
     pb::DeployRequest {
         app: app.to_owned(),
         source: source.to_owned(),
+        kind: table
+            .kind
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default(),
+        profile: table
+            .profile
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default(),
+        command: table.command.clone(),
+        bind: table
+            .bind
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default(),
+        instances: table.instances,
+        readiness_path: table
+            .readiness
+            .as_ref()
+            .and_then(|readiness| readiness.path.clone())
+            .unwrap_or_default(),
+        readiness_timeout_ms: duration_field(
+            table
+                .readiness
+                .as_ref()
+                .and_then(|readiness| readiness.timeout.as_ref()),
+        ),
+        stop_signal: table.stop_signal.clone().unwrap_or_default(),
         entrypoint: table.entrypoint.clone(),
         interface: table
             .interface
@@ -1972,7 +2203,43 @@ fn duration_field(text: Option<&String>) -> Option<u64> {
 /// A recorded spec as the table that declares it, every key written so
 /// the file means the same thing without the source's [tool.muru].
 fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
+    // Section 9.9: a managed HTTP release writes its server keys and
+    // the few settings that apply to it.
+
+    if let Some(http) = &spec.http {
+        return ReleaseTable {
+            kind: Some(muru_config::ReleaseKind::Http),
+            profile: Some(http.profile),
+            command: http.command.clone(),
+            cwd: Some(spec.source.display().to_string()),
+            bind: Some(http.bind),
+            instances: Some(http.instances),
+            readiness: Some(muru_config::Readiness {
+                path: http.readiness_path.clone(),
+                timeout: Some(format_ms(http.readiness_timeout_ms)),
+            }),
+            stop_signal: http.stop_signal.clone(),
+            timeouts: Some(muru_config::Timeouts {
+                shutdown_timeout: Some(format_ms(spec.timeouts.shutdown_timeout_ms)),
+                ..muru_config::Timeouts::default()
+            }),
+            env: env_table_from(&spec.env),
+            error_pages: spec.error_pages.clone(),
+            error_override: spec.error_override.clone(),
+            maintenance: spec.maintenance.clone(),
+            ..ReleaseTable::default()
+        };
+    }
+
     ReleaseTable {
+        kind: None,
+        profile: None,
+        command: Vec::new(),
+        cwd: None,
+        bind: None,
+        instances: None,
+        readiness: None,
+        stop_signal: None,
         source: Some(spec.source.display().to_string()),
         entrypoint: spec.entrypoint.clone(),
         interface: Some(spec.interface),
@@ -2050,26 +2317,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
             }
         }),
-        env: spec
-            .env
-            .iter()
-            .map(|entry| {
-                let value = match (&entry.secret_store, &entry.secret_key) {
-                    (Some(store), Some(key)) => {
-                        muru_config::EnvValue::Secret(muru_config::SecretValue {
-                            secret: muru_config::SecretRef {
-                                store: store.clone(),
-                                key: key.clone(),
-                            },
-                            deliver: entry.as_file.then(|| "file".to_owned()),
-                        })
-                    }
-                    _ => muru_config::EnvValue::Plain(entry.value.clone().unwrap_or_default()),
-                };
-
-                (entry.name.clone(), value)
-            })
-            .collect(),
+        env: env_table_from(&spec.env),
         memory: (spec.memory != crate::model::MemoryPolicy::default()).then(|| {
             muru_config::Memory {
                 measure: Some(spec.memory.measure),
@@ -2092,6 +2340,28 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
     }
 }
 
+/// The environment as the table that declares it, secrets as references.
+fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
+    env.iter()
+        .map(|entry| {
+            let value = match (&entry.secret_store, &entry.secret_key) {
+                (Some(store), Some(key)) => {
+                    muru_config::EnvValue::Secret(muru_config::SecretValue {
+                        secret: muru_config::SecretRef {
+                            store: store.clone(),
+                            key: key.clone(),
+                        },
+                        deliver: entry.as_file.then(|| "file".to_owned()),
+                    })
+                }
+                _ => muru_config::EnvValue::Plain(entry.value.clone().unwrap_or_default()),
+            };
+
+            (entry.name.clone(), value)
+        })
+        .collect()
+}
+
 /// Section 7.6: a soft timeout is a duration, and the hard timeout, the
 /// backstop for a request the soft timeout could not interrupt, must
 /// exceed it by at least 5 s.
@@ -2109,9 +2379,35 @@ pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<
     Ok(())
 }
 
+/// Section 9.9: a managed HTTP release's server settings as one phrase,
+/// or `workers` for a release with none.
+fn describe_http(http: Option<&HttpServerSpec>) -> String {
+    let Some(http) = http else {
+        return "workers".to_owned();
+    };
+
+    format!(
+        "{} {:?} bind {} instances {} readiness {}/{}{}",
+        http.profile.as_str(),
+        http.command,
+        http.bind.as_str(),
+        http.instances,
+        http.readiness_path.as_deref().unwrap_or("any"),
+        format_ms(http.readiness_timeout_ms),
+        http.stop_signal
+            .as_ref()
+            .map(|signal| format!(" stop {signal}"))
+            .unwrap_or_default()
+    )
+}
+
 /// What a release runs, for the report: entrypoint, processes by threads
 /// and the source.
 fn describe(spec: &ReleaseSpec) -> String {
+    if let Some(http) = &spec.http {
+        return format!("{} in {}", http.describe(), spec.source.display());
+    }
+
     format!(
         "{} {}x{} from {}{}",
         spec.entrypoint,
@@ -2139,6 +2435,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "source",
         declared.source.display().to_string(),
         recorded.source.display().to_string(),
+    );
+    compare(
+        "server",
+        describe_http(declared.http.as_ref()),
+        describe_http(recorded.http.as_ref()),
     );
     compare(
         "entrypoint",

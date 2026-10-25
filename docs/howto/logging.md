@@ -207,3 +207,9 @@ on to its workers for the hook), and a background daemon its own log.
 Lines written between the rename and the reopen land in the renamed file,
 and none are lost. In development mode only the access log can go to a
 file, and SIGUSR1 to a worker runs the hook.
+
+The instances of a [managed HTTP server](managed-servers.md) write to
+their release's file themselves and cannot be told to reopen it, so the
+built-in rotation copies that file to its archive and truncates it in
+place, and lines written while it is copied are lost. With
+`rotate = 'external'`, give those files logrotate's `copytruncate`.

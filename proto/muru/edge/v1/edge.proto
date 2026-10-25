@@ -40,6 +40,8 @@ message Snapshot {
   repeated ErrorPage error_pages = 8;   // section 4.12: the node-wide pages
   ErrorOverride error_override = 9;     // the node-wide override; off when absent
   repeated Upstream upstreams = 10;     // section 4.13: the HTTP upstreams routes may name
+  string default_app = 11;              // the application the default workers belong to; found by sockets when empty
+  string default_release = 12;          // and its release
 }
 
 // Section 4.13: an unmanaged HTTP server that routes, fallbacks, traffic
@@ -198,6 +200,7 @@ message AppWorkers {
   repeated ErrorPage error_pages = 9;   // section 4.12: the release's pages, the application level
   ErrorOverride error_override = 10;
   Maintenance maintenance = 11;         // maintenance mode and its exemptions; off when absent
+  Upstream server = 12;                 // section 9.9: a managed HTTP release's instances, routed as an upstream; no sockets then
 }
 
 message Mount {

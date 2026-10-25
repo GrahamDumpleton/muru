@@ -361,5 +361,22 @@ period and a `health` table probes a path; `muru_upstream_health`
 reports each address, `trust_muru_headers` lets an upstream redirect
 internally, WebSockets are relayed to `http1` upstreams, and `muructl
 upstream list`, `route list`, `apply` and `config export` know the
-tables. Still to come: managed HTTP server releases (section 9.9) and
-`X-Muru-Sendfile` from an upstream.
+tables. Still to come: `X-Muru-Sendfile` from an upstream.
+
+Managed HTTP server releases (section 9.9) are in: a release with
+`kind = 'http'` runs a `command` such as the gunicorn, uvicorn, Granian
+or mod_wsgi-express an existing deployment already uses (or any server,
+with the `generic` profile and a `stop_signal`), in `cwd`, as one or
+more instances each bound to a Unix socket or a loopback port the daemon
+allocates and substitutes for `{bind}` or passes through the profile's
+own flags; the daemon waits for a readiness probe, starts an instance
+again when it exits with a doubling backoff, stops the instances with
+the profile's signal and SIGKILL after the grace period, and re-adopts
+them after a detach or an upgrade; the edge routes to the release as an
+upstream named after it, so traffic policies, canaries, previews, sticky
+sessions, drains, warm retention and rollbacks work between it and native
+releases of the same application, which is the cutover the phase's exit
+criterion asks for; `muructl deploy --server`, the release tables of
+`apply` and `config export`, `release list`, the release log and
+`muru_upstream_health` know them. Still to come: instance autoscaling
+and socket activation (section 20.1).
