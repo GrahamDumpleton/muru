@@ -522,6 +522,34 @@ pub struct Limits {
     /// Time a worker may pause mid-response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_idle_timeout: Option<String>,
+    /// Open connections per listener (section 4.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
+    /// Open connections per client address; 0 disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_client: Option<usize>,
+    /// Idle time before a keep-alive connection is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_timeout: Option<String>,
+    /// The same for connections from trusted proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_timeout_proxy: Option<String>,
+    /// Requests served on one connection before it is closed; 0 for no
+    /// limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_connection: Option<u64>,
+    /// HTTP/2 settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http2: Option<Http2Limits>,
+}
+
+/// The `[limits.http2]` table (section 4.18).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http2Limits {
+    /// Concurrent streams per connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_streams: Option<u32>,
 }
 
 /// The `[compression]` table (section 4.17): how the edge compresses

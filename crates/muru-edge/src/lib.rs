@@ -31,6 +31,7 @@ use tokio_rustls::TlsAcceptor;
 
 pub mod access;
 pub mod compression;
+pub mod connections;
 pub mod errors;
 pub mod link;
 pub mod metrics;
@@ -112,6 +113,24 @@ pub struct Limits {
     pub websocket_ping_interval: Duration,
     /// How long a WebSocket may stay silent before it is closed with 1001.
     pub websocket_idle_timeout: Duration,
+    /// Open connections per listener (section 4.18), else 503
+    /// edge_overloaded within the reserve and closed beyond it.
+    pub max_connections: usize,
+    /// Open connections per client address (IPv6 by /64), else closed; 0
+    /// disables it. Trusted proxies are exempt.
+    pub max_connections_per_client: usize,
+    /// How long an idle HTTP/1.1 connection waits for its next request
+    /// before it is closed; it also bounds reading a request head on
+    /// that connection.
+    pub keep_alive_timeout: Duration,
+    /// The same, for connections from trusted proxies, which sit behind
+    /// longer load balancer idle timeouts.
+    pub keep_alive_timeout_proxy: Duration,
+    /// Requests served on one HTTP/1.1 connection before it is closed; 0
+    /// leaves it open.
+    pub max_requests_per_connection: u64,
+    /// Concurrent streams per HTTP/2 connection.
+    pub http2_max_concurrent_streams: u32,
 }
 
 impl Default for Limits {
@@ -125,15 +144,18 @@ impl Default for Limits {
             request_deadline: Duration::from_secs(300),
             body_idle_timeout: Duration::from_secs(60),
             response_idle_timeout: Duration::from_secs(60),
+            max_connections: 65_536,
+            max_connections_per_client: 256,
+            keep_alive_timeout: Duration::from_secs(20),
+            keep_alive_timeout_proxy: Duration::from_secs(75),
+            max_requests_per_connection: 0,
+            http2_max_concurrent_streams: 128,
             websocket_max_message_size: 1024 * 1024,
             websocket_ping_interval: Duration::from_secs(30),
             websocket_idle_timeout: Duration::from_secs(300),
         }
     }
 }
-
-/// Concurrent streams accepted per HTTP/2 connection (section 4.18).
-const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
 
 /// The routing tables requests go through, replaceable while the edge
 /// runs: a reload or a snapshot swaps them (sections 4.4 and 9.8). Each
@@ -199,6 +221,9 @@ struct Shared {
     /// Cloned for each connection accepted and dropped when it ends, so
     /// a drain can wait for the count to come back to one.
     connections: Arc<()>,
+    /// Each listener's connection counts and limits (section 4.18), in
+    /// listener order.
+    admission: Vec<Arc<connections::Connections>>,
 }
 
 /// Stops an edge accepting and lets its connections finish (section
@@ -335,6 +360,16 @@ impl Edge {
             .iter()
             .find(|(_, _, acceptor)| acceptor.is_some())
             .map(|(_, address, _)| address.port());
+        let admission = bound
+            .iter()
+            .map(|(_, address, _)| {
+                Arc::new(connections::Connections::new(
+                    address.to_string(),
+                    config.limits.max_connections,
+                    config.limits.max_connections_per_client,
+                ))
+            })
+            .collect();
 
         // Each connection is served as HTTP/1.1 or, when it opens with the
         // HTTP/2 preface, as HTTP/2.
@@ -351,7 +386,7 @@ impl Edge {
         protocols
             .http2()
             .timer(TokioTimer::new())
-            .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
+            .max_concurrent_streams(limits.http2_max_concurrent_streams)
             .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX))
             // RFC 8441: WebSockets over HTTP/2 arrive as extended CONNECT.
             .enable_connect_protocol();
@@ -369,8 +404,14 @@ impl Edge {
                 https_port,
                 draining: tokio::sync::watch::channel(false).0,
                 connections: Arc::new(()),
+                admission,
             }),
         })
+    }
+
+    /// Every listener's connection samples (section 4.18), for metrics.
+    pub fn connection_samples(&self) -> Vec<metrics::Sample> {
+        self.shared.connection_samples()
     }
 
     /// A handle that stops this edge accepting and drains its connections.
@@ -380,6 +421,38 @@ impl Edge {
         }
     }
 
+    /// A handle that reports every listener's connection counts.
+    pub fn connections(&self) -> ConnectionCounts {
+        ConnectionCounts {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// Reports the connection counts of an edge's listeners, for the edge
+/// process's metrics once the edge itself has been consumed by `run`.
+#[derive(Clone)]
+pub struct ConnectionCounts {
+    shared: Arc<Shared>,
+}
+
+impl ConnectionCounts {
+    /// Every listener's connection samples (section 4.18).
+    pub fn samples(&self) -> Vec<metrics::Sample> {
+        self.shared.connection_samples()
+    }
+}
+
+impl Shared {
+    fn connection_samples(&self) -> Vec<metrics::Sample> {
+        self.admission
+            .iter()
+            .flat_map(|connections| connections.samples())
+            .collect()
+    }
+}
+
+impl Edge {
     /// The address the first listener is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local
@@ -414,12 +487,13 @@ impl Edge {
     /// Accept connections on every listener until one fails or the edge
     /// is drained.
     pub async fn run(self) -> anyhow::Result<()> {
-        let accepting = self
-            .listeners
-            .into_iter()
-            .map(|(listener, address, acceptor)| {
-                accept(listener, address, acceptor, Arc::clone(&self.shared))
-            });
+        let accepting =
+            self.listeners
+                .into_iter()
+                .enumerate()
+                .map(|(index, (listener, address, acceptor))| {
+                    accept(listener, address, acceptor, Arc::clone(&self.shared), index)
+                });
 
         futures::future::try_join_all(accepting).await.map(|_| ())
     }
@@ -434,8 +508,10 @@ async fn accept(
     local: SocketAddr,
     acceptor: Option<TlsAcceptor>,
     shared: Arc<Shared>,
+    index: usize,
 ) -> anyhow::Result<()> {
     let mut draining = shared.draining.subscribe();
+    let admission = Arc::clone(&shared.admission[index]);
 
     loop {
         if *draining.borrow() {
@@ -449,6 +525,57 @@ async fn accept(
         let _ = stream.set_nodelay(true);
         let shared = Arc::clone(&shared);
 
+        // Section 4.18: a client over its share is closed at once; a full
+        // listener answers 503 while the reserve lasts and closes beyond
+        // it, pausing a moment before the next accept.
+
+        let trusted = shared.pools.current().trust().trusts(&peer);
+
+        let guard = match admission.admit(peer.ip(), trusted) {
+            connections::Admission::Accept(guard) => guard,
+            connections::Admission::ClientLimit => {
+                tracing::debug!(%peer, "connection closed: the client holds its share");
+                drop(stream);
+                continue;
+            }
+            connections::Admission::Overloaded => {
+                let admission = Arc::clone(&admission);
+                let plain = acceptor.is_none();
+                admission.overload_started();
+                tokio::spawn(async move {
+                    let mut stream = stream;
+
+                    // The answer is written and the write side closed, then
+                    // whatever the client sent is read until it closes too,
+                    // so the client sees the answer rather than a reset.
+
+                    if plain {
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                            stream.write_all(connections::OVERLOADED).await?;
+                            stream.shutdown().await?;
+                            let mut sink = [0u8; 4096];
+
+                            while stream.read(&mut sink).await? > 0 {}
+
+                            Ok::<(), std::io::Error>(())
+                        })
+                        .await;
+                    }
+
+                    drop(stream);
+                    admission.overload_finished();
+                });
+                continue;
+            }
+            connections::Admission::Paused => {
+                drop(stream);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
         // Counted here, before the task starts, so a drain that begins
         // between the two still waits for this connection.
 
@@ -456,7 +583,9 @@ async fn accept(
 
         match acceptor.clone() {
             None => {
-                tokio::spawn(serve(stream, peer, local, None, shared, token));
+                tokio::spawn(serve(
+                    stream, peer, local, None, shared, token, guard, trusted,
+                ));
             }
             Some(acceptor) => {
                 tokio::spawn(async move {
@@ -472,7 +601,17 @@ async fn accept(
                     match handshake {
                         Ok(Ok(stream)) => {
                             let info = tls::info(stream.get_ref().1);
-                            serve(stream, peer, local, Some(info), shared, token).await;
+                            serve(
+                                stream,
+                                peer,
+                                local,
+                                Some(info),
+                                shared,
+                                token,
+                                guard,
+                                trusted,
+                            )
+                            .await;
                         }
                         Ok(Err(error)) => {
                             tracing::debug!(%peer, %error, "TLS handshake failed");
@@ -487,6 +626,7 @@ async fn accept(
 
 /// Serve one connection, cleartext or already inside TLS. The token is
 /// the connection's count towards a drain, held until it ends.
+#[allow(clippy::too_many_arguments)] // one call site per listener kind, each argument a distinct fact
 async fn serve<I>(
     io: I,
     peer: SocketAddr,
@@ -494,6 +634,8 @@ async fn serve<I>(
     tls: Option<pb::TlsInfo>,
     shared: Arc<Shared>,
     token: Arc<()>,
+    guard: connections::Guard,
+    trusted: bool,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -502,11 +644,27 @@ async fn serve<I>(
     let redirect_to = shared.redirect_to.filter(|_| tls.is_none());
     let state = Arc::clone(&shared);
     let listener = local.to_string();
+
+    // Section 4.18: an idle keep-alive connection waits this long for its
+    // next request; a trusted proxy gets the longer wait. The same timer
+    // bounds reading a request head on the connection.
+
+    let keep_alive = if trusted {
+        shared.limits.keep_alive_timeout_proxy
+    } else {
+        shared
+            .limits
+            .keep_alive_timeout
+            .min(shared.limits.header_read_timeout)
+    };
+    let max_requests = shared.limits.max_requests_per_connection;
+    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let service = service_fn(move |mut request: http::Request<Incoming>| {
         let shared = Arc::clone(&shared);
         let tls = tls.clone();
         let listener = listener.clone();
         let request_id = shared.request_ids.next();
+        let served = Arc::clone(&served);
         async move {
             // Section 4.7: forwarding headers from a trusted proxy say who
             // the client is and how it connected; from anyone else they
@@ -693,6 +851,17 @@ async fn serve<I>(
                 response,
             );
 
+            // Section 4.18: the connection closes after its share of
+            // requests.
+
+            let count = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+            if max_requests > 0 && count >= max_requests {
+                response
+                    .headers_mut()
+                    .insert(CONNECTION, HeaderValue::from_static("close"));
+            }
+
             // Section 4.19: every response names its request.
 
             if let Ok(value) = HeaderValue::from_str(&request_id) {
@@ -710,9 +879,9 @@ async fn serve<I>(
     // response in flight is done, or at once when idle, and HTTP/2 sends
     // GOAWAY and lets its streams complete.
 
-    let connection = state
-        .protocols
-        .serve_connection_with_upgrades(TokioIo::new(io), service);
+    let mut protocols = state.protocols.clone();
+    protocols.http1().header_read_timeout(keep_alive);
+    let connection = protocols.serve_connection_with_upgrades(TokioIo::new(io), service);
     let mut connection = std::pin::pin!(connection);
     let mut draining = state.draining.subscribe();
 
@@ -734,6 +903,7 @@ async fn serve<I>(
     }
 
     drop(token);
+    drop(guard);
 }
 
 /// Headers that describe this connection rather than the request, which

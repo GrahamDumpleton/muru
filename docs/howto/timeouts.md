@@ -23,6 +23,8 @@ muructl run app:application --timeout deadline=30s --timeout queue=2s
 | `deadline` | 300s | from arrival to the response head | 504 `deadline`; the worker is told to abandon the request |
 | `body_idle` | 60s | between two chunks of a streamed request body | 408 `client_timeout` if no response has started |
 | `response_idle` | 60s | between two chunks of a streamed response | the response is cut off and the connection closed |
+| `keep_alive` | 20s | an idle keep-alive connection waiting for its next request | the connection is closed (see the [connections guide](connections.md)) |
+| `keep_alive_proxy` | 75s | the same, for a trusted proxy's connection | the connection is closed |
 
 `queue` is the one to tune when the application is overloaded: a short
 queue timeout turns a backlog into fast 503s with a `Retry-After`, which

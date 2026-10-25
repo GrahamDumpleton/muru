@@ -31,6 +31,7 @@ https
 static-files
 compression
 timeouts
+connections
 recycling
 memory
 logging

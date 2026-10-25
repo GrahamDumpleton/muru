@@ -362,12 +362,28 @@ struct RunArgs {
     max_body_size: Option<u64>,
 
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
-    /// header_read (30s), body_idle (60s) or response_idle (60s) at the
-    /// edge; hard (off), hard_drain_grace (10s) or shutdown (5s) in the
-    /// host, which replaces a worker whose request runs past the hard
-    /// timeout. Repeatable.
+    /// header_read (30s), body_idle (60s), response_idle (60s),
+    /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; hard
+    /// (off), hard_drain_grace (10s) or shutdown (5s) in the host, which
+    /// replaces a worker whose request runs past the hard timeout.
+    /// Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
+
+    /// Open connections the listener holds at once (default 65536);
+    /// beyond it clients get a fast 503 (section 4.18).
+    #[arg(long, value_name = "N")]
+    max_connections: Option<usize>,
+
+    /// Open connections one client address may hold (default 256; 0 for
+    /// no limit).
+    #[arg(long, value_name = "N")]
+    max_connections_per_client: Option<usize>,
+
+    /// Requests served on one connection before it is closed (default 0,
+    /// no limit).
+    #[arg(long, value_name = "N")]
+    max_requests_per_connection: Option<u64>,
 
     /// Replace a worker after this many requests, with jitter.
     #[arg(long, value_name = "N")]
@@ -736,6 +752,8 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "header_read",
         "body_idle",
         "response_idle",
+        "keep_alive",
+        "keep_alive_proxy",
         "hard",
         "hard_drain_grace",
         "shutdown",
@@ -744,10 +762,26 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
-             response_idle, hard, hard_drain_grace or shutdown"
+             response_idle, keep_alive, keep_alive_proxy, hard, hard_drain_grace or shutdown"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
+}
+
+/// Apply the edge's timeouts from --timeout settings to the limits.
+pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String, Duration)]) {
+    for (name, duration) in timeouts {
+        match name.as_str() {
+            "queue" => limits.queue_timeout = *duration,
+            "deadline" => limits.request_deadline = *duration,
+            "header_read" => limits.header_read_timeout = *duration,
+            "body_idle" => limits.body_idle_timeout = *duration,
+            "response_idle" => limits.response_idle_timeout = *duration,
+            "keep_alive" => limits.keep_alive_timeout = *duration,
+            "keep_alive_proxy" => limits.keep_alive_timeout_proxy = *duration,
+            _ => {}
+        }
+    }
 }
 
 /// Parse KEY=VALUE for --memory, checking the key and the value's form.
@@ -905,20 +939,16 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
         } else {
             DEVELOPMENT_MAX_BODY_SIZE
         }),
+        max_connections: args.max_connections.unwrap_or(defaults.max_connections),
+        max_connections_per_client: args
+            .max_connections_per_client
+            .unwrap_or(defaults.max_connections_per_client),
+        max_requests_per_connection: args
+            .max_requests_per_connection
+            .unwrap_or(defaults.max_requests_per_connection),
         ..defaults
     };
-
-    for (name, duration) in &args.timeouts {
-        match name.as_str() {
-            "queue" => limits.queue_timeout = *duration,
-            "deadline" => limits.request_deadline = *duration,
-            "header_read" => limits.header_read_timeout = *duration,
-            "body_idle" => limits.body_idle_timeout = *duration,
-            "response_idle" => limits.response_idle_timeout = *duration,
-            _ => {}
-        }
-    }
-
+    apply_timeouts(&mut limits, &args.timeouts);
     limits
 }
 
@@ -1185,6 +1215,16 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             request_deadline: Some(muru_config::format_duration(limits.request_deadline)),
             body_idle_timeout: Some(muru_config::format_duration(limits.body_idle_timeout)),
             response_idle_timeout: Some(muru_config::format_duration(limits.response_idle_timeout)),
+            max_connections: Some(limits.max_connections),
+            max_connections_per_client: Some(limits.max_connections_per_client),
+            keep_alive_timeout: Some(muru_config::format_duration(limits.keep_alive_timeout)),
+            keep_alive_timeout_proxy: Some(muru_config::format_duration(
+                limits.keep_alive_timeout_proxy,
+            )),
+            max_requests_per_connection: Some(limits.max_requests_per_connection),
+            http2: Some(muru_config::Http2Limits {
+                max_concurrent_streams: Some(limits.http2_max_concurrent_streams),
+            }),
         }),
         app: std::collections::BTreeMap::from([(
             name,
@@ -1548,6 +1588,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 started: std::time::Instant::now(),
                 release: Arc::clone(&release_number),
                 pools: edge.pools(),
+                connections: edge.connections(),
                 access_log: edge.access_log(),
                 logs: logs.clone(),
             },

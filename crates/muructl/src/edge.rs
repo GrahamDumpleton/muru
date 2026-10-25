@@ -52,10 +52,27 @@ pub struct EdgeRunArgs {
     #[arg(long, value_name = "N")]
     max_headers: Option<usize>,
 
-    /// A timeout as NAME=DURATION: queue, deadline, header_read, body_idle
-    /// or response_idle.
+    /// A timeout as NAME=DURATION: queue, deadline, header_read, body_idle,
+    /// response_idle, keep_alive or keep_alive_proxy.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = crate::parse_timeout)]
     timeouts: Vec<(String, Duration)>,
+
+    /// Open connections per listener (section 4.18).
+    #[arg(long, value_name = "N")]
+    max_connections: Option<usize>,
+
+    /// Open connections per client address; 0 disables it.
+    #[arg(long, value_name = "N")]
+    max_connections_per_client: Option<usize>,
+
+    /// Requests served on one connection before it is closed; 0 for no
+    /// limit.
+    #[arg(long, value_name = "N")]
+    max_requests_per_connection: Option<u64>,
+
+    /// Concurrent streams per HTTP/2 connection.
+    #[arg(long, value_name = "N")]
+    http2_max_concurrent_streams: Option<u32>,
 
     /// A worker socket to serve from the start, before any snapshot.
     #[arg(long = "worker-socket", value_name = "PATH")]
@@ -83,17 +100,23 @@ impl EdgeRunArgs {
             limits.max_headers = count;
         }
 
-        for (name, duration) in &self.timeouts {
-            match name.as_str() {
-                "queue" => limits.queue_timeout = *duration,
-                "deadline" => limits.request_deadline = *duration,
-                "header_read" => limits.header_read_timeout = *duration,
-                "body_idle" => limits.body_idle_timeout = *duration,
-                "response_idle" => limits.response_idle_timeout = *duration,
-                _ => {}
-            }
+        if let Some(count) = self.max_connections {
+            limits.max_connections = count;
         }
 
+        if let Some(count) = self.max_connections_per_client {
+            limits.max_connections_per_client = count;
+        }
+
+        if let Some(count) = self.max_requests_per_connection {
+            limits.max_requests_per_connection = count;
+        }
+
+        if let Some(count) = self.http2_max_concurrent_streams {
+            limits.http2_max_concurrent_streams = count;
+        }
+
+        crate::apply_timeouts(&mut limits, &self.timeouts);
         limits
     }
 }
@@ -175,6 +198,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     .await?;
     let pools = edge.pools();
     let listeners = edge.listeners();
+    let connections = edge.connections();
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // The control socket, on which the daemon pushes snapshots.
@@ -188,6 +212,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         resolver,
         listeners,
         access_log: edge.access_log(),
+        connections,
         version: AtomicU64::new(0),
         stop: stop_tx,
     });
@@ -279,6 +304,7 @@ struct Control {
     resolver: Arc<muru_edge::tls::Resolver>,
     listeners: Vec<(SocketAddr, bool)>,
     access_log: Arc<muru_edge::access::AccessLog>,
+    connections: muru_edge::ConnectionCounts,
     version: AtomicU64,
     stop: tokio::sync::mpsc::Sender<()>,
 }
@@ -353,6 +379,7 @@ impl EdgeControl for Control {
             .samples()
             .into_iter()
             .chain(muru_edge::metrics::pool_samples(&routing))
+            .chain(self.connections.samples())
             .map(|sample| sample.to_message())
             .collect();
         Ok(Response::new(pb::MetricsReport { samples }))

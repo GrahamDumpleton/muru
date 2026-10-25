@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sys
+import sysconfig
 from collections.abc import Iterator
 
 import pytest
@@ -66,8 +66,12 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
     info = json.loads(hooked.get("/").body)
     assert info["worker_id"] in (0, 1)
     assert info["app"] == "preload_wsgi"
-    gil = getattr(sys, "_is_gil_enabled", lambda: True)()
-    assert info["process_model"] == ("threaded" if gil else "free-threaded")
+
+    # The workers run this interpreter fresh, so the build decides, not
+    # whether an extension re-enabled the GIL in this process.
+
+    free_threaded = sysconfig.get_config_var("Py_GIL_DISABLED") == 1
+    assert info["process_model"] == ("free-threaded" if free_threaded else "threaded")
 
 
 def test_worker_output_is_tagged_with_the_worker(hooked: support.Server) -> None:

@@ -461,13 +461,23 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg("--max-header-bytes")
         .arg(spec.limits.max_header_bytes.to_string())
         .arg("--max-headers")
-        .arg(spec.limits.max_headers.to_string());
+        .arg(spec.limits.max_headers.to_string())
+        .arg("--max-connections")
+        .arg(spec.limits.max_connections.to_string())
+        .arg("--max-connections-per-client")
+        .arg(spec.limits.max_connections_per_client.to_string())
+        .arg("--max-requests-per-connection")
+        .arg(spec.limits.max_requests_per_connection.to_string())
+        .arg("--http2-max-concurrent-streams")
+        .arg(spec.limits.http2_max_concurrent_streams.to_string());
     for (name, duration) in [
         ("queue", spec.limits.queue_timeout),
         ("deadline", spec.limits.request_deadline),
         ("header_read", spec.limits.header_read_timeout),
         ("body_idle", spec.limits.body_idle_timeout),
         ("response_idle", spec.limits.response_idle_timeout),
+        ("keep_alive", spec.limits.keep_alive_timeout),
+        ("keep_alive_proxy", spec.limits.keep_alive_timeout_proxy),
     ] {
         command
             .arg("--timeout")

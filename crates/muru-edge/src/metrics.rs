@@ -144,6 +144,16 @@ pub const FAMILIES: &[Family] = &[
         help: "A worker's memory as it last reported it, by measure: rss, pss or uss.",
     },
     Family {
+        name: "muru_connections_open",
+        kind: Kind::Gauge,
+        help: "Connections open on a listener.",
+    },
+    Family {
+        name: "muru_connections_refused_total",
+        kind: Kind::Counter,
+        help: "Connections a listener refused, by reason: client_limit, overloaded (answered 503) or paused (closed).",
+    },
+    Family {
         name: "muru_snapshot_version",
         kind: Kind::Gauge,
         help: "The routing snapshot in force at the edge.",

@@ -2166,6 +2166,31 @@ fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Li
         limits.max_headers = count;
     }
 
+    if let Some(count) = table.max_connections {
+        anyhow::ensure!(count > 0, "[limits] max_connections must be at least 1");
+        limits.max_connections = count;
+    }
+
+    if let Some(count) = table.max_connections_per_client {
+        limits.max_connections_per_client = count;
+    }
+
+    if let Some(count) = table.max_requests_per_connection {
+        limits.max_requests_per_connection = count;
+    }
+
+    if let Some(count) = table
+        .http2
+        .as_ref()
+        .and_then(|http2| http2.max_concurrent_streams)
+    {
+        anyhow::ensure!(
+            count > 0,
+            "[limits.http2] max_concurrent_streams must be at least 1"
+        );
+        limits.http2_max_concurrent_streams = count;
+    }
+
     for (value, field) in [
         (&table.header_read_timeout, &mut limits.header_read_timeout),
         (&table.queue_timeout, &mut limits.queue_timeout),
@@ -2174,6 +2199,11 @@ fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Li
         (
             &table.response_idle_timeout,
             &mut limits.response_idle_timeout,
+        ),
+        (&table.keep_alive_timeout, &mut limits.keep_alive_timeout),
+        (
+            &table.keep_alive_timeout_proxy,
+            &mut limits.keep_alive_timeout_proxy,
         ),
     ] {
         if let Some(text) = value {

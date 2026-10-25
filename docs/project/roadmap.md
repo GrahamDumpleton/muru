@@ -180,4 +180,15 @@ out, a symbolic link leaving the directory or a name that differs from
 the file's on disk, declared through apply and exported, and `muructl
 serve-static DIR` serves a directory with the same code (listings,
 release static files, file hints, internal redirects and the metadata
-cache later). Next from phase 2: connection limits at the edge.
+cache later). Connection limits (section 4.18) have their first slice:
+`max_connections` per listener with a fast 503 edge_overloaded within
+the overload reserve and a close beyond it, `max_connections_per_client`
+by address (IPv6 by /64) applied first with trusted proxies exempt,
+`keep_alive_timeout` and `keep_alive_timeout_proxy` as the idle timer
+of each connection, `max_requests_per_connection` closing with
+Connection: close, `http2.max_concurrent_streams`, and the open and
+refused counts as metrics, from the `[limits]` table or run flags
+(eviction of idle connections under pressure, shrinking idle timeouts,
+per-listener settings, HTTP/2 idle closure and Unix socket listeners
+later). Next from phase 2: secrets and per-application users, then log
+rotation and the dashboard's charts.

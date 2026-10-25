@@ -37,6 +37,8 @@ pub struct Inputs {
     pub release: Arc<AtomicU32>,
     /// The worker pools.
     pub pools: Arc<Pools>,
+    /// The listeners' connection counts (section 4.18).
+    pub connections: muru_edge::ConnectionCounts,
     /// The access log.
     pub access_log: Arc<AccessLog>,
     /// Recent host and worker output.
@@ -56,13 +58,15 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
     let bound = listener.local_addr()?;
     let pools = Arc::clone(&inputs.pools);
     let access_log = Arc::clone(&inputs.access_log);
+    let connections = inputs.connections.clone();
     let metrics: MetricsSource = Arc::new(move || {
         let routing = pools.current();
         let samples = access_log
             .metrics()
             .samples()
             .into_iter()
-            .chain(pool_samples(&routing));
+            .chain(pool_samples(&routing))
+            .chain(connections.samples());
         render(&aggregate(samples))
     });
     let source: Source = Arc::new(move || collect(&inputs));
