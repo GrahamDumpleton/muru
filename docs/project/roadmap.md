@@ -13,7 +13,7 @@ criteria. The full table, with scope and exit criteria, is in
 | 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 2 in progress. Phase 0 landed the
+Current position: phase 2 complete, phase 3 next. Phase 0 landed the
 framed worker link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a
 fixed pool of long-lived application threads and the benchmark harness.
 Phase 1, released as 0.1.0a2, is development mode for one WSGI application:
@@ -29,7 +29,8 @@ development defaults and the loopback rule of section 13.1,
 `--print-config`, the read-only dashboard in `muructl run`, Flask and Django
 fixtures, and the many-threads stress test of section 6.11 on the
 free-threaded build. Sanitizer builds are a future idea (section 20.10).
-Phase 2 so far, released as 0.1.0a3, has the ASGI bridge: one event loop per worker, lifespan
+Phase 2, released as 0.1.0a3 and completed in 0.1.0a4, has the ASGI
+bridge: one event loop per worker, lifespan
 with its state, the sync thread pool, concurrency declared to the edge in
 HELLO, WebSockets relayed by the edge with the MESSAGE and CLOSE frames of
 section 5.6 and checked by the Autobahn suite, the ASGI conformance suite,
@@ -226,5 +227,6 @@ root; each release's socket directory opens to the application's user
 and the edge's group alone, and a rotated log is recreated with its
 owner. Dropping the daemon's own capabilities to the few it needs is
 the next step on that path and is still to come. That completes the
-phase 2 scope; the exit run under sustained load in the virtual machine
-has passed, and the next alpha follows.
+phase 2 scope: the exit runs passed in the virtual machine, deploys and
+rollbacks under sustained load and daemon and edge restarts and upgrades
+with no failed request, and 0.1.0a4 is the release.
