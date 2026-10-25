@@ -40,8 +40,12 @@ pub mod kind {
     /// Closes a WebSocket with a code and reason (protobuf `Close`), in
     /// either direction; each side sends exactly one (section 5.6).
     pub const CLOSE: u8 = 9;
-    // Kinds 10 and up are reserved for INFORMATIONAL, FILE and DETACH
-    // (design specification section 5.2).
+    /// The response body, or the next piece of it, is a range of the file
+    /// whose descriptor is attached to the frame (protobuf `FileHint`),
+    /// worker to edge (section 5.7). The END flag ends the body with it.
+    pub const FILE: u8 = 11;
+    // Kinds 10 and 12 are reserved for INFORMATIONAL and DETACH (design
+    // specification section 5.2).
 }
 
 /// Frame flags.

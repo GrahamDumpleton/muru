@@ -1219,6 +1219,16 @@ pub struct DeployArgs {
     #[arg(long, value_name = "NAME")]
     stop_signal: Option<String>,
 
+    /// A directory a path in an X-Muru-Sendfile response header must lie
+    /// in for the edge to serve the file; repeatable (default the table's).
+    #[arg(long = "sendfile-root", value_name = "DIR")]
+    sendfile_roots: Vec<String>,
+
+    /// A second response header honoured as X-Muru-Sendfile is, such as
+    /// X-Sendfile.
+    #[arg(long, value_name = "NAME")]
+    sendfile_header: Option<String>,
+
     #[command(flatten)]
     socket: SocketArgs,
 
@@ -1517,6 +1527,8 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         soft_timeout_ms: timeout_ms(&args.timeouts, "soft"),
         accel_redirect: None,
         cgi_local_redirect: None,
+        sendfile_roots: args.sendfile_roots,
+        sendfile_header: args.sendfile_header,
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),

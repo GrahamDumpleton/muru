@@ -5,11 +5,11 @@
 
 Static routes to a directory, with index files, conditional requests,
 ranges, precompressed variants, cache headers and a fallback to an
-application or a file, `muructl serve-static`, and internal routes that
-only an [internal redirect](internal-redirects.md) reaches. Directory
-listings, static files that belong to a release, file hints from
-applications (`X-Muru-Sendfile`) and the metadata cache are still to
-come.
+application or a file, `muructl serve-static`, internal routes that only
+an [internal redirect](internal-redirects.md) reaches, and
+[file hints](file-hints.md) from applications. Directory listings,
+static files that belong to a release and the metadata cache are still
+to come.
 ```
 
 A route that names a directory instead of an application is served by

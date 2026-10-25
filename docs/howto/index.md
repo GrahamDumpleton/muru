@@ -33,6 +33,7 @@ scaling
 mounts
 https
 static-files
+file-hints
 internal-redirects
 error-pages
 auth-subrequests

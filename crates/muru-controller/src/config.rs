@@ -1355,6 +1355,19 @@ pub fn resolve_spec(
         .or(table.cgi_local_redirect)
         .unwrap_or(false);
 
+    // Section 4.9: the file hint keys, from the request, else the table.
+
+    let sendfile_roots = if request.sendfile_roots.is_empty() {
+        table.sendfile_roots.clone()
+    } else {
+        request.sendfile_roots.clone()
+    };
+    let sendfile_header = request
+        .sendfile_header
+        .clone()
+        .or_else(|| table.sendfile_header.clone());
+    muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
+
     for (name, mount) in mounts.unwrap_or(&table.mounts) {
         if !crate::model::valid_name(name) {
             return Err(format!("{name:?} is not a valid mount name"));
@@ -1379,6 +1392,17 @@ pub fn resolve_spec(
             return Err(format!("mount {name}: another mount has the path {path}"));
         }
 
+        let mount_roots = mount
+            .sendfile_roots
+            .clone()
+            .unwrap_or_else(|| sendfile_roots.clone());
+        let mount_header = mount
+            .sendfile_header
+            .clone()
+            .or_else(|| sendfile_header.clone());
+        muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
+            .map_err(|error| format!("mount {name}: {error}"))?;
+
         // Section 4.10: a mount's redirect settings, with the release's
         // as the defaults.
 
@@ -1391,6 +1415,8 @@ pub fn resolve_spec(
             accept_redirects_from: mount.accept_redirects_from.clone(),
             accel_redirect: mount.accel_redirect.unwrap_or(accel_redirect),
             cgi_local_redirect: mount.cgi_local_redirect.unwrap_or(cgi_local_redirect),
+            sendfile_roots: mount_roots,
+            sendfile_header: mount_header,
         });
     }
 
@@ -1553,6 +1579,8 @@ pub fn resolve_spec(
         mounts: resolved_mounts,
         accel_redirect,
         cgi_local_redirect,
+        sendfile_roots,
+        sendfile_header,
         logging: logging
             .or(table.logging.as_ref())
             .and_then(|logging| logging.python.clone())
@@ -1720,6 +1748,8 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         env: BTreeMap::new(),
         accel_redirect: request.accel_redirect,
         cgi_local_redirect: request.cgi_local_redirect,
+        sendfile_roots: request.sendfile_roots.clone(),
+        sendfile_header: request.sendfile_header.clone(),
         error_pages: BTreeMap::new(),
         error_override: None,
         maintenance: None,
@@ -1773,6 +1803,7 @@ fn resolve_http_spec(
     let env = resolve_env_specs(&BTreeMap::new(), &request.env)?;
     let (error_pages, error_override, maintenance) =
         resolve_error_tables(tables, &BTreeMap::new(), None, None, &source)?;
+    muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
 
     Ok(ReleaseSpec {
         source,
@@ -1790,6 +1821,8 @@ fn resolve_http_spec(
         mounts: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
+        sendfile_roots: table.sendfile_roots.clone(),
+        sendfile_header: table.sendfile_header.clone(),
         logging: muru_config::PythonLogging::default(),
         max_requests: None,
         max_lifetime_ms: None,
@@ -2124,6 +2157,8 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         max_lifetime_ms: duration_field(table.max_lifetime.as_ref()),
         accel_redirect: table.accel_redirect,
         cgi_local_redirect: table.cgi_local_redirect,
+        sendfile_roots: table.sendfile_roots.clone(),
+        sendfile_header: table.sendfile_header.clone(),
         soft_timeout_ms: duration_field(
             table
                 .timeouts
@@ -2286,6 +2321,11 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                             .then_some(mount.accel_redirect),
                         cgi_local_redirect: (mount.cgi_local_redirect != spec.cgi_local_redirect)
                             .then_some(mount.cgi_local_redirect),
+                        sendfile_roots: (mount.sendfile_roots != spec.sendfile_roots)
+                            .then(|| mount.sendfile_roots.clone()),
+                        sendfile_header: (mount.sendfile_header != spec.sendfile_header)
+                            .then(|| mount.sendfile_header.clone())
+                            .flatten(),
                     },
                 )
             })
@@ -2334,6 +2374,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         }),
         accel_redirect: spec.accel_redirect.then_some(true),
         cgi_local_redirect: spec.cgi_local_redirect.then_some(true),
+        sendfile_roots: spec.sendfile_roots.clone(),
+        sendfile_header: spec.sendfile_header.clone(),
         error_pages: spec.error_pages.clone(),
         error_override: spec.error_override.clone(),
         maintenance: spec.maintenance.clone(),
@@ -2516,6 +2558,16 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "cgi_local_redirect",
         declared.cgi_local_redirect.to_string(),
         recorded.cgi_local_redirect.to_string(),
+    );
+    compare(
+        "sendfile_roots",
+        declared.sendfile_roots.join(", "),
+        recorded.sendfile_roots.join(", "),
+    );
+    compare(
+        "sendfile_header",
+        declared.sendfile_header.clone().unwrap_or_default(),
+        recorded.sendfile_header.clone().unwrap_or_default(),
     );
     compare(
         "max_requests",
@@ -2747,6 +2799,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
             if mount.cgi_local_redirect {
                 flags.push("cgi_local_redirect".to_owned());
+            }
+
+            if !mount.sendfile_roots.is_empty() {
+                flags.push(format!("sendfile from {}", mount.sendfile_roots.join(", ")));
             }
 
             let flags = if flags.is_empty() {

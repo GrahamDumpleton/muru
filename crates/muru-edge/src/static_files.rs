@@ -208,7 +208,144 @@ pub async fn serve(
         }
     };
 
-    respond(route, method, headers, found, policy).await
+    respond(Some(route), method, headers, found, Some(policy)).await
+}
+
+/// Why a hinted path is not served.
+enum Located {
+    /// The path is not absolute, or lies outside every root.
+    Refused,
+    /// The path names nothing, or not a regular file.
+    Missing,
+}
+
+/// Where a hinted path leads: a regular file whose canonical path lies in
+/// one of the roots, compared by canonical path (section 4.9).
+fn locate(candidate: &Path, roots: &[PathBuf]) -> Result<Found, Located> {
+    if !candidate.is_absolute() {
+        return Err(Located::Refused);
+    }
+
+    let canonical = std::fs::canonicalize(candidate).map_err(|_| Located::Missing)?;
+    let inside = roots
+        .iter()
+        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| canonical.starts_with(root)));
+
+    if !inside {
+        return Err(Located::Refused);
+    }
+
+    let metadata = std::fs::metadata(&canonical).map_err(|_| Located::Missing)?;
+
+    if !metadata.is_file() {
+        return Err(Located::Missing);
+    }
+
+    Ok(Found {
+        path: canonical,
+        relative: String::new(),
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// Section 4.9: serve the file an application's X-Muru-Sendfile header
+/// names, with the status and headers of the application's response
+/// around it. A 200 gets the static behaviour of conditional and range
+/// requests; any other status sends the whole file as it is. `strip`
+/// names the hint headers, which never reach the client.
+pub async fn serve_hint(
+    path: &str,
+    roots: &[PathBuf],
+    method: &Method,
+    headers: &HeaderMap,
+    head: &muru_proto::worker::v1::ResponseHead,
+    strip: &[&str],
+) -> Result<Outcome, crate::errors::Problem> {
+    let candidate = PathBuf::from(path);
+    let roots = roots.to_vec();
+    let located = tokio::task::spawn_blocking(move || locate(&candidate, &roots))
+        .await
+        .unwrap_or(Err(Located::Missing));
+
+    let found = match located {
+        Ok(found) => found,
+        Err(Located::Refused) => {
+            tracing::warn!(
+                path,
+                "the application named a file outside the mount's sendfile_roots; refused"
+            );
+            return Err(crate::errors::Problem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sendfile_refused",
+                "The application named a file the edge may not send.",
+            ));
+        }
+        Err(Located::Missing) => {
+            tracing::warn!(path, "the application named a file that is not there");
+            return Err(crate::errors::Problem::new(
+                StatusCode::NOT_FOUND,
+                "sendfile_missing",
+                "The file the application named is not there.",
+            ));
+        }
+    };
+
+    let status = u16::try_from(head.status).unwrap_or(500);
+    let empty = HeaderMap::new();
+    let conditional = if status == 200 { headers } else { &empty };
+    let mut outcome = respond(None, method, conditional, found, None).await;
+
+    if let Outcome::Served {
+        response,
+        status: served,
+        ..
+    } = &mut outcome
+    {
+        // The application's own headers go with the file, except those
+        // the file itself decides, the hints and what the edge sets.
+
+        let own = response.headers_mut();
+
+        for header in &head.headers {
+            let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
+
+            if strip.contains(&name.as_str())
+                || name.starts_with("x-muru-")
+                || matches!(
+                    name.as_str(),
+                    "content-length"
+                        | "content-range"
+                        | "accept-ranges"
+                        | "etag"
+                        | "last-modified"
+                        | "transfer-encoding"
+                        | "connection"
+                        | "server"
+                )
+            {
+                continue;
+            }
+
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(&header.name),
+                HeaderValue::from_bytes(&header.value),
+            ) {
+                if name == CONTENT_TYPE {
+                    own.insert(name, value);
+                } else {
+                    own.append(name, value);
+                }
+            }
+        }
+
+        if status != 200 {
+            *response.status_mut() = crate::status_code(head.status);
+            *served = status;
+        }
+    }
+
+    Ok(outcome)
 }
 
 /// The path's components below the route, percent-decoded and
@@ -328,11 +465,11 @@ fn same_names(root: &Path, components: &[String]) -> bool {
 /// The response for a file: conditional requests, ranges, precompressed
 /// variants and cache headers.
 async fn respond(
-    route: &StaticRoute,
+    route: Option<&StaticRoute>,
     method: &Method,
     headers: &HeaderMap,
     found: Found,
-    policy: &Compression,
+    policy: Option<&Compression>,
 ) -> Outcome {
     let etag = etag(&found);
     let modified = found.modified.map(httpdate::fmt_http_date);
@@ -351,7 +488,7 @@ async fn respond(
         base.insert(LAST_MODIFIED, value);
     }
 
-    if let Some(value) = cache_control(route, &found.relative) {
+    if let Some(value) = route.and_then(|route| cache_control(route, &found.relative)) {
         base.insert(CACHE_CONTROL, value);
     }
 
@@ -433,7 +570,10 @@ async fn respond(
         None => {}
     }
 
-    let variant = precompressed(&found.path, headers, policy).await;
+    let variant = match policy {
+        Some(policy) => precompressed(&found.path, headers, policy).await,
+        None => None,
+    };
 
     let (path, length, encoding) = match &variant {
         Some((path, length, encoding)) => (path.clone(), *length, Some(*encoding)),

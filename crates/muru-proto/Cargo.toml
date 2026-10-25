@@ -11,10 +11,14 @@ publish.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+libc = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }

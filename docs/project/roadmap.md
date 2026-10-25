@@ -180,8 +180,7 @@ to an application or a file, never a hidden file, a path that climbs
 out, a symbolic link leaving the directory or a name that differs from
 the file's on disk, declared through apply and exported, and `muructl
 serve-static DIR` serves a directory with the same code (listings,
-release static files, file hints, internal redirects and the metadata
-cache later). Connection limits (section 4.18) have their first slice:
+release static files and the metadata cache later). Connection limits (section 4.18) have their first slice:
 `max_connections` per listener with a fast 503 edge_overloaded within
 the overload reserve and a close beyond it, `max_connections_per_client`
 by address (IPv6 by /64) applied first with trusted proxies exempt,
@@ -317,8 +316,22 @@ redirecting response's Content-Disposition, Cache-Control, Expires,
 Set-Cookie, Vary and non-empty Content-Type carry over; a chain stops
 after 5 hops with 500 redirect_loop under the client's deadline, with
 one access log line naming every hop; and a client's X-Muru-* request
-headers are stripped at the edge. Still to come: upload offloading and
-the file hints (X-Muru-Sendfile) the same directory serving backs.
+headers are stripped at the edge. Still to come: upload offloading.
+
+File hints (sections 4.9, 5.7 and 6.5) are in, in both forms. By
+descriptor: a `wsgi.file_wrapper` object returned as the iterable with
+a regular file behind it, and the ASGI `pathsend` and `zerocopysend`
+extensions advertised in the scope, pass a duplicate of the descriptor
+on a FILE frame with an offset and length, and the edge sends the range
+while the application's file is already closed. By path: an
+`X-Muru-Sendfile` header, or the second header a release's, mount's or
+upstream's `sendfile_header` names, makes the edge serve a file inside
+`sendfile_roots`, checked by canonical path, with static-file
+behaviour and the application's status and headers around it; a path
+outside is 500 sendfile_refused and logged, a missing one 404
+sendfile_missing. Trusted upstreams and managed servers give path hints
+too, and `muructl deploy --sendfile-root` and `--sendfile-header`,
+`apply` and `config export` know the keys.
 
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as
@@ -361,7 +374,8 @@ period and a `health` table probes a path; `muru_upstream_health`
 reports each address, `trust_muru_headers` lets an upstream redirect
 internally, WebSockets are relayed to `http1` upstreams, and `muructl
 upstream list`, `route list`, `apply` and `config export` know the
-tables. Still to come: `X-Muru-Sendfile` from an upstream.
+tables, and a trusted upstream's `X-Muru-Sendfile` is served within its
+`sendfile_roots`.
 
 Managed HTTP server releases (section 9.9) are in: a release with
 `kind = 'http'` runs a `command` such as the gunicorn, uvicorn, Granian

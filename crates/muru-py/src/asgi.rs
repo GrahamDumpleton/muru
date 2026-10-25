@@ -679,11 +679,49 @@ impl Channel {
                 drop(state);
                 self.enqueue(py, items)
             }
-            "http.response.trailers" | "http.response.pathsend" | "http.response.zerocopysend" => {
-                Err(PyRuntimeError::new_err(format!(
-                    "{kind} is not advertised in scope['extensions'] and cannot be sent"
-                )))
+            "http.response.pathsend" | "http.response.zerocopysend" => {
+                if self.websocket {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} is not advertised in scope['extensions'] and cannot be sent"
+                    )));
+                }
+
+                if !state.head_sent {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} sent before http.response.start"
+                    )));
+                }
+
+                if state.body_ended {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{kind} sent after the response was completed"
+                    )));
+                }
+
+                let (fd, offset, length, more) = if kind == "http.response.pathsend" {
+                    let (fd, length) = open_path(py, message)?;
+                    (fd, 0, length, false)
+                } else {
+                    zerocopy_range(py, message)?
+                };
+                let mut items = vec![Outgoing::File {
+                    fd,
+                    offset,
+                    length,
+                    more,
+                }];
+
+                if !more {
+                    state.body_ended = true;
+                    items.push(Outgoing::Finished);
+                }
+
+                drop(state);
+                self.enqueue(py, items)
             }
+            "http.response.trailers" => Err(PyRuntimeError::new_err(format!(
+                "{kind} is not advertised in scope['extensions'] and cannot be sent"
+            ))),
             other => Err(PyRuntimeError::new_err(format!(
                 "unexpected ASGI message type {other:?} on an http connection"
             ))),
@@ -797,6 +835,100 @@ pub fn resolve_future(future: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> Py
 }
 
 /// Build the dictionary the application receives for a message.
+/// `http.response.pathsend`: the file at `path`, opened as the
+/// application's user, and its size.
+fn open_path(py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<(std::os::fd::OwnedFd, u64)> {
+    let path = message
+        .get_item("path")?
+        .ok_or_else(|| PyTypeError::new_err("http.response.pathsend has no path"))?;
+    let path = py
+        .import(pyo3::intern!(py, "os"))?
+        .call_method1(pyo3::intern!(py, "fsdecode"), (path,))?
+        .extract::<String>()
+        .map_err(|_| PyTypeError::new_err("http.response.pathsend path must be a path"))?;
+    let file = std::fs::File::open(&path).map_err(|error| {
+        pyo3::exceptions::PyOSError::new_err(format!("http.response.pathsend: {path}: {error}"))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        pyo3::exceptions::PyOSError::new_err(format!("http.response.pathsend: {path}: {error}"))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(pyo3::exceptions::PyOSError::new_err(format!(
+            "http.response.pathsend: {path} is not a regular file"
+        )));
+    }
+
+    Ok((file.into(), metadata.len()))
+}
+
+/// `http.response.zerocopysend`: a duplicate of the file's descriptor with
+/// the range to send and whether body chunks follow.
+fn zerocopy_range(
+    py: Python<'_>,
+    message: &Bound<'_, PyDict>,
+) -> PyResult<(std::os::fd::OwnedFd, u64, u64, bool)> {
+    use std::os::fd::BorrowedFd;
+
+    let file = message
+        .get_item("file")?
+        .ok_or_else(|| PyTypeError::new_err("http.response.zerocopysend has no file"))?;
+    let raw = file
+        .call_method0(pyo3::intern!(py, "fileno"))?
+        .extract::<i32>()
+        .map_err(|_| PyTypeError::new_err("http.response.zerocopysend file has no descriptor"))?;
+
+    if raw < 0 {
+        return Err(PyValueError::new_err(
+            "http.response.zerocopysend file has no descriptor",
+        ));
+    }
+
+    // SAFETY: the descriptor is the application's open file, alive for the
+    // call since the message holding the file object is.
+
+    let copy = std::fs::File::from(unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned()?);
+    let metadata = copy.metadata()?;
+
+    if !metadata.is_file() {
+        return Err(PyValueError::new_err(
+            "http.response.zerocopysend file is not a regular file",
+        ));
+    }
+
+    let optional = |name: &str| -> PyResult<Option<u64>> {
+        match message.get_item(name)? {
+            Some(value) if !value.is_none() => value.extract::<u64>().map(Some).map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "http.response.zerocopysend {name} must be a non-negative int"
+                ))
+            }),
+            _ => Ok(None),
+        }
+    };
+
+    // The range: from the given offset, else the file's position, for
+    // the given count, else the rest of the file.
+
+    let offset = match optional("offset")? {
+        Some(offset) => offset,
+        None => file
+            .call_method0(pyo3::intern!(py, "tell"))
+            .and_then(|value| value.extract::<u64>())
+            .unwrap_or(0),
+    };
+
+    let rest = metadata.len().saturating_sub(offset);
+    let count = optional("count")?.map_or(rest, |count| count.min(rest));
+
+    let more = match message.get_item("more_body")? {
+        Some(more) => more.is_truthy()?,
+        None => false,
+    };
+
+    Ok((copy.into(), offset, count, more))
+}
+
 fn message_dict<'py>(
     py: Python<'py>,
     message: &Message,
@@ -1055,6 +1187,11 @@ fn build_scope<'py>(py: Python<'py>, head: &pb::RequestHead) -> PyResult<Bound<'
         // Declining the handshake with a full response (section 5.6).
 
         extensions.set_item("websocket.http.response", PyDict::new(py))?;
+    } else {
+        // Section 6.6: the file extensions, served as FILE frames.
+
+        extensions.set_item("http.response.pathsend", PyDict::new(py))?;
+        extensions.set_item("http.response.zerocopysend", PyDict::new(py))?;
     }
 
     scope.set_item("extensions", extensions)?;

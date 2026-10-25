@@ -69,6 +69,8 @@ pub struct Config {
     /// The default mount treats a 200 with a local Location and no body
     /// as an internal redirect (section 4.10).
     pub cgi_local_redirect: bool,
+    /// The default mount's file hints by path (section 4.9).
+    pub sendfile: Arc<routing::Sendfile>,
     /// The application's error pages and override (section 4.12).
     pub errors: Arc<errors::ErrorPolicy>,
     /// Development mode: error pages show tracebacks (section 4.12).
@@ -355,7 +357,8 @@ impl Edge {
                         },
                     )
                     .await?
-                    .with_errors(Arc::clone(&config.errors)),
+                    .with_errors(Arc::clone(&config.errors))
+                    .with_sendfile(Arc::clone(&config.sendfile)),
                 )
                 .with_compression(config.compression.clone()),
             )),
@@ -781,6 +784,7 @@ async fn serve<I>(
                     snapshot: routing.version(),
                     mount: String::new(),
                     mount_path: String::new(),
+                    sendfile: Arc::default(),
                     forwarded_host: forwarded.host.clone(),
                     forwarded_port: forwarded.port,
                     prefix: forwarded.prefix.clone(),
@@ -924,6 +928,7 @@ async fn serve<I>(
                             context.group = selection.group;
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
+                            context.sendfile = selection.sendfile;
                             dispatch(
                                 &mut parts,
                                 body.take(),
@@ -1036,6 +1041,7 @@ async fn serve<I>(
                                 context.group = selection.group.clone();
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
+                                context.sendfile = Arc::clone(&selection.sendfile);
                                 dispatch(
                                     &mut parts,
                                     body.take(),
@@ -1592,6 +1598,7 @@ pub(crate) fn copy_headers(headers: &mut http::HeaderMap, from: Vec<pb::Header>)
         if name
             .get(..15)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-muru-redirect"))
+            || name.eq_ignore_ascii_case(b"x-muru-sendfile")
             || name.eq_ignore_ascii_case(errors::X_MURU_ERROR_OVERRIDE.as_str().as_bytes())
         {
             continue;

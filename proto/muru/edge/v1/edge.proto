@@ -59,6 +59,8 @@ message Upstream {
   UpstreamProbe probe = 10;             // active health checks; none when absent
   uint32 eject_after = 11;              // failed requests in a row before an address is set aside; never when 0
   uint64 eject_for_ms = 12;             // how long it is set aside; 30000 when 0
+  repeated string sendfile_roots = 13;  // section 4.9: directories an X-Muru-Sendfile path must lie in, when trusted
+  string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is, such as X-Sendfile; none when empty
 }
 
 // How an upstream's addresses are probed.
@@ -201,6 +203,8 @@ message AppWorkers {
   ErrorOverride error_override = 10;
   Maintenance maintenance = 11;         // maintenance mode and its exemptions; off when absent
   Upstream server = 12;                 // section 9.9: a managed HTTP release's instances, routed as an upstream; no sockets then
+  repeated string sendfile_roots = 13;  // section 4.9: directories the default mount's X-Muru-Sendfile paths must lie in
+  string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
 }
 
 message Mount {
@@ -210,6 +214,8 @@ message Mount {
   repeated string accept_redirects_from = 4; // other applications whose redirects may reach an internal mount
   bool accel_redirect = 5;              // X-Accel-Redirect from the mount is an internal redirect
   bool cgi_local_redirect = 6;          // a 200 with a local Location and no body is an internal redirect
+  repeated string sendfile_roots = 7;   // section 4.9: directories the mount's X-Muru-Sendfile paths must lie in
+  string sendfile_header = 8;           // a second header honoured as X-Muru-Sendfile is; none when empty
 }
 
 message Group {

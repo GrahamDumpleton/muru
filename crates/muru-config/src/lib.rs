@@ -343,6 +343,15 @@ pub struct Mount {
     /// release's setting, else false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgi_local_redirect: Option<bool>,
+    /// Directories a path in an `X-Muru-Sendfile` response header must
+    /// lie in for the edge to serve the file (section 4.9); the
+    /// release's when absent, and an empty list refuses every hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_roots: Option<Vec<String>>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile` (default the release's setting, else none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
 }
 
 /// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
@@ -490,6 +499,16 @@ pub struct Release {
     /// body as an internal redirect, the CGI convention (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgi_local_redirect: Option<bool>,
+    /// Directories a path in an `X-Muru-Sendfile` response header must
+    /// lie in for the edge to serve the file (section 4.9), for the
+    /// default mount and any mount that does not say otherwise; with
+    /// none every hint is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile` for the frameworks that send that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
     /// Custom error pages (section 4.12), by status or status:reason.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub error_pages: BTreeMap<String, ErrorPage>,
@@ -1497,6 +1516,15 @@ pub struct Upstream {
     /// removed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_muru_headers: bool,
+    /// Directories a path in a trusted `X-Muru-Sendfile` response header
+    /// must lie in for the edge to serve the file (section 4.9); with
+    /// none every hint is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
     /// How long a connection may take to open, for example 5s (the
     /// default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1742,6 +1770,36 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     Ok(())
 }
 
+/// Check a mount's, release's or upstream's file hint keys (section
+/// 4.9): absolute roots and a header name.
+pub fn check_sendfile(roots: &[String], header: Option<&str>) -> Result<(), String> {
+    for root in roots {
+        if !root.starts_with('/') {
+            return Err(format!("sendfile_roots: {root:?} must be an absolute path"));
+        }
+    }
+
+    if let Some(header) = header {
+        let token = !header.is_empty()
+            && header
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+
+        if !token {
+            return Err(format!("sendfile_header: {header:?} is not a header name"));
+        }
+
+        if header.to_ascii_lowercase().starts_with("x-muru-") {
+            return Err(
+                "sendfile_header: X-Muru-Sendfile is always honoured; name the other header"
+                    .to_owned(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Check an `[upstream.NAME]` table: the addresses, the protocol, the
 /// TLS and health settings and the durations. Whether the CA file is
 /// readable is for the daemon to check.
@@ -1749,6 +1807,8 @@ pub fn check_upstream(table: &Upstream) -> Result<(), String> {
     if table.addresses.is_empty() {
         return Err("addresses names nowhere".to_owned());
     }
+
+    check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
 
     for address in &table.addresses {
         parse_upstream_address(address).map_err(|error| format!("addresses: {error}"))?;
@@ -2061,6 +2121,16 @@ pub struct ToolMuru {
     /// body as an internal redirect, the CGI convention (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgi_local_redirect: Option<bool>,
+    /// Directories a path in an `X-Muru-Sendfile` response header must
+    /// lie in for the edge to serve the file (section 4.9), for the
+    /// default mount and any mount that does not say otherwise; with
+    /// none every hint is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second response header honoured as `X-Muru-Sendfile` is, such
+    /// as `X-Sendfile` for the frameworks that send that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
     /// Custom error pages (section 4.12), by status or status:reason.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub error_pages: BTreeMap<String, ErrorPage>,

@@ -846,6 +846,8 @@ mod tests {
             scaling: ScalingSpec::default(),
             accel_redirect: false,
             cgi_local_redirect: false,
+            sendfile_roots: Vec::new(),
+            sendfile_header: None,
             error_pages: Default::default(),
             error_override: None,
             maintenance: None,

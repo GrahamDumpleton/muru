@@ -30,17 +30,18 @@ use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::body::{Body, Frame, Incoming};
+use muru_proto::descriptors::FdReader;
 use muru_proto::frame::{self, flag, kind};
 use muru_proto::worker::v1 as pb;
 use prost::Message;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, BufReader};
 use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::access::{AccessLog, Record};
 use crate::errors::{self, Negotiation, Problem};
-use crate::routing::RedirectFlags;
+use crate::routing::{RedirectFlags, Sendfile};
 use crate::{BoxError, Limits, ResponseBody, close_after, request_head};
 
 /// After the response has ended, this much of an unread request body is
@@ -55,7 +56,7 @@ const DISCARD_DELAY: Duration = Duration::from_secs(2);
 /// exceeded.
 pub const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 
-pub(crate) type Reader = BufReader<OwnedReadHalf>;
+pub(crate) type Reader = BufReader<FdReader>;
 pub(crate) type Writer = OwnedWriteHalf;
 
 /// One idle connection to a worker.
@@ -260,7 +261,7 @@ fn capacity(hello: &pb::Hello) -> usize {
 async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     let stream = UnixStream::connect(path).await?;
     let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::with_capacity(32 * 1024, read_half);
+    let mut reader = BufReader::with_capacity(32 * 1024, FdReader::new(read_half));
     let mut writer = write_half;
     let hello = pb::Hello {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
@@ -462,6 +463,9 @@ pub struct Context<'a> {
     pub mount: String,
     /// The mount's path, joined to SCRIPT_NAME.
     pub mount_path: String,
+    /// The file hints by path the mount, upstream or server may give
+    /// (section 4.9).
+    pub sendfile: Arc<Sendfile>,
     /// How the request arrived by internal redirect (section 4.10), for
     /// the request head; none for a client's own request.
     pub internal: Option<Internal>,
@@ -511,6 +515,7 @@ impl<'a> Context<'a> {
             snapshot: self.snapshot,
             mount: String::new(),
             mount_path: String::new(),
+            sendfile: Arc::default(),
             forwarded_host: self.forwarded_host.clone(),
             forwarded_port: self.forwarded_port,
             prefix: self.prefix.clone(),
@@ -1117,6 +1122,23 @@ async fn handle_inner(
         return failing.respond(problem);
     }
 
+    // Section 4.9: a file hint by path replaces the response's body with
+    // the file, served by the edge; the rest of the worker's response is
+    // drained as for a redirect.
+
+    if upgrade.is_none()
+        && let Some(path) = sendfile_from(&head, &context.sendfile)
+    {
+        if response_end {
+            back.give_reader(Some(reader));
+            back.abort_request();
+        } else {
+            drain_response(reader, &back, limits.response_idle_timeout).await;
+        }
+
+        return serve_hint(&path, parts, context, &head, &failing, recording).await;
+    }
+
     // The worker accepted the WebSocket: finish the handshake and relay
     // messages for the life of the socket on the leased connection. Any
     // other answer is the response to the upgrade, sent as usual.
@@ -1187,6 +1209,7 @@ async fn handle_inner(
                 recording,
                 bytes: 0,
                 idle_timeout: limits.response_idle_timeout,
+                file: None,
             },
             next_chunk,
         );
@@ -1293,13 +1316,90 @@ pub(crate) fn redirect_from(
     })
 }
 
+/// The file hint by path a response head carries (section 4.9):
+/// X-Muru-Sendfile, or the second header the policy names, with a value.
+pub(crate) fn sendfile_from(head: &pb::ResponseHead, policy: &Sendfile) -> Option<String> {
+    head.headers.iter().find_map(|header| {
+        let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
+
+        if name == "x-muru-sendfile" || policy.header.as_deref() == Some(name.as_str()) {
+            let value = String::from_utf8_lossy(&header.value).trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        } else {
+            None
+        }
+    })
+}
+
+/// Serve the file a hint names in place of the response it came with
+/// (section 4.9), recording the outcome for the access log.
+pub(crate) async fn serve_hint(
+    path: &str,
+    parts: &http::request::Parts,
+    context: &Context<'_>,
+    head: &pb::ResponseHead,
+    failing: &Failing<'_>,
+    recording: Option<Recording>,
+) -> Response<ResponseBody> {
+    let strip: Vec<&str> = std::iter::once("x-muru-sendfile")
+        .chain(context.sendfile.header.as_deref())
+        .collect();
+    let served = crate::static_files::serve_hint(
+        path,
+        &context.sendfile.roots,
+        &parts.method,
+        &parts.headers,
+        head,
+        &strip,
+    )
+    .await;
+
+    match served {
+        Ok(crate::static_files::Outcome::Served {
+            response,
+            status,
+            bytes,
+            ..
+        }) => {
+            if let Some(recording) = recording {
+                recording.complete(status, "", bytes);
+            }
+
+            response
+        }
+        Ok(_) => {
+            failing.put_recording(recording);
+            failing.respond(Problem::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "A file answers GET and HEAD only.",
+            ))
+        }
+        Err(problem) => {
+            failing.put_recording(recording);
+            failing.respond(problem)
+        }
+    }
+}
+
+/// Whether a frame carries response body: bytes, or a file range whose
+/// descriptor the edge has to let go of when it drains the response.
+fn carries_body(next: &frame::Frame, reader: &mut Reader) -> bool {
+    if next.kind == kind::FILE {
+        drop(reader.get_mut().take_fd());
+        return true;
+    }
+
+    next.kind == kind::BODY
+}
+
 /// Read the rest of a response the edge has no use for, so the worker
 /// connection goes back to the pool intact (section 4.10).
 async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Duration) {
     loop {
         match tokio::time::timeout(idle_timeout, frame::read(&mut reader)).await {
             Ok(Ok(Some(next))) if next.kind == kind::CONTINUE => back.continue_request(),
-            Ok(Ok(Some(next))) if next.kind == kind::BODY && !next.is_end() => {}
+            Ok(Ok(Some(next))) if carries_body(&next, &mut reader) && !next.is_end() => {}
             Ok(Ok(Some(next))) if next.kind == kind::BODY || next.kind == kind::END => {
                 back.give_reader(Some(reader));
                 back.abort_request();
@@ -1536,6 +1636,16 @@ struct BodyState {
     recording: Option<Recording>,
     bytes: u64,
     idle_timeout: Duration,
+    /// A file range a FILE frame handed over, being read (section 5.7).
+    file: Option<FileRange>,
+}
+
+/// The range of a file the edge is sending for a FILE frame.
+struct FileRange {
+    file: tokio::fs::File,
+    remaining: u64,
+    /// The frame ended the body: nothing follows the range.
+    last: bool,
 }
 
 impl BodyState {
@@ -1568,7 +1678,7 @@ impl Drop for BodyState {
                     match frame::read(&mut reader).await {
                         Ok(Some(next))
                             if next.kind == kind::CONTINUE
-                                || (next.kind == kind::BODY && !next.is_end()) => {}
+                                || (carries_body(&next, &mut reader) && !next.is_end()) => {}
                         Ok(Some(next)) if next.kind == kind::BODY || next.kind == kind::END => {
                             back.give_reader(Some(reader));
                             back.abort_request();
@@ -1588,6 +1698,45 @@ impl Drop for BodyState {
 
 async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxError>, BodyState)> {
     loop {
+        if let Some(range) = state.file.as_mut() {
+            // The range's end is noticed with its last chunk, not on the
+            // poll after it: hyper drops a body once the declared length
+            // is written, and the connection must be back by then.
+
+            match read_range(range).await {
+                Ok(Some(chunk)) => {
+                    state.bytes += chunk.len() as u64;
+
+                    if range.remaining == 0 {
+                        let last = range.last;
+                        state.file = None;
+
+                        if last {
+                            state.finish(true);
+                        }
+                    }
+
+                    return Some((Ok(Frame::data(chunk)), state));
+                }
+                Ok(None) => {
+                    let last = range.last;
+                    state.file = None;
+
+                    if last {
+                        state.finish(true);
+                        return None;
+                    }
+
+                    continue;
+                }
+                Err(error) => {
+                    state.file = None;
+                    state.finish(false);
+                    return Some((Err(error), state));
+                }
+            }
+        }
+
         let idle_timeout = state.idle_timeout;
         let reader = state.reader.as_mut()?;
 
@@ -1615,6 +1764,37 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                 }
 
                 Some((Ok(Frame::data(next.payload)), state))
+            }
+            Ok(Some(next)) if next.kind == kind::FILE => {
+                // Section 5.7: the descriptor arrived with the frame; the
+                // range is read from it on the blocking pool.
+
+                let last = next.is_end();
+                let hint = pb::FileHint::decode(next.payload).unwrap_or_default();
+                let Some(fd) = reader.get_mut().take_fd() else {
+                    state.finish(false);
+                    return Some((
+                        Err(BoxError::from(
+                            "the worker sent a file hint without a descriptor",
+                        )),
+                        state,
+                    ));
+                };
+                let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
+
+                if hint.offset > 0
+                    && let Err(error) = file.seek(std::io::SeekFrom::Start(hint.offset)).await
+                {
+                    state.finish(false);
+                    return Some((Err(BoxError::from(error)), state));
+                }
+
+                state.file = Some(FileRange {
+                    file,
+                    remaining: hint.length,
+                    last,
+                });
+                continue;
             }
             Ok(Some(next)) if next.kind == kind::END => {
                 let end = pb::End::decode(next.payload).unwrap_or_default();
@@ -1644,6 +1824,32 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             }
         };
     }
+}
+
+/// The next chunk of a file range, or none once it is all sent. A file
+/// shorter than the hint said is an error, since the client was promised
+/// the length.
+async fn read_range(range: &mut FileRange) -> Result<Option<Bytes>, BoxError> {
+    const CHUNK: usize = 64 * 1024;
+
+    if range.remaining == 0 {
+        return Ok(None);
+    }
+
+    let wanted = usize::try_from(range.remaining.min(CHUNK as u64)).unwrap_or(CHUNK);
+    let mut buffer = vec![0u8; wanted];
+    let read = range.file.read(&mut buffer).await?;
+
+    if read == 0 {
+        return Err(BoxError::from(format!(
+            "the file ended {} bytes before the hinted range did",
+            range.remaining
+        )));
+    }
+
+    buffer.truncate(read);
+    range.remaining -= read as u64;
+    Ok(Some(Bytes::from(buffer)))
 }
 
 /// Send the request body as BODY frames, then END. If the response ends

@@ -126,6 +126,13 @@ pub struct MountSpec {
     /// A 200 with a local Location and no body is an internal redirect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cgi_local_redirect: bool,
+    /// Directories the mount's X-Muru-Sendfile paths must lie in
+    /// (section 4.9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second header honoured as X-Muru-Sendfile is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -210,6 +217,13 @@ pub struct ReleaseSpec {
     /// as an internal redirect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cgi_local_redirect: bool,
+    /// Directories the default mount's X-Muru-Sendfile paths must lie in
+    /// (section 4.9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sendfile_roots: Vec<String>,
+    /// A second header honoured as X-Muru-Sendfile is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendfile_header: Option<String>,
     /// Custom error pages (section 4.12), by status or status:reason; a
     /// relative file is taken from the source directory.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

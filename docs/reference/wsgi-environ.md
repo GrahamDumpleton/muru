@@ -33,7 +33,7 @@ it adds.
 | `wsgi.multithread` | `True` when the worker has more than one application thread |
 | `wsgi.multiprocess` | `True`, except for a single-process `muructl run`, where it is `False` |
 | `wsgi.run_once` | `False` |
-| `wsgi.file_wrapper` | `muru._native.FileWrapper`: iterates a file in blocks, with `close()` closing the file. Passing the descriptor to the edge is phase 2 |
+| `wsgi.file_wrapper` | `muru._native.FileWrapper`: returned as the iterable itself with a regular file behind it, a duplicate of the descriptor goes to the edge, which sends the range from the file's position (the [file hints](../howto/file-hints.md) page); otherwise it iterates the file in blocks. `close()` closes the file |
 
 ## Keys Muru adds
 

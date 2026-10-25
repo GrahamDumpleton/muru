@@ -59,7 +59,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | max_body_size, buffer_body, chunked_body, buffer_response | route and wider | 10MB, off, buffer, on | 4.6 |
 | max_header_bytes, max_headers, header_read_timeout | listener, host | 64KiB, 100, 30s | 4.6 |
 | upload, max_file_size, max_files, hash, precheck, spool quota | route | off, unlimited, 100, sha256, false, 10GB per application | 4.11 |
-| static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache, sendfile_roots | route, mount | none | 4.9 |
+| static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache | route | none | 4.9 |
+| sendfile_roots, sendfile_header | release, mount, upstream | none, none | 4.9 |
 | error_pages, error_override | global, host, application (release), route | built-in, off | 4.12 |
 | maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release | none, none, none, 60s | 4.12 |
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |
@@ -87,10 +88,10 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Status | Reasons |
 | --- | --- |
 | 400, 414, 431 | malformed, uri_too_long, headers_too_large |
-| 404 | no_route, internal_only |
+| 404 | no_route, internal_only, sendfile_missing |
 | 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, misdirected, upgrade_not_allowed |
 | 429 | rate_limited |
-| 500 | app_error, redirect_loop |
+| 500 | app_error, redirect_loop, sendfile_refused |
 | 502 | worker_crashed, upstream_failed |
 | 503 | queue_full, no_workers, cold_start_timeout, release_failed, draining, maintenance, read_only, auth_unavailable, edge_overloaded |
 | 504 | deadline, soft_timeout, hard_timeout |

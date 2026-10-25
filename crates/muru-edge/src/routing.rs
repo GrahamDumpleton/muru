@@ -164,6 +164,28 @@ pub struct RedirectFlags {
     pub cgi_local_redirect: bool,
 }
 
+/// Section 4.9: the file hints by path a mount's, an upstream's or a
+/// managed server's responses may give.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sendfile {
+    /// Directories a hinted path must lie in, compared by canonical path
+    /// when the hint arrives; with none every path hint is refused.
+    pub roots: Vec<std::path::PathBuf>,
+    /// A second response header honoured as X-Muru-Sendfile is, in lower
+    /// case: `x-sendfile` for the frameworks that send that one.
+    pub header: Option<String>,
+}
+
+impl Sendfile {
+    /// The policy a snapshot's roots and header name describe.
+    pub fn new(roots: &[String], header: &str) -> Arc<Self> {
+        Arc::new(Self {
+            roots: roots.iter().map(std::path::PathBuf::from).collect(),
+            header: (!header.is_empty()).then(|| header.to_ascii_lowercase()),
+        })
+    }
+}
+
 /// The worker sockets of one group of a release, as a snapshot or a
 /// development run names them.
 #[derive(Debug, Clone)]
@@ -192,6 +214,8 @@ pub struct MountPath {
     pub accel_redirect: bool,
     /// A 200 with a local Location and no body is an internal redirect.
     pub cgi_local_redirect: bool,
+    /// The file hints by path the mount may give (section 4.9).
+    pub sendfile: Arc<Sendfile>,
 }
 
 /// Where a request goes within an application: the group's pool and the
@@ -211,6 +235,9 @@ pub struct Selection {
     pub script_name: String,
     /// Which response forms from the mount are internal redirects.
     pub redirects: RedirectFlags,
+    /// The file hints by path the mount, upstream or server may give
+    /// (section 4.9).
+    pub sendfile: Arc<Sendfile>,
     /// Maintenance mode, when the application is in it (section 4.12).
     pub maintenance: Option<Arc<Maintenance>>,
     /// The upstream that takes the request instead of workers (section
@@ -425,6 +452,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         mount: String::new(),
         script_name: String::new(),
         redirects: RedirectFlags::default(),
+        sendfile: upstream.sendfile(),
         maintenance: None,
         upstream: Some(Arc::clone(upstream)),
     }
@@ -532,6 +560,8 @@ pub struct AppPools {
     mounts: Vec<MountPath>,
     /// The default mount's redirect forms (section 4.10).
     redirects: RedirectFlags,
+    /// The default mount's file hints by path (section 4.9).
+    sendfile: Arc<Sendfile>,
     /// The release's error pages and override (section 4.12).
     errors: Arc<ErrorPolicy>,
     /// Maintenance mode, when the application is in it.
@@ -579,6 +609,7 @@ impl AppPools {
                 accept_redirects_from: mount.accept_redirects_from.clone(),
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
+                sendfile: Arc::clone(&mount.sendfile),
             })
             .collect();
         mounts.sort_by_key(|mount| std::cmp::Reverse(mount.path.len()));
@@ -590,6 +621,7 @@ impl AppPools {
             groups: connected,
             mounts,
             redirects,
+            sendfile: Arc::default(),
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
             server: None,
@@ -605,10 +637,18 @@ impl AppPools {
             groups: Vec::new(),
             mounts: Vec::new(),
             redirects: RedirectFlags::default(),
+            sendfile: Arc::default(),
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
             server: None,
         }
+    }
+
+    /// The same pools with the default mount's file hints by path
+    /// (section 4.9).
+    pub fn with_sendfile(mut self, sendfile: Arc<Sendfile>) -> Self {
+        self.sendfile = sendfile;
+        self
     }
 
     /// The same release served by the instances of a managed HTTP server
@@ -652,6 +692,7 @@ impl AppPools {
                 mount: String::new(),
                 script_name: String::new(),
                 redirects: RedirectFlags::default(),
+                sendfile: Arc::clone(&self.sendfile),
                 maintenance: self.maintenance.clone(),
                 upstream: Some(Arc::clone(server)),
             });
@@ -695,6 +736,10 @@ impl AppPools {
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
             }),
+            sendfile: mount.map_or_else(
+                || Arc::clone(&self.sendfile),
+                |mount| Arc::clone(&mount.sendfile),
+            ),
             maintenance: self.maintenance.clone(),
             upstream: None,
         })
@@ -885,7 +930,8 @@ impl Routing {
             )
             .await?
             .with_errors(Arc::new(errors))
-            .with_maintenance(maintenance);
+            .with_maintenance(maintenance)
+            .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header));
 
             // Section 9.9: a managed HTTP release's instances stand in
             // for its workers, as an upstream named after the release.
@@ -1366,6 +1412,7 @@ impl Routing {
                 mount: String::new(),
                 script_name: String::new(),
                 redirects: RedirectFlags::default(),
+                sendfile: Arc::default(),
                 maintenance: None,
                 upstream: None,
             }),
@@ -1410,6 +1457,7 @@ fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {
             accept_redirects_from: mount.accept_redirects_from.clone(),
             accel_redirect: mount.accel_redirect,
             cgi_local_redirect: mount.cgi_local_redirect,
+            sendfile: Sendfile::new(&mount.sendfile_roots, &mount.sendfile_header),
         })
         .collect()
 }

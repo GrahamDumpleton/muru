@@ -2711,6 +2711,11 @@ impl Daemon {
                                     accept_redirects_from: mount.accept_redirects_from.clone(),
                                     accel_redirect: mount.accel_redirect,
                                     cgi_local_redirect: mount.cgi_local_redirect,
+                                    sendfile_roots: mount.sendfile_roots.clone(),
+                                    sendfile_header: mount
+                                        .sendfile_header
+                                        .clone()
+                                        .unwrap_or_default(),
                                 })
                                 .collect()
                         })
@@ -2723,6 +2728,17 @@ impl Daemon {
                         .store
                         .release(name, id)
                         .is_ok_and(|release| release.spec.cgi_local_redirect),
+                    sendfile_roots: self
+                        .store
+                        .release(name, id)
+                        .map(|release| release.spec.sendfile_roots.clone())
+                        .unwrap_or_default(),
+                    sendfile_header: self
+                        .store
+                        .release(name, id)
+                        .ok()
+                        .and_then(|release| release.spec.sendfile_header.clone())
+                        .unwrap_or_default(),
                     error_pages: self
                         .store
                         .release(name, id)
@@ -2747,7 +2763,18 @@ impl Daemon {
                             .and_then(|release| release.spec.maintenance)
                             .as_ref(),
                     )),
-                    server: running.backend.server_message(name, id),
+                    server: running.backend.server_message(name, id).map(|mut server| {
+                        // Section 4.9: the release's file hint keys apply
+                        // to the server's responses, which are trusted.
+
+                        if let Ok(release) = self.store.release(name, id) {
+                            server.sendfile_roots = release.spec.sendfile_roots.clone();
+                            server.sendfile_header =
+                                release.spec.sendfile_header.clone().unwrap_or_default();
+                        }
+
+                        server
+                    }),
                 });
             }
         }
@@ -4687,6 +4714,8 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
             .as_ref()
             .is_some_and(|tls| tls.verify == Some(false)),
         trust_muru_headers: table.trust_muru_headers,
+        sendfile_roots: table.sendfile_roots.clone(),
+        sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),

@@ -179,6 +179,8 @@ message DeployRequest {
   string readiness_path = 38;               // the path probed until an instance answers 2xx or 3xx; any answer when empty
   optional uint64 readiness_timeout_ms = 39; // how long the instances get to be ready; 60 s when absent
   string stop_signal = 40;                  // the signal that stops an instance gracefully; the profile's when empty
+  repeated string sendfile_roots = 41;      // section 4.9: directories an X-Muru-Sendfile path must lie in; the table's when empty
+  optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
 }
 
 // One environment variable: a value, or a secret reference.

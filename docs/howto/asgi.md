@@ -3,10 +3,10 @@
 ```{admonition} Status
 :class: note
 
-Development mode serves ASGI over HTTP and WebSockets. Response trailers
-and the `pathsend` and `zerocopysend` file extensions are not served yet.
-WebSockets over HTTP/2 (extended CONNECT) are accepted but not yet covered
-by the test suite.
+Development mode serves ASGI over HTTP and WebSockets, with the
+`pathsend` and `zerocopysend` file extensions ([file hints](file-hints.md)).
+Response trailers are not served yet. WebSockets over HTTP/2 (extended
+CONNECT) are accepted but not yet covered by the test suite.
 ```
 
 Point `muructl run` at the ASGI callable, exactly as for WSGI:

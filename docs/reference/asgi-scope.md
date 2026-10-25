@@ -49,10 +49,13 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | `auth_request`, `original_method`, `original_uri`, `original_host` | Only on an [authentication sub-request](../howto/auth-subrequests.md): `True`, and the method, path and query, and host of the request being decided about; `internal` is `True` too, and the `redirect_*` keys are absent |
 
 A `websocket` scope also advertises `websocket.http.response`, so the
-application may decline the handshake with a response of its own. No
-other extension is advertised yet. Sending `http.response.trailers`,
-`http.response.pathsend` or `http.response.zerocopysend` raises
-`RuntimeError`, as it would under any server that does not announce them.
+application may decline the handshake with a response of its own. On
+`http` scopes `http.response.pathsend` and `http.response.zerocopysend`
+are advertised: the file named, or the open file with its `offset`,
+`count` and `more_body`, is sent by the edge from a duplicate of the
+descriptor (the [file hints](../howto/file-hints.md) page). Sending
+`http.response.trailers` raises `RuntimeError`, as it would under any
+server that does not announce it.
 
 ## Messages
 

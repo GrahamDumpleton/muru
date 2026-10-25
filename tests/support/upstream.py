@@ -3,8 +3,10 @@
 Each server answers every path with a JSON report of what it received,
 and a few paths do something else: `/slow` waits, `/status/NNN` answers
 that status, `/redirect` asks the edge for an internal redirect,
-`/health` answers 200 or 503 as the server's `healthy` flag says, and
-`/auth` decides like an authentication handler.
+`/health` answers 200 or 503 as the server's `healthy` flag says,
+`/sendfile` names the file of the request's `X-File` header in an
+`X-Muru-Sendfile` header, and `/auth` decides like an authentication
+handler.
 """
 
 from __future__ import annotations
@@ -81,6 +83,14 @@ class Upstream:
 
                 if name == "redirect":
                     self.reply(200, b"redirect", [("X-Muru-Redirect", "/internal-info")])
+                    return
+
+                if name == "sendfile":
+                    # Section 4.9: a file hint by path, naming the file the
+                    # request's X-File header asks for.
+
+                    hint = self.headers.get("X-File", "")
+                    self.reply(200, b"never sent", [("X-Muru-Sendfile", hint), ("X-App", "up")])
                     return
 
                 if name == "auth":

@@ -103,6 +103,14 @@ message UploadRef {
   string ref = 1;
 }
 
+// Payload of a FILE frame (section 5.7): the response body, or the next
+// piece of it, is `length` bytes of the file whose descriptor is attached
+// to the frame, from `offset`. The END flag ends the body with it.
+message FileHint {
+  uint64 offset = 1;
+  uint64 length = 2;
+}
+
 // How the worker should flush response body chunks (section 5.4).
 enum FlushPolicy {
   FLUSH_POLICY_UNSPECIFIED = 0;     // the worker's configured default

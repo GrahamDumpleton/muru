@@ -1164,8 +1164,10 @@ name = "muru-proto"
 version = "0.1.0-alpha.4"
 dependencies = [
  "bytes",
+ "libc",
  "prost",
  "protoc-bin-vendored",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-prost",

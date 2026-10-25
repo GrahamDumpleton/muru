@@ -270,6 +270,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         mounts: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
+        sendfile: Arc::default(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
         access_log,
@@ -1090,6 +1091,9 @@ struct Resolved {
     /// Section 4.10: the default mount's redirect settings from the table.
     accel_redirect: bool,
     cgi_local_redirect: bool,
+    /// Section 4.9: the default mount's file hints by path from the table.
+    sendfile_roots: Vec<String>,
+    sendfile_header: Option<String>,
     /// Section 4.12: the error pages, override and maintenance
     /// exemptions from the table.
     error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
@@ -1219,6 +1223,8 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         mounts: table.mounts,
         accel_redirect: table.accel_redirect.unwrap_or(false),
         cgi_local_redirect: table.cgi_local_redirect.unwrap_or(false),
+        sendfile_roots: table.sendfile_roots,
+        sendfile_header: table.sendfile_header,
         error_pages: table.error_pages,
         error_override: table.error_override,
         maintenance: table.maintenance,
@@ -1289,6 +1295,8 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         mounts: resolved.mounts.clone(),
         accel_redirect: resolved.accel_redirect.then_some(true),
         cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
+        sendfile_roots: resolved.sendfile_roots.clone(),
+        sendfile_header: resolved.sendfile_header.clone(),
         error_pages: resolved.error_pages.clone(),
         error_override: resolved.error_override.clone(),
         maintenance: resolved.maintenance.clone(),
@@ -1425,6 +1433,17 @@ fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
             cgi_local_redirect: mount
                 .cgi_local_redirect
                 .unwrap_or(resolved.cgi_local_redirect),
+            sendfile: muru_edge::routing::Sendfile::new(
+                mount
+                    .sendfile_roots
+                    .as_deref()
+                    .unwrap_or(&resolved.sendfile_roots),
+                mount
+                    .sendfile_header
+                    .as_deref()
+                    .or(resolved.sendfile_header.as_deref())
+                    .unwrap_or_default(),
+            ),
         })
         .collect()
 }
@@ -1636,6 +1655,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
     };
+    let sendfile = muru_edge::routing::Sendfile::new(
+        &resolved.sendfile_roots,
+        resolved.sendfile_header.as_deref().unwrap_or_default(),
+    );
 
     // Section 4.12: the project's error pages, with files under it.
 
@@ -1685,6 +1708,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         mounts: mounts.clone(),
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
+        sendfile: Arc::clone(&sendfile),
         errors: Arc::clone(&error_policy),
         development,
         access_log,
@@ -1849,7 +1873,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             redirect_flags,
                         )
                         .await
-                        .map(|pools| pools.with_errors(Arc::clone(&error_policy)));
+                        .map(|pools| {
+                            pools
+                                .with_errors(Arc::clone(&error_policy))
+                                .with_sendfile(Arc::clone(&sendfile))
+                        });
 
                         match connected {
                             Ok(connected) => {
@@ -1899,7 +1927,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     redirect_flags,
                                 )
                                 .await
-                                .map(|pools| pools.with_errors(Arc::clone(&error_policy)));
+                                .map(|pools| {
+                                    pools
+                                        .with_errors(Arc::clone(&error_policy))
+                                        .with_sendfile(Arc::clone(&sendfile))
+                                });
 
                                 match connected {
                                     Ok(connected) => pools.replace(connected),

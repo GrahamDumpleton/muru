@@ -13,6 +13,7 @@
 //! the request.
 
 use std::io;
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -502,8 +503,8 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
             .map(|asgi| u32::try_from(asgi.concurrency).unwrap_or(u32::MAX))
             .unwrap_or_default(),
         websockets: shared.asgi.is_some(),
+        files: true,
         max_message_size: MAX_MESSAGE_SIZE,
-        ..Default::default()
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -1113,6 +1114,54 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                         deadline = Some(Instant::now() + COALESCE_MAX_DELAY);
                     }
                 }
+            }
+            Some(Some(Outgoing::File {
+                fd,
+                offset,
+                length,
+                more,
+            })) => {
+                if ended {
+                    continue;
+                }
+
+                // Section 5.7: what was buffered goes first, then the head
+                // if it is still waiting, then the hint with the descriptor
+                // attached. The range is cut to the declared Content-Length.
+
+                if !buffer.is_empty() {
+                    let buffered = buffer.split().freeze();
+                    sent += buffered.len() as u64;
+                    write_body(
+                        writer,
+                        &mut pending_head,
+                        &mut head_written,
+                        buffered,
+                        false,
+                    )
+                    .await?;
+                }
+
+                if let Some(head) = pending_head.take() {
+                    frame::write(writer, kind::RESPONSE, 0, head).await?;
+                    head_written = true;
+                }
+
+                let length = match content_length {
+                    Some(declared) => length.min(declared.saturating_sub(sent)),
+                    None => length,
+                };
+
+                sent += length;
+                let end = !more || content_length == Some(sent);
+                let hint = pb::FileHint { offset, length }.encode_to_vec();
+                let flags = if end { flag::END } else { 0 };
+                let encoded = frame::encode(kind::FILE, flags, &hint);
+                muru_proto::descriptors::write_with_fd(writer, &encoded, fd.as_fd()).await?;
+                drop(fd);
+                ended |= end;
+                first_block_sent = true;
+                deadline = None;
             }
             Some(Some(Outgoing::Finished)) => unreachable!("mapped to the end of output above"),
             Some(Some(Outgoing::Continue)) => {

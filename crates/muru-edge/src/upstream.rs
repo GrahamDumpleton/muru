@@ -290,6 +290,9 @@ struct Shared {
     /// speaks TLS.
     tls: Option<(Arc<rustls::ClientConfig>, Option<String>)>,
     trust_muru_headers: bool,
+    /// The file hints by path the upstream may give when trusted
+    /// (section 4.9).
+    sendfile: Arc<crate::routing::Sendfile>,
     connect_timeout: Duration,
     eject_after: u32,
     eject_for: Duration,
@@ -365,6 +368,10 @@ impl Upstream {
             protocol,
             tls,
             trust_muru_headers: message.trust_muru_headers,
+            sendfile: crate::routing::Sendfile::new(
+                &message.sendfile_roots,
+                &message.sendfile_header,
+            ),
             connect_timeout: millis(message.connect_timeout_ms, DEFAULT_CONNECT_TIMEOUT),
             eject_after: message.eject_after,
             eject_for: millis(message.eject_for_ms, DEFAULT_EJECT_FOR),
@@ -401,6 +408,11 @@ impl Upstream {
     /// Whether X-Muru-Redirect from the upstream is honoured.
     pub fn trusts_muru_headers(&self) -> bool {
         self.shared.trust_muru_headers
+    }
+
+    /// The file hints by path the upstream may give (section 4.9).
+    pub fn sendfile(&self) -> Arc<crate::routing::Sendfile> {
+        Arc::clone(&self.shared.sendfile)
     }
 
     /// The health gauge of each address: 1 when it takes requests.
@@ -1093,6 +1105,19 @@ pub async fn handle(
         failing.put_recording(recording.take());
         drop(response);
         return Handled::Response(failing.respond(problem));
+    }
+
+    // Section 4.9: a trusted upstream's file hint by path is served by
+    // the edge like an application's.
+
+    if upgrade.is_none()
+        && shared.trust_muru_headers
+        && let Some(path) = link::sendfile_from(&head, &context.sendfile)
+    {
+        drop(response);
+        return Handled::Response(
+            link::serve_hint(&path, parts, context, &head, &failing, recording.take()).await,
+        );
     }
 
     // The upstream accepted the WebSocket: the connection is handed over

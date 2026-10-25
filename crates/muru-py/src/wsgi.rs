@@ -40,6 +40,18 @@ pub enum Outgoing {
     },
     /// One body chunk.
     Body(Bytes),
+    /// The body, or its next piece, is a range of a file the edge sends
+    /// itself (section 5.7): the descriptor goes on a FILE frame.
+    File {
+        /// A duplicate of the application's descriptor, closed once sent.
+        fd: std::os::fd::OwnedFd,
+        /// Where the range starts.
+        offset: u64,
+        /// How long it is.
+        length: u64,
+        /// Body chunks follow it rather than ending the response.
+        more: bool,
+    },
     /// The application failed: before the head, in which case the edge
     /// renders the error page from the reason and detail (section 4.12),
     /// or after it, in which case the stream ends with the error.
@@ -184,6 +196,47 @@ impl StartResponse {
         self.ensure_head_sent(py)?;
 
         if self.sink.send(py, Outgoing::Body(data)) {
+            Ok(())
+        } else {
+            Err(PyBrokenPipeError::new_err("the client went away"))
+        }
+    }
+
+    /// The Content-Length the application declared, while the head is
+    /// still to be sent.
+    fn declared_length(&self) -> Option<u64> {
+        let state = self.state.lock().expect("head state poisoned");
+
+        if state.sent {
+            return None;
+        }
+
+        state
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(b"content-length"))
+            .and_then(|(_, value)| std::str::from_utf8(value).ok()?.trim().parse().ok())
+    }
+
+    /// Hand the whole body to the edge as a range of a file (section 5.7).
+    fn send_file(
+        &self,
+        py: Python<'_>,
+        fd: std::os::fd::OwnedFd,
+        offset: u64,
+        length: u64,
+    ) -> PyResult<()> {
+        self.ensure_head_sent(py)?;
+
+        if self.sink.send(
+            py,
+            Outgoing::File {
+                fd,
+                offset,
+                length,
+                more: false,
+            },
+        ) {
             Ok(())
         } else {
             Err(PyBrokenPipeError::new_err("the client went away"))
@@ -965,7 +1018,14 @@ fn run_app<'py>(
     let input = Bound::new(py, Input::new(body_rx, announce, interrupt))?;
     let environ = build_environ(py, shared, head, input)?;
     let result = app.bind(py).call1((environ, start_response))?;
-    let outcome = iterate(py, &result, start_response.get(), cancelled);
+
+    // Section 6.5: a file the edge can send itself goes by descriptor;
+    // anything else is iterated.
+
+    let outcome = match file_range(py, &result, start_response.get()) {
+        Some((fd, offset, length)) => start_response.get().send_file(py, fd, offset, length),
+        None => iterate(py, &result, start_response.get(), cancelled),
+    };
 
     // PEP 3333: close() is called whether or not the iteration completed.
     // An error from close() is reported but does not fail a response that
@@ -1036,14 +1096,92 @@ fn iterate(
     start_response.ensure_head_sent(py)
 }
 
+/// Section 6.5: the range of a regular file the edge sends in place of
+/// iterating the response, when the application returned the object from
+/// `wsgi.file_wrapper` itself and nothing has been written yet. The range
+/// starts at the file's position and covers the declared Content-Length,
+/// or the rest of the file. None means the response is iterated as PEP
+/// 3333 describes.
+fn file_range(
+    py: Python<'_>,
+    result: &Bound<'_, PyAny>,
+    start_response: &StartResponse,
+) -> Option<(std::os::fd::OwnedFd, u64, u64)> {
+    let wrapper = result.cast::<FileWrapper>().ok()?;
+
+    if start_response.head_sent() {
+        return None;
+    }
+
+    let (fd, position, size) = wrapper.get().descriptor(py)?;
+    let length = start_response
+        .declared_length()
+        .unwrap_or_else(|| size.saturating_sub(position))
+        .min(size.saturating_sub(position));
+
+    if length == 0 {
+        return None;
+    }
+
+    Some((fd, position, length))
+}
+
 /// `wsgi.file_wrapper`: iterate a file-like object in blocks, and close it.
 ///
-/// Phase 1 scope: the iteration form only. Descriptor passing to the edge
-/// (section 5.7) follows with the FILE frame.
+/// Returned as the response iterable itself, with a regular file behind
+/// it, the bridge passes a duplicate of its descriptor to the edge instead
+/// (section 5.7); iteration is the fallback for everything else.
 #[pyclass(frozen, module = "muru._native")]
 pub struct FileWrapper {
     file: Py<PyAny>,
     block_size: usize,
+}
+
+impl FileWrapper {
+    /// A duplicate of the file's descriptor with its position and size,
+    /// when it is a regular file.
+    fn descriptor(&self, py: Python<'_>) -> Option<(std::os::fd::OwnedFd, u64, u64)> {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+
+        let file = self.file.bind(py);
+        let raw = file
+            .call_method0(intern!(py, "fileno"))
+            .ok()?
+            .extract::<i32>()
+            .ok()?;
+
+        if raw < 0 {
+            return None;
+        }
+
+        // SAFETY: the descriptor is the application's open file, alive for
+        // the call since the application object holding it is.
+
+        let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+        let copy = std::fs::File::from(borrowed.try_clone_to_owned().ok()?);
+        let size = copy
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())?
+            .len();
+
+        // The file's own position: Python buffers reads, so its tell() is
+        // the truth, and the descriptor's offset is a fallback for a raw
+        // file object.
+
+        let position = file
+            .call_method0(intern!(py, "tell"))
+            .and_then(|value| value.extract::<u64>())
+            .ok()
+            .or_else(|| {
+                // SAFETY: lseek on a descriptor this process owns.
+
+                let offset = unsafe { libc::lseek(copy.as_raw_fd(), 0, libc::SEEK_CUR) };
+                u64::try_from(offset).ok()
+            })?;
+
+        Some((copy.into(), position, size))
+    }
 }
 
 #[pymethods]
