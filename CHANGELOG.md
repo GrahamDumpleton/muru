@@ -26,6 +26,7 @@ breaking changes, which are listed under each release.
 
 ### Fixed
 
+- A client whose WebSocket message was over the limit, or whose frame was malformed, could see the connection reset instead of the 1009 or 1002 close frame: the edge now reads away what the client is still sending before it drops the socket.
 - Streaming responses (`text/event-stream` or `X-Accel-Buffering: no`) and accepted WebSockets no longer count toward the hard timeout, which replaced the worker of a long-lived WebSocket as if its request were stuck.
 - The daemon's once-a-second work (host and edge checks, retention, log rotation, rollout gates and the autoscaler) no longer stalls while admin requests arrive more often than once a second.
 - `muructl daemon stop` and `muructl daemon upgrade` bound every exchange with the daemon, so a daemon that accepts a connection and never answers cannot hold the command past its `--timeout`; the daemon also closes its API connections once the shutdown grace period ends.

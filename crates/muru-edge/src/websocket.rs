@@ -7,7 +7,7 @@
 //! Masking, fragment reassembly, pings and pongs never reach the worker.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -19,6 +19,7 @@ use hyper_util::rt::TokioIo;
 use muru_proto::frame::{self, flag, kind};
 use muru_proto::worker::v1 as pb;
 use prost::Message as _;
+use tokio::io::AsyncReadExt as _;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -151,6 +152,9 @@ struct Closing {
     told_worker: bool,
     /// A close frame has been sent to the client.
     told_client: bool,
+    /// The client was cut off in the middle of a message, so the rest of
+    /// it is still arriving and is read away before the socket is dropped.
+    drain_client: bool,
 }
 
 impl Closing {
@@ -330,6 +334,16 @@ pub(crate) async fn relay(relay: Relay) {
     // request; one that broke off takes its connection with it.
 
     let intact = intact && closing.complete();
+
+    // Dropping a socket with bytes unread resets the connection, and a reset
+    // discards the close frame queued before it at the client. What the
+    // client is still sending is read away first, until it hangs up on
+    // seeing the close frame or the time allowed for the handshake is up.
+
+    if closing.drain_client {
+        drain(socket.get_mut(), limits.response_idle_timeout).await;
+    }
+
     let _ = socket.close(None).await;
     back.give_writer(intact.then_some(writer));
     back.give_reader(intact.then_some(reader));
@@ -409,10 +423,13 @@ where
             Ok(0)
         }
         Some(Err(WsError::Capacity(_))) => {
-            // Section 4.18: a message over the limit is 1009.
+            // Section 4.18: a message over the limit is 1009. The stream has
+            // ended at the frame layer with the message still arriving.
 
             let _ = close_client(socket, 1009, "message too large").await;
             closing.told_client = true;
+            closing.stream_done = true;
+            closing.drain_client = true;
             tell_worker(writer, closing, 1009, "message too large").await?;
             Ok(0)
         }
@@ -430,6 +447,7 @@ where
             let _ = close_client(socket, 1002, &reason).await;
             closing.told_client = true;
             closing.stream_done = true;
+            closing.drain_client = true;
             tell_worker(writer, closing, 1002, &reason).await?;
             Ok(0)
         }
@@ -437,6 +455,7 @@ where
             let _ = close_client(socket, 1007, "invalid UTF-8").await;
             closing.told_client = true;
             closing.stream_done = true;
+            closing.drain_client = true;
             tell_worker(writer, closing, 1007, "invalid UTF-8").await?;
             Ok(0)
         }
@@ -479,9 +498,50 @@ where
     socket.close(Some(frame)).await
 }
 
+/// Read and discard what the client still sends, until it hangs up or
+/// `wait` has passed, so that the socket can be dropped without a reset.
+async fn drain<S>(stream: &mut S, wait: Duration)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut scratch = [0u8; 16 * 1024];
+    let deadline = tokio::time::Instant::now() + wait;
+
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut scratch)).await {
+            Ok(Ok(read)) if read > 0 => {}
+            _ => break,
+        }
+    }
+}
+
 /// Record the socket in the access log as the 101 it began with.
 fn finish(recording: Option<Recording>, bytes: u64) {
     if let Some(recording) = recording {
         recording.complete(101, "", bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_reads_to_the_end_of_the_stream() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let sender = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut client, &[0u8; 100_000])
+                .await
+                .unwrap();
+        });
+
+        drain(&mut server, Duration::from_secs(5)).await;
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_gives_up_when_the_time_is_up() {
+        let (_client, mut server) = tokio::io::duplex(1024);
+        drain(&mut server, Duration::from_millis(100)).await;
     }
 }
