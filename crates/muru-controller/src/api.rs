@@ -706,6 +706,15 @@ impl Service {
                 .ensure_app(app)
                 .map(|_| "created".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::SetAppIdentity {
+                app,
+                user,
+                group,
+                umask,
+            } => store
+                .set_app_identity(app, user.as_deref(), group.as_deref(), umask.as_deref())
+                .map(|()| "set".to_owned())
+                .map_err(|error| error.to_string()),
             Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
@@ -856,6 +865,9 @@ fn app_message(app: crate::model::App) -> pb::App {
         previous_release: app.previous.unwrap_or_default(),
         resource_version: app.resource_version,
         created_unix_ms: app.created_unix_ms,
+        user: app.user.unwrap_or_default(),
+        group: app.group.unwrap_or_default(),
+        umask: app.umask.unwrap_or_default(),
     }
 }
 

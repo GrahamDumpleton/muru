@@ -28,6 +28,18 @@ pub enum Action {
         /// The application.
         app: String,
     },
+    /// Set the user, group and umask an application's processes run
+    /// with (section 10.9).
+    SetAppIdentity {
+        /// The application.
+        app: String,
+        /// The user, or none for the daemon's.
+        user: Option<String>,
+        /// The group, or none for the user's primary group.
+        group: Option<String>,
+        /// The umask, in octal, or none for the daemon's.
+        umask: Option<String>,
+    },
     /// Create a release with this spec and move traffic to it.
     Deploy {
         /// The application.
@@ -84,6 +96,7 @@ impl Action {
     pub fn name(&self) -> &'static str {
         match self {
             Action::CreateApp { .. } => "create-app",
+            Action::SetAppIdentity { .. } => "set-identity",
             Action::Deploy { .. } => "deploy",
             Action::RemoveRelease { .. } => "remove-release",
             Action::RemoveApp { .. } => "remove-app",
@@ -122,7 +135,9 @@ impl Change {
     /// route HOST PATH.
     pub fn subject(&self) -> String {
         match &self.action {
-            Action::CreateApp { app } | Action::RemoveApp { app } => app.clone(),
+            Action::CreateApp { app }
+            | Action::RemoveApp { app }
+            | Action::SetAppIdentity { app, .. } => app.clone(),
             Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
                 format!("{app}@{id}")
             }
@@ -222,12 +237,61 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         return;
     }
 
-    if store.app(name).is_err() {
+    let stored = store.app(name).ok();
+
+    if stored.is_none() {
         plan.changes.push(Change {
             action: Action::CreateApp {
                 app: name.to_owned(),
             },
             detail: String::new(),
+        });
+    }
+
+    // Section 10.9: the identity is set whenever the table says
+    // something different from the record.
+
+    if let Some(umask) = &app.umask
+        && !crate::model::valid_umask(umask)
+    {
+        plan.errors.push(format!(
+            "{name}: umask must be octal digits such as 027, not {umask:?}"
+        ));
+        return;
+    }
+
+    if app.group.is_some() && app.user.is_none() {
+        plan.errors
+            .push(format!("{name}: a group needs a user as well"));
+        return;
+    }
+
+    let same = stored.as_ref().is_some_and(|stored| {
+        stored.user == app.user && stored.group == app.group && stored.umask == app.umask
+    });
+
+    if !same && (stored.is_some() || app.user.is_some() || app.umask.is_some()) {
+        plan.changes.push(Change {
+            action: Action::SetAppIdentity {
+                app: name.to_owned(),
+                user: app.user.clone(),
+                group: app.group.clone(),
+                umask: app.umask.clone(),
+            },
+            detail: match &app.user {
+                Some(user) => format!(
+                    "user {user}{}{}",
+                    app.group
+                        .as_ref()
+                        .map(|group| format!(", group {group}"))
+                        .unwrap_or_default(),
+                    app.umask
+                        .as_ref()
+                        .map(|umask| format!(", umask {umask}"))
+                        .unwrap_or_default()
+                ),
+                None => "the daemon's own user".to_owned(),
+            },
         });
     }
 
@@ -618,7 +682,12 @@ pub fn export(
     for app in apps {
         let mut releases = store.releases(Some(&app.name))?;
         releases.sort_by_key(|release| release_order(&release.id));
-        let mut table = AppTable::default();
+        let mut table = AppTable {
+            user: app.user.clone(),
+            group: app.group.clone(),
+            umask: app.umask.clone(),
+            ..AppTable::default()
+        };
 
         for release in releases {
             let serves = app.current.as_deref() == Some(release.id.as_str());

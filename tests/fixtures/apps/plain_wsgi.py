@@ -25,10 +25,21 @@ REQUEST_MARK: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+def umask_of_process() -> int:
+    """Read the file creation mask without changing it for long."""
+
+    current = os.umask(0)
+    os.umask(current)
+    return current
+
+
 def info() -> dict[str, Any]:
     is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
     return {
         "pid": os.getpid(),
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "umask": oct(umask_of_process()),
         "gc_enabled": gc.isenabled(),
         "gc_frozen": gc.get_freeze_count(),
         "threads": threading.active_count(),

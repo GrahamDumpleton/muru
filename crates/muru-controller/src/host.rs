@@ -316,6 +316,66 @@ pub struct HostSpec {
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
+    /// The user and group the host runs as, and its umask, when the
+    /// daemon is root and the application names them (section 10.9).
+    pub identity: Option<Identity>,
+}
+
+/// Whom a host runs as (section 10.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    /// The user id.
+    pub uid: u32,
+    /// The group id.
+    pub gid: u32,
+    /// The file creation mask, or none to keep the daemon's.
+    pub umask: Option<u32>,
+}
+
+impl Identity {
+    /// Look a user and group up by name: the group defaults to the
+    /// user's primary group.
+    pub fn lookup(user: &str, group: Option<&str>, umask: Option<u32>) -> anyhow::Result<Self> {
+        let user_name = std::ffi::CString::new(user)?;
+
+        // SAFETY: getpwnam takes a NUL-terminated name and returns a
+        // pointer to static storage or null; the fields are read at once.
+
+        let (uid, primary) = unsafe {
+            let entry = libc::getpwnam(user_name.as_ptr());
+            anyhow::ensure!(!entry.is_null(), "no user named {user}");
+            ((*entry).pw_uid, (*entry).pw_gid)
+        };
+
+        let gid = match group {
+            None => primary,
+            Some(group) => {
+                let group_name = std::ffi::CString::new(group)?;
+
+                // SAFETY: as for getpwnam.
+
+                unsafe {
+                    let entry = libc::getgrnam(group_name.as_ptr());
+                    anyhow::ensure!(!entry.is_null(), "no group named {group}");
+                    (*entry).gr_gid
+                }
+            }
+        };
+
+        Ok(Self { uid, gid, umask })
+    }
+
+    /// Whether this process may switch to another user.
+    pub fn can_switch() -> bool {
+        // SAFETY: geteuid has no preconditions.
+
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Give a path to the identity's user and group.
+    pub fn own(&self, path: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid))
+    }
 }
 
 /// A named mount, as the host loads it.
@@ -411,13 +471,34 @@ impl HostProcess {
                 command.stdout(log.try_clone()?).stderr(log);
 
                 // Its own session, so the daemon's signals and terminal do
-                // not reach it.
-                // SAFETY: setsid is async-signal-safe and the closure runs
-                // in the child between fork and exec.
+                // not reach it, and the application's identity (section
+                // 10.9) when one is set.
+
+                let identity = spec.identity;
+
+                // SAFETY: setsid, setgroups, setgid, setuid and umask are
+                // async-signal-safe and the closure runs in the child
+                // between fork and exec, touching nothing else.
 
                 unsafe {
-                    command.pre_exec(|| {
+                    command.pre_exec(move || {
                         libc::setsid();
+
+                        if let Some(identity) = identity {
+                            let groups = [identity.gid as libc::gid_t];
+
+                            if libc::setgroups(1, groups.as_ptr()) != 0
+                                || libc::setgid(identity.gid as libc::gid_t) != 0
+                                || libc::setuid(identity.uid as libc::uid_t) != 0
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+
+                            if let Some(mask) = identity.umask {
+                                libc::umask(mask as libc::mode_t);
+                            }
+                        }
+
                         Ok(())
                     });
                 }

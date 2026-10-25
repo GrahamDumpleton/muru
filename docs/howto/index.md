@@ -24,6 +24,7 @@ asgi
 starlette-and-fastapi
 daemon
 secrets
+users
 virtual-hosts
 behind-a-proxy
 worker-groups

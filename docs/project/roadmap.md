@@ -211,5 +211,11 @@ Server-Sent Events on `/v1/history/stream`, streams events as rendered
 rows and JSON on `/v1/events/stream`, and the pages draw the charts with
 uPlot and take live events through the htmx SSE extension, both
 vendored; a development run has the same charts (worker inspection
-views and mutating actions later). Next from phase 2: per-application
-users.
+views and mutating actions later). Per-application users (section 10.9)
+have their first slice: an application's `user`, `group` and `umask`
+are recorded, applied and exported, a root daemon gives the release's
+directories, secret files and log to the user and starts the host with
+that identity, and a daemon that is not root records an
+`app.user_not_applied` warning (cgroup limits and the admin group
+later). That completes the phase 2 scope; what remains is the exit
+run under sustained load in the virtual machine and the next alpha.

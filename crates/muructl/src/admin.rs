@@ -1456,14 +1456,26 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {:<12}", "APP", "CURRENT", "PREVIOUS");
+    println!("{:<20} {:<12} {:<12} USER", "APP", "CURRENT", "PREVIOUS");
 
     for app in apps {
+        let user = if app.user.is_empty() {
+            "-".to_owned()
+        } else if app.group.is_empty() {
+            app.user.clone()
+        } else {
+            format!("{}:{}", app.user, app.group)
+        };
         println!(
-            "{:<20} {:<12} {:<12}",
+            "{:<20} {:<12} {:<12} {user}{}",
             app.name,
             or_dash(&app.current_release),
-            or_dash(&app.previous_release)
+            or_dash(&app.previous_release),
+            if app.umask.is_empty() {
+                String::new()
+            } else {
+                format!(" umask {}", app.umask)
+            }
         );
     }
 

@@ -1546,6 +1546,44 @@ impl Daemon {
         let spec = &release.spec;
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
 
+        // Section 10.9: under a root daemon the host runs as the
+        // application's user; otherwise a configured user is reported
+        // as not applied.
+
+        let identity = match self.store.app(app).ok().and_then(|record| {
+            record
+                .user
+                .clone()
+                .map(|user| (user, record.group.clone(), record.umask.clone()))
+        }) {
+            Some((user, group, umask)) if crate::host::Identity::can_switch() => {
+                let mask = umask
+                    .as_deref()
+                    .and_then(|text| u32::from_str_radix(text, 8).ok());
+
+                match crate::host::Identity::lookup(&user, group.as_deref(), mask) {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        let message = format!("the application's user cannot be used: {error:#}");
+                        self.set_state(&release, ReleaseState::Failed, &message);
+                        self.events
+                            .emit("release.failed", &subject, "error", &message);
+                        return Err(message);
+                    }
+                }
+            }
+            Some((user, _, _)) => {
+                self.events.emit(
+                    "app.user_not_applied",
+                    &subject,
+                    "warning",
+                    &format!("user {user} not applied: the daemon is not root"),
+                );
+                None
+            }
+            None => None,
+        };
+
         // Section 10.8: secrets are resolved now, for this start, and
         // delivered as variables or as files only the host can read.
 
@@ -1582,6 +1620,7 @@ impl Daemon {
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
             memory: spec.memory.clone(),
             env,
+            identity,
             groups: spec
                 .groups
                 .iter()
@@ -1605,6 +1644,44 @@ impl Daemon {
                 .collect(),
         };
         let started = Instant::now();
+
+        // The release's directories, its secret files and its log belong
+        // to the user the host runs as, so it can bind its sockets,
+        // read its secrets and reopen its log.
+
+        if let Some(identity) = identity {
+            let owned = [run_dir.clone(), run_dir.join("r1"), run_dir.join("secrets")];
+
+            for path in &owned {
+                let _ = std::fs::create_dir_all(path);
+            }
+
+            let mut paths: Vec<PathBuf> = owned.to_vec();
+
+            if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
+                paths.extend(entries.flatten().map(|entry| entry.path()));
+            }
+
+            let log = self.host_log(app, id);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log);
+            paths.push(log);
+
+            for path in paths {
+                if let Err(error) = identity.own(&path) {
+                    let message = format!(
+                        "giving {} to the application's user failed: {error}",
+                        path.display()
+                    );
+                    self.set_state(&release, ReleaseState::Failed, &message);
+                    self.events
+                        .emit("release.failed", &subject, "error", &message);
+                    return Err(message);
+                }
+            }
+        }
 
         let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs) {
             Ok(host) => host,

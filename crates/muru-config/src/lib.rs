@@ -852,6 +852,16 @@ pub struct App {
     /// Releases by identifier.
     #[serde(default)]
     pub release: BTreeMap<String, Release>,
+    /// The user the application's hosts and workers run as, when the
+    /// daemon runs as root (section 10.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The group, else the user's primary group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The file creation mask, in octal, for example 027.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umask: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -960,6 +970,15 @@ impl Document {
 
         for (name, app) in other.app {
             let entry = self.app.entry(name.clone()).or_default();
+
+            // The identity (section 10.9) comes along; a later file that
+            // sets it replaces an earlier one's.
+
+            if app.user.is_some() || app.group.is_some() || app.umask.is_some() {
+                entry.user = app.user;
+                entry.group = app.group;
+                entry.umask = app.umask;
+            }
 
             for (id, release) in app.release {
                 if entry.release.contains_key(&id) {
@@ -1186,6 +1205,7 @@ mod tests {
                         ..Release::default()
                     },
                 )]),
+                ..App::default()
             },
         );
         document.host.insert(

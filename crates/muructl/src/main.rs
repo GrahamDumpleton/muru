@@ -1241,6 +1241,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             name,
             App {
                 release: std::collections::BTreeMap::from([("r1".to_owned(), release)]),
+                ..App::default()
             },
         )]),
         ..Document::default()
@@ -1499,6 +1500,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 )),
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
+        identity: None,
     };
 
     let logs = Logs::default();

@@ -134,6 +134,19 @@ class Daemon:
         finally:
             connection.close()
 
+    @staticmethod
+    def request_static(port: int, path: str = "/") -> support.Response:
+        """One request to a daemon this test did not start, by port."""
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+
+        try:
+            connection.request("GET", path)
+            raw = connection.getresponse()
+            return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
+        finally:
+            connection.close()
+
     @property
     def https_port(self) -> int | None:
         """The first TLS listener's port, when the daemon has one."""

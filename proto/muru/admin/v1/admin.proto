@@ -107,6 +107,9 @@ message App {
   string previous_release = 3;      // the release a rollback restores, if any
   uint64 resource_version = 4;
   uint64 created_unix_ms = 5;
+  string user = 6;                  // the user its processes run as under a root daemon (section 10.9)
+  string group = 7;
+  string umask = 8;                 // octal
 }
 
 // A deploy names the application (created on first use) and the source.

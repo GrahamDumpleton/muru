@@ -339,6 +339,37 @@ pub struct App {
     pub created_unix_ms: u64,
     /// For optimistic concurrency.
     pub resource_version: u64,
+    /// The user its hosts and workers run as, when the daemon is root
+    /// (section 10.9).
+    pub user: Option<String>,
+    /// The group, else the user's primary group.
+    pub group: Option<String>,
+    /// The file creation mask, in octal.
+    pub umask: Option<String>,
+}
+
+impl App {
+    /// The identity as one phrase, or none.
+    pub fn describe_identity(&self) -> Option<String> {
+        let user = self.user.as_ref()?;
+        let mut text = user.clone();
+
+        if let Some(group) = &self.group {
+            text.push(':');
+            text.push_str(group);
+        }
+
+        if let Some(umask) = &self.umask {
+            text.push_str(&format!(" umask {umask}"));
+        }
+
+        Some(text)
+    }
+}
+
+/// Whether a string is an octal file creation mask such as 027.
+pub fn valid_umask(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 4 && text.chars().all(|c| ('0'..='7').contains(&c))
 }
 
 /// One state change (section 11.5).
