@@ -1388,13 +1388,139 @@ pub struct RouteTarget {
     pub upstream: Option<String>,
 }
 
-/// What an overlay changes on an application.
+/// What an overlay changes on an application: its maintenance mode, and
+/// the capacity of section 7.5, for its default worker group or `group`.
+/// Capacity does not conflict between overlays: the highest floor and
+/// ceiling stand.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppOverlay {
     /// Maintenance mode (section 4.12) while the overlay is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<bool>,
+    /// The worker group the capacity applies to; the default group
+    /// without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The fewest workers, a floor over the group's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workers: Option<u32>,
+    /// The most workers, a ceiling over the group's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<u32>,
+    /// `hold` keeps the group from scaling in; `normal` (the default)
+    /// leaves it to the autoscaler's rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_in: Option<String>,
+    /// Refuse deploys and rollouts of the application unless overridden
+    /// (section 9.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_deploys: Option<bool>,
+}
+
+impl AppOverlay {
+    /// Whether it sets any capacity.
+    pub fn sets_capacity(&self) -> bool {
+        self.min_workers.is_some() || self.max_workers.is_some() || self.scale_in.is_some()
+    }
+}
+
+/// An `[[app.NAME.schedule]]` entry (section 7.5): capacity for a window,
+/// shorthand for an overlay named `APP.NAME` that sets only the floor,
+/// the ceiling, how scale-in behaves and a deploy freeze.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacitySchedule {
+    /// The schedule's name, unique within the application.
+    pub name: String,
+    /// A one-off window's start, as for an overlay's schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// A one-off window's end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// A recurring window's start times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// A recurring window's length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    /// The time zone of local times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// The worker group; the default group without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workers: Option<u32>,
+    /// The ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<u32>,
+    /// How long before each window the floor applies, such as 30m.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_up: Option<String>,
+    /// `hold` or `normal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_in: Option<String>,
+    /// Refuse deploys and rollouts during the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_deploys: Option<bool>,
+}
+
+impl CapacitySchedule {
+    /// The overlay the schedule stands for, on application `app`.
+    pub fn overlay(&self, app: &str) -> Overlay {
+        let change = AppOverlay {
+            maintenance: None,
+            group: self.group.clone(),
+            min_workers: self.min_workers,
+            max_workers: self.max_workers,
+            scale_in: self.scale_in.clone(),
+            freeze_deploys: self.freeze_deploys,
+        };
+        let schedule = OverlaySchedule {
+            start: self.start.clone(),
+            end: self.end.clone(),
+            cron: self.cron.clone(),
+            duration: self.duration.clone(),
+            timezone: self.timezone.clone(),
+        };
+        Overlay {
+            apps: BTreeMap::from([(app.to_owned(), change)]),
+            trigger: Some(OverlayTrigger {
+                schedule: Some(schedule),
+            }),
+            warm_up: self.warm_up.clone().map(|lead| WarmUp {
+                lead,
+                start_release: None,
+            }),
+            ..Overlay::default()
+        }
+    }
+
+    /// The schedule an overlay named `APP.NAME` stands for, as (APP,
+    /// schedule), when it is one.
+    pub fn from_overlay(name: &str, overlay: &Overlay) -> Option<(String, Self)> {
+        let (app, schedule_name) = name.split_once('.')?;
+        let change = overlay.apps.get(app)?;
+        let schedule = overlay.trigger.as_ref()?.schedule.as_ref()?;
+        let found = Self {
+            name: schedule_name.to_owned(),
+            start: schedule.start.clone(),
+            end: schedule.end.clone(),
+            cron: schedule.cron.clone(),
+            duration: schedule.duration.clone(),
+            timezone: schedule.timezone.clone(),
+            group: change.group.clone(),
+            min_workers: change.min_workers,
+            max_workers: change.max_workers,
+            warm_up: overlay.warm_up.as_ref().map(|warm_up| warm_up.lead.clone()),
+            scale_in: change.scale_in.clone(),
+            freeze_deploys: change.freeze_deploys,
+        };
+        (found.overlay(app) == *overlay).then(|| (app.to_owned(), found))
+    }
 }
 
 /// When an overlay is active on its own.
@@ -1510,10 +1636,45 @@ pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
             .map_err(|error| format!("overlay {name}: warm_up.lead: {error}"))?;
     }
 
+    for (app, change) in &overlay.apps {
+        check_app_overlay(change)
+            .map_err(|error| format!("overlay {name}: apps.{app}: {error}"))?;
+    }
+
     if (overlay.latch.is_some() || overlay.advisory.is_some()) && schedule.is_none() {
         return Err(format!(
             "overlay {name}: latch and advisory apply to a schedule, and it has none"
         ));
+    }
+
+    Ok(())
+}
+
+/// Check what an overlay sets on an application: a floor of at least
+/// one, no higher than the ceiling, and a known `scale_in`.
+fn check_app_overlay(change: &AppOverlay) -> Result<(), String> {
+    if change.maintenance.is_none() && !change.sets_capacity() && change.freeze_deploys.is_none() {
+        return Err("sets nothing".to_owned());
+    }
+
+    if change.group.is_some() && !change.sets_capacity() {
+        return Err("group names where capacity applies, and none is set".to_owned());
+    }
+
+    if change.min_workers == Some(0) {
+        return Err("min_workers must be at least 1".to_owned());
+    }
+
+    if let (Some(min), Some(max)) = (change.min_workers, change.max_workers)
+        && max < min
+    {
+        return Err(format!("max_workers {max} is below min_workers {min}"));
+    }
+
+    if let Some(scale_in) = &change.scale_in
+        && !matches!(scale_in.as_str(), "hold" | "normal")
+    {
+        return Err(format!("scale_in {scale_in:?} is not hold or normal"));
     }
 
     Ok(())
@@ -2780,6 +2941,9 @@ pub struct App {
     /// Releases by identifier.
     #[serde(default)]
     pub release: BTreeMap<String, Release>,
+    /// Scheduled capacity (section 7.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule: Vec<CapacitySchedule>,
     /// The user the application's hosts and workers run as, when the
     /// daemon runs as root (section 10.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2985,6 +3149,17 @@ impl Document {
                 }
 
                 entry.release.insert(id, release);
+            }
+
+            for schedule in app.schedule {
+                if entry.schedule.iter().any(|seen| seen.name == schedule.name) {
+                    return Err(format!(
+                        "schedule {} of {name} is declared twice",
+                        schedule.name
+                    ));
+                }
+
+                entry.schedule.push(schedule);
             }
         }
 
@@ -3275,6 +3450,17 @@ mod tests {
                 "apps.shop = { maintenance = true }\nlatch = true",
                 "latch and advisory apply to a schedule",
             ),
+            ("apps.shop = {}", "apps.shop: sets nothing"),
+            ("apps.shop = { min_workers = 0 }", "at least 1"),
+            (
+                "apps.shop = { min_workers = 4, max_workers = 2 }",
+                "below min_workers",
+            ),
+            ("apps.shop = { scale_in = 'never' }", "not hold or normal"),
+            (
+                "apps.shop = { group = 'reports', maintenance = true }",
+                "none is set",
+            ),
             (
                 "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = '2026-11-02T09:00', end = '2026-11-02T08:00', timezone = 'UTC' } }",
                 "end must be after",
@@ -3283,6 +3469,28 @@ mod tests {
             let error = check_overlay("o", &overlay(text)).unwrap_err();
             assert!(error.contains(expected), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn capacity_schedules_are_overlays_and_back() {
+        let document = Document::parse(
+            "[[app.shop.schedule]]\nname = 'black-friday'\nstart = '2026-11-27T00:00'\nend = '2026-11-30T23:59'\ntimezone = 'America/New_York'\nmin_workers = 24\nmax_workers = 48\nwarm_up = '30m'\nscale_in = 'hold'\nfreeze_deploys = true\n",
+        )
+        .unwrap();
+        let schedule = &document.app["shop"].schedule[0];
+        let overlay = schedule.overlay("shop");
+        assert!(check_overlay("shop.black-friday", &overlay).is_ok());
+        assert_eq!(overlay.apps["shop"].min_workers, Some(24));
+        assert_eq!(overlay.warm_up.as_ref().unwrap().lead, "30m");
+        assert_eq!(
+            CapacitySchedule::from_overlay("shop.black-friday", &overlay),
+            Some(("shop".to_owned(), schedule.clone()))
+        );
+        assert_eq!(CapacitySchedule::from_overlay("backup", &overlay), None);
+
+        let mut merged = document.clone();
+        let error = merged.merge(document).unwrap_err();
+        assert!(error.contains("schedule black-friday of shop is declared twice"));
     }
 
     #[test]

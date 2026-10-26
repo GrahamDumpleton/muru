@@ -71,7 +71,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | traffic: split, sticky, hash_key, salt, sticky_grace | route | 100% to newest ready release, off, cookie, per route, 10m | 9.4 |
 | retention of superseded releases | application | 30m | 9.1 |
 | reload.mode, paths, include, exclude, respect_gitignore, debounce, poll | application | off, source, `**/*.py`, none, true, 300ms, false | 9.8 |
-| schedules (cron or start and end, duration, timezone, min_workers, max_workers, warm_up, scale_in, freeze_deploys) | application, group | none | 7.5 |
+| schedules (name, start and end or cron and duration, timezone, group, min_workers, max_workers, warm_up, scale_in, freeze_deploys) | application, group | none | 7.5 |
 | wsgi_multiprocess, wsgi_multithread | release | auto | 6.5 |
 | logging.python level, format, request_id, capture_warnings, loggers | global, application, release | WARNING (Python default), standard, false, false, none | 11.4 |
 | rotate (size, every, keep, compress, naming), reopen_on_rename, on_overflow | log sinks | daily, 14, zstd, built-in | 11.3 |
@@ -108,7 +108,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Category | Types (prefix dev.muru.) |
 | --- | --- |
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
-| Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back |
+| Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened |

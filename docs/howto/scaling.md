@@ -3,10 +3,10 @@
 ```{admonition} Status
 :class: note
 
-The spare and target modes with their windows and churn budget, pins and
-`muructl scale status`, under the daemon. Scheduled capacity, node budgets
-across applications, worker CPU and GIL signals, and scale to zero are
-still to come.
+The spare and target modes with their windows and churn budget, pins,
+scheduled capacity and `muructl scale status`, under the daemon. Node
+budgets across applications, worker CPU and GIL signals, and scale to
+zero are still to come.
 ```
 
 A worker group has a fixed number of processes unless it is given a
@@ -106,6 +106,74 @@ to `min_workers` when below it. In static mode the table takes no other
 key, so a key that does nothing is never written by mistake. `muructl
 config export` writes the resolved policy with every key.
 
+## Scheduled capacity
+
+Schedules on an application keep capacity ready for load that is known
+in advance:
+
+```toml
+[[app.shop.schedule]]
+name = 'black-friday'
+start = '2026-11-27T00:00'
+end = '2026-11-30T23:59'
+timezone = 'America/New_York'
+min_workers = 24
+max_workers = 48
+warm_up = '30m'
+scale_in = 'hold'
+freeze_deploys = true
+
+[[app.shop.schedule]]
+name = 'weekday-mornings'
+cron = '0 8 * * mon-fri'
+duration = '4h'
+timezone = 'Australia/Sydney'
+min_workers = 6
+```
+
+| Key | Effect |
+| --- | --- |
+| `name` | The schedule's name, unique within the application |
+| `start`, `end`, or `cron`, `duration`, with `timezone` | The window, one-off or recurring, read as an [overlay's schedule](overlays.md#activating) is |
+| `group` | The worker group; the default group without it |
+| `min_workers` | The floor: the group has at least this many workers during the window |
+| `max_workers` | The ceiling: the autoscaler may grow the group this far during the window |
+| `warm_up` | How long before each window the floor already applies, such as `30m` |
+| `scale_in` | `hold` keeps the group from scaling in during the window; `normal`, the default, leaves it to the autoscaler |
+| `freeze_deploys` | Refuse deploys and rollouts of the application during the window (see [deploy freezes](rollouts.md#deploy-freezes)) |
+
+The group grows to the floor in batches of `max_step_up` workers, each
+once the batch before it is ready. A floor above the group's
+`max_workers` raises the ceiling with it, and a static group's count
+rises to the floor. When schedules overlap, the highest floor and the
+highest ceiling apply, and scale-in is held if any of them holds it.
+After the window, the group scales in by the autoscaler's usual slow
+rules, and a static group goes back to its count one worker per reap
+interval. While a canary or a traffic split gives a release part of the
+application's requests, the release gets that share of the floor,
+rounded up.
+
+Each schedule is an [overlay](overlays.md) named `APP.NAME`, so `muructl
+overlay list` shows it with its next window, and `muructl overlay
+activate` and `end` start or stop it by hand. The events are
+`schedule.activated` and `schedule.expired`, and the floor's scale-outs
+are `scaling.decision` events. An `[overlay.NAME]` table sets the same
+capacity on an application with `apps.NAME = { min_workers = 24,
+max_workers = 48 }`, beside its other changes.
+
+A floor for a while, without declaring a schedule:
+
+```console
+$ muructl scale shop --min 8 --for 3h
+muru: shop default kept at 8 workers or more until 2026-11-02T08:00:00Z
+$ muructl scale shop --group reports --min 2 --max 4 --until 2026-11-02T18:00 --timezone Australia/Sydney
+```
+
+This makes a temporary overlay, `shop:scale` or `shop:scale:reports`,
+which the next such command for the group replaces, `muructl overlay end`
+ends early, and which is forgotten once it ends. `muructl apply` leaves it
+alone and `muructl config export` does not write it.
+
 ## Watching and overriding
 
 ```console
@@ -118,7 +186,9 @@ reports      1            0/1        1.0     -          0/6        target 1-6 wo
 ```
 
 `WORKERS` shows the workers the edge routes to and, while they differ, the
-count the group is being brought to. `IDLE` is the idle worker
+count the group is being brought to. While a schedule sets capacity, a
+line below the group's says so, as `scheduled: 24-48 workers, no
+scale-in from shop.black-friday`. `IDLE` is the idle worker
 equivalents, negative when the group is short. `REAPS` is the churn budget
 used in the last hour, with `halt` while scale-in is suspended.
 

@@ -10,6 +10,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use muru_config::{Methods, Overlay, Route, Traffic};
 
 use crate::model::OverlayState;
+use crate::scaling::Capacity;
+
+/// The name of the overlay `muructl scale --min` makes for a worker group
+/// of an application: `APP:scale`, or `APP:scale:GROUP` for a group other
+/// than the default. No declared overlay or schedule has a `:`.
+pub fn temporary_name(app: &str, group: &str) -> String {
+    if group == muru_edge::routing::DEFAULT_GROUP {
+        format!("{app}:scale")
+    } else {
+        format!("{app}:scale:{group}")
+    }
+}
+
+/// Whether an overlay stands for an application's `[[app.NAME.schedule]]`
+/// entry (section 7.5), named `APP.NAME`, whose activation and end are
+/// the events schedule.activated and schedule.expired.
+pub fn is_schedule(name: &str) -> bool {
+    name.contains('.') && !is_temporary(name)
+}
+
+/// Whether an overlay is one `muructl scale --min` made, which apply
+/// leaves alone and which is forgotten once it ends.
+pub fn is_temporary(name: &str) -> bool {
+    name.contains(':')
+}
 
 /// The window of an overlay's schedule that `now` falls in, else the
 /// next one, as Unix milliseconds: from its start, until its end when it
@@ -253,6 +278,51 @@ pub fn apply_maintenance(
     apps
 }
 
+/// Section 7.5: the capacity the overlays set, by application and worker
+/// group: the highest floor and ceiling, and a hold on scale-in if any
+/// sets one.
+pub fn capacities<'a>(
+    overlays: impl IntoIterator<Item = &'a (String, Overlay)>,
+) -> BTreeMap<(String, String), Capacity> {
+    let mut found: BTreeMap<(String, String), Capacity> = BTreeMap::new();
+
+    for (name, overlay) in overlays {
+        for (app, change) in &overlay.apps {
+            if !change.sets_capacity() {
+                continue;
+            }
+
+            let group = change
+                .group
+                .clone()
+                .unwrap_or_else(|| muru_edge::routing::DEFAULT_GROUP.to_owned());
+            let capacity = found.entry((app.clone(), group)).or_default();
+            capacity.floor = capacity.floor.max(change.min_workers.unwrap_or(0));
+            capacity.ceiling = capacity.ceiling.max(change.max_workers.unwrap_or(0));
+            capacity.hold |= change.scale_in.as_deref() == Some("hold");
+            capacity.sources.push(name.clone());
+        }
+    }
+
+    found
+}
+
+/// Section 9.6: the applications whose deploys and rollouts the overlays
+/// freeze, with the overlays that do.
+pub fn freezes(overlays: &[&(String, Overlay)]) -> BTreeMap<String, Vec<String>> {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for (name, overlay) in overlays {
+        for (app, change) in &overlay.apps {
+            if change.freeze_deploys == Some(true) {
+                found.entry(app.clone()).or_default().push(name.clone());
+            }
+        }
+    }
+
+    found
+}
+
 /// The applications whose traffic an active overlay pins or splits on
 /// one of their routes, whose rollouts wait meanwhile.
 pub fn pinned_apps(routes: &[Route], overlays: &[&(String, Overlay)]) -> BTreeSet<String> {
@@ -413,9 +483,43 @@ pub fn preview(overlay: &Overlay, routes: &[Route], maintenance: &BTreeSet<Strin
                 ));
             }
         }
+
+        if change.sets_capacity() {
+            lines.push(format!(
+                "app {app}: group {}: {}",
+                change
+                    .group
+                    .as_deref()
+                    .unwrap_or(muru_edge::routing::DEFAULT_GROUP),
+                describe_capacity(change)
+            ));
+        }
+
+        if change.freeze_deploys == Some(true) {
+            lines.push(format!("app {app}: deploys and rollouts frozen"));
+        }
     }
 
     lines
+}
+
+/// The capacity an overlay sets on an application, as a phrase.
+pub fn describe_capacity(change: &muru_config::AppOverlay) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(floor) = change.min_workers {
+        parts.push(format!("at least {floor} workers"));
+    }
+
+    if let Some(ceiling) = change.max_workers {
+        parts.push(format!("at most {ceiling}"));
+    }
+
+    if change.scale_in.as_deref() == Some("hold") {
+        parts.push("no scale-in".to_owned());
+    }
+
+    parts.join(", ")
 }
 
 fn describe_target(route: &Route) -> String {
@@ -570,6 +674,42 @@ mod tests {
         assert_eq!(describe_wait(45_000), "45s");
         assert_eq!(describe_wait(HOUR - 1), "59m");
         assert_eq!(describe_wait(HOUR * 3 / 2), "1h30m");
+    }
+
+    #[test]
+    fn capacity_takes_the_highest_floor_and_ceiling_and_freezes_add_up() {
+        let declared = [
+            (
+                "shop.weekday".to_owned(),
+                overlay("apps.shop = { min_workers = 4, max_workers = 16 }"),
+            ),
+            (
+                "shop.black-friday".to_owned(),
+                overlay(
+                    "apps.shop = { min_workers = 24, max_workers = 12, scale_in = 'hold', freeze_deploys = true }",
+                ),
+            ),
+            (
+                "reports".to_owned(),
+                overlay("apps.shop = { group = 'reports', min_workers = 2 }"),
+            ),
+        ];
+        let all: Vec<&(String, Overlay)> = declared.iter().collect();
+        let found = capacities(all.iter().copied());
+        let web = &found[&("shop".to_owned(), "default".to_owned())];
+        assert_eq!((web.floor, web.ceiling, web.hold), (24, 16, true));
+        assert_eq!(web.sources, ["shop.weekday", "shop.black-friday"]);
+        assert_eq!(found[&("shop".to_owned(), "reports".to_owned())].floor, 2);
+        assert_eq!(
+            freezes(&all),
+            BTreeMap::from([("shop".to_owned(), vec!["shop.black-friday".to_owned()])])
+        );
+
+        // Capacity never conflicts.
+
+        assert!(conflicts(&declared.into_iter().collect()).is_empty());
+        assert_eq!(temporary_name("shop", "default"), "shop:scale");
+        assert!(is_temporary(&temporary_name("shop", "reports")));
     }
 
     #[test]

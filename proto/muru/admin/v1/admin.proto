@@ -187,6 +187,7 @@ message DeployRequest {
   string stop_signal = 40;                  // the signal that stops an instance gracefully; the profile's when empty
   repeated string sendfile_roots = 41;      // section 4.9: directories an X-Muru-Sendfile path must lie in; the table's when empty
   optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
+  bool override_freeze = 43;                // deploy although an overlay freezes the application's deploys (section 9.6)
 }
 
 // One environment variable: a value, or a secret reference.
@@ -237,6 +238,7 @@ message StartRolloutRequest {
   uint64 max_p95_ms = 5;            // a gate: the candidate's p95 over the step; none when 0
   uint64 min_requests = 6;          // requests before the gates judge, 100 when 0
   bool approve_each_step = 7;       // wait for ResumeRollout before each step after the first
+  bool override_freeze = 8;         // start although an overlay freezes the application's deploys (section 9.6)
 }
 
 message RolloutStep {
@@ -277,12 +279,14 @@ message ListRolloutsResponse {
 
 message RolloutControlRequest {
   string app = 1;                   // the application's active rollout
+  bool override_freeze = 2;         // promote although an overlay freezes the application's deploys
 }
 
 // Blue/green (section 9.2): move all traffic to the release now.
 message PromoteReleaseRequest {
   string app = 1;
   string release = 2;
+  bool override_freeze = 3;         // promote although an overlay freezes the application's deploys (section 9.6)
 }
 
 // Section 7.4: pin a group's worker count, so the autoscaler stands
@@ -293,6 +297,9 @@ message SetScaleRequest {
   string group = 3;                 // default when empty
   optional uint32 processes = 4;    // the count to pin
   bool unpin = 5;                   // let the autoscaler decide again
+  optional uint32 min_workers = 6;  // section 7.5: a floor until until_unix_ms, as a temporary schedule
+  optional uint32 max_workers = 7;  // and a ceiling with it
+  uint64 until_unix_ms = 8;         // when the floor ends
 }
 
 message SetMaintenanceRequest {
@@ -340,6 +347,10 @@ message GroupScale {
   string policy = 18;               // the policy as one phrase
   uint64 scale_outs = 19;
   uint64 scale_ins = 20;
+  uint32 floor = 21;                // the fewest workers, with what schedules and overlays set (section 7.5)
+  uint32 ceiling = 22;              // the most workers, likewise
+  repeated string capacity_from = 23; // the overlays and schedules setting capacity now
+  bool scale_in_held = 24;          // a schedule holds scale-in
 }
 
 // Section 9.1: pending, starting, warming, ready, draining, stopping,
@@ -474,6 +485,7 @@ message ApplyConfigRequest {
   string document = 1;
   bool dry_run = 2;                 // report the plan and change nothing
   bool prune = 3;                   // also remove what the document does not contain
+  bool override_freeze = 4;         // deploy releases of applications an overlay freezes (section 9.6)
 }
 
 message DiffConfigRequest {

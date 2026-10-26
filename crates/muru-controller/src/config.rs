@@ -1057,8 +1057,14 @@ fn plan_overlays(
         document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
     };
 
-    for (name, overlay) in &document.overlay {
-        if !valid_name(name) {
+    // Section 7.5: each application's schedules are overlays named
+    // APP.NAME, checked and recorded as the declared ones are.
+
+    let (schedules, schedule_errors) = schedule_overlays(document);
+    plan.errors.extend(schedule_errors);
+
+    for (name, overlay) in document.overlay.iter().chain(schedules.iter()) {
+        if !valid_name(name) && !schedules.contains_key(name) {
             plan.errors
                 .push(format!("overlay {name:?} is not a valid name"));
             continue;
@@ -1160,6 +1166,7 @@ fn plan_overlays(
     // declared ones and those already recorded that stay.
 
     let mut all = document.overlay.clone();
+    all.extend(schedules);
 
     if !prune {
         for (name, overlay) in stored {
@@ -1168,6 +1175,36 @@ fn plan_overlays(
     }
 
     plan.errors.extend(crate::overlays::conflicts(&all));
+}
+
+/// Section 7.5: the overlays the applications' `[[app.NAME.schedule]]`
+/// entries stand for, by name, and what is wrong with the entries.
+fn schedule_overlays(document: &Document) -> (BTreeMap<String, Overlay>, Vec<String>) {
+    let mut overlays = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for (app, table) in &document.app {
+        for schedule in &table.schedule {
+            if !valid_name(&schedule.name) {
+                errors.push(format!(
+                    "app {app}: schedule {:?} is not a valid name",
+                    schedule.name
+                ));
+                continue;
+            }
+
+            let name = format!("{app}.{}", schedule.name);
+
+            if overlays.insert(name, schedule.overlay(app)).is_some() {
+                errors.push(format!(
+                    "app {app}: two schedules are named {}",
+                    schedule.name
+                ));
+            }
+        }
+    }
+
+    (overlays, errors)
 }
 
 /// The release an overlay's `release_ready` names, as (app, release):
@@ -1376,8 +1413,13 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         }
     }
 
+    let (schedules, _) = schedule_overlays(document);
+
     for (name, _) in store.overlays().unwrap_or_default() {
-        if !document.overlay.contains_key(&name) {
+        if !document.overlay.contains_key(&name)
+            && !schedules.contains_key(&name)
+            && !crate::overlays::is_temporary(&name)
+        {
             plan.changes.push(Change {
                 action: Action::RemoveOverlay { name },
                 detail: "not declared".to_owned(),
@@ -1499,6 +1541,41 @@ pub fn export(
 
         if app.is_none() || named {
             document.upstream.insert(name, upstream);
+        }
+    }
+
+    // Overlays (section 9.10): schedules go back to their applications'
+    // tables, and with one application asked for, only the overlays that
+    // change it or its routes come along. Those muructl scale made are
+    // not configuration.
+
+    for (name, overlay) in store.overlays()? {
+        if crate::overlays::is_temporary(&name) {
+            continue;
+        }
+
+        if let Some((owner, schedule)) =
+            muru_config::CapacitySchedule::from_overlay(&name, &overlay)
+        {
+            if let Some(table) = document.app.get_mut(&owner) {
+                table.schedule.push(schedule);
+            }
+
+            continue;
+        }
+
+        let relevant = app.is_none_or(|app| {
+            overlay.apps.contains_key(app)
+                || overlay.routes.keys().any(|route| {
+                    document
+                        .route
+                        .iter()
+                        .any(|declared| declared.name.as_deref() == Some(route))
+                })
+        });
+
+        if relevant {
+            document.overlay.insert(name, overlay);
         }
     }
 
@@ -2455,6 +2532,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
     pb::DeployRequest {
         app: app.to_owned(),
         source: source.to_owned(),
+        override_freeze: false,
         kind: table
             .kind
             .map(|value| value.as_str().to_owned())

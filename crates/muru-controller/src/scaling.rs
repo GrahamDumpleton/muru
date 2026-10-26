@@ -131,6 +131,20 @@ pub enum Decision {
     },
 }
 
+/// Section 7.5: what schedules and overlays set over a group's policy
+/// while they last.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capacity {
+    /// The fewest workers; none below the policy's when 0.
+    pub floor: u32,
+    /// The most workers; none above the policy's when 0.
+    pub ceiling: u32,
+    /// Whether scale-in waits until they are over.
+    pub hold: bool,
+    /// The overlays that set it, for the reasons.
+    pub sources: Vec<String>,
+}
+
 /// One observation kept for the windows.
 #[derive(Debug, Clone, Copy)]
 struct Point {
@@ -145,6 +159,7 @@ pub struct Scaler {
     spec: ScalingSpec,
     desired: u32,
     pinned: Option<u32>,
+    capacity: Option<Capacity>,
     points: VecDeque<Point>,
     queue: VecDeque<(Instant, Buckets)>,
     out_since: Option<Instant>,
@@ -171,6 +186,12 @@ pub struct ScaleStatus {
     pub desired: u32,
     /// The count pinned by an operator, when one is.
     pub pinned: Option<u32>,
+    /// What schedules and overlays set over the policy, when any do.
+    pub capacity: Option<Capacity>,
+    /// The fewest workers, with what they set.
+    pub floor: u32,
+    /// The most workers, with what they set.
+    pub ceiling: u32,
     /// Workers the edge routes to.
     pub ready: u32,
     /// Slots busy and total across them.
@@ -198,6 +219,7 @@ impl Scaler {
             spec,
             desired: current,
             pinned: None,
+            capacity: None,
             points: VecDeque::new(),
             queue: VecDeque::new(),
             out_since: None,
@@ -248,6 +270,35 @@ impl Scaler {
         self.last = Some((now, "unpinned".to_owned()));
     }
 
+    /// Section 7.5: the floor, ceiling and scale-in hold that schedules
+    /// and overlays set now, or none.
+    pub fn set_capacity(&mut self, capacity: Option<Capacity>) {
+        self.capacity = capacity.filter(|capacity| *capacity != Capacity::default());
+    }
+
+    /// The fewest workers: the policy's, a static group's count, or a
+    /// schedule's floor, the highest.
+    pub fn floor(&self) -> u32 {
+        let own = if self.spec.is_static() {
+            self.spec.max_workers
+        } else {
+            self.spec.min_workers
+        };
+        self.capacity
+            .as_ref()
+            .map_or(own, |capacity| own.max(capacity.floor))
+    }
+
+    /// The most workers: the policy's, or a schedule's ceiling or floor
+    /// above it.
+    pub fn ceiling(&self) -> u32 {
+        let raised = self
+            .capacity
+            .as_ref()
+            .map_or(0, |capacity| capacity.ceiling);
+        self.spec.max_workers.max(raised).max(self.floor())
+    }
+
     /// Take the count the group has as the one wanted: in advisory mode
     /// nothing is carried out, so each recommendation starts from what
     /// is there.
@@ -268,6 +319,9 @@ impl Scaler {
             spec: self.spec.clone(),
             desired: self.desired,
             pinned: self.pinned,
+            capacity: self.capacity.clone(),
+            floor: self.floor(),
+            ceiling: self.ceiling(),
             ready: self.signals.ready,
             busy: self.signals.busy,
             total: self.signals.total,
@@ -288,8 +342,12 @@ impl Scaler {
         self.note_queue(now, &signals);
         self.signals = signals;
 
-        if self.pinned.is_some() || self.spec.is_static() {
+        if self.pinned.is_some() {
             return None;
+        }
+
+        if self.spec.is_static() {
+            return self.raise_to_floor(now).or_else(|| self.settle(now));
         }
 
         // Starting workers have all arrived: how long that took sets the
@@ -339,6 +397,10 @@ impl Scaler {
 
         let exhausted = self.reaps.len() >= self.spec.churn_budget as usize;
 
+        if let Some(decision) = self.raise_to_floor(now) {
+            return Some(decision);
+        }
+
         if let Some(decision) = self.scale_out(now, idle) {
             return Some(decision);
         }
@@ -360,6 +422,68 @@ impl Scaler {
 
         self.suspended = false;
         self.scale_in(now)
+    }
+
+    /// Section 7.5: bring the group up to a schedule's floor in staggered
+    /// batches of max_step_up, each once the last has arrived and no
+    /// sooner than a scale-out window after it.
+    fn raise_to_floor(&mut self, now: Instant) -> Option<Decision> {
+        let sources = self.capacity.as_ref()?.sources.join(", ");
+        let floor = self.floor();
+
+        if self.desired >= floor || self.desired > self.signals.ready {
+            return None;
+        }
+
+        let window = Duration::from_millis(self.spec.scale_out_window_ms);
+
+        if self
+            .last_out
+            .is_some_and(|last| now.saturating_duration_since(last) < window)
+        {
+            return None;
+        }
+
+        let to = (self.desired + self.spec.max_step_up.max(1)).min(floor);
+        let reason = format!("raising toward the floor of {floor} that {sources} sets");
+        self.last_step = to - self.desired;
+        self.desired = to;
+        self.last_out = Some(now);
+        self.requested_at = Some(now);
+        self.out_since = None;
+        self.decisions.0 += 1;
+        self.last = Some((now, format!("scaled out to {to}: {reason}")));
+        Some(Decision::ScaleOut { to, reason })
+    }
+
+    /// A static group above its count, once a floor is over or a pin
+    /// lifted: back down one worker per reap interval.
+    fn settle(&mut self, now: Instant) -> Option<Decision> {
+        let count = self.floor();
+
+        if self.desired <= count
+            || self.desired > self.signals.ready
+            || self.capacity.as_ref().is_some_and(|capacity| capacity.hold)
+        {
+            return None;
+        }
+
+        let interval = Duration::from_millis(self.spec.reap_interval_ms);
+
+        if self
+            .last_in
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return None;
+        }
+
+        let to = self.desired - 1;
+        let reason = format!("back toward the static count of {count}");
+        self.desired = to;
+        self.last_in = Some(now);
+        self.decisions.1 += 1;
+        self.last = Some((now, format!("scaled in to {to}: {reason}")));
+        Some(Decision::ScaleIn { to, reason })
     }
 
     /// Keep the queue histogram for the scale-out window and read the p95
@@ -504,7 +628,7 @@ impl Scaler {
             ScalingMode::Static => (false, String::new()),
         };
 
-        if !short || self.desired >= self.spec.max_workers {
+        if !short || self.desired >= self.ceiling() {
             self.out_since = None;
             return None;
         }
@@ -547,7 +671,7 @@ impl Scaler {
         };
 
         let step = doubling.max(shortfall).max(1).min(self.spec.max_step_up);
-        let to = (self.desired + step).min(self.spec.max_workers);
+        let to = (self.desired + step).min(self.ceiling());
         let reason = format!(
             "{why} for {}",
             muru_config::format_duration(now.saturating_duration_since(since))
@@ -565,7 +689,10 @@ impl Scaler {
     /// Section 7.4: scale in one worker when every condition has held
     /// over the window, judged by the peak of the window.
     fn scale_in(&mut self, now: Instant) -> Option<Decision> {
-        if self.desired <= self.spec.min_workers || self.desired > self.signals.ready {
+        if self.desired <= self.floor()
+            || self.desired > self.signals.ready
+            || self.capacity.as_ref().is_some_and(|capacity| capacity.hold)
+        {
             return None;
         }
 
@@ -969,6 +1096,71 @@ mod tests {
         group.scaler.unpin(group.start + MINUTE);
         group.run(MINUTE, MINUTE, |_| 8.0);
         assert!(!group.outs().is_empty());
+    }
+
+    #[test]
+    fn a_scheduled_floor_is_reached_in_batches_and_holds_scale_in() {
+        let mut group = Group::new(spare(), 1, 1.0);
+        group.scaler.set_capacity(Some(Capacity {
+            floor: 10,
+            ceiling: 12,
+            hold: true,
+            sources: vec!["shop.black-friday".to_owned()],
+        }));
+        group.run(Duration::ZERO, MINUTE, |_| 0.0);
+
+        // Batches of max_step_up, each once the last has arrived.
+
+        let outs: Vec<u32> = group.outs().iter().map(|(_, to)| *to).collect();
+        assert_eq!(outs, [5, 9, 10]);
+        assert!(group.outs()[1].0 - group.outs()[0].0 >= SECOND * 2);
+        assert_eq!(group.scaler.ceiling(), 12);
+
+        // Idle, but held for the window.
+
+        group.run(MINUTE, MINUTE * 30, |_| 0.0);
+        assert!(group.ins().is_empty(), "{:?}", group.ins());
+
+        // After it, scale-in follows the usual slow rules down to the
+        // policy's own floor.
+
+        group.scaler.set_capacity(None);
+        group.run(MINUTE * 31, MINUTE * 30, |_| 0.0);
+        assert!(!group.ins().is_empty());
+        assert!(group.scaler.desired() < 10);
+        assert!(
+            group
+                .ins()
+                .windows(2)
+                .all(|pair| pair[1].0 - pair[0].0 >= MINUTE)
+        );
+    }
+
+    #[test]
+    fn a_static_group_takes_a_floor_and_settles_back_after() {
+        let fixed = ScalingSpec {
+            max_workers: 2,
+            ..ScalingSpec::default()
+        };
+        let mut group = Group::new(fixed, 2, 1.0);
+        group.run(Duration::ZERO, MINUTE, |_| 1.0);
+        assert!(group.log.is_empty());
+
+        group.scaler.set_capacity(Some(Capacity {
+            floor: 4,
+            sources: vec!["shop.weekday".to_owned()],
+            ..Capacity::default()
+        }));
+        group.run(MINUTE, MINUTE, |_| 1.0);
+        assert_eq!(group.outs().last().map(|(_, to)| *to), Some(4));
+
+        group.scaler.set_capacity(None);
+        group.run(MINUTE * 2, MINUTE * 3, |_| 1.0);
+        assert_eq!(
+            group.ins().iter().map(|(_, to)| *to).collect::<Vec<_>>(),
+            [3, 2]
+        );
+        assert_eq!(group.scaler.desired(), 2);
     }
 
     #[test]

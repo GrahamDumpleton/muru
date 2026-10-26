@@ -7,8 +7,9 @@ Overlays activated by hand or by a one-off or recurring schedule, over
 routes and applications: site modes, method restrictions, traffic pins
 and splits, route targets, rate limits and maintenance mode, with
 preconditions, warm-up, advisory and latched schedules, previews and
-promotion. Scheduled capacity and deploy freezes, the external trigger,
-and overlays that activate on conditions are still to come.
+promotion, and the capacity and deploy freezes of
+[schedules](scaling.md#scheduled-capacity). The external trigger and
+overlays that activate on conditions are still to come.
 ```
 
 An overlay is a named piece of configuration laid over the routes and
@@ -49,12 +50,15 @@ and reach routes by the route's `name`.
 | `routes.NAME.target` | What serves the route instead: `{ app = 'NAME' }`, `{ static = '/srv/snapshot' }` or `{ upstream = 'NAME' }` |
 | `routes.NAME.rate_limits` | The [rate limits](client-classes.md) in place of the route's |
 | `apps.NAME.maintenance` | Maintenance mode on (`true`) or off (`false`) for the application |
+| `apps.NAME.min_workers`, `max_workers`, `scale_in`, `group` | [Scheduled capacity](scaling.md#scheduled-capacity) for the application's default worker group, or `group` |
+| `apps.NAME.freeze_deploys` | Refuse the application's [deploys and rollouts](rollouts.md#deploy-freezes) |
 
 While an overlay pins or splits a route's traffic, a rollout of that
 route's application waits, and carries on when the overlay ends.
 
 Two overlays that set the same field cannot both be applied unless each
-has a different `priority`; the higher one's value stands while both are
+has a different `priority` (capacity is the exception: the highest floor
+and ceiling apply); the higher one's value stands while both are
 active. `muructl apply` refuses overlays that would conflict, or that
 name a route, application, upstream, directory or rate limit that does
 not exist.
@@ -113,8 +117,9 @@ warm_up = { start_release = 'r43', lead = '30m' }
 ```
 
 For `lead` before the window begins, the release runs, started again if
-it was stopped or retained, without taking traffic; the event
-`overlay.warming` says so. The release is named as for `release_ready`.
+it was stopped or retained, without taking traffic, and the overlay's
+capacity floors already apply; the event `overlay.warming` says so. A
+`start_release` is optional. The release is named as for `release_ready`.
 If the overlay does not activate, nothing else keeps the release
 running, and it is retained as a superseded release is.
 

@@ -1458,6 +1458,11 @@ pub struct DeployArgs {
     #[arg(long)]
     hold: bool,
 
+    /// Deploy although an overlay freezes the application's deploys
+    /// (section 9.6); recorded as an event.
+    #[arg(long)]
+    override_freeze: bool,
+
     /// How long the release this one replaces stays warm for an instant
     /// rollback (default 30m; 0 stops it as soon as it has drained).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -1824,6 +1829,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
+        override_freeze: args.override_freeze,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         max_requests: args.max_requests,
         max_lifetime_ms: args
@@ -1935,6 +1941,11 @@ pub enum RolloutCommand {
         #[arg(long)]
         wait: bool,
 
+        /// Go ahead although an overlay freezes the application's
+        /// deploys (section 9.6); recorded as an event.
+        #[arg(long)]
+        override_freeze: bool,
+
         #[command(flatten)]
         socket: SocketArgs,
     },
@@ -1944,6 +1955,11 @@ pub enum RolloutCommand {
     Bluegreen {
         /// The release, as app@release.
         release: String,
+
+        /// Go ahead although an overlay freezes the application's
+        /// deploys (section 9.6); recorded as an event.
+        #[arg(long)]
+        override_freeze: bool,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -1986,6 +2002,11 @@ pub enum RolloutCommand {
         /// The application.
         app: String,
 
+        /// Go ahead although an overlay freezes the application's
+        /// deploys (section 9.6); recorded as an event.
+        #[arg(long)]
+        override_freeze: bool,
+
         #[command(flatten)]
         socket: SocketArgs,
     },
@@ -2025,6 +2046,32 @@ pub struct ScaleArgs {
     /// Let the autoscaler decide the group's count again.
     #[arg(long)]
     unpin: bool,
+
+    /// Keep at least this many workers until --until or for --for, a
+    /// temporary schedule over the application (section 7.5).
+    #[arg(long = "min", value_name = "COUNT", conflicts_with_all = ["processes", "unpin"])]
+    min_workers: Option<u32>,
+
+    /// With --min, allow up to this many workers meanwhile.
+    #[arg(long = "max", value_name = "COUNT", requires = "min_workers")]
+    max_workers: Option<u32>,
+
+    /// When the floor ends, such as 2026-11-30T23:59 or an RFC 3339 time.
+    #[arg(
+        long,
+        value_name = "TIME",
+        requires = "min_workers",
+        conflicts_with = "duration"
+    )]
+    until: Option<String>,
+
+    /// How long the floor lasts, such as 4h.
+    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, requires = "min_workers")]
+    duration: Option<Duration>,
+
+    /// The time zone --until is in; the local zone without it.
+    #[arg(long, value_name = "ZONE", requires = "until")]
+    timezone: Option<String>,
 
     #[command(flatten)]
     socket: SocketArgs,
@@ -2066,11 +2113,22 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     let target = args.target.unwrap_or_default();
     let (app, release) = split_target(&target)?;
 
-    if args.processes.is_none() && !args.unpin {
+    if args.processes.is_none() && !args.unpin && args.min_workers.is_none() {
         anyhow::bail!(
-            "give --processes COUNT to pin the group, or --unpin; `scale status` shows the state"
+            "give --processes COUNT to pin the group, --unpin, or --min COUNT with --until or --for; `scale status` shows the state"
         );
     }
+
+    let until_unix_ms = match (&args.until, args.duration) {
+        (Some(text), _) => muru_config::parse_moment(text, args.timezone.as_deref())
+            .map_err(|error| anyhow::anyhow!("--until: {error}"))?
+            .max(0) as u64,
+        (None, Some(duration)) => now_unix_ms() + duration.as_millis() as u64,
+        (None, None) if args.min_workers.is_some() => {
+            anyhow::bail!("--min needs --until TIME or --for DURATION")
+        }
+        (None, None) => 0,
+    };
 
     let mut client = client::connect(&args.socket.socket()).await?;
     let status = client
@@ -2080,10 +2138,22 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             group: args.group.clone(),
             processes: args.processes,
             unpin: args.unpin,
+            min_workers: args.min_workers,
+            max_workers: args.max_workers,
+            until_unix_ms,
         })
         .await
         .map_err(explain)?
         .into_inner();
+
+    if let Some(floor) = args.min_workers {
+        println!(
+            "muru: {app} {} kept at {floor} workers or more until {}",
+            args.group,
+            format_time(until_unix_ms)
+        );
+        return Ok(());
+    }
 
     match args.processes {
         Some(count) => println!(
@@ -2150,6 +2220,20 @@ fn print_scale_status(status: &pb::ScaleStatus) {
             group.policy
         );
 
+        if !group.capacity_from.is_empty() {
+            println!(
+                "  scheduled: {}-{} workers{} from {}",
+                group.floor,
+                group.ceiling,
+                if group.scale_in_held {
+                    ", no scale-in"
+                } else {
+                    ""
+                },
+                group.capacity_from.join(", ")
+            );
+        }
+
         if !group.last_decision.is_empty() {
             println!(
                 "  last: {} ({} ago)",
@@ -2174,6 +2258,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             min_requests,
             approve_each_step,
             wait,
+            override_freeze,
             socket,
         } => {
             let (app, id) = split_release(&release)?;
@@ -2193,6 +2278,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                     max_p95_ms: max_p95.map_or(0, |p95| p95.as_millis() as u64),
                     min_requests,
                     approve_each_step,
+                    override_freeze,
                 })
                 .await
                 .map_err(explain)?
@@ -2212,13 +2298,18 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
 
             Ok(())
         }
-        RolloutCommand::Bluegreen { release, socket } => {
+        RolloutCommand::Bluegreen {
+            release,
+            override_freeze,
+            socket,
+        } => {
             let (app, id) = split_release(&release)?;
             let mut client = client::connect(&socket.socket()).await?;
             let release = client
                 .promote_release(pb::PromoteReleaseRequest {
                     app: app.to_owned(),
                     release: id.to_owned(),
+                    override_freeze,
                 })
                 .await
                 .map_err(explain)?
@@ -2281,7 +2372,10 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
         RolloutCommand::Pause { app, socket } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .pause_rollout(pb::RolloutControlRequest { app })
+                .pause_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze: false,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -2294,7 +2388,10 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
         RolloutCommand::Resume { app, socket } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .resume_rollout(pb::RolloutControlRequest { app })
+                .resume_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze: false,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -2304,10 +2401,17 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        RolloutCommand::Promote { app, socket } => {
+        RolloutCommand::Promote {
+            app,
+            override_freeze,
+            socket,
+        } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .promote_rollout(pb::RolloutControlRequest { app })
+                .promote_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -2320,7 +2424,10 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
         RolloutCommand::Abort { app, socket } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .abort_rollout(pb::RolloutControlRequest { app })
+                .abort_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze: false,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -2513,12 +2620,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
             socket,
         } => {
             let until = match (duration, until) {
-                (Some(duration), _) => Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_millis() as u64
-                        + duration.as_millis() as u64,
-                ),
+                (Some(duration), _) => Some(now_unix_ms() + duration.as_millis() as u64),
                 (None, Some(text)) => Some(
                     muru_config::parse_moment(&text, timezone.as_deref())
                         .map_err(anyhow::Error::msg)?
@@ -3007,6 +3109,11 @@ pub struct ApplyArgs {
     #[arg(long)]
     prune: bool,
 
+    /// Deploy releases of applications an overlay freezes (section 9.6);
+    /// recorded as an event.
+    #[arg(long)]
+    override_freeze: bool,
+
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -3026,6 +3133,7 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
             document: document.to_toml().context("writing the configuration")?,
             dry_run: args.dry_run,
             prune: args.prune,
+            override_freeze: args.override_freeze,
         })
         .await
         .map_err(explain)?
@@ -3293,6 +3401,13 @@ fn report_json(report: &pb::ConfigReport) -> serde_json::Value {
         "unchanged": report.unchanged,
         "applied": report.applied,
     })
+}
+
+/// The time now, as Unix milliseconds.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// Unix milliseconds as an RFC 3339 instant in UTC.

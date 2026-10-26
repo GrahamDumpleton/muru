@@ -2,6 +2,7 @@
 //! `muru.admin.v1` service over the admin Unix socket, which muructl and
 //! the dashboard's gateway speak.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
@@ -167,6 +168,7 @@ impl Admin for Service {
         request: Request<pb::DeployRequest>,
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
+        self.check_freeze(&request.app, "deploy", request.override_freeze)?;
         let previous = self
             .handle
             .store
@@ -717,6 +719,7 @@ impl Admin for Service {
         request: Request<pb::StartRolloutRequest>,
     ) -> Result<Response<pb::Rollout>, Status> {
         let request = request.into_inner();
+        self.check_freeze(&request.app, "start a rollout", request.override_freeze)?;
         let steps = request
             .steps
             .iter()
@@ -806,7 +809,9 @@ impl Admin for Service {
         &self,
         request: Request<pb::RolloutControlRequest>,
     ) -> Result<Response<pb::Rollout>, Status> {
-        self.control_rollout(request.into_inner().app, RolloutAction::Promote)
+        let request = request.into_inner();
+        self.check_freeze(&request.app, "promote", request.override_freeze)?;
+        self.control_rollout(request.app, RolloutAction::Promote)
             .await
     }
 
@@ -823,6 +828,7 @@ impl Admin for Service {
         request: Request<pb::PromoteReleaseRequest>,
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
+        self.check_freeze(&request.app, "promote", request.override_freeze)?;
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -852,6 +858,36 @@ impl Admin for Service {
         } else {
             request.group.clone()
         };
+
+        // Section 7.5: a floor until a time is a temporary schedule over
+        // the application, whichever release serves.
+
+        if let Some(min_workers) = request.min_workers {
+            let (done_tx, done_rx) = oneshot::channel();
+            self.handle
+                .commands
+                .send(Command::ScaleFloor {
+                    app: request.app.clone(),
+                    group,
+                    min_workers,
+                    max_workers: request.max_workers,
+                    until: request.until_unix_ms,
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| Status::unavailable(STOPPING))?;
+            done_rx
+                .await
+                .map_err(|_| Status::unavailable(STOPPING))?
+                .map_err(Status::failed_precondition)?;
+            return self
+                .get_scale_status(Request::new(pb::GetScaleStatusRequest {
+                    app: request.app,
+                    release,
+                }))
+                .await;
+        }
+
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -1024,8 +1060,37 @@ impl Admin for Service {
             .read()
             .expect("rate limits poisoned")
             .clone();
-        let plan = config::plan(&self.handle.store, &document, request.prune, &rate_limits);
+        let mut plan = config::plan(&self.handle.store, &document, request.prune, &rate_limits);
+        let frozen = self.frozen().map_err(internal)?;
+        let mut overridden = BTreeMap::new();
+
+        for change in &plan.changes {
+            if let Action::Deploy { app, id, .. } = &change.action
+                && let Some(by) = frozen.get(app)
+            {
+                if request.override_freeze {
+                    overridden.insert(app.clone(), (id.clone(), by.join(", ")));
+                } else {
+                    plan.errors.push(format!(
+                        "{app}@{id}: deploys of {app} are frozen by overlay {}; give --override-freeze to deploy anyway",
+                        by.join(", ")
+                    ));
+                }
+            }
+        }
+
         let mut report = report_message(&plan);
+
+        if !request.dry_run && plan.errors.is_empty() {
+            for (app, (id, by)) in &overridden {
+                self.handle.events.emit(
+                    "deploy.freeze_overridden",
+                    app,
+                    "warning",
+                    &format!("apply deploys {app}@{id} despite the freeze set by overlay {by}"),
+                );
+            }
+        }
 
         if !plan.errors.is_empty() || request.dry_run {
             return Ok(Response::new(report));
@@ -1339,6 +1404,42 @@ fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
 impl Service {
     /// The release named, or the application's current release when none
     /// is; checked to exist.
+    /// Section 9.6: the applications whose deploys and rollouts an active
+    /// overlay freezes, with the overlays that do.
+    fn frozen(&self) -> Result<BTreeMap<String, Vec<String>>, crate::store::StoreError> {
+        let overlays = self.handle.store.overlays()?;
+        let states = self.handle.store.overlay_states()?;
+        Ok(crate::overlays::freezes(&crate::overlays::ordered(
+            &overlays, &states,
+        )))
+    }
+
+    /// Refuse to `what` an application an active overlay freezes, unless
+    /// overridden, which is recorded as a warning event.
+    fn check_freeze(&self, app: &str, what: &str, override_freeze: bool) -> Result<(), Status> {
+        let frozen = self.frozen().map_err(internal)?;
+
+        let Some(by) = frozen.get(app) else {
+            return Ok(());
+        };
+
+        let by = by.join(", ");
+
+        if !override_freeze {
+            return Err(Status::failed_precondition(format!(
+                "deploys of {app} are frozen by overlay {by}; give --override-freeze to {what} anyway"
+            )));
+        }
+
+        self.handle.events.emit(
+            "deploy.freeze_overridden",
+            app,
+            "warning",
+            &format!("{what} despite the freeze set by overlay {by}"),
+        );
+        Ok(())
+    }
+
     fn current_release(&self, app: &str, release: &str) -> Result<String, Status> {
         let release = if release.is_empty() {
             let record = self.handle.store.app(app).map_err(not_found)?;
@@ -1419,6 +1520,17 @@ fn scale_message(
                 policy: status.spec.describe(),
                 scale_outs: status.decisions.0,
                 scale_ins: status.decisions.1,
+                floor: status.floor,
+                ceiling: status.ceiling,
+                capacity_from: status
+                    .capacity
+                    .as_ref()
+                    .map(|capacity| capacity.sources.clone())
+                    .unwrap_or_default(),
+                scale_in_held: status
+                    .capacity
+                    .as_ref()
+                    .is_some_and(|capacity| capacity.hold),
             })
             .collect(),
     }

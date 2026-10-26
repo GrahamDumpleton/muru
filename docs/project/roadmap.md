@@ -281,10 +281,20 @@ spent; every decision is a `scaling.decision` event with its reasons,
 and `--unpin` hands it back, and `advisory = true` reports without
 acting. The decision engine is a module with an injectable clock, driven
 through step, ramp, sawtooth, bursty and budget scenarios in unit tests.
-Still to come: scheduled capacity, the node budget manager across
-applications, the worker CPU, GIL wait and loop lag signals with the
-diagnosis table, scale to zero, and the floor divided by traffic share
-during canaries.
+Still to come: the node budget manager across applications, the worker
+CPU, GIL wait and loop lag signals with the diagnosis table, and scale
+to zero.
+
+Scheduled capacity (section 7.5) is in: `[[app.NAME.schedule]]` entries,
+one-off or recurring, raise a worker group's floor and ceiling for their
+windows and through their warm-up, in batches, with `scale_in = 'hold'`
+and the floor divided by traffic share during canaries; each is an
+overlay named `APP.NAME`, overlays set the same keys under `apps.NAME`,
+and `muructl scale --min N --until TIME` makes a temporary one. Deploy
+freezes (section 9.6) refuse deploys, deploying applies, rollouts and
+promotions of a frozen application unless `--override-freeze` is given,
+recorded as an event, and hold rollouts under way. Still to come:
+checking budgets for schedules, with the node budget manager.
 
 The soft timeout (section 7.6) is in: `soft_timeout` in the `timeouts`
 table or `--timeout soft=` starts a watchdog thread in each worker that
@@ -398,8 +408,8 @@ rollout, and `muructl overlay list`, `activate` (with `--for` or
 event; a restarted daemon carries on with the windows it was in.
 Advisory schedules only say they would activate, latched ones stay
 active until a person ends them, and a warm-up starts a release ahead
-of each window. Still to come: scheduled capacity and deploy freezes
-(section 7.5), the signed webhook trigger,
+of each window, and overlays set scheduled capacity and deploy freezes.
+Still to come: the signed webhook trigger,
 client class routes, error page selections, `config show --effective`
 and the clock warning; condition triggers are phase 4.
 

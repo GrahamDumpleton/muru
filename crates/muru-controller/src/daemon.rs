@@ -329,6 +329,22 @@ pub enum Command {
         /// Answered with a sentence about what happened.
         done: oneshot::Sender<Result<String, String>>,
     },
+    /// Section 7.5: a temporary schedule raising a worker group's floor,
+    /// and its ceiling with it, until a time.
+    ScaleFloor {
+        /// The application.
+        app: String,
+        /// The worker group.
+        group: String,
+        /// The floor.
+        min_workers: u32,
+        /// The ceiling, when raised too.
+        max_workers: Option<u32>,
+        /// When it ends, Unix milliseconds.
+        until: u64,
+        /// Answered with a sentence about what happened.
+        done: oneshot::Sender<Result<String, String>>,
+    },
 }
 
 /// What a person asks of an overlay (section 9.10).
@@ -1818,12 +1834,18 @@ impl Daemon {
                 }
                 crate::overlays::Step::End { reason } => {
                     let _ = self.store.set_overlay_state(name, None);
-                    self.events.emit(
-                        "overlay.ended",
-                        &subject,
-                        "notice",
-                        &format!("ended: {reason}"),
-                    );
+
+                    if crate::overlays::is_temporary(name) {
+                        let _ = self.store.delete_overlay(name);
+                    }
+
+                    let kind = if crate::overlays::is_schedule(name) {
+                        "schedule.expired"
+                    } else {
+                        "overlay.ended"
+                    };
+                    self.events
+                        .emit(kind, &subject, "notice", &format!("ended: {reason}"));
                     changed = true;
                 }
                 crate::overlays::Step::Begin { until } => {
@@ -1846,6 +1868,12 @@ impl Daemon {
                                 "overlay.would_activate",
                                 "notice",
                                 format!("would be skipped: {why}; it is advisory"),
+                            ),
+                            (false, Ok(())) if crate::overlays::is_schedule(name) => (
+                                "schedule",
+                                "schedule.activated",
+                                "notice",
+                                "activated: its window began".to_owned(),
                             ),
                             (false, Ok(())) => (
                                 "schedule",
@@ -1956,6 +1984,62 @@ impl Daemon {
             .collect()
     }
 
+    /// Section 7.5: record and activate the temporary overlay `muructl
+    /// scale --min` stands for, replacing one already there for the group.
+    async fn scale_floor(
+        &mut self,
+        app: &str,
+        group: &str,
+        min_workers: u32,
+        max_workers: Option<u32>,
+        until: u64,
+    ) -> Result<String, String> {
+        self.store.app(app).map_err(|error| error.to_string())?;
+        let now = now_unix_ms();
+
+        if until <= now {
+            return Err("--until is not in the future".to_owned());
+        }
+
+        let change = muru_config::AppOverlay {
+            group: (group != muru_edge::routing::DEFAULT_GROUP).then(|| group.to_owned()),
+            min_workers: Some(min_workers),
+            max_workers,
+            ..muru_config::AppOverlay::default()
+        };
+        let overlay = muru_config::Overlay {
+            apps: BTreeMap::from([(app.to_owned(), change.clone())]),
+            ..muru_config::Overlay::default()
+        };
+        muru_config::check_overlay("scale", &overlay)?;
+        let name = crate::overlays::temporary_name(app, group);
+        self.store
+            .put_overlay(&name, &overlay)
+            .map_err(|error| error.to_string())?;
+        let state = crate::model::OverlayState {
+            name: name.clone(),
+            active: true,
+            source: "manual".to_owned(),
+            since_unix_ms: now,
+            until_unix_ms: Some(until),
+        };
+        self.store
+            .set_overlay_state(&name, Some(&state))
+            .map_err(|error| error.to_string())?;
+        let detail = format!(
+            "activated by muructl scale: {group} {} for {}",
+            crate::overlays::describe_capacity(&change),
+            crate::overlays::describe_wait(until - now)
+        );
+        self.events.emit(
+            "overlay.activated",
+            &format!("overlay {name}"),
+            "notice",
+            &detail,
+        );
+        Ok(detail)
+    }
+
     /// Section 9.10: what a person asks of an overlay.
     async fn control_overlay(
         &mut self,
@@ -2023,6 +2107,13 @@ impl Daemon {
                 self.store
                     .set_overlay_state(name, held.as_ref())
                     .map_err(|error| error.to_string())?;
+
+                if crate::overlays::is_temporary(name) {
+                    self.store
+                        .delete_overlay(name)
+                        .map_err(|error| error.to_string())?;
+                }
+
                 let detail = "ended by hand".to_owned();
                 self.events
                     .emit("overlay.ended", &subject, "notice", &detail);
@@ -2642,6 +2733,19 @@ impl Daemon {
             }
             Command::Overlay { name, action, done } => {
                 let _ = done.send(self.control_overlay(&name, action).await);
+            }
+            Command::ScaleFloor {
+                app,
+                group,
+                min_workers,
+                max_workers,
+                until,
+                done,
+            } => {
+                let outcome = self
+                    .scale_floor(&app, &group, min_workers, max_workers, until)
+                    .await;
+                let _ = done.send(outcome);
             }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
@@ -3976,13 +4080,17 @@ impl Daemon {
             .collect();
 
         // Section 9.10: an overlay that pins or splits a route's traffic
-        // holds its application's rollout until it ends.
+        // holds its application's rollout until it ends, as a deploy
+        // freeze does (section 9.6).
 
         let pinned = {
             let overlays = self.store.overlays().unwrap_or_default();
             let states = self.store.overlay_states().unwrap_or_default();
             let active = crate::overlays::ordered(&overlays, &states);
-            crate::overlays::pinned_apps(&self.store.routes().unwrap_or_default(), &active)
+            let mut pinned =
+                crate::overlays::pinned_apps(&self.store.routes().unwrap_or_default(), &active);
+            pinned.extend(crate::overlays::freezes(&active).into_keys());
+            pinned
         };
 
         for mut rollout in running {
@@ -4225,6 +4333,7 @@ impl Daemon {
         let now = Instant::now();
         let mut requests: Vec<(String, String, String, u32)> = Vec::new();
         let mut emitted: Vec<(&'static str, String, &'static str, String)> = Vec::new();
+        let mut capacities = self.capacities();
 
         for ((app, id), running) in &mut self.running {
             // A retained release is at its warm floor (section 9.1), not
@@ -4256,6 +4365,11 @@ impl Daemon {
                     .max()
                     .map(|at| now.saturating_duration_since(*at));
                 let advisory = group.scaler.spec().advisory;
+                group.scaler.set_capacity(capacities.remove(&(
+                    app.clone(),
+                    id.clone(),
+                    group.name.clone(),
+                )));
 
                 if advisory {
                     group.scaler.sync(ready);
@@ -4315,6 +4429,96 @@ impl Daemon {
         for (app, id, group, processes) in requests {
             self.ask_scale(&app, &id, &group, processes);
         }
+    }
+
+    /// Section 7.5: the capacity active overlays and schedules set, and
+    /// those warming up ahead of a window, for each running release's
+    /// groups. A release taking a share of its application's traffic, as
+    /// a canary does, takes that share of the floor.
+    fn capacities(&self) -> HashMap<(String, String, String), crate::scaling::Capacity> {
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states = self.store.overlay_states().unwrap_or_default();
+        let mut applied = crate::overlays::ordered(&overlays, &states);
+        applied.extend(
+            overlays
+                .iter()
+                .filter(|(name, _)| self.warm_ups.contains_key(name)),
+        );
+        let by_app = crate::overlays::capacities(applied);
+        let mut found = HashMap::new();
+
+        if by_app.is_empty() {
+            return found;
+        }
+
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+
+        for (app, id) in self.running.keys() {
+            let share = self.traffic_share(app, id, &routes, &rollouts);
+
+            if share == 0 {
+                continue;
+            }
+
+            for ((capacity_app, group), capacity) in &by_app {
+                if capacity_app != app {
+                    continue;
+                }
+
+                let mut capacity = capacity.clone();
+                capacity.floor = (capacity.floor * share).div_ceil(100);
+                found.insert((app.clone(), id.clone(), group.clone()), capacity);
+            }
+        }
+
+        found
+    }
+
+    /// The percentage of its application's requests a release takes: its
+    /// rollout or policy share on the route that gives it the most, the
+    /// rest for the release that serves, and none for another.
+    fn traffic_share(
+        &self,
+        app: &str,
+        id: &str,
+        routes: &[muru_config::Route],
+        rollouts: &[Rollout],
+    ) -> u32 {
+        let serves = self.serving.get(app).is_some_and(|serving| serving == id);
+        let rollout = rollouts
+            .iter()
+            .find(|rollout| rollout.app == app && rollout.state.is_active());
+        let mut best = None;
+
+        for route in routes
+            .iter()
+            .filter(|route| route_apps(route).first() == Some(&app))
+        {
+            let mut shares: BTreeMap<&str, u32> = route
+                .traffic
+                .iter()
+                .flat_map(|traffic| traffic.split.iter())
+                .filter(|(release, _)| !release.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
+                .map(|(release, percent)| (release.as_str(), (*percent).min(100)))
+                .collect();
+
+            if let Some(rollout) = rollout {
+                shares.insert(rollout.candidate.as_str(), rollout.percent().min(100));
+            }
+
+            let named: u32 = shares.values().sum();
+
+            let share = match shares.get(id) {
+                Some(share) => *share,
+                None if serves => 100u32.saturating_sub(named),
+                None => 0,
+            };
+
+            best = Some(best.unwrap_or(0).max(share));
+        }
+
+        best.unwrap_or(if serves { 100 } else { 0 })
     }
 
     /// Ask a release's host to bring a group to a worker count; the host
@@ -4397,10 +4601,10 @@ impl Daemon {
                 return Err("processes must be at least 1".to_owned());
             }
 
-            if !spec.is_static() && count > spec.max_workers {
+            if !spec.is_static() && count > scaling.scaler.ceiling() {
                 return Err(format!(
                     "{count} is over the group's max_workers of {}",
-                    spec.max_workers
+                    scaling.scaler.ceiling()
                 ));
             }
 

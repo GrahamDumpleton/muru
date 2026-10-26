@@ -107,6 +107,20 @@ is kept running while the rollout lasts, a deploy or rollback that would
 drain it leaves it in place, and `muructl config export` does not include
 its share, which is live state rather than declared configuration.
 
+## Deploy freezes
+
+While an overlay or a [schedule](scaling.md#scheduled-capacity) with
+`freeze_deploys = true` is active for an application, its deploys and
+rollouts are refused: `muructl deploy`, `muructl apply` when it would
+deploy a release of the application, `muructl rollout canary`,
+`bluegreen` and `promote`. A rollout already under way holds its step
+until the freeze ends. Rolling back, pausing and aborting are never
+frozen.
+
+Each of those commands takes `--override-freeze` to go ahead anyway,
+which is recorded as a `deploy.freeze_overridden` event at warning level,
+saying what was done and which overlay froze it.
+
 ## Events
 
 Every change is an event: `rollout.started`, `rollout.step` for each new
