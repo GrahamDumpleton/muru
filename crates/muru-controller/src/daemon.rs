@@ -3726,6 +3726,19 @@ impl Daemon {
             })
             .collect();
 
+        // Section 9.3: with no host declared, the default application's
+        // rollout chooses among its releases as a route's would.
+
+        let default_traffic = if hosts.is_empty() && !default_app.is_empty() {
+            let route = muru_config::Route {
+                app: default_app.clone(),
+                ..muru_config::Route::default()
+            };
+            self.route_traffic(&route, &included, &rollouts)
+        } else {
+            None
+        };
+
         pb::Snapshot {
             version: 0,
             worker_sockets,
@@ -3741,6 +3754,7 @@ impl Daemon {
             default_release,
             client_classes: self.clients.classes_message.clone(),
             rate_limits: self.clients.limits_message.clone(),
+            default_traffic,
         }
     }
 
@@ -4731,7 +4745,21 @@ impl Daemon {
             best = Some(best.unwrap_or(0).max(share));
         }
 
-        best.unwrap_or(if serves { 100 } else { 0 })
+        // Without a route, a rollout of the default application shares
+        // its requests all the same.
+
+        match (best, rollout) {
+            (Some(best), _) => best,
+            (None, Some(rollout)) if rollout.candidate == id => rollout.percent().min(100),
+            (None, Some(rollout)) if serves => 100u32.saturating_sub(rollout.percent().min(100)),
+            (None, _) => {
+                if serves {
+                    100
+                } else {
+                    0
+                }
+            }
+        }
     }
 
     /// Ask a release's host to bring a group to a worker count; the host

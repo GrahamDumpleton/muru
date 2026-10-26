@@ -907,6 +907,9 @@ pub struct Routing {
     upstreams: HashMap<String, Arc<Upstream>>,
     /// The client classification rules (section 4.14).
     classifier: crate::classify::Classifier,
+    /// With no host declared, the default application and the policy
+    /// that chooses among its releases, when it has one (section 9.3).
+    default_policy: Option<(String, Policy)>,
 }
 
 /// Where a request goes.
@@ -999,6 +1002,7 @@ impl Routing {
             errors: Arc::new(ErrorPolicy::default()),
             upstreams: HashMap::new(),
             classifier: crate::classify::Classifier::default(),
+            default_policy: None,
         }
     }
 
@@ -1101,6 +1105,15 @@ impl Routing {
             )),
         };
 
+        let default_policy = match &snapshot.default_traffic {
+            Some(traffic) if apps.contains_key(&snapshot.default_app) => Some((
+                snapshot.default_app.clone(),
+                Policy::from_message(traffic)
+                    .map_err(|error| anyhow::anyhow!("the default application: {error}"))?,
+            )),
+            _ => None,
+        };
+
         // Exact names go in a map; wildcards keep their suffix, longest
         // first, so *.shop.example.com beats *.example.com.
 
@@ -1162,6 +1175,7 @@ impl Routing {
             errors: Arc::new(errors),
             upstreams: upstreams.clone(),
             classifier,
+            default_policy,
         };
 
         for host in &snapshot.hosts {
@@ -1430,11 +1444,23 @@ impl Routing {
         origin: Option<&Origin>,
     ) -> Decision {
         if self.hosts.is_empty() {
-            return match self.default.select(path, client.client_class, origin) {
+            // A rollout of the default application chooses among its
+            // releases as a route's policy does.
+
+            let mut cookies = Vec::new();
+
+            let selection = match &self.default_policy {
+                Some((app, policy)) => {
+                    self.selection_for(app, Some(policy), path, client, &mut cookies, origin)
+                }
+                None => self.default.select(path, client.client_class, origin),
+            };
+
+            return match selection {
                 Some(selection) => Decision::Serve {
                     selection,
                     server_name: None,
-                    cookies: Vec::new(),
+                    cookies,
                     auth: None,
                     upload: None,
                     max_body_size: None,
@@ -1750,6 +1776,7 @@ mod tests {
             version: 7,
             client_classes: Vec::new(),
             rate_limits: Vec::new(),
+            default_traffic: None,
             compression: None,
             worker_sockets: Vec::new(),
             default_app: String::new(),

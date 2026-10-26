@@ -4,9 +4,10 @@ A deploy moves traffic to the new release as soon as it is ready. A
 rollout does it in stages: the release is started without traffic, gets a
 share of the application's requests step by step, is judged at each step
 against the release that still serves, and is promoted when every step
-passes or rolled back when one fails. Rollouts need a route to the
-application, since the shares are applied on the application's routes
-(see [virtual hosts](virtual-hosts.md)).
+passes or rolled back when one fails. The shares are applied on the
+application's routes (see [virtual hosts](virtual-hosts.md)), or, on a
+daemon with no host declared, to every request the application takes
+as the default one.
 
 ## Holding a release
 

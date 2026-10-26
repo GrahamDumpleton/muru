@@ -198,6 +198,31 @@ def test_a_probe_failing_on_the_candidate_alone_rolls_back(daemon: Daemon, tmp_p
     assert "not an http or https URL with a host" in refused.stderr
 
 
+def test_a_rollout_needs_no_route_for_the_default_application(daemon: Daemon) -> None:
+    daemon.deploy("shop", SHOP)
+    daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "50", "--hold", "60s", "--min-requests", "1000"
+    )
+
+    # With no host declared, the application's requests are shared
+    # between the releases as a route's would be, and a preview reaches
+    # the candidate.
+
+    def release(**headers: str) -> str:
+        response = daemon.request("/", headers=headers)
+        assert response.status == 200, response.body
+        served: str = json.loads(response.body)["release"]
+        return served
+
+    seen = {release(Cookie=f"muru_id=default-{n}") for n in range(40)}
+    assert seen == {"r1", "r2"}, seen
+    assert release(**{"Muru-Preview": "r2", "Cookie": "muru_id=default-0"}) == "r2"
+
+    daemon.muructl("rollout", "abort", "shop")
+    assert {release(Cookie=f"muru_id=default-{n}") for n in range(20)} == {"r1"}
+
+
 def test_an_export_can_resolve_a_rollout_where_it_stands(daemon: Daemon, tmp_path: Path) -> None:
     prepare(daemon, tmp_path)
     daemon.muructl(

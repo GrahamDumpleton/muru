@@ -44,6 +44,7 @@ message Snapshot {
   string default_release = 12;          // and its release
   repeated ClientClass client_classes = 13; // section 4.14: classification rules, in order
   repeated RateLimit rate_limits = 14;  // section 4.15: the rate limits hosts and routes name
+  Traffic default_traffic = 15;         // with no host declared, the default application's policy: its rollout's share (section 9.3)
 }
 
 // Section 4.14: a client classification rule, with its list files read.
