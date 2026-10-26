@@ -31,6 +31,7 @@ use tokio_rustls::TlsAcceptor;
 
 pub mod access;
 pub mod auth;
+pub mod buckets;
 pub mod classify;
 pub mod compression;
 pub mod connections;
@@ -95,6 +96,10 @@ pub struct Config {
     /// Where upload routes store files (section 4.11); a route that
     /// takes uploads without one passes its bodies through.
     pub spool: Option<Arc<uploads::Spool>>,
+    /// The table of the rate limits' buckets, shared with the node's
+    /// other edge processes (section 4.15); the process's own buckets
+    /// when absent, or when the table cannot be mapped.
+    pub rate_buckets: Option<PathBuf>,
 }
 
 /// An HTTPS listener next to the HTTP one (section 13.1 in development).
@@ -451,7 +456,21 @@ impl Edge {
                 admission,
                 spool: config.spool,
                 verifier: classify::Verifier::new(),
-                buckets: ratelimit::Buckets::default(),
+                buckets: config
+                    .rate_buckets
+                    .as_deref()
+                    .and_then(|path| {
+                        ratelimit::Buckets::shared(path)
+                            .map_err(|error| {
+                                tracing::warn!(
+                                    %error,
+                                    path = %path.display(),
+                                    "the shared rate limit buckets are unusable; this process keeps its own"
+                                );
+                            })
+                            .ok()
+                    })
+                    .unwrap_or_default(),
             }),
         })
     }

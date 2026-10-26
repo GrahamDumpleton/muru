@@ -401,8 +401,8 @@ groups, and classes and limits may be declared in applied files too.
 An overlay's `apps.NAME.mode` sets the site mode, and `deny` the
 refused methods, on every route of an application. The JA4 fingerprint
 of a client's TLS ClientHello is an input to the class rules and reaches
-the application in `muru.tls`. Still to come: buckets shared between
-several edge processes.
+the application in `muru.tls`. Rate limit buckets are in shared memory,
+so they outlast an edge's replacement.
 
 Worker inspection's phase 3 commands (section 11.7) are in, through the
 in-process control thread of ADR 0025: `muructl debug profile` samples

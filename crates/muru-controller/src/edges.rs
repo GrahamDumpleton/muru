@@ -85,6 +85,10 @@ pub fn directory(run_dir: &Path) -> PathBuf {
     run_dir.join("edge")
 }
 
+/// The file of the rate limits' shared buckets in the edges' directory,
+/// named for its layout.
+pub const BUCKETS_FILE: &str = "rate-buckets-v1";
+
 /// The control socket and the listener-return socket of an edge of the
 /// given generation, in the edges' directory.
 pub fn socket_paths(directory: &Path, generation: u32) -> (PathBuf, PathBuf) {
@@ -546,6 +550,17 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg(&spec.spool)
         .arg("--spool-quota")
         .arg(spec.limits.spool_quota.to_string());
+
+    // Section 4.15: the rate limits' buckets, in the edges' directory,
+    // which every generation of the edge maps, so a replacement draws
+    // from the buckets of the edge it replaces.
+
+    if let Some(directory) = spec.control.parent() {
+        command
+            .arg("--rate-buckets")
+            .arg(directory.join(BUCKETS_FILE));
+    }
+
     for (name, duration) in [
         ("queue", spec.limits.queue_timeout),
         ("deadline", spec.limits.request_deadline),

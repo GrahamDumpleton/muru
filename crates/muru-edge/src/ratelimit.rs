@@ -4,8 +4,10 @@
 //! a combination, which a host's and a route's limits draw from in turn.
 //! A bucket fills at the limit's rate up to its burst; a request that
 //! finds it empty is refused with 429, held until a token comes when the
-//! limit delays, or only counted when it logs. The buckets belong to the
-//! edge process and outlive snapshots; idle full ones are dropped.
+//! limit delays, or only counted when it logs. The buckets outlive
+//! snapshots: under the daemon they are in shared memory, which every
+//! edge process on the node maps (see `buckets`), and otherwise they
+//! belong to the edge process, which drops idle full ones.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -216,10 +218,17 @@ impl Bucket {
     }
 }
 
-/// Every limit's buckets, for the edge process.
+/// Every limit's buckets: the edge process's own, or a table in shared
+/// memory.
 #[derive(Debug)]
 pub struct Buckets {
-    state: Mutex<State>,
+    store: Store,
+}
+
+#[derive(Debug)]
+enum Store {
+    Local(Mutex<State>),
+    Shared(crate::buckets::Table),
 }
 
 #[derive(Debug)]
@@ -231,15 +240,76 @@ struct State {
 impl Default for Buckets {
     fn default() -> Self {
         Self {
-            state: Mutex::new(State {
+            store: Store::Local(Mutex::new(State {
                 buckets: HashMap::new(),
                 swept: Instant::now(),
-            }),
+            })),
         }
     }
 }
 
 impl Buckets {
+    /// The buckets in the shared table at `path`, made when it is not
+    /// there.
+    pub fn shared(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            store: Store::Shared(crate::buckets::Table::open(path)?),
+        })
+    }
+
+    /// Draw from a limit's bucket for `key`: take a token when `take`
+    /// says so, given the seconds until one is there. Returns those
+    /// seconds.
+    fn draw(&self, limit: &Limit, key: String, now: Instant, take: impl Fn(f64) -> bool) -> f64 {
+        match &self.store {
+            Store::Local(state) => {
+                let mut state = state.lock().expect("buckets poisoned");
+
+                if now.saturating_duration_since(state.swept) >= SWEEP_EVERY {
+                    state.buckets.retain(|_, bucket| {
+                        let mut idle = *bucket;
+                        idle.refill(now);
+                        idle.tokens < idle.burst
+                    });
+                    state.swept = now;
+                }
+
+                let bucket = state
+                    .buckets
+                    .entry((Arc::clone(&limit.name), key))
+                    .or_insert(Bucket {
+                        tokens: limit.burst,
+                        at: now,
+                        per_second: limit.per_second,
+                        burst: limit.burst,
+                    });
+                bucket.refill(now);
+                let wait = bucket.wait();
+
+                if take(wait) {
+                    bucket.tokens -= 1.0;
+                }
+
+                wait
+            }
+            Store::Shared(table) => {
+                // Processes share the wall clock, not each other's
+                // monotonic one.
+
+                let micros = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_micros() as u64);
+                table.draw(
+                    crate::buckets::key(&limit.name, &key),
+                    limit.per_second,
+                    limit.burst,
+                    micros,
+                    take,
+                )
+            }
+        }
+    }
+
     /// Draw from each applicable limit's bucket in turn: the first that
     /// refuses decides, and the longest delay is the wait.
     pub fn check(
@@ -250,42 +320,28 @@ impl Buckets {
         headers: &HeaderMap,
         now: Instant,
     ) -> Outcome {
-        let mut state = self.state.lock().expect("buckets poisoned");
         let mut delay = Duration::ZERO;
         let mut counted = Vec::new();
 
-        if now.saturating_duration_since(state.swept) >= SWEEP_EVERY {
-            state.buckets.retain(|_, bucket| {
-                let mut idle = *bucket;
-                idle.refill(now);
-                idle.tokens < idle.burst
-            });
-            state.swept = now;
-        }
-
         for limit in limits.iter().filter(|limit| limit.applies(class)) {
-            let key = (Arc::clone(&limit.name), limit.key(client, class, headers));
-            let bucket = state.buckets.entry(key).or_insert(Bucket {
-                tokens: limit.burst,
-                at: now,
-                per_second: limit.per_second,
-                burst: limit.burst,
+            // A token is taken when there is one, and by a delaying limit
+            // whose wait is within its longest: the request waits for it,
+            // so those behind it wait longer.
+
+            let delays = |wait: f64| {
+                limit.action == Action::Delay && Duration::from_secs_f64(wait) <= limit.max_delay
+            };
+            let wait = self.draw(limit, limit.key(client, class, headers), now, |wait| {
+                wait == 0.0 || delays(wait)
             });
-            bucket.refill(now);
-            let wait = bucket.wait();
 
             if wait == 0.0 {
-                bucket.tokens -= 1.0;
                 continue;
             }
 
             match limit.action {
                 Action::Log => counted.push((Arc::clone(&limit.name), "logged")),
-                Action::Delay if Duration::from_secs_f64(wait) <= limit.max_delay => {
-                    // The token is taken now and the request waits for it,
-                    // so those behind it wait longer.
-
-                    bucket.tokens -= 1.0;
+                Action::Delay if delays(wait) => {
                     delay = delay.max(Duration::from_secs_f64(wait));
                     counted.push((Arc::clone(&limit.name), "delayed"));
                 }

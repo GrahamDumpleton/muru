@@ -216,8 +216,11 @@ shows what a limit would do before it is enforced, and the
 `ratelimit.enforcing` event records a limit beginning to refuse or hold
 requests after a quiet minute.
 
-Buckets belong to the edge process: idle full ones are dropped, and
-every bucket starts full again when the edge is replaced.
+Under the daemon the buckets are in shared memory, so they outlast the
+edge process: an edge replaced by an upgrade or restarted after a crash
+draws from the buckets its predecessor left, and both draw from the
+same buckets while they overlap. In development mode they belong to the
+`muructl run` process.
 
 ## Method restrictions and site modes
 

@@ -86,6 +86,11 @@ pub struct EdgeRunArgs {
     #[arg(long, value_name = "BYTES")]
     spool_quota: Option<u64>,
 
+    /// The rate limits' buckets, shared with the node's other edge
+    /// processes (section 4.15); this process's own when absent.
+    #[arg(long, value_name = "PATH")]
+    rate_buckets: Option<PathBuf>,
+
     /// A Unix socket on which the listener is handed to whoever connects:
     /// a daemon that restarted without it (section 2.3).
     #[arg(long, value_name = "PATH")]
@@ -225,6 +230,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             compression: muru_edge::compression::Compression::default(),
             https: None,
             spool,
+            rate_buckets: args.rate_buckets.clone(),
         },
         inherited,
         Arc::clone(&resolver),

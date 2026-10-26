@@ -293,6 +293,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         compression: compression.clone(),
         https: None,
         spool: None,
+        rate_buckets: None,
     })
     .await
     .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
@@ -1794,6 +1795,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         },
         https: tls.as_ref().map(|tls| tls.https.clone()),
         spool: None,
+        rate_buckets: None,
     })
     .await
     {
