@@ -258,12 +258,13 @@ steps can wait for approval, and `rollout status`, `pause`, `resume`,
 `promote` and `abort` follow and control the rollout; `muructl rollout
 bluegreen` moves all traffic at once; every change is a `rollout.*`
 event, and a daemon restart continues a rollout with its current step
-starting afresh. Still to
-come in this part of the phase: A/B cohorts by header and cookie
-matches, per-route policies for one application, and rollouts for an
-application reached as the default with no route. Scheduled freezes came with
-capacity schedules, and the worker crash, p99, queue wait and probe URL
-gates and `config export --resolve-rollouts` followed.
+starting afresh. Still to come in this part of the phase: rollouts for
+an application reached as the default with no route. Scheduled freezes
+came with capacity schedules, and the worker crash, p99, queue wait and
+probe URL gates and `config export --resolve-rollouts` followed. A/B
+cohorts by header or cookie are client classes given a release by a
+policy's `classes`, and per-route policies are each route's own split,
+both described in the traffic guide.
 
 The autoscaler (sections 7.2 to 7.4) followed: a `scaling` table on a
 release or a worker group gives the group a policy, spare mode keeping
