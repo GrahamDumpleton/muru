@@ -591,7 +591,24 @@ pub enum DebugCommand {
     /// command, and the end of input lets the code go on. Without
     /// --worker, the first worker with a breakpoint waiting. Allowed only
     /// when the daemon's [daemon] table sets debug_exec.
-    Attach(DebugArgs),
+    Attach(AttachArgs),
+}
+
+/// `muructl debug attach`.
+#[derive(Args)]
+pub struct AttachArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Carry the Debug Adapter Protocol for an IDE instead of a pdb
+    /// session, to debugpy in the worker, which the release's
+    /// environment must have.
+    #[arg(long)]
+    dap: bool,
+
+    /// Where the IDE connects with --dap.
+    #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:5678")]
+    listen: SocketAddr,
 }
 
 /// `muructl debug profile`.
@@ -781,8 +798,10 @@ const ATTACH_POLL: Duration = Duration::from_millis(300);
 /// line, each line read going to the worker with a request whose answer
 /// brings what pdb wrote since, and the session polled while nothing is
 /// typed.
-async fn attach(args: &DebugArgs) -> anyhow::Result<()> {
+async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
     use std::io::Write as _;
+
+    let args = &attach_args.common;
 
     let worker = match args.worker {
         Some(worker) => worker,
@@ -818,6 +837,10 @@ async fn attach(args: &DebugArgs) -> anyhow::Result<()> {
 
         parse_result(answer).ok_or_else(|| anyhow::anyhow!("worker {worker}: {}", answer.error))
     };
+
+    if attach_args.dap {
+        return relay_dap(attach_args.listen, worker, exchange).await;
+    }
 
     let opened = exchange("attach", serde_json::json!({})).await?;
     let session = opened["session"].as_u64().unwrap_or_default();
@@ -860,6 +883,78 @@ async fn attach(args: &DebugArgs) -> anyhow::Result<()> {
         let result = exchange(op, request).await?;
         print!("{}", result["output"].as_str().unwrap_or_default());
         std::io::stdout().flush()?;
+
+        if op == "detach" || result["ended"].as_bool().unwrap_or(true) {
+            eprintln!("muru: the session in worker {worker} has ended");
+            return Ok(());
+        }
+    }
+}
+
+/// `muructl debug attach --dap` (section 11.7): the Debug Adapter
+/// Protocol between an IDE connected to `listen` and debugpy's adapter in
+/// the worker, what the IDE sent going with each request and what the
+/// adapter sent coming back with its answer, base64, and the session
+/// polled while the IDE is quiet. The IDE closing its connection ends it.
+async fn relay_dap<F, R>(listen: SocketAddr, worker: u32, exchange: F) -> anyhow::Result<()>
+where
+    F: Fn(&'static str, serde_json::Value) -> R,
+    R: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+{
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("listening on {listen}"))?;
+    eprintln!(
+        "muru: waiting for an IDE to attach to {} with the Debug Adapter Protocol",
+        listener.local_addr()?
+    );
+    let (ide, _) = listener.accept().await?;
+    drop(listener);
+
+    let opened = exchange("attach", serde_json::json!({"dap": true})).await?;
+    let session = opened["session"].as_u64().unwrap_or_default();
+    eprintln!(
+        "muru: attached to worker {worker} at {}; the IDE disconnecting lets the code go on",
+        opened["where"].as_str().unwrap_or("?")
+    );
+
+    let (mut from_ide, mut to_ide) = ide.into_split();
+    let mut buffer = vec![0; 65536];
+
+    loop {
+        let (op, request) =
+            match tokio::time::timeout(ATTACH_POLL, from_ide.read(&mut buffer)).await {
+                Ok(Ok(0) | Err(_)) => ("detach", serde_json::json!({"session": session})),
+                Ok(Ok(read)) => (
+                    "attach_io",
+                    serde_json::json!({
+                        "session": session,
+                        "data": STANDARD.encode(&buffer[..read]),
+                        "wait_s": 0.5,
+                    }),
+                ),
+                Err(_) => (
+                    "attach_io",
+                    serde_json::json!({"session": session, "data": "", "wait_s": 0.0}),
+                ),
+            };
+
+        let result = exchange(op, request).await?;
+        let sent = STANDARD
+            .decode(result["data"].as_str().unwrap_or_default())
+            .context("the worker's answer")?;
+
+        // An IDE that has gone ends the session at the next turn.
+
+        if !sent.is_empty() && to_ide.write_all(&sent).await.is_err() {
+            exchange("detach", serde_json::json!({"session": session})).await?;
+            eprintln!("muru: the session in worker {worker} has ended");
+            return Ok(());
+        }
 
         if op == "detach" || result["ended"].as_bool().unwrap_or(true) {
             eprintln!("muru: the session in worker {worker} has ended");

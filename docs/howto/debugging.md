@@ -6,9 +6,9 @@
 Status, stacks, tasks, inspect, logger levels, profiling, tracing,
 memory, running a snippet, a pdb session with `breakpoint()`, and the
 automatic captures, answered from inside each worker by the runtime's
-control thread, with faulthandler when a worker cannot answer. The Debug
-Adapter Protocol for IDEs and reading a worker from outside with PEP 768
-on Python 3.14 are still to come.
+control thread, with faulthandler when a worker cannot answer, and the
+Debug Adapter Protocol for IDEs. Reading a worker from outside with PEP
+768 on Python 3.14 is still to come.
 ```
 
 `muructl debug` looks into the workers of a release through the daemon,
@@ -172,6 +172,38 @@ While a session is open its worker takes no new requests, and nothing
 replaces it: recycling, the hard timeout, the memory limits and scaling
 in all wait until the session ends, when the worker serves again.
 `muructl debug status` shows it as `debugging` meanwhile.
+
+### From an IDE
+
+`--dap` carries the Debug Adapter Protocol instead of a pdb session, so
+an IDE such as VS Code debugs the worker through muructl. The release's
+environment needs debugpy installed. muructl listens for the IDE on
+`127.0.0.1:5678`, or the address `--listen` gives, and attaches once it
+connects:
+
+```
+$ muructl debug attach shop --dap
+muru: waiting for an IDE to attach to 127.0.0.1:5678 with the Debug Adapter Protocol
+muru: attached to worker 1 at /srv/shop/views.py:42; the IDE disconnecting lets the code go on
+```
+
+In VS Code that is an `attach` configuration naming the address:
+
+```json
+{
+  "name": "Muru worker",
+  "type": "debugpy",
+  "request": "attach",
+  "connect": { "host": "127.0.0.1", "port": 5678 },
+  "pathMappings": [{ "localRoot": "${workspaceFolder}", "remoteRoot": "/srv/shop" }]
+}
+```
+
+A request waiting at `breakpoint()` stops at the line after it once the
+IDE has attached, and the IDE can step through it from there; with none
+waiting, the IDE sees the worker's threads and can pause them. As with
+pdb, the worker takes no new requests meanwhile. Disconnecting ends the
+session and lets the code go on.
 
 A debugger runs code in the worker, so attaching needs `debug_exec =
 true` as running a snippet does. Each session is the event

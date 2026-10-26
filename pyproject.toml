@@ -22,6 +22,7 @@ dev = [
     "zstandard>=0.25.0",
 ]
 fixtures = [
+    "debugpy>=1.8.17",
     "django>=5.2",
     "fastapi>=0.115",
     "flask>=3.1",

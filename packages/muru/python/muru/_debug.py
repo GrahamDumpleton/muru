@@ -11,15 +11,23 @@ In a worker, ``breakpoint()`` waits for an attach: it records where it
 stopped, raises the ``debug.breakpoint`` event, takes its request out of
 the timeouts, and gives up after ``timeout`` seconds (60 by default) and
 carries on.
+
+With ``dap`` the session is a relay instead: the bytes of the Debug
+Adapter Protocol, base64 in each exchange, between the operator's IDE and
+the adapter debugpy starts for the worker on a loopback port. A waiting
+``breakpoint()`` then stops at its caller's next line once the IDE has
+finished configuring.
 """
 
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 import os
 import pdb
 import queue
+import socket
 import sys
 import threading
 import time
@@ -41,8 +49,12 @@ IDLE_LIMIT = 600.0
 _worker = {"index": 0, "report": -1}
 _ids = itertools.count(1)
 _lock = threading.Lock()
-_sessions: dict[int, Session] = {}
+_sessions: dict[int, Session | Relay] = {}
 _waiting: list[Waiting] = []
+
+# Where debugpy's adapter listens, once a DAP session has started it.
+
+_adapter: dict[str, tuple[str, int]] = {}
 
 
 def install(index: int, report: int | None) -> None:
@@ -178,6 +190,109 @@ class Debugger(pdb.Pdb):
         self.session.finish()
 
 
+class Relay:
+    """One operator's DAP session: bytes between the IDE and debugpy's adapter."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        self.id = next(_ids)
+        self.connection = connection
+        self.output = bytearray()
+        self.changed = threading.Condition()
+        self.ended = False
+        self.started = time.monotonic()
+        self.last_line = self.started
+        self.where = ""
+        reader = threading.Thread(target=self.read, name="muru-dap", daemon=True)
+        _keep_running(reader)
+        reader.start()
+
+    def read(self) -> None:
+        """Keep what the adapter sends for the operator's next exchange."""
+
+        self.connection.settimeout(1.0)
+
+        while not self.ended:
+            now = time.monotonic()
+
+            if now - self.started > MAX_SESSION or now - self.last_line > IDLE_LIMIT:
+                break
+
+            try:
+                data = self.connection.recv(65536)
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+
+            if not data:
+                break
+
+            with self.changed:
+                self.output.extend(data)
+                self.changed.notify_all()
+
+        self.finish()
+
+    def feed(self, data: bytes) -> None:
+        """Pass the IDE's bytes to the adapter."""
+
+        self.last_line = time.monotonic()
+
+        if data:
+            self.connection.sendall(data)
+
+    def take(self, wait: float) -> bytes:
+        """Return what the adapter sent, waiting up to `wait` seconds for something."""
+
+        with self.changed:
+            if not self.output and not self.ended:
+                self.changed.wait(wait)
+
+            data = bytes(self.output)
+            self.output.clear()
+            return data
+
+    def finish(self) -> None:
+        """End the session; the adapter lets the debugged code go on."""
+
+        with self.changed:
+            if self.ended:
+                return
+
+            self.ended = True
+            self.changed.notify_all()
+
+        self.connection.close()
+        event("debug.detached", "info", f"the debugger session at {self.where} ended")
+
+
+def _keep_running(thread: threading.Thread) -> None:
+    """Keep debugpy from tracing a thread or suspending it at a stop.
+
+    The relay and the control thread carry the IDE's messages, so they go
+    on while the debugged code is stopped.
+    """
+
+    thread.is_pydev_daemon_thread = True  # type: ignore[attr-defined]
+    thread.pydev_do_not_trace = True  # type: ignore[attr-defined]
+
+
+def _adapter_address() -> tuple[str, int]:
+    """Start debugpy's adapter for the worker, once, and return where it listens."""
+
+    if "address" not in _adapter:
+        os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
+
+        try:
+            import debugpy
+        except ImportError:
+            raise RuntimeError("debugpy is not installed in the release's environment") from None
+
+        _adapter["address"] = debugpy.listen(("127.0.0.1", 0))
+
+    return _adapter["address"]
+
+
 class Waiting:
     """A thread stopped at breakpoint(), waiting for a session."""
 
@@ -186,7 +301,7 @@ class Waiting:
         self.where = f"{frame.f_code.co_filename}:{frame.f_lineno}"
         self.thread = threading.get_ident()
         self.ready = threading.Event()
-        self.session: Session | None = None
+        self.session: Session | Relay | None = None
 
 
 def breakpoint_hook(*args: Any, timeout: float = BREAKPOINT_TIMEOUT, **kwargs: Any) -> None:
@@ -228,7 +343,38 @@ def breakpoint_hook(*args: Any, timeout: float = BREAKPOINT_TIMEOUT, **kwargs: A
         )
         return
 
-    Debugger(session).set_trace(frame)
+    if isinstance(session, Relay):
+        _stop_for_ide(session, frame)
+    else:
+        Debugger(session).set_trace(frame)
+
+
+def _stop_for_ide(relay: Relay, frame: FrameType) -> None:
+    """Stop at the frame's next line once the IDE has finished configuring."""
+
+    import debugpy
+    from debugpy.server.api import _settrace
+
+    while not debugpy.is_client_connected():
+        if relay.ended:
+            return
+
+        time.sleep(0.1)
+
+    # The runtime's request threads are not threading's, so debugpy
+    # traces one only once told to.
+
+    debugpy.debug_this_thread()
+
+    # debugpy.breakpoint() stops in its own caller, this function;
+    # settrace is what it calls, and takes the frame to stop in.
+
+    _settrace(  # type: ignore[no-untyped-call]
+        suspend=True,
+        trace_only_current_thread=True,
+        patch_multiprocessing=False,
+        stop_at_frame=frame,
+    )
 
 
 def _shell(session: Session) -> None:
@@ -246,10 +392,20 @@ def waiting() -> dict[str, Any]:
         return {"waiting": [{"where": entry.where, "thread": entry.thread} for entry in _waiting]}
 
 
-def attach() -> dict[str, Any]:
-    """Open a session: on the oldest breakpoint waiting, else on a thread of its own."""
+def attach(dap: bool = False) -> dict[str, Any]:
+    """Open a session: on the oldest breakpoint waiting, else on a thread of its own.
 
-    session = Session()
+    With `dap` the session relays the Debug Adapter Protocol to debugpy's
+    adapter, which reaches every thread itself.
+    """
+
+    session: Session | Relay
+
+    if dap:
+        _keep_running(threading.current_thread())
+        session = Relay(socket.create_connection(_adapter_address(), timeout=10))
+    else:
+        session = Session()
 
     with _lock:
         waiting = _waiting.pop(0) if _waiting else None
@@ -261,32 +417,45 @@ def attach() -> dict[str, Any]:
 
     if waiting is not None:
         waiting.ready.set()
+    elif isinstance(session, Relay):
+        session.where = "the worker's threads"
     else:
         session.where = "a thread of its own"
         thread = threading.Thread(target=_shell, args=(session,), name="muru-debug", daemon=True)
         thread.start()
 
+    if isinstance(session, Relay):
+        return {"session": session.id, "where": session.where, "dap": True}
+
     return {"session": session.id, "where": session.where, "output": session.take(2.0)}
 
 
-def exchange(session_id: int, text: str, wait: float) -> dict[str, Any]:
-    """Pass the operator's lines to a session and return what pdb wrote."""
+def exchange(session_id: int, text: str, wait: float, data: str = "") -> dict[str, Any]:
+    """Pass the operator's lines to a session and return what pdb wrote.
+
+    A DAP session takes and returns base64 `data` instead.
+    """
 
     session = _sessions.get(session_id)
 
     if session is None:
         raise ValueError(f"no debugger session {session_id} in this worker")
 
-    if text:
-        session.feed(text)
+    if isinstance(session, Relay):
+        session.feed(base64.b64decode(data))
+        sent = session.take(wait)
+        answer = {"data": base64.b64encode(sent).decode(), "ended": session.ended}
+    else:
+        if text:
+            session.feed(text)
 
-    output = session.take(wait)
+        answer = {"output": session.take(wait), "ended": session.ended}
 
     if session.ended and not session.output:
         with _lock:
             _sessions.pop(session_id, None)
 
-    return {"output": output, "ended": session.ended}
+    return answer
 
 
 def detach(session_id: int) -> dict[str, Any]:
@@ -296,6 +465,10 @@ def detach(session_id: int) -> dict[str, Any]:
 
     if session is None:
         return {"output": "", "ended": True}
+
+    if isinstance(session, Relay):
+        session.finish()
+        return exchange(session_id, "", 0.0)
 
     if not session.ended:
         session.let_go()

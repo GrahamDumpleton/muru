@@ -399,8 +399,9 @@ Debugger attach followed: `breakpoint()` in a worker waits for `muructl
 debug attach`, out of the timeouts, and `debug attach` carries a pdb
 session line by line through the daemon and the host, at the breakpoint
 or on a thread of its own, allowed where exec is, and the debugged
-worker is out of routing and pinned while the session lasts. Still to
-come: DAP, `--requests` and `--path`, pstats output, and reading from
+worker is out of routing and pinned while the session lasts, and
+`--dap` carries the Debug Adapter Protocol to debugpy for an IDE. Still
+to come: `--requests` and `--path`, pstats output, and reading from
 outside with PEP 768.
 
 Overlays (section 9.10) are in, activated by hand or by a one-off or

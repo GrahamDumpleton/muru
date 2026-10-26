@@ -1343,6 +1343,7 @@ name = "muructl"
 version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "globset",
  "ignore",

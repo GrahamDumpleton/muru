@@ -105,12 +105,13 @@ def handle(
         elif op == "breakpoints":
             result = _debug.waiting()
         elif op == "attach":
-            result = _debug.attach()
+            result = _debug.attach(bool(args.get("dap", False)))
         elif op == "attach_io":
             result = _debug.exchange(
                 int(args.get("session", 0)),
                 str(args.get("input", "")),
                 float(args.get("wait_s", 0.5)),
+                str(args.get("data", "")),
             )
         elif op == "detach":
             result = _debug.detach(int(args.get("session", 0)))
