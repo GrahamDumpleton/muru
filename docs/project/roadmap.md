@@ -379,8 +379,8 @@ followed: a route's `match` makes it a route for some classes, sharing
 its path with the route for every class, a traffic policy's `classes`
 gives a class a release or upstream of its own, kept running for it,
 and a worker group's `match` takes a class's requests ahead of the other
-groups. Still to come: classes and limits in applied files, the
-application-level mode (section 9.10), buckets shared between several
+groups, and classes and limits may be declared in applied files too.
+Still to come: the application-level mode (section 9.10), buckets shared between several
 edge processes, and TLS fingerprints as an input.
 
 Worker inspection's phase 3 commands (section 11.7) are in, through the

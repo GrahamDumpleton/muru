@@ -605,8 +605,11 @@ struct Daemon {
     /// 4.12), for every snapshot.
     error_pages: Vec<pb::ErrorPage>,
     error_override: Option<pb::ErrorOverride>,
-    /// The client classes and rate limits (sections 4.14 and 4.15), for
-    /// every snapshot, with the list files they were read from.
+    /// The daemon file's client classes and rate limits (sections 4.14
+    /// and 4.15).
+    client_rules: crate::clients::FileRules,
+    /// Those with the applied files', for every snapshot, with the list
+    /// files they were read from.
     clients: crate::clients::ClientPolicies,
     /// Which rate limits are refusing requests, for the events.
     enforcement: crate::clients::Enforcement,
@@ -673,12 +676,11 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let (error_pages, error_override) =
         error_tables_message(&config.error_pages, config.error_override.as_ref())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let clients = crate::clients::ClientPolicies::resolve(
-        &config.client_classes,
-        &config.rate_limits,
-        &config_directory(&config.locations.config.path),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let client_rules = crate::clients::FileRules {
+        classes: config.client_classes.clone(),
+        limits: config.rate_limits.clone(),
+        directory: config_directory(&config.locations.config.path),
+    };
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
@@ -706,6 +708,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     let store = Arc::new(Store::open(&locations.state_store())?);
+    let clients = client_rules
+        .policies(&store)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let events = Events::new(Arc::clone(&store));
 
     // Section 11.5: each sink delivers from its own cursor, so nothing
@@ -808,7 +813,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
         dashboard,
-        defined: std::sync::RwLock::new(clients.defined()),
+        defined: std::sync::RwLock::new(client_rules.defined()),
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -918,6 +923,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         compression,
         error_pages,
         error_override,
+        client_rules,
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
@@ -1754,11 +1760,12 @@ impl Daemon {
             .map_err(|error| format!("[compression]: {error}"))?;
         let (error_pages, error_override) =
             error_tables_message(&document.error_pages, document.error_override.as_ref())?;
-        let clients = crate::clients::ClientPolicies::resolve(
-            &document.client_class,
-            &document.rate_limit,
-            &config_directory(&path),
-        )?;
+        let client_rules = crate::clients::FileRules {
+            classes: document.client_class.clone(),
+            limits: document.rate_limit.clone(),
+            directory: config_directory(&path),
+        };
+        let clients = client_rules.policies(&self.store)?;
         let changed = proxy != self.proxy
             || compression != self.compression
             || error_pages != self.error_pages
@@ -1769,7 +1776,8 @@ impl Daemon {
         self.compression = compression;
         self.error_pages = error_pages;
         self.error_override = error_override;
-        *self.info.defined.write().expect("defined names poisoned") = clients.defined();
+        *self.info.defined.write().expect("defined names poisoned") = client_rules.defined();
+        self.client_rules = client_rules;
         self.clients = clients;
 
         if changed {
@@ -2711,6 +2719,16 @@ impl Daemon {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
             Command::Reconfigure { done } => {
+                // An apply may have changed the applied classes and
+                // limits.
+
+                match self.client_rules.policies(&self.store) {
+                    Ok(clients) => self.clients = clients,
+                    Err(error) => {
+                        tracing::warn!(%error, "the client classes stay as they were");
+                    }
+                }
+
                 self.reconcile_traffic().await;
                 let _ = done.send(self.push_snapshot().await);
             }

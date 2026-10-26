@@ -1,9 +1,10 @@
 //! Client classes and rate limits for the edge (design specification
-//! sections 4.14 and 4.15), from the daemon's own configuration file. A
-//! class's list files are read relative to that file's directory and read
-//! again when they change; a limit that starts refusing requests is an
-//! event.
+//! sections 4.14 and 4.15), from the daemon's own configuration file and,
+//! after its, from applied files. A class's list files are read relative
+//! to the daemon file's directory and read again when they change; a
+//! limit that starts refusing requests is an event.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -11,9 +12,81 @@ use std::time::{Duration, Instant, SystemTime};
 use muru_config::{ClientClass, RateLimit};
 use muru_proto::edge::v1 as pb;
 
+use crate::store::Store;
+
 /// How long a limit must have refused nothing before refusing again is a
 /// new ratelimit.enforcing event.
 const QUIET_FOR: Duration = Duration::from_secs(60);
+
+/// The daemon file's classes and limits, with the directory its list
+/// files are relative to.
+#[derive(Debug, Clone, Default)]
+pub struct FileRules {
+    /// The `[[client_class]]` rules, in order.
+    pub classes: Vec<ClientClass>,
+    /// The `[rate_limit.NAME]` tables.
+    pub limits: BTreeMap<String, RateLimit>,
+    /// The daemon file's directory.
+    pub directory: PathBuf,
+}
+
+impl FileRules {
+    /// The names the file defines, for checking what applied files name.
+    pub fn defined(&self) -> crate::config::Defined {
+        crate::config::Defined {
+            rate_limits: self.limits.keys().cloned().collect(),
+            client_classes: self
+                .classes
+                .iter()
+                .map(|class| class.name.clone())
+                .collect(),
+        }
+    }
+
+    /// The classes and limits for the edge: the file's, then the applied
+    /// files' from `store`, a name the file defines staying the file's.
+    /// An error is the file's own; when the applied ones cannot be read,
+    /// they are left out with a warning.
+    pub fn policies(&self, store: &Store) -> Result<ClientPolicies, String> {
+        let alone = ClientPolicies::resolve(&self.classes, &self.limits, &self.directory)?;
+        let applied = store.client_classes().unwrap_or_default();
+        let applied_limits = store.rate_limits().unwrap_or_default();
+
+        if applied.is_empty() && applied_limits.is_empty() {
+            return Ok(alone);
+        }
+
+        let mut classes = self.classes.clone();
+        let mut limits = self.limits.clone();
+
+        for (_, class) in applied {
+            if classes.iter().any(|defined| defined.name == class.name) {
+                tracing::warn!(class = %class.name, "the daemon's file defines an applied client class too; its rule stands");
+            } else {
+                classes.push(class);
+            }
+        }
+
+        for (name, limit) in applied_limits {
+            match limits.entry(name) {
+                Entry::Occupied(entry) => {
+                    tracing::warn!(limit = %entry.key(), "the daemon's file defines an applied rate limit too; its table stands");
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(limit);
+                }
+            }
+        }
+
+        match ClientPolicies::resolve(&classes, &limits, &self.directory) {
+            Ok(policies) => Ok(policies),
+            Err(error) => {
+                tracing::warn!(%error, "the applied client classes and rate limits are left out");
+                Ok(alone)
+            }
+        }
+    }
+}
 
 /// The classes and limits as the edge gets them, with the list files
 /// they were read from.
@@ -63,23 +136,6 @@ impl ClientPolicies {
         };
         policies.read_classes()?;
         Ok(policies)
-    }
-
-    /// The names of the limits and classes, for checking what applied
-    /// files name.
-    pub fn defined(&self) -> crate::config::Defined {
-        crate::config::Defined {
-            rate_limits: self
-                .limits_message
-                .iter()
-                .map(|limit| limit.name.clone())
-                .collect(),
-            client_classes: self
-                .classes_message
-                .iter()
-                .map(|class| class.name.clone())
-                .collect(),
-        }
     }
 
     /// Read the list files again when one has changed since they were

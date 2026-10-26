@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use muru_config::{Host as VirtualHost, Overlay, Route, Upstream};
+use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
 
 use crate::model::{
     App, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms,
@@ -109,13 +109,24 @@ CREATE TABLE IF NOT EXISTS overlay_state (
     since_unix_ms INTEGER NOT NULL,
     until_unix_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS client_classes (
+    name TEXT PRIMARY KEY,
+    position INTEGER NOT NULL,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS rate_limits (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The store.
 pub struct Store {
@@ -138,8 +149,9 @@ impl Store {
         // version 4 added the application's user, group and umask, which
         // are added to an older table here; version 5 added the
         // applications in maintenance mode (section 4.12), version 6 the
-        // HTTP upstreams and version 7 overlays and their state (section
-        // 9.10).
+        // HTTP upstreams, version 7 overlays and their state (section
+        // 9.10) and version 8 the client classes and rate limits of
+        // applied files (sections 4.14 and 4.15).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -460,6 +472,92 @@ impl Store {
     pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// The client classes of applied files with their positions, in the
+    /// order their rules are tried (section 4.14).
+    pub fn client_classes(&self) -> Result<Vec<(i64, ClientClass)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT position, spec FROM client_classes ORDER BY position, name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut classes = Vec::new();
+
+            for row in rows {
+                let (position, encoded) = row?;
+                classes.push((position, decode(&encoded)?));
+            }
+
+            Ok(classes)
+        })
+    }
+
+    /// Create or replace a client class, its rule tried at `position`
+    /// among the applied ones.
+    pub fn put_client_class(&self, class: &ClientClass, position: i64) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(class).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO client_classes (name, position, spec) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET position = excluded.position, \
+                 spec = excluded.spec, resource_version = resource_version + 1",
+                params![class.name, position, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a client class.
+    pub fn delete_client_class(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM client_classes WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// The rate limits of applied files, by name (section 4.15).
+    pub fn rate_limits(&self) -> Result<Vec<(String, RateLimit)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM rate_limits ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut limits = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                limits.push((name, decode(&encoded)?));
+            }
+
+            Ok(limits)
+        })
+    }
+
+    /// Create or replace a rate limit.
+    pub fn put_rate_limit(&self, name: &str, limit: &RateLimit) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(limit).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO rate_limits (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a rate limit.
+    pub fn delete_rate_limit(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM rate_limits WHERE name = ?1", [name])?;
             Ok(())
         })
     }
@@ -1021,5 +1119,41 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].kind, "release.failed");
         assert_eq!(after[0].level, "error");
+    }
+
+    #[test]
+    fn client_classes_keep_their_order_and_limits_their_names() {
+        let store = Store::in_memory().unwrap();
+        let class = |name: &str| ClientClass {
+            name: name.to_owned(),
+            user_agent: vec![name.to_owned()],
+            ..ClientClass::default()
+        };
+        store.put_client_class(&class("zeta"), 0).unwrap();
+        store.put_client_class(&class("alpha"), 1).unwrap();
+        store.put_client_class(&class("zeta"), 2).unwrap();
+
+        let names: Vec<String> = store
+            .client_classes()
+            .unwrap()
+            .into_iter()
+            .map(|(_, class)| class.name)
+            .collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+
+        store.delete_client_class("alpha").unwrap();
+        assert_eq!(store.client_classes().unwrap().len(), 1);
+
+        let limit = RateLimit {
+            rate: "2/s".to_owned(),
+            ..RateLimit::default()
+        };
+        store.put_rate_limit("crawlers", &limit).unwrap();
+        assert_eq!(
+            store.rate_limits().unwrap(),
+            [("crawlers".to_owned(), limit)]
+        );
+        store.delete_rate_limit("crawlers").unwrap();
+        assert!(store.rate_limits().unwrap().is_empty());
     }
 }

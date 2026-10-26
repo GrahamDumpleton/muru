@@ -1280,6 +1280,26 @@ impl Service {
                 .delete_overlay(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::PutClientClass {
+                class,
+                position,
+                new,
+            } => store
+                .put_client_class(class, *position)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveClientClass { name } => store
+                .delete_client_class(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutRateLimit { name, limit, new } => store
+                .put_rate_limit(name, limit)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveRateLimit { name } => store
+                .delete_rate_limit(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
         };
 
         outcome.unwrap_or_else(|error| format!("failed: {error}"))

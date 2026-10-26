@@ -4,9 +4,8 @@
 :class: note
 
 Client classes, routing by class, rate limits, method restrictions and
-route site modes, under the daemon. Classes and limits are declared in
-the daemon's own configuration file; declaring them in applied files is
-still to come.
+route site modes, under the daemon, with classes and limits declared in
+the daemon's own configuration file or in applied files.
 ```
 
 The edge gives every request a client class, which the access log,
@@ -17,9 +16,10 @@ feeds its verdict in as a header.
 
 ## Classes
 
-`[[client_class]]` rules go in the daemon's configuration file, where
-they are tried in order; the first whose inputs all match names the
-class, and a request that matches none is class `default`.
+`[[client_class]]` rules go in the daemon's configuration file or in the
+files `muructl apply` reads. They are tried in order, the daemon's
+file's first; the first whose inputs all match names the class, and a
+request that matches none is class `default`.
 
 ```toml
 [[client_class]]
@@ -68,8 +68,9 @@ through to the later rules, the `unverified_bot` above for instance.
 Confirmed names are remembered for 24 hours and failures for an hour.
 
 List files hold one entry a line; blank lines and lines starting with
-`#` are ignored. A path is relative to the configuration file's
-directory, and a list that changes is read again within a second, which
+`#` are ignored. A path in the daemon's file is relative to its
+directory, and one in an applied file is absolute. A list that changes
+is read again within a second, which
 the `client_class.list_reloaded` event records. Community lists of AI
 crawler user agents or a provider's address ranges can be dropped in as
 they are.
@@ -135,8 +136,8 @@ processes = 1
 threads = 4
 ```
 
-`muructl apply` refuses a class the daemon's file does not define;
-`default` is always defined. `muructl route list` shows the classes a
+`muructl apply` refuses a class that is not defined; `default` always
+is. `muructl route list` shows the classes a
 route is for, as `[for ai_crawler]`, and the releases its policy gives
 classes.
 
@@ -146,8 +147,8 @@ sending crawlers to a snapshot only when they become a burden, with
 
 ## Rate limits
 
-A `[rate_limit.NAME]` table in the daemon's file is a token bucket for
-each key, and hosts and routes name the limits their requests draw from:
+A `[rate_limit.NAME]` table, in the daemon's file or an applied one, is
+a token bucket for each key, and hosts and routes name the limits their requests draw from:
 
 ```toml
 [rate_limit.crawlers]
@@ -213,12 +214,27 @@ A route's `mode` is any short word, passed to the application as
 `muru.mode` in the environ or `mode` in the scope's `extensions["muru"]`,
 so it can hide or disable what the mode rules out. Both are the usual
 way to take a site read-only for maintenance of its database, and
-`muructl apply` checks them, with the rate limits a host or route names,
-against the daemon's file.
+`muructl apply` checks them, and that the rate limits a host or route
+names are defined.
 
 ## Changing them
 
 `muructl daemon reload`, or SIGHUP, reads the daemon's file again and
-gives the edge changed classes and limits without a restart. An applied
-file's `[[client_class]]` and `[rate_limit]` tables are reported as
-belonging in the daemon's file and are not applied.
+gives the edge changed classes and limits without a restart.
+
+Classes and limits in applied files reach the edge when they are
+applied, and `muructl config export` writes them out. An applied class's
+rule keeps its place among the applied rules when it changes, and a new
+one goes after them; with `--prune` they take the file's order, and
+those the file leaves out are removed. A name the daemon's file defines
+is refused, and a list file must be an absolute path:
+
+```toml
+[[client_class]]
+name = 'ai_crawler'
+user_agent_list = '/srv/shop/lists/ai-crawlers.txt'
+
+[rate_limit.crawlers]
+match = { client_class = ['ai_crawler'] }
+rate = '2/s'
+```

@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use muru_config::{
-    App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
-    Overlay, Release as ReleaseTable, Route as RouteTable, ScalingMode, Upstream as UpstreamTable,
+    App as AppTable, ClientClass, Document, Group as GroupTable, Host as VirtualHost,
+    Mount as MountTable, Overlay, RateLimit, Release as ReleaseTable, Route as RouteTable,
+    ScalingMode, Upstream as UpstreamTable,
 };
 use muru_proto::admin::v1 as pb;
 
@@ -121,6 +122,34 @@ pub enum Action {
         /// The overlay's name.
         name: String,
     },
+    /// Create or replace a client class (section 4.14).
+    PutClientClass {
+        /// Its rule.
+        class: Box<ClientClass>,
+        /// Where its rule is tried among the applied ones.
+        position: i64,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a client class (prune).
+    RemoveClientClass {
+        /// The class's name.
+        name: String,
+    },
+    /// Create or replace a rate limit (section 4.15).
+    PutRateLimit {
+        /// The limit's name.
+        name: String,
+        /// Its table.
+        limit: Box<RateLimit>,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a rate limit (prune).
+    RemoveRateLimit {
+        /// The limit's name.
+        name: String,
+    },
 }
 
 impl Action {
@@ -144,6 +173,12 @@ impl Action {
             Action::PutOverlay { new: true, .. } => "create-overlay",
             Action::PutOverlay { new: false, .. } => "update-overlay",
             Action::RemoveOverlay { .. } => "remove-overlay",
+            Action::PutClientClass { new: true, .. } => "create-client-class",
+            Action::PutClientClass { new: false, .. } => "update-client-class",
+            Action::RemoveClientClass { .. } => "remove-client-class",
+            Action::PutRateLimit { new: true, .. } => "create-rate-limit",
+            Action::PutRateLimit { new: false, .. } => "update-rate-limit",
+            Action::RemoveRateLimit { .. } => "remove-rate-limit",
         }
     }
 
@@ -159,6 +194,10 @@ impl Action {
                 | Action::RemoveUpstream { .. }
                 | Action::PutOverlay { .. }
                 | Action::RemoveOverlay { .. }
+                | Action::PutClientClass { .. }
+                | Action::RemoveClientClass { .. }
+                | Action::PutRateLimit { .. }
+                | Action::RemoveRateLimit { .. }
         )
     }
 }
@@ -191,6 +230,11 @@ impl Change {
             }
             Action::PutOverlay { name, .. } | Action::RemoveOverlay { name } => {
                 format!("overlay {name}")
+            }
+            Action::PutClientClass { class, .. } => format!("client_class {}", class.name),
+            Action::RemoveClientClass { name } => format!("client_class {name}"),
+            Action::PutRateLimit { name, .. } | Action::RemoveRateLimit { name } => {
+                format!("rate_limit {name}")
             }
         }
     }
@@ -277,13 +321,11 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
         );
     }
 
-    if !document.client_class.is_empty() || !document.rate_limit.is_empty() {
-        plan.warnings.push(
-            "[[client_class]] and [rate_limit] tables belong in the daemon configuration file \
-             and were not applied"
-                .to_owned(),
-        );
-    }
+    // Sections 4.14 and 4.15: the document's classes and limits come
+    // first, so what follows may name them.
+
+    plan_clients(store, document, defined, prune, &mut plan);
+    let defined = &defined.with_applied(store, document, prune);
 
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
@@ -294,7 +336,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
             for (group, table) in &release.groups {
                 for class in unknown_classes(table.matches.as_ref(), defined) {
                     plan.errors.push(format!(
-                        "{name}@{id}: worker group {group}: no client class named {class} in the daemon configuration file"
+                        "{name}@{id}: worker group {group}: no client class named {class}"
                     ));
                 }
             }
@@ -452,8 +494,9 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
 /// The changes the document's hosts imply (section 4.3): names are
 /// checked, duplicates refused and certificates read, so a bad host
 /// never reaches the edge.
-/// What the daemon's own file defines that applied files may name:
-/// rate limits (section 4.15) and client classes (section 4.14).
+/// The rate limits (section 4.15) and client classes (section 4.14)
+/// applied files may name: the daemon's file's, and with
+/// `with_applied`, the applied files' too.
 #[derive(Debug, Clone, Default)]
 pub struct Defined {
     /// The `[rate_limit.NAME]` tables.
@@ -462,8 +505,175 @@ pub struct Defined {
     pub client_classes: Vec<String>,
 }
 
-/// Section 4.14: the classes a `match` names that the daemon's file does
-/// not define; `default` is always defined.
+impl Defined {
+    /// These names with the classes and limits of applied files: those
+    /// `document` declares and, without `prune`, those recorded.
+    fn with_applied(&self, store: &Store, document: &Document, prune: bool) -> Defined {
+        let mut all = self.clone();
+        all.client_classes
+            .extend(document.client_class.iter().map(|class| class.name.clone()));
+        all.rate_limits.extend(document.rate_limit.keys().cloned());
+
+        if !prune {
+            all.client_classes.extend(
+                store
+                    .client_classes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, class)| class.name),
+            );
+            all.rate_limits.extend(
+                store
+                    .rate_limits()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
+        }
+
+        all
+    }
+}
+
+/// Sections 4.14 and 4.15: the changes the document's client classes and
+/// rate limits imply. A class's rule keeps its place among the applied
+/// ones, a new one going after them, and with `prune` they take the
+/// document's order; names the daemon's file defines are refused, as are
+/// list files that are not absolute paths.
+fn plan_clients(store: &Store, document: &Document, file: &Defined, prune: bool, plan: &mut Plan) {
+    let stored = store.client_classes().unwrap_or_default();
+    let mut next = stored
+        .iter()
+        .map(|(position, _)| position + 1)
+        .max()
+        .unwrap_or(0);
+    let mut seen = BTreeSet::new();
+
+    for (index, class) in document.client_class.iter().enumerate() {
+        let name = &class.name;
+
+        if !seen.insert(name.clone()) {
+            plan.errors
+                .push(format!("client_class {name} is declared twice"));
+            continue;
+        }
+
+        if file.client_classes.contains(name) {
+            plan.errors.push(format!(
+                "client_class {name}: the daemon configuration file defines it"
+            ));
+            continue;
+        }
+
+        let relative = [&class.user_agent_list, &class.address_list]
+            .into_iter()
+            .flatten()
+            .find(|list| !Path::new(list).is_absolute());
+
+        if let Some(list) = relative {
+            plan.errors.push(format!(
+                "client_class {name}: the list {list} must be an absolute path"
+            ));
+            continue;
+        }
+
+        // The edge's own parsing, with the lists read, checks the rule.
+
+        let resolved = crate::clients::ClientPolicies::resolve(
+            std::slice::from_ref(class),
+            &BTreeMap::new(),
+            Path::new("/"),
+        );
+
+        if let Err(error) = resolved {
+            plan.errors.push(error);
+            continue;
+        }
+
+        let recorded = stored.iter().find(|(_, stored)| &stored.name == name);
+
+        let position = match recorded {
+            _ if prune => index as i64,
+            Some((position, _)) => *position,
+            None => {
+                next += 1;
+                next - 1
+            }
+        };
+
+        match recorded {
+            Some((at, stored)) if stored == class && *at == position => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutClientClass {
+                    class: Box::new(class.clone()),
+                    position,
+                    new: recorded.is_none(),
+                },
+                detail: describe_class(class),
+            }),
+        }
+    }
+
+    let stored_limits: BTreeMap<String, RateLimit> = store
+        .rate_limits()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    for (name, limit) in &document.rate_limit {
+        if file.rate_limits.contains(name) {
+            plan.errors.push(format!(
+                "rate_limit {name}: the daemon configuration file defines it"
+            ));
+            continue;
+        }
+
+        if let Err(error) = muru_config::check_rate_limit(name, limit) {
+            plan.errors.push(error);
+            continue;
+        }
+
+        match stored_limits.get(name) {
+            Some(recorded) if recorded == limit => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutRateLimit {
+                    name: name.clone(),
+                    limit: Box::new(limit.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: format!(
+                    "{}, {}",
+                    limit.rate,
+                    limit.action.as_deref().unwrap_or("reject")
+                ),
+            }),
+        }
+    }
+}
+
+/// What a class's rule matches on, as a phrase.
+fn describe_class(class: &ClientClass) -> String {
+    let inputs = [
+        ("user_agent", !class.user_agent.is_empty()),
+        ("user_agent_regex", !class.user_agent_regex.is_empty()),
+        ("user_agent_list", class.user_agent_list.is_some()),
+        ("addresses", !class.addresses.is_empty()),
+        ("address_list", class.address_list.is_some()),
+        ("headers", !class.headers.is_empty()),
+        ("cookies", !class.cookies.is_empty()),
+    ];
+    let named: Vec<&str> = inputs
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(input, _)| input)
+        .collect();
+    let verified = class.verify.as_ref().map_or("", |_| ", verified");
+
+    format!("matches {}{verified}", named.join(", "))
+}
+
+/// Section 4.14: the classes a `match` names that neither the daemon's
+/// file nor an applied file defines; `default` is always defined.
 fn unknown_classes(matches: Option<&muru_config::ClientMatch>, defined: &Defined) -> Vec<String> {
     matches
         .iter()
@@ -499,9 +709,8 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
         let mut valid = true;
 
         for missing in unknown_limits(&host.rate_limits, rate_limits) {
-            plan.errors.push(format!(
-                "host {name}: no rate limit named {missing} in the daemon configuration file"
-            ));
+            plan.errors
+                .push(format!("host {name}: no rate limit named {missing}"));
             valid = false;
         }
 
@@ -819,7 +1028,7 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
 
         for missing in unknown_limits(&route.rate_limits, &defined.rate_limits) {
             plan.errors.push(format!(
-                "route {} {}: no rate limit named {missing} in the daemon configuration file",
+                "route {} {}: no rate limit named {missing}",
                 route.host, route.path
             ));
             valid = false;
@@ -843,7 +1052,7 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
             .chain(unknown_classes(Some(&named), defined))
         {
             plan.errors.push(format!(
-                "route {} {}: no client class named {class} in the daemon configuration file",
+                "route {} {}: no client class named {class}",
                 route.host, route.path
             ));
             valid = false;
@@ -1182,7 +1391,7 @@ fn plan_overlays(
                 for limit in change.rate_limits.iter().flatten() {
                     if !defined.rate_limits.contains(limit) {
                         errors.push(format!(
-                            "overlay {name}: {field}: no rate limit named {limit} in the daemon configuration file"
+                            "overlay {name}: {field}: no rate limit named {limit}"
                         ));
                     }
                 }
@@ -1219,7 +1428,7 @@ fn plan_overlays(
             for class in change.client_routes.iter().flat_map(BTreeMap::keys) {
                 if class != "default" && !defined.client_classes.contains(class) {
                     errors.push(format!(
-                        "overlay {name}: routes.{route}.client_routes: no client class named {class} in the daemon configuration file"
+                        "overlay {name}: routes.{route}.client_routes: no client class named {class}"
                     ));
                 }
             }
@@ -1520,6 +1729,28 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         }
     }
 
+    for (_, class) in store.client_classes().unwrap_or_default() {
+        if !document
+            .client_class
+            .iter()
+            .any(|declared| declared.name == class.name)
+        {
+            plan.changes.push(Change {
+                action: Action::RemoveClientClass { name: class.name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
+    for (name, _) in store.rate_limits().unwrap_or_default() {
+        if !document.rate_limit.contains_key(&name) {
+            plan.changes.push(Change {
+                action: Action::RemoveRateLimit { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
     for (name, _) in store.upstreams().unwrap_or_default() {
         if !document.upstream.contains_key(&name) {
             plan.changes.push(Change {
@@ -1659,6 +1890,69 @@ pub fn export(
             document.upstream.insert(name, upstream);
         }
     }
+
+    // Applied client classes and rate limits (sections 4.14 and 4.15),
+    // in their order; with one application asked for, the limits its
+    // hosts and routes draw from and the classes they, its worker groups
+    // and those limits name.
+
+    let limits: Vec<(String, muru_config::RateLimit)> = store
+        .rate_limits()?
+        .into_iter()
+        .filter(|(name, _)| {
+            app.is_none()
+                || document
+                    .route
+                    .iter()
+                    .any(|route| route.rate_limits.contains(name))
+                || document
+                    .host
+                    .values()
+                    .any(|host| host.rate_limits.contains(name))
+        })
+        .collect();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+
+    for route in &document.route {
+        named.extend(route.classes().iter().map(String::as_str));
+        named.extend(
+            route
+                .traffic
+                .iter()
+                .flat_map(|traffic| traffic.classes.keys().map(String::as_str)),
+        );
+    }
+
+    for table in document.app.values() {
+        for release in table.release.values() {
+            for group in release.groups.values() {
+                named.extend(
+                    group
+                        .matches
+                        .iter()
+                        .flat_map(|matches| matches.client_class.iter().map(String::as_str)),
+                );
+            }
+        }
+    }
+
+    for (_, limit) in &limits {
+        named.extend(
+            limit
+                .matches
+                .iter()
+                .flat_map(|matches| matches.client_class.iter().map(String::as_str)),
+        );
+    }
+
+    let classes: Vec<muru_config::ClientClass> = store
+        .client_classes()?
+        .into_iter()
+        .map(|(_, class)| class)
+        .filter(|class| app.is_none() || named.contains(class.name.as_str()))
+        .collect();
+    document.client_class = classes;
+    document.rate_limit = limits.into_iter().collect();
 
     // Overlays (section 9.10): schedules go back to their applications'
     // tables, and with one application asked for, only the overlays that
@@ -3566,6 +3860,96 @@ mod tests {
                 ("deploy", "shop@r2".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn applied_classes_keep_their_place_and_limits_may_be_named() {
+        let store = Store::in_memory().unwrap();
+        let file = Defined {
+            rate_limits: vec!["crawlers".to_owned()],
+            client_classes: vec!["partner".to_owned()],
+        };
+        let class =
+            |name: &str| format!("[[client_class]]\nname = '{name}'\nuser_agent = ['{name}']\n");
+        let placed = |plan: &Plan| -> Vec<(String, i64)> {
+            plan.changes
+                .iter()
+                .filter_map(|change| match &change.action {
+                    Action::PutClientClass {
+                        class, position, ..
+                    } => Some((class.name.clone(), *position)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let record = |plan: &Plan| {
+            for change in &plan.changes {
+                if let Action::PutClientClass {
+                    class, position, ..
+                } = &change.action
+                {
+                    store.put_client_class(class, *position).unwrap();
+                }
+            }
+        };
+
+        // A host may draw from a limit the same document defines.
+
+        let text = format!(
+            "{}{}[rate_limit.slow]\nrate = '1/s'\n\
+             [host.shop]\nnames = ['shop.example.com']\nrate_limits = ['slow']\n",
+            class("late"),
+            class("early")
+        );
+        let first = plan(&store, &Document::parse(&text).unwrap(), false, &file);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(
+            placed(&first),
+            [("late".to_owned(), 0), ("early".to_owned(), 1)]
+        );
+        record(&first);
+
+        let again = format!("{}{}", class("late"), class("early"));
+        assert!(
+            plan(&store, &Document::parse(&again).unwrap(), false, &file)
+                .changes
+                .is_empty()
+        );
+
+        // A new class goes after those recorded; with prune the
+        // document's order is the order.
+
+        let added = plan(
+            &store,
+            &Document::parse(&class("extra")).unwrap(),
+            false,
+            &file,
+        );
+        assert_eq!(placed(&added), [("extra".to_owned(), 2)]);
+
+        let reordered = format!("{}{}", class("early"), class("late"));
+        let pruned = plan(&store, &Document::parse(&reordered).unwrap(), true, &file);
+        assert_eq!(
+            placed(&pruned),
+            [("early".to_owned(), 0), ("late".to_owned(), 1)]
+        );
+
+        let refused = format!(
+            "{}[[client_class]]\nname = 'listed'\nuser_agent_list = 'bots.txt'\n\
+             [rate_limit.crawlers]\nrate = '1/s'\n",
+            class("partner")
+        );
+        let errors = plan(&store, &Document::parse(&refused).unwrap(), false, &file)
+            .errors
+            .join("\n");
+
+        for expected in [
+            "client_class partner: the daemon configuration file defines it",
+            "client_class listed: the list bots.txt must be an absolute path",
+            "rate_limit crawlers: the daemon configuration file defines it",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
     }
 
     #[test]

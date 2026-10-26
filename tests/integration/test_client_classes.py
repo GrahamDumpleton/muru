@@ -307,12 +307,54 @@ methods = {{ deny = ['delete'] }}
     assert "no rate limit named missing" in completed.stdout
     assert "not a method" in completed.stdout
 
-    # Classes and limits are the daemon's, and an applied file's are left
-    # out with a warning.
 
+def test_an_applied_file_defines_classes_and_limits(site: Site) -> None:
+    listed = site.base / "lists" / "applied.txt"
+    listed.write_text("Appliedbot\n")
     tables = site.base / "tables.toml"
-    tables.write_text("[[client_class]]\nname = 'elsewhere'\nuser_agent = ['x']\n")
-    applied = site.daemon.muructl("apply", "-f", str(tables))
-    assert "[[client_class]] and [rate_limit] tables belong in the daemon" in (
-        applied.stdout + applied.stderr
+    tables.write_text(
+        f"""[[client_class]]
+name = 'applied'
+user_agent_list = '{listed}'
+
+[rate_limit.applied_limit]
+match = {{ client_class = ['applied'] }}
+rate = '1/m'
+burst = 1
+
+[[route]]
+host = 'site'
+path = '/applied/'
+app = 'clients'
+rate_limits = ['applied_limit']
+"""
     )
+    applied = site.daemon.muructl("apply", "-f", str(tables))
+    assert "create-client-class" in applied.stdout, applied.stdout
+    bot = {"User-Agent": "Appliedbot/1.0"}
+
+    # Its rules come after the daemon's file's.
+
+    assert eventually(lambda: site.seen("/", bot)["class"] == "applied")
+    assert site.request("/applied/", bot).status == 200
+    assert site.request("/applied/", bot).status == 429
+
+    exported = site.daemon.muructl("config", "export").stdout
+    assert 'name = "applied"' in exported and "[rate_limit.applied_limit]" in exported
+
+    # A name the daemon's file defines, and a list that is not an
+    # absolute path, are refused.
+
+    tables.write_text(
+        "[[client_class]]\nname = 'partner'\nuser_agent = ['x']\n\n"
+        "[[client_class]]\nname = 'relative'\nuser_agent_list = 'lists/ai.txt'\n"
+    )
+    refused = site.daemon.muructl("apply", "-f", str(tables), check=False)
+    assert refused.returncode != 0
+    assert "client_class partner: the daemon configuration file defines it" in refused.stdout
+    assert "must be an absolute path" in refused.stdout
+
+    # Pruned, they are gone.
+
+    site.daemon.muructl("apply", "--prune", "-f", str(site.base / "site.toml"))
+    assert eventually(lambda: site.seen("/", bot)["class"] == "default")
