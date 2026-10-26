@@ -188,6 +188,10 @@ pub struct ReleaseSpec {
     pub hooks: Option<String>,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
+    /// The origins whose pages may call it through gRPC-Web, answered
+    /// with CORS (section 6.13).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_web_origins: Vec<String>,
     /// Whether gRPC server reflection is served (section 6.13).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reflection: bool,

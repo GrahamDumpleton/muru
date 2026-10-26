@@ -2405,6 +2405,15 @@ pub fn resolve_spec(
         .or_else(|| table.sendfile_header.clone());
     muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
 
+    // Section 6.13: the origins gRPC-Web answers with CORS, likewise.
+
+    let grpc_web_origins = if request.grpc_web_origins.is_empty() {
+        table.grpc_web_origins.clone()
+    } else {
+        request.grpc_web_origins.clone()
+    };
+    muru_config::check_origins(&grpc_web_origins)?;
+
     for (name, mount) in mounts.unwrap_or(&table.mounts) {
         if !crate::model::valid_name(name) {
             return Err(format!("{name:?} is not a valid mount name"));
@@ -2642,6 +2651,7 @@ pub fn resolve_spec(
             .or(table.hooks),
         factory,
         reflection: request.reflection.or(table.reflection).unwrap_or(false),
+        grpc_web_origins,
         groups: resolved_groups,
         mounts: resolved_mounts,
         accel_redirect,
@@ -3122,6 +3132,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         entrypoint: request.entrypoint.clone(),
         interface: parse_optional(&request.interface)?,
         reflection: request.reflection,
+        grpc_web_origins: request.grpc_web_origins.clone(),
         factory: request.factory,
         factory_phase: parse_optional(&request.factory_phase)?,
         python: (!request.python.is_empty()).then(|| request.python.clone()),
@@ -3218,6 +3229,7 @@ fn resolve_http_spec(
         hooks: None,
         factory: None,
         reflection: false,
+        grpc_web_origins: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
         accel_redirect: false,
@@ -3556,6 +3568,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         hooks: table.hooks.clone().unwrap_or_default(),
         factory: table.factory,
         reflection: table.reflection,
+        grpc_web_origins: table.grpc_web_origins.clone(),
         factory_phase: table
             .factory_phase
             .map(|value| value.as_str().to_owned())
@@ -3696,6 +3709,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         entrypoint: spec.entrypoint.clone(),
         interface: Some(spec.interface),
         reflection: spec.reflection.then_some(true),
+        grpc_web_origins: spec.grpc_web_origins.clone(),
         factory: spec.factory.map(|_| true),
         factory_phase: spec.factory,
         python: Some(spec.python.display().to_string()),
@@ -3962,6 +3976,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "reflection",
         declared.reflection.to_string(),
         recorded.reflection.to_string(),
+    );
+    compare(
+        "grpc_web_origins",
+        declared.grpc_web_origins.join(", "),
+        recorded.grpc_web_origins.join(", "),
     );
     compare(
         "factory",

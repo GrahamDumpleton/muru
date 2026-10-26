@@ -555,6 +555,9 @@ pub struct Context<'a> {
     /// The file hints by path the mount, upstream or server may give
     /// (section 4.9).
     pub sendfile: Arc<Sendfile>,
+    /// The origins whose pages may call the release through gRPC-Web
+    /// (section 6.13).
+    pub grpc_web: Arc<crate::grpc::WebOrigins>,
     /// How the request arrived by internal redirect (section 4.10), for
     /// the request head; none for a client's own request.
     pub internal: Option<Internal>,
@@ -614,6 +617,7 @@ impl<'a> Context<'a> {
             mount: String::new(),
             mount_path: String::new(),
             sendfile: Arc::default(),
+            grpc_web: Arc::default(),
             forwarded_host: self.forwarded_host.clone(),
             forwarded_port: self.forwarded_port,
             prefix: self.prefix.clone(),
@@ -901,12 +905,22 @@ pub async fn handle(
     // Section 6.13: a client's gRPC call to a release that registered
     // gRPC methods takes its own path.
 
-    if context.internal.is_none()
-        && context.handler.is_none()
-        && pool.serves_grpc()
-        && let Some(protocol) = crate::grpc::Protocol::of(&parts.headers)
-    {
-        return Handled::Response(crate::grpc::handle(parts, body, pool, context, protocol).await);
+    if context.internal.is_none() && context.handler.is_none() && pool.serves_grpc() {
+        if context.grpc_web.is_preflight(parts) {
+            let response = context.grpc_web.preflight(parts);
+            Recording::new(context, parts).complete(response.status().as_u16(), "", 0);
+            return Handled::Response(response);
+        }
+
+        if let Some(protocol) = crate::grpc::Protocol::of(&parts.headers) {
+            let mut response = crate::grpc::handle(parts, body, pool, context, protocol).await;
+
+            if protocol.is_web() {
+                context.grpc_web.decorate(&parts.headers, &mut response);
+            }
+
+            return Handled::Response(response);
+        }
     }
 
     // Section 4.11: an upload route with precheck asks the application

@@ -4,9 +4,9 @@
 :class: note
 
 gRPC mounts beside WSGI and ASGI, gRPC-only releases, the four kinds of
-call over h2 and h2c, gRPC-Web, the health service and reflection.
-Limiting h2c to trusted networks, CORS for gRPC-Web and per-mount thread
-pools are still to come.
+call over h2 and h2c, h2c limited to some clients, gRPC-Web with CORS,
+the health service and reflection. Per-mount thread pools are still to
+come.
 ```
 
 A release can serve gRPC services from the same workers as its WSGI or
@@ -79,7 +79,20 @@ the worker's event loop. Each call is balanced across the workers on its
 own, so one client connection spreads its calls over all of them.
 
 Clients connect with HTTP/2 over TLS (h2) on an HTTPS listener, or over
-plain HTTP/2 (h2c) on any listener. Request messages compressed with
+plain HTTP/2 (h2c) on any listener. A listener's `h2c` in the daemon's
+configuration file names the clients that may use h2c on it; another
+client opening with HTTP/2 is answered 505, and its HTTP/1.1 requests
+are served as usual:
+
+```toml
+[[listener]]
+address = '0.0.0.0:8080'
+h2c = ['10.0.0.0/8', 'loopback']
+```
+
+The entries are addresses, ranges, `loopback` or `private`, as the
+`[proxy]` table's `trusted` takes them; an empty list turns h2c off, and
+a listener without the key takes h2c from any client. Request messages compressed with
 gzip or deflate are decompressed at the edge; responses are sent
 uncompressed.
 
@@ -127,3 +140,19 @@ Browsers call the same services with gRPC-Web. The edge translates
 HTTP/1.1 or HTTP/2, with the status and trailing metadata in a frame at
 the end of the body. Routes and policies, rate limits, client classes and
 authentication sub-requests apply to gRPC calls as to any other request.
+
+A page served from another origin calls with CORS. `grpc_web_origins`,
+in the release's table or its `[tool.muru]` table, names the origins
+allowed, or `*` for any:
+
+```toml
+[tool.muru]
+grpc_web_origins = ['https://app.example.com']
+```
+
+The edge answers a preflight to an allowed origin with 204, allowing
+POST and the headers it asks for, for a day, and an origin not named
+with 403; a call from an allowed origin is answered with
+`Access-Control-Allow-Origin` and the `grpc-status`, `grpc-message` and
+`grpc-status-details-bin` headers exposed. Without `grpc_web_origins`, no
+CORS headers are added and a preflight goes to the application.

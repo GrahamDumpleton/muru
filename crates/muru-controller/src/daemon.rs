@@ -90,6 +90,9 @@ pub struct Config {
     /// a daemon that runs as root starts the edge and the applications
     /// that name no user as (ADR 0026); `muru` when none is named.
     pub service_user: Option<String>,
+    /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
+    /// clients, with those clients.
+    pub h2c: Vec<pb::H2cPolicy>,
     /// Whether `muructl debug exec` may run code in workers (section
     /// 11.7).
     pub debug_exec: bool,
@@ -770,6 +773,8 @@ struct Daemon {
     service: Option<crate::host::Identity>,
     /// Whether `muructl debug exec` may run code in workers.
     debug_exec: bool,
+    /// The listeners' h2c policies, for every snapshot (section 6.13).
+    h2c: Vec<pb::H2cPolicy>,
     /// Section 7.4: the node's budget, and the schedule windows already
     /// checked against it, by overlay and start.
     budget: crate::budget::Budget,
@@ -1096,6 +1101,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
         debug_exec: config.debug_exec,
+        h2c: config.h2c.clone(),
         budget: config.budget,
         budget_checked: BTreeSet::new(),
         history,
@@ -1115,6 +1121,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     };
     daemon.restore().await;
     daemon.reconcile_traffic().await;
+
+    // The edge has the node's settings, a listener's h2c among them, from
+    // the start, whether or not any release runs yet.
+
+    if let Err(error) = daemon.push_snapshot().await {
+        tracing::warn!(%error, "pushing the first snapshot failed");
+    }
 
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
@@ -3772,6 +3785,11 @@ impl Daemon {
                         .map(|socket| socket.display().to_string())
                         .collect(),
                     waking_groups: running.waking_groups(),
+                    grpc_web_origins: self
+                        .store
+                        .release(name, id)
+                        .map(|release| release.spec.grpc_web_origins)
+                        .unwrap_or_default(),
                     groups: running
                         .groups
                         .iter()
@@ -4029,6 +4047,7 @@ impl Daemon {
             client_classes: self.clients.classes_message.clone(),
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
+            h2c: self.h2c.clone(),
         }
     }
 

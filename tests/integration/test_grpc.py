@@ -290,6 +290,43 @@ def test_grpc_web_is_translated_at_the_edge(service: Service, content_type: str)
     assert replies("/demo.Greeter/Chat", names) == ["echo:p", "echo:q"]
 
 
+def test_grpc_web_answers_cors_for_the_origins_named(service: Service) -> None:
+    def ask(method: str, origin: str, headers: dict[str, str] | None = None) -> Any:
+        connection = http.client.HTTPConnection("127.0.0.1", service.server.port, timeout=30)
+
+        try:
+            connection.request(
+                method,
+                "/demo.Greeter/SayHello",
+                body=b"" if method == "OPTIONS" else struct.pack(">BI", 0, 0),
+                headers={"Origin": origin, **(headers or {})},
+            )
+            response = connection.getresponse()
+            response.read()
+            return response
+        finally:
+            connection.close()
+
+    preflight = {
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-grpc-web",
+    }
+    allowed = ask("OPTIONS", "https://app.example.com", preflight)
+    assert allowed.status == 204
+    assert allowed.getheader("Access-Control-Allow-Origin") == "https://app.example.com"
+    assert allowed.getheader("Access-Control-Allow-Headers") == "content-type,x-grpc-web"
+    assert ask("OPTIONS", "https://elsewhere.example.com", preflight).status == 403
+
+    call = ask(
+        "POST",
+        "https://app.example.com",
+        {"Content-Type": "application/grpc-web+proto", "X-Grpc-Web": "1"},
+    )
+    assert call.status == 200
+    assert call.getheader("Access-Control-Allow-Origin") == "https://app.example.com"
+    assert "grpc-status" in (call.getheader("Access-Control-Expose-Headers") or "")
+
+
 @pytest.fixture(scope="module")
 def grpc_only(service: Service) -> Iterator[support.Server]:
     instance = support.start(

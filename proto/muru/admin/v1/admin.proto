@@ -197,6 +197,7 @@ message DeployRequest {
   optional bool reflection = 44;            // section 6.13: serve gRPC server reflection; the table's when absent
   optional uint64 loop_stall_timeout_ms = 45; // section 7.6: how long an ASGI worker's loop may stall before it is replaced
   optional uint32 retain_workers = 46;      // section 9.1: the workers each group of the superseded release keeps while warm; 1 when absent
+  repeated string grpc_web_origins = 47;    // section 6.13: origins whose pages may call it through gRPC-Web, or *; the table's when empty
 }
 
 // One environment variable: a value, or a secret reference.

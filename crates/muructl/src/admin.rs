@@ -220,6 +220,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     };
 
     let limits = limits_from(&document)?;
+    let h2c = h2c_from(&document)?;
     let metrics = metrics_from(&document, args.metrics)?;
     let dashboard = dashboard_from(&document, args.dashboard)?;
     let sinks = sinks_from(&document)?;
@@ -265,6 +266,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         listeners,
         limits,
         service_user,
+        h2c,
         debug_exec: document
             .daemon
             .as_ref()
@@ -2065,6 +2067,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         hold: args.hold,
         override_freeze: args.override_freeze,
         reflection: None,
+        grpc_web_origins: Vec::new(),
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
         max_requests: args.max_requests,
@@ -4188,6 +4191,33 @@ fn listeners_from(document: &muru_config::Document) -> anyhow::Result<Vec<(Socke
     }
 
     Ok(listeners)
+}
+
+/// Section 6.13: the listeners that limit cleartext HTTP/2, checked.
+fn h2c_from(
+    document: &muru_config::Document,
+) -> anyhow::Result<Vec<muru_proto::edge::v1::H2cPolicy>> {
+    let mut policies = Vec::new();
+
+    for listener in &document.listener {
+        let Some(allowed) = &listener.h2c else {
+            continue;
+        };
+
+        anyhow::ensure!(
+            !listener.tls,
+            "listener {}: h2c is for a listener without TLS, where HTTP/2 is cleartext",
+            listener.address
+        );
+        muru_edge::proxy::Networks::parse(allowed)
+            .map_err(|error| anyhow::anyhow!("listener {}: h2c: {error}", listener.address))?;
+        policies.push(muru_proto::edge::v1::H2cPolicy {
+            listener: listener.address.clone(),
+            allowed: allowed.clone(),
+        });
+    }
+
+    Ok(policies)
 }
 
 /// The edge limits from the [limits] table, with the defaults for the rest.

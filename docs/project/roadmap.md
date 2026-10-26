@@ -527,5 +527,7 @@ call, with grpcio's servicer context; the edge answers the standard
 health service, `reflection = true` serves reflection through
 grpcio-reflection, and gRPC-Web, binary and text, is translated at the
 edge. grpcio has no free-threaded wheels, so gRPC mounts are unavailable
-on those builds. Still to come: limiting h2c to trusted networks, CORS
-for gRPC-Web, and per-mount thread pools.
+on those builds. A listener's `h2c` limits cleartext HTTP/2 to the
+clients it names, and a release's `grpc_web_origins` has the edge answer
+gRPC-Web with CORS, preflights included. Still to come: per-mount thread
+pools.

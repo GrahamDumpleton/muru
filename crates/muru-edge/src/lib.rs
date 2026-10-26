@@ -76,6 +76,9 @@ pub struct Config {
     pub cgi_local_redirect: bool,
     /// The default mount's file hints by path (section 4.9).
     pub sendfile: Arc<routing::Sendfile>,
+    /// The origins whose pages may call it through gRPC-Web (section
+    /// 6.13).
+    pub grpc_web_origins: Vec<String>,
     /// The application's error pages and override (section 4.12).
     pub errors: Arc<errors::ErrorPolicy>,
     /// Development mode: error pages show tracebacks (section 4.12).
@@ -380,7 +383,8 @@ impl Edge {
                     )
                     .await?
                     .with_errors(Arc::clone(&config.errors))
-                    .with_sendfile(Arc::clone(&config.sendfile)),
+                    .with_sendfile(Arc::clone(&config.sendfile))
+                    .with_grpc_web(&config.grpc_web_origins),
                 )
                 .with_compression(config.compression.clone()),
             )),
@@ -633,9 +637,19 @@ async fn accept(
 
         match acceptor.clone() {
             None => {
-                tokio::spawn(serve(
-                    stream, peer, local, None, shared, token, guard, trusted,
-                ));
+                tokio::spawn(async move {
+                    // Section 6.13: a listener may keep cleartext HTTP/2
+                    // to some clients.
+
+                    if !shared.pools.current().allows_h2c(&local, &peer)
+                        && opens_http2(&stream, shared.limits.header_read_timeout).await
+                    {
+                        refuse_http2(stream).await;
+                        return;
+                    }
+
+                    serve(stream, peer, local, None, shared, token, guard, trusted).await;
+                });
             }
             Some(acceptor) => {
                 tokio::spawn(async move {
@@ -672,6 +686,48 @@ async fn accept(
             }
         }
     }
+}
+
+/// The connection preface an HTTP/2 client opens with (RFC 9113).
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Whether a plain connection opens with the HTTP/2 preface, looked at
+/// without taking it from the socket, within `timeout`.
+async fn opens_http2(stream: &tokio::net::TcpStream, timeout: Duration) -> bool {
+    let mut buffer = [0u8; HTTP2_PREFACE.len()];
+
+    tokio::time::timeout(timeout, async {
+        loop {
+            let read = stream.peek(&mut buffer).await.ok()?;
+
+            if read == 0 || buffer[..read] != HTTP2_PREFACE[..read] {
+                return Some(false);
+            }
+
+            if read == HTTP2_PREFACE.len() {
+                return Some(true);
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// Answer a client that may not speak HTTP/2 in cleartext with 505, in
+/// HTTP/1.1, and close.
+async fn refuse_http2(mut stream: tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    let _ = stream.shutdown().await;
 }
 
 /// Serve one connection, cleartext or already inside TLS. The token is
@@ -830,6 +886,7 @@ async fn serve<I>(
                     mount: String::new(),
                     mount_path: String::new(),
                     sendfile: Arc::default(),
+                    grpc_web: Arc::default(),
                     forwarded_host: forwarded.host.clone(),
                     forwarded_port: forwarded.port,
                     prefix: forwarded.prefix.clone(),
@@ -1028,6 +1085,7 @@ async fn serve<I>(
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
                             context.sendfile = selection.sendfile;
+                            context.grpc_web = selection.grpc_web;
 
                             // Sections 4.6 and 4.11: the route's body limit
                             // and uploads apply to a client's own request,
@@ -1157,6 +1215,7 @@ async fn serve<I>(
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
                                 context.sendfile = Arc::clone(&selection.sendfile);
+                                context.grpc_web = Arc::clone(&selection.grpc_web);
                                 dispatch(
                                     &mut parts,
                                     body.take(),

@@ -284,6 +284,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         accel_redirect: false,
         cgi_local_redirect: false,
         sendfile: Arc::default(),
+        grpc_web_origins: Vec::new(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
         access_log,
@@ -1113,6 +1114,8 @@ struct Resolved {
     factory: Option<muru_config::FactoryPhase>,
     /// Whether gRPC server reflection is served (section 6.13).
     reflection: bool,
+    /// The origins whose pages may call it through gRPC-Web.
+    grpc_web_origins: Vec<String>,
     processes: usize,
     threads: usize,
     sync_threads: usize,
@@ -1239,6 +1242,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     } else {
         None
     };
+    muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
     Ok(Resolved {
         entrypoint,
         interface: args
@@ -1247,6 +1251,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .unwrap_or(muru_config::Interface::Auto),
         factory,
         reflection: table.reflection.unwrap_or(false),
+        grpc_web_origins: table.grpc_web_origins.clone(),
         processes: args
             .processes
             .or(table.processes)
@@ -1304,16 +1309,19 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     let mut listeners = vec![Listener {
         address: http.to_string(),
         tls: false,
+        h2c: None,
     }];
 
     if args.https || args.https_only || args.tls_cert.is_some() {
         listeners.push(Listener {
             address: https.to_string(),
             tls: true,
+            h2c: None,
         });
     }
 
     let release = Release {
+        grpc_web_origins: resolved.grpc_web_origins.clone(),
         kind: None,
         profile: None,
         command: Vec::new(),
@@ -1766,6 +1774,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
         sendfile: Arc::clone(&sendfile),
+        grpc_web_origins: resolved.grpc_web_origins.clone(),
         errors: Arc::clone(&error_policy),
         development,
         access_log,
@@ -1935,6 +1944,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             pools
                                 .with_errors(Arc::clone(&error_policy))
                                 .with_sendfile(Arc::clone(&sendfile))
+                                .with_grpc_web(&resolved.grpc_web_origins)
                         });
 
                         match connected {
@@ -1989,6 +1999,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     pools
                                         .with_errors(Arc::clone(&error_policy))
                                         .with_sendfile(Arc::clone(&sendfile))
+                                        .with_grpc_web(&resolved.grpc_web_origins)
                                 });
 
                                 match connected {

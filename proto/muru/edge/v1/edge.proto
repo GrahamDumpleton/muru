@@ -48,6 +48,14 @@ message Snapshot {
   repeated ClientClass client_classes = 13; // section 4.14: classification rules, in order
   repeated RateLimit rate_limits = 14;  // section 4.15: the rate limits hosts and routes name
   Traffic default_traffic = 15;         // with no host declared, the default application's policy: its rollout's share (section 9.3)
+  repeated H2cPolicy h2c = 16;          // section 6.13: listeners that limit cleartext HTTP/2; every client elsewhere
+}
+
+// Section 6.13: who may speak HTTP/2 in cleartext on a listener without
+// TLS; the others are served HTTP/1.1.
+message H2cPolicy {
+  string listener = 1;                  // the listener's address, as IP:PORT
+  repeated string allowed = 2;          // addresses, ranges, loopback or private; none when empty
 }
 
 // Section 4.14: a client classification rule, with its list files read.
@@ -264,6 +272,7 @@ message AppWorkers {
   repeated string sendfile_roots = 13;  // section 4.9: directories the default mount's X-Muru-Sendfile paths must lie in
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
   repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
+  repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
 }
 
 message Mount {

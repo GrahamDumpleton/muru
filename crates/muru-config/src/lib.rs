@@ -211,6 +211,33 @@ pub struct ParseError {
     pub accepted: &'static [&'static str],
 }
 
+/// Section 6.13: check the origins gRPC-Web is answered with CORS for:
+/// `*`, or an http or https scheme with a host and an optional port, and
+/// nothing after.
+pub fn check_origins(origins: &[String]) -> Result<(), String> {
+    for origin in origins {
+        if origin == "*" {
+            continue;
+        }
+
+        let rest = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .ok_or_else(|| {
+                format!("grpc_web_origins: {origin:?} is not * or http(s)://HOST[:PORT]")
+            })?;
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+
+        if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
+            return Err(format!(
+                "grpc_web_origins: {origin:?} is not * or http(s)://HOST[:PORT]"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a size such as 10MB, 512KB, 1GB or a plain number of bytes.
 /// KB, MB and GB are powers of 1024, as mod_wsgi counts them (ADR 0008);
 /// case does not matter and a lone K, M or G is accepted.
@@ -448,6 +475,11 @@ pub struct Release {
     /// mounts register (section 6.13, default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<bool>,
+    /// The origins whose pages may call the release's gRPC methods
+    /// through gRPC-Web, answered with CORS (section 6.13): scheme, host
+    /// and port, or `*`; none when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_web_origins: Vec<String>,
     /// Whether the entrypoint is a factory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<bool>,
@@ -1013,6 +1045,12 @@ pub struct Listener {
     /// virtual hosts it serves, chosen by SNI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tls: bool,
+    /// Section 6.13: on a listener without TLS, the clients that may
+    /// speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or
+    /// private; every client when omitted, none when empty. The others
+    /// are served HTTP/1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2c: Option<Vec<String>>,
 }
 
 /// How forwarding headers are left after they have been applied.
@@ -3405,6 +3443,10 @@ pub struct ToolMuru {
     /// Serve gRPC server reflection for the registered services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<bool>,
+    /// The origins whose pages may call the gRPC methods through
+    /// gRPC-Web, or `*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_web_origins: Vec<String>,
     /// Whether the entrypoint is a factory returning the application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<bool>,
@@ -3933,6 +3975,7 @@ traffic = { classes = { ai_crawler = 'r1' } }"
             listener: vec![Listener {
                 address: "127.0.0.1:8080".to_owned(),
                 tls: false,
+                h2c: Some(vec!["loopback".to_owned()]),
             }],
             limits: Some(Limits {
                 max_body_size: Some("100MB".to_owned()),

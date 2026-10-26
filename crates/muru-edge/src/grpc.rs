@@ -85,7 +85,7 @@ impl Protocol {
         }
     }
 
-    fn is_web(self) -> bool {
+    pub(crate) fn is_web(self) -> bool {
         self != Self::Grpc
     }
 }
@@ -143,6 +143,115 @@ impl Status {
 
         trailers
     }
+}
+
+/// Section 6.13: the origins whose pages may call the release's methods
+/// through gRPC-Web, for CORS; none when empty, and every one for `*`.
+#[derive(Debug, Default)]
+pub struct WebOrigins {
+    any: bool,
+    origins: Vec<String>,
+}
+
+/// The request headers a gRPC-Web client sends, allowed when a preflight
+/// names none.
+const WEB_HEADERS: &str = "content-type, x-grpc-web, x-user-agent, grpc-timeout";
+
+/// The response headers a page may read: the status of a trailers-only
+/// answer.
+const WEB_EXPOSED: &str = "grpc-status, grpc-message, grpc-status-details-bin";
+
+impl WebOrigins {
+    /// The origins as the release names them: `*`, or scheme, host and
+    /// port, compared without regard to case.
+    pub fn new(origins: &[String]) -> Self {
+        Self {
+            any: origins.iter().any(|origin| origin == "*"),
+            origins: origins
+                .iter()
+                .filter(|origin| *origin != "*")
+                .map(|origin| origin.trim_end_matches('/').to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    /// The request's Origin, when CORS is on and it is allowed.
+    fn allowed<'a>(&self, headers: &'a HeaderMap) -> Option<&'a HeaderValue> {
+        if !self.any && self.origins.is_empty() {
+            return None;
+        }
+
+        let origin = headers.get(http::header::ORIGIN)?;
+        let text = origin.to_str().ok()?.to_ascii_lowercase();
+        (self.any || self.origins.contains(&text)).then_some(origin)
+    }
+
+    /// Whether a request is a CORS preflight these origins answer: an
+    /// OPTIONS with an Origin and Access-Control-Request-Method.
+    pub(crate) fn is_preflight(&self, parts: &http::request::Parts) -> bool {
+        (self.any || !self.origins.is_empty())
+            && parts.method == http::Method::OPTIONS
+            && parts.headers.contains_key(http::header::ORIGIN)
+            && parts
+                .headers
+                .contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD)
+    }
+
+    /// The answer to a preflight: 204 allowing POST with the headers asked
+    /// for, for a day, or 403 to an origin not named.
+    pub(crate) fn preflight(&self, parts: &http::request::Parts) -> Response<ResponseBody> {
+        let mut response = Response::new(empty());
+        let headers = response.headers_mut();
+        headers.insert(http::header::VARY, HeaderValue::from_static("Origin"));
+
+        let Some(origin) = self.allowed(&parts.headers) else {
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            return response;
+        };
+
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        let headers = response.headers_mut();
+        headers.insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(
+            http::header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("POST"),
+        );
+        headers.insert(
+            http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            parts
+                .headers
+                .get(http::header::ACCESS_CONTROL_REQUEST_HEADERS)
+                .cloned()
+                .unwrap_or(HeaderValue::from_static(WEB_HEADERS)),
+        );
+        headers.insert(
+            http::header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("86400"),
+        );
+        response
+    }
+
+    /// Add the CORS headers to a gRPC-Web answer to an allowed origin.
+    pub(crate) fn decorate(&self, request: &HeaderMap, response: &mut Response<ResponseBody>) {
+        let Some(origin) = self.allowed(request) else {
+            return;
+        };
+
+        let headers = response.headers_mut();
+        headers.insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(
+            http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static(WEB_EXPOSED),
+        );
+        headers.append(http::header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
+/// An empty response body.
+fn empty() -> ResponseBody {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 /// Serve one call.
@@ -993,5 +1102,55 @@ mod tests {
         assert_eq!(parse_timeout("123456789S"), None);
         assert_eq!(parse_timeout("5x"), None);
         assert_eq!(percent_encode("50% off\n"), b"50%25 off%0A");
+    }
+
+    #[test]
+    fn grpc_web_answers_cors_for_the_origins_named() {
+        let origins = WebOrigins::new(&["https://App.example.com/".to_owned()]);
+        let request = |method: &str, origin: &str| {
+            http::Request::builder()
+                .method(method)
+                .uri("/shop.Cart/Add")
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "x-grpc-web, content-type")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        let allowed = request("OPTIONS", "https://app.example.com");
+        assert!(origins.is_preflight(&allowed));
+        let answer = origins.preflight(&allowed);
+        assert_eq!(answer.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            answer.headers()["access-control-allow-origin"],
+            "https://app.example.com"
+        );
+        assert_eq!(
+            answer.headers()["access-control-allow-headers"],
+            "x-grpc-web, content-type"
+        );
+        assert_eq!(answer.headers()["access-control-allow-methods"], "POST");
+
+        let other = request("OPTIONS", "https://evil.example.com");
+        assert_eq!(origins.preflight(&other).status(), StatusCode::FORBIDDEN);
+        assert!(!origins.is_preflight(&request("POST", "https://app.example.com")));
+        assert!(!WebOrigins::new(&[]).is_preflight(&allowed));
+
+        let mut response = Response::new(empty());
+        origins.decorate(&allowed.headers, &mut response);
+        assert_eq!(
+            response.headers()["access-control-expose-headers"],
+            WEB_EXPOSED
+        );
+
+        let mut response = Response::new(empty());
+        origins.decorate(&other.headers, &mut response);
+        assert!(response.headers().is_empty());
+
+        let any = WebOrigins::new(&["*".to_owned()]);
+        assert_eq!(any.preflight(&other).status(), StatusCode::NO_CONTENT);
     }
 }

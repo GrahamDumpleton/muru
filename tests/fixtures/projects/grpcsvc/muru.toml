@@ -1,6 +1,7 @@
 entrypoint = "grpcsvc:wsgi_app"
 threads = 2
 reflection = true
+grpc_web_origins = ["https://app.example.com"]
 
 [mounts.api]
 interface = "grpc"

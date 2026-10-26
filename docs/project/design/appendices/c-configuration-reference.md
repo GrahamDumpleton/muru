@@ -55,6 +55,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |
+| h2c (the clients that may speak HTTP/2 in cleartext) | listener | every client | 6.13 |
+| grpc_web_origins (CORS for gRPC-Web) | release | none | 6.13 |
 | budget.workers, budget.memory, budget.cpu | `[daemon]` | off | 7.4 |
 | min_workers = 0 (scale to zero), host_idle_timeout | group; host_idle_timeout in the release's own scaling table | none, off | 7.4 |
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |

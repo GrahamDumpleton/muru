@@ -13,7 +13,7 @@
 //! the group's workers, else the default group's (section 7.1).
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use http::HeaderMap;
@@ -270,6 +270,9 @@ pub struct Selection {
     /// The upstream that takes the request instead of workers (section
     /// 4.13); `pool` is then empty.
     pub upstream: Option<Arc<Upstream>>,
+    /// The origins that may call the release through gRPC-Web (section
+    /// 6.13).
+    pub grpc_web: Arc<crate::grpc::WebOrigins>,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -501,6 +504,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         sendfile: upstream.sendfile(),
         maintenance: None,
         upstream: Some(Arc::clone(upstream)),
+        grpc_web: Arc::default(),
     }
 }
 
@@ -625,6 +629,8 @@ pub struct AppPools {
     /// Section 9.9: the instances of a managed HTTP release, which take
     /// every request in place of workers.
     server: Option<Arc<Upstream>>,
+    /// Section 6.13: the origins that may call it through gRPC-Web.
+    grpc_web: Arc<crate::grpc::WebOrigins>,
 }
 
 /// A path that selects a worker group (section 7.1).
@@ -719,6 +725,7 @@ impl AppPools {
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
             server: None,
+            grpc_web: Arc::default(),
         })
     }
 
@@ -735,6 +742,7 @@ impl AppPools {
             errors: Arc::new(ErrorPolicy::default()),
             maintenance: None,
             server: None,
+            grpc_web: Arc::default(),
         }
     }
 
@@ -742,6 +750,13 @@ impl AppPools {
     /// (section 4.9).
     pub fn with_sendfile(mut self, sendfile: Arc<Sendfile>) -> Self {
         self.sendfile = sendfile;
+        self
+    }
+
+    /// The same pools, answering gRPC-Web from these origins' pages with
+    /// CORS (section 6.13).
+    pub fn with_grpc_web(mut self, origins: &[String]) -> Self {
+        self.grpc_web = Arc::new(crate::grpc::WebOrigins::new(origins));
         self
     }
 
@@ -790,6 +805,7 @@ impl AppPools {
                 sendfile: Arc::clone(&self.sendfile),
                 maintenance: self.maintenance.clone(),
                 upstream: Some(Arc::clone(server)),
+                grpc_web: Arc::default(),
             });
         }
 
@@ -840,6 +856,7 @@ impl AppPools {
             ),
             maintenance: self.maintenance.clone(),
             upstream: None,
+            grpc_web: Arc::clone(&self.grpc_web),
         })
     }
 
@@ -941,6 +958,9 @@ pub struct Routing {
     /// With no host declared, the default application and the policy
     /// that chooses among its releases, when it has one (section 9.3).
     default_policy: Option<(String, Policy)>,
+    /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
+    /// clients.
+    h2c: HashMap<SocketAddr, crate::proxy::Networks>,
 }
 
 /// Where a request goes.
@@ -1034,6 +1054,7 @@ impl Routing {
             upstreams: HashMap::new(),
             classifier: crate::classify::Classifier::default(),
             default_policy: None,
+            h2c: HashMap::new(),
         }
     }
 
@@ -1091,7 +1112,8 @@ impl Routing {
             .with_errors(Arc::new(errors))
             .with_maintenance(maintenance)
             .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header))
-            .with_waking(&app.waking_groups);
+            .with_waking(&app.waking_groups)
+            .with_grpc_web(&app.grpc_web_origins);
 
             // Section 9.9: a managed HTTP release's instances stand in
             // for its workers, as an upstream named after the release.
@@ -1193,6 +1215,18 @@ impl Routing {
                 .collect()
         };
 
+        let mut h2c = HashMap::new();
+
+        for policy in &snapshot.h2c {
+            let listener: SocketAddr = policy
+                .listener
+                .parse()
+                .map_err(|_| anyhow::anyhow!("h2c: {:?} is not IP:PORT", policy.listener))?;
+            let networks = crate::proxy::Networks::parse(&policy.allowed)
+                .map_err(|error| anyhow::anyhow!("listener {listener}: h2c: {error}"))?;
+            h2c.insert(listener, networks);
+        }
+
         let mut routing = Self {
             version: snapshot.version,
             trust,
@@ -1208,6 +1242,7 @@ impl Routing {
             upstreams: upstreams.clone(),
             classifier,
             default_policy,
+            h2c,
         };
 
         for host in &snapshot.hosts {
@@ -1417,6 +1452,14 @@ impl Routing {
     /// Which peers may speak for the client (section 4.7).
     pub fn trust(&self) -> &Trust {
         &self.trust
+    }
+
+    /// Section 6.13: whether a client may speak HTTP/2 in cleartext on
+    /// the listener at `local`.
+    pub fn allows_h2c(&self, local: &SocketAddr, peer: &SocketAddr) -> bool {
+        self.h2c
+            .get(local)
+            .is_none_or(|networks| networks.contains(peer))
     }
 
     /// How responses are compressed (section 4.17).
@@ -1704,6 +1747,7 @@ impl Routing {
                 sendfile: Arc::default(),
                 maintenance: None,
                 upstream: None,
+                grpc_web: Arc::default(),
             }),
         }
     }
@@ -1822,6 +1866,10 @@ mod tests {
     fn snapshot() -> pb::Snapshot {
         pb::Snapshot {
             version: 7,
+            h2c: vec![pb::H2cPolicy {
+                listener: "0.0.0.0:8080".to_owned(),
+                allowed: vec!["10.0.0.0/8".to_owned(), "loopback".to_owned()],
+            }],
             client_classes: Vec::new(),
             rate_limits: Vec::new(),
             default_traffic: None,
@@ -1882,6 +1930,19 @@ mod tests {
             .unwrap()
             .block_on(Routing::from_snapshot(&snapshot()))
             .unwrap()
+    }
+
+    #[test]
+    fn a_listener_may_keep_cleartext_http2_to_some_clients() {
+        let routing = routing();
+        let limited: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let open: SocketAddr = "0.0.0.0:8081".parse().unwrap();
+        let inside: SocketAddr = "10.1.2.3:50000".parse().unwrap();
+        let outside: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        assert!(routing.allows_h2c(&limited, &inside));
+        assert!(routing.allows_h2c(&limited, &"127.0.0.1:1".parse().unwrap()));
+        assert!(!routing.allows_h2c(&limited, &outside));
+        assert!(routing.allows_h2c(&open, &outside));
     }
 
     /// A request with these headers, from a fixed client.
