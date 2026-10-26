@@ -3012,14 +3012,26 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
             format!("static {}, else {}", route.static_dir, route.fallback_app)
         };
 
-        // Section 9.4: the policy, when the route has one.
+        // Section 9.4: the policy, when the route has one, with the
+        // releases it gives client classes (section 4.14).
 
-        if !route.traffic.is_empty() || route.sticky || !route.hash_key.is_empty() {
+        if !route.traffic.is_empty()
+            || route.sticky
+            || !route.hash_key.is_empty()
+            || !route.traffic_classes.is_empty()
+        {
             let mut parts: Vec<String> = route
                 .traffic
                 .iter()
                 .map(|share| format!("{} {}%", share.release, share.percent))
                 .collect();
+            let mut classes: Vec<_> = route.traffic_classes.iter().collect();
+            classes.sort();
+            parts.extend(
+                classes
+                    .into_iter()
+                    .map(|(class, release)| format!("{class} to {release}")),
+            );
 
             if route.sticky {
                 parts.push("sticky".to_owned());
@@ -3060,6 +3072,12 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
 
         if !route.upload.is_empty() {
             target.push_str(&format!(" [uploads {}]", route.upload));
+        }
+
+        // Section 4.14: the client classes the route is for.
+
+        if !route.client_classes.is_empty() {
+            target.push_str(&format!(" [for {}]", route.client_classes.join(", ")));
         }
 
         println!("{:<16} {:<24} {target}", route.host, route.path);

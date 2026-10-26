@@ -401,6 +401,8 @@ struct HostRecord {
 struct GroupRecord {
     name: String,
     paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    client_classes: Vec<String>,
     sockets: Vec<PathBuf>,
 }
 
@@ -444,9 +446,9 @@ pub struct Info {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
     pub dashboard: Option<SocketAddr>,
-    /// The rate limits the daemon's file defines (section 4.15), which
-    /// applied hosts and routes may name.
-    pub rate_limits: std::sync::RwLock<Vec<String>>,
+    /// The rate limits (section 4.15) and client classes (section 4.14)
+    /// the daemon's file defines, which applied files may name.
+    pub defined: std::sync::RwLock<crate::config::Defined>,
 }
 
 /// What a ReopenLogs command reached.
@@ -806,7 +808,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
         dashboard,
-        rate_limits: std::sync::RwLock::new(clients.limit_names()),
+        defined: std::sync::RwLock::new(clients.defined()),
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -1767,7 +1769,7 @@ impl Daemon {
         self.compression = compression;
         self.error_pages = error_pages;
         self.error_override = error_override;
-        *self.info.rate_limits.write().expect("rate limits poisoned") = clients.limit_names();
+        *self.info.defined.write().expect("defined names poisoned") = clients.defined();
         self.clients = clients;
 
         if changed {
@@ -3111,15 +3113,17 @@ impl Daemon {
         let groups: Vec<GroupRecord> = host
             .group_sockets
             .iter()
-            .map(|(name, sockets)| GroupRecord {
-                name: name.clone(),
-                paths: spec
-                    .groups
-                    .iter()
-                    .find(|group| &group.name == name)
-                    .map(|group| group.paths.clone())
-                    .unwrap_or_default(),
-                sockets: sockets.clone(),
+            .map(|(name, sockets)| {
+                let group = spec.groups.iter().find(|group| &group.name == name);
+
+                GroupRecord {
+                    name: name.clone(),
+                    paths: group.map(|group| group.paths.clone()).unwrap_or_default(),
+                    client_classes: group
+                        .map(|group| group.client_class.clone())
+                        .unwrap_or_default(),
+                    sockets: sockets.clone(),
+                }
             })
             .collect();
         write_record(
@@ -3467,6 +3471,7 @@ impl Daemon {
                         .map(|group| pb::Group {
                             name: group.name.clone(),
                             paths: group.paths.clone(),
+                            client_classes: group.client_classes.clone(),
                             sockets: group
                                 .sockets
                                 .iter()
@@ -3634,6 +3639,7 @@ impl Daemon {
                     .and_then(|size| muru_config::parse_size(size).ok())
                     .unwrap_or(0),
                 traffic: self.route_traffic(&route, &included, &rollouts),
+                client_classes: route.classes().to_vec(),
                 host: route.host,
                 path: route.path,
                 app: route.app,
@@ -4884,8 +4890,22 @@ impl Daemon {
             })
         }));
 
+        // Section 4.14: a class goes to its release while the snapshot
+        // carries it, else as the policy's other requests do.
+
+        let classes = traffic
+            .classes
+            .iter()
+            .filter(|(_, id)| {
+                id.starts_with(muru_edge::routing::UPSTREAM_PREFIX)
+                    || included.contains(&(app.to_owned(), (*id).clone()))
+            })
+            .map(|(class, id)| (class.clone(), id.clone()))
+            .collect();
+
         Some(pb::Traffic {
             shares,
+            classes,
             hash_key: traffic.hash_key.clone().unwrap_or_default(),
             salt: traffic
                 .salt
@@ -5682,7 +5702,7 @@ fn route_apps(route: &muru_config::Route) -> Vec<&str> {
 }
 
 /// The releases the routes' traffic policies name, as (application,
-/// release) pairs (section 9.4).
+/// release) pairs (section 9.4), for a share or for a client class.
 fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
     routes
         .iter()
@@ -5692,6 +5712,7 @@ fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
                 traffic
                     .split
                     .keys()
+                    .chain(traffic.classes.values())
                     .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
                     .map(move |id| (app.to_owned(), id.clone()))
             })

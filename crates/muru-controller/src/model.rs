@@ -145,6 +145,10 @@ pub struct GroupSpec {
     pub name: String,
     /// Path prefixes it serves, with an optional trailing `*`.
     pub paths: Vec<String>,
+    /// The client classes it takes (section 4.14), ahead of the groups
+    /// that name none; their requests for every path without `paths`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<String>,
     /// Worker processes.
     pub processes: u32,
     /// Application threads per worker.

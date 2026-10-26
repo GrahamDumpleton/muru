@@ -781,6 +781,7 @@ async fn serve<I>(
                         peer: client.ip(),
                         secure,
                         ids: &shared.request_ids,
+                        client_class: &client_class,
                     },
                     origin.as_ref(),
                 );
@@ -800,8 +801,13 @@ async fn serve<I>(
                     _ => None,
                 };
 
-                let errors =
-                    routing.errors_for(host.as_deref(), parts.uri.path(), &listener, located);
+                let errors = routing.errors_for(
+                    host.as_deref(),
+                    parts.uri.path(),
+                    &client_class,
+                    &listener,
+                    located,
+                );
                 let mut context = link::Context {
                     request_id: &request_id,
                     peer: client,
@@ -911,6 +917,7 @@ async fn serve<I>(
                                 peer: client.ip(),
                                 secure,
                                 ids: &shared.request_ids,
+                                client_class: &client_class,
                             },
                         },
                     )

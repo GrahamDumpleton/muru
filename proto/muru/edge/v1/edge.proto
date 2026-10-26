@@ -198,6 +198,7 @@ message Route {
   repeated string rate_limits = 23;     // section 4.15: applied after the host's
   Methods methods = 24;                 // methods the route refuses; none when absent
   string mode = 25;                     // the site mode the application sees as muru.mode; none when empty
+  repeated string client_classes = 26;  // section 4.14: the classes the route takes; every request when empty
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.
@@ -231,6 +232,7 @@ message Traffic {
   string salt = 3;
   bool sticky = 4;                      // a cookie keeps a client on the release it first got
   uint64 sticky_grace_s = 5;
+  map<string, string> classes = 6;      // section 4.14: a client class to the release, or upstream:NAME, that takes all of its requests
 }
 
 message Share {
@@ -274,6 +276,7 @@ message Group {
   string name = 1;
   repeated string paths = 2;            // prefixes, with an optional trailing *
   repeated string sockets = 3;
+  repeated string client_classes = 4;   // section 4.14: the classes the group takes, ahead of groups naming none
 }
 
 message Applied {

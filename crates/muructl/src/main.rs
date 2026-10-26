@@ -1414,6 +1414,11 @@ fn group_sockets_from(
                 .get(name)
                 .map(|group| group.paths.clone())
                 .unwrap_or_default(),
+            client_classes: groups
+                .get(name)
+                .and_then(|group| group.matches.as_ref())
+                .map(|matches| matches.client_class.clone())
+                .unwrap_or_default(),
             sockets: sockets.clone(),
         })
         .collect()

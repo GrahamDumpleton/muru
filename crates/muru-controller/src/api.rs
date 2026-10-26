@@ -987,6 +987,12 @@ impl Admin for Service {
             routes: routes
                 .into_iter()
                 .map(|route| pb::Route {
+                    client_classes: route.classes().to_vec(),
+                    traffic_classes: route
+                        .traffic
+                        .as_ref()
+                        .map(|traffic| traffic.classes.clone().into_iter().collect())
+                        .unwrap_or_default(),
                     traffic: route
                         .traffic
                         .as_ref()
@@ -1054,14 +1060,14 @@ impl Admin for Service {
             Err(error) => return Ok(Response::new(parse_failure(error))),
         };
 
-        let rate_limits = self
+        let defined = self
             .handle
             .info
-            .rate_limits
+            .defined
             .read()
-            .expect("rate limits poisoned")
+            .expect("defined names poisoned")
             .clone();
-        let mut plan = config::plan(&self.handle.store, &document, request.prune, &rate_limits);
+        let mut plan = config::plan(&self.handle.store, &document, request.prune, &defined);
         let frozen = self.frozen().map_err(internal)?;
         let mut overridden = BTreeMap::new();
 
@@ -1153,14 +1159,14 @@ impl Admin for Service {
         // A diff shows both directions: what the document would add and
         // what desired state holds beyond it.
 
-        let rate_limits = self
+        let defined = self
             .handle
             .info
-            .rate_limits
+            .defined
             .read()
-            .expect("rate limits poisoned")
+            .expect("defined names poisoned")
             .clone();
-        let plan = config::plan(&self.handle.store, &document, true, &rate_limits);
+        let plan = config::plan(&self.handle.store, &document, true, &defined);
         Ok(Response::new(report_message(&plan)))
     }
 
@@ -1231,7 +1237,7 @@ impl Service {
                     .routes()
                     .unwrap_or_default()
                     .into_iter()
-                    .find(|stored| stored.host == route.host && stored.path == route.path)
+                    .find(|stored| stored.host == route.host && stored.key() == route.key())
                     .and_then(|stored| stored.traffic);
 
                 // Section 9.4: a changed policy is an event of its own.
@@ -1239,7 +1245,7 @@ impl Service {
                 if before != route.traffic {
                     self.handle.events.emit(
                         "traffic_policy.changed",
-                        &format!("route {} {}", route.host, route.path),
+                        &format!("route {} {}", route.host, route.key()),
                         "notice",
                         &crate::config::describe_traffic(route.traffic.as_ref()),
                     );

@@ -100,6 +100,9 @@ impl Maintenance {
 
 struct Route {
     path: String,
+    /// The client classes the route takes (section 4.14); every request
+    /// when empty.
+    classes: Vec<String>,
     app: String,
     /// The upstream that takes the requests (section 4.13), instead of
     /// an application.
@@ -149,6 +152,13 @@ impl Route {
     /// 4.10): its own application's always may, another's when listed.
     fn accepts(&self, app: &str) -> bool {
         self.owner() == app || self.accept_redirects_from.iter().any(|name| name == app)
+    }
+
+    /// Whether the route takes a request for `path` from a client of
+    /// `class`.
+    fn matches(&self, path: &str, class: &str) -> bool {
+        prefix_matches(&self.path, path)
+            && (self.classes.is_empty() || self.classes.iter().any(|name| name == class))
     }
 }
 
@@ -208,6 +218,9 @@ pub struct GroupSockets {
     pub name: String,
     /// The paths it serves: prefixes, with an optional trailing `*`.
     pub paths: Vec<String>,
+    /// The client classes it takes (section 4.14), ahead of the groups
+    /// that name none; every path of theirs without `paths`.
+    pub client_classes: Vec<String>,
     /// Its workers.
     pub sockets: Vec<std::path::PathBuf>,
 }
@@ -272,6 +285,9 @@ pub struct Client<'a> {
     pub secure: bool,
     /// Issues an anonymous id to a client that has none yet.
     pub ids: &'a crate::errors::RequestIds,
+    /// The client's class (section 4.14), which routes, policies and
+    /// worker groups may be for.
+    pub client_class: &'a str,
 }
 
 /// An application's releases that may take requests: the serving one,
@@ -306,6 +322,8 @@ pub struct Policy {
     key: Key,
     salt: String,
     sticky: bool,
+    /// The target that takes every request of a client class.
+    classes: HashMap<String, Target>,
 }
 
 /// What a request is bucketed by.
@@ -358,11 +376,25 @@ impl Policy {
             top = low;
         }
 
+        let classes = message
+            .classes
+            .iter()
+            .map(|(class, name)| {
+                let target = match name.strip_prefix(UPSTREAM_PREFIX) {
+                    Some(upstream) => Target::Upstream(upstream.to_owned()),
+                    None => Target::Release(name.clone()),
+                };
+
+                (class.clone(), target)
+            })
+            .collect();
+
         Ok(Self {
             shares,
             key,
             salt: message.salt.clone(),
             sticky: message.sticky,
+            classes,
         })
     }
 
@@ -447,9 +479,9 @@ impl Chosen<'_> {
         }
     }
 
-    fn select(self, path: &str, origin: Option<&Origin>) -> Option<Selection> {
+    fn select(self, path: &str, class: &str, origin: Option<&Origin>) -> Option<Selection> {
         match self {
-            Self::Pools(pools) => pools.select(path, origin),
+            Self::Pools(pools) => pools.select(path, class, origin),
             Self::Upstream(upstream) => Some(upstream_selection(&upstream)),
         }
     }
@@ -473,9 +505,10 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
 }
 
 /// Section 4.5: which of an application's releases takes a request. The
-/// release a preview header or cookie names comes first, then the one a
-/// sticky cookie records, then the policy's bucket for the client's key,
-/// else the serving release. Cookies the edge issues on the way go into
+/// release a preview header or cookie names comes first, then the one the
+/// policy gives the client's class (section 4.14), then the one a sticky
+/// cookie records, then the policy's bucket for the client's key, else
+/// the serving release. Cookies the edge issues on the way go into
 /// `cookies` as Set-Cookie values.
 fn choose<'a>(
     app: &'a AppReleases,
@@ -501,6 +534,14 @@ fn choose<'a>(
     let Some(policy) = policy else {
         return Chosen::Pools(&app.serving);
     };
+
+    if let Some(chosen) = policy
+        .classes
+        .get(client.client_class)
+        .and_then(|target| Chosen::named(&target.label(), app, upstreams))
+    {
+        return chosen;
+    }
 
     if policy.sticky
         && let Some(chosen) = cookie(client.headers, STICKY_COOKIE)
@@ -569,8 +610,9 @@ pub struct AppPools {
     app: String,
     release: String,
     default: Arc<LinkPool>,
-    /// A group path prefix, the group's name and its pool.
-    groups: Vec<(String, String, Arc<LinkPool>)>,
+    /// The groups by path, most specific first, those for client classes
+    /// ahead of the rest.
+    groups: Vec<GroupPath>,
     mounts: Vec<MountPath>,
     /// The default mount's redirect forms (section 4.10).
     redirects: RedirectFlags,
@@ -583,6 +625,18 @@ pub struct AppPools {
     /// Section 9.9: the instances of a managed HTTP release, which take
     /// every request in place of workers.
     server: Option<Arc<Upstream>>,
+}
+
+/// A path that selects a worker group (section 7.1).
+struct GroupPath {
+    /// The prefix.
+    prefix: String,
+    /// The client classes the group is for; every class when empty.
+    classes: Vec<String>,
+    /// The group's name.
+    name: String,
+    /// Its workers.
+    pool: Arc<LinkPool>,
 }
 
 /// The group name a managed HTTP release's requests are logged under
@@ -608,12 +662,33 @@ impl AppPools {
         for group in groups {
             let pool = Arc::new(LinkPool::connect(&group.sockets).await?);
 
-            for path in &group.paths {
-                connected.push((group_prefix(path), group.name.clone(), Arc::clone(&pool)));
+            // Section 4.14: a group for client classes with no paths of
+            // its own takes those classes' requests for every path.
+
+            let root = ["/".to_owned()];
+
+            let paths = if group.paths.is_empty() && !group.client_classes.is_empty() {
+                &root[..]
+            } else {
+                &group.paths[..]
+            };
+
+            for path in paths {
+                connected.push(GroupPath {
+                    prefix: group_prefix(path),
+                    classes: group.client_classes.clone(),
+                    name: group.name.clone(),
+                    pool: Arc::clone(&pool),
+                });
             }
         }
 
-        connected.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+        connected.sort_by_key(|group| {
+            (
+                group.classes.is_empty(),
+                std::cmp::Reverse(group.prefix.len()),
+            )
+        });
 
         // Section 6.13: a gRPC mount has no path; its calls are matched by
         // the services its workers registered.
@@ -695,13 +770,14 @@ impl AppPools {
         self
     }
 
-    /// Where a path goes: the most specific group path's pool, else the
-    /// default group's, and the longest mount prefix, else the default
-    /// mount (section 6.7). An internal mount (section 4.10) is reached
+    /// Where a path goes: the most specific path of a group for the
+    /// client's class (section 4.14), else of a group for every class,
+    /// else the default group, and the longest mount prefix, else the
+    /// default mount (section 6.7). An internal mount (section 4.10) is reached
     /// only by a redirect from the release's own application, or from
     /// one it accepts: a client's request for it, or an unaccepted
     /// redirect, gets nothing.
-    pub fn select(&self, path: &str, origin: Option<&Origin>) -> Option<Selection> {
+    pub fn select(&self, path: &str, class: &str, origin: Option<&Origin>) -> Option<Selection> {
         if let Some(server) = &self.server {
             return Some(Selection {
                 pool: Arc::new(LinkPool::empty()),
@@ -720,8 +796,11 @@ impl AppPools {
         let (group, pool) = self
             .groups
             .iter()
-            .find(|(prefix, _, _)| prefix_matches(prefix, path))
-            .map(|(_, name, pool)| (name.clone(), Arc::clone(pool)))
+            .find(|group| {
+                prefix_matches(&group.prefix, path)
+                    && (group.classes.is_empty() || group.classes.iter().any(|name| name == class))
+            })
+            .map(|group| (group.name.clone(), Arc::clone(&group.pool)))
             .unwrap_or_else(|| (DEFAULT_GROUP.to_owned(), Arc::clone(&self.default)));
         let mount = self
             .mounts
@@ -779,9 +858,9 @@ impl AppPools {
     pub fn pools(&self) -> Vec<(String, Arc<LinkPool>)> {
         let mut pools = vec![(DEFAULT_GROUP.to_owned(), Arc::clone(&self.default))];
 
-        for (_, name, pool) in &self.groups {
-            if !pools.iter().any(|(seen, _)| seen == name) {
-                pools.push((name.clone(), Arc::clone(pool)));
+        for group in &self.groups {
+            if !pools.iter().any(|(seen, _)| seen == &group.name) {
+                pools.push((group.name.clone(), Arc::clone(&group.pool)));
             }
         }
 
@@ -1166,6 +1245,7 @@ impl Routing {
                     .map(Arc::new);
                 routing.routes[index].push(Route {
                     path: route.path.clone(),
+                    classes: route.client_classes.clone(),
                     app: route.app.clone(),
                     upstream: upstream_named(&route.upstream, route)?,
                     static_route,
@@ -1194,8 +1274,16 @@ impl Routing {
             }
         }
 
+        // Section 4.14: of routes with the same path, those for client
+        // classes come before the one for every request.
+
         for routes in &mut routing.routes {
-            routes.sort_by_key(|route| std::cmp::Reverse(route.path.len()));
+            routes.sort_by_key(|route| {
+                (
+                    std::cmp::Reverse(route.path.len()),
+                    route.classes.is_empty(),
+                )
+            });
         }
 
         Ok(routing)
@@ -1241,6 +1329,7 @@ impl Routing {
         &self,
         name: Option<&str>,
         path: &str,
+        class: &str,
         listener: &str,
         located: Option<(&str, &str)>,
     ) -> Chain {
@@ -1259,7 +1348,7 @@ impl Routing {
         if let Some(index) = host
             && let Some(route) = self.routes[index]
                 .iter()
-                .find(|route| prefix_matches(&route.path, path))
+                .find(|route| route.matches(path, class))
         {
             levels.push(Arc::clone(&route.errors));
         }
@@ -1341,7 +1430,7 @@ impl Routing {
         origin: Option<&Origin>,
     ) -> Decision {
         if self.hosts.is_empty() {
-            return match self.default.select(path, origin) {
+            return match self.default.select(path, client.client_class, origin) {
                 Some(selection) => Decision::Serve {
                     selection,
                     server_name: None,
@@ -1375,7 +1464,7 @@ impl Routing {
 
         let Some(route) = self.routes[index]
             .iter()
-            .find(|route| prefix_matches(&route.path, path))
+            .find(|route| route.matches(path, client.client_class))
         else {
             return Decision::NoRoute;
         };
@@ -1484,7 +1573,9 @@ impl Routing {
         };
 
         if self.hosts.is_empty() {
-            return self.default.select(path, Some(&origin));
+            return self
+                .default
+                .select(path, client.client_class, Some(&origin));
         }
 
         let mut cookies = Vec::new();
@@ -1520,9 +1611,12 @@ impl Routing {
                     .and_then(|origin| releases.releases.get(&origin.release));
 
                 match pinned {
-                    Some(pools) => pools.select(path, origin),
-                    None => choose(releases, policy, client, cookies, &self.upstreams)
-                        .select(path, origin),
+                    Some(pools) => pools.select(path, client.client_class, origin),
+                    None => choose(releases, policy, client, cookies, &self.upstreams).select(
+                        path,
+                        client.client_class,
+                        origin,
+                    ),
                 }
             }
             None => Some(Selection {
@@ -1589,6 +1683,7 @@ fn groups_of(app: &pb::AppWorkers) -> Vec<GroupSockets> {
         .map(|group| GroupSockets {
             name: group.name.clone(),
             paths: group.paths.clone(),
+            client_classes: group.client_classes.clone(),
             sockets: paths(&group.sockets),
         })
         .collect()
@@ -1721,6 +1816,7 @@ mod tests {
             peer: "10.0.0.1".parse().unwrap(),
             secure: false,
             ids,
+            client_class: "default",
         }
     }
 
@@ -1874,6 +1970,7 @@ mod tests {
             salt: "shop /".to_owned(),
             sticky,
             sticky_grace_s: 600,
+            classes: Default::default(),
         });
         snapshot
     }
@@ -2087,6 +2184,95 @@ mod tests {
             select(&routing, Some("whatever"), "/", "127.0.0.1:1", false),
             Decision::Serve { .. }
         ));
+    }
+
+    /// The application, release and group a request of a class to a
+    /// path of shop.example.com goes to.
+    fn placed(routing: &Routing, path: &str, class: &str) -> (String, String, String) {
+        let headers = HeaderMap::new();
+        let ids = crate::errors::RequestIds::new();
+        let client = Client {
+            client_class: class,
+            ..client(&headers, &ids)
+        };
+
+        match routing.select(
+            Some("shop.example.com"),
+            path,
+            "127.0.0.1:1",
+            true,
+            &client,
+            None,
+        ) {
+            Decision::Serve { selection, .. } => {
+                (selection.app, selection.release, selection.group)
+            }
+            _ => panic!("{path} as {class} is not served"),
+        }
+    }
+
+    #[test]
+    fn client_classes_pick_routes_releases_and_groups() {
+        let mut snapshot = split_snapshot(true, "");
+        snapshot.routes[0].traffic.as_mut().unwrap().classes =
+            [("ai_crawler".to_owned(), "r2".to_owned())]
+                .into_iter()
+                .collect();
+        snapshot.routes[0].traffic.as_mut().unwrap().shares[0].weight = 0;
+        snapshot.routes.push(pb::Route {
+            host: "shop".to_owned(),
+            path: "/".to_owned(),
+            app: "archive".to_owned(),
+            client_classes: vec!["partner".to_owned()],
+            ..Default::default()
+        });
+        snapshot.apps[0].groups = vec![
+            pb::Group {
+                name: "hot".to_owned(),
+                paths: vec!["/status".to_owned()],
+                ..Default::default()
+            },
+            pb::Group {
+                name: "crawlers".to_owned(),
+                client_classes: vec!["ai_crawler".to_owned()],
+                ..Default::default()
+            },
+        ];
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot))
+            .unwrap();
+        let at = |path: &str, class: &str| placed(&routing, path, class);
+
+        // A route for a class comes before the one for every request at
+        // the same path, and a longer path still wins.
+
+        assert_eq!(at("/", "partner").0, "archive");
+        assert_eq!(at("/", "default").0, "shop");
+        assert_eq!(at("/api/x", "partner").0, "api");
+
+        // The policy gives a class its release, ahead of the split, which
+        // gives r2 nothing.
+
+        assert_eq!(at("/", "default").1, "r1");
+        assert_eq!(at("/", "ai_crawler").1, "r2");
+
+        // A group for a class takes its requests on every path, ahead of
+        // a group for the path; others keep to the path's group.
+
+        assert_eq!(at("/status", "default").2, "hot");
+        assert_eq!(at("/", "default").2, "default");
+
+        // Without the policy, which sends the class to r2, its requests
+        // reach r1's group for it.
+
+        snapshot.routes[0].traffic = None;
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot))
+            .unwrap();
+        assert_eq!(placed(&routing, "/status", "ai_crawler").2, "crawlers");
+        assert_eq!(placed(&routing, "/", "ai_crawler").2, "crawlers");
     }
 
     #[test]

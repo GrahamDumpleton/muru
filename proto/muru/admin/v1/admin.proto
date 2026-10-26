@@ -564,6 +564,8 @@ message Route {
   string fallback_upstream = 13;    // the upstream behind a static route, when there is one
   string upload = 14;               // multipart or raw when the edge receives uploads (section 4.11), with ", precheck"
   string max_body_size = 15;        // the route's own body limit, as configured (section 4.6)
+  repeated string client_classes = 16; // the client classes the route takes (section 4.14); every request when empty
+  map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
 }
 
 message ListUpstreamsRequest {}

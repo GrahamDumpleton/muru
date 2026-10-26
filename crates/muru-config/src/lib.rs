@@ -372,6 +372,11 @@ pub struct Group {
     /// match across all groups wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// The client classes (section 4.14) the group takes: their requests
+    /// for its paths, or for every path without `paths`, ahead of the
+    /// groups that name no class.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<ClientMatch>,
     /// Worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processes: Option<usize>,
@@ -1099,6 +1104,11 @@ pub struct Route {
     /// The path prefix, `/` for everything. The longest prefix wins.
     #[serde(default = "root_path")]
     pub path: String,
+    /// The client classes (section 4.14) the route takes; every request
+    /// without it. Among routes with the same path, one naming the
+    /// request's class comes first.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<ClientMatch>,
     /// The application whose serving release takes the requests; empty
     /// for a static or upstream route.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1194,6 +1204,30 @@ pub struct Route {
     pub mode: Option<String>,
 }
 
+impl Route {
+    /// The client classes the route is for, empty for every request.
+    pub fn classes(&self) -> &[String] {
+        self.matches
+            .as_ref()
+            .map_or(&[], |matches| matches.client_class.as_slice())
+    }
+
+    /// What identifies the route within its host: the path, followed by
+    /// the classes it is for, so routes for different classes may share
+    /// a path.
+    pub fn key(&self) -> String {
+        let mut classes = self.classes().to_vec();
+
+        if classes.is_empty() {
+            return self.path.clone();
+        }
+
+        classes.sort();
+        classes.dedup();
+        format!("{} client_class={}", self.path, classes.join(","))
+    }
+}
+
 /// A route's method restrictions (section 4.15).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1212,6 +1246,16 @@ pub struct Methods {
 pub fn check_route_policies(route: &Route) -> Result<(), String> {
     for name in &route.rate_limits {
         check_policy_name("rate_limits", name)?;
+    }
+
+    check_client_match(route.matches.as_ref())?;
+
+    for class in route
+        .traffic
+        .iter()
+        .flat_map(|traffic| traffic.classes.keys())
+    {
+        check_policy_name("traffic.classes", class)?;
     }
 
     if let Some(methods) = &route.methods {
@@ -1243,6 +1287,25 @@ pub fn check_route_policies(route: &Route) -> Result<(), String> {
         return Err(format!(
             "mode: {mode:?} must be a short word such as read-only"
         ));
+    }
+
+    Ok(())
+}
+
+/// Check a route's or worker group's `match`: it names at least one
+/// client class, each a valid name. `default` is the class of requests
+/// no rule matches, and may be named.
+pub fn check_client_match(matches: Option<&ClientMatch>) -> Result<(), String> {
+    let Some(matches) = matches else {
+        return Ok(());
+    };
+
+    if matches.client_class.is_empty() {
+        return Err("match.client_class names no class".to_owned());
+    }
+
+    for class in &matches.client_class {
+        check_policy_name("match.client_class", class)?;
     }
 
     Ok(())
@@ -1925,7 +1988,7 @@ pub fn check_client_class(class: &ClientClass) -> Result<(), String> {
 pub struct RateLimit {
     /// Which requests draw from the buckets; all of them without it.
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<RateLimitMatch>,
+    pub matches: Option<ClientMatch>,
     /// What a bucket is kept for: `address` (the default),
     /// `client_class`, `header:NAME`, `cookie:NAME`, or a list of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1954,10 +2017,10 @@ pub struct RateLimit {
     pub headers: Option<bool>,
 }
 
-/// The requests a rate limit applies to.
+/// The requests a rate limit, route or worker group applies to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RateLimitMatch {
+pub struct ClientMatch {
     /// Client classes (section 4.14).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<String>,
@@ -2275,6 +2338,11 @@ pub struct Traffic {
     /// alive, for example 10m (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky_grace: Option<String>,
+    /// The release, by id, or `upstream:NAME`, that takes every request
+    /// of a client class (section 4.14), ahead of stickiness and the
+    /// split.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub classes: BTreeMap<String, String>,
 }
 
 /// A static route's fallback (section 4.9): an application, or a file
@@ -3632,10 +3700,33 @@ mod tests {
             ),
             ("mode = 'read only'", "mode:"),
             ("rate_limits = ['Bad']", "rate_limits:"),
+            ("match = { client_class = [] }", "names no class"),
+            ("match = { client_class = ['AI'] }", "match.client_class:"),
+            (
+                "traffic = { classes = { 'Bots' = 'r1' } }",
+                "traffic.classes:",
+            ),
         ] {
             let error = check_route_policies(&route(keys)).unwrap_err();
             assert!(error.contains(expected), "{keys}: {error}");
         }
+    }
+
+    #[test]
+    fn routes_for_classes_have_keys_of_their_own() {
+        let route = |keys: &str| upload_route(keys);
+        assert_eq!(route("").key(), "/");
+        assert_eq!(
+            route("match = { client_class = ['partner', 'ai_crawler', 'partner'] }").key(),
+            "/ client_class=ai_crawler,partner"
+        );
+        assert!(
+            check_route_policies(&route(
+                "match = { client_class = ['default'] }
+traffic = { classes = { ai_crawler = 'r1' } }"
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3744,6 +3835,7 @@ mod tests {
             name: Some("shop-root".to_owned()),
             host: "shop".to_owned(),
             path: "/".to_owned(),
+            matches: None,
             app: "shop".to_owned(),
             upstream: String::new(),
             static_dir: None,

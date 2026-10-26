@@ -576,7 +576,8 @@ impl Store {
         })
     }
 
-    /// Create or replace a route, identified by its host and path.
+    /// Create or replace a route, identified by its host and key: the
+    /// path, and the client classes it is for (section 4.14).
     pub fn put_route(&self, route: &Route) -> Result<(), StoreError> {
         let encoded =
             toml::to_string(route).map_err(|error| StoreError::Decode(error.to_string()))?;
@@ -585,7 +586,7 @@ impl Store {
                 "INSERT INTO routes (host, path, spec) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(host, path) DO UPDATE SET spec = excluded.spec, \
                  resource_version = resource_version + 1",
-                params![route.host, route.path, encoded],
+                params![route.host, route.key(), encoded],
             )?;
             Ok(())
         })
@@ -724,7 +725,7 @@ impl Store {
         })
     }
 
-    /// Remove a route.
+    /// Remove a route, by its host and key.
     pub fn delete_route(&self, host: &str, path: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute(

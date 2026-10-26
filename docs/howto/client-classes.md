@@ -3,9 +3,9 @@
 ```{admonition} Status
 :class: note
 
-Client classes, rate limits, method restrictions and route site modes,
-under the daemon. Classes and limits are declared in the daemon's own
-configuration file; routing by class and modes set by overlays are
+Client classes, routing by class, rate limits, method restrictions and
+route site modes, under the daemon. Classes and limits are declared in
+the daemon's own configuration file; declaring them in applied files is
 still to come.
 ```
 
@@ -79,6 +79,66 @@ The class appears in the access log as `class=` (for anything but
 label of `muru_requests_total`, and to the application as
 `muru.client_class` in the environ or `client_class` in the scope's
 `extensions["muru"]`.
+
+## Routing by class
+
+A route, a traffic policy and a worker group can each be for some
+classes, so crawlers can be kept off the capacity that serves people.
+
+A route with `match` takes only the requests of its classes. Several
+routes may share a path when no class is in two of them, and at the same
+path the route for the request's class comes before the route for every
+class. Here partners' requests for anything on the site get a static
+snapshot:
+
+```toml
+[[route]]
+host = 'shop'
+path = '/'
+app = 'shop'
+
+[[route]]
+host = 'shop'
+path = '/'
+static = '/srv/shop/snapshot'
+match = { client_class = ['ai_crawler', 'unverified_bot'] }
+```
+
+A longer path still wins over a shorter one, whatever the classes: with
+these two routes and a third for `/api`, a crawler's request for
+`/api/items` takes the `/api` route.
+
+A traffic policy's `classes` gives a class a release of its own, such as
+an older, cheaper one kept running for it. A preview header or cookie
+still comes first, but the class's release comes before a sticky cookie
+and the split:
+
+```toml
+[[route]]
+host = 'shop'
+app = 'shop'
+traffic = { classes = { ai_crawler = 'r41' } }
+```
+
+The release stays running while a policy names it. A value of
+`upstream:NAME` sends the class to an [upstream](upstreams.md)
+instead.
+
+A worker group with `match` takes its classes' requests for its paths,
+or for every path when it has none, ahead of the groups for every class.
+The group's workers then carry the crawlers' load and nothing else:
+
+```toml
+[app.shop.release.r42.groups.crawlers]
+match = { client_class = ['ai_crawler'] }
+processes = 1
+threads = 4
+```
+
+`muructl apply` refuses a class the daemon's file does not define;
+`default` is always defined. `muructl route list` shows the classes a
+route is for, as `[for ai_crawler]`, and the releases its policy gives
+classes.
 
 ## Rate limits
 

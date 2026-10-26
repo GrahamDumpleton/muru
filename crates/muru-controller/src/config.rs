@@ -89,7 +89,8 @@ pub enum Action {
     RemoveRoute {
         /// The host.
         host: String,
-        /// The path prefix.
+        /// The route's key: its path prefix, and the client classes it
+        /// is for.
         path: String,
     },
     /// Create or replace an HTTP upstream (section 4.13).
@@ -183,7 +184,7 @@ impl Change {
                 format!("{app}@{id}")
             }
             Action::PutHost { name, .. } | Action::RemoveHost { name } => format!("host {name}"),
-            Action::PutRoute { route, .. } => format!("route {} {}", route.host, route.path),
+            Action::PutRoute { route, .. } => format!("route {} {}", route.host, route.key()),
             Action::RemoveRoute { host, path } => format!("route {host} {path}"),
             Action::PutUpstream { name, .. } | Action::RemoveUpstream { name } => {
                 format!("upstream {name}")
@@ -213,7 +214,7 @@ pub struct Plan {
 /// last declared release of an application is the one that serves; hosts
 /// and routes follow; with `prune`, removals of what the document does
 /// not contain come last.
-pub fn plan(store: &Store, document: &Document, prune: bool, rate_limits: &[String]) -> Plan {
+pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) -> Plan {
     let mut plan = Plan::default();
 
     // Listeners and limits are node settings, read from the daemon's own
@@ -286,12 +287,24 @@ pub fn plan(store: &Store, document: &Document, prune: bool, rate_limits: &[Stri
 
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
+
+        // Section 4.14: a worker group's classes are the daemon's.
+
+        for (id, release) in &app.release {
+            for (group, table) in &release.groups {
+                for class in unknown_classes(table.matches.as_ref(), defined) {
+                    plan.errors.push(format!(
+                        "{name}@{id}: worker group {group}: no client class named {class} in the daemon configuration file"
+                    ));
+                }
+            }
+        }
     }
 
-    plan_hosts(store, document, rate_limits, &mut plan);
+    plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
-    plan_routes(store, document, rate_limits, &mut plan);
-    plan_overlays(store, document, rate_limits, prune, &mut plan);
+    plan_routes(store, document, defined, &mut plan);
+    plan_overlays(store, document, &defined.rate_limits, prune, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -439,6 +452,27 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
 /// The changes the document's hosts imply (section 4.3): names are
 /// checked, duplicates refused and certificates read, so a bad host
 /// never reaches the edge.
+/// What the daemon's own file defines that applied files may name:
+/// rate limits (section 4.15) and client classes (section 4.14).
+#[derive(Debug, Clone, Default)]
+pub struct Defined {
+    /// The `[rate_limit.NAME]` tables.
+    pub rate_limits: Vec<String>,
+    /// The classes of the `[[client_class]]` rules.
+    pub client_classes: Vec<String>,
+}
+
+/// Section 4.14: the classes a `match` names that the daemon's file does
+/// not define; `default` is always defined.
+fn unknown_classes(matches: Option<&muru_config::ClientMatch>, defined: &Defined) -> Vec<String> {
+    matches
+        .iter()
+        .flat_map(|matches| matches.client_class.iter())
+        .filter(|class| class.as_str() != "default" && !defined.client_classes.contains(class))
+        .cloned()
+        .collect()
+}
+
 /// Section 4.15: the rate limits `names` asks for that the daemon's file
 /// does not define.
 fn unknown_limits(names: &[String], defined: &[String]) -> Vec<String> {
@@ -551,12 +585,12 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
 }
 
 /// The changes the document's routes imply (section 4.5).
-fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan: &mut Plan) {
+fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut Plan) {
     let stored: BTreeMap<(String, String), RouteTable> = store
         .routes()
         .unwrap_or_default()
         .into_iter()
-        .map(|route| ((route.host.clone(), route.path.clone()), route))
+        .map(|route| ((route.host.clone(), route.key()), route))
         .collect();
     let stored_hosts: Vec<String> = store
         .hosts()
@@ -579,18 +613,19 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
     let known_upstream = |name: &str| {
         document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
     };
-    let mut seen = Vec::new();
-    let mut names: BTreeMap<&str, (&str, &str)> = BTreeMap::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut classes_at: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+    let mut names: BTreeMap<&str, (&str, String)> = BTreeMap::new();
 
     // Section 9.10: a route's name is how overlays reach it, so it is
     // unique among the declared routes and those already recorded.
 
     for route in &stored_routes_named(&stored) {
-        names.insert(route.0, (route.1, route.2));
+        names.insert(route.0, (route.1, route.2.clone()));
     }
 
     for route in &document.route {
-        let key = (route.host.clone(), route.path.clone());
+        let key = (route.host.clone(), route.key());
         let mut valid = true;
 
         if let Some(name) = &route.name {
@@ -603,9 +638,7 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
             }
 
             match names.get(name.as_str()) {
-                Some((host, path))
-                    if (*host, *path) != (route.host.as_str(), route.path.as_str()) =>
-                {
+                Some((host, path)) if (*host, path) != (route.host.as_str(), &key.1) => {
                     plan.errors.push(format!(
                         "route {} {}: the name {name} is the route {host} {path}'s",
                         route.host, route.path
@@ -613,7 +646,7 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
                     valid = false;
                 }
                 _ => {
-                    names.insert(name, (&route.host, &route.path));
+                    names.insert(name, (&route.host, key.1.clone()));
                 }
             }
         }
@@ -784,13 +817,55 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
             valid = false;
         }
 
-        for missing in unknown_limits(&route.rate_limits, rate_limits) {
+        for missing in unknown_limits(&route.rate_limits, &defined.rate_limits) {
             plan.errors.push(format!(
                 "route {} {}: no rate limit named {missing} in the daemon configuration file",
                 route.host, route.path
             ));
             valid = false;
         }
+
+        // Section 4.14: the classes a route and its policy are for are
+        // the daemon's, and two routes with one path are for different
+        // classes.
+
+        let pinned = route
+            .traffic
+            .iter()
+            .flat_map(|traffic| traffic.classes.keys().cloned())
+            .collect::<Vec<_>>();
+        let named = muru_config::ClientMatch {
+            client_class: pinned,
+        };
+
+        for class in unknown_classes(route.matches.as_ref(), defined)
+            .into_iter()
+            .chain(unknown_classes(Some(&named), defined))
+        {
+            plan.errors.push(format!(
+                "route {} {}: no client class named {class} in the daemon configuration file",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        let at = classes_at
+            .entry((route.host.as_str(), route.path.as_str()))
+            .or_default();
+
+        if let Some(class) = route
+            .classes()
+            .iter()
+            .find(|class| at.contains(&class.as_str()))
+        {
+            plan.errors.push(format!(
+                "route {} {}: another route with the path is for client class {class}",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        at.extend(route.classes().iter().map(String::as_str));
 
         // Sections 4.6 and 4.11: the body limit, and the upload keys, which
         // need an application to hand the files to.
@@ -830,14 +905,14 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
                     valid = false;
                 }
                 Some(app) => {
-                    for id in traffic.split.keys() {
+                    for id in traffic.split.keys().chain(traffic.classes.values()) {
                         // Section 4.13: a share may go to an upstream.
 
                         if let Some(upstream) = id.strip_prefix(muru_edge::routing::UPSTREAM_PREFIX)
                         {
                             if !known_upstream(upstream) {
                                 plan.errors.push(format!(
-                                    "route {} {}: traffic.split names upstream {upstream}, which does not exist",
+                                    "route {} {}: traffic names upstream {upstream}, which does not exist",
                                     route.host, route.path
                                 ));
                                 valid = false;
@@ -853,7 +928,7 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
 
                         if !declared && store.release(app, id).is_err() {
                             plan.errors.push(format!(
-                                "route {} {}: traffic.split names {app}@{id}, which does not exist",
+                                "route {} {}: traffic names {app}@{id}, which does not exist",
                                 route.host, route.path
                             ));
                             valid = false;
@@ -937,10 +1012,8 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
         }
 
         if seen.contains(&key) {
-            plan.errors.push(format!(
-                "route {} {} is declared twice",
-                route.host, route.path
-            ));
+            plan.errors
+                .push(format!("route {} {} is declared twice", route.host, key.1));
             valid = false;
         }
 
@@ -1004,15 +1077,17 @@ pub fn auth_handler(auth: &muru_config::Auth) -> String {
 }
 
 /// The changes the document's HTTP upstreams imply (section 4.13).
-/// The recorded routes with names, as (name, host, path).
-fn stored_routes_named(stored: &BTreeMap<(String, String), RouteTable>) -> Vec<(&str, &str, &str)> {
+/// The recorded routes with names, as (name, host, key).
+fn stored_routes_named(
+    stored: &BTreeMap<(String, String), RouteTable>,
+) -> Vec<(&str, &str, String)> {
     stored
         .values()
         .filter_map(|route| {
             route
                 .name
                 .as_deref()
-                .map(|name| (name, route.host.as_str(), route.path.as_str()))
+                .map(|name| (name, route.host.as_str(), route.key()))
         })
         .collect()
 }
@@ -1367,9 +1442,16 @@ pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
         .map(|(release, percent)| format!("{release} {percent}%"))
         .collect();
 
-    if parts.is_empty() {
+    if parts.is_empty() && traffic.classes.is_empty() {
         parts.push("no shares".to_owned());
     }
+
+    parts.extend(
+        traffic
+            .classes
+            .iter()
+            .map(|(class, release)| format!("{class} to {release}")),
+    );
 
     if traffic.sticky == Some(true) {
         parts.push("sticky".to_owned());
@@ -1389,13 +1471,13 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         let declared = document
             .route
             .iter()
-            .any(|candidate| candidate.host == route.host && candidate.path == route.path);
+            .any(|candidate| candidate.host == route.host && candidate.key() == route.key());
 
         if !declared {
             plan.changes.push(Change {
                 action: Action::RemoveRoute {
+                    path: route.key(),
                     host: route.host,
-                    path: route.path,
                 },
                 detail: "not declared".to_owned(),
             });
@@ -1785,8 +1867,18 @@ pub fn resolve_spec(
             return Err(format!("{name:?} is not a valid worker group name"));
         }
 
-        if group.paths.is_empty() {
-            return Err(format!("worker group {name} has no paths"));
+        muru_config::check_client_match(group.matches.as_ref())
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+        let client_class = group
+            .matches
+            .as_ref()
+            .map(|matches| matches.client_class.clone())
+            .unwrap_or_default();
+
+        if group.paths.is_empty() && client_class.is_empty() {
+            return Err(format!(
+                "worker group {name} has no paths and no match.client_class"
+            ));
         }
 
         if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
@@ -1807,6 +1899,7 @@ pub fn resolve_spec(
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
+            client_class,
             processes: group_processes,
             threads: group.threads.map_or(threads, |value| value as u32),
             sync_threads: group
@@ -2788,6 +2881,11 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                     group.name.clone(),
                     GroupTable {
                         paths: group.paths.clone(),
+                        matches: (!group.client_class.is_empty()).then(|| {
+                            muru_config::ClientMatch {
+                                client_class: group.client_class.clone(),
+                            }
+                        }),
                         processes: Some(group.processes as usize),
                         threads: Some(group.threads as usize),
                         sync_threads: Some(group.sync_threads as usize),
@@ -3251,12 +3349,23 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
     groups
         .iter()
         .map(|group| {
+            let on = match (group.paths.is_empty(), group.client_class.is_empty()) {
+                (_, true) => group.paths.join(" "),
+                (true, false) => format!("every path for {}", group.client_class.join(" ")),
+                (false, false) => {
+                    format!(
+                        "{} for {}",
+                        group.paths.join(" "),
+                        group.client_class.join(" ")
+                    )
+                }
+            };
+
             format!(
-                "{} {}x{} on {}{}",
+                "{} {}x{} on {on}{}",
                 group.name,
                 group.processes,
                 group.threads,
-                group.paths.join(" "),
                 if group.scaling.is_static() {
                     String::new()
                 } else {
@@ -3370,7 +3479,12 @@ mod tests {
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
 
-        let plan = plan(&store, &Document::parse(&text).unwrap(), true, &[]);
+        let plan = plan(
+            &store,
+            &Document::parse(&text).unwrap(),
+            true,
+            &Defined::default(),
+        );
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.changes.is_empty(), "{:?}", plan.changes);
         assert_eq!(plan.unchanged, 1);
@@ -3399,7 +3513,12 @@ mod tests {
             source.display()
         );
 
-        let plan = plan(&store, &Document::parse(&text).unwrap(), false, &[]);
+        let plan = plan(
+            &store,
+            &Document::parse(&text).unwrap(),
+            false,
+            &Defined::default(),
+        );
         assert_eq!(plan.errors.len(), 1, "{:?}", plan.errors);
         assert!(
             plan.errors[0].contains("shop@r1 already exists")
@@ -3423,10 +3542,58 @@ mod tests {
     }
 
     #[test]
+    fn routes_for_client_classes_share_a_path() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let defined = Defined {
+            rate_limits: Vec::new(),
+            client_classes: vec!["partner".to_owned(), "ai_crawler".to_owned()],
+        };
+        let routes = |extra: &str| {
+            format!(
+                "[host.shop]\nnames = ['shop.example.com']\n\
+                 [[route]]\nhost = 'shop'\napp = 'shop'\n\
+                 [[route]]\nhost = 'shop'\napp = 'shop'\nmatch = {{ client_class = ['partner'] }}\n\
+                 traffic = {{ classes = {{ ai_crawler = 'r1' }} }}\n{extra}"
+            )
+        };
+
+        let plan = plan(
+            &store,
+            &Document::parse(&routes("")).unwrap(),
+            false,
+            &defined,
+        );
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        let subjects: Vec<String> = plan.changes.iter().map(Change::subject).collect();
+        assert!(
+            subjects.contains(&"route shop /".to_owned())
+                && subjects.contains(&"route shop / client_class=partner".to_owned()),
+            "{subjects:?}"
+        );
+
+        let text = routes(
+            "[[route]]\nhost = 'shop'\napp = 'shop'\nmatch = { client_class = ['partner', 'bots'] }\n\
+             traffic = { classes = { robots = 'r9' } }\n",
+        );
+        let refused = super::plan(&store, &Document::parse(&text).unwrap(), false, &defined);
+        let errors = refused.errors.join("\n");
+
+        for expected in [
+            "no client class named bots",
+            "no client class named robots",
+            "traffic names shop@r9, which does not exist",
+            "another route with the path is for client class partner",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
+    }
+
+    #[test]
     fn prune_removes_what_is_not_declared() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let plan = plan(&store, &Document::default(), true, &[]);
+        let plan = plan(&store, &Document::default(), true, &Defined::default());
         let names: Vec<(&str, String)> = plan
             .changes
             .iter()
@@ -3450,7 +3617,12 @@ mod tests {
                     [app.shop.release.r2]\nsource = '/nonexistent/dir'\n\
                     [[listener]]\naddress = '127.0.0.1:8080'\n";
 
-        let plan = plan(&store, &Document::parse(text).unwrap(), false, &[]);
+        let plan = plan(
+            &store,
+            &Document::parse(text).unwrap(),
+            false,
+            &Defined::default(),
+        );
         assert_eq!(plan.errors.len(), 3, "{:?}", plan.errors);
         assert!(plan.errors[0].contains("\"Shop\" is not a valid application name"));
         assert!(plan.errors[1].contains("shop@r1 has no source directory"));

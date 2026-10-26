@@ -50,6 +50,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | hooks | release | none | 6.3 |
 | kind, profile, command, cwd, bind, instances, readiness (path, timeout), stop_signal | release | workers, none, none, source, unix, 1, none and 60s, the profile's | 9.9 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |
+| match.client_class | group, route | none (every class) | 4.14 |
 | path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none (required except for a gRPC mount, which takes none), false, false, false, 1000, 1000 | 6.7, 4.10, 6.13 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
@@ -70,7 +71,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release | none, none, none, 60s | 4.12 |
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |
 | names, listeners, tls, canonical, https_redirect, use_canonical_name | host | none, all, none, none, false, false | 4.3 |
-| traffic: split, sticky, hash_key, salt, sticky_grace | route | 100% to newest ready release, off, cookie, per route, 10m | 9.4 |
+| traffic: split, sticky, hash_key, salt, sticky_grace, classes | route | 100% to newest ready release, off, cookie, per route, 10m, none | 9.4, 4.14 |
 | retention of superseded releases | application | 30m | 9.1 |
 | reload.mode, paths, include, exclude, respect_gitignore, debounce, poll | application | off, source, `**/*.py`, none, true, 300ms, false | 9.8 |
 | schedules (name, start and end or cron and duration, timezone, group, min_workers, max_workers, warm_up, scale_in, freeze_deploys) | application, group | none | 7.5 |

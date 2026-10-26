@@ -65,12 +65,21 @@ impl ClientPolicies {
         Ok(policies)
     }
 
-    /// The names of the limits, for checking what hosts and routes name.
-    pub fn limit_names(&self) -> Vec<String> {
-        self.limits_message
-            .iter()
-            .map(|limit| limit.name.clone())
-            .collect()
+    /// The names of the limits and classes, for checking what applied
+    /// files name.
+    pub fn defined(&self) -> crate::config::Defined {
+        crate::config::Defined {
+            rate_limits: self
+                .limits_message
+                .iter()
+                .map(|limit| limit.name.clone())
+                .collect(),
+            client_classes: self
+                .classes_message
+                .iter()
+                .map(|class| class.name.clone())
+                .collect(),
+        }
     }
 
     /// Read the list files again when one has changed since they were

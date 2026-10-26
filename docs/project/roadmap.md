@@ -374,11 +374,14 @@ and routes name, reject with 429 and Retry-After (and the RateLimit
 fields where asked), delay, or only log, counted in
 `muru_rate_limited_total` with the `ratelimit.enforcing` event. A
 route's `methods` refuses methods with 503 read_only or 405, and its
-`mode` reaches the application as `muru.mode`. Still to come: routing
-on a class (routes, traffic policies and worker groups), classes and
-limits in applied files, the application-level mode and modes set by
-overlays (section 9.10), buckets shared between several edge processes,
-and TLS fingerprints as an input.
+`mode` reaches the application as `muru.mode`. Routing on a class
+followed: a route's `match` makes it a route for some classes, sharing
+its path with the route for every class, a traffic policy's `classes`
+gives a class a release or upstream of its own, kept running for it,
+and a worker group's `match` takes a class's requests ahead of the other
+groups. Still to come: classes and limits in applied files, the
+application-level mode (section 9.10), buckets shared between several
+edge processes, and TLS fingerprints as an input.
 
 Worker inspection's phase 3 commands (section 11.7) are in, through the
 in-process control thread of ADR 0025: `muructl debug profile` samples
