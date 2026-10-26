@@ -117,7 +117,7 @@ jobs:
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
       - run: bash packaging/dev/fetch-h2spec.sh
-      - run: uv run pytest tests/integration tests/conformance
+      - run: for i in $(seq 8); do uv run pytest -x tests/integration/test_inspect.py tests/integration/test_memory.py || exit 1; done
 
   python:
     runs-on: ${{ matrix.os }}

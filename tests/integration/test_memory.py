@@ -46,7 +46,12 @@ def test_a_worker_over_the_hard_limit_is_replaced_at_once() -> None:
     try:
         first = json.loads(server.get("/info").body)["pid"]
         assert int(server.get("/grow?mb=160").body) >= 160 * MB
-        wait_for(lambda: len(recycled(server.log())) >= 1)
+
+        try:
+            wait_for(lambda: len(recycled(server.log())) >= 1)
+        except AssertionError:
+            raise AssertionError(f"no recycle in time; the log:\n{server.log()[-8000:]}") from None
+
         line = recycled(server.log())[0]
         assert "over the hard limit of 96MB" in line and "rss" in line
 
