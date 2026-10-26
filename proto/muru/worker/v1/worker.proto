@@ -109,6 +109,7 @@ message TlsInfo {
   string cipher = 2;                // negotiated cipher suite, for example TLS13_AES_256_GCM_SHA384
   string server_name = 3;           // the name the client asked for (SNI), if any
   string alpn = 4;                  // negotiated application protocol, for example h2
+  string ja4 = 5;                   // the ClientHello's JA4 fingerprint (section 4.14), if it was read
 }
 
 // How a request arrived by internal redirect (section 4.10): what the

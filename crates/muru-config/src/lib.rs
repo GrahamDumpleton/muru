@@ -1516,6 +1516,13 @@ pub struct ClientClass {
     /// `user_agent_list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_list: Option<String>,
+    /// JA4 fingerprints of the client's TLS ClientHello, or their
+    /// beginnings ending in `*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ja4: Vec<String>,
+    /// A file of JA4 fingerprints, one a line, as for `user_agent_list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_list: Option<String>,
     /// Request headers by name, each value matched by a regular
     /// expression: a CDN's verdict, say.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -2166,12 +2173,25 @@ pub fn check_client_class(class: &ClientClass) -> Result<(), String> {
         || class.user_agent_list.is_some()
         || !class.addresses.is_empty()
         || class.address_list.is_some()
+        || !class.ja4.is_empty()
+        || class.ja4_list.is_some()
         || !class.headers.is_empty()
         || !class.cookies.is_empty();
 
     if !inputs {
         return Err(format!(
             "client_class {}: names nothing to match",
+            class.name
+        ));
+    }
+
+    if let Some(fingerprint) = class
+        .ja4
+        .iter()
+        .find(|fingerprint| fingerprint.is_empty() || fingerprint.contains(char::is_whitespace))
+    {
+        return Err(format!(
+            "client_class {}: {fingerprint:?} is not a JA4 fingerprint",
             class.name
         ));
     }

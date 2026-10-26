@@ -36,6 +36,7 @@ pub mod compression;
 pub mod connections;
 pub mod errors;
 pub mod grpc;
+pub mod ja4;
 pub mod link;
 pub mod metrics;
 pub mod proxy;
@@ -656,15 +657,20 @@ async fn accept(
                     // A client that never finishes its handshake is cut off
                     // as one that never finishes its request head would be.
 
-                    let handshake = tokio::time::timeout(
-                        shared.limits.header_read_timeout,
-                        acceptor.accept(stream),
-                    )
-                    .await;
+                    let handshake =
+                        tokio::time::timeout(shared.limits.header_read_timeout, async {
+                            // Section 4.14: the ClientHello's fingerprint, read
+                            // before the handshake takes it.
+
+                            let ja4 = ja4::peek(&stream, shared.limits.header_read_timeout).await;
+                            acceptor.accept(stream).await.map(|stream| (stream, ja4))
+                        })
+                        .await;
 
                     match handshake {
-                        Ok(Ok(stream)) => {
-                            let info = tls::info(stream.get_ref().1);
+                        Ok(Ok((stream, ja4))) => {
+                            let mut info = tls::info(stream.get_ref().1);
+                            info.ja4 = ja4.unwrap_or_default();
                             serve(
                                 stream,
                                 peer,
@@ -794,9 +800,15 @@ async fn serve<I>(
             let proxy = forwarded.client.map(|_| peer);
 
             // Section 4.14: the client's class, from the address and
-            // headers the request arrived with.
+            // headers the request arrived with, and the TLS fingerprint
+            // when the client connected itself rather than through a
+            // trusted proxy.
 
-            let client_class = routing.classify(client.ip(), &parts.headers, &shared.verifier);
+            let ja4 = tls
+                .as_ref()
+                .filter(|tls| proxy.is_none() && !tls.ja4.is_empty())
+                .map(|tls| tls.ja4.as_str());
+            let client_class = routing.classify(client.ip(), &parts.headers, ja4, &shared.verifier);
             let client_target = parts
                 .uri
                 .path_and_query()

@@ -1350,6 +1350,7 @@ fn build_scope<'py>(
         details.set_item("cipher", &tls.cipher)?;
         details.set_item("server_name", &tls.server_name)?;
         details.set_item("alpn", &tls.alpn)?;
+        details.set_item("ja4", &tls.ja4)?;
         muru.set_item("tls", details)?;
     }
 

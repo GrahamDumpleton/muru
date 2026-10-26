@@ -73,7 +73,8 @@ both and prints them.
 
 Over HTTPS the environ has `HTTPS = "on"`, `wsgi.url_scheme = "https"`,
 and `muru.tls` with the protocol version, cipher, the name the client
-asked for and the negotiated application protocol; the
+asked for, the negotiated application protocol and the JA4 fingerprint
+of the client's TLS ClientHello; the
 [environ reference](../reference/wsgi-environ.md) lists them.
 
 Do not send `Strict-Transport-Security` from the application in

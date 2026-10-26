@@ -50,7 +50,7 @@ it adds.
 | `muru.internal` | `True` on a request that arrived by internal redirect, absent otherwise; `muru.is_internal(environ)` reads it |
 | `muru.error_reason` | Present only when the edge asked the application for an [error page](../howto/error-pages.md): the error's reason, for example `app_error`, while `REDIRECT_STATUS` is its status |
 | `muru.auth_request`, `muru.original_method`, `muru.original_uri`, `muru.original_host` | Present only on an [authentication sub-request](../howto/auth-subrequests.md): `True`, and the method, path and query, and host of the request being decided about. `muru.internal` is `True` too, and the `REDIRECT_*` keys are absent |
-| `muru.tls` | Present over HTTPS only: a dictionary with `version` (`TLSv1.3` or `TLSv1.2`), `cipher` (the negotiated suite, for example `TLS13_AES_256_GCM_SHA384`), `server_name` (the name the client asked for, empty when it connected by address) and `alpn` (`h2`, `http/1.1`, or empty when the client offered none) |
+| `muru.tls` | Present over HTTPS only: a dictionary with `version` (`TLSv1.3` or `TLSv1.2`), `cipher` (the negotiated suite, for example `TLS13_AES_256_GCM_SHA384`), `server_name` (the name the client asked for, empty when it connected by address) `alpn` (`h2`, `http/1.1`, or empty when the client offered none) and `ja4` (the JA4 fingerprint of the client's TLS ClientHello, empty when it could not be read) |
 
 ## Rules worth knowing
 

@@ -1,6 +1,6 @@
 //! Client classification (design specification section 4.14). Each
 //! request gets a class from the first rule whose inputs all match, or
-//! `default`: user agents, client addresses, headers and cookies, with a
+//! `default`: user agents, client addresses, TLS fingerprints, headers and cookies, with a
 //! claimed crawler confirmed by reverse and forward DNS. Verification
 //! never holds a request: a lookup starts in the background, and until it
 //! has confirmed the address the rule does not match, so the request
@@ -46,9 +46,11 @@ struct Rule {
     user_agents: Vec<String>,
     user_agent_regexes: Vec<Regex>,
     addresses: Vec<Network>,
+    ja4: Vec<String>,
     headers: Vec<(HeaderName, Regex)>,
     cookies: Vec<(String, Regex)>,
     verify_domains: Vec<String>,
+    empty_list: bool,
 }
 
 impl Classifier {
@@ -92,6 +94,8 @@ impl Classifier {
                     .map(regex)
                     .collect::<Result<_, _>>()?,
                 addresses,
+                ja4: message.ja4.clone(),
+                empty_list: message.empty_list,
                 headers,
                 cookies: message
                     .cookies
@@ -109,24 +113,36 @@ impl Classifier {
         Ok(Self { rules })
     }
 
-    /// The class of a request from `client` with `headers`.
+    /// The class of a request from `client` with `headers`, over a TLS
+    /// connection with the fingerprint `ja4` when it has one.
     pub fn classify(
         &self,
         client: IpAddr,
         headers: &HeaderMap,
+        ja4: Option<&str>,
         verifier: &Arc<Verifier>,
     ) -> Arc<str> {
         let client = client.to_canonical();
 
         self.rules
             .iter()
-            .find(|rule| rule.matches(client, headers, verifier))
+            .find(|rule| rule.matches(client, headers, ja4, verifier))
             .map_or_else(|| Arc::clone(&DEFAULT_CLASS), |rule| Arc::clone(&rule.name))
     }
 }
 
 impl Rule {
-    fn matches(&self, client: IpAddr, headers: &HeaderMap, verifier: &Arc<Verifier>) -> bool {
+    fn matches(
+        &self,
+        client: IpAddr,
+        headers: &HeaderMap,
+        ja4: Option<&str>,
+        verifier: &Arc<Verifier>,
+    ) -> bool {
+        if self.empty_list {
+            return false;
+        }
+
         if !self.user_agents.is_empty() || !self.user_agent_regexes.is_empty() {
             let agent = headers
                 .get(USER_AGENT)
@@ -152,6 +168,19 @@ impl Rule {
                 .addresses
                 .iter()
                 .any(|network| network.contains(client))
+        {
+            return false;
+        }
+
+        // An entry ending in * matches the fingerprints it begins.
+
+        if !self.ja4.is_empty()
+            && !ja4.is_some_and(|ja4| {
+                self.ja4.iter().any(|entry| match entry.strip_suffix('*') {
+                    Some(prefix) => ja4.starts_with(prefix),
+                    None => ja4 == entry,
+                })
+            })
         {
             return false;
         }
@@ -411,7 +440,7 @@ mod tests {
 
         let class = |client: IpAddr, pairs: &[(&str, &str)]| {
             rules
-                .classify(client, &headers(pairs), &verifier)
+                .classify(client, &headers(pairs), None, &verifier)
                 .to_string()
         };
 
@@ -440,6 +469,43 @@ mod tests {
         assert_eq!(class(outside, &[]), "default");
     }
 
+    #[test]
+    fn a_fingerprint_matches_exactly_or_by_its_beginning() {
+        let rules = classifier(vec![
+            pb::ClientClass {
+                name: "scripted".to_owned(),
+                ja4: vec!["t13d1516h2_8daaf6152771_b186095e22b6".to_owned()],
+                ..Default::default()
+            },
+            pb::ClientClass {
+                name: "old_tls".to_owned(),
+                ja4: vec!["t12*".to_owned()],
+                ..Default::default()
+            },
+        ]);
+        let verifier = Verifier::new();
+        let client: IpAddr = "198.51.100.7".parse().unwrap();
+        let class = |ja4: Option<&str>| {
+            rules
+                .classify(client, &HeaderMap::new(), ja4, &verifier)
+                .to_string()
+        };
+
+        assert_eq!(
+            class(Some("t13d1516h2_8daaf6152771_b186095e22b6")),
+            "scripted"
+        );
+        assert_eq!(
+            class(Some("t12d1312h2_8daaf6152771_b186095e22b6")),
+            "old_tls"
+        );
+        assert_eq!(
+            class(Some("t13d1516h2_8daaf6152771_000000000000")),
+            "default"
+        );
+        assert_eq!(class(None), "default");
+    }
+
     #[tokio::test]
     async fn a_claimed_name_falls_through_until_dns_confirms_it() {
         let rules = classifier(vec![
@@ -459,7 +525,10 @@ mod tests {
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         let request = headers(&[("user-agent", "Testbot/1.0")]);
 
-        assert_eq!(&*rules.classify(loopback, &request, &verifier), "claimed");
+        assert_eq!(
+            &*rules.classify(loopback, &request, None, &verifier),
+            "claimed"
+        );
 
         let deadline = Instant::now() + Duration::from_secs(10);
 
@@ -472,7 +541,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        assert_eq!(&*rules.classify(loopback, &request, &verifier), "verified");
+        assert_eq!(
+            &*rules.classify(loopback, &request, None, &verifier),
+            "verified"
+        );
 
         // An address whose name is not in the domains never is.
 
@@ -481,7 +553,7 @@ mod tests {
             Some("crawl.example.org".to_owned()),
         );
         assert_eq!(
-            &*rules.classify("192.0.2.1".parse().unwrap(), &request, &verifier),
+            &*rules.classify("192.0.2.1".parse().unwrap(), &request, None, &verifier),
             "claimed"
         );
     }

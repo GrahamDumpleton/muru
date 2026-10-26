@@ -164,10 +164,12 @@ impl ClientPolicies {
             muru_config::check_client_class(class)?;
             let mut user_agents = class.user_agent.clone();
             let mut addresses = class.addresses.clone();
+            let mut ja4 = class.ja4.clone();
 
             for (list, into) in [
                 (&class.user_agent_list, &mut user_agents),
                 (&class.address_list, &mut addresses),
+                (&class.ja4_list, &mut ja4),
             ] {
                 if let Some(list) = list {
                     let path = self.directory.join(list);
@@ -177,6 +179,15 @@ impl ClientPolicies {
                     })?);
                 }
             }
+
+            // An input taken from a list file that holds no entries
+            // matches nothing, rather than dropping out of the rule.
+
+            let empty_list = (class.user_agent_list.is_some()
+                && user_agents.is_empty()
+                && class.user_agent_regex.is_empty())
+                || (class.address_list.is_some() && addresses.is_empty())
+                || (class.ja4_list.is_some() && ja4.is_empty());
 
             messages.push(pb::ClientClass {
                 name: class.name.clone(),
@@ -190,6 +201,8 @@ impl ClientPolicies {
                     .collect(),
                 cookies: class.cookies.clone().into_iter().collect(),
                 verify_domains: class.verify_domains.clone(),
+                ja4,
+                empty_list,
             });
         }
 
@@ -315,6 +328,29 @@ mod tests {
             policies.classes_message[0].user_agents,
             vec!["CCBot", "Bytespider"]
         );
+    }
+
+    #[test]
+    fn an_input_from_an_empty_list_matches_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("ja4.txt"), "# none yet\n").unwrap();
+        std::fs::write(directory.path().join("ai.txt"), "GPTBot\n").unwrap();
+        let classes = vec![
+            ClientClass {
+                name: "fingerprinted".to_owned(),
+                ja4_list: Some("ja4.txt".to_owned()),
+                ..ClientClass::default()
+            },
+            ClientClass {
+                name: "ai_crawler".to_owned(),
+                user_agent_list: Some("ai.txt".to_owned()),
+                ..ClientClass::default()
+            },
+        ];
+        let policies =
+            ClientPolicies::resolve(&classes, &BTreeMap::new(), directory.path()).unwrap();
+        assert!(policies.classes_message[0].empty_list);
+        assert!(!policies.classes_message[1].empty_list);
     }
 
     #[test]

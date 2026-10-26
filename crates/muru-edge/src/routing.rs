@@ -1375,9 +1375,10 @@ impl Routing {
         &self,
         client: std::net::IpAddr,
         headers: &HeaderMap,
+        ja4: Option<&str>,
         verifier: &Arc<crate::classify::Verifier>,
     ) -> Arc<str> {
-        self.classifier.classify(client, headers, verifier)
+        self.classifier.classify(client, headers, ja4, verifier)
     }
 
     /// The snapshot's version.

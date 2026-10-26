@@ -69,6 +69,8 @@ message ClientClass {
   map<string, string> headers = 5;      // lower-case header name to a regular expression its value must match
   map<string, string> cookies = 6;      // cookie name to a regular expression its value must match
   repeated string verify_domains = 7;   // reverse and forward DNS must confirm a name in one of these; no verification when empty
+  repeated string ja4 = 8;              // JA4 fingerprints, or prefixes ending in *, the list file's included
+  bool empty_list = 9;                  // an input whose entries all come from a list file holding none: the rule matches nothing
 }
 
 // Section 4.15: a token bucket for each key, which requests of the

@@ -851,6 +851,7 @@ fn build_environ<'py>(
         details.set_item(intern!(py, "cipher"), &tls.cipher)?;
         details.set_item(intern!(py, "server_name"), &tls.server_name)?;
         details.set_item(intern!(py, "alpn"), &tls.alpn)?;
+        details.set_item(intern!(py, "ja4"), &tls.ja4)?;
         environ.set_item(intern!(py, "muru.tls"), details)?;
     }
 

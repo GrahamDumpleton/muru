@@ -399,9 +399,10 @@ gives a class a release or upstream of its own, kept running for it,
 and a worker group's `match` takes a class's requests ahead of the other
 groups, and classes and limits may be declared in applied files too.
 An overlay's `apps.NAME.mode` sets the site mode, and `deny` the
-refused methods, on every route of an application. Still to come:
-buckets shared between several edge processes, and TLS fingerprints as
-an input.
+refused methods, on every route of an application. The JA4 fingerprint
+of a client's TLS ClientHello is an input to the class rules and reaches
+the application in `muru.tls`. Still to come: buckets shared between
+several edge processes.
 
 Worker inspection's phase 3 commands (section 11.7) are in, through the
 in-process control thread of ADR 0025: `muructl debug profile` samples

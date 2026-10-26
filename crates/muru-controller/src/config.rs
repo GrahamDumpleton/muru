@@ -593,7 +593,7 @@ fn plan_clients(store: &Store, document: &Document, file: &Defined, prune: bool,
             continue;
         }
 
-        let relative = [&class.user_agent_list, &class.address_list]
+        let relative = [&class.user_agent_list, &class.address_list, &class.ja4_list]
             .into_iter()
             .flatten()
             .find(|list| !Path::new(list).is_absolute());
@@ -687,6 +687,8 @@ fn describe_class(class: &ClientClass) -> String {
         ("user_agent_list", class.user_agent_list.is_some()),
         ("addresses", !class.addresses.is_empty()),
         ("address_list", class.address_list.is_some()),
+        ("ja4", !class.ja4.is_empty()),
+        ("ja4_list", class.ja4_list.is_some()),
         ("headers", !class.headers.is_empty()),
         ("cookies", !class.cookies.is_empty()),
     ];

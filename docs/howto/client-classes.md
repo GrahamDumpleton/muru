@@ -48,6 +48,8 @@ addresses = ['203.0.113.0/24']
 | `user_agent_list` | the User-Agent contains a substring from the file |
 | `addresses` | the client's address is one of these addresses or networks; `loopback` and `private` work too |
 | `address_list` | the client's address is in a network from the file |
+| `ja4` | the JA4 fingerprint of the client's TLS ClientHello is one of these, or begins with one ending in `*` |
+| `ja4_list` | the JA4 fingerprint is one from the file, or begins with one ending in `*` |
 | `headers` | each named header is present and matches its regular expression |
 | `cookies` | each named cookie is present and matches its regular expression |
 
@@ -59,6 +61,26 @@ header, say `headers = { 'X-Bot-Score' = '^[0-2]?[0-9]$' }`, classifies
 what reaches you through it. Class names are lower case letters, digits,
 `_` and `-`.
 
+JA4 is FoxIO's fingerprint of how a client opens a TLS connection, such
+as `t13d1516h2_8daaf6152771_b186095e22b6`: it names the TLS library a
+client uses whatever its User-Agent says, so a script claiming to be a
+browser still has its library's fingerprint. The edge reads it from each
+TLS connection made to it directly, and the application finds it as
+`muru.tls["ja4"]`. A request that came through a trusted proxy has none
+to match, since the proxy made the connection; a CDN that computes JA4
+can send it in a header for the `headers` input instead. Plain HTTP
+requests have no fingerprint, so a rule with `ja4` never matches them.
+
+```toml
+[[client_class]]
+name = 'scripted'
+ja4_list = 'lists/scripted-ja4.txt'
+user_agent = ['Mozilla']
+```
+
+Here a request is `scripted` when its User-Agent claims a browser and
+its fingerprint is one from the list.
+
 `verify = 'dns'` confirms a claimed crawler: the client's address must
 reverse-resolve to a name that is, or ends in, one of `verify_domains`,
 and that name must resolve back to the address. A lookup never holds a
@@ -68,7 +90,9 @@ through to the later rules, the `unverified_bot` above for instance.
 Confirmed names are remembered for 24 hours and failures for an hour.
 
 List files hold one entry a line; blank lines and lines starting with
-`#` are ignored. A path in the daemon's file is relative to its
+`#` are ignored. An input whose only entries come from a list that holds
+none matches nothing, so its rule matches nothing until the list has
+entries. A path in the daemon's file is relative to its
 directory, and one in an applied file is absolute. A list that changes
 is read again within a second, which
 the `client_class.list_reloaded` event records. Community lists of AI
