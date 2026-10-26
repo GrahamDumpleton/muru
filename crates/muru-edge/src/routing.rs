@@ -614,8 +614,13 @@ impl AppPools {
         }
 
         connected.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+
+        // Section 6.13: a gRPC mount has no path; its calls are matched by
+        // the services its workers registered.
+
         let mut mounts: Vec<MountPath> = mounts
             .iter()
+            .filter(|mount| !mount.path.is_empty())
             .map(|mount| MountPath {
                 name: mount.name.clone(),
                 path: group_prefix(&mount.path),

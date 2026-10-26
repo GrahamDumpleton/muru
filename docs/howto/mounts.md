@@ -5,8 +5,8 @@
 
 Named mounts at path prefixes, any mix of WSGI and ASGI in the same
 workers, in development mode and under the daemon, and internal mounts.
-Per-mount thread pools and connection limits, gRPC mounts and the groups
-`mounts` subset are still to come.
+[gRPC mounts](grpc.md) have a page of their own. Per-mount thread pools
+and connection limits and the groups `mounts` subset are still to come.
 ```
 
 A release can serve several entrypoints from the same worker processes,

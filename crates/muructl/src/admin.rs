@@ -1837,6 +1837,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         wait: !args.no_wait,
         hold: args.hold,
         override_freeze: args.override_freeze,
+        reflection: None,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         max_requests: args.max_requests,
         max_lifetime_ms: args

@@ -947,6 +947,7 @@ mod tests {
             preload: Preload::Auto,
             hooks: None,
             factory: None,
+            reflection: false,
             groups: Vec::new(),
             mounts: Vec::new(),
             logging: Default::default(),

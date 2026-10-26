@@ -188,6 +188,7 @@ message DeployRequest {
   repeated string sendfile_roots = 41;      // section 4.9: directories an X-Muru-Sendfile path must lie in; the table's when empty
   optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
   bool override_freeze = 43;                // deploy although an overlay freezes the application's deploys (section 9.6)
+  optional bool reflection = 44;            // section 6.13: serve gRPC server reflection; the table's when absent
 }
 
 // One environment variable: a value, or a secret reference.

@@ -1,0 +1,7 @@
+entrypoint = "grpcsvc:wsgi_app"
+threads = 2
+reflection = true
+
+[mounts.api]
+interface = "grpc"
+entrypoint = "grpcsvc:register"

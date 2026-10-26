@@ -539,6 +539,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         websockets: shared.asgi.is_some(),
         files: true,
         max_message_size: MAX_MESSAGE_SIZE,
+        grpc_methods: shared.grpc_methods.clone(),
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -831,6 +832,13 @@ async fn handle_asgi_request(
         return handle_websocket(reader, writer, out_rx, shared, channel, &done, request_id).await;
     }
 
+    if head.scope == pb::Scope::Grpc as i32 {
+        return handle_grpc(
+            reader, writer, out_rx, shared, channel, &done, request_id, &head,
+        )
+        .await;
+    }
+
     let read_side = async {
         if request_end {
             channel.deliver(Bytes::new(), false).await;
@@ -1000,6 +1008,166 @@ async fn handle_websocket(
     let early = read_result?;
     write_result?;
     Ok(early)
+}
+
+/// Run one gRPC call (section 6.13): MESSAGE frames from the edge become
+/// `grpc.message` events, its END `grpc.end`, and ABORT or the end of the
+/// call `grpc.disconnect`, while the application's metadata, messages and
+/// trailers go out as RESPONSE, MESSAGE and END. A streaming call runs as
+/// long as it needs to, outside the soft timeout.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the call
+async fn handle_grpc(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    out_rx: mpsc::Receiver<Outgoing>,
+    shared: &Arc<Shared>,
+    channel: &asgi::Channel,
+    done: &tokio::sync::Notify,
+    request_id: u64,
+    head: &pb::RequestHead,
+) -> io::Result<Option<frame::Frame>> {
+    let path = String::from_utf8_lossy(&head.raw_path);
+    let streaming = shared
+        .grpc_methods
+        .iter()
+        .find(|method| {
+            method.path == path
+                || (method.path.ends_with('/') && path.starts_with(method.path.as_str()))
+        })
+        .is_none_or(|method| method.client_streaming || method.server_streaming);
+
+    if streaming {
+        shared.request_exempt(request_id);
+    }
+
+    let read_side = async {
+        loop {
+            let Some(next) = frame::read(reader).await? else {
+                channel.disconnect();
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the edge closed the connection during a gRPC call",
+                ));
+            };
+
+            match next.kind {
+                kind::MESSAGE => channel.deliver_message(next.payload, false).await,
+                kind::END => {
+                    channel.deliver_end().await;
+                    break;
+                }
+                kind::ABORT => {
+                    channel.disconnect();
+                    break;
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected frame type {other} in a gRPC call"),
+                    ));
+                }
+            }
+        }
+
+        // Section 5.5: the client going away is grpc.disconnect.
+
+        loop {
+            match watch_request(reader, done).await? {
+                Interrupt::Done => return Ok(None),
+                Interrupt::Request(next) => return Ok(Some(next)),
+                Interrupt::Abort => channel.disconnect(),
+                Interrupt::Closed => {
+                    channel.disconnect();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during a gRPC call",
+                    ));
+                }
+            }
+        }
+    };
+    let write_side = async {
+        let result = write_grpc_response(out_rx, writer).await;
+        channel.complete();
+        done.notify_one();
+        result
+    };
+
+    let (read_result, write_result) = tokio::join!(read_side, write_side);
+    channel.disconnect();
+    shared.request_finished(request_id);
+
+    let early = read_result?;
+    write_result?;
+    Ok(early)
+}
+
+/// Turn a gRPC call's output into frames as it comes, each message on its
+/// own: the head, the messages, and an END with the trailers or the
+/// application's failure.
+async fn write_grpc_response(
+    mut rx: mpsc::Receiver<Outgoing>,
+    writer: &mut Writer,
+) -> io::Result<()> {
+    loop {
+        match rx.recv().await {
+            Some(Outgoing::Head { headers, .. }) => {
+                let head = pb::ResponseHead {
+                    status: 200,
+                    headers: headers
+                        .into_iter()
+                        .map(|(name, value)| pb::Header {
+                            name: Bytes::from(name),
+                            value: Bytes::from(value),
+                        })
+                        .collect(),
+                    flush: pb::FlushPolicy::Immediate as i32,
+                    ..Default::default()
+                };
+                frame::write(writer, kind::RESPONSE, 0, head.encode_to_vec().into()).await?;
+            }
+            Some(Outgoing::Message { data, .. }) => {
+                frame::write(writer, kind::MESSAGE, 0, data).await?;
+            }
+            Some(Outgoing::Trailers(trailers)) => {
+                let end = pb::End {
+                    trailers: trailers
+                        .into_iter()
+                        .map(|(name, value)| pb::Header {
+                            name: Bytes::from(name),
+                            value: Bytes::from(value),
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
+            }
+            Some(Outgoing::Abort {
+                error,
+                reason,
+                detail,
+            }) => {
+                // The edge turns the failure into the call's status.
+
+                let end = pb::End {
+                    error,
+                    reason,
+                    detail,
+                    ..Default::default()
+                };
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
+            }
+            Some(Outgoing::Finished) | None => {
+                let end = pb::End {
+                    error: "the application returned without finishing the call".to_owned(),
+                    reason: "app_error".to_owned(),
+                    ..Default::default()
+                };
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// Turn the application's output into frames, coalescing small chunks.
@@ -1254,6 +1422,9 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     let flags = if text { flag::TEXT } else { 0 };
                     frame::write(writer, kind::MESSAGE, flags, data).await?;
                 }
+            }
+            Some(Some(Outgoing::Trailers(_))) => {
+                // Only a gRPC call sends trailers, through its own writer.
             }
             Some(Some(Outgoing::Close { code, reason })) => {
                 if upgraded {

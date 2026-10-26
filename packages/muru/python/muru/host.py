@@ -121,7 +121,7 @@ def log(message: str) -> None:
         pass
 
 
-INTERFACES = ("auto", "wsgi", "asgi")
+INTERFACES = ("auto", "wsgi", "asgi", "grpc")
 FACTORY_PHASES = ("worker", "host")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -159,12 +159,17 @@ def detect_interface(app: Any) -> str:
 
 
 def resolve_interface(spec: str, app: Any, interface: str) -> str:
-    """Return the interface the application is served with: ``wsgi`` or ``asgi``.
+    """Return the interface the application is served with: ``wsgi``, ``asgi`` or ``grpc``.
 
-    ``auto`` detects it from the callable. A declared interface is trusted,
-    except that an application declared WSGI whose callable is a coroutine
-    function cannot be served that way and is refused.
+    ``auto`` detects WSGI or ASGI from the callable; ``grpc`` is never
+    detected, since its entrypoint is a registration function (section
+    6.13). A declared interface is trusted, except that an application
+    declared WSGI whose callable is a coroutine function cannot be served
+    that way and is refused.
     """
+
+    if interface == "grpc":
+        return interface
 
     detected = detect_interface(app)
     if interface == "auto":
@@ -189,7 +194,7 @@ def app_name(spec: str) -> str:
 def process_model(threads: int, interface: str = "wsgi") -> str:
     """Name the process model of section 6.4 for a release."""
 
-    if interface == "asgi":
+    if interface in ("asgi", "grpc"):
         return "async"
 
     gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
@@ -242,9 +247,19 @@ class Release:
         return self.hooks
 
     def accept(self, app: Any) -> None:
-        """Keep the application and settle the interface it is served with."""
+        """Keep the application and settle the interface it is served with.
+
+        A gRPC entrypoint is called now with the server it registers its
+        services on (section 6.13), which is what is served.
+        """
 
         self.resolved = resolve_interface(self.spec, app, self.interface)
+
+        if self.resolved == "grpc":
+            from muru import _grpc
+
+            app = _grpc.register(app)
+
         self.app = app
 
         # The context tells hooks and the application what they run under.
@@ -314,13 +329,15 @@ class Mount:
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
-        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE]."""
+        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE]; a gRPC mount's PATH is empty."""
 
         parts = text.split("=")
-        if len(parts) not in (3, 4) or not parts[0] or not parts[1].startswith("/"):
+        interface = parts[3] if len(parts) == 4 else "auto"
+        path_given = parts[1].startswith("/") if len(parts) > 1 else False
+
+        if len(parts) not in (3, 4) or not parts[0] or path_given == (interface == "grpc"):
             raise argparse.ArgumentTypeError(f"{text!r} is not NAME=PATH=ENTRYPOINT[=INTERFACE]")
 
-        interface = parts[3] if len(parts) == 4 else "auto"
         if interface not in INTERFACES:
             raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
 
@@ -476,9 +493,11 @@ class Host:
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
         memory: MemoryPolicy | None = None,
+        reflection: bool = False,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
+        self.reflection = reflection
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
@@ -825,8 +844,8 @@ class Host:
             realised = [
                 (mount.name, mount.release.realise(), mount.release) for mount in self.mounts
             ]
-            any_asgi = release.resolved == "asgi" or any(
-                mounted.resolved == "asgi" for _, _, mounted in realised
+            any_asgi = release.resolved in ("asgi", "grpc") or any(
+                mounted.resolved in ("asgi", "grpc") for _, _, mounted in realised
             )
 
             if any_asgi:
@@ -840,8 +859,29 @@ class Host:
             lifespans: list[_asgi.Lifespan] = []
             served_mounts: list[tuple[str, Any, Any]] = []
 
+            # Section 6.13: a gRPC application is served by a dispatcher on
+            # the loop, which runs synchronous handlers on threads of the
+            # mount's own, and its methods are declared to the edge.
+
+            grpc_servers: list[tuple[str, Any]] = []
+            grpc_runner: Any = None
+
+            if loop is not None and release.resolved == "grpc":
+                from muru import _grpc
+
+                grpc_servers.append(("", app))
+                app = _grpc.Dispatcher(app, group.threads)
+                grpc_runner = _asgi.runner(app, loop, {})
+
             for name, mounted_app, mounted in realised:
-                if loop is not None and mounted.resolved == "asgi":
+                if loop is not None and mounted.resolved == "grpc":
+                    from muru import _grpc
+
+                    grpc_servers.append((name, mounted_app))
+                    dispatcher = _grpc.Dispatcher(mounted_app, group.threads)
+                    runner = _asgi.runner(dispatcher, loop, {})
+                    served_mounts.append((name, dispatcher, runner))
+                elif loop is not None and mounted.resolved == "asgi":
                     mounted_lifespan = _asgi.Lifespan(mounted_app, loop, mounted.spec)
                     mounted_lifespan.startup()
                     lifespans.append(mounted_lifespan)
@@ -849,6 +889,15 @@ class Host:
                     served_mounts.append((name, mounted_app, runner))
                 else:
                     served_mounts.append((name, mounted_app, None))
+
+            if grpc_servers and self.reflection:
+                from muru import _grpc
+
+                _grpc.enable_reflection([server for _, server in grpc_servers])
+
+            grpc_methods = [
+                method for name, server in grpc_servers for method in server.listing(name)
+            ]
 
             hooks.call("on_ready", context)
         except Exception as error:
@@ -881,6 +930,9 @@ class Host:
 
         if loop is not None and lifespan is not None:
             asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
+
+        if grpc_runner is not None:
+            asgi_arguments["runner"] = grpc_runner
 
         # Section 7.6: the soft timeout interrupts a request by raising
         # muru.RequestTimeout in its thread, or cancelling its task.
@@ -916,6 +968,7 @@ class Host:
                     names,
                     slots=group.threads if loop is None else group.concurrency,
                 ),
+                grpc_methods=grpc_methods,
                 **asgi_arguments,
                 **timeout_arguments,
             )
@@ -2088,6 +2141,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the interface the entrypoint speaks; auto detects it from the callable",
     )
     parser.add_argument(
+        "--reflection",
+        action="store_true",
+        help="serve gRPC server reflection for the registered services (section 6.13)",
+    )
+    parser.add_argument(
         "--factory",
         action="store_true",
         help="the entrypoint is a factory returning the application (section 6.8)",
@@ -2434,6 +2492,7 @@ def main(argv: list[str] | None = None) -> int:
             hard_limit=args.memory_hard_limit,
             check_interval=args.memory_check_interval,
         ),
+        reflection=args.reflection,
     )
 
     if args.single:

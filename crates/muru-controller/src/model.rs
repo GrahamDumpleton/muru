@@ -184,6 +184,9 @@ pub struct ReleaseSpec {
     pub hooks: Option<String>,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
+    /// Whether gRPC server reflection is served (section 6.13).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reflection: bool,
     /// Named worker groups beside the default one.
     #[serde(default)]
     pub groups: Vec<GroupSpec>,

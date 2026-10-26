@@ -42,14 +42,15 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 
 | Key | Scope | Default | Section |
 | --- | --- | --- | --- |
-| entrypoint, interface, factory, factory_phase | release, mount | interface detected, factory_phase worker | 6.8 |
+| entrypoint, interface (auto, wsgi, asgi or grpc), factory, factory_phase | release, mount | interface detected, factory_phase worker | 6.8, 6.13 |
+| reflection | release | false (gRPC server reflection for the registered services) | 6.13 |
 | source or image, python, build, runtime_source | release | none, none, none, image | 8.1 to 8.5 |
 | preload | release | auto (preload with the import check, falling back to per-worker imports) | 6.1, 6.2 |
 | processes, threads, sync_threads | release, group, mount | 2, 8 for WSGI, 1 loop for ASGI | 6.4 |
 | hooks | release | none | 6.3 |
 | kind, profile, command, cwd, bind, instances, readiness (path, timeout), stop_signal | release | workers, none, none, source, unix, 1, none and 60s, the profile's | 9.9 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |
-| path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none, false, false, false, 1000, 1000 | 6.7, 4.10 |
+| path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none (required except for a gRPC mount, which takes none), false, false, false, 1000, 1000 | 6.7, 4.10, 6.13 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |

@@ -60,9 +60,9 @@ pub(crate) type Reader = BufReader<FdReader>;
 pub(crate) type Writer = OwnedWriteHalf;
 
 /// One idle connection to a worker.
-struct Conn {
-    reader: Reader,
-    writer: Writer,
+pub(crate) struct Conn {
+    pub(crate) reader: Reader,
+    pub(crate) writer: Writer,
 }
 
 struct WorkerSlots {
@@ -99,6 +99,9 @@ pub struct LinkPool {
     next: AtomicUsize,
     /// Requests waiting for a slot, for the metrics.
     waiting: AtomicUsize,
+    /// The gRPC methods the workers' mounts registered, from HELLO
+    /// (section 6.13).
+    grpc: Vec<pb::GrpcMethod>,
 }
 
 /// One request's place in the queue for a slot, given back when it gets
@@ -112,10 +115,10 @@ impl Drop for Waiting<'_> {
 }
 
 /// A connection taken from the pool for one request.
-struct Lease {
-    conn: Conn,
-    permit: OwnedSemaphorePermit,
-    worker: usize,
+pub(crate) struct Lease {
+    pub(crate) conn: Conn,
+    pub(crate) permit: OwnedSemaphorePermit,
+    pub(crate) worker: usize,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
 }
@@ -126,11 +129,18 @@ impl LinkPool {
     /// on the kind of worker. The first connection stays in the pool.
     pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
         let mut workers = Vec::with_capacity(sockets.len());
+        let mut grpc = Vec::new();
 
         for path in sockets {
             let (conn, hello) = connect(path)
                 .await
                 .with_context(|| format!("connecting to the worker at {}", path.display()))?;
+
+            // Every worker of a release registers the same methods.
+
+            if grpc.is_empty() {
+                grpc = hello.grpc_methods.clone();
+            }
 
             let slots = capacity(&hello);
             workers.push(WorkerSlots {
@@ -147,6 +157,36 @@ impl LinkPool {
             workers,
             next: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
+            grpc,
+        })
+    }
+
+    /// Whether the workers serve gRPC methods (section 6.13).
+    pub(crate) fn serves_grpc(&self) -> bool {
+        !self.grpc.is_empty()
+    }
+
+    /// The registered gRPC method at `path`, or the whole service it
+    /// belongs to when only that was registered.
+    pub(crate) fn grpc_method(&self, path: &str) -> Option<&pb::GrpcMethod> {
+        self.grpc
+            .iter()
+            .find(|method| method.path == path)
+            .or_else(|| {
+                self.grpc.iter().find(|method| {
+                    method.path.ends_with('/') && path.starts_with(method.path.as_str())
+                })
+            })
+    }
+
+    /// Whether a gRPC service of this name is registered.
+    pub(crate) fn grpc_service(&self, name: &str) -> bool {
+        self.grpc.iter().any(|method| {
+            method
+                .path
+                .strip_prefix('/')
+                .and_then(|path| path.split_once('/'))
+                .is_some_and(|(service, _)| service == name)
         })
     }
 
@@ -172,6 +212,7 @@ impl LinkPool {
             workers: Vec::new(),
             next: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
+            grpc: Vec::new(),
         }
     }
 
@@ -195,7 +236,7 @@ impl LinkPool {
 
     /// Take a connection from the worker with the most free slots, waiting
     /// for one if every worker is busy.
-    async fn acquire(&self) -> io::Result<Lease> {
+    pub(crate) async fn acquire(&self) -> io::Result<Lease> {
         if self.workers.is_empty() {
             return Err(io::Error::other("no release is serving"));
         }
@@ -292,7 +333,7 @@ pub(crate) struct Return {
     state: Mutex<ReturnState>,
     /// Signalled when the request direction should stop: the response has
     /// ended, or failed.
-    abort: Notify,
+    pub(crate) abort: Notify,
     /// Signalled when the worker has sent CONTINUE: the application is
     /// reading the body, so a waiting client may be told to send it.
     proceed: Notify,
@@ -314,7 +355,11 @@ struct ReturnState {
 }
 
 impl Return {
-    fn new(pool: Arc<LinkPool>, worker: usize, permit: OwnedSemaphorePermit) -> Arc<Self> {
+    pub(crate) fn new(
+        pool: Arc<LinkPool>,
+        worker: usize,
+        permit: OwnedSemaphorePermit,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             worker,
@@ -340,7 +385,7 @@ impl Return {
     }
 
     /// Tell the body pump, if it is still running, to send ABORT and stop.
-    fn abort_request(&self) {
+    pub(crate) fn abort_request(&self) {
         self.abort.notify_one();
     }
 
@@ -817,6 +862,17 @@ pub async fn handle(
     context: &Context<'_>,
     flags: RedirectFlags,
 ) -> Handled {
+    // Section 6.13: a client's gRPC call to a release that registered
+    // gRPC methods takes its own path.
+
+    if context.internal.is_none()
+        && context.handler.is_none()
+        && pool.serves_grpc()
+        && let Some(protocol) = crate::grpc::Protocol::of(&parts.headers)
+    {
+        return Handled::Response(crate::grpc::handle(parts, body, pool, context, protocol).await);
+    }
+
     // Section 4.11: an upload route with precheck asks the application
     // with the headers alone before the body is read, and anything but a
     // 2xx is the answer; the client is told to send its body only after.
@@ -1772,7 +1828,7 @@ pub(crate) enum BodyError {
 
 /// Read a request body in full, up to the size limit.
 /// A deadline as Unix milliseconds, for the request head.
-fn unix_deadline(deadline: Instant) -> u64 {
+pub(crate) fn unix_deadline(deadline: Instant) -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)

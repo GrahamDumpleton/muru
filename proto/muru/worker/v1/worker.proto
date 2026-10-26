@@ -26,6 +26,17 @@ message Hello {
   bool websockets = 5;              // accepts websocket scopes
   bool files = 6;                   // accepts FILE frames
   uint32 max_message_size = 7;      // largest WebSocket message, bytes
+  repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
+}
+
+// A gRPC method a worker serves (section 6.13). A path ending in / is a
+// whole service whose methods were not listed, taken as streaming both
+// ways.
+message GrpcMethod {
+  string path = 1;                  // /package.Service/Method, or /package.Service/
+  string mount = 2;                 // the mount that registered it, empty for the default
+  bool client_streaming = 3;
+  bool server_streaming = 4;
 }
 
 // Payload of a REQUEST frame.
@@ -54,17 +65,21 @@ message RequestHead {
   repeated UploadRef uploads = 22;  // descriptors passed with the request head
   bool precheck = 23;
   string http_version = 24;         // for example HTTP/1.1, for SERVER_PROTOCOL
-  Scope scope = 25;                 // http unless the request is a WebSocket upgrade
+  Scope scope = 25;                 // http unless the request is a WebSocket upgrade or a gRPC call
   bool expect_continue = 26;        // the client waits for 100 Continue before sending the body (section 5.5)
   string server_name = 27;          // the virtual host name matched, or its canonical name (section 4.3); SERVER_NAME when set
   string client_class = 28;         // section 4.14: the class the edge assigned, default when no rule matched
   string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
 }
 
-// What a REQUEST frame opens (section 5.6).
+// What a REQUEST frame opens (sections 5.6 and 6.13). A gRPC call's
+// request and response bodies are MESSAGE frames, one whole message each,
+// already unframed and decompressed by the edge; the response's END
+// carries the status in its trailers.
 enum Scope {
   SCOPE_HTTP = 0;
   SCOPE_WEBSOCKET = 1;
+  SCOPE_GRPC = 2;
 }
 
 message Header {

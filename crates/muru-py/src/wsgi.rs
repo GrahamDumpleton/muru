@@ -73,6 +73,9 @@ pub enum Outgoing {
         /// Text rather than binary.
         text: bool,
     },
+    /// The trailers that end a gRPC call (section 6.13), its status
+    /// among them.
+    Trailers(Vec<(Vec<u8>, Vec<u8>)>),
     /// The application closes the WebSocket (section 5.6).
     Close {
         /// The close code.

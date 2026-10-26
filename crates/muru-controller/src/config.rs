@@ -1849,7 +1849,17 @@ pub fn resolve_spec(
             return Err(format!("{name:?} is not a valid mount name"));
         }
 
-        if !mount.path.starts_with('/') || mount.path == "/" {
+        // Section 6.13: a gRPC mount is reached by service name, not path.
+
+        let grpc = mount.interface == Some(muru_config::Interface::Grpc);
+
+        if grpc && !mount.path.is_empty() {
+            return Err(format!(
+                "mount {name}: a gRPC mount has no path; its calls are matched by service name"
+            ));
+        }
+
+        if !grpc && (!mount.path.starts_with('/') || mount.path == "/") {
             return Err(format!(
                 "mount {name}: {:?} is not a path below /",
                 mount.path
@@ -1864,7 +1874,7 @@ pub fn resolve_spec(
 
         let path = mount.path.trim_end_matches('/').to_owned();
 
-        if resolved_mounts.iter().any(|other| other.path == path) {
+        if !grpc && resolved_mounts.iter().any(|other| other.path == path) {
             return Err(format!("mount {name}: another mount has the path {path}"));
         }
 
@@ -2051,6 +2061,7 @@ pub fn resolve_spec(
             .then(|| request.hooks.clone())
             .or(table.hooks),
         factory,
+        reflection: request.reflection.or(table.reflection).unwrap_or(false),
         groups: resolved_groups,
         mounts: resolved_mounts,
         accel_redirect,
@@ -2199,6 +2210,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         source: Some(request.source.clone()),
         entrypoint: request.entrypoint.clone(),
         interface: parse_optional(&request.interface)?,
+        reflection: request.reflection,
         factory: request.factory,
         factory_phase: parse_optional(&request.factory_phase)?,
         python: (!request.python.is_empty()).then(|| request.python.clone()),
@@ -2293,6 +2305,7 @@ fn resolve_http_spec(
         preload: muru_config::Preload::Auto,
         hooks: None,
         factory: None,
+        reflection: false,
         groups: Vec::new(),
         mounts: Vec::new(),
         accel_redirect: false,
@@ -2622,6 +2635,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
             .unwrap_or_default(),
         hooks: table.hooks.clone().unwrap_or_default(),
         factory: table.factory,
+        reflection: table.reflection,
         factory_phase: table
             .factory_phase
             .map(|value| value.as_str().to_owned())
@@ -2755,6 +2769,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         source: Some(spec.source.display().to_string()),
         entrypoint: spec.entrypoint.clone(),
         interface: Some(spec.interface),
+        reflection: spec.reflection.then_some(true),
         factory: spec.factory.map(|_| true),
         factory_phase: spec.factory,
         python: Some(spec.python.display().to_string()),
@@ -3004,6 +3019,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "hooks",
         declared.hooks.clone().unwrap_or_default(),
         recorded.hooks.clone().unwrap_or_default(),
+    );
+    compare(
+        "reflection",
+        declared.reflection.to_string(),
+        recorded.reflection.to_string(),
     );
     compare(
         "factory",

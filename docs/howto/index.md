@@ -31,6 +31,7 @@ behind-a-proxy
 worker-groups
 scaling
 mounts
+grpc
 https
 static-files
 file-hints

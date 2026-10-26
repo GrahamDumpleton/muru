@@ -278,6 +278,8 @@ pub struct HostSpec {
     pub interface: muru_config::Interface,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<muru_config::FactoryPhase>,
+    /// Whether gRPC server reflection is served (section 6.13).
+    pub reflection: bool,
     /// Worker processes to fork.
     pub processes: usize,
     /// Application threads per worker.
@@ -514,6 +516,10 @@ impl HostProcess {
 
         if spec.single {
             command.arg("--single");
+        }
+
+        if spec.reflection {
+            command.arg("--reflection");
         }
 
         if let Some(log) = &spec.detach_to {

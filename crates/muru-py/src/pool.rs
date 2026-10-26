@@ -226,6 +226,8 @@ pub struct Shared {
     pub pool: Pool,
     /// The soft timeout (section 7.6), when one is set.
     pub soft_timeout: Option<SoftTimeout>,
+    /// The gRPC methods the mounts registered (section 6.13), for HELLO.
+    pub grpc_methods: Vec<muru_proto::worker::v1::GrpcMethod>,
     in_flight: AtomicU32,
     total: AtomicU64,
     next_id: AtomicU64,
@@ -255,6 +257,7 @@ impl Shared {
             asgi,
             pool: Pool::start(threads)?,
             soft_timeout,
+            grpc_methods: Vec::new(),
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),

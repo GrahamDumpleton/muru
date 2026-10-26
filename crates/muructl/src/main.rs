@@ -335,7 +335,8 @@ struct RunArgs {
     app: Option<String>,
 
     /// The interface the entrypoint speaks: auto (detected from the
-    /// callable), wsgi or asgi.
+    /// callable), wsgi, asgi, or grpc for a function that registers gRPC
+    /// services.
     #[arg(long, value_name = "NAME")]
     interface: Option<muru_config::Interface>,
 
@@ -1080,6 +1081,8 @@ struct Resolved {
     entrypoint: String,
     interface: muru_config::Interface,
     factory: Option<muru_config::FactoryPhase>,
+    /// Whether gRPC server reflection is served (section 6.13).
+    reflection: bool,
     processes: usize,
     threads: usize,
     sync_threads: usize,
@@ -1213,6 +1216,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .or(table.interface)
             .unwrap_or(muru_config::Interface::Auto),
         factory,
+        reflection: table.reflection.unwrap_or(false),
         processes: args
             .processes
             .or(table.processes)
@@ -1292,6 +1296,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         entrypoint: resolved.entrypoint.clone(),
         interface: (resolved.interface != muru_config::Interface::Auto)
             .then_some(resolved.interface),
+        reflection: resolved.reflection.then_some(true),
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
         python: Some(
@@ -1606,6 +1611,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         release: None,
         interface: resolved.interface,
         factory: resolved.factory,
+        reflection: resolved.reflection,
         processes: resolved.processes,
         threads: resolved.threads,
         sync_threads: resolved.sync_threads,

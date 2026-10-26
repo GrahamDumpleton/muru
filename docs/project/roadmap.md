@@ -477,3 +477,20 @@ criterion asks for; `muructl deploy --server`, the release tables of
 `apply` and `config export`, `release list`, the release log and
 `muru_upstream_health` know them. Still to come: instance autoscaling
 and socket activation (section 20.1).
+
+gRPC mounts (section 6.13) are in: a mount or a release with
+`interface = 'grpc'` serves the services its registration function adds
+with grpcio-generated code, matched by content type and the method
+names its workers declare in HELLO, so gRPC and HTTP share listeners,
+hosts and routes; the edge unframes and decompresses request messages,
+passes them whole in MESSAGE frames of a `grpc` scope, frames the
+responses, carries the status in trailers, bounds each call by its
+grpc-timeout (and a unary call by the request deadline), and balances
+calls across the workers one by one; synchronous handlers run on
+threads and asynchronous ones on the event loop for all four kinds of
+call, with grpcio's servicer context; the edge answers the standard
+health service, `reflection = true` serves reflection through
+grpcio-reflection, and gRPC-Web, binary and text, is translated at the
+edge. grpcio has no free-threaded wheels, so gRPC mounts are unavailable
+on those builds. Still to come: limiting h2c to trusted networks, CORS
+for gRPC-Web, and per-mount thread pools.

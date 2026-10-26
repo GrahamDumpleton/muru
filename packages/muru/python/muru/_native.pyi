@@ -26,6 +26,7 @@ def serve(
     on_control: Callable[[str, list[dict[str, Any]], dict[int, str]], str] | None = None,
     soft_timeout_ms: int | None = None,
     timeout_error: type[BaseException] | None = None,
+    grpc_methods: list[tuple[str, str, bool, bool]] = [],
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -42,7 +43,9 @@ def serve(
     None for a WSGI mount; event_loop is needed when any mount is ASGI.
     soft_timeout_ms is the soft timeout, after which a request is
     interrupted by raising timeout_error (muru.RequestTimeout) in its
-    thread or cancelling its task.
+    thread or cancelling its task. grpc_methods are the methods the gRPC
+    mounts registered, as (path, mount, client streaming, server streaming)
+    tuples, which HELLO declares to the edge.
     """
 
 def memory_usage() -> dict[str, int] | None:

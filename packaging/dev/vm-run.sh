@@ -37,7 +37,7 @@ rsync -a --delete \
 cd "$work"
 
 uv python install 3.15 3.15t
-uv sync --only-group dev --only-group fixtures --python 3.15
+uv sync --only-group dev --only-group fixtures --only-group grpc --python 3.15
 (cd packages/muru && uv run --project ../.. maturin develop)
 
 case "$action" in
@@ -49,7 +49,9 @@ case "$action" in
         rm -rf scratch/venv-315t scratch/wheels
         uv venv -q -p 3.15t scratch/venv-315t
         (cd packages/muru && uvx --from 'maturin>=1.8,<2' maturin build -i "$(uv python find 3.15t)" --out ../../scratch/wheels)
-        # The same test and fixture packages as the lock file gives 3.15.
+        # The same test and fixture packages as the lock file gives 3.15,
+        # without the grpc group: grpcio has no free-threaded wheels, so
+        # gRPC mounts are unavailable there (section 6.13).
         uv export -q --no-hashes --no-emit-project --only-group dev --only-group fixtures \
             --format requirements.txt -o scratch/requirements-315t.txt
         uv pip install -q --python scratch/venv-315t/bin/python \

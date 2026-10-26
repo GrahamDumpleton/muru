@@ -55,12 +55,15 @@ fn version() -> &'static str {
 /// names by identifier. `soft_timeout_ms` is the soft timeout (section
 /// 7.6), after which a request is interrupted by raising `timeout_error`
 /// (the `muru.RequestTimeout` class) in its thread, or by cancelling its
-/// task; both are needed for the timeout to be on.
+/// task; both are needed for the timeout to be on. `grpc_methods` are
+/// the gRPC methods the gRPC mounts registered (section 6.13), as (path,
+/// mount, client streaming, server streaming) tuples; a gRPC mount's
+/// runner is the dispatcher of its calls.
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new()))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -82,6 +85,7 @@ fn serve(
     on_control: Option<Py<PyAny>>,
     soft_timeout_ms: Option<u64>,
     timeout_error: Option<Py<PyAny>>,
+    grpc_methods: Vec<(String, String, bool, bool)>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -128,7 +132,7 @@ fn serve(
         named.insert(name, pool::Mount { app, runner });
     }
 
-    let shared = pool::Shared::new(
+    let mut shared = pool::Shared::new(
         app,
         named,
         errors,
@@ -138,6 +142,17 @@ fn serve(
         soft_timeout,
     )
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    shared.grpc_methods = grpc_methods
+        .into_iter()
+        .map(|(path, mount, client_streaming, server_streaming)| {
+            muru_proto::worker::v1::GrpcMethod {
+                path,
+                mount,
+                client_streaming,
+                server_streaming,
+            }
+        })
+        .collect();
     let shared = Arc::new(shared);
     let lifecycle = link::Lifecycle {
         on_drain,

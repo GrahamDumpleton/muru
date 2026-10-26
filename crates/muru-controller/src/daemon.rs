@@ -3021,6 +3021,7 @@ impl Daemon {
             release: Some(id.to_owned()),
             interface: spec.interface,
             factory: spec.factory,
+            reflection: spec.reflection,
             processes: spec.processes as usize,
             threads: spec.threads as usize,
             sync_threads: spec.sync_threads as usize,
@@ -5532,7 +5533,12 @@ fn scalers_for(
     pins: &[(String, u32)],
     now: Instant,
 ) -> Vec<GroupScaling> {
-    let asgi = spec.interface == muru_config::Interface::Asgi;
+    // gRPC calls are held on the event loop too (section 6.13).
+
+    let asgi = matches!(
+        spec.interface,
+        muru_config::Interface::Asgi | muru_config::Interface::Grpc
+    );
     let slots = |threads: u32, concurrency: u32| {
         if asgi {
             concurrency as f64

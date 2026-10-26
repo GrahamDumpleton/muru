@@ -24,7 +24,7 @@ runs:
 | `release` | The release identifier; `dev` in development mode |
 | `group` | The worker group; `default` until worker groups arrive |
 | `worker_id` | The worker's index from 0, or `None` in the host (and outside Muru) |
-| `interface` | `wsgi` or `asgi`, detected from the callable or declared with `--interface` |
+| `interface` | `wsgi`, `asgi` or `grpc`, detected from the callable or declared with `--interface` |
 | `process_model` | `threaded`, `process-per-request` (one thread per worker) or `free-threaded` (on a free-threaded interpreter) for WSGI; `async` for ASGI |
 
 Outside Muru the defaults are `app="default"`, `release="dev"`,

@@ -27,6 +27,9 @@ pub enum Interface {
     Wsgi,
     /// ASGI 3.
     Asgi,
+    /// gRPC services: the entrypoint is a registration function given a
+    /// server to add grpcio servicers to (section 6.13).
+    Grpc,
 }
 
 /// Whether the application is imported in the host before forking (section 6.1).
@@ -101,7 +104,7 @@ macro_rules! words {
     };
 }
 
-words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi" });
+words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi", Grpc => "grpc" });
 words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
@@ -321,7 +324,9 @@ pub fn format_duration(duration: Duration) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
-    /// The path prefix; the longest wins, on segment boundaries.
+    /// The path prefix; the longest wins, on segment boundaries. A gRPC
+    /// mount has none: its calls are matched by service name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
     /// The application as module:callable.
     pub entrypoint: String,
@@ -434,6 +439,10 @@ pub struct Release {
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Interface>,
+    /// Serve gRPC server reflection for the services the release's gRPC
+    /// mounts register (section 6.13, default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<bool>,
     /// Whether the entrypoint is a factory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<bool>,
@@ -3207,6 +3216,9 @@ pub struct ToolMuru {
     /// The interface the entrypoint speaks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Interface>,
+    /// Serve gRPC server reflection for the registered services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<bool>,
     /// Whether the entrypoint is a factory returning the application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<bool>,

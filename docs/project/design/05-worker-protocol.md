@@ -40,7 +40,7 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete. Sent in place of RESPONSE when the application failed before producing a head, with the reason and detail the edge's error page shows (section 4.12) |
 | ABORT | 6 | edge to worker | Abort | The edge has no more use for the request: the client has gone, or the response ended before the request body did (section 5.5) |
 | CONTINUE | 7 | worker to edge | empty | The application has started reading the request body, so the edge may send 100 Continue (section 4.6). Sent only when the request head says the client is waiting for it |
-| MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6) |
+| MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6). On a gRPC call, one whole gRPC message (section 6.13) |
 | CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason (section 5.6) |
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
 | FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame (section 5.7). Phase 2 |
@@ -50,9 +50,9 @@ Flags: END (0x01) on the last frame of a direction; TEXT (0x02) on a text MESSAG
 
 The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
-- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size. The edge sends only its version.
+- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size, and the gRPC methods the worker's mounts registered, each with its mount and whether its requests and responses stream (section 6.13). The edge sends only its version.
 
-- **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, and the scope (http or websocket).
+- **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, and the scope (http, websocket or grpc).
 
 - **ResponseHead:** status, ordered headers, flush policy override.
 

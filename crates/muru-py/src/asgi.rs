@@ -45,8 +45,10 @@ enum Message {
     Body { data: Bytes, more: bool },
     /// The WebSocket handshake has arrived (section 5.6).
     Connect,
-    /// One WebSocket message from the client.
+    /// One WebSocket message from the client, or one gRPC message.
     Received { data: Bytes, text: bool },
+    /// A gRPC call's request stream has ended (section 6.13).
+    End,
     /// The client went away, or the response is complete. On a WebSocket
     /// the close code and reason say how it ended.
     Disconnect { code: u16, reason: String },
@@ -96,6 +98,8 @@ pub struct Channel {
     announce: AtomicBool,
     /// The request is a WebSocket upgrade (section 5.6).
     websocket: bool,
+    /// The request is a gRPC call (section 6.13).
+    grpc: bool,
     /// Mirrors `SendState.accepted`, for the link's read side.
     accepted: AtomicBool,
     /// The worker's shared state and the request's id in it, so a
@@ -136,6 +140,7 @@ impl Channel {
             completed: AtomicBool::new(false),
             announce: AtomicBool::new(head.expect_continue),
             websocket: head.scope == pb::Scope::Websocket as i32,
+            grpc: head.scope == pb::Scope::Grpc as i32,
             accepted: AtomicBool::new(false),
             shared,
             request,
@@ -180,6 +185,11 @@ impl Channel {
     pub async fn deliver_message(&self, data: Bytes, text: bool) {
         self.deliver_message_inner(Message::Received { data, text })
             .await;
+    }
+
+    /// The gRPC call's request stream has ended.
+    pub async fn deliver_end(&self) {
+        self.deliver_message_inner(Message::End).await;
     }
 
     async fn deliver_message_inner(&self, message: Message) {
@@ -274,12 +284,13 @@ impl Channel {
     /// Complete a waiting future on the loop's thread.
     fn wake(&self, waiter: Py<PyAny>, message: &Message) {
         Python::attach(|py| {
-            let delivered = message_dict(py, message, self.websocket).and_then(|value| {
-                self.event_loop.bind(py).call_method1(
-                    "call_soon_threadsafe",
-                    (self.resolver.bind(py), waiter.bind(py), value),
-                )
-            });
+            let delivered =
+                message_dict(py, message, self.websocket, self.grpc).and_then(|value| {
+                    self.event_loop.bind(py).call_method1(
+                        "call_soon_threadsafe",
+                        (self.resolver.bind(py), waiter.bind(py), value),
+                    )
+                });
 
             // The loop refusing the call means it is closed: the worker is
             // stopping and the request with it.
@@ -355,6 +366,90 @@ impl Channel {
 }
 
 impl Channel {
+    /// Handle the grpc.* messages of a gRPC call (section 6.13): the
+    /// initial metadata, each response message, and the trailers that
+    /// end the call. A message or the trailers sent first bring an empty
+    /// head with them.
+    fn send_grpc(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        message: &Bound<'_, PyDict>,
+        state: &mut SendState,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        if state.body_ended {
+            return Err(PyRuntimeError::new_err(format!(
+                "{kind} sent after grpc.finish"
+            )));
+        }
+
+        let head = |headers| Outgoing::Head {
+            status: 200,
+            reason: String::new(),
+            headers,
+            flush: pb::FlushPolicy::Immediate,
+        };
+        let mut items = Vec::with_capacity(3);
+
+        match kind {
+            "grpc.start" => {
+                if state.head_sent {
+                    return Err(PyRuntimeError::new_err(
+                        "grpc.start sent after the response started",
+                    ));
+                }
+
+                let headers = match message.get_item("headers")? {
+                    Some(headers) => validate_headers(&headers)?,
+                    None => Vec::new(),
+                };
+
+                items.push(head(headers));
+                state.head_sent = true;
+            }
+            "grpc.message" => {
+                let data = message
+                    .get_item("message")?
+                    .ok_or_else(|| PyTypeError::new_err("grpc.message has no message"))?;
+                let Ok(data) = data.cast::<PyBytes>() else {
+                    return Err(PyTypeError::new_err("grpc.message message must be bytes"));
+                };
+
+                if !state.head_sent {
+                    items.push(head(Vec::new()));
+                    state.head_sent = true;
+                }
+
+                items.push(Outgoing::Message {
+                    data: wsgi::bytes_from_py(data),
+                    text: false,
+                });
+            }
+            "grpc.finish" => {
+                let trailers = match message.get_item("trailers")? {
+                    Some(trailers) => validate_headers(&trailers)?,
+                    None => Vec::new(),
+                };
+
+                if !state.head_sent {
+                    items.push(head(Vec::new()));
+                    state.head_sent = true;
+                }
+
+                items.push(Outgoing::Trailers(trailers));
+                items.push(Outgoing::Finished);
+                state.body_ended = true;
+            }
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unexpected ASGI message type {other:?} on a gRPC call"
+                )));
+            }
+        }
+
+        self.enqueue(py, items)
+    }
+
     /// Handle the websocket.* messages. Returns None for a message that is
     /// not one of them, which the http handling then takes.
     fn send_websocket(
@@ -559,12 +654,18 @@ impl Channel {
         if let Some(message) = inbox.queue.pop_front() {
             drop(inbox);
             self.permits.add_permits(1);
-            future.call_method1("set_result", (message_dict(py, &message, self.websocket)?,))?;
+            future.call_method1(
+                "set_result",
+                (message_dict(py, &message, self.websocket, self.grpc)?,),
+            )?;
         } else if inbox.closed {
             let (code, reason) = inbox.close.clone();
             drop(inbox);
             let message = Message::Disconnect { code, reason };
-            future.call_method1("set_result", (message_dict(py, &message, self.websocket)?,))?;
+            future.call_method1(
+                "set_result",
+                (message_dict(py, &message, self.websocket, self.grpc)?,),
+            )?;
         } else {
             inbox.waiter = Some(future.clone().unbind());
         }
@@ -582,6 +683,11 @@ impl Channel {
             .map_err(|_| PyTypeError::new_err("ASGI message type must be a str"))?;
 
         let mut state = self.state.lock().expect("send state poisoned");
+
+        if self.grpc {
+            return self.send_grpc(py, &kind, message, &mut state);
+        }
+
         if self.websocket
             && let Some(result) = self.send_websocket(py, &kind, message, &mut state)?
         {
@@ -934,8 +1040,25 @@ fn message_dict<'py>(
     py: Python<'py>,
     message: &Message,
     websocket: bool,
+    grpc: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+
+    // Section 6.13: a gRPC call receives whole messages, the end of the
+    // request stream, and grpc.disconnect when the call is over.
+
+    if grpc {
+        match message {
+            Message::Received { data, .. } => {
+                dict.set_item("type", "grpc.message")?;
+                dict.set_item("message", PyBytes::new(py, data))?;
+            }
+            Message::End => dict.set_item("type", "grpc.end")?,
+            _ => dict.set_item("type", "grpc.disconnect")?,
+        }
+
+        return Ok(dict);
+    }
 
     match message {
         Message::Body { data, more } => {
@@ -962,7 +1085,7 @@ fn message_dict<'py>(
             dict.set_item("code", *code)?;
             dict.set_item("reason", reason)?;
         }
-        Message::Disconnect { .. } => {
+        Message::Disconnect { .. } | Message::End => {
             dict.set_item("type", "http.disconnect")?;
         }
     }
@@ -1030,15 +1153,24 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
     Ok(out)
 }
 
-/// Build the http scope (Appendix D.2) from the request head.
+/// Build the http, websocket or grpc scope (Appendix D.2) from the request head.
 fn build_scope<'py>(
     py: Python<'py>,
     head: &pb::RequestHead,
     uploads: &[RawFd],
 ) -> PyResult<Bound<'py, PyDict>> {
     let websocket = head.scope == pb::Scope::Websocket as i32;
+    let grpc = head.scope == pb::Scope::Grpc as i32;
     let scope = PyDict::new(py);
-    scope.set_item("type", if websocket { "websocket" } else { "http" })?;
+
+    let kind = if websocket {
+        "websocket"
+    } else if grpc {
+        "grpc"
+    } else {
+        "http"
+    };
+    scope.set_item("type", kind)?;
     let asgi = PyDict::new(py);
     asgi.set_item("version", "3.0")?;
     asgi.set_item("spec_version", "2.4")?;
@@ -1145,6 +1277,13 @@ fn build_scope<'py>(
 
     if head.max_body_size != 0 {
         muru.set_item("max_body_size", head.max_body_size)?;
+    }
+
+    // Section 6.13: a gRPC call's deadline, for time_remaining(), in
+    // seconds since the epoch.
+
+    if grpc && head.deadline_unix_ms != 0 {
+        muru.set_item("deadline", head.deadline_unix_ms as f64 / 1000.0)?;
     }
 
     // Section 4.11: the files the edge stored, read through

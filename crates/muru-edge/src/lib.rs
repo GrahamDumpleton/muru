@@ -35,6 +35,7 @@ pub mod classify;
 pub mod compression;
 pub mod connections;
 pub mod errors;
+pub mod grpc;
 pub mod link;
 pub mod metrics;
 pub mod proxy;
