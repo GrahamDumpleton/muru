@@ -2216,12 +2216,18 @@ fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static s
 
 /// Resolve a deploy request into a release spec: the request's settings,
 /// then the source's [tool.muru] table, then the previous release when
-/// one is given (a deploy), then the defaults of section 13.1.
+/// one is given (a deploy) and it ran native workers, then the defaults
+/// of section 13.1.
 pub fn resolve_spec(
     request: &pb::DeployRequest,
     previous: Option<&ReleaseSpec>,
     tables: &Tables<'_>,
 ) -> Result<ReleaseSpec, String> {
+    // Section 9.9: a managed server's release has no workers, entrypoint
+    // or interpreter of its own, so the native release after it, the
+    // cutover, starts from the defaults.
+
+    let previous = previous.filter(|previous| previous.http.is_none());
     let Tables {
         groups,
         mounts,
