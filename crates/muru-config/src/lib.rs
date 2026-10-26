@@ -1504,6 +1504,15 @@ pub struct AppOverlay {
     /// Maintenance mode (section 4.12) while the overlay is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<bool>,
+    /// The site mode (section 4.15) on each of the application's routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Methods refused on each of the application's routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<Vec<String>>,
+    /// How refused methods are answered, as a route's `methods.answer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
     /// The worker group the capacity applies to; the default group
     /// without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1584,6 +1593,7 @@ impl CapacitySchedule {
             max_workers: self.max_workers,
             scale_in: self.scale_in.clone(),
             freeze_deploys: self.freeze_deploys,
+            ..AppOverlay::default()
         };
         let schedule = OverlaySchedule {
             start: self.start.clone(),
@@ -1799,8 +1809,29 @@ fn check_route_overlay(change: &RouteOverlay, outer: bool) -> Result<(), String>
 /// Check what an overlay sets on an application: a floor of at least
 /// one, no higher than the ceiling, and a known `scale_in`.
 fn check_app_overlay(change: &AppOverlay) -> Result<(), String> {
-    if change.maintenance.is_none() && !change.sets_capacity() && change.freeze_deploys.is_none() {
+    if change.maintenance.is_none()
+        && !change.sets_capacity()
+        && change.freeze_deploys.is_none()
+        && change.mode.is_none()
+        && change.deny.is_none()
+    {
         return Err("sets nothing".to_owned());
+    }
+
+    // Section 4.15: the site mode and methods, as a route's.
+
+    let probe = Route {
+        mode: change.mode.clone(),
+        methods: change.deny.as_ref().map(|deny| Methods {
+            deny: deny.clone(),
+            answer: change.answer.clone(),
+        }),
+        ..Route::default()
+    };
+    check_route_policies(&probe)?;
+
+    if change.answer.is_some() && change.deny.is_none() {
+        return Err("answer needs deny".to_owned());
     }
 
     if change.group.is_some() && !change.sets_capacity() {

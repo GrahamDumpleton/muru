@@ -215,7 +215,8 @@ A route's `mode` is any short word, passed to the application as
 so it can hide or disable what the mode rules out. Both are the usual
 way to take a site read-only for maintenance of its database, and
 `muructl apply` checks them, and that the rate limits a host or route
-names are defined.
+names are defined. An [overlay](overlays.md) sets them for a while, on
+one route or on every route of an application.
 
 ## Changing them
 

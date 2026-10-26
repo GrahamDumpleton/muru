@@ -255,6 +255,22 @@ pub fn apply_routes(routes: &mut Vec<Route>, overlays: &[&(String, Overlay)]) {
                 }
             }
         }
+
+        // Section 4.15: an application's mode and methods go on each of
+        // its routes.
+
+        for (app, change) in &overlay.apps {
+            let as_route = RouteOverlay {
+                mode: change.mode.clone(),
+                deny: change.deny.clone(),
+                answer: change.answer.clone(),
+                ..RouteOverlay::default()
+            };
+
+            for route in routes.iter_mut().filter(|route| &route.app == app) {
+                change_route(route, &as_route);
+            }
+        }
     }
 }
 
@@ -455,11 +471,19 @@ pub fn conflicts(overlays: &BTreeMap<String, Overlay>) -> Vec<String> {
         }
 
         for (app, change) in &overlay.apps {
-            if change.maintenance.is_some() {
-                setters
-                    .entry(format!("apps.{app}.maintenance"))
-                    .or_default()
-                    .push((name, overlay.priority));
+            let fields = [
+                ("maintenance", change.maintenance.is_some()),
+                ("mode", change.mode.is_some()),
+                ("methods", change.deny.is_some()),
+            ];
+
+            for (field, set) in fields {
+                if set {
+                    setters
+                        .entry(format!("apps.{app}.{field}"))
+                        .or_default()
+                        .push((name, overlay.priority));
+                }
             }
         }
     }
@@ -705,6 +729,42 @@ fn changes(
 
     for (app, change) in &overlay.apps {
         let subject = format!("app {app}");
+
+        // Section 4.15: the mode and methods on its routes, each value
+        // they have now listed once.
+
+        let on_routes = |all: &[Route], value: fn(&Route) -> String| -> String {
+            let values: BTreeSet<String> = all
+                .iter()
+                .filter(|route| &route.app == app)
+                .map(value)
+                .collect();
+            values.into_iter().collect::<Vec<_>>().join(" | ")
+        };
+        let mode = |route: &Route| route.mode.clone().unwrap_or_default();
+        let deny = |route: &Route| {
+            route
+                .methods
+                .as_ref()
+                .map(|methods| methods.deny.join(", "))
+                .unwrap_or_default()
+        };
+
+        for (field, set, value) in [
+            ("mode", change.mode.is_some(), mode as fn(&Route) -> String),
+            ("methods.deny", change.deny.is_some(), deny),
+        ] {
+            let (was, will) = (on_routes(routes, value), on_routes(&changed, value));
+
+            if set && was != will {
+                found.push(FieldChange {
+                    subject: subject.clone(),
+                    field: field.to_owned(),
+                    before: Some(was),
+                    after: will,
+                });
+            }
+        }
 
         if let Some(on) = change.maintenance {
             let was = maintenance.contains(app);
@@ -1242,6 +1302,47 @@ mod tests {
         declared.get_mut("a").unwrap().priority = Some(1);
         declared.get_mut("b").unwrap().priority = Some(2);
         assert!(conflicts(&declared).is_empty());
+    }
+
+    #[test]
+    fn an_applications_mode_goes_on_each_of_its_routes() {
+        let mut api = route("api", "shop");
+        api.path = "/api".to_owned();
+        let base = vec![route("root", "shop"), api, route("blog", "blog")];
+        let declared = [(
+            "backup".to_owned(),
+            overlay("apps.shop = { mode = 'read-only', deny = ['POST'] }"),
+        )];
+        let active: Vec<&(String, Overlay)> = declared.iter().collect();
+        let mut routes = base.clone();
+        apply_routes(&mut routes, &active);
+        assert_eq!(routes[0].mode.as_deref(), Some("read-only"));
+        assert_eq!(routes[1].methods.as_ref().unwrap().deny, ["POST"]);
+        assert_eq!(routes[2].mode, None, "another application's route");
+
+        assert_eq!(
+            preview(&declared[0].1, &base, &BTreeSet::new()),
+            [
+                "app shop: mode (none) -> read-only",
+                "app shop: methods.deny (none) -> POST",
+            ]
+        );
+        assert_eq!(
+            attribute(&base, &BTreeSet::new(), &active),
+            [
+                "app shop: methods.deny = POST (overlay backup)",
+                "app shop: mode = read-only (overlay backup)",
+            ]
+        );
+
+        let twice = BTreeMap::from([
+            declared[0].clone(),
+            (
+                "again".to_owned(),
+                overlay("apps.shop = { mode = 'limited' }"),
+            ),
+        ]);
+        assert!(conflicts(&twice)[0].contains("all set apps.shop.mode"));
     }
 
     #[test]

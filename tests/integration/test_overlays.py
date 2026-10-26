@@ -260,6 +260,30 @@ routes.root.error_pages = { '503:maintenance' = { template = '<p>Upgrading, back
     site.apply(OVERLAYS, prune=True)
 
 
+def test_an_applications_mode_reaches_each_of_its_routes(site: Site) -> None:
+    backup = """
+[overlay.backup]
+apps.clients = { mode = 'backup', deny = ['POST'], answer = 'method_not_allowed' }
+"""
+    site.apply(OVERLAYS + backup)
+    preview = site.overlay("preview", "backup")
+    assert "app clients: mode (none) -> backup" in preview
+
+    site.overlay("activate", "backup")
+    assert site.seen()["mode"] == "backup"
+    refused = site.request("POST")
+    assert refused.status == 405
+    assert (
+        "app clients: mode = backup (overlay backup)"
+        in site.daemon.muructl("config", "show", "--effective").stdout
+    )
+
+    site.overlay("end", "backup")
+    assert site.seen()["mode"] is None
+    assert site.request("POST").status == 200
+    site.apply(OVERLAYS, prune=True)
+
+
 def test_a_recurring_schedule_covers_each_window(site: Site) -> None:
     every_minute = """
 [overlay.always]

@@ -53,6 +53,7 @@ and reach routes by the route's `name`.
 | `routes.NAME.error_pages` | [Error pages](error-pages.md) by status or `status:reason`, each in place of the route's page for the same key; the route's other pages stay |
 | `routes.NAME.client_routes` | Routes for [client classes](client-classes.md), by class: each takes the keys above (except `client_routes`) for that class's requests at the route's host and path |
 | `apps.NAME.maintenance` | Maintenance mode on (`true`) or off (`false`) for the application |
+| `apps.NAME.mode`, `deny`, `answer` | The site mode and refused methods on each of the application's routes, as `routes.NAME` sets them on one |
 | `apps.NAME.min_workers`, `max_workers`, `scale_in`, `group` | [Scheduled capacity](scaling.md#scheduled-capacity) for the application's default worker group, or `group` |
 | `apps.NAME.freeze_deploys` | Refuse the application's [deploys and rollouts](rollouts.md#deploy-freezes) |
 
@@ -75,6 +76,19 @@ route with the overlay's changes, and other requests carry on as before:
 [overlay.crawler-surge]
 routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }
 ```
+
+An application's mode goes on every route of the application at once,
+such as for a backup that must not see writes:
+
+```toml
+[overlay.nightly-backup]
+apps.shop = { mode = 'read-only', deny = ['POST', 'PUT', 'PATCH', 'DELETE'] }
+```
+
+The application's routes take the mode and methods as if each route
+named them, in the overlays' order, so a later overlay setting a route's
+mode replaces the application's on that route. An application reached
+with no route, on a daemon with no host declared, has no mode.
 
 While an overlay pins or splits a route's traffic, or a class's, a
 rollout of that route's application waits, and carries on when the

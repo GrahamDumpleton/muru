@@ -385,8 +385,10 @@ its path with the route for every class, a traffic policy's `classes`
 gives a class a release or upstream of its own, kept running for it,
 and a worker group's `match` takes a class's requests ahead of the other
 groups, and classes and limits may be declared in applied files too.
-Still to come: the application-level mode (section 9.10), buckets shared
-between several edge processes, and TLS fingerprints as an input.
+An overlay's `apps.NAME.mode` sets the site mode, and `deny` the
+refused methods, on every route of an application. Still to come:
+buckets shared between several edge processes, and TLS fingerprints as
+an input.
 
 Worker inspection's phase 3 commands (section 11.7) are in, through the
 in-process control thread of ADR 0025: `muructl debug profile` samples
