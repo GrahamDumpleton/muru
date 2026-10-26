@@ -8,9 +8,11 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use muru_config::{Host as VirtualHost, Route, Upstream};
+use muru_config::{Host as VirtualHost, Overlay, Route, Upstream};
 
-use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms};
+use crate::model::{
+    App, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms,
+};
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -95,13 +97,25 @@ CREATE TABLE IF NOT EXISTS upstreams (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS overlays (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS overlay_state (
+    name TEXT PRIMARY KEY,
+    active INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    since_unix_ms INTEGER NOT NULL,
+    until_unix_ms INTEGER
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// The store.
 pub struct Store {
@@ -123,7 +137,9 @@ impl Store {
         // which the CREATE statements above supply to an older store;
         // version 4 added the application's user, group and umask, which
         // are added to an older table here; version 5 added the
-        // applications in maintenance mode (section 4.12).
+        // applications in maintenance mode (section 4.12), version 6 the
+        // HTTP upstreams and version 7 overlays and their state (section
+        // 9.10).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -444,6 +460,102 @@ impl Store {
     pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Every overlay declared, by name (section 9.10).
+    pub fn overlays(&self) -> Result<Vec<(String, Overlay)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM overlays ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut overlays = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                overlays.push((name, decode(&encoded)?));
+            }
+
+            Ok(overlays)
+        })
+    }
+
+    /// Create or replace an overlay's declaration.
+    pub fn put_overlay(&self, name: &str, overlay: &Overlay) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(overlay).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO overlays (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove an overlay's declaration and its state.
+    pub fn delete_overlay(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM overlays WHERE name = ?1", [name])?;
+            connection.execute("DELETE FROM overlay_state WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Every overlay's state: active, or ended for a while.
+    pub fn overlay_states(&self) -> Result<Vec<OverlayState>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT name, active, source, since_unix_ms, until_unix_ms \
+                 FROM overlay_state ORDER BY name",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(OverlayState {
+                    name: row.get(0)?,
+                    active: row.get::<_, i64>(1)? != 0,
+                    source: row.get(2)?,
+                    since_unix_ms: row.get::<_, i64>(3)? as u64,
+                    until_unix_ms: row.get::<_, Option<i64>>(4)?.map(|until| until as u64),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Record an overlay's state, or clear it with `None`.
+    pub fn set_overlay_state(
+        &self,
+        name: &str,
+        state: Option<&OverlayState>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            match state {
+                Some(state) => {
+                    connection.execute(
+                        "INSERT INTO overlay_state (name, active, source, since_unix_ms, until_unix_ms) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(name) DO UPDATE SET \
+                         active = excluded.active, source = excluded.source, \
+                         since_unix_ms = excluded.since_unix_ms, until_unix_ms = excluded.until_unix_ms",
+                        params![
+                            name,
+                            i64::from(state.active),
+                            state.source,
+                            state.since_unix_ms as i64,
+                            state.until_unix_ms.map(|until| until as i64)
+                        ],
+                    )?;
+                }
+                None => {
+                    connection.execute("DELETE FROM overlay_state WHERE name = ?1", [name])?;
+                }
+            }
+
             Ok(())
         })
     }

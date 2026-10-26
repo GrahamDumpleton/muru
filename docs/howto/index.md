@@ -36,6 +36,7 @@ static-files
 file-hints
 uploads
 client-classes
+overlays
 internal-redirects
 error-pages
 auth-subrequests

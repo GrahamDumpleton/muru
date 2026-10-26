@@ -559,6 +559,141 @@ impl Admin for Service {
         }))
     }
 
+    async fn list_overlays(
+        &self,
+        _: Request<pb::ListOverlaysRequest>,
+    ) -> Result<Response<pb::ListOverlaysResponse>, Status> {
+        let store = &self.handle.store;
+        let states: std::collections::HashMap<String, crate::model::OverlayState> = store
+            .overlay_states()
+            .map_err(internal)?
+            .into_iter()
+            .map(|state| (state.name.clone(), state))
+            .collect();
+        let now = crate::model::now_unix_ms();
+        let overlays = store
+            .overlays()
+            .map_err(internal)?
+            .into_iter()
+            .map(|(name, overlay)| {
+                let state = states.get(&name);
+                let window = crate::overlays::window(&overlay);
+                pb::OverlayInfo {
+                    active: state.is_some_and(|state| state.active),
+                    state: state.map(|state| state.source.clone()).unwrap_or_default(),
+                    since_unix_ms: state.map_or(0, |state| state.since_unix_ms),
+                    until_unix_ms: state.and_then(|state| state.until_unix_ms).unwrap_or(0),
+                    trigger: overlay
+                        .trigger
+                        .as_ref()
+                        .and_then(|trigger| trigger.schedule.as_ref())
+                        .map(|schedule| {
+                            format!(
+                                "from {}{}{}",
+                                schedule.start,
+                                schedule
+                                    .end
+                                    .as_ref()
+                                    .map(|end| format!(" until {end}"))
+                                    .unwrap_or_default(),
+                                schedule
+                                    .timezone
+                                    .as_ref()
+                                    .map(|zone| format!(" {zone}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .unwrap_or_else(|| "by hand".to_owned()),
+                    changes: overlay
+                        .routes
+                        .keys()
+                        .map(|route| format!("route {route}"))
+                        .chain(overlay.apps.keys().map(|app| format!("app {app}")))
+                        .collect(),
+                    starts_unix_ms: window
+                        .map(|(start, _)| start)
+                        .filter(|start| *start > now)
+                        .unwrap_or(0),
+                    name,
+                }
+            })
+            .collect();
+        Ok(Response::new(pb::ListOverlaysResponse { overlays }))
+    }
+
+    async fn control_overlay(
+        &self,
+        request: Request<pb::ControlOverlayRequest>,
+    ) -> Result<Response<pb::ControlOverlayResponse>, Status> {
+        let request = request.into_inner();
+
+        let action = match request.action.as_str() {
+            "activate" => crate::daemon::OverlayAction::Activate {
+                until: (request.until_unix_ms > 0).then_some(request.until_unix_ms),
+            },
+            "end" => crate::daemon::OverlayAction::End,
+            "promote" => crate::daemon::OverlayAction::Promote,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "{other:?} is not activate, end or promote"
+                )));
+            }
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Overlay {
+                name: request.name,
+                action,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let message = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::ControlOverlayResponse { message }))
+    }
+
+    async fn preview_overlay(
+        &self,
+        request: Request<pb::PreviewOverlayRequest>,
+    ) -> Result<Response<pb::PreviewOverlayResponse>, Status> {
+        let name = request.into_inner().name;
+        let store = &self.handle.store;
+        let overlays = store.overlays().map_err(internal)?;
+        let overlay = overlays
+            .iter()
+            .find(|(declared, _)| *declared == name)
+            .map(|(_, overlay)| overlay.clone())
+            .ok_or_else(|| Status::not_found(format!("no overlay is named {name}")))?;
+
+        // Against the routes as they stand now, with the other active
+        // overlays applied.
+
+        let states = store.overlay_states().map_err(internal)?;
+        let others: Vec<(String, muru_config::Overlay)> = overlays
+            .iter()
+            .filter(|(declared, _)| *declared != name)
+            .cloned()
+            .collect();
+        let active = crate::overlays::ordered(&others, &states);
+        let mut routes = store.routes().map_err(internal)?;
+        crate::overlays::apply_routes(&mut routes, &active);
+        let base: std::collections::BTreeSet<String> = store
+            .maintenance()
+            .map_err(internal)?
+            .into_iter()
+            .map(|(app, _)| app)
+            .collect();
+        let maintenance = crate::overlays::apply_maintenance(&base, &active);
+        Ok(Response::new(pb::PreviewOverlayResponse {
+            changes: crate::overlays::preview(&overlay, &routes, &maintenance),
+        }))
+    }
+
     async fn upgrade_daemon(
         &self,
         _: Request<pb::UpgradeDaemonRequest>,
@@ -1075,6 +1210,14 @@ impl Service {
                 .map_err(|error| error.to_string()),
             Action::RemoveUpstream { name } => store
                 .delete_upstream(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutOverlay { name, overlay, new } => store
+                .put_overlay(name, overlay)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveOverlay { name } => store
+                .delete_overlay(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
         };

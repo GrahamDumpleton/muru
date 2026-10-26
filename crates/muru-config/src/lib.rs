@@ -1063,6 +1063,10 @@ pub struct HostTls {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    /// A name for the route, unique among routes, by which overlays
+    /// change it (section 9.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The virtual host.
     pub host: String,
     /// The path prefix, `/` for everything. The longest prefix wins.
@@ -1281,6 +1285,225 @@ pub struct ClientClass {
 
 /// The class a request matching no rule gets.
 pub const DEFAULT_CLIENT_CLASS: &str = "default";
+
+/// An `[overlay.NAME]` table (section 9.10): changes to named routes and
+/// to applications, applied over the base configuration while the
+/// overlay is active, by its schedule or by hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Overlay {
+    /// Changes to routes, by the route's `name`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, RouteOverlay>,
+    /// Changes to applications, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, AppOverlay>,
+    /// When the overlay is active on its own; by hand only without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<OverlayTrigger>,
+    /// What must hold for the overlay to activate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Preconditions>,
+    /// Which of two active overlays setting the same field wins: the
+    /// higher. Overlays that would conflict must both set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+}
+
+/// What an overlay changes on a route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteOverlay {
+    /// The site mode (section 4.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Methods refused, as the route's `methods.deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<Vec<String>>,
+    /// How refused methods are answered, as the route's `methods.answer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// The traffic policy: a pin sends every request to one release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<TrafficOverlay>,
+    /// What serves the route instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RouteTarget>,
+    /// The rate limits, in place of the route's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<Vec<String>>,
+}
+
+/// An overlay's traffic policy for a route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrafficOverlay {
+    /// Send every request to this release of the route's application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// Shares by release, in place of the route's split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<BTreeMap<String, u32>>,
+}
+
+/// What serves a route under an overlay: one of an application, a
+/// static directory or an upstream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTarget {
+    /// An application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// A directory the edge serves (section 4.9).
+    #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
+    pub static_dir: Option<String>,
+    /// An HTTP upstream (section 4.13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+}
+
+/// What an overlay changes on an application.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppOverlay {
+    /// Maintenance mode (section 4.12) while the overlay is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<bool>,
+}
+
+/// When an overlay is active on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayTrigger {
+    /// A window in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<OverlaySchedule>,
+}
+
+/// A one-off window: from `start`, until `end` when it has one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlaySchedule {
+    /// When it starts, as a local date and time such as
+    /// 2026-11-02T09:00, or with an offset.
+    pub start: String,
+    /// When it ends; it stays active until ended or promoted without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// The time zone local times are in, such as Australia/Sydney; the
+    /// daemon's own zone without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// What must hold for an overlay to activate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preconditions {
+    /// A release that must be ready, as app@release, or as release when
+    /// the overlay changes routes of one application only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_ready: Option<String>,
+}
+
+/// Check an overlay on its own: its name, the changes, the schedule and
+/// the preconditions. Whether the routes, applications, releases and
+/// limits it names exist is for the daemon to check.
+pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
+    if overlay.routes.is_empty() && overlay.apps.is_empty() {
+        return Err(format!(
+            "overlay {name}: changes no route and no application"
+        ));
+    }
+
+    for (route, change) in &overlay.routes {
+        let methods = change.deny.as_ref().map(|deny| Methods {
+            deny: deny.clone(),
+            answer: change.answer.clone(),
+        });
+        let probe = Route {
+            mode: change.mode.clone(),
+            methods,
+            rate_limits: change.rate_limits.clone().unwrap_or_default(),
+            ..Route::default()
+        };
+        check_route_policies(&probe)
+            .map_err(|error| format!("overlay {name}: routes.{route}: {error}"))?;
+
+        if change.answer.is_some() && change.deny.is_none() {
+            return Err(format!("overlay {name}: routes.{route}: answer needs deny"));
+        }
+
+        if let Some(traffic) = &change.traffic
+            && traffic.pin.is_some() == traffic.split.is_some()
+        {
+            return Err(format!(
+                "overlay {name}: routes.{route}: traffic sets one of pin and split"
+            ));
+        }
+
+        if let Some(target) = &change.target {
+            let named = usize::from(target.app.is_some())
+                + usize::from(target.static_dir.is_some())
+                + usize::from(target.upstream.is_some());
+
+            if named != 1 {
+                return Err(format!(
+                    "overlay {name}: routes.{route}: target names one of app, static and upstream"
+                ));
+            }
+        }
+    }
+
+    if let Some(schedule) = overlay
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.schedule.as_ref())
+    {
+        let start = parse_moment(&schedule.start, schedule.timezone.as_deref())
+            .map_err(|error| format!("overlay {name}: schedule.start: {error}"))?;
+
+        if let Some(end) = &schedule.end {
+            let end = parse_moment(end, schedule.timezone.as_deref())
+                .map_err(|error| format!("overlay {name}: schedule.end: {error}"))?;
+
+            if end <= start {
+                return Err(format!(
+                    "overlay {name}: schedule.end must be after its start"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// A moment as Unix milliseconds: an RFC 3339 time with an offset, or a
+/// local date and time (seconds optional) in `timezone`, the system's
+/// zone without one. A local time that a daylight saving change skips or
+/// repeats takes the later or earlier instant as Temporal's compatible
+/// rule does.
+pub fn parse_moment(text: &str, timezone: Option<&str>) -> Result<i64, String> {
+    let text = text.trim();
+
+    if let Ok(instant) = text.parse::<jiff::Timestamp>() {
+        return Ok(instant.as_millisecond());
+    }
+
+    let zone = match timezone {
+        Some(name) => jiff::tz::TimeZone::get(name)
+            .map_err(|_| format!("{name:?} is not a time zone such as Australia/Sydney"))?,
+        None => jiff::tz::TimeZone::system(),
+    };
+
+    let civil: jiff::civil::DateTime = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a date and time such as 2026-11-02T09:00"))?;
+    let zoned = civil
+        .to_zoned(zone)
+        .map_err(|error| format!("{text:?}: {error}"))?;
+    Ok(zoned.timestamp().as_millisecond())
+}
 
 /// Check a `[[client_class]]` rule: a name, at least one input, regular
 /// expressions that compile and a verification with its domains. Whether
@@ -2477,6 +2700,10 @@ pub struct Document {
     /// Rate limits by name (section 4.15), from the daemon's own file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rate_limit: BTreeMap<String, RateLimit>,
+    /// Overlays by name (section 9.10): partial configuration laid over
+    /// the routes and applications while active.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overlay: BTreeMap<String, Overlay>,
     /// Routes, in the order written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<Route>,
@@ -2515,6 +2742,14 @@ impl Document {
             }
 
             self.rate_limit.insert(name, limit);
+        }
+
+        for (name, overlay) in other.overlay {
+            if self.overlay.contains_key(&name) {
+                return Err(format!("overlay {name} is declared twice"));
+            }
+
+            self.overlay.insert(name, overlay);
         }
 
         if other.limits.is_some() {
@@ -2813,6 +3048,62 @@ mod tests {
     }
 
     #[test]
+    fn moments_are_read_in_their_time_zone() {
+        // 09:00 in Sydney in November is 22:00 UTC the day before.
+
+        assert_eq!(
+            parse_moment("2026-11-02T09:00", Some("Australia/Sydney")),
+            Ok(1_793_570_400_000)
+        );
+        assert_eq!(
+            parse_moment("2026-11-01T22:00:00Z", Some("Australia/Sydney")),
+            Ok(1_793_570_400_000)
+        );
+
+        // 02:30 does not exist on the morning clocks go forward in New
+        // York; it is read as 03:30.
+
+        assert_eq!(
+            parse_moment("2026-03-08T02:30", Some("America/New_York")),
+            parse_moment("2026-03-08T03:30", Some("America/New_York"))
+        );
+        assert!(parse_moment("2026-11-02T09:00", Some("Mars/Olympus")).is_err());
+        assert!(parse_moment("tomorrow", None).is_err());
+    }
+
+    #[test]
+    fn overlays_are_checked() {
+        let overlay = |text: &str| -> Overlay { toml::from_str(text).unwrap() };
+        assert!(check_overlay(
+            "backup",
+            &overlay("routes.shop-root = { mode = 'read-only', deny = ['POST'] }\ntrigger = { schedule = { start = '2026-11-02T02:00', end = '2026-11-02T03:00', timezone = 'UTC' } }")
+        )
+        .is_ok());
+
+        for (text, expected) in [
+            ("priority = 1", "changes no route"),
+            ("routes.a = { deny = ['post'] }", "not a method"),
+            ("routes.a = { answer = 'read_only' }", "answer needs deny"),
+            ("routes.a = { traffic = {} }", "one of pin and split"),
+            (
+                "routes.a = { target = { app = 'x', upstream = 'y' } }",
+                "one of app, static",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = 'soon' } }",
+                "schedule.start",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = '2026-11-02T09:00', end = '2026-11-02T08:00', timezone = 'UTC' } }",
+                "end must be after",
+            ),
+        ] {
+            let error = check_overlay("o", &overlay(text)).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+    }
+
+    #[test]
     fn rates_are_parsed() {
         assert_eq!(parse_rate("2/s"), Ok((2, 1)));
         assert_eq!(parse_rate("100 / m"), Ok((100, 60)));
@@ -3020,6 +3311,7 @@ mod tests {
             },
         );
         document.route.push(Route {
+            name: Some("shop-root".to_owned()),
             host: "shop".to_owned(),
             path: "/".to_owned(),
             app: "shop".to_owned(),
@@ -3055,6 +3347,7 @@ mod tests {
             mode: Some("read-only".to_owned()),
         });
         let text = document.to_toml().unwrap();
+        assert!(text.contains("name = \"shop-root\""), "{text}");
         assert!(text.contains("rate_limits = [\"crawlers\"]"), "{text}");
         assert!(text.contains("mode = \"read-only\""), "{text}");
         assert!(text.contains("upload = \"multipart\""), "{text}");

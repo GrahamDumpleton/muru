@@ -1,6 +1,7 @@
 """Client classes, site modes and method restrictions (sections 4.14 and
-4.15): `wsgi_app` and `asgi_app` answer every request with the class and
-mode they were given and the method, as JSON.
+4.15), and overlays (section 9.10): `wsgi_app` and `asgi_app` answer
+every request with the class and mode they were given, the method and,
+for `wsgi_app`, the release that served it, as JSON.
 """
 
 from __future__ import annotations
@@ -9,6 +10,8 @@ import json
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+import muru
+
 
 def wsgi_app(environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:
     body = json.dumps(
@@ -16,6 +19,7 @@ def wsgi_app(environ: dict[str, Any], start_response: Callable[..., Any]) -> Ite
             "class": environ.get("muru.client_class"),
             "mode": environ.get("muru.mode"),
             "method": environ["REQUEST_METHOD"],
+            "release": muru.context().release,
         }
     ).encode()
     start_response(

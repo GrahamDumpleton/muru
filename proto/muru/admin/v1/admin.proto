@@ -94,6 +94,12 @@ service Admin {
   // DumpStacks and SetLogLevel of appendix B are the stacks and logging
   // operations of this one call.
   rpc Debug(DebugRequest) returns (DebugResponse);
+
+  // Section 9.10: overlays, their state, and activating, ending,
+  // previewing and promoting one.
+  rpc ListOverlays(ListOverlaysRequest) returns (ListOverlaysResponse);
+  rpc ControlOverlay(ControlOverlayRequest) returns (ControlOverlayResponse);
+  rpc PreviewOverlay(PreviewOverlayRequest) returns (PreviewOverlayResponse);
 }
 
 message GetStatusRequest {}
@@ -417,6 +423,42 @@ message WorkerDebug {
   bool ok = 3;
   string error = 4;                 // when not ok
   string result_json = 5;           // the operation's result, when ok
+}
+
+message ListOverlaysRequest {}
+
+message ListOverlaysResponse {
+  repeated OverlayInfo overlays = 1;
+}
+
+// An overlay as declared, with its state (section 9.10).
+message OverlayInfo {
+  string name = 1;
+  bool active = 2;
+  string state = 3;                 // schedule or manual while active; ended, skipped or promoted while held; empty when idle
+  uint64 since_unix_ms = 4;         // when the state began; 0 when idle
+  uint64 until_unix_ms = 5;         // when it ends or the hold lifts; 0 for none
+  string trigger = 6;               // its schedule, or "by hand"
+  repeated string changes = 7;      // what it changes, as route NAME and app NAME
+  uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
+}
+
+message ControlOverlayRequest {
+  string name = 1;
+  string action = 2;                // activate, end or promote
+  uint64 until_unix_ms = 3;         // for activate: when it ends; never when 0
+}
+
+message ControlOverlayResponse {
+  string message = 1;               // what happened
+}
+
+message PreviewOverlayRequest {
+  string name = 1;
+}
+
+message PreviewOverlayResponse {
+  repeated string changes = 1;      // what activating it now would change, one line per field
 }
 
 message UpgradeDaemonRequest {}

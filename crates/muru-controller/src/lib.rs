@@ -20,6 +20,7 @@ pub mod logs;
 pub mod metrics;
 pub mod model;
 pub mod notify;
+pub mod overlays;
 pub mod rollouts;
 pub mod rotation;
 pub mod scaling;

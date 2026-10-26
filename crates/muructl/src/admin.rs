@@ -2422,6 +2422,183 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `muructl overlay` subcommands (section 9.10).
+#[derive(Subcommand)]
+pub enum OverlayCommand {
+    /// Every overlay, whether it is active and what it changes.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Apply an overlay now, until ended, or for a time.
+    Activate {
+        /// The overlay.
+        name: String,
+
+        /// End it on its own after this long, for example 2h.
+        #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, conflicts_with = "until")]
+        duration: Option<Duration>,
+
+        /// End it on its own at this time, such as 2026-11-02T09:00 or an
+        /// RFC 3339 time.
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+
+        /// The time zone --until is in; the local zone without it.
+        #[arg(long, value_name = "ZONE", requires = "until")]
+        timezone: Option<String>,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Stop applying an overlay; one its schedule activated stays ended
+    /// until the schedule's window is over.
+    End {
+        /// The overlay.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// What activating an overlay now would change.
+    Preview {
+        /// The overlay.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Fold an active overlay's changes into the base configuration and
+    /// end it for good.
+    Promote {
+        /// The overlay.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// List, activate, end, preview or promote overlays.
+pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
+    let (name, action, until, socket) = match command {
+        OverlayCommand::List { socket } => return list_overlays(&socket).await,
+        OverlayCommand::Preview { name, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let preview = client
+                .preview_overlay(pb::PreviewOverlayRequest { name: name.clone() })
+                .await
+                .map_err(explain)?
+                .into_inner();
+
+            if preview.changes.is_empty() {
+                println!("muru: activating overlay {name} would change nothing now");
+            }
+
+            for change in preview.changes {
+                println!("{change}");
+            }
+
+            return Ok(());
+        }
+        OverlayCommand::Activate {
+            name,
+            duration,
+            until,
+            timezone,
+            socket,
+        } => {
+            let until = match (duration, until) {
+                (Some(duration), _) => Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as u64
+                        + duration.as_millis() as u64,
+                ),
+                (None, Some(text)) => Some(
+                    muru_config::parse_moment(&text, timezone.as_deref())
+                        .map_err(anyhow::Error::msg)?
+                        .max(0) as u64,
+                ),
+                (None, None) => None,
+            };
+
+            (name, "activate", until, socket)
+        }
+        OverlayCommand::End { name, socket } => (name, "end", None, socket),
+        OverlayCommand::Promote { name, socket } => (name, "promote", None, socket),
+    };
+
+    let mut client = client::connect(&socket.socket()).await?;
+    let response = client
+        .control_overlay(pb::ControlOverlayRequest {
+            name: name.clone(),
+            action: action.to_owned(),
+            until_unix_ms: until.unwrap_or(0),
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    println!(
+        "muru: overlay {name} {}{}",
+        response.message,
+        until
+            .map(|until| format!(", until {}", format_time(until)))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+async fn list_overlays(socket: &SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let overlays = client
+        .list_overlays(pb::ListOverlaysRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner()
+        .overlays;
+
+    if overlays.is_empty() {
+        println!("muru: no overlays are declared");
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<10} {:<34} CHANGES",
+        "OVERLAY", "STATE", "TRIGGER"
+    );
+
+    for overlay in overlays {
+        let mut state = if overlay.state.is_empty() {
+            "idle".to_owned()
+        } else if overlay.active {
+            format!("active ({})", overlay.state)
+        } else {
+            overlay.state.clone()
+        };
+
+        if overlay.until_unix_ms > 0 {
+            state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
+        } else if overlay.starts_unix_ms > 0 {
+            state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
+        }
+
+        println!(
+            "{:<24} {:<10} {:<34} {}",
+            overlay.name,
+            state,
+            overlay.trigger,
+            overlay.changes.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 /// The `muructl maintenance` subcommands (section 4.12).
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {

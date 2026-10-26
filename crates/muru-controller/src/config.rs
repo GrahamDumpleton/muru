@@ -8,13 +8,13 @@
 //! Listeners and limits belong to the daemon's own file and are reported,
 //! not applied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use muru_config::{
     App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
-    Release as ReleaseTable, Route as RouteTable, ScalingMode, Upstream as UpstreamTable,
+    Overlay, Release as ReleaseTable, Route as RouteTable, ScalingMode, Upstream as UpstreamTable,
 };
 use muru_proto::admin::v1 as pb;
 
@@ -106,6 +106,20 @@ pub enum Action {
         /// The upstream's name.
         name: String,
     },
+    /// Create or replace an overlay (section 9.10).
+    PutOverlay {
+        /// The overlay's name.
+        name: String,
+        /// Its declaration.
+        overlay: Box<Overlay>,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop an overlay, ending it if it is active (prune).
+    RemoveOverlay {
+        /// The overlay's name.
+        name: String,
+    },
 }
 
 impl Action {
@@ -126,6 +140,9 @@ impl Action {
             Action::PutUpstream { new: true, .. } => "create-upstream",
             Action::PutUpstream { new: false, .. } => "update-upstream",
             Action::RemoveUpstream { .. } => "remove-upstream",
+            Action::PutOverlay { new: true, .. } => "create-overlay",
+            Action::PutOverlay { new: false, .. } => "update-overlay",
+            Action::RemoveOverlay { .. } => "remove-overlay",
         }
     }
 
@@ -139,6 +156,8 @@ impl Action {
                 | Action::RemoveRoute { .. }
                 | Action::PutUpstream { .. }
                 | Action::RemoveUpstream { .. }
+                | Action::PutOverlay { .. }
+                | Action::RemoveOverlay { .. }
         )
     }
 }
@@ -168,6 +187,9 @@ impl Change {
             Action::RemoveRoute { host, path } => format!("route {host} {path}"),
             Action::PutUpstream { name, .. } | Action::RemoveUpstream { name } => {
                 format!("upstream {name}")
+            }
+            Action::PutOverlay { name, .. } | Action::RemoveOverlay { name } => {
+                format!("overlay {name}")
             }
         }
     }
@@ -262,6 +284,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool, rate_limits: &[Stri
     plan_hosts(store, document, rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, rate_limits, &mut plan);
+    plan_overlays(store, document, rate_limits, prune, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -550,10 +573,43 @@ fn plan_routes(store: &Store, document: &Document, rate_limits: &[String], plan:
         document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
     };
     let mut seen = Vec::new();
+    let mut names: BTreeMap<&str, (&str, &str)> = BTreeMap::new();
+
+    // Section 9.10: a route's name is how overlays reach it, so it is
+    // unique among the declared routes and those already recorded.
+
+    for route in &stored_routes_named(&stored) {
+        names.insert(route.0, (route.1, route.2));
+    }
 
     for route in &document.route {
         let key = (route.host.clone(), route.path.clone());
         let mut valid = true;
+
+        if let Some(name) = &route.name {
+            if !valid_name(name) {
+                plan.errors.push(format!(
+                    "route {} {}: {name:?} is not a valid name",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+
+            match names.get(name.as_str()) {
+                Some((host, path))
+                    if (*host, *path) != (route.host.as_str(), route.path.as_str()) =>
+                {
+                    plan.errors.push(format!(
+                        "route {} {}: the name {name} is the route {host} {path}'s",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+                _ => {
+                    names.insert(name, (&route.host, &route.path));
+                }
+            }
+        }
 
         if !route.path.starts_with('/') {
             plan.errors.push(format!(
@@ -941,6 +997,241 @@ pub fn auth_handler(auth: &muru_config::Auth) -> String {
 }
 
 /// The changes the document's HTTP upstreams imply (section 4.13).
+/// The recorded routes with names, as (name, host, path).
+fn stored_routes_named(stored: &BTreeMap<(String, String), RouteTable>) -> Vec<(&str, &str, &str)> {
+    stored
+        .values()
+        .filter_map(|route| {
+            route
+                .name
+                .as_deref()
+                .map(|name| (name, route.host.as_str(), route.path.as_str()))
+        })
+        .collect()
+}
+
+/// Section 9.10: the overlays a document declares, checked against the
+/// routes, applications, upstreams and rate limits they name, and
+/// against each other.
+fn plan_overlays(
+    store: &Store,
+    document: &Document,
+    rate_limits: &[String],
+    prune: bool,
+    plan: &mut Plan,
+) {
+    let stored: BTreeMap<String, Overlay> =
+        store.overlays().unwrap_or_default().into_iter().collect();
+    let stored_routes = store.routes().unwrap_or_default();
+    let mut route_names: BTreeMap<String, String> = document
+        .route
+        .iter()
+        .filter_map(|route| route.name.clone().map(|name| (name, route.app.clone())))
+        .collect();
+
+    if !prune {
+        for route in &stored_routes {
+            if let Some(name) = &route.name {
+                route_names
+                    .entry(name.clone())
+                    .or_insert_with(|| route.app.clone());
+            }
+        }
+    }
+
+    let stored_apps: Vec<String> = store
+        .apps()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|app| app.name)
+        .collect();
+    let known_app =
+        |app: &str| document.app.contains_key(app) || stored_apps.iter().any(|name| name == app);
+    let stored_upstreams: Vec<String> = store
+        .upstreams()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let known_upstream = |name: &str| {
+        document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
+    };
+
+    for (name, overlay) in &document.overlay {
+        if !valid_name(name) {
+            plan.errors
+                .push(format!("overlay {name:?} is not a valid name"));
+            continue;
+        }
+
+        let mut errors = Vec::new();
+
+        if let Err(error) = muru_config::check_overlay(name, overlay) {
+            errors.push(error);
+        }
+
+        for (route, change) in &overlay.routes {
+            if !route_names.contains_key(route) {
+                errors.push(format!("overlay {name}: no route is named {route}"));
+            }
+
+            for limit in change.rate_limits.iter().flatten() {
+                if !rate_limits.contains(limit) {
+                    errors.push(format!(
+                        "overlay {name}: routes.{route}: no rate limit named {limit} in the daemon configuration file"
+                    ));
+                }
+            }
+
+            if let Some(target) = &change.target {
+                if let Some(app) = &target.app
+                    && !known_app(app)
+                {
+                    errors.push(format!(
+                        "overlay {name}: routes.{route}: no application named {app}"
+                    ));
+                }
+
+                if let Some(upstream) = &target.upstream
+                    && !known_upstream(upstream)
+                {
+                    errors.push(format!(
+                        "overlay {name}: routes.{route}: no upstream named {upstream}"
+                    ));
+                }
+
+                if let Some(directory) = &target.static_dir
+                    && !Path::new(directory).is_dir()
+                {
+                    errors.push(format!(
+                        "overlay {name}: routes.{route}: {directory} is not a directory"
+                    ));
+                }
+            }
+        }
+
+        for app in overlay.apps.keys() {
+            if !known_app(app) {
+                errors.push(format!("overlay {name}: no application named {app}"));
+            }
+        }
+
+        if let Some(ready) = overlay
+            .preconditions
+            .as_ref()
+            .and_then(|preconditions| preconditions.release_ready.as_deref())
+            && precondition_release(ready, overlay, &route_names).is_none()
+        {
+            errors.push(format!(
+                "overlay {name}: release_ready {ready:?} must be app@release, or a release when the overlay changes routes of one application"
+            ));
+        }
+
+        if !errors.is_empty() {
+            plan.errors.extend(errors);
+            continue;
+        }
+
+        match stored.get(name) {
+            Some(recorded) if recorded == overlay => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutOverlay {
+                    name: name.clone(),
+                    overlay: Box::new(overlay.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: describe_overlay(overlay),
+            }),
+        }
+    }
+
+    // Overlays that would set the same field need priorities, among the
+    // declared ones and those already recorded that stay.
+
+    let mut all = document.overlay.clone();
+
+    if !prune {
+        for (name, overlay) in stored {
+            all.entry(name).or_insert(overlay);
+        }
+    }
+
+    plan.errors.extend(crate::overlays::conflicts(&all));
+}
+
+/// The release an overlay's `release_ready` names, as (app, release):
+/// app@release, or a release of the one application its routes belong to.
+pub fn precondition_release(
+    ready: &str,
+    overlay: &Overlay,
+    route_apps: &BTreeMap<String, String>,
+) -> Option<(String, String)> {
+    if let Some((app, release)) = ready.split_once('@') {
+        return (!app.is_empty() && !release.is_empty())
+            .then(|| (app.to_owned(), release.to_owned()));
+    }
+
+    let apps: BTreeSet<&String> = overlay
+        .routes
+        .keys()
+        .filter_map(|route| route_apps.get(route))
+        .filter(|app| !app.is_empty())
+        .collect();
+
+    match apps.into_iter().collect::<Vec<_>>().as_slice() {
+        [app] => Some(((*app).clone(), ready.to_owned())),
+        _ => None,
+    }
+}
+
+/// An overlay for the report: what triggers it and what it changes.
+fn describe_overlay(overlay: &Overlay) -> String {
+    let mut parts = Vec::new();
+
+    match overlay
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.schedule.as_ref())
+    {
+        Some(schedule) => parts.push(format!(
+            "from {}{}{}",
+            schedule.start,
+            schedule
+                .end
+                .as_ref()
+                .map(|end| format!(" until {end}"))
+                .unwrap_or_default(),
+            schedule
+                .timezone
+                .as_ref()
+                .map(|zone| format!(" {zone}"))
+                .unwrap_or_default()
+        )),
+        None => parts.push("by hand".to_owned()),
+    }
+
+    if !overlay.routes.is_empty() {
+        parts.push(format!(
+            "routes {}",
+            overlay
+                .routes
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if !overlay.apps.is_empty() {
+        parts.push(format!(
+            "apps {}",
+            overlay.apps.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    parts.join("; ")
+}
+
 fn plan_upstreams(store: &Store, document: &Document, plan: &mut Plan) {
     let stored: BTreeMap<String, UpstreamTable> =
         store.upstreams().unwrap_or_default().into_iter().collect();
@@ -1089,6 +1380,15 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         if !document.upstream.contains_key(&name) {
             plan.changes.push(Change {
                 action: Action::RemoveUpstream { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
+    for (name, _) in store.overlays().unwrap_or_default() {
+        if !document.overlay.contains_key(&name) {
+            plan.changes.push(Change {
+                action: Action::RemoveOverlay { name },
                 detail: "not declared".to_owned(),
             });
         }

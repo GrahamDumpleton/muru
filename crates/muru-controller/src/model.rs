@@ -698,6 +698,25 @@ pub struct Event {
     pub message: String,
 }
 
+/// An overlay's state (section 9.10): active, with what made it so, or
+/// held inactive after a person ended it, its preconditions failed or it
+/// was promoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayState {
+    /// The overlay.
+    pub name: String,
+    /// Whether it is applied.
+    pub active: bool,
+    /// `schedule` or `manual` while active; `ended`, `skipped` or
+    /// `promoted` while held.
+    pub source: String,
+    /// When it became active or was held, Unix milliseconds.
+    pub since_unix_ms: u64,
+    /// When it ends, while active, or may activate again, while held;
+    /// never without one.
+    pub until_unix_ms: Option<u64>,
+}
+
 /// Check a name against section 3.2: lowercase letters, digits and
 /// hyphens, up to 63 characters.
 pub fn valid_name(name: &str) -> bool {

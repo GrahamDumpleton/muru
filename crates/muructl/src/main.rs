@@ -116,6 +116,13 @@ enum Command {
     /// Pin a worker group's count, or show the autoscaler's state.
     Scale(admin::ScaleArgs),
 
+    /// Overlays: list them, activate or end one by hand, preview what
+    /// one changes, or make one's changes permanent (section 9.10).
+    Overlay {
+        #[command(subcommand)]
+        command: admin::OverlayCommand,
+    },
+
     /// Serve an application's maintenance page at the edge, or serve it
     /// as usual again.
     Maintenance {
@@ -734,6 +741,7 @@ fn main() -> anyhow::Result<()> {
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
+        Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {

@@ -320,6 +320,29 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Activate, end or promote an overlay (section 9.10).
+    Overlay {
+        /// The overlay.
+        name: String,
+        /// What to do.
+        action: OverlayAction,
+        /// Answered with a sentence about what happened.
+        done: oneshot::Sender<Result<String, String>>,
+    },
+}
+
+/// What a person asks of an overlay (section 9.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAction {
+    /// Apply it now, until a time or until ended.
+    Activate {
+        /// When it ends, Unix milliseconds; never without one.
+        until: Option<u64>,
+    },
+    /// Stop applying it; a schedule's window stays ended until it is over.
+    End,
+    /// Fold its changes into the base configuration and end it for good.
+    Promote,
 }
 
 /// What a previous daemon left behind about its edge, for re-adoption
@@ -955,6 +978,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
                 daemon.refresh_client_lists().await;
+                daemon.reconcile_overlays().await;
                 daemon.watch_rate_limits(samples.as_deref());
             }
         }
@@ -1709,6 +1733,272 @@ impl Daemon {
         Ok(message)
     }
 
+    /// Section 9.10: the routes and the applications in maintenance mode
+    /// with the active overlays laid over them, lowest priority first.
+    fn effective(&self) -> (Vec<muru_config::Route>, BTreeSet<String>) {
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states = self.store.overlay_states().unwrap_or_default();
+        let active = crate::overlays::ordered(&overlays, &states);
+        let mut routes = self.store.routes().unwrap_or_default();
+        crate::overlays::apply_routes(&mut routes, &active);
+        let base: BTreeSet<String> = self.maintenance.keys().cloned().collect();
+        let maintained = crate::overlays::apply_maintenance(&base, &active);
+        (routes, maintained)
+    }
+
+    /// Section 9.10: whether an overlay's preconditions hold, or why not.
+    fn overlay_preconditions(&self, overlay: &muru_config::Overlay) -> Result<(), String> {
+        let Some(ready) = overlay
+            .preconditions
+            .as_ref()
+            .and_then(|preconditions| preconditions.release_ready.as_deref())
+        else {
+            return Ok(());
+        };
+
+        let route_apps: std::collections::BTreeMap<String, String> = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.name.map(|name| (name, route.app)))
+            .collect();
+        let (app, id) = crate::config::precondition_release(ready, overlay, &route_apps)
+            .ok_or_else(|| format!("release_ready {ready:?} names no release"))?;
+
+        // A retained release is warm and takes traffic at once, so it
+        // counts as ready.
+
+        match self.store.release(&app, &id) {
+            Ok(release)
+                if matches!(release.state, ReleaseState::Ready | ReleaseState::Retained) =>
+            {
+                Ok(())
+            }
+            Ok(release) => Err(format!("{app}@{id} is {}, not ready", release.state)),
+            Err(_) => Err(format!("{app}@{id} does not exist")),
+        }
+    }
+
+    /// Section 9.10: begin and end overlays by their schedules and by the
+    /// time they were activated for, and give the edge the result.
+    async fn reconcile_overlays(&mut self) {
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states: HashMap<String, crate::model::OverlayState> = self
+            .store
+            .overlay_states()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|state| (state.name.clone(), state))
+            .collect();
+        let now = now_unix_ms();
+        let mut changed = false;
+
+        for (name, overlay) in &overlays {
+            let subject = format!("overlay {name}");
+
+            match crate::overlays::step(overlay, states.get(name), now) {
+                crate::overlays::Step::Stay => {}
+                crate::overlays::Step::Release => {
+                    let _ = self.store.set_overlay_state(name, None);
+                }
+                crate::overlays::Step::End { reason } => {
+                    let _ = self.store.set_overlay_state(name, None);
+                    self.events.emit(
+                        "overlay.ended",
+                        &subject,
+                        "notice",
+                        &format!("ended: {reason}"),
+                    );
+                    changed = true;
+                }
+                crate::overlays::Step::Begin { until } => match self.overlay_preconditions(overlay)
+                {
+                    Ok(()) => {
+                        let state = crate::model::OverlayState {
+                            name: name.clone(),
+                            active: true,
+                            source: "schedule".to_owned(),
+                            since_unix_ms: now,
+                            until_unix_ms: until,
+                        };
+                        let _ = self.store.set_overlay_state(name, Some(&state));
+                        self.events.emit(
+                            "overlay.activated",
+                            &subject,
+                            "notice",
+                            "activated: its schedule's window began",
+                        );
+                        changed = true;
+                    }
+                    Err(why) => {
+                        // Skipped for the rest of this window, so a failing
+                        // precondition is not retried every second.
+
+                        let state = crate::model::OverlayState {
+                            name: name.clone(),
+                            active: false,
+                            source: "skipped".to_owned(),
+                            since_unix_ms: now,
+                            until_unix_ms: until,
+                        };
+                        let _ = self.store.set_overlay_state(name, Some(&state));
+                        self.events.emit(
+                            "overlay.skipped",
+                            &subject,
+                            "warning",
+                            &format!("not activated: {why}"),
+                        );
+                    }
+                },
+            }
+        }
+
+        if changed {
+            self.reconcile_traffic().await;
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for an overlay failed");
+            }
+        }
+    }
+
+    /// Section 9.10: what a person asks of an overlay.
+    async fn control_overlay(
+        &mut self,
+        name: &str,
+        action: OverlayAction,
+    ) -> Result<String, String> {
+        let overlay = self
+            .store
+            .overlays()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(declared, _)| declared == name)
+            .map(|(_, overlay)| overlay)
+            .ok_or_else(|| format!("no overlay is named {name}"))?;
+        let state = self
+            .store
+            .overlay_states()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|state| state.name == name);
+        let active = state.as_ref().is_some_and(|state| state.active);
+        let subject = format!("overlay {name}");
+        let now = now_unix_ms();
+
+        let message = match action {
+            OverlayAction::Activate { until } => {
+                if active {
+                    return Err(format!("overlay {name} is already active"));
+                }
+
+                self.overlay_preconditions(&overlay)
+                    .map_err(|why| format!("overlay {name} was not activated: {why}"))?;
+                let state = crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: true,
+                    source: "manual".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: until,
+                };
+                self.store
+                    .set_overlay_state(name, Some(&state))
+                    .map_err(|error| error.to_string())?;
+                let detail = "activated by hand".to_owned();
+                self.events
+                    .emit("overlay.activated", &subject, "notice", &detail);
+                detail
+            }
+            OverlayAction::End => {
+                if !active {
+                    return Err(format!("overlay {name} is not active"));
+                }
+
+                // Ended inside its schedule's window, it stays ended until
+                // the window is over; otherwise it is simply inactive.
+
+                let window = crate::overlays::window(&overlay)
+                    .filter(|(start, end)| now >= *start && end.is_none_or(|end| now < end));
+                let held = window.map(|(_, end)| crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: false,
+                    source: "ended".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: end,
+                });
+                self.store
+                    .set_overlay_state(name, held.as_ref())
+                    .map_err(|error| error.to_string())?;
+                let detail = "ended by hand".to_owned();
+                self.events
+                    .emit("overlay.ended", &subject, "notice", &detail);
+                detail
+            }
+            OverlayAction::Promote => {
+                if !active {
+                    return Err(format!("overlay {name} is not active; activate it first"));
+                }
+
+                // Its changes become the base: the named routes as the
+                // overlay leaves them, and its maintenance settings.
+
+                let pair = (name.to_owned(), overlay.clone());
+
+                for route in self.store.routes().unwrap_or_default() {
+                    if route
+                        .name
+                        .as_ref()
+                        .is_some_and(|route_name| overlay.routes.contains_key(route_name))
+                    {
+                        let mut changed = [route];
+                        crate::overlays::apply_routes(&mut changed, &[&pair]);
+                        self.store
+                            .put_route(&changed[0])
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+
+                for (app, change) in &overlay.apps {
+                    if let Some(on) = change.maintenance {
+                        let since = on.then_some(now);
+                        self.store
+                            .set_maintenance(app, since)
+                            .map_err(|error| error.to_string())?;
+
+                        match since {
+                            Some(since) => {
+                                self.maintenance.entry(app.clone()).or_insert(since);
+                            }
+                            None => {
+                                self.maintenance.remove(app);
+                            }
+                        }
+                    }
+                }
+
+                let held = crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: false,
+                    source: "promoted".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: None,
+                };
+                self.store
+                    .set_overlay_state(name, Some(&held))
+                    .map_err(|error| error.to_string())?;
+                let detail = "promoted: its changes are now the base configuration".to_owned();
+                self.events
+                    .emit("overlay.promoted", &subject, "notice", &detail);
+                detail
+            }
+        };
+
+        self.reconcile_traffic().await;
+        self.push_snapshot().await?;
+        Ok(message)
+    }
+
     /// Section 4.14: read the client classes' list files again when one
     /// has changed, and give the edge the result.
     async fn refresh_client_lists(&mut self) {
@@ -2256,6 +2546,9 @@ impl Daemon {
                         )));
                     }
                 }
+            }
+            Command::Overlay { name, action, done } => {
+                let _ = done.send(self.control_overlay(&name, action).await);
             }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
@@ -2819,7 +3112,11 @@ impl Daemon {
     /// workers are those of the application traffic was last switched to.
     fn build_snapshot(&mut self) -> pb::Snapshot {
         let mut apps = Vec::new();
-        let routes = self.store.routes().unwrap_or_default();
+
+        // Section 9.10: the routes and the applications in maintenance
+        // mode with the active overlays laid over them.
+
+        let (routes, maintained) = self.effective();
         let rollouts: Vec<Rollout> = self
             .store
             .rollouts(None)
@@ -2941,7 +3238,7 @@ impl Daemon {
                         .and_then(|release| release.spec.error_override)
                         .map(|table| error_override_message(&table)),
                     maintenance: Some(maintenance_message(
-                        self.maintenance.contains_key(name),
+                        maintained.contains(name),
                         self.store
                             .release(name, id)
                             .ok()
@@ -3585,8 +3882,23 @@ impl Daemon {
             .filter(|rollout| rollout.state == RolloutState::Running)
             .collect();
 
+        // Section 9.10: an overlay that pins or splits a route's traffic
+        // holds its application's rollout until it ends.
+
+        let pinned = {
+            let overlays = self.store.overlays().unwrap_or_default();
+            let states = self.store.overlay_states().unwrap_or_default();
+            let active = crate::overlays::ordered(&overlays, &states);
+            crate::overlays::pinned_apps(&self.store.routes().unwrap_or_default(), &active)
+        };
+
         for mut rollout in running {
             let app = rollout.app.clone();
+
+            if pinned.contains(&app) {
+                continue;
+            }
+
             let subject = format!("{app}@{}", rollout.candidate);
             let now = now_unix_ms();
 
@@ -4073,7 +4385,7 @@ impl Daemon {
     /// The releases the route policies name and the candidates of the
     /// rollouts under way, by application.
     fn referenced_releases(&self) -> BTreeSet<(String, String)> {
-        let mut referenced = referenced_in(&self.store.routes().unwrap_or_default());
+        let mut referenced = referenced_in(&self.effective().0);
         referenced.extend(
             self.store
                 .rollouts(None)
