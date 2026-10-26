@@ -1,1 +1,0 @@
-Added the workers' own scaling signals: CPU time, GIL wait and event loop lag, reported every memory check interval, shown by `muructl scale status` with a diagnosis of each group's bottleneck and the tuning it suggests, which every `scaling.decision` event carries too, and `muru_worker_cpu_seconds_total` in the metrics.

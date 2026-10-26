@@ -1,1 +1,0 @@
-Added client classes and rate limits in applied files: `[[client_class]]` and `[rate_limit.NAME]` tables that `muructl apply` reads are recorded and reach the edge, after the daemon file's, and `muructl config export` writes them out.

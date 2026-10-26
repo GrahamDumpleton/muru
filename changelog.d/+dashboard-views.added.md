@@ -1,1 +1,0 @@
-Added rollouts, scaling and maintenance mode to the daemon's dashboard: the rollouts under way and the latest that ended, each worker group's workers, policy, CPU, GIL wait, loop lag, diagnosis and last decision, and when an application went into maintenance, on the page and as `/v1/rollouts` and `/v1/scaling`.

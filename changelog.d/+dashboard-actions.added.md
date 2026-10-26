@@ -1,1 +1,0 @@
-Added the dashboard's first action: with `actions = true` in the `[dashboard]` table, a browser signed in through a single-use link from `muructl dashboard login` turns an application's maintenance mode on and off from the page, each action CSRF-protected and recorded as a `dashboard.action` event.

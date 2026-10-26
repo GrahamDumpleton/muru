@@ -1,1 +1,0 @@
-Added two canary gates: `--max-queue-wait`, the candidate's 95th percentile wait for a worker thread, and `--probe URL`, repeatable, a URL requested through the edge from the candidate and the baseline every 5 seconds by preview, which rolls back when it fails on the candidate alone.

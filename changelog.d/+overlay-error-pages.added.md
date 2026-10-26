@@ -1,1 +1,0 @@
-Added error page selections to overlays: `routes.NAME.error_pages` chooses the route's page for a status or `status:reason` while the overlay is active, each key in place of the route's own, and `muructl overlay preview` and `config show --effective` show the pages chosen.
