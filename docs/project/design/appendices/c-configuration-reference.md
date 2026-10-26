@@ -17,7 +17,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- | --- |
 | `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode, debug_exec (section 11.7) |
 | `[tools]` | daemon file | uv path and version constraints |
-| `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, PROXY protocol, processes, threads |
+| `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, processes, threads |
 | `[proxy]` | daemon, host or listener | trusted proxies and header types |
 | `[metrics]` | daemon file | the internal address `/metrics` is served on (`listen`), none by default |
 | `[dashboard]` | daemon file | the loopback address the dashboard and JSON gateway are served on (`listen`), none by default, and whether signed-in sessions may act (`actions`, false) |

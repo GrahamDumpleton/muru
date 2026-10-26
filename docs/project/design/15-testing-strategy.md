@@ -41,7 +41,7 @@ Most of Muru's value is in behaviour under change and failure (deploys, drains, 
 - Internal redirects, internal routes and mounts, error pages and override, maintenance mode.
 - Uploads: multipart and raw, prechecks, quotas, crash during upload leaves no files.
 - Virtual hosts with a test certificate authority: SNI, wildcards, 421 cases.
-- Trusted proxies: spoofing attempts, underscore headers, recursive chains, PROXY protocol.
+- Trusted proxies: spoofing attempts, underscore headers, recursive chains.
 - Log rotation by size, time, logrotate rename plus reopen, and copytruncate, asserting no lost lines.
 - Events: every scenario asserts the expected event sequence, and webhook delivery survives a receiver outage.
 - Configuration export, apply and diff round-trip with no changes.

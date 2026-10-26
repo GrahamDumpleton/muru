@@ -5,8 +5,8 @@
 
 The `[proxy]` table in the daemon's configuration file, with Forwarded,
 X-Forwarded-For, -Proto, -Host, -Port, -Prefix and X-Real-IP. Per-host
-and per-listener settings, PROXY protocol and client certificate headers
-are still to come.
+and per-listener settings and client certificate headers are still to
+come.
 ```
 
 When requests arrive through a load balancer, a CDN or another proxy, the

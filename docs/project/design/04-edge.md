@@ -15,7 +15,7 @@ The edge terminates client connections and turns each request into a typed strea
 
 ```mermaid
 flowchart TD
-  A[Accept connection, PROXY protocol if configured] --> B[TLS handshake, certificate by SNI]
+  A[Accept connection] --> B[TLS handshake, certificate by SNI]
   B --> C[Read request head within limits]
   C --> D[Resolve trusted proxies, strip and normalise headers]
   D --> E[Select virtual host, check SNI and authority]
@@ -40,7 +40,7 @@ flowchart TD
 
 ## 4.2 Listeners and edge pools
 
-- Listeners (address, protocols, TLS on or off, PROXY protocol) belong to edge pools. Without explicit pools there is one pool with one process that owns every listener.
+- Listeners (address, protocols, TLS on or off) belong to edge pools. Without explicit pools there is one pool with one process that owns every listener.
 - Each edge process runs a multi-threaded tokio runtime (threads default to the number of cores). One process is normally sufficient: per-request edge work costs microseconds against milliseconds in Python.
 - Several processes per pool use SO_REUSEPORT. A shared memory table of atomic per-worker in-flight counters keeps least-outstanding balancing exact across processes. Queue and admission limits are divided between processes.
 - Separate pools isolate traffic, for example a public pool and an admin pool, or tenants whose keys must not share a process.
@@ -140,7 +140,7 @@ recursive = true
 forwarded_headers = 'keep'                # keep normalised, or consume
 ```
 
-- Nothing is trusted by default. Settings can be overridden per listener and per host. Supported types: Forwarded, X-Forwarded-For, -Proto, -Host, -Port, -Prefix, X-Real-IP and client certificate headers. PROXY protocol v1 and v2 can be enabled per listener for listed sources.
+- Nothing is trusted by default. Settings can be overridden per listener and per host. Supported types: Forwarded, X-Forwarded-For, -Proto, -Host, -Port, -Prefix, X-Real-IP and client certificate headers. The PROXY protocol is not accepted (ADR 0029, section 20.12).
 - From untrusted peers, every forwarding header of every known type is removed. From trusted peers only configured types are applied and all equivalents are removed. Recursive resolution walks the chain right to left past trusted proxies.
 - Request headers whose names contain underscores are dropped, so that X_Forwarded_For cannot reach an application as HTTP_X_FORWARDED_FOR. Malformed values are ignored and logged. Hop-by-hop headers and client-supplied X-Muru-* headers are always removed.
 - Resolved values reach the application as REMOTE_ADDR, wsgi.url_scheme and HTTPS, HTTP_HOST, SERVER_NAME and SERVER_PORT, SCRIPT_NAME (ASGI: client, scheme, server, root_path), with the original peer in muru.proxy_addr. They travel to workers as typed fields, not headers.
