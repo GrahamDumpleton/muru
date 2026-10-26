@@ -1566,8 +1566,8 @@ impl Daemon {
     /// log tail from its file.
     async fn dashboard_data(&mut self) -> muru_dashboard::NodeData {
         use muru_dashboard::{
-            AppRow, EventRow, HostRow, LogPanel, NodeData, NodeRequestRow, ReleaseRow, RouteRow,
-            Summary,
+            AppRow, EventRow, HostRow, LogPanel, NodeData, NodeRequestRow, ReleaseRow, RolloutRow,
+            RouteRow, ScalingRow, Summary,
         };
         use muru_edge::access::{format_bytes, format_duration};
 
@@ -1605,6 +1605,12 @@ impl Daemon {
         };
 
         let mut apps = Vec::new();
+        let maintenance: HashMap<String, u64> = self
+            .store
+            .maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         for app in self.store.apps().unwrap_or_default() {
             let mut releases = Vec::new();
@@ -1637,9 +1643,77 @@ impl Daemon {
                 name: app.name.clone(),
                 current: app.current.clone().unwrap_or_default(),
                 previous: app.previous.clone().unwrap_or_default(),
+                maintenance_since: maintenance
+                    .get(&app.name)
+                    .map(|since| clock_hms(*since))
+                    .unwrap_or_default(),
                 releases,
             });
         }
+
+        // Sections 7.3 and 7.4: each running release's groups as their
+        // autoscalers see them.
+
+        let mut scaling = Vec::new();
+        let mut running: Vec<&(String, String)> = self.running.keys().collect();
+        running.sort();
+
+        for (app, id) in running {
+            let measured = |value: Option<f64>, unit: &str| {
+                value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
+            };
+
+            for (group, status) in self.scale_status(app, id).unwrap_or_default() {
+                scaling.push(ScalingRow {
+                    release: format!("{app}@{id}"),
+                    group,
+                    workers: if status.desired == status.ready {
+                        status.ready.to_string()
+                    } else {
+                        format!("{} -> {}", status.ready, status.desired)
+                    },
+                    policy: status.spec.describe(),
+                    cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
+                    loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    diagnosis: status.diagnosis.summary.to_owned(),
+                    advice: status.diagnosis.advice.to_owned(),
+                    last_decision: status
+                        .last
+                        .map(|(age, what)| {
+                            format!(
+                                "{what} ({} ago)",
+                                muru_config::format_duration(Duration::from_secs(age.as_secs()))
+                            )
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+
+        // Section 9.3: the rollouts under way, then the latest that ended.
+
+        let mut rollouts = self.store.rollouts(None).unwrap_or_default();
+        rollouts.sort_by_key(|rollout| {
+            (
+                !rollout.state.is_active(),
+                std::cmp::Reverse(rollout.updated_unix_ms),
+            )
+        });
+        let rollouts = rollouts
+            .into_iter()
+            .take(10)
+            .map(|rollout| RolloutRow {
+                percent: rollout.percent(),
+                app: rollout.app,
+                id: rollout.id,
+                candidate: rollout.candidate,
+                baseline: rollout.baseline,
+                state: rollout.state.as_str().to_owned(),
+                message: rollout.message,
+                updated: clock_hms(rollout.updated_unix_ms),
+            })
+            .collect();
 
         let hosts = self
             .store
@@ -1752,6 +1826,8 @@ impl Daemon {
             apps,
             hosts,
             routes,
+            scaling,
+            rollouts,
             requests,
             events,
             logs,

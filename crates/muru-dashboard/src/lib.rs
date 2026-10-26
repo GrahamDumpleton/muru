@@ -168,6 +168,12 @@ pub struct NodeData {
     pub hosts: Vec<HostRow>,
     /// Routes.
     pub routes: Vec<RouteRow>,
+    /// Each running release's worker groups as the autoscaler sees them
+    /// (sections 7.3 and 7.4).
+    pub scaling: Vec<ScalingRow>,
+    /// Rollouts, those under way first, then the latest ended ones
+    /// (section 9.3).
+    pub rollouts: Vec<RolloutRow>,
     /// Recent requests, newest first.
     pub requests: Vec<NodeRequestRow>,
     /// Recent events, newest first.
@@ -185,8 +191,59 @@ pub struct AppRow {
     pub current: String,
     /// The release a rollback restores, or empty.
     pub previous: String,
+    /// When maintenance mode began, as a clock time, or empty when it is
+    /// off (section 4.12).
+    pub maintenance_since: String,
     /// Its releases, newest first.
     pub releases: Vec<ReleaseRow>,
+}
+
+/// One worker group of a running release, as the autoscaler sees it.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScalingRow {
+    /// app@release.
+    pub release: String,
+    /// The group.
+    pub group: String,
+    /// Workers ready, and the count being reached while they differ.
+    pub workers: String,
+    /// The policy as one phrase.
+    pub policy: String,
+    /// CPU per wall second as a share of what a worker can use,
+    /// formatted, or a dash.
+    pub cpu: String,
+    /// The 95th percentile GIL wait, formatted, or a dash.
+    pub gil_wait: String,
+    /// The 95th percentile event loop lag, formatted, or a dash.
+    pub loop_lag: String,
+    /// The bottleneck in words.
+    pub diagnosis: String,
+    /// The tuning it suggests, or empty.
+    pub advice: String,
+    /// The last decision and how long ago, or empty.
+    pub last_decision: String,
+}
+
+/// One rollout.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RolloutRow {
+    /// The application.
+    pub app: String,
+    /// The rollout's id.
+    pub id: String,
+    /// The release gaining traffic.
+    pub candidate: String,
+    /// The release that served when it began.
+    pub baseline: String,
+    /// Its state: running, paused, awaiting_approval, promoted or
+    /// rolled_back.
+    pub state: String,
+    /// The candidate's share in force, in percent.
+    pub percent: u32,
+    /// What it is doing, or why it ended.
+    pub message: String,
+    /// When it last changed, as a clock time.
+    pub updated: String,
 }
 
 /// One release.
@@ -644,6 +701,8 @@ async fn respond_node(
         "/v1/apps" => json(&data.apps),
         "/v1/hosts" => json(&data.hosts),
         "/v1/routes" => json(&data.routes),
+        "/v1/scaling" => json(&data.scaling),
+        "/v1/rollouts" => json(&data.rollouts),
         "/v1/events" => json(&data.events),
         "/v1/requests" => json(&data.requests),
         _ => match path

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -238,3 +239,30 @@ def test_events_stream_as_rows_and_json(served: tuple[Daemon, int]) -> None:
     assert '"kind":"release.' in text or '"kind":"traffic.' in text
     page = fetch(port, "/")[2].decode()
     assert 'sse-connect="/v1/events/stream"' in page and 'id="event-rows"' in page
+
+
+def test_scaling_rollouts_and_maintenance_are_shown(served: tuple[Daemon, int]) -> None:
+    daemon, port = served
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "20", "--hold", "60s", "--min-requests", "1000"
+    )
+    daemon.muructl("maintenance", "on", "shop")
+
+    rollouts = fetch_json(port, "/v1/rollouts")
+    assert rollouts[0]["candidate"] == "r2" and rollouts[0]["baseline"] == "r1"
+    assert rollouts[0]["state"] == "running" and rollouts[0]["percent"] == 20
+
+    scaling = fetch_json(port, "/v1/scaling")
+    rows = {(row["release"], row["group"]): row for row in scaling}
+    assert rows[("shop@r1", "default")]["workers"] == "2"
+    assert rows[("shop@r1", "default")]["policy"].startswith("static")
+    assert rows[("shop@r1", "default")]["diagnosis"]
+
+    apps = fetch_json(port, "/v1/apps")
+    assert apps[0]["maintenance_since"]
+
+    page = fetch(port, "/")[2].decode()
+    assert "maintenance since" in page
+    assert "<h3>Rollouts</h3>" in page and "<h3>Scaling</h3>" in page

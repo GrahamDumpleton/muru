@@ -5,9 +5,9 @@
 
 A development run and the daemon each serve a read-only dashboard on a
 loopback address with charts over the last hour or day, the daemon's
-serves the same figures as JSON and streams its history and events with
-Server-Sent Events. Worker inspection views and mutating actions are
-still to come.
+serves the same figures as JSON, with rollouts, scaling and maintenance,
+and streams its history and events with Server-Sent Events. Worker
+inspection views and mutating actions are still to come.
 ```
 
 ## In development mode
@@ -40,7 +40,13 @@ listen = "127.0.0.1:8090"
   total time, 5xx responses and requests in flight;
 - every application's releases with their state, whether traffic goes to
   them, the workers listening, the slots busy and in all, and requests
-  waiting for a slot, with the virtual hosts and routes when declared;
+  waiting for a slot, with when maintenance mode began for an application
+  in it, and the virtual hosts and routes when declared;
+- the [rollouts](rollouts.md) under way and the latest that ended, with
+  the candidate's share and what each is doing or why it ended;
+- each running release's worker groups as the [autoscaler](scaling.md)
+  sees them: workers, policy, the workers' CPU, GIL wait and event loop
+  lag, the diagnosis with the tuning it suggests, and the last decision;
 - charts of requests and errors per second and of the median and 95th
   percentile total time, over the last hour at one second or, with
   `?range=24h`, the last day at one minute;
@@ -56,6 +62,8 @@ with what the page shows:
 | `/v1/apps` | applications with their releases |
 | `/v1/apps/APP/releases` | one application's releases |
 | `/v1/hosts`, `/v1/routes` | virtual hosts and routes |
+| `/v1/rollouts` | rollouts, those under way first, then the latest ten |
+| `/v1/scaling` | each running release's worker groups, as `muructl scale status` shows them |
 | `/v1/requests` | recent requests, newest first |
 | `/v1/events` | recent events, newest first |
 | `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers]`, one a second for the last hour, or one a minute for the last day with `range=24h` |

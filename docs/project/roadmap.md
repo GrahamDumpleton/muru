@@ -444,8 +444,10 @@ and the `X-Muru-Error-Override: off` opt-out; `muructl maintenance on`
 and `off` over SetMaintenance, serving 503 maintenance at the edge with
 exemptions by path, address and bypass cookie, recorded in the store,
 announced as `maintenance.changed` and marked in `muructl app list`; and
-`muru.error_reason` for handlers. Still to come: the dashboard's
-maintenance control.
+`muru.error_reason` for handlers. The daemon's dashboard shows
+maintenance mode, the rollouts and each group as the autoscaler sees
+it, on its pages and as `/v1/rollouts` and `/v1/scaling`. Still to
+come: the dashboard's maintenance control.
 
 Authentication sub-requests (section 4.16) are in: a route's `auth`
 table names an application path the edge asks, with a bodiless GET
