@@ -40,6 +40,7 @@ impl FileRules {
                 .iter()
                 .map(|class| class.name.clone())
                 .collect(),
+            ..crate::config::Defined::default()
         }
     }
 

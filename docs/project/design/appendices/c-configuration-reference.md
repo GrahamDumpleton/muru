@@ -55,6 +55,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |
+| budget.workers, budget.memory, budget.cpu | `[daemon]` | off | 7.4 |
+| priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
 | timeouts (queue_timeout, request_deadline, soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, idle_timeout) | group, route | 5s, 300s, off, off, 10s, 5s, 10s, 60s | 7.6 |
@@ -113,7 +115,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
 | Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, worker.loop_stalled, server.started, server.exited, server.failed |
-| Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
+| Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |

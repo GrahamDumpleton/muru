@@ -71,6 +71,15 @@ impl Admin for Service {
         let info = &self.handle.info;
         let apps = self.handle.store.apps().map_err(internal)?;
         let releases = self.handle.store.releases(None).map_err(internal)?;
+        let budget = {
+            let view = &info.defined.read().expect("defined names poisoned").budget;
+
+            if view.budget.is_set() {
+                view.budget.describe(&view.used)
+            } else {
+                String::new()
+            }
+        };
 
         Ok(Response::new(pb::Status {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -97,6 +106,7 @@ impl Admin for Service {
                 .dashboard
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
+            budget,
         }))
     }
 
@@ -1256,6 +1266,10 @@ impl Service {
                 .set_app_identity(app, user.as_deref(), group.as_deref(), umask.as_deref())
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::SetAppPriority { app, priority } => store
+                .set_app_priority(app, *priority)
+                .map(|()| "set".to_owned())
+                .map_err(|error| error.to_string()),
             Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
@@ -1471,6 +1485,7 @@ fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
         maintenance,
+        priority: app.priority,
     }
 }
 

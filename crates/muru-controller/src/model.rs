@@ -713,6 +713,9 @@ pub struct App {
     pub group: Option<String>,
     /// The file creation mask, in octal.
     pub umask: Option<String>,
+    /// Which applications' scale-ups the node's budget admits first, the
+    /// highest first (section 7.4).
+    pub priority: i32,
 }
 
 impl App {

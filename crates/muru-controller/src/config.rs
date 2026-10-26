@@ -44,6 +44,14 @@ pub enum Action {
         /// The umask, in octal, or none for the daemon's.
         umask: Option<String>,
     },
+    /// Set the priority by which the node's budget admits the
+    /// application's scale-ups (section 7.4).
+    SetAppPriority {
+        /// The application.
+        app: String,
+        /// The priority, 0 by default.
+        priority: i32,
+    },
     /// Create a release with this spec and move traffic to it.
     Deploy {
         /// The application.
@@ -158,6 +166,7 @@ impl Action {
         match self {
             Action::CreateApp { .. } => "create-app",
             Action::SetAppIdentity { .. } => "set-identity",
+            Action::SetAppPriority { .. } => "set-priority",
             Action::Deploy { .. } => "deploy",
             Action::RemoveRelease { .. } => "remove-release",
             Action::RemoveApp { .. } => "remove-app",
@@ -218,7 +227,8 @@ impl Change {
         match &self.action {
             Action::CreateApp { app }
             | Action::RemoveApp { app }
-            | Action::SetAppIdentity { app, .. } => app.clone(),
+            | Action::SetAppIdentity { app, .. }
+            | Action::SetAppPriority { app, .. } => app.clone(),
             Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
                 format!("{app}@{id}")
             }
@@ -347,6 +357,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune, &mut plan);
+    plan_budget(document, defined, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -422,6 +433,21 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         });
     }
 
+    let priority = app.priority.unwrap_or(0);
+
+    if stored
+        .as_ref()
+        .map_or(priority != 0, |stored| stored.priority != priority)
+    {
+        plan.changes.push(Change {
+            action: Action::SetAppPriority {
+                app: name.to_owned(),
+                priority,
+            },
+            detail: format!("priority {priority}"),
+        });
+    }
+
     // Releases are resolved as a deploy would resolve them, from the
     // table and the source's own [tool.muru], never from an earlier
     // release, so a file means the same thing wherever it is applied.
@@ -492,18 +518,19 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
     plan.changes.extend(deploys);
 }
 
-/// The changes the document's hosts imply (section 4.3): names are
-/// checked, duplicates refused and certificates read, so a bad host
-/// never reaches the edge.
-/// The rate limits (section 4.15) and client classes (section 4.14)
-/// applied files may name: the daemon's file's, and with
-/// `with_applied`, the applied files' too.
+/// What the daemon's file sets that applied files are checked against:
+/// the rate limits (section 4.15) and client classes (section 4.14) they
+/// may name, the daemon's file's and, with `with_applied`, the applied
+/// files' too, and the node's budget with what its releases hold
+/// (section 7.4).
 #[derive(Debug, Clone, Default)]
 pub struct Defined {
     /// The `[rate_limit.NAME]` tables.
     pub rate_limits: Vec<String>,
     /// The classes of the `[[client_class]]` rules.
     pub client_classes: Vec<String>,
+    /// The node's budget and what its releases hold.
+    pub budget: crate::budget::View,
 }
 
 impl Defined {
@@ -694,6 +721,57 @@ fn unknown_limits(names: &[String], defined: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Section 7.4: whether the releases the plan deploys, and the floors its
+/// schedules and overlays raise, fit the node's budget as it stands;
+/// warnings, since the node may hold less or more when they apply.
+fn plan_budget(document: &Document, defined: &Defined, plan: &mut Plan) {
+    let view = &defined.budget;
+
+    if !view.budget.is_set() {
+        return;
+    }
+
+    for change in &plan.changes {
+        if let Action::Deploy { app, id, spec } = &change.action
+            && let Err(why) = view.release_fits(app, spec, view.retained)
+        {
+            plan.warnings
+                .push(format!("{app}@{id}: {why}, so its deploy would be refused"));
+        }
+    }
+
+    let (schedules, _) = schedule_overlays(document);
+    let overlays: Vec<(String, Overlay)> = document
+        .overlay
+        .clone()
+        .into_iter()
+        .chain(schedules)
+        .collect();
+
+    for entry in &overlays {
+        for ((app, group), capacity) in crate::overlays::capacities(std::iter::once(entry)) {
+            if capacity.floor == 0 {
+                continue;
+            }
+
+            if let Err(why) = view.floor_fits(&app, &group, capacity.floor, None) {
+                let what = if crate::overlays::is_schedule(&entry.0) {
+                    "schedule"
+                } else {
+                    "overlay"
+                };
+                plan.warnings.push(format!(
+                    "{what} {}: a floor of {} workers for {app} ({group} group) does not fit the node's budget as it stands: {why}",
+                    entry.0, capacity.floor
+                ));
+            }
+        }
+    }
+}
+
+/// The changes the document's hosts imply (section 4.3): names are
+/// checked, duplicates refused and certificates read, so a bad host
+/// never reaches the edge.
 fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: &mut Plan) {
     let stored: BTreeMap<String, VirtualHost> =
         store.hosts().unwrap_or_default().into_iter().collect();
@@ -1832,6 +1910,7 @@ pub fn export(
             user: app.user.clone(),
             group: app.group.clone(),
             umask: app.umask.clone(),
+            priority: (app.priority != 0).then_some(app.priority),
             ..AppTable::default()
         };
 
@@ -4335,6 +4414,7 @@ mod tests {
         let file = Defined {
             rate_limits: vec!["crawlers".to_owned()],
             client_classes: vec!["partner".to_owned()],
+            ..Defined::default()
         };
         let class =
             |name: &str| format!("[[client_class]]\nname = '{name}'\nuser_agent = ['{name}']\n");
@@ -4424,8 +4504,8 @@ mod tests {
         let source = source_dir();
         let store = store_with_shop(&source);
         let defined = Defined {
-            rate_limits: Vec::new(),
             client_classes: vec!["partner".to_owned(), "ai_crawler".to_owned()],
+            ..Defined::default()
         };
         let routes = |extra: &str| {
             format!(

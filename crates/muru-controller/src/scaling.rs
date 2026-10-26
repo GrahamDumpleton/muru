@@ -115,6 +115,9 @@ pub struct WorkerSignals {
     /// of what a worker can use: one core with a GIL, a core per thread
     /// without.
     pub worker_cpu: Option<f64>,
+    /// CPU seconds per wall second, averaged over the workers: the cores
+    /// a worker uses, for the node's budget (section 7.4).
+    pub cores: Option<f64>,
     /// The 95th percentile wait for the GIL, in milliseconds.
     pub gil_wait_p95_ms: Option<f64>,
     /// The 95th percentile lateness of the event loop, in milliseconds.
@@ -133,6 +136,7 @@ impl WorkerSignals {
         threads: u32,
     ) -> Self {
         let mut cpu = Vec::new();
+        let mut cores = Vec::new();
         let mut gil_wait = Vec::new();
         let mut loop_lag = Vec::new();
         let wall_ms = elapsed.as_millis() as f64;
@@ -145,12 +149,15 @@ impl WorkerSignals {
             if let (Some(now), Some(then)) = (worker.cpu_ms, earlier.cpu_ms)
                 && wall_ms > 0.0
             {
-                let cores = if worker.gil_enabled {
+                let used = now.saturating_sub(then) as f64 / wall_ms;
+
+                let usable = if worker.gil_enabled {
                     1.0
                 } else {
                     threads.max(1) as f64
                 };
-                cpu.push(now.saturating_sub(then) as f64 / wall_ms / cores);
+                cores.push(used);
+                cpu.push(used / usable);
             }
 
             add_growth(&mut gil_wait, &worker.gil_wait, &earlier.gil_wait);
@@ -158,11 +165,17 @@ impl WorkerSignals {
         }
 
         Self {
-            worker_cpu: (!cpu.is_empty()).then(|| cpu.iter().sum::<f64>() / cpu.len() as f64),
+            worker_cpu: mean(&cpu),
+            cores: mean(&cores),
             gil_wait_p95_ms: p95_ms(&gil_wait),
             loop_lag_p95_ms: p95_ms(&loop_lag),
         }
     }
+}
+
+/// The mean of some values, or none without any.
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 /// Add one worker's histogram growth to a group's.
@@ -521,6 +534,29 @@ impl Scaler {
     pub fn set_workers(&mut self, workers: WorkerSignals, memory_near_limit: bool) {
         self.workers = workers;
         self.memory_near_limit = memory_near_limit;
+    }
+
+    /// What the group's workers last said about themselves.
+    pub fn worker_signals(&self) -> &WorkerSignals {
+        &self.workers
+    }
+
+    /// Section 7.4: the node's budget admitted only `to` of the workers
+    /// the last scale-out asked for from `from`; hold the group there. A
+    /// scale-out given nothing is not counted as one.
+    pub fn limit(&mut self, from: u32, to: u32, now: Instant, reason: &str) {
+        if to >= self.desired {
+            return;
+        }
+
+        if to <= from {
+            self.decisions.0 = self.decisions.0.saturating_sub(1);
+            self.requested_at = None;
+        }
+
+        self.last_step = to.saturating_sub(from).max(1);
+        self.desired = to.max(from);
+        self.last = Some((now, format!("held at {}: {reason}", self.desired)));
     }
 
     /// What holds the group back, from the latest signals.
@@ -1284,6 +1320,44 @@ mod tests {
     }
 
     #[test]
+    fn a_scale_out_the_budget_holds_back_is_asked_for_again_after_a_window() {
+        let mut scaler = Scaler::new(spare(), 1);
+        let start = Instant::now();
+        let saturated = Signals {
+            busy: 1.0,
+            total: 1.0,
+            queue_depth: 3.0,
+            ready: 1,
+            slots_per_worker: 1.0,
+            ..Signals::default()
+        };
+        let mut asked = Vec::new();
+
+        for second in 0..20 {
+            let now = start + SECOND * second;
+
+            if let Some(Decision::ScaleOut { to, .. }) = scaler.observe(now, saturated.clone()) {
+                asked.push((second, to));
+                scaler.limit(1, 1, now, "the node's worker budget is full");
+            }
+        }
+
+        assert_eq!(asked, [(5, 5), (11, 5), (17, 5)]);
+        assert_eq!(scaler.desired(), 1);
+
+        let status = scaler.status(start + SECOND * 20);
+        assert_eq!(status.decisions, (0, 0));
+        assert!(status.last.unwrap().1.starts_with("held at 1"));
+
+        // Given part of a step, the group holds what it was given.
+
+        scaler.observe(start + SECOND * 25, saturated);
+        scaler.limit(1, 3, start + SECOND * 25, "the node's memory budget");
+        assert_eq!(scaler.desired(), 3);
+        assert_eq!(scaler.status(start + SECOND * 25).decisions, (1, 0));
+    }
+
+    #[test]
     fn a_pin_overrides_the_autoscaler() {
         let mut group = Group::new(spare(), 1, 1.0);
         group.scaler.pin(3, group.start);
@@ -1489,6 +1563,7 @@ mod tests {
             4,
         );
         assert_eq!(free.worker_cpu, Some(0.2));
+        assert_eq!(free.cores, Some(0.8));
     }
 
     #[test]

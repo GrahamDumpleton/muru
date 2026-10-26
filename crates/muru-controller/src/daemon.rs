@@ -70,6 +70,8 @@ pub struct Config {
     /// Whether `muructl debug exec` may run code in workers (section
     /// 11.7).
     pub debug_exec: bool,
+    /// The node's budget (section 7.4).
+    pub budget: crate::budget::Budget,
     /// Trusted proxies and the headers taken from them (section 4.7).
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
@@ -432,6 +434,9 @@ struct GroupScaling {
     threads: u32,
     /// The soft memory limit and what it measures, when one is set.
     memory_limit: Option<(muru_config::Measure, u64)>,
+    /// The last scale-out the node's budget held back: the count asked
+    /// for, the count given and the limit, so each is one event.
+    denied: Option<(u32, u32, crate::budget::Limit)>,
 }
 
 /// What the API needs to talk to a running daemon.
@@ -587,12 +592,74 @@ struct Running {
     signals_from: Option<(Instant, Vec<crate::host::WorkerStatus>)>,
     /// Section 7.4: each worker group's autoscaler, the default first.
     scalers: Vec<GroupScaling>,
+    /// The host's own proportional set size, where it can be read, for
+    /// the node's memory budget.
+    host_pss: Option<u64>,
     /// When each worker socket entered routing, for the age of the
     /// youngest worker.
     ready_at: HashMap<PathBuf, Instant>,
 }
 
 impl Running {
+    /// Section 7.4: what one worker of a group costs, from its workers'
+    /// mean proportional set size and CPU, the soft memory limit standing
+    /// in before any has reported, then `fallback`.
+    fn worker_cost(&self, group: &GroupScaling, fallback: Option<u64>) -> crate::budget::Cost {
+        let sizes: Vec<u64> = self
+            .status
+            .iter()
+            .filter(|worker| worker.group == group.name)
+            .filter_map(|worker| worker.pss)
+            .collect();
+        let measured = (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64);
+
+        crate::budget::Cost {
+            memory: measured
+                .or(group.memory_limit.map(|(_, limit)| limit))
+                .or(fallback),
+            cpu: group.scaler.worker_signals().cores,
+        }
+    }
+
+    /// A group's workers, as the sockets the host announced; none for a
+    /// group it has not announced yet.
+    fn group_sockets(&self, group: &str) -> Option<&[PathBuf]> {
+        if group == muru_edge::routing::DEFAULT_GROUP {
+            return Some(&self.sockets);
+        }
+
+        self.groups
+            .iter()
+            .find(|record| record.name == group)
+            .map(|record| record.sockets.as_slice())
+    }
+
+    /// Section 7.4: what the release holds against the node's budget:
+    /// each group at the larger of the workers it has and the count its
+    /// autoscaler is bringing it to, at what a worker costs, and the
+    /// host's own memory; a managed server's instances count as workers.
+    fn usage(&self, fallback: Option<u64>) -> crate::budget::Usage {
+        let mut usage = crate::budget::Usage::default();
+
+        if matches!(self.backend, Backend::Servers(_)) {
+            usage.workers = self.workers() as u32;
+            return usage;
+        }
+
+        for group in &self.scalers {
+            let mut count = self.group_sockets(&group.name).map_or(0, <[PathBuf]>::len) as u32;
+
+            if self.retained_until.is_none() {
+                count = count.max(group.scaler.desired());
+            }
+
+            usage.add(count, self.worker_cost(group, fallback));
+        }
+
+        usage.memory += self.host_pss.unwrap_or(0);
+        usage
+    }
+
     /// The processes serving: workers in every group, or a managed
     /// server's instances.
     fn workers(&self) -> usize {
@@ -652,6 +719,10 @@ struct Daemon {
     service: Option<crate::host::Identity>,
     /// Whether `muructl debug exec` may run code in workers.
     debug_exec: bool,
+    /// Section 7.4: the node's budget, and the schedule windows already
+    /// checked against it, by overlay and start.
+    budget: crate::budget::Budget,
+    budget_checked: BTreeSet<(String, u64)>,
     /// The points the dashboard's charts draw, one a second.
     history: Arc<muru_dashboard::History>,
     /// Turns the edge's counters into those points.
@@ -847,7 +918,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        defined: std::sync::RwLock::new(client_rules.defined()),
+        defined: std::sync::RwLock::new(crate::config::Defined {
+            budget: crate::budget::View {
+                budget: config.budget,
+                ..crate::budget::View::default()
+            },
+            ..client_rules.defined()
+        }),
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -968,6 +1045,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
         debug_exec: config.debug_exec,
+        budget: config.budget,
+        budget_checked: BTreeSet::new(),
         history,
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
@@ -1881,6 +1960,13 @@ impl Daemon {
             directory: config_directory(&path),
         };
         let clients = client_rules.policies(&self.store)?;
+        let budget = crate::budget::Budget::from_table(
+            document
+                .daemon
+                .as_ref()
+                .and_then(|table| table.budget.as_ref()),
+        )
+        .map_err(|error| format!("[daemon.budget]: {error}"))?;
         let changed = proxy != self.proxy
             || compression != self.compression
             || error_pages != self.error_pages
@@ -1891,7 +1977,10 @@ impl Daemon {
         self.compression = compression;
         self.error_pages = error_pages;
         self.error_override = error_override;
-        *self.info.defined.write().expect("defined names poisoned") = client_rules.defined();
+        self.budget = budget;
+        let mut defined = client_rules.defined();
+        defined.budget = self.budget_view(self.budget_usage());
+        *self.info.defined.write().expect("defined names poisoned") = defined;
         self.client_rules = client_rules;
         self.clients = clients;
 
@@ -1900,13 +1989,14 @@ impl Daemon {
         }
 
         let message = format!(
-            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}, and the budget is {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
             } else {
                 "are unchanged"
-            }
+            },
+            self.budget.describe(&self.budget_usage())
         );
         self.events
             .emit("config.reloaded", "daemon", "info", &message);
@@ -2677,6 +2767,7 @@ impl Daemon {
                         status: Vec::new(),
                         signals_from: None,
                         scalers,
+                        host_pss: None,
                         ready_at,
                     },
                 );
@@ -2762,6 +2853,7 @@ impl Daemon {
                         status: Vec::new(),
                         signals_from: None,
                         scalers: Vec::new(),
+                        host_pss: None,
                         ready_at: HashMap::new(),
                     },
                 );
@@ -3002,6 +3094,11 @@ impl Daemon {
         hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
+        if let Err(error) = self.make_room(app, &spec).await {
+            let _ = created.send(Err(error.clone()));
+            return Err(error);
+        }
+
         let record = self.create(app, spec, id);
 
         let release = match record {
@@ -3296,6 +3393,7 @@ impl Daemon {
                 status: Vec::new(),
                 signals_from: None,
                 scalers,
+                host_pss: None,
                 ready_at,
             },
         );
@@ -3487,6 +3585,7 @@ impl Daemon {
                 status: Vec::new(),
                 signals_from: None,
                 scalers: Vec::new(),
+                host_pss: None,
                 ready_at: HashMap::new(),
             },
         );
@@ -4072,6 +4171,7 @@ impl Daemon {
             }
         }
 
+        self.make_room_for(app, candidate).await?;
         self.start(app, candidate).await?;
 
         if let Some(running) = self
@@ -4376,6 +4476,7 @@ impl Daemon {
             return Err(format!("{app}@{id} already serves"));
         }
 
+        self.make_room_for(app, id).await?;
         self.start(app, id).await?;
         self.switch_to(app, id).await;
         self.store
@@ -4613,7 +4714,12 @@ impl Daemon {
                 running.sticky_until = None;
             }
 
-            match self.start(app, id).await {
+            let started_now = match self.make_room_for(app, id).await {
+                Ok(()) => self.start(app, id).await,
+                Err(error) => Err(error),
+            };
+
+            match started_now {
                 Ok(()) => started.push(key),
                 Err(error) => {
                     let why = if warming.contains(&key) {
@@ -4661,8 +4767,9 @@ impl Daemon {
 
     /// Section 7.4: feed every running release's scalers what the edge
     /// reports and carry out their decisions, each one an event with its
-    /// reasons. A group whose count is not what its scaler wants, after a
-    /// restart or a restored pin, is asked for again.
+    /// reasons, scale-outs once the node's budget admits them. A group
+    /// whose count is not what its scaler wants, after a restart or a
+    /// restored pin, is asked for again.
     async fn autoscale(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
         let Some(samples) = samples else {
             return;
@@ -4671,6 +4778,21 @@ impl Daemon {
         let mut requests: Vec<(String, String, String, u32)> = Vec::new();
         let mut emitted: Vec<(&'static str, String, &'static str, String)> = Vec::new();
         let mut capacities = self.capacities();
+
+        // Scale-outs are admitted against what the releases hold before
+        // any of them, the highest application priority first.
+
+        let fallback = self.node_mean_pss();
+        let used = self.budget_usage();
+        let priorities: HashMap<String, i32> = self
+            .store
+            .apps()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|app| (app.name, app.priority))
+            .collect();
+        let mut asks = Vec::new();
+        let mut reasons: HashMap<(String, String, String), (u32, String)> = HashMap::new();
 
         for ((app, id), running) in &mut self.running {
             // A retained release is at its warm floor (section 9.1), not
@@ -4682,18 +4804,11 @@ impl Daemon {
 
             let subject = format!("{app}@{id}");
 
-            for group in &mut running.scalers {
-                let sockets = if group.name == muru_edge::routing::DEFAULT_GROUP {
-                    &running.sockets
-                } else {
-                    match running
-                        .groups
-                        .iter()
-                        .find(|record| record.name == group.name)
-                    {
-                        Some(record) => &record.sockets,
-                        None => continue,
-                    }
+            for index in 0..running.scalers.len() {
+                let cost = running.worker_cost(&running.scalers[index], fallback);
+                let name = running.scalers[index].name.clone();
+                let Some(sockets) = running.group_sockets(&name) else {
+                    continue;
                 };
                 let ready = sockets.len() as u32;
                 let youngest = sockets
@@ -4701,6 +4816,7 @@ impl Daemon {
                     .filter_map(|socket| running.ready_at.get(socket))
                     .max()
                     .map(|at| now.saturating_duration_since(*at));
+                let group = &mut running.scalers[index];
                 let advisory = group.scaler.spec().advisory;
                 group.scaler.set_capacity(capacities.remove(&(
                     app.clone(),
@@ -4712,6 +4828,7 @@ impl Daemon {
                     group.scaler.sync(ready);
                 }
 
+                let before = group.scaler.desired();
                 let signals = Signals::from_samples(
                     samples,
                     app,
@@ -4723,6 +4840,21 @@ impl Daemon {
                 );
 
                 match group.scaler.observe(now, signals) {
+                    Some(Decision::ScaleOut { to, reason }) if !advisory => {
+                        let reason = format!(
+                            "{reason}; {}",
+                            describe_diagnosis(&group.scaler.diagnosis())
+                        );
+                        let key = (app.clone(), id.clone(), name);
+                        reasons.insert(key.clone(), (ready, reason));
+                        asks.push(crate::budget::Ask {
+                            key,
+                            priority: priorities.get(app).copied().unwrap_or(0),
+                            from: before,
+                            to,
+                            cost,
+                        });
+                    }
                     Some(Decision::ScaleOut { to, reason } | Decision::ScaleIn { to, reason }) => {
                         let diagnosis = group.scaler.diagnosis();
                         emitted.push((
@@ -4748,10 +4880,80 @@ impl Daemon {
                     }
                     None => {}
                 }
+            }
+        }
 
+        for admitted in crate::budget::admit(&self.budget, used, asks) {
+            let (app, id, name) = &admitted.ask.key;
+            let Some(group) = self
+                .running
+                .get_mut(&(app.clone(), id.clone()))
+                .and_then(|running| running.scalers.iter_mut().find(|group| &group.name == name))
+            else {
+                continue;
+            };
+
+            let subject = format!("{app}@{id}");
+            let (ready, reason) = reasons.remove(&admitted.ask.key).unwrap_or_default();
+            let from = admitted.ask.from;
+
+            match admitted.limit {
+                Some(limit) => {
+                    let held = format!(
+                        "the node's {limit} budget ({})",
+                        self.budget.describe(&used)
+                    );
+                    group.scaler.limit(from, admitted.to, now, &held);
+                    let denial = (admitted.ask.to, admitted.to, limit);
+
+                    if group.denied != Some(denial) {
+                        group.denied = Some(denial);
+                        emitted.push((
+                            "scaling.denied_by_budget",
+                            subject.clone(),
+                            "warning",
+                            format!(
+                                "{name}: {} of the {} more workers asked for fit {held}, at priority {}",
+                                admitted.to - from,
+                                admitted.ask.to - from,
+                                admitted.ask.priority
+                            ),
+                        ));
+                    }
+                }
+                None => group.denied = None,
+            }
+
+            if admitted.to > from {
+                emitted.push((
+                    "scaling.decision",
+                    subject,
+                    "info",
+                    decision_message(name, ready, admitted.to, &reason, false),
+                ));
+            }
+        }
+
+        for ((app, id), running) in &mut self.running {
+            if running.retained_until.is_some() || running.control.is_none() {
+                continue;
+            }
+
+            for index in 0..running.scalers.len() {
+                let Some(ready) = running
+                    .group_sockets(&running.scalers[index].name)
+                    .map(|sockets| sockets.len() as u32)
+                else {
+                    continue;
+                };
+
+                let group = &mut running.scalers[index];
                 let desired = group.scaler.desired();
 
-                if !advisory && desired != ready && group.requested != Some(desired) {
+                if !group.scaler.spec().advisory
+                    && desired != ready
+                    && group.requested != Some(desired)
+                {
                     group.requested = Some(desired);
                     requests.push((app.clone(), id.clone(), group.name.clone(), desired));
                 }
@@ -4765,6 +4967,220 @@ impl Daemon {
         for (app, id, group, processes) in requests {
             self.ask_scale(&app, &id, &group, processes);
         }
+
+        // Section 9.1: over the memory budget, retained releases make way,
+        // the oldest first, one a tick.
+
+        if self
+            .budget
+            .memory
+            .is_some_and(|memory| used.memory > memory)
+            && let Some((app, id)) = self.oldest_retained(None)
+        {
+            self.stop_release(&app, &id, "the node is over its memory budget")
+                .await;
+        }
+
+        let view = self.budget_view(used);
+        self.check_floors_ahead(&view);
+        self.info
+            .defined
+            .write()
+            .expect("defined names poisoned")
+            .budget = view;
+    }
+
+    /// Section 7.5: each window of a schedule or overlay that raises a
+    /// floor is checked against the node's budget once ahead of it, from
+    /// the start of its warm-up's lead or `BUDGET_LEAD` before it,
+    /// whichever is longer, with an event when it does not fit.
+    fn check_floors_ahead(&mut self, view: &crate::budget::View) {
+        if !self.budget.is_set() {
+            return;
+        }
+
+        let now = now_unix_ms();
+        let overlays = self.store.overlays().unwrap_or_default();
+
+        for entry in &overlays {
+            let (name, overlay) = entry;
+            let Some((start, _)) = crate::overlays::window(overlay, now) else {
+                continue;
+            };
+            let lead = overlay
+                .warm_up
+                .as_ref()
+                .and_then(|warm_up| muru_config::parse_duration(&warm_up.lead).ok())
+                .unwrap_or_default()
+                .max(BUDGET_LEAD);
+
+            if now >= start
+                || start > now + lead.as_millis() as u64
+                || !self.budget_checked.insert((name.clone(), start))
+            {
+                continue;
+            }
+
+            for ((app, group), capacity) in crate::overlays::capacities(std::iter::once(entry)) {
+                if capacity.floor == 0 {
+                    continue;
+                }
+
+                if let Err(why) = view.floor_fits(&app, &group, capacity.floor, None) {
+                    self.events.emit(
+                        "schedule.over_budget",
+                        &format!("overlay {name}"),
+                        "warning",
+                        &format!(
+                            "the window from {}: a floor of {} workers for {app} ({group} group) does not fit the node's budget as it stands: {why}",
+                            clock(start),
+                            capacity.floor
+                        ),
+                    );
+                }
+            }
+        }
+
+        self.budget_checked.retain(|(_, start)| *start > now);
+    }
+
+    /// Section 7.4: the mean proportional set size of every worker that
+    /// reported one, standing in for a group's that is not known.
+    fn node_mean_pss(&self) -> Option<u64> {
+        let sizes: Vec<u64> = self
+            .running
+            .values()
+            .flat_map(|running| running.status.iter().filter_map(|worker| worker.pss))
+            .collect();
+        (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64)
+    }
+
+    /// Section 7.4: what the running releases hold against the node's
+    /// budget.
+    fn budget_usage(&self) -> crate::budget::Usage {
+        let fallback = self.node_mean_pss();
+        let mut used = crate::budget::Usage::default();
+
+        for running in self.running.values() {
+            used.add_usage(&running.usage(fallback));
+        }
+
+        used
+    }
+
+    /// Section 7.4: the node's budget and what its releases hold, for the
+    /// checks before a release starts and on schedules.
+    fn budget_view(&self, used: crate::budget::Usage) -> crate::budget::View {
+        let fallback = self.node_mean_pss();
+        let mut view = crate::budget::View {
+            budget: self.budget,
+            used,
+            fallback,
+            ..crate::budget::View::default()
+        };
+
+        for ((app, id), running) in &self.running {
+            if running.retained_until.is_some() {
+                view.retained += running.usage(fallback).memory;
+                continue;
+            }
+
+            if self.serving.get(app) != Some(id) {
+                continue;
+            }
+
+            if let Some(pss) = running.host_pss {
+                view.hosts.insert(app.clone(), pss);
+            }
+
+            for group in &running.scalers {
+                let held = running
+                    .group_sockets(&group.name)
+                    .map_or(0, <[PathBuf]>::len) as u32;
+                view.groups.insert(
+                    (app.clone(), group.name.clone()),
+                    (
+                        held.max(group.scaler.desired()),
+                        running.worker_cost(group, None),
+                    ),
+                );
+            }
+        }
+
+        view
+    }
+
+    /// Section 13.6: before a release starts, whether its memory fits the
+    /// node's budget, retained releases making way, the oldest first,
+    /// when that is enough; refused with a `scaling.denied_by_budget`
+    /// event when it is not.
+    async fn make_room(&mut self, app: &str, spec: &ReleaseSpec) -> Result<(), String> {
+        if self.budget.memory.is_none() {
+            return Ok(());
+        }
+
+        let view = self.budget_view(self.budget_usage());
+
+        if let Err(why) = view.release_fits(app, spec, view.retained) {
+            let message = if view.retained > 0 {
+                format!("{app}: {why}, even with the retained releases stopped")
+            } else {
+                format!("{app}: {why}")
+            };
+            self.events
+                .emit("scaling.denied_by_budget", app, "warning", &message);
+            return Err(format!("not started: {message}"));
+        }
+
+        while self
+            .budget_view(self.budget_usage())
+            .release_fits(app, spec, 0)
+            .is_err()
+        {
+            let Some((other_app, other_id)) = self.oldest_retained(None) else {
+                break;
+            };
+            self.stop_release(
+                &other_app,
+                &other_id,
+                &format!("making room in the node's memory budget for {app}"),
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// `make_room` for a recorded release that is not running.
+    async fn make_room_for(&mut self, app: &str, id: &str) -> Result<(), String> {
+        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return Ok(());
+        }
+
+        let release = self
+            .store
+            .release(app, id)
+            .map_err(|error| error.to_string())?;
+        self.make_room(app, &release.spec).await
+    }
+
+    /// Section 9.1: the retained release created first, other than one
+    /// of `except`'s application, which make way under memory pressure.
+    fn oldest_retained(&self, except: Option<&str>) -> Option<(String, String)> {
+        self.running
+            .iter()
+            .filter(|((app, _), running)| {
+                running.retained_until.is_some() && except != Some(app.as_str())
+            })
+            .map(|((app, id), _)| {
+                let created = self
+                    .store
+                    .release(app, id)
+                    .map_or(0, |release| release.created_unix_ms);
+                (created, app.clone(), id.clone())
+            })
+            .min()
+            .map(|(_, app, id)| (app, id))
     }
 
     /// Section 7.5: the capacity active overlays and schedules set, and
@@ -5513,6 +5929,17 @@ impl Daemon {
                         }
                     }
 
+                    // Section 7.4: the host is measured when its workers
+                    // are, for the node's memory budget.
+
+                    if workers.iter().any(|worker| worker.pss.is_some()) {
+                        running.host_pss = running
+                            .backend
+                            .host()
+                            .and_then(HostProcess::pid)
+                            .and_then(crate::budget::process_pss);
+                    }
+
                     running.status = workers;
                 }
             }
@@ -5895,6 +6322,7 @@ fn scalers_for(
         requested: None,
         threads: threads(spec.threads, spec.sync_threads),
         memory_limit,
+        denied: None,
     }];
 
     for group in &spec.groups {
@@ -5909,6 +6337,7 @@ fn scalers_for(
             requested: None,
             threads: threads(group.threads, group.sync_threads),
             memory_limit,
+            denied: None,
         });
     }
 
@@ -5920,6 +6349,10 @@ fn scalers_for(
 
     scalers
 }
+
+/// Section 7.5: how long before a window raising a floor, at least, it
+/// is checked against the node's budget.
+const BUDGET_LEAD: Duration = Duration::from_secs(15 * 60);
 
 /// How often the clock's synchronisation is checked.
 const CLOCK_CHECK: Duration = Duration::from_secs(600);

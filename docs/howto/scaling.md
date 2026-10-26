@@ -5,9 +5,8 @@
 
 The spare and target modes with their windows and churn budget, pins,
 scheduled capacity, the workers' CPU, GIL wait and event loop lag with
-a diagnosis of each group, and `muructl scale status`, under the
-daemon. Node budgets across applications and scale to zero are still
-to come.
+a diagnosis of each group, `muructl scale status` and the node's budget
+across applications, under the daemon. Scale to zero is still to come.
 ```
 
 A worker group has a fixed number of processes unless it is given a
@@ -174,6 +173,69 @@ This makes a temporary overlay, `shop:scale` or `shop:scale:reports`,
 which the next such command for the group replaces, `muructl overlay end`
 ends early, and which is forgotten once it ends. `muructl apply` leaves it
 alone and `muructl config export` does not write it.
+
+## The node's budget
+
+The `[daemon.budget]` table of the daemon's configuration file caps what
+the releases on the node hold between them:
+
+```toml
+[daemon.budget]
+workers = 32
+memory = '12GB'
+cpu = 6
+```
+
+| Key | Limit |
+| --- | --- |
+| `workers` | Worker processes, and managed server instances, across every release |
+| `memory` | Memory for the hosts and their workers |
+| `cpu` | CPU cores the workers use |
+
+Each limit is off when it is left out, and `muructl daemon reload` picks
+up a change. A worker counts at what its group's workers measure, its
+proportional set size and the CPU it uses, and before any has reported at
+the group's `memory.soft_limit`, else at the mean of the node's workers.
+On Linux each host counts at its own memory too. `muructl daemon status`
+shows what is held:
+
+```console
+$ muructl daemon status
+...
+budget   27 of 32 workers, 9.8GB of 12GB memory, 3.1 of 6 cores
+```
+
+A scale-out, including the climb to a schedule's floor, is given as many
+of the workers it asks for as still fit. When several groups want more at
+once, applications with a higher `priority` go first:
+
+```toml
+[app.shop]
+priority = 10
+```
+
+The priority is 0 when it is not set, and may be negative. A group given
+fewer workers than it asked for stays at what it was given, shown as
+`held at` in `muructl scale status`, and asks again once its rule has held
+for another scale-out window. Each new shortfall is a
+`scaling.denied_by_budget` event. Workers already running are not stopped
+to make room for another application, a pin is not limited by the budget,
+and an advisory policy reports without it.
+
+Before a release starts for a deploy, a rollout or a traffic policy, its
+memory is estimated from the application's serving release, else from
+its `memory.soft_limit`. When it fits only with the retained releases
+gone, they are stopped, oldest first; when it does not fit even then, the
+deploy is refused with a `scaling.denied_by_budget` event and no release
+is recorded. A rollback, and the releases the daemon starts again after a
+restart, are not held back. While the node is over its memory budget,
+retained releases are stopped, oldest first.
+
+`muructl apply` warns of a release, a schedule or an overlay whose floor
+would not fit the budget as it stands, and each window that raises a
+floor is checked again ahead of time, from the start of its `warm_up` or
+15 minutes before it, whichever is earlier, with a `schedule.over_budget`
+event when it would not fit.
 
 ## Watching and overriding
 

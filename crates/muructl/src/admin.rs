@@ -270,6 +270,13 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
             .as_ref()
             .and_then(|table| table.debug_exec)
             .unwrap_or(false),
+        budget: muru_controller::budget::Budget::from_table(
+            document
+                .daemon
+                .as_ref()
+                .and_then(|table| table.budget.as_ref()),
+        )
+        .map_err(|error| anyhow::anyhow!("[daemon.budget]: {error}"))?,
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
         error_pages: document.error_pages.clone(),
@@ -1602,6 +1609,11 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
     println!("apps     {} ({} releases)", status.apps, status.releases);
+
+    if !status.budget.is_empty() {
+        println!("budget   {}", status.budget);
+    }
+
     Ok(())
 }
 
@@ -2779,7 +2791,7 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             format!("{}:{}", app.user, app.group)
         };
         println!(
-            "{:<20} {:<12} {:<12} {user}{}{}",
+            "{:<20} {:<12} {:<12} {user}{}{}{}",
             app.name,
             or_dash(&app.current_release),
             or_dash(&app.previous_release),
@@ -2787,6 +2799,11 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
                 String::new()
             } else {
                 format!(" umask {}", app.umask)
+            },
+            if app.priority == 0 {
+                String::new()
+            } else {
+                format!(" [priority {}]", app.priority)
             },
             if app.maintenance {
                 " [maintenance]"

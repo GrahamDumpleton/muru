@@ -710,7 +710,7 @@ pub struct Logs {
 
 /// The `[daemon]` table of the daemon's file: how the daemon itself runs
 /// (ADR 0026).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Daemon {
     /// The service user: whom a daemon that runs as root starts the edge,
@@ -722,6 +722,25 @@ pub struct Daemon {
     /// 11.7); off unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_exec: Option<bool>,
+    /// The node's budget across every application (section 7.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+}
+
+/// The `[daemon.budget]` table (section 7.4): what the releases on the
+/// node may hold between them. Each limit is off when omitted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    /// Worker processes and managed server instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<u32>,
+    /// Memory for the hosts and workers, as a size such as 12GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// CPU cores the workers use, as measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
 }
 
 /// The `[secrets]` table of the daemon's file (section 10.8).
@@ -3137,6 +3156,10 @@ pub struct App {
     /// The file creation mask, in octal, for example 027.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub umask: Option<String>,
+    /// Which applications' scale-ups the node's budget admits first, the
+    /// highest first (section 7.4); 0 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -3331,6 +3354,10 @@ impl Document {
                 entry.user = app.user;
                 entry.group = app.group;
                 entry.umask = app.umask;
+            }
+
+            if app.priority.is_some() {
+                entry.priority = app.priority;
             }
 
             for (id, release) in app.release {

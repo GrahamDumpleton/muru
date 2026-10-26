@@ -286,8 +286,14 @@ through step, ramp, sawtooth, bursty and budget scenarios in unit tests.
 The workers' CPU, GIL wait and event loop lag followed, reported to the
 host with their memory and turned into rates by the daemon, with the
 diagnosis table naming each group's bottleneck in every decision and in
-`muructl scale status`. Still to come: the node budget manager across
-applications, and scale to zero.
+`muructl scale status`. The node budget manager came next: the daemon
+file's `[daemon.budget]` table caps the workers, memory and CPU the
+releases hold between them, measured from what the workers and hosts
+report, and scale-outs are admitted against it, the highest application
+`priority` first and in part when only part fits, each shortfall a
+`scaling.denied_by_budget` event; a release is not started when its
+memory does not fit, after the retained releases have made way, and
+`muructl daemon status` shows what is held. Still to come: scale to zero.
 
 Scheduled capacity (section 7.5) is in: `[[app.NAME.schedule]]` entries,
 one-off or recurring, raise a worker group's floor and ceiling for their
@@ -297,8 +303,8 @@ overlay named `APP.NAME`, overlays set the same keys under `apps.NAME`,
 and `muructl scale --min N --until TIME` makes a temporary one. Deploy
 freezes (section 9.6) refuse deploys, deploying applies, rollouts and
 promotions of a frozen application unless `--override-freeze` is given,
-recorded as an event, and hold rollouts under way. Still to come:
-checking budgets for schedules, with the node budget manager.
+recorded as an event, and hold rollouts under way. Schedules are checked
+against the node's budget when applied and ahead of each window.
 
 The soft timeout (section 7.6) is in: `soft_timeout` in the `timeouts`
 table or `--timeout soft=` starts a watchdog thread in each worker that

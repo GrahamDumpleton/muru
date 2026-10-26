@@ -121,6 +121,7 @@ message Status {
   uint32 edge_pid = 10;             // the edge process serving the listeners
   string metrics = 11;              // the metrics listener's address, or empty
   string dashboard = 12;            // the dashboard's address, or empty
+  string budget = 13;               // what the releases hold of the node's budget (section 7.4), or empty without one
 }
 
 message ListAppsRequest {}
@@ -143,6 +144,7 @@ message App {
   string group = 7;
   string umask = 8;                 // octal
   bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
+  int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first (section 7.4)
 }
 
 // A deploy names the application (created on first use) and the source.

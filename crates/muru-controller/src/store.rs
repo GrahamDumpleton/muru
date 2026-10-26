@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// The store.
 pub struct Store {
@@ -150,8 +150,9 @@ impl Store {
         // are added to an older table here; version 5 added the
         // applications in maintenance mode (section 4.12), version 6 the
         // HTTP upstreams, version 7 overlays and their state (section
-        // 9.10) and version 8 the client classes and rate limits of
-        // applied files (sections 4.14 and 4.15).
+        // 9.10), version 8 the client classes and rate limits of applied
+        // files (sections 4.14 and 4.15) and version 9 the application's
+        // priority (section 7.4), added to an older table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -197,7 +198,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask FROM apps ORDER BY name",
+                 user, grp, umask, priority FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -211,7 +212,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask FROM apps WHERE name = ?1",
+                     user, grp, umask, priority FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -234,6 +235,24 @@ impl Store {
                 "UPDATE apps SET user = ?2, grp = ?3, umask = ?4, \
                  resource_version = resource_version + 1 WHERE name = ?1",
                 params![name, user, group, umask],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("application {name}")));
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Set the priority by which the node's budget admits an
+    /// application's scale-ups (section 7.4).
+    pub fn set_app_priority(&self, name: &str, priority: i32) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE apps SET priority = ?2, resource_version = resource_version + 1 \
+                 WHERE name = ?1",
+                params![name, priority],
             )?;
 
             if changed == 0 {
@@ -972,20 +991,26 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         user: row.get(5)?,
         group: row.get(6)?,
         umask: row.get(7)?,
+        priority: row.get::<_, Option<i64>>(8)?.unwrap_or(0) as i32,
     })
 }
 
-/// Add the identity columns of version 4 to an applications table that
-/// predates them.
+/// Add the identity columns of version 4, and the priority of version
+/// 9, to an applications table that predates them.
 fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection.prepare("PRAGMA table_info(apps)")?;
     let columns: Vec<String> = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    for column in ["user", "grp", "umask"] {
+    for (column, kind) in [
+        ("user", "TEXT"),
+        ("grp", "TEXT"),
+        ("umask", "TEXT"),
+        ("priority", "INTEGER"),
+    ] {
         if !columns.iter().any(|name| name == column) {
-            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} TEXT"), [])?;
+            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} {kind}"), [])?;
         }
     }
 
