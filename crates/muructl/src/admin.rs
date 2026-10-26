@@ -583,7 +583,8 @@ pub enum DebugCommand {
     Inspect(DebugArgs),
 
     /// Sample every thread's stack for a period, merged across the
-    /// workers, as collapsed stacks for a flame graph.
+    /// workers, as collapsed stacks for a flame graph or as pstats; with
+    /// --requests or --path, only the requests chosen.
     Profile(ProfileArgs),
 
     /// Count calls and time every Python function with sys.monitoring
@@ -638,9 +639,33 @@ pub struct ProfileArgs {
     #[arg(long, value_name = "DURATION", default_value = "10ms", value_parser = muru_config::parse_duration)]
     interval: Duration,
 
-    /// Write the collapsed stacks here rather than to standard output.
+    /// Sample only the threads serving requests whose path starts with
+    /// this.
+    #[arg(long, value_name = "PREFIX")]
+    path: Option<String>,
+
+    /// End once this many of the requests sampled have finished, within
+    /// --for.
+    #[arg(long, value_name = "N")]
+    requests: Option<u32>,
+
+    /// Collapsed stacks for a flame graph, or pstats, which needs
+    /// --output.
+    #[arg(long, value_enum, default_value_t = ProfileFormat::Collapsed)]
+    format: ProfileFormat,
+
+    /// Write the profile here rather than to standard output.
     #[arg(long, short, value_name = "FILE")]
     output: Option<PathBuf>,
+}
+
+/// How `muructl debug profile` writes the samples.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProfileFormat {
+    /// One line per stack, root first, and its count.
+    Collapsed,
+    /// Python's pstats, from the samples.
+    Pstats,
 }
 
 /// `muructl debug trace`.
@@ -732,6 +757,13 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         return attach(args).await;
     }
 
+    if let DebugCommand::Profile(profile) = &command
+        && profile.format == ProfileFormat::Pstats
+        && profile.output.is_none()
+    {
+        anyhow::bail!("--format pstats writes a binary file, so it needs --output");
+    }
+
     // Section 11.7: an operation over a period gives the host that long
     // and a little more before it gives up on a worker.
 
@@ -748,6 +780,8 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
             serde_json::json!({
                 "duration_s": profile.duration.as_secs_f64(),
                 "interval_ms": profile.interval.as_secs_f64() * 1000.0,
+                "requests": profile.requests.unwrap_or(0),
+                "path": profile.path.clone().unwrap_or_default(),
                 "timeout_s": period(profile.duration),
             }),
         ),
@@ -794,7 +828,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Stacks(_) => print_stacks(&response),
         DebugCommand::Tasks(_) => print_tasks(&response),
         DebugCommand::Inspect(_) => print_inspect(&response),
-        DebugCommand::Profile(profile) => write_profile(&response, profile.output.as_deref())?,
+        DebugCommand::Profile(profile) => write_profile(&response, profile)?,
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
         DebugCommand::Exec(_) => print_exec(&response),
@@ -976,14 +1010,17 @@ where
     }
 }
 
-/// Merge the workers' collapsed stacks and write them, heaviest first,
-/// with the functions that took most samples on standard error.
-fn write_profile(response: &pb::DebugResponse, output: Option<&Path>) -> anyhow::Result<()> {
+/// Merge the workers' collapsed stacks and write them, heaviest first, or
+/// as pstats, with the functions that took most samples on standard
+/// error.
+fn write_profile(response: &pb::DebugResponse, profile: &ProfileArgs) -> anyhow::Result<()> {
     use std::io::Write as _;
 
+    let output = profile.output.as_deref();
     let mut stacks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut leaves: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut rounds = 0;
+    let mut requests = 0;
 
     for answer in &response.workers {
         let Some(result) = parse_result(answer) else {
@@ -995,6 +1032,7 @@ fn write_profile(response: &pb::DebugResponse, output: Option<&Path>) -> anyhow:
         };
 
         rounds += result["rounds"].as_u64().unwrap_or(0);
+        requests += result["requests"].as_u64().unwrap_or(0);
 
         for (stack, count) in result["stacks"].as_object().into_iter().flatten() {
             let count = count.as_u64().unwrap_or(0);
@@ -1014,11 +1052,19 @@ fn write_profile(response: &pb::DebugResponse, output: Option<&Path>) -> anyhow:
         text.push_str(&format!("{stack} {count}\n"));
     }
 
+    let bytes = match profile.format {
+        ProfileFormat::Collapsed => text.into_bytes(),
+        ProfileFormat::Pstats => crate::pstats::encode(
+            stacks.iter().map(|(stack, count)| (stack.as_str(), *count)),
+            profile.interval.as_secs_f64(),
+        ),
+    };
+
     match output {
         Some(path) => {
-            std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?
+            std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?
         }
-        None => std::io::stdout().write_all(text.as_bytes())?,
+        None => std::io::stdout().write_all(&bytes)?,
     }
 
     let total: u64 = leaves.values().sum();
@@ -1037,8 +1083,20 @@ fn write_profile(response: &pb::DebugResponse, output: Option<&Path>) -> anyhow:
         );
     }
 
+    if profile.requests.is_some() || profile.path.is_some() {
+        eprintln!(
+            "{requests} request{} sampled to the end",
+            if requests == 1 { "" } else { "s" }
+        );
+    }
+
     if let Some(path) = output {
-        eprintln!("muru: collapsed stacks written to {}", path.display());
+        let what = match profile.format {
+            ProfileFormat::Collapsed => "collapsed stacks",
+            ProfileFormat::Pstats => "pstats",
+        };
+
+        eprintln!("muru: {what} written to {}", path.display());
     }
 
     Ok(())

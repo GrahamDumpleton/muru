@@ -420,9 +420,10 @@ debug attach`, out of the timeouts, and `debug attach` carries a pdb
 session line by line through the daemon and the host, at the breakpoint
 or on a thread of its own, allowed where exec is, and the debugged
 worker is out of routing and pinned while the session lasts, and
-`--dap` carries the Debug Adapter Protocol to debugpy for an IDE. Still
-to come: `--requests` and `--path`, pstats output, and reading from
-outside with PEP 768.
+`--dap` carries the Debug Adapter Protocol to debugpy for an IDE.
+`debug profile --path` and `--requests` sample only the requests chosen,
+and `--format pstats` writes the samples as pstats. Still to come:
+reading from outside with PEP 768.
 
 Overlays (section 9.10) are in, activated by hand or by a one-off or
 recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach

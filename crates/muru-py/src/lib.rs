@@ -231,6 +231,19 @@ fn suspend_timeouts() -> bool {
         .is_some_and(|shared| shared.exempt_thread(thread))
 }
 
+/// The requests in flight, as the control thread is given them: for
+/// `muructl debug profile --requests` and `--path` (section 11.7), which
+/// look again at every sample.
+#[pyfunction]
+fn requests(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyList>> {
+    let serving = SERVING.lock().expect("serving poisoned").upgrade();
+
+    match serving {
+        Some(shared) => shared.active_requests(py),
+        None => Ok(pyo3::types::PyList::empty(py)),
+    }
+}
+
 /// The worker's memory as section 7.7 measures it: resident,
 /// proportional and unique sizes in bytes, or none where the platform
 /// gives no figures (section 11.7's `muructl debug memory`).
@@ -254,6 +267,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(memory_usage, m)?)?;
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
+    m.add_function(wrap_pyfunction!(requests, m)?)?;
     m.add_function(wrap_pyfunction!(loop_beat, m)?)?;
     m.add_class::<wsgi::Input>()?;
     m.add_class::<wsgi::StartResponse>()?;

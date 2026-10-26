@@ -89,6 +89,25 @@ as idle threads of the pool, are not sampled, so the profile is of the
 work being done. Sampling costs the worker little, so it is safe on a
 release serving traffic.
 
+On a busy worker, `--path` samples only the threads serving requests
+whose path starts with a prefix, and `--requests` ends the profile once
+that many of them have finished, within `--for`:
+
+```console
+muructl debug profile shop --path /reports --requests 20 --for 5m --output reports.folded
+```
+
+A request shorter than the interval may finish unseen and is not
+counted. Requests on an ASGI worker's event loop have no thread of their
+own and are not sampled this way.
+
+`--format pstats --output FILE` writes the samples as Python's pstats
+instead, for `python -m pstats`, snakeviz and other tools that read
+it. The figures come from the samples: a function's calls are the
+samples it appeared in, its own time the samples it was running in, and
+its cumulative time the samples it was on the stack for, each sample
+worth one interval.
+
 ## Trace
 
 `muructl debug trace` counts every call of every Python function and the

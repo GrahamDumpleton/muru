@@ -9,6 +9,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import pstats
 import signal
 import sys
 import threading
@@ -246,6 +247,71 @@ def test_profile_samples_the_stacks_running_python(daemon: Daemon, tmp_path: Pat
     assert "application (plain_wsgi.py:" in stack
     assert "samples of running Python code" in completed.stderr
     assert "debug.profile" in daemon.events()
+
+
+def test_profile_samples_the_requests_chosen_and_writes_pstats(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    deploy_plain(daemon, processes=1)
+    threads = in_background(daemon, "/sleep?seconds=4", "/busy?seconds=2")
+    output = tmp_path / "chosen.txt"
+    started = time.monotonic()
+
+    try:
+        completed = daemon.muructl(
+            "debug",
+            "profile",
+            "plain",
+            "--for",
+            "20s",
+            "--path",
+            "/busy",
+            "--requests",
+            "1",
+            "--output",
+            str(output),
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        for thread in threads:
+            thread.join()
+
+    # Only the thread serving /busy is sampled, and the profile ends with
+    # its request, long before the period.
+
+    lines = output.read_text().splitlines()
+    assert lines, completed.stderr
+    assert len({line.split(";", 1)[0] for line in lines}) == 1, lines
+    assert "1 request sampled to the end" in completed.stderr
+    assert elapsed < 10, elapsed
+
+    threads = in_background(daemon, "/busy?seconds=2")
+    written = tmp_path / "profile.pstats"
+
+    try:
+        completed = daemon.muructl(
+            "debug",
+            "profile",
+            "plain",
+            "--for",
+            "1s",
+            "--format",
+            "pstats",
+            "--output",
+            str(written),
+        )
+    finally:
+        for thread in threads:
+            thread.join()
+
+    stats = pstats.Stats(str(written))
+    functions = {(file, name) for file, _, name in stats.stats}  # type: ignore[attr-defined]
+    assert ("plain_wsgi.py", "application") in functions, functions
+    assert "pstats written to" in completed.stderr
+
+    refused = daemon.muructl("debug", "profile", "plain", "--format", "pstats", check=False)
+    assert refused.returncode != 0
+    assert "needs --output" in refused.stderr
 
 
 def test_trace_counts_calls_and_refuses_a_busy_worker(daemon: Daemon) -> None:

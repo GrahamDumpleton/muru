@@ -11,6 +11,7 @@ mod admin;
 mod dashboard;
 mod devcert;
 mod edge;
+mod pstats;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};

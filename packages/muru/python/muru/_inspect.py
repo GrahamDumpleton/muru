@@ -85,6 +85,8 @@ def handle(
                 float(args.get("duration_s", 10.0)),
                 float(args.get("interval_ms", 10.0)) / 1000,
                 names or {},
+                int(args.get("requests", 0)),
+                str(args.get("path", "")),
             )
         elif op == "trace":
             result = trace(
@@ -132,7 +134,13 @@ def _label(code: Any) -> str:
     return f"{name} ({os.path.basename(code.co_filename)}:{code.co_firstlineno})"
 
 
-def profile(duration: float, interval: float, names: dict[int, str]) -> dict[str, Any]:
+def profile(
+    duration: float,
+    interval: float,
+    names: dict[int, str],
+    requests: int = 0,
+    path: str = "",
+) -> dict[str, Any]:
     """Sample every thread's stack for `duration` seconds.
 
     Each sample of a thread running Python code counts once for its
@@ -140,17 +148,44 @@ def profile(duration: float, interval: float, names: dict[int, str]) -> dict[str
     flame graph tools read. Threads waiting outside Python (idle workers
     of the pool) have no stack and are not counted, and neither is the
     main thread, which waits in the runtime for the worker's life.
+
+    With `requests` or `path`, only the threads serving a request whose
+    path starts with `path` are sampled, and with `requests` the profile
+    ends once that many such requests have finished.
     """
+
+    from muru import _native
 
     known = {thread.ident: thread.name for thread in threading.enumerate()}
     skipped = {threading.get_ident(), threading.main_thread().ident}
     counts: Counter[str] = Counter()
     rounds = 0
     deadline = time.monotonic() + duration
+    chosen = bool(requests or path)
+    seen: set[str] = set()
+    finished = 0
 
     while time.monotonic() < deadline:
+        serving: set[int] | None = None
+
+        # Section 11.7: the requests chosen are those in flight under the
+        # path; one no longer in flight has finished.
+
+        if chosen:
+            matching = {
+                request["request_id"]: request["thread"]
+                for request in _native.requests()
+                if request["path"].startswith(path)
+            }
+            finished += len(seen - matching.keys())
+            seen = set(matching)
+            serving = {thread for thread in matching.values() if thread is not None}
+
+            if requests and finished >= requests:
+                break
+
         for ident, frame in sys._current_frames().items():
-            if ident in skipped:
+            if ident in skipped or (serving is not None and ident not in serving):
                 continue
 
             stack = []
@@ -166,7 +201,16 @@ def profile(duration: float, interval: float, names: dict[int, str]) -> dict[str
         rounds += 1
         time.sleep(interval)
 
-    return {"interval_ms": interval * 1000, "rounds": rounds, "stacks": dict(counts)}
+    result: dict[str, Any] = {
+        "interval_ms": interval * 1000,
+        "rounds": rounds,
+        "stacks": dict(counts),
+    }
+
+    if chosen:
+        result["requests"] = finished
+
+    return result
 
 
 def trace(duration: float, force: bool, busy: int, slots: int, top: int) -> dict[str, Any]:
