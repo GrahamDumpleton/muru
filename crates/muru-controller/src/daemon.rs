@@ -639,6 +639,9 @@ struct Daemon {
     /// Section 9.3: the counters each running rollout's current step
     /// started from, by application.
     rollout_runs: HashMap<String, RolloutRun>,
+    /// Section 9.3: each release's worker crashes and timeout kills, from
+    /// the host's events, for the gates.
+    worker_faults: HashMap<(String, String), u64>,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
@@ -937,6 +940,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
         rollout_runs: HashMap::new(),
+        worker_faults: HashMap::new(),
         serving: HashMap::new(),
         default_app: None,
         owns_log,
@@ -3974,6 +3978,23 @@ impl Daemon {
         Ok(rollout)
     }
 
+    /// Section 9.3: a release's counters for the gates, the edge's with
+    /// its workers' crashes and timeout kills.
+    fn counters(
+        &self,
+        samples: &[muru_edge::metrics::Sample],
+        app: &str,
+        release: &str,
+    ) -> Counters {
+        let mut counters = Counters::from_samples(samples, app, release);
+        counters.faults = self
+            .worker_faults
+            .get(&(app.to_owned(), release.to_owned()))
+            .copied()
+            .unwrap_or(0) as f64;
+        counters
+    }
+
     /// Section 9.3: mark where a rollout's current step starts from, once
     /// its share is in force, so the gates judge the requests served under
     /// this step alone. Without the edge's counters the first tick marks
@@ -3986,12 +4007,8 @@ impl Daemon {
                     RolloutRun {
                         rollout: rollout.id.clone(),
                         step: rollout.step,
-                        candidate: Counters::from_samples(
-                            &samples,
-                            &rollout.app,
-                            &rollout.candidate,
-                        ),
-                        baseline: Counters::from_samples(&samples, &rollout.app, &rollout.baseline),
+                        candidate: self.counters(&samples, &rollout.app, &rollout.candidate),
+                        baseline: self.counters(&samples, &rollout.app, &rollout.baseline),
                     },
                 );
             }
@@ -4229,8 +4246,8 @@ impl Daemon {
                     let run = RolloutRun {
                         rollout: rollout.id.clone(),
                         step: rollout.step,
-                        candidate: Counters::from_samples(samples, &app, &rollout.candidate),
-                        baseline: Counters::from_samples(samples, &app, &rollout.baseline),
+                        candidate: self.counters(samples, &app, &rollout.candidate),
+                        baseline: self.counters(samples, &app, &rollout.baseline),
                     };
                     rollout.step_started_unix_ms = now;
                     let _ = self.store.put_rollout(&rollout);
@@ -4239,10 +4256,12 @@ impl Daemon {
                 }
             };
 
-            let candidate =
-                Counters::from_samples(samples, &app, &rollout.candidate).since(&run.candidate);
-            let baseline =
-                Counters::from_samples(samples, &app, &rollout.baseline).since(&run.baseline);
+            let candidate = self
+                .counters(samples, &app, &rollout.candidate)
+                .since(&run.candidate);
+            let baseline = self
+                .counters(samples, &app, &rollout.baseline)
+                .since(&run.baseline);
             let verdict = judge(&candidate, &baseline, &rollout.gates);
             let percent = rollout.percent();
 
@@ -5266,6 +5285,16 @@ impl Daemon {
                     "notice" => "notice",
                     _ => "info",
                 };
+
+                // Section 9.3: a crash or a timeout kill counts against
+                // the release in a rollout's gates.
+
+                if kind == "worker.timeout_killed" || (kind == "worker.exited" && level != "info") {
+                    *self
+                        .worker_faults
+                        .entry((app.to_owned(), id.to_owned()))
+                        .or_default() += 1;
+                }
 
                 self.events
                     .emit(&kind, &format!("{app}@{id}"), level, &message);

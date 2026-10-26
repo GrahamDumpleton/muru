@@ -165,6 +165,20 @@ def test_a_failing_gate_rolls_the_canary_back(daemon: Daemon, tmp_path: Path) ->
     assert "rollout.gate_failed" in events and "rollout.rolled_back" in events
 
 
+def test_a_worker_crash_rolls_the_canary_back_at_once(daemon: Daemon, tmp_path: Path) -> None:
+    prepare(daemon, tmp_path)
+    daemon.muructl("rollout", "canary", "shop@r2", "--steps", "50", "--hold", "60s")
+
+    # One crash, long before the step has the requests the other gates
+    # need, decides.
+
+    crashed = daemon.request("/crash", host="shop.test", headers={"Muru-Preview": "r2"})
+    assert crashed.status >= 500, crashed.status
+    wait_for_rollout(daemon, "rolled_back")
+    status = daemon.muructl("rollout", "status", "shop").stdout
+    assert "gate failed at 50%: 1 worker crashes and timeout kills" in status, status
+
+
 def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_path: Path) -> None:
     prepare(daemon, tmp_path)
     daemon.muructl(

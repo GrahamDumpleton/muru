@@ -736,6 +736,8 @@ impl Admin for Service {
                 0.01
             },
             max_p95_ms: (request.max_p95_ms > 0).then_some(request.max_p95_ms),
+            max_p99_ms: (request.max_p99_ms > 0).then_some(request.max_p99_ms),
+            max_worker_faults: request.max_worker_faults,
             min_requests: if request.min_requests > 0 {
                 request.min_requests
             } else {
@@ -1594,6 +1596,8 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
         updated_unix_ms: rollout.updated_unix_ms,
         max_error_rate: rollout.gates.max_error_rate,
         max_p95_ms: rollout.gates.max_p95_ms.unwrap_or(0),
+        max_p99_ms: rollout.gates.max_p99_ms.unwrap_or(0),
+        max_worker_faults: rollout.gates.max_worker_faults,
         min_requests: rollout.gates.min_requests,
         approve_each_step: rollout.approve_each_step,
     }

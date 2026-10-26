@@ -59,6 +59,8 @@ rollout.
 | `--hold` | `2m` | How long each step lasts before its gates decide |
 | `--max-error-rate` | `1` | The candidate's 5xx rate over the step, in percent |
 | `--max-p95` | none | The candidate's 95th percentile request time over the step |
+| `--max-p99` | none | The candidate's 99th percentile request time over the step |
+| `--max-worker-faults` | `0` | The candidate's worker crashes and timeout kills over the step |
 | `--min-requests` | `100` | Requests the candidate must serve in a step before the gates judge |
 | `--approve-each-step` | off | Wait for `rollout resume` before each step after the first |
 
@@ -87,6 +89,11 @@ shop             1        r2           r1           rolled_back        0%       
 A step whose hold has passed with too few requests to judge holds on
 until there are enough, saying so in its message. A quiet application can
 be promoted by hand instead.
+
+A worker that crashes, or that the [hard timeout](timeouts.md#the-hard-timeout)
+or the loop stall timeout replaces, counts against its release at once,
+whatever the step's request count: by default one more than the baseline
+had over the step rolls the candidate back.
 
 ## Controlling a rollout
 

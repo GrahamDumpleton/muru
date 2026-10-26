@@ -576,6 +576,13 @@ pub struct RolloutGates {
     pub max_error_rate: f64,
     /// The 95th percentile of total request time, when set.
     pub max_p95_ms: Option<u64>,
+    /// The 99th percentile of total request time, when set.
+    #[serde(default)]
+    pub max_p99_ms: Option<u64>,
+    /// Worker crashes and timeout kills, which need no request count to
+    /// judge.
+    #[serde(default)]
+    pub max_worker_faults: u64,
     /// Requests the candidate must have served before the gates judge.
     pub min_requests: u64,
 }

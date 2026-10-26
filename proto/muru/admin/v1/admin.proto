@@ -241,6 +241,8 @@ message StartRolloutRequest {
   uint64 min_requests = 6;          // requests before the gates judge, 100 when 0
   bool approve_each_step = 7;       // wait for ResumeRollout before each step after the first
   bool override_freeze = 8;         // start although an overlay freezes the application's deploys (section 9.6)
+  uint64 max_p99_ms = 9;            // a gate: the candidate's p99 over the step; none when 0
+  uint64 max_worker_faults = 10;    // a gate: the candidate's worker crashes and timeout kills over the step
 }
 
 message RolloutStep {
@@ -264,6 +266,8 @@ message Rollout {
   uint64 max_p95_ms = 13;
   uint64 min_requests = 14;
   bool approve_each_step = 15;
+  uint64 max_p99_ms = 16;
+  uint64 max_worker_faults = 17;
 }
 
 message GetRolloutRequest {

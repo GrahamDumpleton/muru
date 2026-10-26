@@ -2143,6 +2143,15 @@ pub enum RolloutCommand {
         #[arg(long = "max-p95", value_name = "DURATION", value_parser = muru_config::parse_duration)]
         max_p95: Option<Duration>,
 
+        /// The 99th percentile request time the candidate may not exceed.
+        #[arg(long = "max-p99", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        max_p99: Option<Duration>,
+
+        /// Worker crashes and timeout kills the candidate may have in a
+        /// step; one more rolls back at once.
+        #[arg(long = "max-worker-faults", value_name = "COUNT", default_value = "0")]
+        max_worker_faults: u64,
+
         /// Requests the candidate must serve in a step before the gates
         /// judge it.
         #[arg(long = "min-requests", value_name = "COUNT", default_value = "100")]
@@ -2470,6 +2479,8 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             hold,
             max_error_rate,
             max_p95,
+            max_p99,
+            max_worker_faults,
             min_requests,
             approve_each_step,
             wait,
@@ -2491,6 +2502,8 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                         .collect(),
                     max_error_rate: max_error_rate / 100.0,
                     max_p95_ms: max_p95.map_or(0, |p95| p95.as_millis() as u64),
+                    max_p99_ms: max_p99.map_or(0, |p99| p99.as_millis() as u64),
+                    max_worker_faults,
                     min_requests,
                     approve_each_step,
                     override_freeze,

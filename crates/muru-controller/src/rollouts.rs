@@ -10,7 +10,8 @@ use crate::model::RolloutGates;
 
 /// A release's request counters: how many requests it answered, how many
 /// with a 5xx status, and the cumulative histogram of total request time
-/// by upper bound in seconds.
+/// by upper bound in seconds, with its workers' crashes and timeout kills,
+/// which the daemon counts from the host's events.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Counters {
     /// Requests answered.
@@ -20,6 +21,8 @@ pub struct Counters {
     /// Histogram buckets: the upper bound's bits, then the bound in
     /// seconds and the cumulative count at or below it.
     pub buckets: BTreeMap<u64, (f64, f64)>,
+    /// Worker crashes and timeout kills.
+    pub faults: f64,
 }
 
 impl Counters {
@@ -84,6 +87,7 @@ impl Counters {
             total: (self.total - start.total).max(0.0),
             errors: (self.errors - start.errors).max(0.0),
             buckets,
+            faults: (self.faults - start.faults).max(0.0),
         }
     }
 
@@ -96,10 +100,22 @@ impl Counters {
         }
     }
 
-    /// The 95th percentile of total request time in milliseconds: the
-    /// upper bound of the first bucket holding 95 percent of the requests
-    /// the histogram counted, or none without requests.
+    /// The 95th percentile of total request time in milliseconds, or
+    /// none without requests.
     pub fn p95_ms(&self) -> Option<f64> {
+        self.percentile_ms(0.95)
+    }
+
+    /// The 99th percentile of total request time in milliseconds, or
+    /// none without requests.
+    pub fn p99_ms(&self) -> Option<f64> {
+        self.percentile_ms(0.99)
+    }
+
+    /// A percentile of total request time in milliseconds: the upper
+    /// bound of the first bucket holding that share of the requests the
+    /// histogram counted, or none without requests.
+    fn percentile_ms(&self, share: f64) -> Option<f64> {
         let mut ordered: Vec<(f64, f64)> = self.buckets.values().copied().collect();
         ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let counted = ordered.last().map(|(_, count)| *count).unwrap_or(0.0);
@@ -108,7 +124,7 @@ impl Counters {
             return None;
         }
 
-        let target = counted * 0.95;
+        let target = counted * share;
         ordered
             .iter()
             .find(|(_, count)| *count >= target)
@@ -133,6 +149,16 @@ pub enum Verdict {
 /// the baseline, so a fault both releases share does not roll back. A
 /// baseline with too few requests is not compared, only the limits apply.
 pub fn judge(candidate: &Counters, baseline: &Counters, gates: &RolloutGates) -> Verdict {
+    // A worker that crashes or is killed decides at once, however few
+    // requests the step has seen.
+
+    if candidate.faults > gates.max_worker_faults as f64 && candidate.faults > baseline.faults {
+        return Verdict::Fail(format!(
+            "{} worker crashes and timeout kills, over the limit of {} (baseline {})",
+            candidate.faults, gates.max_worker_faults, baseline.faults
+        ));
+    }
+
     if candidate.total < gates.min_requests as f64 {
         return Verdict::Insufficient;
     }
@@ -158,6 +184,19 @@ pub fn judge(candidate: &Counters, baseline: &Counters, gates: &RolloutGates) ->
             "p95 {p95:.0} ms over the limit of {limit} ms (baseline {})",
             baseline
                 .p95_ms()
+                .map_or("none".to_owned(), |base| format!("{base:.0} ms"))
+        ));
+    }
+
+    if let Some(limit) = gates.max_p99_ms
+        && let Some(p99) = candidate.p99_ms()
+        && p99 > limit as f64
+        && (!compared || baseline.p99_ms().is_none_or(|base| p99 > base))
+    {
+        return Verdict::Fail(format!(
+            "p99 {p99:.0} ms over the limit of {limit} ms (baseline {})",
+            baseline
+                .p99_ms()
                 .map_or("none".to_owned(), |base| format!("{base:.0} ms"))
         ));
     }
@@ -189,6 +228,7 @@ mod tests {
             total,
             errors,
             buckets,
+            faults: 0.0,
         }
     }
 
@@ -196,6 +236,8 @@ mod tests {
         RolloutGates {
             max_error_rate: 0.01,
             max_p95_ms: Some(500),
+            max_p99_ms: None,
+            max_worker_faults: 0,
             min_requests: 10,
         }
     }
@@ -293,5 +335,44 @@ mod tests {
             Verdict::Pass,
             "as slow as the baseline passes"
         );
+    }
+
+    #[test]
+    fn a_worker_crash_decides_at_once_and_p99_is_a_gate_of_its_own() {
+        let good = counters(100.0, 0.0, 100.0);
+        let mut crashed = counters(2.0, 0.0, 2.0);
+        crashed.faults = 1.0;
+
+        match judge(&crashed, &good, &gates()) {
+            Verdict::Fail(reason) => assert!(reason.contains("1 worker crashes"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Faults the baseline has as well are not the candidate's, and a
+        // limit allows some.
+
+        let mut shared = good.clone();
+        shared.faults = 1.0;
+        assert_eq!(judge(&shared, &shared, &gates()), Verdict::Pass);
+        let allowing = RolloutGates {
+            max_worker_faults: 1,
+            ..gates()
+        };
+        assert_eq!(judge(&shared, &good, &allowing), Verdict::Pass);
+
+        // 99 percent land in the one second bucket: within p95's limit of
+        // 500 ms when 95 are fast, past a p99 limit.
+
+        let tail = counters(100.0, 0.0, 96.0);
+        let strict = RolloutGates {
+            max_p99_ms: Some(500),
+            ..gates()
+        };
+        assert_eq!(judge(&tail, &good, &gates()), Verdict::Pass);
+
+        match judge(&tail, &good, &strict) {
+            Verdict::Fail(reason) => assert!(reason.contains("p99 1000 ms"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -234,6 +234,11 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     if environ["PATH_INFO"].endswith("/error"):
         raise RuntimeError("deliberate failure")
 
+    # /crash ends the worker at once, as a fault in a C extension would.
+
+    if environ["PATH_INFO"].endswith("/crash"):
+        os._exit(3)
+
     # /status/CODE answers with that status, for the error override
     # tests: body=html, json or empty, override=off to keep the response,
     # www=1 for a WWW-Authenticate header and allow=METHODS for Allow.

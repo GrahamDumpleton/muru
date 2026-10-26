@@ -1,0 +1,1 @@
+Added two canary gates: `--max-p99` on the candidate's 99th percentile request time, and `--max-worker-faults` (0 by default) on its worker crashes and timeout kills, which rolls back at once, before the step has the requests the other gates need.
