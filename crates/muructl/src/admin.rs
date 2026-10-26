@@ -3421,6 +3421,12 @@ pub enum ConfigCommand {
         #[arg(long)]
         all_releases: bool,
 
+        /// Write each rollout under way as where it stands: its candidate
+        /// declared, and the application's routes splitting traffic at
+        /// its current share.
+        #[arg(long)]
+        resolve_rollouts: bool,
+
         /// Write JSON rather than TOML.
         #[arg(long)]
         json: bool,
@@ -3462,6 +3468,7 @@ pub enum ConfigCommand {
 pub async fn config_export(
     app: Option<String>,
     all_releases: bool,
+    resolve_rollouts: bool,
     json: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
@@ -3471,6 +3478,7 @@ pub async fn config_export(
             app: app.unwrap_or_default(),
             all_releases,
             effective: false,
+            resolve_rollouts,
         })
         .await
         .map_err(explain)?
@@ -3508,6 +3516,7 @@ pub async fn config_show(
             app: app.unwrap_or_default(),
             all_releases: false,
             effective,
+            resolve_rollouts: false,
         })
         .await
         .map_err(explain)?

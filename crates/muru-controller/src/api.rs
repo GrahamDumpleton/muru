@@ -1184,6 +1184,10 @@ impl Admin for Service {
         let mut document =
             config::export(&self.handle.store, app, request.all_releases).map_err(not_found)?;
 
+        if request.resolve_rollouts {
+            config::resolve_rollouts(&self.handle.store, &mut document).map_err(internal)?;
+        }
+
         let (attributions, layers) = if request.effective {
             (
                 config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?,

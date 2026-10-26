@@ -127,6 +127,12 @@ With `--approve-each-step`, the rollout stops before each step after the
 first with the state `awaiting_approval` and the previous step's share
 still in force, until `rollout resume` approves it.
 
+A rollout is not part of the configuration `muructl config export`
+writes. `config export --resolve-rollouts` writes it as where it stands:
+the candidate declared beside the serving release, and the
+application's routes splitting traffic between them at the candidate's
+current share, which a file in version control can keep.
+
 An application has at most one rollout under way. A rollout's candidate
 is kept running while the rollout lasts, a deploy or rollback that would
 drain it leaves it in place, and `muructl config export` does not include

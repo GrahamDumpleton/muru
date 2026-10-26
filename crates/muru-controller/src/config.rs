@@ -1993,6 +1993,50 @@ pub fn export(
     Ok(document)
 }
 
+/// Section 10.4: write each rollout under way in an exported document as
+/// where it stands: its candidate declared beside the baseline, and each
+/// of the application's routes splitting traffic between them at the
+/// candidate's share in force, the baseline taking what the other shares
+/// leave, so the file gives the same split whichever release serves.
+pub fn resolve_rollouts(store: &Store, document: &mut Document) -> Result<(), StoreError> {
+    for rollout in store.rollouts(None)? {
+        let Some(table) = document.app.get_mut(&rollout.app) else {
+            continue;
+        };
+
+        if !rollout.state.is_active() {
+            continue;
+        }
+
+        for id in [&rollout.baseline, &rollout.candidate] {
+            if !table.release.contains_key(id) {
+                let release = store.release(&rollout.app, id)?;
+                table.release.insert(id.clone(), table_from(&release.spec));
+            }
+        }
+
+        for route in document
+            .route
+            .iter_mut()
+            .filter(|route| route.app == rollout.app)
+        {
+            let traffic = route.traffic.get_or_insert_with(Default::default);
+            traffic
+                .split
+                .insert(rollout.candidate.clone(), rollout.percent().min(100));
+
+            if !traffic.split.contains_key(&rollout.baseline) {
+                let named: u32 = traffic.split.values().sum();
+                traffic
+                    .split
+                    .insert(rollout.baseline.clone(), 100u32.saturating_sub(named));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Section 9.10: turn an exported document into the effective one, its
 /// routes as the active overlays leave them and without the overlays,
 /// and say what each sets that is in force, for `app` alone when given.

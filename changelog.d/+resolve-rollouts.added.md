@@ -1,0 +1,1 @@
+Added `muructl config export --resolve-rollouts`, which writes a rollout under way as where it stands: the candidate declared beside the serving release, and the application's routes splitting traffic between them at the candidate's current share.

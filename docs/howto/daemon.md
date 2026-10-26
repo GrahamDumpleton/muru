@@ -124,10 +124,14 @@ a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
 spelled out, so applying the file back to the daemon it came from changes
 nothing; `--all-releases` writes every release, `--app NAME` one
-application, and `--json` the same document as JSON. `muructl config
-diff -f FILE` compares a file with desired state in both directions,
-listing what the file would add and what the daemon holds that the file
-does not, with exit code 2 when they differ.
+application, and `--json` the same document as JSON. A
+[rollout](rollouts.md) under way is not part of the file; with
+`--resolve-rollouts` it is written as where it stands, the candidate
+declared beside the serving release and the application's routes
+splitting traffic between them at the candidate's current share.
+`muructl config diff -f FILE` compares a file with desired state in
+both directions, listing what the file would add and what the daemon
+holds that the file does not, with exit code 2 when they differ.
 
 `muructl config show [APP] --effective` writes the same document headed
 by each serving release's settings and where each came from: the

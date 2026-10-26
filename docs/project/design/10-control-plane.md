@@ -79,6 +79,8 @@ What a dry run cannot know, such as whether new code imports cleanly, is listed 
 
 For scripts and CI: --json gives the same report in machine-readable form, and the exit code is 0 for no changes, 2 for changes planned and 1 for errors. --save-plan FILE records the plan with the state versions it was computed against, and muructl apply --plan FILE applies exactly that plan, refusing if desired state has changed since. This supports a reviewed workflow in which a pull request's plan is produced in CI, reviewed and then applied unchanged.
 
+- **Details fixed by the implementation.** `--resolve-rollouts` writes each rollout under way (running, paused or awaiting approval) as where it stands, since rollouts are not declared in files: the candidate and the baseline are both declared, and each of the application's routes gets a traffic split giving the candidate its share in force and the baseline what the route's other shares leave, so the file gives the same split whichever release ends up serving after an apply. A rollout that has ended is not written.
+
 ## 10.5 What changes live
 
 | Change | Mechanism | Disruption |
