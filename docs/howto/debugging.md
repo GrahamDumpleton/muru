@@ -4,10 +4,11 @@
 :class: note
 
 Status, stacks, tasks, inspect, logger levels, profiling, tracing,
-memory, running a snippet and the automatic captures, answered from
-inside each worker by the runtime's control thread, with faulthandler
-when a worker cannot answer. Attaching a debugger is still to come, as is
-reading a worker from outside with PEP 768 on Python 3.14.
+memory, running a snippet, a pdb session with `breakpoint()`, and the
+automatic captures, answered from inside each worker by the runtime's
+control thread, with faulthandler when a worker cannot answer. The Debug
+Adapter Protocol for IDEs, draining the debugged worker, and reading a
+worker from outside with PEP 768 on Python 3.14 are still to come.
 ```
 
 `muructl debug` looks into the workers of a release through the daemon,
@@ -129,6 +130,49 @@ debug_exec = true
 Every use is the event `debug.exec` with the code that ran, as profiles,
 traces and memory traces are `debug.profile`, `debug.trace` and
 `debug.memory`.
+
+## Attaching a debugger
+
+`breakpoint()` in application code makes the worker wait there for a
+debugger, for 60 seconds or the `timeout` it is given, and raises the
+event `debug.breakpoint` with the worker, file and line. A WSGI request
+waiting there is exempt from the soft and hard timeouts meanwhile; in an
+ASGI application, `breakpoint()` holds the worker's event loop, as pdb
+does, and the timeouts still apply. When nobody attaches it carries on,
+with the event `debug.breakpoint_expired`.
+
+```python
+def checkout(request):
+    order = build_order(request)
+    breakpoint(timeout=300)
+    return charge(order)
+```
+
+`muructl debug attach` opens a pdb session at the waiting breakpoint,
+taking the worker that waits unless `--worker` names one:
+
+```
+$ muructl debug attach shop
+muru: attached to worker 1 at /srv/shop/views.py:42; the end of input lets the code go on
+> /srv/shop/views.py(43)checkout()
+-> return charge(order)
+(Pdb) p order.total
+Decimal('120.00')
+(Pdb) continue
+muru: the session in worker 1 has ended
+```
+
+Each line typed is a pdb command. `continue` lets the request go on and
+ends the session; so does the end of input, as does an hour in all or ten
+minutes without a line. In a worker with no breakpoint waiting, the
+session has a thread of its own, from which the worker's modules and
+state can be examined.
+
+A debugger runs code in the worker, so attaching needs `debug_exec =
+true` as running a snippet does. Each session is the event
+`debug.attached`, and `debug.detached` when it ends. Outside Muru,
+`breakpoint()` is the ordinary pdb, so the call is safe to leave in
+while developing; setting `PYTHONBREAKPOINT` keeps whatever it names.
 
 ## Automatic captures
 

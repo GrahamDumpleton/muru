@@ -945,6 +945,12 @@ class Host:
                 "timeout_error": RequestTimeout,
             }
 
+        # Section 11.7: breakpoint() waits for muructl debug attach.
+
+        from muru import _debug
+
+        _debug.install(index, report)
+
         try:
             _native.serve(
                 path or self.socket_path(index),

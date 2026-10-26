@@ -346,6 +346,20 @@ impl Shared {
         }
     }
 
+    /// Exempt the request a thread serves from the timeouts, while a
+    /// debugger holds it (section 11.7). Returns whether the thread was
+    /// serving one.
+    pub fn exempt_thread(&self, thread: u64) -> bool {
+        let mut active = self.active.lock().expect("active requests poisoned");
+
+        let Some(info) = active.values_mut().find(|info| info.thread == Some(thread)) else {
+            return false;
+        };
+
+        info.exempt = true;
+        true
+    }
+
     /// Interrupt every request past the soft timeout that has not been
     /// interrupted yet (section 7.6): a WSGI request gets the timeout
     /// exception injected into its thread and its bridge waits woken, an

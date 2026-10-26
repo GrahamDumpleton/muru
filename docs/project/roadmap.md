@@ -392,8 +392,12 @@ these an event. The automatic captures are in too: a request past the
 soft timeout is the event `request.soft_timeout` with where it was,
 taken before it was interrupted, a hard-timeout kill names where the
 oldest request was, and a memory recycle names the commonest objects.
-Still to come: attach with `breakpoint()` and DAP, `--requests` and
-`--path`, pstats output, and reading from outside with PEP 768.
+Debugger attach followed: `breakpoint()` in a worker waits for `muructl
+debug attach`, out of the timeouts, and `debug attach` carries a pdb
+session line by line through the daemon and the host, at the breakpoint
+or on a thread of its own, allowed where exec is. Still to come: DAP,
+draining and pinning the debugged worker, `--requests` and `--path`,
+pstats output, and reading from outside with PEP 768.
 
 Overlays (section 9.10) are in, activated by hand or by a one-off or
 recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach

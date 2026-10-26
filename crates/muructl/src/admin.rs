@@ -585,6 +585,13 @@ pub enum DebugCommand {
     /// Run Python code in the workers and print its output and value;
     /// allowed only when the daemon's [daemon] table sets debug_exec.
     Exec(ExecArgs),
+
+    /// Open a pdb session in a worker: on the thread stopped at
+    /// breakpoint(), else on a thread of its own. Each line read is a pdb
+    /// command, and the end of input lets the code go on. Without
+    /// --worker, the first worker with a breakpoint waiting. Allowed only
+    /// when the daemon's [daemon] table sets debug_exec.
+    Attach(DebugArgs),
 }
 
 /// `muructl debug profile`.
@@ -691,6 +698,10 @@ pub enum LoggingCommand {
 
 /// Ask a release's workers something and print what came back.
 pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
+    if let DebugCommand::Attach(args) = &command {
+        return attach(args).await;
+    }
+
     // Section 11.7: an operation over a period gives the host that long
     // and a little more before it gives up on a worker.
 
@@ -738,6 +749,7 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
                 "timeout_s": exec.timeout.as_secs_f64(),
             }),
         ),
+        DebugCommand::Attach(_) => unreachable!("attach is handled above"),
     };
 
     let response = ask(&args.socket, &args.target, op, args.worker, request).await?;
@@ -756,9 +768,104 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Trace(_) => print_trace(&response),
         DebugCommand::Memory(_) => print_memory(&response),
         DebugCommand::Exec(_) => print_exec(&response),
+        DebugCommand::Attach(_) => {}
     }
 
     Ok(())
+}
+
+/// How often a session with nothing typed asks for pdb's output.
+const ATTACH_POLL: Duration = Duration::from_millis(300);
+
+/// `muructl debug attach` (section 11.7): a pdb session carried line by
+/// line, each line read going to the worker with a request whose answer
+/// brings what pdb wrote since, and the session polled while nothing is
+/// typed.
+async fn attach(args: &DebugArgs) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let worker = match args.worker {
+        Some(worker) => worker,
+        None => {
+            let response = ask(
+                &args.socket,
+                &args.target,
+                "breakpoints",
+                None,
+                serde_json::json!({}),
+            )
+            .await?;
+            let waiting = response.workers.iter().find(|answer| {
+                parse_result(answer).is_some_and(|result| {
+                    result["waiting"]
+                        .as_array()
+                        .is_some_and(|waiting| !waiting.is_empty())
+                })
+            });
+
+            waiting
+                .or(response.workers.first())
+                .map_or(0, |answer| answer.index)
+        }
+    };
+
+    let exchange = |op: &'static str, request: serde_json::Value| async move {
+        let response = ask(&args.socket, &args.target, op, Some(worker), request).await?;
+        let answer = response
+            .workers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("worker {worker} did not answer"))?;
+
+        parse_result(answer).ok_or_else(|| anyhow::anyhow!("worker {worker}: {}", answer.error))
+    };
+
+    let opened = exchange("attach", serde_json::json!({})).await?;
+    let session = opened["session"].as_u64().unwrap_or_default();
+    eprintln!(
+        "muru: attached to worker {worker} at {}; the end of input lets the code go on",
+        opened["where"].as_str().unwrap_or("?")
+    );
+    print!("{}", opened["output"].as_str().unwrap_or_default());
+    std::io::stdout().flush()?;
+
+    // Lines are read on a thread of their own, since reading blocks.
+
+    let (lines_tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let (op, request) = match tokio::time::timeout(ATTACH_POLL, lines.recv()).await {
+            Ok(Some(line)) => (
+                "attach_io",
+                serde_json::json!({"session": session, "input": line, "wait_s": 0.5}),
+            ),
+            Ok(None) => ("detach", serde_json::json!({"session": session})),
+            Err(_) => (
+                "attach_io",
+                serde_json::json!({"session": session, "input": "", "wait_s": 0.0}),
+            ),
+        };
+
+        let result = exchange(op, request).await?;
+        print!("{}", result["output"].as_str().unwrap_or_default());
+        std::io::stdout().flush()?;
+
+        if op == "detach" || result["ended"].as_bool().unwrap_or(true) {
+            eprintln!("muru: the session in worker {worker} has ended");
+            return Ok(());
+        }
+    }
 }
 
 /// Merge the workers' collapsed stacks and write them, heaviest first,

@@ -2744,17 +2744,37 @@ impl Daemon {
                 args,
                 done,
             } => {
-                // Section 11.7: exec runs code in a worker, so it is off
-                // unless the daemon's file allows it, and the operations
-                // that reach into a worker for a period are recorded.
+                // Section 11.7: exec runs code in a worker, and so does a
+                // debugger session, so both are off unless the daemon's
+                // file allows them, and the operations that reach into a
+                // worker are recorded.
 
-                if op == "exec" && !self.debug_exec {
-                    let _ = done.send(Err(
-                        "debug exec is off: set debug_exec = true in the [daemon] table of the \
+                if matches!(op.as_str(), "exec" | "attach" | "attach_io" | "detach")
+                    && !self.debug_exec
+                {
+                    let what = if op == "exec" {
+                        "debug exec"
+                    } else {
+                        "debugger attach"
+                    };
+                    let _ = done.send(Err(format!(
+                        "{what} is off: set debug_exec = true in the [daemon] table of the \
                          daemon's configuration file"
-                            .to_owned(),
-                    ));
+                    )));
                     return;
+                }
+
+                if op == "attach" {
+                    let whom = worker.map_or_else(
+                        || "every worker".to_owned(),
+                        |index| format!("worker {index}"),
+                    );
+                    self.events.emit(
+                        "debug.attached",
+                        &format!("{app}@{id}"),
+                        "warning",
+                        &format!("a debugger session opened in {whom}"),
+                    );
                 }
 
                 if matches!(op.as_str(), "profile" | "trace" | "memory" | "exec") {

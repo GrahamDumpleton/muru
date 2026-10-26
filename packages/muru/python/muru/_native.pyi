@@ -51,6 +51,9 @@ def serve(
 def memory_usage() -> dict[str, int] | None:
     """Return the worker's rss, pss and uss in bytes, or None where unmeasured."""
 
+def suspend_timeouts() -> bool:
+    """Take the calling thread's request out of the timeouts while a debugger holds it."""
+
 def resolve_future(future: Any, value: Any) -> None:
     """Complete an asyncio future with a value unless it is already done."""
 

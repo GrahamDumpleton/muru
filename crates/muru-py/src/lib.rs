@@ -154,6 +154,7 @@ fn serve(
         })
         .collect();
     let shared = Arc::new(shared);
+    *SERVING.lock().expect("serving poisoned") = Arc::downgrade(&shared);
     let lifecycle = link::Lifecycle {
         on_drain,
         on_exit,
@@ -168,6 +169,28 @@ fn serve(
 
     py.detach(move || link::serve(&socket_path, shared, lifecycle))
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
+/// The worker being served, for the functions the runtime library calls
+/// from its threads.
+static SERVING: std::sync::Mutex<std::sync::Weak<pool::Shared>> =
+    std::sync::Mutex::new(std::sync::Weak::new());
+
+/// Take the request the calling thread serves out of the soft and hard
+/// timeouts, for as long as a debugger holds it (section 11.7). Returns
+/// whether the thread was serving a request.
+#[pyfunction]
+fn suspend_timeouts() -> bool {
+    // SAFETY: PyThread_get_thread_ident reads the calling thread's
+    // identifier and needs no interpreter state.
+
+    let thread = unsafe { pyo3::ffi::PyThread_get_thread_ident() } as u64;
+
+    SERVING
+        .lock()
+        .expect("serving poisoned")
+        .upgrade()
+        .is_some_and(|shared| shared.exempt_thread(thread))
 }
 
 /// The worker's memory as section 7.7 measures it: resident,
@@ -192,6 +215,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(memory_usage, m)?)?;
+    m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
     m.add_class::<wsgi::Input>()?;
     m.add_class::<wsgi::StartResponse>()?;
     m.add_class::<wsgi::FileWrapper>()?;

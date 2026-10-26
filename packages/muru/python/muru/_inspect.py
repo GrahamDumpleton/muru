@@ -4,8 +4,8 @@ The answers are the Python stacks of its threads with the request each
 serves, the asyncio tasks of its event loop, what it has loaded and how it
 is configured, and a logger's level for a period; and for phase 3, a
 sampling profile or a sys.monitoring trace over a period, the memory with
-an optional tracemalloc period, and the output of a snippet run in the
-worker.
+an optional tracemalloc period, the output of a snippet run in the
+worker, and the exchanges of a debugger session.
 
 Each request is one JSON object with an ``op`` and ``args``; each answer
 is one JSON object with ``ok`` and a ``result`` or an ``error``. The
@@ -30,6 +30,8 @@ import traceback
 from collections import Counter, defaultdict
 from concurrent.futures import Future
 from typing import Any
+
+from muru import _debug
 
 # Environment keys whose values are not shown.
 
@@ -100,6 +102,18 @@ def handle(
             )
         elif op == "exec":
             result = run_code(str(args.get("code", "")))
+        elif op == "breakpoints":
+            result = _debug.waiting()
+        elif op == "attach":
+            result = _debug.attach()
+        elif op == "attach_io":
+            result = _debug.exchange(
+                int(args.get("session", 0)),
+                str(args.get("input", "")),
+                float(args.get("wait_s", 0.5)),
+            )
+        elif op == "detach":
+            result = _debug.detach(int(args.get("session", 0)))
         else:
             raise ValueError(f"unknown operation {op!r}")
     except Exception as error:

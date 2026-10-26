@@ -1,0 +1,1 @@
+Added debugger attach: `breakpoint()` in a worker waits for `muructl debug attach`, out of the request timeouts, and `debug attach` opens a pdb session there, carried line by line through the daemon, or on a thread of its own when no breakpoint waits; it is allowed where the daemon's `[daemon] debug_exec` allows exec.
