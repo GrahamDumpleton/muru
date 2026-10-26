@@ -93,6 +93,8 @@ pub struct Config {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
     pub dashboard: Option<SocketAddr>,
+    /// Whether the dashboard takes actions from signed-in sessions.
+    pub dashboard_actions: bool,
     /// The overlays' signed webhook (section 9.10), or none.
     pub overlay_webhook: Option<crate::triggers::Webhook>,
     /// The webhooks events are delivered to (section 11.5).
@@ -142,6 +144,10 @@ struct RolloutRun {
     candidate: Counters,
     baseline: Counters,
 }
+
+/// Section 7.3: the shortest time the workers' signals are measured
+/// over.
+const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
 
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
@@ -455,6 +461,9 @@ pub struct Info {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
     pub dashboard: Option<SocketAddr>,
+    /// The dashboard's login codes and sessions, when it takes actions
+    /// (section 10.7).
+    pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
@@ -571,9 +580,11 @@ struct Running {
     held: bool,
     /// The host's control connection, once it is up.
     control: Option<HostControl>,
-    /// What the workers last reported, for metrics, and when.
+    /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
-    status_at: Option<Instant>,
+    /// Section 7.3: the report the workers' signals are measured from,
+    /// and when it arrived.
+    signals_from: Option<(Instant, Vec<crate::host::WorkerStatus>)>,
     /// Section 7.4: each worker group's autoscaler, the default first.
     scalers: Vec<GroupScaling>,
     /// When each worker socket entered routing, for the age of the
@@ -704,6 +715,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
+    let dashboard_sessions =
+        (dashboard.is_some() && config.dashboard_actions).then(muru_dashboard::Sessions::new);
     let sinks = std::mem::take(&mut config.sinks);
     let locations = config.locations;
 
@@ -833,6 +846,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
         dashboard,
+        dashboard_sessions: dashboard_sessions.clone(),
         defined: std::sync::RwLock::new(client_rules.defined()),
     });
     let handle = Handle {
@@ -873,6 +887,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 handle.commands.clone(),
                 Arc::clone(&history),
                 events.clone(),
+                dashboard_sessions,
             )))
         }
         None => None,
@@ -2660,7 +2675,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
-                        status_at: None,
+                        signals_from: None,
                         scalers,
                         ready_at,
                     },
@@ -2745,7 +2760,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
-                        status_at: None,
+                        signals_from: None,
                         scalers: Vec::new(),
                         ready_at: HashMap::new(),
                     },
@@ -3279,7 +3294,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
-                status_at: None,
+                signals_from: None,
                 scalers,
                 ready_at,
             },
@@ -3470,7 +3485,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
-                status_at: None,
+                signals_from: None,
                 scalers: Vec::new(),
                 ready_at: HashMap::new(),
             },
@@ -5459,38 +5474,46 @@ impl Daemon {
             HostMessage::Status { workers } => {
                 if let Some(running) = self.running.get_mut(&key) {
                     // Section 7.3: the workers' own signals, from what
-                    // grew since the last report.
+                    // grew since a report at least a few seconds older,
+                    // since reports can arrive moments apart.
 
                     let now = Instant::now();
 
-                    if let Some(at) = running.status_at {
-                        let elapsed = now.saturating_duration_since(at);
+                    match &running.signals_from {
+                        None => running.signals_from = Some((now, workers.clone())),
+                        Some((at, _)) if now.saturating_duration_since(*at) < SIGNAL_WINDOW => {}
+                        Some((at, before)) => {
+                            let elapsed = now.saturating_duration_since(*at);
 
-                        for group in &mut running.scalers {
-                            let signals = crate::scaling::WorkerSignals::between(
-                                &running.status,
-                                &workers,
-                                &group.name,
-                                elapsed,
-                                group.threads,
-                            );
-                            let near = group.memory_limit.is_some_and(|(measure, limit)| {
-                                workers
-                                    .iter()
-                                    .filter(|worker| worker.group == group.name)
-                                    .filter_map(|worker| match measure {
-                                        muru_config::Measure::Uss => worker.uss,
-                                        muru_config::Measure::Pss => worker.pss,
-                                        muru_config::Measure::Rss => worker.rss,
-                                    })
-                                    .any(|used| used.saturating_mul(10) >= limit.saturating_mul(9))
-                            });
-                            group.scaler.set_workers(signals, near);
+                            for group in &mut running.scalers {
+                                let signals = crate::scaling::WorkerSignals::between(
+                                    before,
+                                    &workers,
+                                    &group.name,
+                                    elapsed,
+                                    group.threads,
+                                );
+                                let near = group.memory_limit.is_some_and(|(measure, limit)| {
+                                    workers
+                                        .iter()
+                                        .filter(|worker| worker.group == group.name)
+                                        .filter_map(|worker| match measure {
+                                            muru_config::Measure::Uss => worker.uss,
+                                            muru_config::Measure::Pss => worker.pss,
+                                            muru_config::Measure::Rss => worker.rss,
+                                        })
+                                        .any(|used| {
+                                            used.saturating_mul(10) >= limit.saturating_mul(9)
+                                        })
+                                });
+                                group.scaler.set_workers(signals, near);
+                            }
+
+                            running.signals_from = Some((now, workers.clone()));
                         }
                     }
 
                     running.status = workers;
-                    running.status_at = Some(now);
                 }
             }
             HostMessage::Response { id, workers, error } => {

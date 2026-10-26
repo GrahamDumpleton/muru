@@ -5,9 +5,9 @@
 
 Custom pages by status or status and reason at the node, host, release
 and route levels, as a file, a template or an application path; the
-error override; and `muructl maintenance on` with exemptions by path,
-address and cookie. The dashboard's maintenance control is still to
-come.
+error override; and maintenance mode, from `muructl maintenance on` or
+the [dashboard](dashboard.md#actions), with exemptions by path, address
+and cookie.
 ```
 
 When Muru answers a request itself, the response is one of the

@@ -281,6 +281,10 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         access_log,
         metrics,
         dashboard,
+        dashboard_actions: document
+            .dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.actions),
         overlay_webhook,
         sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
@@ -3013,6 +3017,34 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
         println!("muru: {} serves as usual again", status.app);
     }
 
+    Ok(())
+}
+
+/// The dashboard subcommands (section 10.7).
+#[derive(Subcommand)]
+pub enum DashboardCommand {
+    /// Print a single-use link that signs a browser in to the dashboard's
+    /// actions, which the [dashboard] table's `actions = true` enables.
+    Login {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Run a dashboard subcommand.
+pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
+    let DashboardCommand::Login { socket } = command;
+    let mut client = client::connect(&socket.socket()).await?;
+    let link = client
+        .dashboard_login(pb::DashboardLoginRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner();
+    println!("{}", link.url);
+    eprintln!(
+        "muru: open the link within {} to sign in; it works once",
+        muru_config::format_duration(Duration::from_secs(link.expires_in_s))
+    );
     Ok(())
 }
 

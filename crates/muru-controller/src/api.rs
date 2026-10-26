@@ -136,6 +136,31 @@ impl Admin for Service {
         Ok(Response::new(app_message(app, on)))
     }
 
+    async fn dashboard_login(
+        &self,
+        _request: Request<pb::DashboardLoginRequest>,
+    ) -> Result<Response<pb::DashboardLoginLink>, Status> {
+        let info = &self.handle.info;
+        let (Some(address), Some(sessions)) = (info.dashboard, info.dashboard_sessions.as_ref())
+        else {
+            return Err(Status::failed_precondition(
+                "the dashboard's actions are off; set actions = true in the [dashboard] table",
+            ));
+        };
+
+        let code = sessions.issue_code();
+        self.handle.events.emit(
+            "dashboard.login_issued",
+            "dashboard",
+            "notice",
+            "a login link for the dashboard's actions was issued over the admin socket",
+        );
+        Ok(Response::new(pb::DashboardLoginLink {
+            url: format!("http://{address}/login?code={code}"),
+            expires_in_s: muru_dashboard::actions::CODE_LIFETIME.as_secs(),
+        }))
+    }
+
     async fn set_maintenance(
         &self,
         request: Request<pb::SetMaintenanceRequest>,

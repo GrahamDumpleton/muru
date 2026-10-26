@@ -8,7 +8,7 @@
 </div>
 <h2 style="margin-top:1rem">Applications and releases</h2>
 <table>
-  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th></tr>
+  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
@@ -21,6 +21,13 @@
     <td class="num">{{ release.waiting }}</td>
     <td>{{ release.created }}</td>
     <td>{{ release.message }}</td>
+    {% if let Some(token) = csrf %}
+    <td>{% if release.serving %}<form method="post" action="/actions/maintenance">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="app" value="{{ app.name }}">
+      {% if app.maintenance_since.is_empty() %}<input type="hidden" name="state" value="on"><button>Maintenance on</button>{% else %}<input type="hidden" name="state" value="off"><button>Maintenance off</button>{% endif %}
+    </form>{% endif %}</td>
+    {% endif %}
   </tr>
   {% endfor %}
   {% endfor %}

@@ -130,6 +130,12 @@ enum Command {
         command: admin::MaintenanceCommand,
     },
 
+    /// The daemon's dashboard.
+    Dashboard {
+        #[command(subcommand)]
+        command: admin::DashboardCommand,
+    },
+
     /// Show the daemon's status.
     Status {
         #[command(flatten)]
@@ -743,6 +749,7 @@ fn main() -> anyhow::Result<()> {
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
+        Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),

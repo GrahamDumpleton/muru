@@ -187,8 +187,9 @@ status` and `muructl status` show the daemon, its edge process, its
 listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
 in the configuration file, serves Prometheus metrics on an internal
 address; the [metrics guide](metrics.md) lists them. `--dashboard
-ADDRESS`, or a `[dashboard]` table, serves the read-only [dashboard and
-JSON gateway](dashboard.md) on a loopback address. An `[overlay_webhook]`
+ADDRESS`, or a `[dashboard]` table, serves the [dashboard and JSON
+gateway](dashboard.md) on a loopback address, read-only unless the
+table turns its actions on. An `[overlay_webhook]`
 table serves the [signed webhook](overlays.md#the-webhook) that
 monitoring systems activate and end overlays with.
 

@@ -52,6 +52,10 @@ service Admin {
   // edge, or serve it as usual again.
   rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
+  // Section 10.7: a single-use link that signs a browser in to the
+  // dashboard's actions, when the daemon's configuration enables them.
+  rpc DashboardLogin(DashboardLoginRequest) returns (DashboardLoginLink);
+
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
@@ -310,6 +314,13 @@ message SetScaleRequest {
   optional uint32 min_workers = 6;  // section 7.5: a floor until until_unix_ms, as a temporary schedule
   optional uint32 max_workers = 7;  // and a ceiling with it
   uint64 until_unix_ms = 8;         // when the floor ends
+}
+
+message DashboardLoginRequest {}
+
+message DashboardLoginLink {
+  string url = 1;                   // open within expires_in_s, once
+  uint64 expires_in_s = 2;
 }
 
 message SetMaintenanceRequest {

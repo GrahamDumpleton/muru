@@ -446,8 +446,10 @@ exemptions by path, address and bypass cookie, recorded in the store,
 announced as `maintenance.changed` and marked in `muructl app list`; and
 `muru.error_reason` for handlers. The daemon's dashboard shows
 maintenance mode, the rollouts and each group as the autoscaler sees
-it, on its pages and as `/v1/rollouts` and `/v1/scaling`. Still to
-come: the dashboard's maintenance control.
+it, on its pages and as `/v1/rollouts` and `/v1/scaling`, and with
+`actions = true` in its table a browser signed in through a single-use
+link from `muructl dashboard login` turns maintenance mode on and off,
+each action CSRF-protected and recorded as an event.
 
 Authentication sub-requests (section 4.16) are in: a route's `auth`
 table names an application path the edge asks, with a bodiless GET

@@ -6,8 +6,9 @@
 A development run and the daemon each serve a read-only dashboard on a
 loopback address with charts over the last hour or day, the daemon's
 serves the same figures as JSON, with rollouts, scaling and maintenance,
-and streams its history and events with Server-Sent Events. Worker
-inspection views and mutating actions are still to come.
+and streams its history and events with Server-Sent Events. The daemon's
+dashboard can turn maintenance mode on and off for a signed-in session.
+Worker inspection views and the other actions are still to come.
 ```
 
 ## In development mode
@@ -77,9 +78,40 @@ daemon asks its edge for them), so rates are exact and the percentiles
 come from the request histogram; a day's points fold each minute's
 seconds into mean rates and the worst percentiles.
 
-Everything is read-only: deploys, rollbacks and drains stay with
-`muructl` and the admin socket. The pages are served with a strict
-content security policy, and the address is loopback, so reaching the
-dashboard from elsewhere means an SSH tunnel or a proxy of your own in
-front of it. The charts are drawn by uPlot and the live updates by the
+The pages are served with a strict content security policy, and the
+address is loopback, so reaching the dashboard from elsewhere means an
+SSH tunnel or a proxy of your own in front of it. The charts are drawn by uPlot and the live updates by the
 htmx Server-Sent Events extension, both vendored into the binary.
+
+## Actions
+
+The daemon's dashboard is read-only unless its table turns actions on:
+
+```toml
+[dashboard]
+listen = "127.0.0.1:8090"
+actions = true
+```
+
+Even then, a browser acts only once it is signed in. `muructl dashboard
+login` asks the daemon, over the admin socket, for a link:
+
+```console
+$ muructl dashboard login
+http://127.0.0.1:8090/login?code=3f9c...
+muru: open the link within 5m to sign in; it works once
+```
+
+Opening the link gives the browser a session for twelve hours, so
+whoever may use the admin socket, and only they, may sign in. A link
+works once and only within five minutes. While signed in, the page
+shows a button beside each application's serving release that turns
+[maintenance mode](error-pages.md#maintenance-mode) on or off. Deploys,
+rollbacks, drains and scaling stay with `muructl`.
+
+Each action is a form posted from the dashboard's own page, carrying a
+token of the session's own, so another site cannot act through a
+signed-in browser. Every action is recorded as a `dashboard.action`
+event naming the start of the session's id, beside the event the action
+itself raises, such as `maintenance.changed`, and every link issued is a
+`dashboard.login_issued` event. Restarting the daemon ends every session.
