@@ -5,7 +5,8 @@
 
 Overlays activated by hand or by a one-off or recurring schedule, over
 routes and applications: site modes, method restrictions, traffic pins
-and splits, route targets, rate limits and maintenance mode, with
+and splits, route targets, rate limits, error pages and maintenance
+mode, with
 preconditions, warm-up, advisory and latched schedules, previews and
 promotion, the capacity and deploy freezes of
 [schedules](scaling.md#scheduled-capacity), a signed webhook for
@@ -50,9 +51,19 @@ and reach routes by the route's `name`.
 | `routes.NAME.traffic` | `{ pin = 'r43' }` sends every request to one release of the route's application; `{ split = { r43 = 20 } }` replaces the route's shares |
 | `routes.NAME.target` | What serves the route instead: `{ app = 'NAME' }`, `{ static = '/srv/snapshot' }` or `{ upstream = 'NAME' }` |
 | `routes.NAME.rate_limits` | The [rate limits](client-classes.md) in place of the route's |
+| `routes.NAME.error_pages` | [Error pages](error-pages.md) by status or `status:reason`, each in place of the route's page for the same key; the route's other pages stay |
 | `apps.NAME.maintenance` | Maintenance mode on (`true`) or off (`false`) for the application |
 | `apps.NAME.min_workers`, `max_workers`, `scale_in`, `group` | [Scheduled capacity](scaling.md#scheduled-capacity) for the application's default worker group, or `group` |
 | `apps.NAME.freeze_deploys` | Refuse the application's [deploys and rollouts](rollouts.md#deploy-freezes) |
+
+An overlay can choose the page people see while it is active, such as a
+notice for a planned upgrade; a page's file must be an absolute path:
+
+```toml
+[overlay.db-upgrade]
+apps.shop = { maintenance = true }
+routes.shop-root.error_pages = { '503:maintenance' = { file = '/srv/shop/upgrade.html' } }
+```
 
 While an overlay pins or splits a route's traffic, a rollout of that
 route's application waits, and carries on when the overlay ends.
@@ -60,7 +71,8 @@ route's application waits, and carries on when the overlay ends.
 Two overlays that set the same field cannot both be applied unless each
 has a different `priority` (capacity is the exception: the highest floor
 and ceiling apply); the higher one's value stands while both are
-active. `muructl apply` refuses overlays that would conflict, or that
+active. Each error page key is a field of its own, so overlays choosing
+pages for different statuses do not conflict. `muructl apply` refuses overlays that would conflict, or that
 name a route, application, upstream, directory or rate limit that does
 not exist.
 

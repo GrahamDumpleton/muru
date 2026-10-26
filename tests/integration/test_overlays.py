@@ -232,6 +232,27 @@ def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None
     site.overlay("end", "read-only")
 
 
+def test_an_overlay_chooses_a_routes_error_page(site: Site) -> None:
+    upgrade = """
+[overlay.upgrade]
+apps.clients = { maintenance = true }
+routes.root.error_pages = { '503:maintenance' = { template = '<p>Upgrading, back soon</p>' } }
+"""
+    site.apply(OVERLAYS + upgrade)
+    preview = site.overlay("preview", "upgrade")
+    assert "route root: error_pages.503:maintenance (none) -> a template" in preview
+
+    site.overlay("activate", "upgrade")
+    assert eventually(lambda: site.request().status == 503)
+    assert site.request().body == b"<p>Upgrading, back soon</p>"
+    shown = site.daemon.muructl("config", "show", "--effective").stdout
+    assert "route root: error_pages.503:maintenance = a template (overlay upgrade)" in shown
+
+    site.overlay("end", "upgrade")
+    assert eventually(lambda: site.request().status == 200)
+    site.apply(OVERLAYS, prune=True)
+
+
 def test_a_recurring_schedule_covers_each_window(site: Site) -> None:
     every_minute = """
 [overlay.always]

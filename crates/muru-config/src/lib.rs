@@ -1446,6 +1446,10 @@ pub struct RouteOverlay {
     /// The rate limits, in place of the route's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limits: Option<Vec<String>>,
+    /// Error pages (section 4.12), by status or status:reason, each in
+    /// place of the route's page for the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_pages: Option<BTreeMap<String, ErrorPage>>,
 }
 
 /// An overlay's traffic policy for a route.
@@ -1686,6 +1690,17 @@ pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
 
         if change.answer.is_some() && change.deny.is_none() {
             return Err(format!("overlay {name}: routes.{route}: answer needs deny"));
+        }
+
+        if let Some(pages) = &change.error_pages {
+            if pages.is_empty() {
+                return Err(format!(
+                    "overlay {name}: routes.{route}: error_pages names no page"
+                ));
+            }
+
+            check_error_pages(pages, false)
+                .map_err(|error| format!("overlay {name}: routes.{route}: {error}"))?;
         }
 
         if let Some(traffic) = &change.traffic
@@ -3516,7 +3531,7 @@ mod tests {
         let overlay = |text: &str| -> Overlay { toml::from_str(text).unwrap() };
         assert!(check_overlay(
             "backup",
-            &overlay("routes.shop-root = { mode = 'read-only', deny = ['POST'] }\ntrigger = { schedule = { start = '2026-11-02T02:00', end = '2026-11-02T03:00', timezone = 'UTC' } }")
+            &overlay("routes.shop-root = { mode = 'read-only', deny = ['POST'], error_pages = { '503:read_only' = { template = '<p>Back at 3</p>' } } }\ntrigger = { schedule = { start = '2026-11-02T02:00', end = '2026-11-02T03:00', timezone = 'UTC' } }")
         )
         .is_ok());
         assert!(check_overlay(
@@ -3530,6 +3545,11 @@ mod tests {
             ("routes.a = { deny = ['post'] }", "not a method"),
             ("routes.a = { answer = 'read_only' }", "answer needs deny"),
             ("routes.a = { traffic = {} }", "one of pin and split"),
+            ("routes.a = { error_pages = {} }", "names no page"),
+            (
+                "routes.a = { error_pages = { '503' = { file = 'down.html' } } }",
+                "absolute",
+            ),
             (
                 "routes.a = { target = { app = 'x', upstream = 'y' } }",
                 "one of app, static",

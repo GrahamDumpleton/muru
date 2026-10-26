@@ -419,9 +419,10 @@ of each window, and overlays set scheduled capacity and deploy freezes.
 The signed webhook of the `[overlay_webhook]` table activates and ends
 overlays with `trigger.external`, `muructl config show --effective`
 attributes what active overlays set, and the daemon warns when the clock
-schedules follow is not synchronised. Still to come: client class
-routes, error page selections, and the release settings' layers in
-`config show`; condition triggers are phase 4.
+schedules follow is not synchronised, and an overlay's `error_pages`
+choose a route's pages while it is active. Still to come: client class
+routes and the release settings' layers in `config show`; condition
+triggers are phase 4.
 
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as

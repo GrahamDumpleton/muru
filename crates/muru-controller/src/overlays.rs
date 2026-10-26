@@ -243,6 +243,12 @@ pub fn apply_routes(routes: &mut [Route], overlays: &[&(String, Overlay)]) {
                 route.rate_limits = limits.clone();
             }
 
+            // Section 4.12: each page replaces the route's for its key.
+
+            for (key, page) in change.error_pages.iter().flatten() {
+                route.error_pages.insert(key.clone(), page.clone());
+            }
+
             if let Some(target) = &change.target {
                 route.app = target.app.clone().unwrap_or_default();
                 route.static_dir = target.static_dir.clone();
@@ -380,6 +386,13 @@ pub fn conflicts(overlays: &BTreeMap<String, Overlay>) -> Vec<String> {
                         .or_default()
                         .push((name, overlay.priority));
                 }
+            }
+
+            for key in change.error_pages.iter().flat_map(BTreeMap::keys) {
+                setters
+                    .entry(format!("routes.{route}.error_pages.{key}"))
+                    .or_default()
+                    .push((name, overlay.priority));
             }
         }
 
@@ -576,11 +589,29 @@ fn changes(
             ),
         ];
 
-        for (field, was, will) in fields {
+        let pages = overlay
+            .routes
+            .get(name)
+            .and_then(|change| change.error_pages.as_ref())
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+            .map(|key| {
+                (
+                    format!("error_pages.{key}"),
+                    describe_page(before.error_pages.get(key)),
+                    describe_page(after.error_pages.get(key)),
+                )
+            });
+
+        for (field, was, will) in fields
+            .into_iter()
+            .map(|(field, was, will)| (field.to_owned(), was, will))
+            .chain(pages)
+        {
             if was != will {
                 found.push(FieldChange {
                     subject: subject.clone(),
-                    field: field.to_owned(),
+                    field,
                     before: Some(was),
                     after: will,
                 });
@@ -650,6 +681,21 @@ pub fn describe_capacity(change: &muru_config::AppOverlay) -> String {
     }
 
     parts.join(", ")
+}
+
+/// An error page as one phrase: what makes it.
+fn describe_page(page: Option<&muru_config::ErrorPage>) -> String {
+    let Some(page) = page else {
+        return String::new();
+    };
+
+    if let Some(file) = &page.file {
+        format!("file {file}")
+    } else if let Some(path) = &page.path {
+        format!("path {path}")
+    } else {
+        "a template".to_owned()
+    }
 }
 
 fn describe_target(route: &Route) -> String {
@@ -924,6 +970,66 @@ mod tests {
         assert_eq!(routes[0].app, "");
         assert_eq!(routes[0].static_dir.as_deref(), Some("/srv/snapshot"));
         assert!(routes[0].traffic.is_none());
+    }
+
+    #[test]
+    fn error_pages_replace_the_routes_page_for_their_key() {
+        let outage = [(
+            "outage".to_owned(),
+            overlay(
+                "routes.root.error_pages = { '503' = { file = '/srv/down.html' }, '502' = { template = 'gone' } }",
+            ),
+        )];
+        let mut routes = vec![route("root", "shop")];
+        routes[0].error_pages = BTreeMap::from([
+            (
+                "503".to_owned(),
+                muru_config::ErrorPage {
+                    path: Some("/errors/503".to_owned()),
+                    ..muru_config::ErrorPage::default()
+                },
+            ),
+            (
+                "404".to_owned(),
+                muru_config::ErrorPage {
+                    path: Some("/errors/404".to_owned()),
+                    ..muru_config::ErrorPage::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            preview(&outage[0].1, &routes, &BTreeSet::new()),
+            [
+                "route root: error_pages.502 (none) -> a template",
+                "route root: error_pages.503 path /errors/503 -> file /srv/down.html",
+            ]
+        );
+
+        apply_routes(&mut routes, &outage.iter().collect::<Vec<_>>());
+        let pages = &routes[0].error_pages;
+        assert_eq!(pages["503"].file.as_deref(), Some("/srv/down.html"));
+        assert_eq!(pages["502"].template.as_deref(), Some("gone"));
+        assert_eq!(pages["404"].path.as_deref(), Some("/errors/404"));
+
+        // Two overlays choosing a page for the same key need priorities;
+        // pages for different keys do not conflict.
+
+        let declared = BTreeMap::from([
+            ("outage".to_owned(), outage[0].1.clone()),
+            (
+                "notice".to_owned(),
+                overlay(
+                    "routes.root.error_pages = { '503' = { template = 'later' }, '500' = { template = 'oops' } }",
+                ),
+            ),
+        ]);
+        assert_eq!(
+            conflicts(&declared),
+            [
+                "overlays notice, outage all set routes.root.error_pages.503: give each a different priority"
+            ]
+        );
     }
 
     #[test]
