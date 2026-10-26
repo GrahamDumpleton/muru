@@ -10,12 +10,14 @@ import http.client
 import json
 import os
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from support import server as support
-from support.daemon import Daemon
+from support.daemon import Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
 
 daemon = daemon_fixture
@@ -200,3 +202,135 @@ def test_debug_refuses_what_it_cannot_reach(daemon: Daemon) -> None:
     assert completed.returncode != 0
     completed = daemon.muructl("debug", "status", "plain@r9", check=False)
     assert completed.returncode != 0
+
+
+def in_background(daemon: Daemon, *paths: str) -> list[threading.Thread]:
+    """Requests running in threads, one for each path."""
+
+    def fetch(path: str) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=60)
+
+        try:
+            connection.request("GET", path)
+            connection.getresponse().read()
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=fetch, args=(path,)) for path in paths]
+
+    for thread in threads:
+        thread.start()
+
+    time.sleep(0.3)
+    return threads
+
+
+def test_profile_samples_the_stacks_running_python(daemon: Daemon, tmp_path: Path) -> None:
+    deploy_plain(daemon, processes=1)
+    threads = in_background(daemon, "/busy?seconds=3")
+    output = tmp_path / "profile.txt"
+
+    try:
+        completed = daemon.muructl(
+            "debug", "profile", "plain", "--for", "1s", "--output", str(output)
+        )
+    finally:
+        for thread in threads:
+            thread.join()
+
+    lines = output.read_text().splitlines()
+    assert lines, completed.stderr
+    stack, count = lines[0].rsplit(" ", 1)
+    assert int(count) > 10
+    assert stack.startswith("muru-app-")
+    assert "application (plain_wsgi.py:" in stack
+    assert "samples of running Python code" in completed.stderr
+    assert "debug.profile" in daemon.events()
+
+
+def test_trace_counts_calls_and_refuses_a_busy_worker(daemon: Daemon) -> None:
+    if sys.version_info < (3, 12):
+        support.unavailable("trace needs Python 3.12 or later, for sys.monitoring")
+
+    deploy_plain(daemon, processes=1)
+    stop = threading.Event()
+
+    def requests() -> None:
+        while not stop.is_set():
+            daemon.get("/")
+
+    caller = threading.Thread(target=requests)
+    caller.start()
+
+    try:
+        text = daemon.muructl("debug", "trace", "plain", "--for", "1s").stdout
+    finally:
+        stop.set()
+        caller.join()
+
+    assert "total ms" in text
+    assert "application (plain_wsgi.py:" in text
+
+    # Both of the worker's threads busy: refused unless forced.
+
+    threads = in_background(daemon, "/sleep?seconds=3", "/sleep?seconds=3")
+
+    try:
+        refused = daemon.muructl("debug", "trace", "plain", "--for", "1s").stdout
+        forced = daemon.muructl("debug", "trace", "plain", "--for", "1s", "--force").stdout
+    finally:
+        for thread in threads:
+            thread.join()
+
+    assert "the worker is busy (2 of 2 slots)" in refused
+    assert "total ms" in forced
+
+
+def test_memory_reports_objects_and_traces_allocations(daemon: Daemon) -> None:
+    deploy_plain(daemon, processes=1)
+    text = daemon.muructl("debug", "memory", "plain").stdout
+    assert "gc counts" in text
+    assert "objects:" in text and " dict" in text
+
+    stop = threading.Event()
+
+    def grow() -> None:
+        while not stop.is_set():
+            daemon.get("/grow?mb=1")
+            time.sleep(0.1)
+
+    grower = threading.Thread(target=grow)
+    grower.start()
+
+    try:
+        traced = daemon.muructl("debug", "memory", "plain", "--trace", "--for", "1s").stdout
+    finally:
+        stop.set()
+        grower.join()
+
+    assert "allocated over the period:" in traced
+    assert "plain_wsgi.py" in traced
+
+
+def test_exec_is_off_unless_the_daemon_allows_it(daemon: Daemon, tmp_path: Path) -> None:
+    deploy_plain(daemon, processes=1)
+    refused = daemon.muructl("debug", "exec", "plain", "--", "1 + 1", check=False)
+    assert refused.returncode != 0
+    assert "debug exec is off" in refused.stderr
+
+    (tmp_path / "allowed").mkdir()
+    allowed = start_daemon(tmp_path / "allowed", config_extra="[daemon]\ndebug_exec = true\n")
+
+    try:
+        deploy_plain(allowed, processes=1)
+        text = allowed.muructl(
+            "debug", "exec", "plain", "--", "import os; print('from', os.getpid()); 6 * 7"
+        ).stdout
+        pid = json.loads(allowed.get("/info").body)["pid"]
+        assert f"from {pid}" in text
+        assert "42" in text
+        failed = allowed.muructl("debug", "exec", "plain", "--", "1 / 0").stdout
+        assert "ZeroDivisionError" in failed
+        assert "debug.exec" in allowed.events()
+    finally:
+        allowed.stop()

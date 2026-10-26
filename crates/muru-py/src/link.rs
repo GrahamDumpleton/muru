@@ -162,7 +162,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
             let stop = Arc::clone(&watchdog_stop);
             std::thread::Builder::new()
                 .name("muru-watchdog".to_owned())
-                .spawn(move || watchdog_loop(&watchdog_shared, timeout, &stop))?;
+                .spawn(move || watchdog_loop(&watchdog_shared, timeout, &stop, report))?;
         }
 
         loop {
@@ -213,8 +213,9 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Interrupt requests past the soft timeout until told to stop (section
-/// 7.6), logging each one.
-fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool) {
+/// 7.6), logging each one with where it was and telling the host, which
+/// makes it an event (section 11.7).
+fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(WATCHDOG_INTERVAL);
 
@@ -224,13 +225,44 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool) {
 
         let interrupted = Python::attach(|py| shared.interrupt_overdue(py));
 
-        for (request_id, method, path) in interrupted {
-            eprintln!(
-                "muru: request {request_id} {method} {path} ran past the soft timeout of {}, \
-                 interrupting it",
+        for request in interrupted {
+            let place = request
+                .place
+                .as_deref()
+                .map(|place| format!(" at {place}"))
+                .unwrap_or_default();
+            let message = format!(
+                "request {} {} {} ran past the soft timeout of {}{place}",
+                request.request_id,
+                request.method,
+                request.path,
                 wsgi::describe_seconds(timeout)
             );
+            eprintln!("muru: {message}, interrupting it");
+
+            if let Some(fd) = report {
+                report_event(fd, "request.soft_timeout", "warning", &message);
+            }
         }
+    }
+}
+
+/// Write an event for the host to raise on the report descriptor, as one
+/// line beside the status lines.
+fn report_event(fd: i32, kind: &str, level: &str, message: &str) {
+    let line = format!(
+        "{{\"event\":{},\"level\":{},\"message\":{}}}\n",
+        serde_json_string(kind),
+        serde_json_string(level),
+        serde_json_string(message)
+    );
+
+    // SAFETY: write from a buffer this frame owns, on the descriptor the
+    // host handed over for reports; a line under PIPE_BUF is written
+    // whole or not at all, and a failed write loses only this event.
+
+    unsafe {
+        libc::write(fd, line.as_ptr().cast(), line.len());
     }
 }
 

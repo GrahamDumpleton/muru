@@ -67,6 +67,9 @@ pub struct Config {
     /// a daemon that runs as root starts the edge and the applications
     /// that name no user as (ADR 0026); `muru` when none is named.
     pub service_user: Option<String>,
+    /// Whether `muructl debug exec` may run code in workers (section
+    /// 11.7).
+    pub debug_exec: bool,
     /// Trusted proxies and the headers taken from them (section 4.7).
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
@@ -572,6 +575,8 @@ struct Daemon {
     /// The service user (ADR 0026), when this daemon is root: whom the
     /// edge and the applications that name no user run as.
     service: Option<crate::host::Identity>,
+    /// Whether `muructl debug exec` may run code in workers.
+    debug_exec: bool,
     /// The points the dashboard's charts draw, one a second.
     history: Arc<muru_dashboard::History>,
     /// Turns the edge's counters into those points.
@@ -846,6 +851,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
+        debug_exec: config.debug_exec,
         history,
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
@@ -2191,6 +2197,48 @@ impl Daemon {
                 args,
                 done,
             } => {
+                // Section 11.7: exec runs code in a worker, so it is off
+                // unless the daemon's file allows it, and the operations
+                // that reach into a worker for a period are recorded.
+
+                if op == "exec" && !self.debug_exec {
+                    let _ = done.send(Err(
+                        "debug exec is off: set debug_exec = true in the [daemon] table of the \
+                         daemon's configuration file"
+                            .to_owned(),
+                    ));
+                    return;
+                }
+
+                if matches!(op.as_str(), "profile" | "trace" | "memory" | "exec") {
+                    let subject = format!("{app}@{id}");
+                    let whom = worker.map_or_else(
+                        || "every worker".to_owned(),
+                        |index| format!("worker {index}"),
+                    );
+
+                    let detail = if op == "exec" {
+                        let code: String = args
+                            .get("code")
+                            .and_then(|code| code.as_str())
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect();
+                        format!("ran code in {whom}: {code}")
+                    } else {
+                        let seconds = args
+                            .get("duration_s")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0);
+                        format!("{op} of {whom} for {seconds} s")
+                    };
+
+                    let level = if op == "exec" { "warning" } else { "info" };
+                    self.events
+                        .emit(&format!("debug.{op}"), &subject, level, &detail);
+                }
+
                 let control = self
                     .running
                     .get(&(app.clone(), id.clone()))

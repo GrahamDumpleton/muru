@@ -511,6 +511,16 @@ impl Admin for Service {
             serde_json::from_str(&request.args_json)
                 .map_err(|error| Status::invalid_argument(format!("args: {error}")))?
         };
+
+        // Section 11.7: an operation over a period has the host wait for
+        // it, and this waits for the host.
+
+        let wait = args
+            .get("timeout_s")
+            .and_then(serde_json::Value::as_f64)
+            .map_or(Duration::from_secs(20), |seconds| {
+                Duration::from_secs_f64(seconds.clamp(0.0, 3600.0)) + Duration::from_secs(15)
+            });
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -524,9 +534,14 @@ impl Admin for Service {
             })
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?;
-        let answered = tokio::time::timeout(Duration::from_secs(20), done_rx)
+        let answered = tokio::time::timeout(wait, done_rx)
             .await
-            .map_err(|_| Status::deadline_exceeded("the host did not answer in 20 seconds"))?
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "the host did not answer in {} seconds",
+                    wait.as_secs()
+                ))
+            })?
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(pb::DebugResponse {

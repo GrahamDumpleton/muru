@@ -702,6 +702,10 @@ pub struct Daemon {
     /// `muru`). Never root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Allow `muructl debug exec`, which runs code in a worker (section
+    /// 11.7); off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_exec: Option<bool>,
 }
 
 /// The `[secrets]` table of the daemon's file (section 10.8).

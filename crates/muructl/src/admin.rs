@@ -259,6 +259,11 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         listeners,
         limits,
         service_user,
+        debug_exec: document
+            .daemon
+            .as_ref()
+            .and_then(|table| table.debug_exec)
+            .unwrap_or(false),
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
         error_pages: document.error_pages.clone(),
@@ -556,6 +561,95 @@ pub enum DebugCommand {
     /// Each worker's interpreter, sys.path, loaded modules, threads,
     /// descriptors and environment (secrets redacted).
     Inspect(DebugArgs),
+
+    /// Sample every thread's stack for a period, merged across the
+    /// workers, as collapsed stacks for a flame graph.
+    Profile(ProfileArgs),
+
+    /// Count calls and time every Python function with sys.monitoring
+    /// for a period (Python 3.12 or later); refused on a busy worker
+    /// unless forced.
+    Trace(TraceArgs),
+
+    /// Each worker's memory, gc state and most common object types, and
+    /// with --trace the sites that allocated most over a period.
+    Memory(MemoryArgs),
+
+    /// Run Python code in the workers and print its output and value;
+    /// allowed only when the daemon's [daemon] table sets debug_exec.
+    Exec(ExecArgs),
+}
+
+/// `muructl debug profile`.
+#[derive(Args)]
+pub struct ProfileArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// How long to sample.
+    #[arg(long = "for", value_name = "DURATION", default_value = "10s", value_parser = muru_config::parse_duration)]
+    duration: Duration,
+
+    /// How often to sample.
+    #[arg(long, value_name = "DURATION", default_value = "10ms", value_parser = muru_config::parse_duration)]
+    interval: Duration,
+
+    /// Write the collapsed stacks here rather than to standard output.
+    #[arg(long, short, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+/// `muructl debug trace`.
+#[derive(Args)]
+pub struct TraceArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// How long to trace.
+    #[arg(long = "for", value_name = "DURATION", default_value = "10s", value_parser = muru_config::parse_duration)]
+    duration: Duration,
+
+    /// Trace a worker serving requests in more than half its slots.
+    #[arg(long)]
+    force: bool,
+
+    /// How many functions to show, by time.
+    #[arg(long, value_name = "N", default_value_t = 30)]
+    top: u32,
+}
+
+/// `muructl debug memory`.
+#[derive(Args)]
+pub struct MemoryArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Trace allocations with tracemalloc for the period.
+    #[arg(long)]
+    trace: bool,
+
+    /// How long to trace allocations.
+    #[arg(long = "for", value_name = "DURATION", default_value = "30s", value_parser = muru_config::parse_duration)]
+    duration: Duration,
+
+    /// How many object types and allocation sites to show.
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    top: u32,
+}
+
+/// `muructl debug exec`.
+#[derive(Args)]
+pub struct ExecArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// How long the code may run.
+    #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = muru_config::parse_duration)]
+    timeout: Duration,
+
+    /// The code, after --.
+    #[arg(last = true, required = true, value_name = "CODE")]
+    code: Vec<String>,
 }
 
 /// The logging subcommands (section 11.4).
@@ -590,35 +684,243 @@ pub enum LoggingCommand {
 
 /// Ask a release's workers something and print what came back.
 pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
-    let (op, args) = match &command {
-        DebugCommand::Status(args) => ("status", args),
-        DebugCommand::Stacks(args) => ("stacks", args),
-        DebugCommand::Tasks(args) => ("tasks", args),
-        DebugCommand::Inspect(args) => ("inspect", args),
+    // Section 11.7: an operation over a period gives the host that long
+    // and a little more before it gives up on a worker.
+
+    let period = |duration: Duration| duration.as_secs_f64() + 5.0;
+
+    let (op, args, request) = match &command {
+        DebugCommand::Status(args) => ("status", args, serde_json::json!({})),
+        DebugCommand::Stacks(args) => ("stacks", args, serde_json::json!({})),
+        DebugCommand::Tasks(args) => ("tasks", args, serde_json::json!({})),
+        DebugCommand::Inspect(args) => ("inspect", args, serde_json::json!({})),
+        DebugCommand::Profile(profile) => (
+            "profile",
+            &profile.common,
+            serde_json::json!({
+                "duration_s": profile.duration.as_secs_f64(),
+                "interval_ms": profile.interval.as_secs_f64() * 1000.0,
+                "timeout_s": period(profile.duration),
+            }),
+        ),
+        DebugCommand::Trace(trace) => (
+            "trace",
+            &trace.common,
+            serde_json::json!({
+                "duration_s": trace.duration.as_secs_f64(),
+                "force": trace.force,
+                "top": trace.top,
+                "timeout_s": period(trace.duration),
+            }),
+        ),
+        DebugCommand::Memory(memory) => (
+            "memory",
+            &memory.common,
+            serde_json::json!({
+                "trace": memory.trace,
+                "duration_s": memory.duration.as_secs_f64(),
+                "top": memory.top,
+                "timeout_s": if memory.trace { period(memory.duration) } else { 30.0 },
+            }),
+        ),
+        DebugCommand::Exec(exec) => (
+            "exec",
+            &exec.common,
+            serde_json::json!({
+                "code": exec.code.join(" "),
+                "timeout_s": exec.timeout.as_secs_f64(),
+            }),
+        ),
     };
 
-    let response = ask(
-        &args.socket,
-        &args.target,
-        op,
-        args.worker,
-        serde_json::json!({}),
-    )
-    .await?;
+    let response = ask(&args.socket, &args.target, op, args.worker, request).await?;
 
     if args.json {
         print_json(&response);
         return Ok(());
     }
 
-    match op {
-        "status" => print_status(&response),
-        "stacks" => print_stacks(&response),
-        "tasks" => print_tasks(&response),
-        _ => print_inspect(&response),
+    match &command {
+        DebugCommand::Status(_) => print_status(&response),
+        DebugCommand::Stacks(_) => print_stacks(&response),
+        DebugCommand::Tasks(_) => print_tasks(&response),
+        DebugCommand::Inspect(_) => print_inspect(&response),
+        DebugCommand::Profile(profile) => write_profile(&response, profile.output.as_deref())?,
+        DebugCommand::Trace(_) => print_trace(&response),
+        DebugCommand::Memory(_) => print_memory(&response),
+        DebugCommand::Exec(_) => print_exec(&response),
     }
 
     Ok(())
+}
+
+/// Merge the workers' collapsed stacks and write them, heaviest first,
+/// with the functions that took most samples on standard error.
+fn write_profile(response: &pb::DebugResponse, output: Option<&Path>) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut stacks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut leaves: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut rounds = 0;
+
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            eprintln!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        rounds += result["rounds"].as_u64().unwrap_or(0);
+
+        for (stack, count) in result["stacks"].as_object().into_iter().flatten() {
+            let count = count.as_u64().unwrap_or(0);
+            *stacks.entry(stack.clone()).or_default() += count;
+
+            if let Some(leaf) = stack.rsplit(';').next() {
+                *leaves.entry(leaf.to_owned()).or_default() += count;
+            }
+        }
+    }
+
+    let mut ordered: Vec<(&String, &u64)> = stacks.iter().collect();
+    ordered.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut text = String::new();
+
+    for (stack, count) in ordered {
+        text.push_str(&format!("{stack} {count}\n"));
+    }
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?
+        }
+        None => std::io::stdout().write_all(text.as_bytes())?,
+    }
+
+    let total: u64 = leaves.values().sum();
+    let mut busiest: Vec<(String, u64)> = leaves.into_iter().collect();
+    busiest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    eprintln!(
+        "{total} samples of running Python code in {rounds} rounds across {} worker{}",
+        response.workers.len(),
+        if response.workers.len() == 1 { "" } else { "s" }
+    );
+
+    for (function, count) in busiest.iter().take(10) {
+        eprintln!(
+            "  {:>5.1}%  {function}",
+            *count as f64 * 100.0 / total.max(1) as f64
+        );
+    }
+
+    if let Some(path) = output {
+        eprintln!("muru: collapsed stacks written to {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn print_trace(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}\n",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        println!("worker {} (pid {})", answer.index, answer.pid);
+        println!("  {:>10}  {:>8}  function", "total ms", "calls");
+
+        for function in result["functions"].as_array().into_iter().flatten() {
+            println!(
+                "  {:>10.3}  {:>8}  {}",
+                function["total_ms"].as_f64().unwrap_or(0.0),
+                function["calls"].as_u64().unwrap_or(0),
+                function["function"].as_str().unwrap_or("?")
+            );
+        }
+
+        println!();
+    }
+}
+
+fn print_memory(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}\n",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        println!("worker {} (pid {})", answer.index, answer.pid);
+
+        if let Some(memory) = result["memory"].as_object() {
+            let size = |name: &str| {
+                memory
+                    .get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .map(muru_config::format_size)
+                    .unwrap_or_else(|| "?".to_owned())
+            };
+            println!(
+                "  rss {}  pss {}  uss {}",
+                size("rss"),
+                size("pss"),
+                size("uss")
+            );
+        }
+
+        println!("  gc counts {}", result["gc"]["counts"]);
+        println!("  objects:");
+
+        for entry in result["objects"].as_array().into_iter().flatten() {
+            println!(
+                "    {:>9}  {}",
+                entry[1].as_u64().unwrap_or(0),
+                entry[0].as_str().unwrap_or("?")
+            );
+        }
+
+        if let Some(allocations) = result["allocations"].as_array() {
+            println!("  allocated over the period:");
+
+            for site in allocations {
+                println!(
+                    "    {:>+12}  {:>+8}  {}",
+                    site["size_diff"].as_i64().unwrap_or(0),
+                    site["count_diff"].as_i64().unwrap_or(0),
+                    site["site"].as_str().unwrap_or("?")
+                );
+            }
+        }
+
+        println!();
+    }
+}
+
+fn print_exec(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        println!("worker {} (pid {}):", answer.index, answer.pid);
+        print!("{}", result["output"].as_str().unwrap_or_default());
+
+        if let Some(value) = result["value"].as_str() {
+            println!("{value}");
+        }
+    }
 }
 
 /// Change logger levels in a release's workers.

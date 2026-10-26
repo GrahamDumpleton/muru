@@ -3,11 +3,11 @@
 ```{admonition} Status
 :class: note
 
-Status, stacks, tasks, inspect and logger levels, answered from inside
-each worker by the runtime's control thread, with faulthandler when a
-worker cannot answer. Profiling, tracing, memory tracing, attaching a
-debugger, running a snippet and the automatic captures are still to come,
-as is reading a worker from outside with PEP 768 on Python 3.14.
+Status, stacks, tasks, inspect, logger levels, profiling, tracing,
+memory, running a snippet and the automatic captures, answered from
+inside each worker by the runtime's control thread, with faulthandler
+when a worker cannot answer. Attaching a debugger is still to come, as is
+reading a worker from outside with PEP 768 on Python 3.14.
 ```
 
 `muructl debug` looks into the workers of a release through the daemon,
@@ -68,6 +68,80 @@ the modules loaded with versions where they declare one, threads, open
 descriptors and environment, with values of keys that look like secrets
 (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL`, `AUTH`) replaced by
 `***`.
+
+## Profile
+
+`muructl debug profile` samples the stack of every thread running Python
+code, every 10 ms for 10 s unless `--interval` and `--for` say otherwise,
+in each worker of the release at once, and merges the samples into
+collapsed stacks, the format flame graph tools read:
+
+```
+muructl debug profile shop --for 30s --output shop.folded
+flamegraph.pl shop.folded > shop.svg
+```
+
+Each line is a stack, root first and under the thread's name, then how
+many samples found it. The functions that took most samples are printed
+on standard error with their share. Threads waiting outside Python, such
+as idle threads of the pool, are not sampled, so the profile is of the
+work being done. Sampling costs the worker little, so it is safe on a
+release serving traffic.
+
+## Trace
+
+`muructl debug trace` counts every call of every Python function and the
+time spent in each, with sys.monitoring, for `--for` (10 s), and prints
+the functions that took longest with their call counts. It needs Python
+3.12 or later. Exact counts cost the worker more than sampling, so a
+worker serving requests in more than half its slots is refused unless
+`--force` is given.
+
+## Memory
+
+`muructl debug memory` shows each worker's resident, proportional and
+unique size, the garbage collector's counts, and the object types it
+holds most of. With `--trace`, tracemalloc runs for `--for` (30 s) and
+the sites that allocated most in that time are shown, by bytes and
+objects added:
+
+```
+muructl debug memory shop --trace --for 1m --top 30
+```
+
+## Running code
+
+`muructl debug exec` runs a snippet in the workers and prints what it
+printed and the value of its last expression, or the traceback when it
+raised:
+
+```
+muructl debug exec shop --worker 0 -- 'import myapp.cache; len(myapp.cache.entries)'
+```
+
+It is off unless the daemon's configuration file allows it:
+
+```toml
+[daemon]
+debug_exec = true
+```
+
+Every use is the event `debug.exec` with the code that ran, as profiles,
+traces and memory traces are `debug.profile`, `debug.trace` and
+`debug.memory`.
+
+## Automatic captures
+
+Some events say what the worker was doing, captured before the worker
+lost the evidence:
+
+- `request.soft_timeout`: a request past the [soft timeout](timeouts.md),
+  with where its thread was, taken before the timeout interrupted it.
+- `worker.timeout_killed`: a worker replaced for the hard timeout, with
+  where its oldest request was. Its threads' stacks go to the log, through
+  faulthandler when the worker cannot answer.
+- `worker.recycled` for memory: a worker replaced over a [memory
+  limit](memory.md), with the object types it held most of.
 
 ## Logger levels
 

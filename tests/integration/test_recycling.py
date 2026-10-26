@@ -128,6 +128,15 @@ def test_a_request_past_the_hard_timeout_replaces_its_worker() -> None:
         log = server.log()
         assert re.search(r"past the hard timeout of 1 s", log)
         assert "plain_wsgi.py" in log and "in application" in log, "no stack dump"
+
+        # Section 11.7: the event says where the stuck request was, from
+        # the stacks taken before the worker went.
+
+        wait_for(lambda: "muru: worker.timeout_killed:" in server.log(), timeout=30)
+        assert re.search(
+            r"muru: worker\.timeout_killed: .*; at plain_wsgi\.py line \d+ in application",
+            server.log(),
+        ), server.log()
         thread.join(timeout=30)
         assert outcome and outcome[0] != "status 200", outcome
 

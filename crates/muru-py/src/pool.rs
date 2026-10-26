@@ -22,6 +22,55 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::asgi::{Asgi, Channel};
 
+/// A request the soft timeout interrupted (section 7.6).
+pub struct Interrupted {
+    /// The request identifier.
+    pub request_id: String,
+    /// The method.
+    pub method: String,
+    /// The path and query.
+    pub path: String,
+    /// Where its thread was, innermost frame first, when it could be read
+    /// (section 11.7).
+    pub place: Option<String>,
+}
+
+/// The innermost frames of a thread as `file line N in function`,
+/// innermost first, read without opening source files.
+fn thread_place(py: Python<'_>, thread: u64) -> Option<String> {
+    let frame = py
+        .import("sys")
+        .ok()?
+        .call_method0("_current_frames")
+        .ok()?
+        .get_item(thread)
+        .ok()?;
+    let traceback = py.import("traceback").ok()?;
+    let walk = traceback.call_method1("walk_stack", (frame,)).ok()?;
+    let options = PyDict::new(py);
+    options.set_item("limit", 3).ok()?;
+    options.set_item("lookup_lines", false).ok()?;
+    let summary = traceback
+        .getattr("StackSummary")
+        .ok()?
+        .call_method("extract", (walk,), Some(&options))
+        .ok()?;
+    let mut places = Vec::new();
+
+    for entry in summary.try_iter().ok()? {
+        let entry = entry.ok()?;
+        let file: String = entry.getattr("filename").ok()?.extract().ok()?;
+        let line: Option<u64> = entry.getattr("lineno").ok()?.extract().ok()?;
+        let name: String = entry.getattr("name").ok()?.extract().ok()?;
+        let file = std::path::Path::new(&file)
+            .file_name()
+            .map_or(file.clone(), |name| name.to_string_lossy().into_owned());
+        places.push(format!("{file} line {} in {name}", line.unwrap_or(0)));
+    }
+
+    (!places.is_empty()).then(|| places.join(", called from "))
+}
+
 /// One request in flight, for the worker's soft timeout, the host's hard
 /// timeout and inspection (sections 7.6 and 11.7).
 pub struct RequestInfo {
@@ -298,14 +347,35 @@ impl Shared {
     /// interrupted yet (section 7.6): a WSGI request gets the timeout
     /// exception injected into its thread and its bridge waits woken, an
     /// ASGI request has its task cancelled. Returns what was interrupted,
-    /// as (request id, method, path) for the log.
-    pub fn interrupt_overdue(&self, py: Python<'_>) -> Vec<(String, String, String)> {
+    /// for the log and the event.
+    pub fn interrupt_overdue(&self, py: Python<'_>) -> Vec<Interrupted> {
         let Some(timeout) = self.soft_timeout.as_ref() else {
             return Vec::new();
         };
         let now = Instant::now();
         let mut interrupted = Vec::new();
         let mut channels = Vec::new();
+
+        // Section 11.7: where each overdue thread is, taken first, before
+        // the exception unwinds it, and without the lock, since reading a
+        // stack runs Python.
+
+        let overdue: Vec<(u64, u64)> = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .iter()
+            .filter(|(_, info)| {
+                !info.timed_out
+                    && !info.exempt
+                    && now.saturating_duration_since(info.started) >= timeout.after
+            })
+            .filter_map(|(id, info)| info.thread.map(|thread| (*id, thread)))
+            .collect();
+        let places: HashMap<u64, String> = overdue
+            .into_iter()
+            .filter_map(|(id, thread)| thread_place(py, thread).map(|place| (id, place)))
+            .collect();
 
         // The injection happens under the lock, so a request that ends
         // meanwhile clears it under the same lock (see request_finished).
@@ -314,7 +384,7 @@ impl Shared {
 
         let mut active = self.active.lock().expect("active requests poisoned");
 
-        for info in active.values_mut() {
+        for (id, info) in active.iter_mut() {
             if info.timed_out
                 || info.exempt
                 || now.saturating_duration_since(info.started) < timeout.after
@@ -323,11 +393,12 @@ impl Shared {
             }
 
             info.timed_out = true;
-            interrupted.push((
-                info.request_id.clone(),
-                info.method.clone(),
-                info.path.clone(),
-            ));
+            interrupted.push(Interrupted {
+                request_id: info.request_id.clone(),
+                method: info.method.clone(),
+                path: info.path.clone(),
+                place: places.get(id).cloned(),
+            });
 
             if let Some(channel) = &info.channel {
                 channels.push(channel.clone_ref(py));

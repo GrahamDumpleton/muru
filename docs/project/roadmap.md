@@ -370,6 +370,21 @@ limits in applied files, the application-level mode and modes set by
 overlays (section 9.10), buckets shared between several edge processes,
 and TLS fingerprints as an input.
 
+Worker inspection's phase 3 commands (section 11.7) are in, through the
+in-process control thread of ADR 0025: `muructl debug profile` samples
+every thread running Python for a period and writes collapsed stacks for
+a flame graph, merged across the workers; `debug trace` counts calls and
+time with sys.monitoring on Python 3.12 and later, refusing a busy
+worker unless forced; `debug memory` reports sizes, gc state and the
+commonest objects, with tracemalloc over a period; and `debug exec` runs
+a snippet when the daemon's `[daemon] debug_exec` allows it, each of
+these an event. The automatic captures are in too: a request past the
+soft timeout is the event `request.soft_timeout` with where it was,
+taken before it was interrupted, a hard-timeout kill names where the
+oldest request was, and a memory recycle names the commonest objects.
+Still to come: attach with `breakpoint()` and DAP, `--requests` and
+`--path`, pstats output, and reading from outside with PEP 768.
+
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as
 a file read when the snapshot is compiled, a template the edge renders

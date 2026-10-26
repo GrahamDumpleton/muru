@@ -15,7 +15,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 
 | Table | Where | Holds |
 | --- | --- | --- |
-| `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode |
+| `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode, debug_exec (section 11.7) |
 | `[tools]` | daemon file | uv path and version constraints |
 | `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, PROXY protocol, processes, threads |
 | `[proxy]` | daemon, host or listener | trusted proxies and header types |
@@ -114,3 +114,4 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
+| Debugging | request.soft_timeout, debug.profile, debug.trace, debug.memory, debug.exec |

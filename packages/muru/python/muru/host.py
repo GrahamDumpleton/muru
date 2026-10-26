@@ -420,6 +420,11 @@ class Pending:
     answers: dict[int, dict[str, Any]] = field(default_factory=dict)
     deadline: float = 0.0
 
+    # Section 11.7: a request the host makes for itself, whose answers go
+    # here rather than to the supervisor.
+
+    then: Callable[[Pending], None] | None = None
+
 
 @dataclass
 class Replacement:
@@ -430,6 +435,11 @@ class Replacement:
     reason: str
     kind: str  # worker.recycled or worker.timeout_killed
     new_pid: int | None = None
+
+    # Section 11.7: what the worker was doing when it was replaced (its
+    # stuck request's stack, or its commonest objects), for the event.
+
+    capture: str | None = None
     announced: int | None = None
     announced_at: float | None = None
     terminate_at: float | None = None
@@ -532,6 +542,11 @@ class Host:
         self.control_sockets: dict[int, socket.socket] = {}
         self.control_buffers: dict[int, bytes] = {}
         self.pending: dict[int, Pending] = {}
+
+        # The host's own requests to workers count down from -1, apart
+        # from the supervisor's.
+
+        self.own_requests = 0
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
@@ -895,7 +910,11 @@ class Host:
                 memory_interval_ms=int(self.memory.check_interval * 1000),
                 control=control,
                 on_control=lambda line, active, names: _inspect.handle(
-                    line, active, loop.loop if loop is not None else None, names
+                    line,
+                    active,
+                    loop.loop if loop is not None else None,
+                    names,
+                    slots=group.threads if loop is None else group.concurrency,
                 ),
                 **asgi_arguments,
                 **timeout_arguments,
@@ -1387,6 +1406,11 @@ class Host:
             }
 
         self.pending.pop(pending.id, None)
+
+        if pending.then is not None:
+            pending.then(pending)
+            return
+
         self.send_to_supervisor(
             {
                 "type": "response",
@@ -1425,6 +1449,17 @@ class Host:
             try:
                 report = json.loads(line)
             except ValueError:
+                continue
+
+            # Section 11.7: an event the worker raises, such as a request
+            # past the soft timeout with where it was.
+
+            if "event" in report:
+                self.emit(
+                    str(report["event"]),
+                    str(report.get("level", "warning")),
+                    f"worker {state.index} (pid {state.pid}): {report.get('message', '')}",
+                )
                 continue
 
             state.requests = int(report.get("requests", state.requests))
@@ -1635,17 +1670,99 @@ class Host:
 
         if "limit" in reason:
             self.note_memory_recycle(index)
+            self.capture_objects(state, replacement)
 
         if hard:
             self.routed[index] = None
             self.announce()
 
             if kind == "worker.timeout_killed":
-                self.signal(state.pid, signal.SIGQUIT)
+                self.capture_stacks(state, replacement)
 
             replacement.terminate_at = time.monotonic() + self.hard_drain_grace
 
         replacement.new_pid = self.spawn(index, replacing=True)
+
+    def ask(
+        self,
+        state: WorkerState,
+        op: str,
+        args: dict[str, Any],
+        timeout: float,
+        then: Callable[[Pending], None],
+    ) -> None:
+        """Ask one worker something for the host itself; `then` gets the answer."""
+
+        self.own_requests -= 1
+        pending = Pending(self.own_requests, op, {state.pid: state.index}, then=then)
+        pending.deadline = time.monotonic() + timeout
+        self.pending[pending.id] = pending
+        control = self.control_sockets.get(state.pid)
+
+        try:
+            if control is None:
+                raise OSError("no control connection")
+
+            control.sendall(json.dumps({"id": pending.id, "op": op, "args": args}).encode() + b"\n")
+        except OSError as error:
+            pending.answers[state.pid] = {"ok": False, "error": str(error)}
+            self.finish_if_answered(pending)
+
+    def capture_stacks(self, state: WorkerState, replacement: Replacement) -> None:
+        """Take a worker's stacks before it is killed for the hard timeout.
+
+        Section 11.7: the stacks go to the log and where the oldest request
+        was goes to the event. A worker that cannot answer within a second
+        gets SIGQUIT, and faulthandler writes its stacks to the log instead.
+        """
+
+        def answered(pending: Pending) -> None:
+            answer = pending.answers.get(state.pid, {})
+
+            if not answer.get("ok"):
+                replacement.capture = "its stacks were written to the log by faulthandler"
+                return
+
+            threads = answer.get("result", {}).get("threads", [])
+
+            for thread in threads:
+                frames = "".join(
+                    f"\n    {frame['file']}:{frame['line']} in {frame['function']}"
+                    for frame in thread.get("frames", [])
+                )
+                log(f"worker {state.index} (pid {state.pid}) {thread.get('name')}:{frames}")
+
+            stuck = max(
+                (thread for thread in threads if thread.get("request")),
+                key=lambda thread: thread["request"].get("elapsed_ms", 0),
+                default=None,
+            )
+
+            if stuck is not None and stuck.get("frames"):
+                innermost = stuck["frames"][-3:][::-1]
+                replacement.capture = "at " + ", called from ".join(
+                    f"{os.path.basename(frame['file'])} line {frame['line']} in {frame['function']}"
+                    for frame in innermost
+                )
+
+        self.ask(state, "stacks", {}, 1.0, answered)
+
+    def capture_objects(self, state: WorkerState, replacement: Replacement) -> None:
+        """Count a worker's commonest objects before it is recycled for memory.
+
+        Section 11.7: the counts go to the event, so the growth is attributed.
+        """
+
+        def answered(pending: Pending) -> None:
+            answer = pending.answers.get(state.pid, {})
+
+            if answer.get("ok"):
+                objects = answer.get("result", {}).get("objects", [])
+                replacement.capture = "most objects: " + ", ".join(
+                    f"{name} {count}" for name, count in objects
+                )
+
+        self.ask(state, "memory", {"top": 5}, 2.0, answered)
 
     def advance(self, replacement: Replacement, now: float) -> None:
         """Move a replacement along.
@@ -1785,11 +1902,12 @@ class Host:
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
                 level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
+                capture = f"; {replacement.capture}" if replacement.capture else ""
                 self.emit(
                     replacement.kind,
                     level,
                     f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
-                    f"{replacement.reason}",
+                    f"{replacement.reason}{capture}",
                 )
                 continue
 

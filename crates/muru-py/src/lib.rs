@@ -155,11 +155,28 @@ fn serve(
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
+/// The worker's memory as section 7.7 measures it: resident,
+/// proportional and unique sizes in bytes, or none where the platform
+/// gives no figures (section 11.7's `muructl debug memory`).
+#[pyfunction]
+fn memory_usage(py: Python<'_>) -> PyResult<Option<Bound<'_, pyo3::types::PyDict>>> {
+    let Some(memory) = memory::measure() else {
+        return Ok(None);
+    };
+
+    let sizes = pyo3::types::PyDict::new(py);
+    sizes.set_item("rss", memory.rss)?;
+    sizes.set_item("pss", memory.pss)?;
+    sizes.set_item("uss", memory.uss)?;
+    Ok(Some(sizes))
+}
+
 /// Module initialisation for `muru._native`.
 #[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
+    m.add_function(wrap_pyfunction!(memory_usage, m)?)?;
     m.add_class::<wsgi::Input>()?;
     m.add_class::<wsgi::StartResponse>()?;
     m.add_class::<wsgi::FileWrapper>()?;
