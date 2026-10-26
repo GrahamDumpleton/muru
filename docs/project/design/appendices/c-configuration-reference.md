@@ -113,6 +113,6 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |
-| Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.promoted |
+| Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Debugging | request.soft_timeout, debug.profile, debug.trace, debug.memory, debug.exec |

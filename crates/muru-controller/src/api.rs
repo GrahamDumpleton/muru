@@ -577,33 +577,13 @@ impl Admin for Service {
             .into_iter()
             .map(|(name, overlay)| {
                 let state = states.get(&name);
-                let window = crate::overlays::window(&overlay);
+                let window = crate::overlays::window(&overlay, now);
                 pb::OverlayInfo {
                     active: state.is_some_and(|state| state.active),
                     state: state.map(|state| state.source.clone()).unwrap_or_default(),
                     since_unix_ms: state.map_or(0, |state| state.since_unix_ms),
                     until_unix_ms: state.and_then(|state| state.until_unix_ms).unwrap_or(0),
-                    trigger: overlay
-                        .trigger
-                        .as_ref()
-                        .and_then(|trigger| trigger.schedule.as_ref())
-                        .map(|schedule| {
-                            format!(
-                                "from {}{}{}",
-                                schedule.start,
-                                schedule
-                                    .end
-                                    .as_ref()
-                                    .map(|end| format!(" until {end}"))
-                                    .unwrap_or_default(),
-                                schedule
-                                    .timezone
-                                    .as_ref()
-                                    .map(|zone| format!(" {zone}"))
-                                    .unwrap_or_default()
-                            )
-                        })
-                        .unwrap_or_else(|| "by hand".to_owned()),
+                    trigger: crate::overlays::describe_trigger(&overlay),
                     changes: overlay
                         .routes
                         .keys()

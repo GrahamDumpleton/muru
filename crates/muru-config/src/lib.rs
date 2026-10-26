@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod cron;
+
 /// The interface an entrypoint speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1308,6 +1310,30 @@ pub struct Overlay {
     /// higher. Overlays that would conflict must both set one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
+    /// Once its schedule activates it, it stays active past the window
+    /// until a person ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latch: Option<bool>,
+    /// Its schedule only raises overlay.would_activate events; it is
+    /// activated by hand only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<bool>,
+    /// What to start ahead of its schedule's windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_up: Option<WarmUp>,
+}
+
+/// An overlay's warm-up: for `lead` before each window of its schedule,
+/// `start_release` runs, so a switch to it lands on warm workers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmUp {
+    /// How long before the window, such as 30m.
+    pub lead: String,
+    /// The release to start, as app@release, or as release when the
+    /// overlay changes routes of one application only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_release: Option<String>,
 }
 
 /// What an overlay changes on a route.
@@ -1380,16 +1406,25 @@ pub struct OverlayTrigger {
     pub schedule: Option<OverlaySchedule>,
 }
 
-/// A one-off window: from `start`, until `end` when it has one.
+/// A window in time: one-off, from `start` until `end` when it has one,
+/// or recurring, from each time `cron` names for `duration`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlaySchedule {
     /// When it starts, as a local date and time such as
     /// 2026-11-02T09:00, or with an offset.
-    pub start: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
     /// When it ends; it stays active until ended or promoted without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<String>,
+    /// When each window starts, as a cron expression such as
+    /// '0 2 * * *' (see [`cron::Cron`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// How long each recurring window lasts, such as 1h.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
     /// The time zone local times are in, such as Australia/Sydney; the
     /// daemon's own zone without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1455,27 +1490,153 @@ pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
         }
     }
 
-    if let Some(schedule) = overlay
+    let schedule = overlay
         .trigger
         .as_ref()
-        .and_then(|trigger| trigger.schedule.as_ref())
-    {
-        let start = parse_moment(&schedule.start, schedule.timezone.as_deref())
-            .map_err(|error| format!("overlay {name}: schedule.start: {error}"))?;
+        .and_then(|trigger| trigger.schedule.as_ref());
 
-        if let Some(end) = &schedule.end {
-            let end = parse_moment(end, schedule.timezone.as_deref())
-                .map_err(|error| format!("overlay {name}: schedule.end: {error}"))?;
+    if let Some(schedule) = schedule {
+        check_schedule(schedule).map_err(|error| format!("overlay {name}: schedule: {error}"))?;
+    }
 
-            if end <= start {
-                return Err(format!(
-                    "overlay {name}: schedule.end must be after its start"
-                ));
-            }
+    if let Some(warm_up) = &overlay.warm_up {
+        if schedule.is_none() {
+            return Err(format!(
+                "overlay {name}: warm_up needs a schedule to start ahead of"
+            ));
         }
+
+        parse_duration(&warm_up.lead)
+            .map_err(|error| format!("overlay {name}: warm_up.lead: {error}"))?;
+    }
+
+    if (overlay.latch.is_some() || overlay.advisory.is_some()) && schedule.is_none() {
+        return Err(format!(
+            "overlay {name}: latch and advisory apply to a schedule, and it has none"
+        ));
     }
 
     Ok(())
+}
+
+/// Check a schedule: a `start` with an optional `end`, or a `cron` with
+/// a `duration`, in a time zone that exists.
+pub fn check_schedule(schedule: &OverlaySchedule) -> Result<(), String> {
+    let zone = schedule.timezone.as_deref();
+
+    match (&schedule.start, &schedule.cron) {
+        (Some(start), None) => {
+            if schedule.duration.is_some() {
+                return Err("duration goes with cron; a start has an end".to_owned());
+            }
+
+            let start = parse_moment(start, zone).map_err(|error| format!("start: {error}"))?;
+
+            if let Some(end) = &schedule.end {
+                let end = parse_moment(end, zone).map_err(|error| format!("end: {error}"))?;
+
+                if end <= start {
+                    return Err("end must be after its start".to_owned());
+                }
+            }
+        }
+        (None, Some(expression)) => {
+            if schedule.end.is_some() {
+                return Err("end goes with start; cron has a duration".to_owned());
+            }
+
+            let Some(duration) = &schedule.duration else {
+                return Err("cron needs a duration, such as 1h".to_owned());
+            };
+
+            if parse_duration(duration).map_err(|error| format!("duration: {error}"))?
+                < Duration::from_secs(60)
+            {
+                return Err("duration must be at least a minute".to_owned());
+            }
+
+            let cron = cron::Cron::parse(expression)?;
+            let zone = time_zone(zone)?;
+
+            if cron.next(jiff::Timestamp::now(), &zone).is_none() {
+                return Err(format!("cron {expression:?} never occurs"));
+            }
+        }
+        _ => return Err("give one of start and cron".to_owned()),
+    }
+
+    Ok(())
+}
+
+/// The window of a schedule that `now` falls in, else the next one, as
+/// Unix milliseconds: from its start, until its end when it has one. None
+/// when no window is to come, or for a schedule that does not parse.
+pub fn schedule_window(schedule: &OverlaySchedule, now: i64) -> Option<(i64, Option<i64>)> {
+    let zone = schedule.timezone.as_deref();
+
+    if let Some(start) = &schedule.start {
+        let start = parse_moment(start, zone).ok()?;
+
+        let end = match &schedule.end {
+            Some(end) => Some(parse_moment(end, zone).ok()?),
+            None => None,
+        };
+
+        return Some((start, end));
+    }
+
+    let cron = cron::Cron::parse(schedule.cron.as_deref()?).ok()?;
+    let length = parse_duration(schedule.duration.as_deref()?)
+        .ok()?
+        .as_millis() as i64;
+    let zone = time_zone(zone).ok()?;
+    let at = jiff::Timestamp::from_millisecond(now).ok()?;
+
+    // The latest start covers now if any does, as each window is as long.
+
+    if let Some(last) = cron.previous(at, &zone) {
+        let start = last.as_millisecond();
+
+        if now < start + length {
+            return Some((start, Some(start + length)));
+        }
+    }
+
+    let next = cron.next(at, &zone)?.as_millisecond();
+    Some((next, Some(next + length)))
+}
+
+/// A time zone by its IANA name, or the system's without one.
+pub fn time_zone(name: Option<&str>) -> Result<jiff::tz::TimeZone, String> {
+    match name {
+        Some(name) => jiff::tz::TimeZone::get(name)
+            .map_err(|_| format!("{name:?} is not a time zone such as Australia/Sydney")),
+        None => Ok(jiff::tz::TimeZone::system()),
+    }
+}
+
+/// A schedule as the reports show it.
+pub fn describe_schedule(schedule: &OverlaySchedule) -> String {
+    let when = match (&schedule.start, &schedule.cron) {
+        (Some(start), _) => format!(
+            "from {start}{}",
+            schedule
+                .end
+                .as_ref()
+                .map(|end| format!(" until {end}"))
+                .unwrap_or_default()
+        ),
+        (None, Some(cron)) => format!(
+            "cron '{cron}' for {}",
+            schedule.duration.as_deref().unwrap_or_default()
+        ),
+        (None, None) => String::new(),
+    };
+
+    match &schedule.timezone {
+        Some(zone) => format!("{when} {zone}"),
+        None => when,
+    }
 }
 
 /// A moment as Unix milliseconds: an RFC 3339 time with an offset, or a
@@ -1490,11 +1651,7 @@ pub fn parse_moment(text: &str, timezone: Option<&str>) -> Result<i64, String> {
         return Ok(instant.as_millisecond());
     }
 
-    let zone = match timezone {
-        Some(name) => jiff::tz::TimeZone::get(name)
-            .map_err(|_| format!("{name:?} is not a time zone such as Australia/Sydney"))?,
-        None => jiff::tz::TimeZone::system(),
-    };
+    let zone = time_zone(timezone)?;
 
     let civil: jiff::civil::DateTime = text
         .parse()
@@ -3079,6 +3236,11 @@ mod tests {
             &overlay("routes.shop-root = { mode = 'read-only', deny = ['POST'] }\ntrigger = { schedule = { start = '2026-11-02T02:00', end = '2026-11-02T03:00', timezone = 'UTC' } }")
         )
         .is_ok());
+        assert!(check_overlay(
+            "nightly",
+            &overlay("apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *', duration = '1h', timezone = 'Australia/Sydney' } }\nwarm_up = { lead = '30m' }\nadvisory = true")
+        )
+        .is_ok());
 
         for (text, expected) in [
             ("priority = 1", "changes no route"),
@@ -3091,7 +3253,27 @@ mod tests {
             ),
             (
                 "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = 'soon' } }",
-                "schedule.start",
+                "schedule: start",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *' } }",
+                "cron needs a duration",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *', start = '2026-11-02T09:00' } }",
+                "one of start and cron",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 25 * * *', duration = '1h' } }",
+                "hour \"25\"",
+            ),
+            (
+                "apps.shop = { maintenance = true }\nwarm_up = { lead = '30m' }",
+                "warm_up needs a schedule",
+            ),
+            (
+                "apps.shop = { maintenance = true }\nlatch = true",
+                "latch and advisory apply to a schedule",
             ),
             (
                 "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = '2026-11-02T09:00', end = '2026-11-02T08:00', timezone = 'UTC' } }",

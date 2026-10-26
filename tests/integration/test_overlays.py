@@ -51,7 +51,7 @@ class Site:
         completed = self.daemon.muructl("overlay", *arguments, check=check)
         return completed.stdout + completed.stderr
 
-    def apply(self, overlays: str, check: bool = True) -> str:
+    def apply(self, overlays: str, check: bool = True, prune: bool = False) -> str:
         config = self.base / "site.toml"
         config.write_text(
             f"""[app.clients.release.r1]
@@ -77,8 +77,16 @@ app = 'clients'
 """
             + overlays
         )
-        completed = self.daemon.muructl("apply", "-f", str(config), check=check)
+        prune_flag = ["--prune"] if prune else []
+        completed = self.daemon.muructl("apply", *prune_flag, "-f", str(config), check=check)
         return completed.stdout + completed.stderr
+
+    def state(self, release: str) -> str:
+        return next(
+            row["state"]
+            for row in self.daemon.releases("clients")
+            if row["release"] == f"clients@{release}"
+        )
 
 
 def eventually(check: Callable[[], bool], timeout: float = 15.0) -> bool:
@@ -201,6 +209,78 @@ trigger = {{ schedule = {{ start = '{at(3)}', end = '{at(7)}' }} }}
     events = site.daemon.muructl("events").stdout
     assert "its schedule's window began" in events
     assert "ended: its schedule" in events
+
+
+def test_a_recurring_schedule_covers_each_window(site: Site) -> None:
+    every_minute = """
+[overlay.always]
+routes.root = { mode = 'recurring' }
+trigger = { schedule = { cron = '* * * * *', duration = '1m', timezone = 'Australia/Sydney' } }
+"""
+    site.apply(every_minute, prune=True)
+    assert "cron '* * * * *' for 1m Australia/Sydney" in site.overlay("list")
+    assert eventually(lambda: site.seen()["mode"] == "recurring")
+
+    # Ended by hand, it stays ended for the rest of the minute's window.
+
+    site.overlay("end", "always")
+    assert site.seen()["mode"] is None
+    assert "ended until" in site.overlay("list")
+
+
+def test_advisory_and_latched_schedules(site: Site) -> None:
+    windows = f"""
+[overlay.advised]
+routes.root = {{ mode = 'advised' }}
+trigger = {{ schedule = {{ start = '{at(2)}', end = '{at(30)}' }} }}
+advisory = true
+
+[overlay.latched]
+apps.clients = {{ maintenance = true }}
+trigger = {{ schedule = {{ start = '{at(2)}', end = '{at(4)}' }} }}
+latch = true
+"""
+    site.apply(windows, prune=True)
+    listed = site.overlay("list")
+    assert "advisory" in listed and "latched" in listed
+
+    # The latched overlay stays past its window's end; the advisory one
+    # only says it would have activated.
+
+    assert eventually(lambda: site.request().status == 503)
+    time.sleep(4)
+    assert site.request().status == 503
+    listed = site.overlay("list")
+    assert "active (schedule)" in listed
+    assert "advised until" in listed
+    events = site.daemon.muructl("events").stdout
+    assert "would activate: its schedule's window began; it is advisory" in events
+
+    site.overlay("end", "latched")
+    assert site.seen()["mode"] is None
+
+
+def test_warm_up_starts_a_release_ahead_of_its_window(site: Site) -> None:
+    site.apply(OVERLAYS, prune=True)
+    assert eventually(lambda: site.state("r1") == "retained", timeout=30)
+
+    cutover = f"""
+[overlay.cutover]
+routes.root.traffic = {{ pin = 'r1' }}
+trigger = {{ schedule = {{ start = '{at(3600)}' }} }}
+warm_up = {{ lead = '2h', start_release = 'r1' }}
+"""
+    site.apply(cutover, prune=True)
+    assert eventually(lambda: site.state("r1") == "ready", timeout=30)
+    assert site.seen()["release"] == "r2"
+    events = site.daemon.muructl("events").stdout
+    assert "warming up: its window begins in 59m" in events
+    assert "starting clients@r1" in events
+
+    # Without the overlay nothing keeps it running.
+
+    site.apply(OVERLAYS, prune=True)
+    assert eventually(lambda: site.state("r1") == "retained", timeout=30)
 
 
 def test_promotion_makes_an_overlay_the_base(site: Site) -> None:

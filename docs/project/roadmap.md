@@ -385,8 +385,8 @@ oldest request was, and a memory recycle names the commonest objects.
 Still to come: attach with `breakpoint()` and DAP, `--requests` and
 `--path`, pstats output, and reading from outside with PEP 768.
 
-Overlays (section 9.10) are in, activated by hand or by a one-off
-schedule in a named time zone: declared in applied files, they reach
+Overlays (section 9.10) are in, activated by hand or by a one-off or
+recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach
 routes by a new route `name` and set a route's mode, method
 restrictions, traffic pin or split, target and rate limits, and an
 application's maintenance mode, laid over the base configuration
@@ -395,9 +395,11 @@ by apply. `preconditions.release_ready` keeps an overlay from moving
 traffic to a release that is not ready, a pin holds the application's
 rollout, and `muructl overlay list`, `activate` (with `--for` or
 `--until`), `end`, `preview` and `promote` manage them, each change an
-event; a restarted daemon carries on with the windows it was in. Still
-to come: recurring schedules, warm-up, scheduled capacity and deploy
-freezes (section 7.5), latch and advisory, the signed webhook trigger,
+event; a restarted daemon carries on with the windows it was in.
+Advisory schedules only say they would activate, latched ones stay
+active until a person ends them, and a warm-up starts a release ahead
+of each window. Still to come: scheduled capacity and deploy freezes
+(section 7.5), the signed webhook trigger,
 client class routes, error page selections, `config show --effective`
 and the clock warning; condition triggers are phase 4.
 

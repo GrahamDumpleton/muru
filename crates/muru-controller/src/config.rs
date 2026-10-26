@@ -1127,6 +1127,17 @@ fn plan_overlays(
             ));
         }
 
+        if let Some(release) = overlay
+            .warm_up
+            .as_ref()
+            .and_then(|warm_up| warm_up.start_release.as_deref())
+            && precondition_release(release, overlay, &route_names).is_none()
+        {
+            errors.push(format!(
+                "overlay {name}: warm_up.start_release {release:?} must be app@release, or a release when the overlay changes routes of one application"
+            ));
+        }
+
         if !errors.is_empty() {
             plan.errors.extend(errors);
             continue;
@@ -1188,27 +1199,7 @@ pub fn precondition_release(
 fn describe_overlay(overlay: &Overlay) -> String {
     let mut parts = Vec::new();
 
-    match overlay
-        .trigger
-        .as_ref()
-        .and_then(|trigger| trigger.schedule.as_ref())
-    {
-        Some(schedule) => parts.push(format!(
-            "from {}{}{}",
-            schedule.start,
-            schedule
-                .end
-                .as_ref()
-                .map(|end| format!(" until {end}"))
-                .unwrap_or_default(),
-            schedule
-                .timezone
-                .as_ref()
-                .map(|zone| format!(" {zone}"))
-                .unwrap_or_default()
-        )),
-        None => parts.push("by hand".to_owned()),
-    }
+    parts.push(crate::overlays::describe_trigger(overlay));
 
     if !overlay.routes.is_empty() {
         parts.push(format!(

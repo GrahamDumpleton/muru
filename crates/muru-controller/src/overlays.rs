@@ -11,20 +11,70 @@ use muru_config::{Methods, Overlay, Route, Traffic};
 
 use crate::model::OverlayState;
 
-/// The window an overlay's schedule gives, as Unix milliseconds: from its
-/// start, until its end when it has one. None without a schedule, or for
-/// one that does not parse (apply refuses those).
-pub fn window(overlay: &Overlay) -> Option<(u64, Option<u64>)> {
+/// The window of an overlay's schedule that `now` falls in, else the
+/// next one, as Unix milliseconds: from its start, until its end when it
+/// has one. None without a schedule, with no window to come, or for one
+/// that does not parse (apply refuses those).
+pub fn window(overlay: &Overlay, now: u64) -> Option<(u64, Option<u64>)> {
     let schedule = overlay.trigger.as_ref()?.schedule.as_ref()?;
-    let zone = schedule.timezone.as_deref();
-    let start = muru_config::parse_moment(&schedule.start, zone).ok()?;
+    let (start, end) = muru_config::schedule_window(schedule, now as i64)?;
+    Some((start.max(0) as u64, end.map(|end| end.max(0) as u64)))
+}
 
-    let end = match &schedule.end {
-        Some(end) => Some(muru_config::parse_moment(end, zone).ok()?),
-        None => None,
+/// Whether `now` falls in a window of the overlay's schedule.
+pub fn in_window(overlay: &Overlay, now: u64) -> bool {
+    window(overlay, now).is_some_and(|(start, end)| now >= start && end.is_none_or(|end| now < end))
+}
+
+/// Whether `now` falls in the lead before a window of the overlay's
+/// schedule, when it has a warm-up.
+pub fn warming(overlay: &Overlay, now: u64) -> bool {
+    let Some(lead) = overlay
+        .warm_up
+        .as_ref()
+        .and_then(|warm_up| muru_config::parse_duration(&warm_up.lead).ok())
+    else {
+        return false;
     };
 
-    Some((start.max(0) as u64, end.map(|end| end.max(0) as u64)))
+    window(overlay, now)
+        .is_some_and(|(start, _)| now < start && now + lead.as_millis() as u64 >= start)
+}
+
+/// What starts an overlay, as the reports show it.
+pub fn describe_trigger(overlay: &Overlay) -> String {
+    let Some(schedule) = overlay
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.schedule.as_ref())
+    else {
+        return "by hand".to_owned();
+    };
+
+    let mut text = muru_config::describe_schedule(schedule);
+
+    if overlay.advisory == Some(true) {
+        text.push_str(", advisory");
+    }
+
+    if overlay.latch == Some(true) {
+        text.push_str(", latched");
+    }
+
+    text
+}
+
+/// A wait as the events say it, to the minute once it is that long:
+/// 45s, 59m, 2h, 1h30m.
+pub fn describe_wait(millis: u64) -> String {
+    let minutes = millis / 60_000;
+
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => format!("{}s", millis / 1000),
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h{minutes}m"),
+    }
 }
 
 /// What should happen to an overlay now.
@@ -32,10 +82,16 @@ pub fn window(overlay: &Overlay) -> Option<(u64, Option<u64>)> {
 pub enum Step {
     /// Nothing changes.
     Stay,
-    /// Its schedule's window has begun: activate it, until the window's
-    /// end, if its preconditions hold.
+    /// Its schedule's window has begun: activate it if its preconditions
+    /// hold, or for an advisory overlay say it would.
     Begin {
         /// When the window ends.
+        until: Option<u64>,
+    },
+    /// Its window ended as the next began, the recurring windows
+    /// overlapping: it stays active, until the new one's end.
+    Extend {
+        /// When the new window ends.
         until: Option<u64>,
     },
     /// It is active and should not be: end it.
@@ -49,23 +105,32 @@ pub enum Step {
 
 /// What should happen to an overlay at `now`, given its state.
 pub fn step(overlay: &Overlay, state: Option<&OverlayState>, now: u64) -> Step {
-    let window = window(overlay);
+    let window = window(overlay, now);
     let in_window =
         window.is_some_and(|(start, end)| now >= start && end.is_none_or(|end| now < end));
+    let latched = overlay.latch == Some(true);
 
     match state {
         Some(state) if state.active => {
+            let by_schedule = state.source == "schedule";
+
             if state.until_unix_ms.is_some_and(|until| now >= until) {
+                if by_schedule && in_window {
+                    return Step::Extend {
+                        until: window.and_then(|(_, end)| end),
+                    };
+                }
+
                 return Step::End {
-                    reason: if state.source == "manual" {
-                        "the time it was activated for is over".to_owned()
-                    } else {
+                    reason: if by_schedule {
                         "its schedule's window is over".to_owned()
+                    } else {
+                        "the time it was activated for is over".to_owned()
                     },
                 };
             }
 
-            if state.source == "schedule" && !in_window {
+            if by_schedule && !in_window && !latched {
                 return Step::End {
                     reason: "its schedule no longer covers now".to_owned(),
                 };
@@ -74,7 +139,8 @@ pub fn step(overlay: &Overlay, state: Option<&OverlayState>, now: u64) -> Step {
             Step::Stay
         }
         Some(state) => {
-            // Held: ended by hand within its window, skipped, or promoted.
+            // Held: ended by hand within its window, skipped, advised, or
+            // promoted.
 
             match state.until_unix_ms {
                 Some(until) if now >= until => Step::Release,
@@ -408,7 +474,7 @@ mod tests {
         let backup = overlay(
             "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = '2026-01-01T02:00:00Z', end = '2026-01-01T03:00:00Z' } }",
         );
-        let (start, end) = window(&backup).unwrap();
+        let (start, end) = window(&backup, 0).unwrap();
         let end = end.unwrap();
         assert_eq!(end - start, 3_600_000);
 
@@ -427,6 +493,83 @@ mod tests {
         let held = state(false, "ended", Some(end));
         assert_eq!(step(&backup, Some(&held), start + 10), Step::Stay);
         assert_eq!(step(&backup, Some(&held), end), Step::Release);
+    }
+
+    const HOUR: u64 = 3_600_000;
+
+    /// 2026-01-01T00:00:00Z.
+    const NEW_YEAR: u64 = 1_767_225_600_000;
+
+    #[test]
+    fn a_recurring_schedule_opens_a_window_at_each_time() {
+        let nightly = overlay(
+            "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *', duration = '1h', timezone = 'UTC' } }",
+        );
+        let two = NEW_YEAR + 2 * HOUR;
+        assert_eq!(window(&nightly, NEW_YEAR), Some((two, Some(two + HOUR))));
+        assert_eq!(step(&nightly, None, two - 1), Step::Stay);
+        assert_eq!(
+            step(&nightly, None, two),
+            Step::Begin {
+                until: Some(two + HOUR)
+            }
+        );
+
+        // After the window, the next is the following night's.
+
+        assert!(!in_window(&nightly, two + HOUR));
+        assert_eq!(
+            window(&nightly, two + HOUR),
+            Some((two + 24 * HOUR, Some(two + 25 * HOUR)))
+        );
+        let active = state(true, "schedule", Some(two + HOUR));
+        assert!(matches!(
+            step(&nightly, Some(&active), two + HOUR),
+            Step::End { .. }
+        ));
+    }
+
+    #[test]
+    fn overlapping_recurring_windows_extend_an_active_overlay() {
+        let busy = overlay(
+            "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 * * * *', duration = '90m', timezone = 'UTC' } }",
+        );
+        let active = state(true, "schedule", Some(NEW_YEAR + 90 * 60_000));
+        assert_eq!(
+            step(&busy, Some(&active), NEW_YEAR + 90 * 60_000),
+            Step::Extend {
+                until: Some(NEW_YEAR + HOUR + 90 * 60_000)
+            }
+        );
+    }
+
+    #[test]
+    fn a_latched_overlay_outlasts_its_window() {
+        let latched = overlay(
+            "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = '2026-01-01T02:00:00Z', end = '2026-01-01T03:00:00Z' } }\nlatch = true",
+        );
+        let active = state(true, "schedule", None);
+        assert_eq!(
+            step(&latched, Some(&active), NEW_YEAR + 5 * HOUR),
+            Step::Stay
+        );
+    }
+
+    #[test]
+    fn warm_up_covers_the_lead_before_each_window() {
+        let cutover = overlay(
+            "routes.root.traffic = { pin = 'r2' }\ntrigger = { schedule = { cron = '0 9 * * *', duration = '1h', timezone = 'UTC' } }\nwarm_up = { lead = '30m', start_release = 'r2' }",
+        );
+        let nine = NEW_YEAR + 9 * HOUR;
+        assert!(!warming(&cutover, nine - HOUR));
+        assert!(warming(&cutover, nine - HOUR / 2));
+        assert!(warming(&cutover, nine - 1));
+        assert!(!warming(&cutover, nine));
+        assert!(warming(&cutover, nine + 24 * HOUR - 60_000));
+        assert_eq!(describe_trigger(&cutover), "cron '0 9 * * *' for 1h UTC");
+        assert_eq!(describe_wait(45_000), "45s");
+        assert_eq!(describe_wait(HOUR - 1), "59m");
+        assert_eq!(describe_wait(HOUR * 3 / 2), "1h30m");
     }
 
     #[test]

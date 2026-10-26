@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -591,6 +591,9 @@ struct Daemon {
     /// The applications in maintenance mode (section 4.12), with when
     /// each was put there.
     maintenance: HashMap<String, u64>,
+    /// Section 9.10: the overlays in the warm-up lead before a window,
+    /// with the release each keeps running meanwhile.
+    warm_ups: BTreeMap<String, Option<(String, String)>>,
     /// The secret stores releases may refer to (section 10.8).
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
@@ -871,6 +874,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
+        warm_ups: BTreeMap::new(),
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
@@ -1781,7 +1785,8 @@ impl Daemon {
     }
 
     /// Section 9.10: begin and end overlays by their schedules and by the
-    /// time they were activated for, and give the edge the result.
+    /// time they were activated for, start what their warm-ups name, and
+    /// give the edge the result.
     async fn reconcile_overlays(&mut self) {
         let overlays = self.store.overlays().unwrap_or_default();
         let states: HashMap<String, crate::model::OverlayState> = self
@@ -1802,6 +1807,15 @@ impl Daemon {
                 crate::overlays::Step::Release => {
                     let _ = self.store.set_overlay_state(name, None);
                 }
+                crate::overlays::Step::Extend { until } => {
+                    if let Some(state) = states.get(name) {
+                        let state = crate::model::OverlayState {
+                            until_unix_ms: until,
+                            ..state.clone()
+                        };
+                        let _ = self.store.set_overlay_state(name, Some(&state));
+                    }
+                }
                 crate::overlays::Step::End { reason } => {
                     let _ = self.store.set_overlay_state(name, None);
                     self.events.emit(
@@ -1812,45 +1826,93 @@ impl Daemon {
                     );
                     changed = true;
                 }
-                crate::overlays::Step::Begin { until } => match self.overlay_preconditions(overlay)
-                {
-                    Ok(()) => {
-                        let state = crate::model::OverlayState {
-                            name: name.clone(),
-                            active: true,
-                            source: "schedule".to_owned(),
-                            since_unix_ms: now,
-                            until_unix_ms: until,
-                        };
-                        let _ = self.store.set_overlay_state(name, Some(&state));
-                        self.events.emit(
-                            "overlay.activated",
-                            &subject,
-                            "notice",
-                            "activated: its schedule's window began",
-                        );
-                        changed = true;
-                    }
-                    Err(why) => {
-                        // Skipped for the rest of this window, so a failing
-                        // precondition is not retried every second.
+                crate::overlays::Step::Begin { until } => {
+                    let preconditions = self.overlay_preconditions(overlay);
 
-                        let state = crate::model::OverlayState {
-                            name: name.clone(),
-                            active: false,
-                            source: "skipped".to_owned(),
-                            since_unix_ms: now,
-                            until_unix_ms: until,
+                    // An advisory overlay only says what it would do, once
+                    // a window; a skipped one is not retried every second.
+
+                    let (source, kind, level, detail) =
+                        match (overlay.advisory == Some(true), &preconditions) {
+                            (true, Ok(())) => (
+                                "advised",
+                                "overlay.would_activate",
+                                "notice",
+                                "would activate: its schedule's window began; it is advisory"
+                                    .to_owned(),
+                            ),
+                            (true, Err(why)) => (
+                                "advised",
+                                "overlay.would_activate",
+                                "notice",
+                                format!("would be skipped: {why}; it is advisory"),
+                            ),
+                            (false, Ok(())) => (
+                                "schedule",
+                                "overlay.activated",
+                                "notice",
+                                "activated: its schedule's window began".to_owned(),
+                            ),
+                            (false, Err(why)) => (
+                                "skipped",
+                                "overlay.skipped",
+                                "warning",
+                                format!("not activated: {why}"),
+                            ),
                         };
-                        let _ = self.store.set_overlay_state(name, Some(&state));
-                        self.events.emit(
-                            "overlay.skipped",
-                            &subject,
-                            "warning",
-                            &format!("not activated: {why}"),
-                        );
-                    }
-                },
+
+                    let active = source == "schedule";
+                    let latched = active && overlay.latch == Some(true);
+                    let state = crate::model::OverlayState {
+                        name: name.clone(),
+                        active,
+                        source: source.to_owned(),
+                        since_unix_ms: now,
+                        until_unix_ms: if latched { None } else { until },
+                    };
+                    let _ = self.store.set_overlay_state(name, Some(&state));
+                    self.events.emit(kind, &subject, level, &detail);
+                    changed |= active;
+                }
+            }
+        }
+
+        let warm_ups = self.warm_ups(&overlays, now);
+
+        if warm_ups != self.warm_ups {
+            for (name, release) in &warm_ups {
+                if self.warm_ups.contains_key(name) {
+                    continue;
+                }
+
+                let starts = overlays
+                    .iter()
+                    .find(|(declared, _)| declared == name)
+                    .and_then(|(_, overlay)| crate::overlays::window(overlay, now))
+                    .map_or(0, |(start, _)| start.saturating_sub(now));
+                let mut detail = format!(
+                    "warming up: its window begins in {}",
+                    crate::overlays::describe_wait(starts)
+                );
+
+                if let Some((app, id)) = release {
+                    detail.push_str(&format!("; starting {app}@{id}"));
+                }
+
+                self.events.emit(
+                    "overlay.warming",
+                    &format!("overlay {name}"),
+                    "info",
+                    &detail,
+                );
+            }
+
+            let releases_changed = warm_ups.values().collect::<BTreeSet<_>>()
+                != self.warm_ups.values().collect::<BTreeSet<_>>();
+            self.warm_ups = warm_ups;
+
+            if releases_changed && !changed {
+                self.reconcile_traffic().await;
             }
         }
 
@@ -1861,6 +1923,37 @@ impl Daemon {
                 tracing::error!(%error, "pushing the snapshot for an overlay failed");
             }
         }
+    }
+
+    /// Section 9.10: the overlays in the lead before a window of their
+    /// schedule, with the release each warm-up starts.
+    fn warm_ups(
+        &self,
+        overlays: &[(String, muru_config::Overlay)],
+        now: u64,
+    ) -> BTreeMap<String, Option<(String, String)>> {
+        let route_apps: BTreeMap<String, String> = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.name.map(|name| (name, route.app)))
+            .collect();
+
+        overlays
+            .iter()
+            .filter(|(_, overlay)| crate::overlays::warming(overlay, now))
+            .map(|(name, overlay)| {
+                let release = overlay
+                    .warm_up
+                    .as_ref()
+                    .and_then(|warm_up| warm_up.start_release.as_deref())
+                    .and_then(|release| {
+                        crate::config::precondition_release(release, overlay, &route_apps)
+                    });
+                (name.clone(), release)
+            })
+            .collect()
     }
 
     /// Section 9.10: what a person asks of an overlay.
@@ -1918,7 +2011,7 @@ impl Daemon {
                 // Ended inside its schedule's window, it stays ended until
                 // the window is over; otherwise it is simply inactive.
 
-                let window = crate::overlays::window(&overlay)
+                let window = crate::overlays::window(&overlay, now)
                     .filter(|(start, end)| now >= *start && end.is_none_or(|end| now < end));
                 let held = window.map(|(_, end)| crate::model::OverlayState {
                     name: name.to_owned(),
@@ -4048,7 +4141,15 @@ impl Daemon {
     /// release that only a policy kept in traffic drains once no policy
     /// names it. Called after the configuration changes and at start.
     async fn reconcile_traffic(&mut self) {
-        let referenced = self.referenced_releases();
+        let mut referenced = self.referenced_releases();
+        let warming: BTreeSet<(String, String)> = self
+            .warm_ups
+            .values()
+            .flatten()
+            .filter(|release| !referenced.contains(*release))
+            .cloned()
+            .collect();
+        referenced.extend(warming.iter().cloned());
         let mut started = Vec::new();
 
         for (app, id) in &referenced {
@@ -4070,11 +4171,16 @@ impl Daemon {
             match self.start(app, id).await {
                 Ok(()) => started.push(key),
                 Err(error) => {
+                    let why = if warming.contains(&key) {
+                        "an overlay's warm-up names the release"
+                    } else {
+                        "a traffic policy names the release"
+                    };
                     self.events.emit(
                         "traffic_policy.release_unavailable",
                         &format!("{app}@{id}"),
                         "warning",
-                        &format!("a traffic policy names the release but it cannot start: {error}"),
+                        &format!("{why} but it cannot start: {error}"),
                     );
                 }
             }
