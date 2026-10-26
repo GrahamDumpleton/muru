@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -145,3 +146,40 @@ def test_respawned_edge_is_readopted_by_the_next_daemon(tmp_path: Path) -> None:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
         second.stop(shutdown=True)
+
+
+def test_rate_limit_buckets_outlast_the_edge(tmp_path: Path) -> None:
+    """Section 4.15: the buckets are in shared memory, so the edge that
+    replaces another draws from the buckets it left."""
+
+    daemon = start_daemon(tmp_path, config_extra="[rate_limit.tight]\nrate = '1/h'\nburst = 2\n")
+
+    try:
+        config = tmp_path / "shop.toml"
+        config.write_text(
+            f"""[app.shop.release.r1]
+source = '{SHOP}'
+python = '{sys.executable}'
+processes = 1
+
+[host.shop]
+names = ['shop.test']
+listeners = ['127.0.0.1:{daemon.port}']
+default = true
+rate_limits = ['tight']
+
+[[route]]
+host = 'shop'
+app = 'shop'
+"""
+        )
+        daemon.muructl("apply", "-f", str(config))
+        daemon.muructl("release", "wait", "shop@r1", "--timeout", "60")
+        assert [daemon.get("/").status for _ in range(3)] == [200, 200, 429]
+
+        edge = edge_pid_of(daemon)
+        daemon.muructl("daemon", "upgrade")
+        assert edge_pid_of(daemon) != edge
+        assert daemon.get("/").status == 429
+    finally:
+        daemon.stop()

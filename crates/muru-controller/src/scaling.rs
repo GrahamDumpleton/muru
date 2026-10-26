@@ -107,6 +107,188 @@ impl Signals {
     }
 }
 
+/// Section 7.3: what a group's workers say about themselves between two
+/// of their host's reports.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkerSignals {
+    /// CPU seconds per wall second, averaged over the workers, as a share
+    /// of what a worker can use: one core with a GIL, a core per thread
+    /// without.
+    pub worker_cpu: Option<f64>,
+    /// CPU seconds per wall second, averaged over the workers: the cores
+    /// a worker uses, for the node's budget (section 7.4).
+    pub cores: Option<f64>,
+    /// The 95th percentile wait for the GIL, in milliseconds.
+    pub gil_wait_p95_ms: Option<f64>,
+    /// The 95th percentile lateness of the event loop, in milliseconds.
+    pub loop_lag_p95_ms: Option<f64>,
+}
+
+impl WorkerSignals {
+    /// The group's signals from two reports `elapsed` apart, each worker
+    /// compared with itself by pid; a worker in only one is left out.
+    /// `threads` is what a worker without a GIL can run at once.
+    pub fn between(
+        before: &[crate::host::WorkerStatus],
+        after: &[crate::host::WorkerStatus],
+        group: &str,
+        elapsed: Duration,
+        threads: u32,
+    ) -> Self {
+        let mut cpu = Vec::new();
+        let mut cores = Vec::new();
+        let mut gil_wait = Vec::new();
+        let mut loop_lag = Vec::new();
+        let wall_ms = elapsed.as_millis() as f64;
+
+        for worker in after.iter().filter(|worker| worker.group == group) {
+            let Some(earlier) = before.iter().find(|earlier| earlier.pid == worker.pid) else {
+                continue;
+            };
+
+            if let (Some(now), Some(then)) = (worker.cpu_ms, earlier.cpu_ms)
+                && wall_ms > 0.0
+            {
+                let used = now.saturating_sub(then) as f64 / wall_ms;
+
+                let usable = if worker.gil_enabled {
+                    1.0
+                } else {
+                    threads.max(1) as f64
+                };
+                cores.push(used);
+                cpu.push(used / usable);
+            }
+
+            add_growth(&mut gil_wait, &worker.gil_wait, &earlier.gil_wait);
+            add_growth(&mut loop_lag, &worker.loop_lag, &earlier.loop_lag);
+        }
+
+        Self {
+            worker_cpu: mean(&cpu),
+            cores: mean(&cores),
+            gil_wait_p95_ms: p95_ms(&gil_wait),
+            loop_lag_p95_ms: p95_ms(&loop_lag),
+        }
+    }
+}
+
+/// The mean of some values, or none without any.
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+/// Add one worker's histogram growth to a group's.
+fn add_growth(sum: &mut Vec<u64>, now: &[u64], then: &[u64]) {
+    if now.len() != then.len() {
+        return;
+    }
+
+    sum.resize(sum.len().max(now.len()), 0);
+
+    for (index, (now, then)) in now.iter().zip(then).enumerate() {
+        sum[index] += now.saturating_sub(*then);
+    }
+}
+
+/// The 95th percentile of a histogram over the signal bounds, in
+/// milliseconds: the bound of the first count holding 95 percent of all,
+/// the last bound for what lies beyond it, or none without observations.
+fn p95_ms(counts: &[u64]) -> Option<f64> {
+    let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
+    let total = *counts.last()?;
+
+    if total == 0 {
+        return None;
+    }
+
+    let target = total as f64 * 0.95;
+    let index = counts.iter().position(|count| *count as f64 >= target)?;
+    let bound = bounds.get(index).or(bounds.last())?;
+    Some(*bound as f64 / 1000.0)
+}
+
+/// Section 7.3: what holds a group back, and what would help the next
+/// release, from its slots, its queue and its workers' own signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnosis {
+    /// The bottleneck: cpu, gil, io, heavy, loop, memory, idle or none.
+    pub bottleneck: &'static str,
+    /// The bottleneck in words.
+    pub summary: &'static str,
+    /// The tuning it suggests, when any.
+    pub advice: &'static str,
+}
+
+/// Classify a group's bottleneck. `utilization` is busy slots over all,
+/// and `memory_near_limit` whether its workers are within 10 percent of
+/// their soft memory limit.
+pub fn diagnose(
+    utilization: f64,
+    queue_wait_p95_ms: Option<f64>,
+    signals: &WorkerSignals,
+    memory_near_limit: bool,
+) -> Diagnosis {
+    let cpu = signals.worker_cpu.unwrap_or(0.0);
+    let gil_wait = signals.gil_wait_p95_ms.unwrap_or(0.0);
+    let queued = queue_wait_p95_ms.unwrap_or(0.0);
+    let diagnosis = |bottleneck, summary, advice| Diagnosis {
+        bottleneck,
+        summary,
+        advice,
+    };
+
+    if memory_near_limit {
+        return diagnosis(
+            "memory",
+            "memory bound",
+            "fewer threads per worker, or a higher memory limit",
+        );
+    }
+
+    if signals.loop_lag_p95_ms.unwrap_or(0.0) >= 100.0 {
+        return diagnosis(
+            "loop",
+            "event loop held by blocking code",
+            "await blocking calls, or run them in a thread, so the loop keeps serving",
+        );
+    }
+
+    if gil_wait >= 10.0 {
+        return diagnosis("gil", "GIL bound", "more processes with fewer threads each");
+    }
+
+    if cpu >= 0.8 {
+        return diagnosis(
+            "cpu",
+            "CPU bound",
+            "more processes, up to the node's cores; more threads will not help",
+        );
+    }
+
+    if utilization >= 0.8 {
+        return diagnosis(
+            "io",
+            "I/O bound with exhausted slots",
+            "more threads per worker, or more concurrency for an ASGI application",
+        );
+    }
+
+    if queued >= 100.0 && utilization < 0.5 {
+        return diagnosis(
+            "heavy",
+            "a few heavy requests",
+            "a worker group of their own for the slow paths",
+        );
+    }
+
+    if utilization < 0.1 && queued < 1.0 {
+        return diagnosis("idle", "idle", "");
+    }
+
+    diagnosis("none", "within capacity", "")
+}
+
 /// What the autoscaler decided for a group.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
@@ -131,6 +313,20 @@ pub enum Decision {
     },
 }
 
+/// Section 7.5: what schedules and overlays set over a group's policy
+/// while they last.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capacity {
+    /// The fewest workers; none below the policy's when 0.
+    pub floor: u32,
+    /// The most workers; none above the policy's when 0.
+    pub ceiling: u32,
+    /// Whether scale-in waits until they are over.
+    pub hold: bool,
+    /// The overlays that set it, for the reasons.
+    pub sources: Vec<String>,
+}
+
 /// One observation kept for the windows.
 #[derive(Debug, Clone, Copy)]
 struct Point {
@@ -145,6 +341,7 @@ pub struct Scaler {
     spec: ScalingSpec,
     desired: u32,
     pinned: Option<u32>,
+    capacity: Option<Capacity>,
     points: VecDeque<Point>,
     queue: VecDeque<(Instant, Buckets)>,
     out_since: Option<Instant>,
@@ -160,6 +357,8 @@ pub struct Scaler {
     signals: Signals,
     queue_wait_p95_ms: Option<f64>,
     decisions: (u64, u64),
+    workers: WorkerSignals,
+    memory_near_limit: bool,
 }
 
 /// The scaler's state for the admin API and the dashboard.
@@ -171,6 +370,12 @@ pub struct ScaleStatus {
     pub desired: u32,
     /// The count pinned by an operator, when one is.
     pub pinned: Option<u32>,
+    /// What schedules and overlays set over the policy, when any do.
+    pub capacity: Option<Capacity>,
+    /// The fewest workers, with what they set.
+    pub floor: u32,
+    /// The most workers, with what they set.
+    pub ceiling: u32,
     /// Workers the edge routes to.
     pub ready: u32,
     /// Slots busy and total across them.
@@ -189,6 +394,10 @@ pub struct ScaleStatus {
     pub suspended: bool,
     /// Scale-outs and scale-ins decided since the scaler began.
     pub decisions: (u64, u64),
+    /// What the workers say about themselves (section 7.3).
+    pub workers: WorkerSignals,
+    /// What holds the group back.
+    pub diagnosis: Diagnosis,
 }
 
 impl Scaler {
@@ -198,6 +407,7 @@ impl Scaler {
             spec,
             desired: current,
             pinned: None,
+            capacity: None,
             points: VecDeque::new(),
             queue: VecDeque::new(),
             out_since: None,
@@ -216,6 +426,8 @@ impl Scaler {
             },
             queue_wait_p95_ms: None,
             decisions: (0, 0),
+            workers: WorkerSignals::default(),
+            memory_near_limit: false,
         }
     }
 
@@ -248,6 +460,35 @@ impl Scaler {
         self.last = Some((now, "unpinned".to_owned()));
     }
 
+    /// Section 7.5: the floor, ceiling and scale-in hold that schedules
+    /// and overlays set now, or none.
+    pub fn set_capacity(&mut self, capacity: Option<Capacity>) {
+        self.capacity = capacity.filter(|capacity| *capacity != Capacity::default());
+    }
+
+    /// The fewest workers: the policy's, a static group's count, or a
+    /// schedule's floor, the highest.
+    pub fn floor(&self) -> u32 {
+        let own = if self.spec.is_static() {
+            self.spec.max_workers
+        } else {
+            self.spec.min_workers
+        };
+        self.capacity
+            .as_ref()
+            .map_or(own, |capacity| own.max(capacity.floor))
+    }
+
+    /// The most workers: the policy's, or a schedule's ceiling or floor
+    /// above it.
+    pub fn ceiling(&self) -> u32 {
+        let raised = self
+            .capacity
+            .as_ref()
+            .map_or(0, |capacity| capacity.ceiling);
+        self.spec.max_workers.max(raised).max(self.floor())
+    }
+
     /// Take the count the group has as the one wanted: in advisory mode
     /// nothing is carried out, so each recommendation starts from what
     /// is there.
@@ -268,6 +509,9 @@ impl Scaler {
             spec: self.spec.clone(),
             desired: self.desired,
             pinned: self.pinned,
+            capacity: self.capacity.clone(),
+            floor: self.floor(),
+            ceiling: self.ceiling(),
             ready: self.signals.ready,
             busy: self.signals.busy,
             total: self.signals.total,
@@ -280,7 +524,55 @@ impl Scaler {
             reaps: self.reaps(),
             suspended: self.suspended,
             decisions: self.decisions,
+            workers: self.workers.clone(),
+            diagnosis: self.diagnosis(),
         }
+    }
+
+    /// Section 7.3: take what the group's workers last said about
+    /// themselves, and whether they are near their memory limit.
+    pub fn set_workers(&mut self, workers: WorkerSignals, memory_near_limit: bool) {
+        self.workers = workers;
+        self.memory_near_limit = memory_near_limit;
+    }
+
+    /// What the group's workers last said about themselves.
+    pub fn worker_signals(&self) -> &WorkerSignals {
+        &self.workers
+    }
+
+    /// Section 7.4: the node's budget admitted only `to` of the workers
+    /// the last scale-out asked for from `from`; hold the group there. A
+    /// scale-out given nothing is not counted as one.
+    pub fn limit(&mut self, from: u32, to: u32, now: Instant, reason: &str) {
+        if to >= self.desired {
+            return;
+        }
+
+        if to <= from {
+            self.decisions.0 = self.decisions.0.saturating_sub(1);
+            self.requested_at = None;
+        }
+
+        self.last_step = to.saturating_sub(from).max(1);
+        self.desired = to.max(from);
+        self.last = Some((now, format!("held at {}: {reason}", self.desired)));
+    }
+
+    /// What holds the group back, from the latest signals.
+    pub fn diagnosis(&self) -> Diagnosis {
+        let utilization = if self.signals.total > 0.0 {
+            self.signals.busy / self.signals.total
+        } else {
+            0.0
+        };
+
+        diagnose(
+            utilization,
+            self.queue_wait_p95_ms,
+            &self.workers,
+            self.memory_near_limit,
+        )
     }
 
     /// Take one observation and decide; none means hold.
@@ -288,8 +580,12 @@ impl Scaler {
         self.note_queue(now, &signals);
         self.signals = signals;
 
-        if self.pinned.is_some() || self.spec.is_static() {
+        if self.pinned.is_some() {
             return None;
+        }
+
+        if self.spec.is_static() {
+            return self.raise_to_floor(now).or_else(|| self.settle(now));
         }
 
         // Starting workers have all arrived: how long that took sets the
@@ -339,6 +635,16 @@ impl Scaler {
 
         let exhausted = self.reaps.len() >= self.spec.churn_budget as usize;
 
+        if let Some(decision) = self.raise_to_floor(now) {
+            return Some(decision);
+        }
+
+        if (self.signals.queue_depth > 0.0 || self.signals.busy > 0.0)
+            && let Some(decision) = self.wake(now)
+        {
+            return Some(decision);
+        }
+
         if let Some(decision) = self.scale_out(now, idle) {
             return Some(decision);
         }
@@ -360,6 +666,87 @@ impl Scaler {
 
         self.suspended = false;
         self.scale_in(now)
+    }
+
+    /// Section 7.4: a group scaled to zero that a request is waiting for
+    /// gets a worker at once, without waiting out a window; none when it
+    /// has workers or is pinned.
+    pub fn wake(&mut self, now: Instant) -> Option<Decision> {
+        if self.desired > 0 || self.pinned.is_some() || self.spec.is_static() {
+            return None;
+        }
+
+        let reason = "a request is waiting for a group scaled to zero".to_owned();
+        self.desired = 1;
+        self.last_step = 1;
+        self.last_out = Some(now);
+        self.requested_at = Some(now);
+        self.out_since = None;
+        self.decisions.0 += 1;
+        self.last = Some((now, format!("woken: {reason}")));
+        Some(Decision::ScaleOut { to: 1, reason })
+    }
+
+    /// Section 7.5: bring the group up to a schedule's floor in staggered
+    /// batches of max_step_up, each once the last has arrived and no
+    /// sooner than a scale-out window after it.
+    fn raise_to_floor(&mut self, now: Instant) -> Option<Decision> {
+        let sources = self.capacity.as_ref()?.sources.join(", ");
+        let floor = self.floor();
+
+        if self.desired >= floor || self.desired > self.signals.ready {
+            return None;
+        }
+
+        let window = Duration::from_millis(self.spec.scale_out_window_ms);
+
+        if self
+            .last_out
+            .is_some_and(|last| now.saturating_duration_since(last) < window)
+        {
+            return None;
+        }
+
+        let to = (self.desired + self.spec.max_step_up.max(1)).min(floor);
+        let reason = format!("raising toward the floor of {floor} that {sources} sets");
+        self.last_step = to - self.desired;
+        self.desired = to;
+        self.last_out = Some(now);
+        self.requested_at = Some(now);
+        self.out_since = None;
+        self.decisions.0 += 1;
+        self.last = Some((now, format!("scaled out to {to}: {reason}")));
+        Some(Decision::ScaleOut { to, reason })
+    }
+
+    /// A static group above its count, once a floor is over or a pin
+    /// lifted: back down one worker per reap interval.
+    fn settle(&mut self, now: Instant) -> Option<Decision> {
+        let count = self.floor();
+
+        if self.desired <= count
+            || self.desired > self.signals.ready
+            || self.capacity.as_ref().is_some_and(|capacity| capacity.hold)
+        {
+            return None;
+        }
+
+        let interval = Duration::from_millis(self.spec.reap_interval_ms);
+
+        if self
+            .last_in
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return None;
+        }
+
+        let to = self.desired - 1;
+        let reason = format!("back toward the static count of {count}");
+        self.desired = to;
+        self.last_in = Some(now);
+        self.decisions.1 += 1;
+        self.last = Some((now, format!("scaled in to {to}: {reason}")));
+        Some(Decision::ScaleIn { to, reason })
     }
 
     /// Keep the queue histogram for the scale-out window and read the p95
@@ -460,6 +847,13 @@ impl Scaler {
             0.0
         };
 
+        // A group scaled to zero stays there until a request wakes it.
+
+        if self.desired == 0 {
+            self.out_since = None;
+            return None;
+        }
+
         let (short, why) = match self.spec.mode {
             ScalingMode::Spare => (
                 idle < self.spec.min_spare as f64,
@@ -504,7 +898,7 @@ impl Scaler {
             ScalingMode::Static => (false, String::new()),
         };
 
-        if !short || self.desired >= self.spec.max_workers {
+        if !short || self.desired >= self.ceiling() {
             self.out_since = None;
             return None;
         }
@@ -547,7 +941,7 @@ impl Scaler {
         };
 
         let step = doubling.max(shortfall).max(1).min(self.spec.max_step_up);
-        let to = (self.desired + step).min(self.spec.max_workers);
+        let to = (self.desired + step).min(self.ceiling());
         let reason = format!(
             "{why} for {}",
             muru_config::format_duration(now.saturating_duration_since(since))
@@ -565,7 +959,10 @@ impl Scaler {
     /// Section 7.4: scale in one worker when every condition has held
     /// over the window, judged by the peak of the window.
     fn scale_in(&mut self, now: Instant) -> Option<Decision> {
-        if self.desired <= self.spec.min_workers || self.desired > self.signals.ready {
+        if self.desired <= self.floor()
+            || self.desired > self.signals.ready
+            || self.capacity.as_ref().is_some_and(|capacity| capacity.hold)
+        {
             return None;
         }
 
@@ -649,7 +1046,12 @@ impl Scaler {
             ScalingMode::Target => {
                 let points = covered(window)?;
                 let peak = points.iter().map(|point| point.busy).fold(0.0, f64::max);
-                let needed = self.workers_for(peak, per_worker).max(1);
+
+                // The last worker goes only when the floor allows it and
+                // nothing was busy over the window.
+
+                let least = u32::from(self.floor() > 0 || peak > 0.0);
+                let needed = self.workers_for(peak, per_worker).max(least);
 
                 if needed >= self.desired {
                     return None;
@@ -955,6 +1357,73 @@ mod tests {
     }
 
     #[test]
+    fn a_scale_out_the_budget_holds_back_is_asked_for_again_after_a_window() {
+        let mut scaler = Scaler::new(spare(), 1);
+        let start = Instant::now();
+        let saturated = Signals {
+            busy: 1.0,
+            total: 1.0,
+            queue_depth: 3.0,
+            ready: 1,
+            slots_per_worker: 1.0,
+            ..Signals::default()
+        };
+        let mut asked = Vec::new();
+
+        for second in 0..20 {
+            let now = start + SECOND * second;
+
+            if let Some(Decision::ScaleOut { to, .. }) = scaler.observe(now, saturated.clone()) {
+                asked.push((second, to));
+                scaler.limit(1, 1, now, "the node's worker budget is full");
+            }
+        }
+
+        assert_eq!(asked, [(5, 5), (11, 5), (17, 5)]);
+        assert_eq!(scaler.desired(), 1);
+
+        let status = scaler.status(start + SECOND * 20);
+        assert_eq!(status.decisions, (0, 0));
+        assert!(status.last.unwrap().1.starts_with("held at 1"));
+
+        // Given part of a step, the group holds what it was given.
+
+        scaler.observe(start + SECOND * 25, saturated);
+        scaler.limit(1, 3, start + SECOND * 25, "the node's memory budget");
+        assert_eq!(scaler.desired(), 3);
+        assert_eq!(scaler.status(start + SECOND * 25).decisions, (1, 0));
+    }
+
+    #[test]
+    fn a_group_with_no_floor_scales_to_zero_and_a_request_wakes_it() {
+        let spec = ScalingSpec {
+            min_workers: 0,
+            idle_reap_after_ms: 10_000,
+            reap_interval_ms: 1_000,
+            min_lifetime_ms: Some(1_000),
+            hold_after_growth_ms: 1_000,
+            ..spare()
+        };
+        let mut group = Group::new(spec, 2, 1.0);
+        group.run(Duration::ZERO, MINUTE, |_| 0.0);
+        assert_eq!(group.scaler.desired(), 0, "{:?}", group.log);
+        assert_eq!(group.ins().len(), 2);
+        let idle_until = group.ins()[0].0;
+        assert!(idle_until >= SECOND * 10, "{:?}", group.ins());
+
+        // Idle at zero, it stays there: the spare rule wants nothing of a
+        // group nobody is calling.
+
+        group.run(MINUTE, MINUTE, |_| 0.0);
+        assert_eq!(group.outs(), []);
+
+        // A request waits: a worker at once, without a window.
+
+        group.run(MINUTE * 2, SECOND * 2, |_| 1.0);
+        assert_eq!(group.outs(), [(MINUTE * 2, 1)]);
+    }
+
+    #[test]
     fn a_pin_overrides_the_autoscaler() {
         let mut group = Group::new(spare(), 1, 1.0);
         group.scaler.pin(3, group.start);
@@ -969,6 +1438,71 @@ mod tests {
         group.scaler.unpin(group.start + MINUTE);
         group.run(MINUTE, MINUTE, |_| 8.0);
         assert!(!group.outs().is_empty());
+    }
+
+    #[test]
+    fn a_scheduled_floor_is_reached_in_batches_and_holds_scale_in() {
+        let mut group = Group::new(spare(), 1, 1.0);
+        group.scaler.set_capacity(Some(Capacity {
+            floor: 10,
+            ceiling: 12,
+            hold: true,
+            sources: vec!["shop.black-friday".to_owned()],
+        }));
+        group.run(Duration::ZERO, MINUTE, |_| 0.0);
+
+        // Batches of max_step_up, each once the last has arrived.
+
+        let outs: Vec<u32> = group.outs().iter().map(|(_, to)| *to).collect();
+        assert_eq!(outs, [5, 9, 10]);
+        assert!(group.outs()[1].0 - group.outs()[0].0 >= SECOND * 2);
+        assert_eq!(group.scaler.ceiling(), 12);
+
+        // Idle, but held for the window.
+
+        group.run(MINUTE, MINUTE * 30, |_| 0.0);
+        assert!(group.ins().is_empty(), "{:?}", group.ins());
+
+        // After it, scale-in follows the usual slow rules down to the
+        // policy's own floor.
+
+        group.scaler.set_capacity(None);
+        group.run(MINUTE * 31, MINUTE * 30, |_| 0.0);
+        assert!(!group.ins().is_empty());
+        assert!(group.scaler.desired() < 10);
+        assert!(
+            group
+                .ins()
+                .windows(2)
+                .all(|pair| pair[1].0 - pair[0].0 >= MINUTE)
+        );
+    }
+
+    #[test]
+    fn a_static_group_takes_a_floor_and_settles_back_after() {
+        let fixed = ScalingSpec {
+            max_workers: 2,
+            ..ScalingSpec::default()
+        };
+        let mut group = Group::new(fixed, 2, 1.0);
+        group.run(Duration::ZERO, MINUTE, |_| 1.0);
+        assert!(group.log.is_empty());
+
+        group.scaler.set_capacity(Some(Capacity {
+            floor: 4,
+            sources: vec!["shop.weekday".to_owned()],
+            ..Capacity::default()
+        }));
+        group.run(MINUTE, MINUTE, |_| 1.0);
+        assert_eq!(group.outs().last().map(|(_, to)| *to), Some(4));
+
+        group.scaler.set_capacity(None);
+        group.run(MINUTE * 2, MINUTE * 3, |_| 1.0);
+        assert_eq!(
+            group.ins().iter().map(|(_, to)| *to).collect::<Vec<_>>(),
+            [3, 2]
+        );
+        assert_eq!(group.scaler.desired(), 2);
     }
 
     #[test]
@@ -1033,5 +1567,103 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn worker(
+        pid: u32,
+        cpu_ms: u64,
+        gil_wait: Vec<u64>,
+        gil_enabled: bool,
+    ) -> crate::host::WorkerStatus {
+        crate::host::WorkerStatus {
+            index: 0,
+            pid,
+            group: "default".to_owned(),
+            requests: 0,
+            in_flight: 0,
+            oldest_ms: 0,
+            rss: None,
+            pss: None,
+            uss: None,
+            cpu_ms: Some(cpu_ms),
+            gil_enabled,
+            gil_wait,
+            loop_lag: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_signals_are_the_growth_between_two_reports() {
+        let zeros = vec![0; 11];
+
+        // Two workers over ten seconds: one used 9 s of CPU, the other 7 s;
+        // 100 GIL waits arrived, 96 of them within 5 ms.
+
+        let before = [
+            worker(1, 1_000, zeros.clone(), true),
+            worker(2, 500, zeros.clone(), true),
+        ];
+        let after = [
+            worker(
+                1,
+                10_000,
+                vec![0, 0, 50, 96, 96, 100, 100, 100, 100, 100, 100],
+                true,
+            ),
+            worker(2, 7_500, zeros.clone(), true),
+            worker(3, 99_000, zeros.clone(), true),
+        ];
+        let signals =
+            WorkerSignals::between(&before, &after, "default", Duration::from_secs(10), 4);
+        assert_eq!(signals.worker_cpu, Some(0.8));
+        assert_eq!(signals.gil_wait_p95_ms, Some(5.0));
+        assert_eq!(signals.loop_lag_p95_ms, None);
+
+        // Without a GIL a worker can use a core per thread.
+
+        let free = WorkerSignals::between(
+            &[worker(1, 0, zeros.clone(), false)],
+            &[worker(1, 8_000, zeros, false)],
+            "default",
+            Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(free.worker_cpu, Some(0.2));
+        assert_eq!(free.cores, Some(0.8));
+    }
+
+    #[test]
+    fn the_diagnosis_names_the_bottleneck() {
+        let quiet = WorkerSignals::default();
+        let busy_cpu = WorkerSignals {
+            worker_cpu: Some(0.95),
+            ..WorkerSignals::default()
+        };
+        let contended = WorkerSignals {
+            worker_cpu: Some(0.6),
+            gil_wait_p95_ms: Some(50.0),
+            ..WorkerSignals::default()
+        };
+        let lagging = WorkerSignals {
+            loop_lag_p95_ms: Some(500.0),
+            ..WorkerSignals::default()
+        };
+
+        assert_eq!(diagnose(0.9, None, &busy_cpu, false).bottleneck, "cpu");
+        assert_eq!(diagnose(0.9, None, &contended, false).bottleneck, "gil");
+        assert_eq!(diagnose(0.9, Some(200.0), &quiet, false).bottleneck, "io");
+        assert_eq!(
+            diagnose(0.3, Some(200.0), &quiet, false).bottleneck,
+            "heavy"
+        );
+        assert_eq!(diagnose(0.05, None, &quiet, false).bottleneck, "idle");
+        assert_eq!(diagnose(0.5, None, &quiet, false).bottleneck, "none");
+        assert_eq!(diagnose(0.5, None, &lagging, false).bottleneck, "loop");
+        assert_eq!(diagnose(0.9, None, &busy_cpu, true).bottleneck, "memory");
+        assert!(
+            diagnose(0.9, None, &quiet, false)
+                .advice
+                .contains("more threads")
+        );
     }
 }

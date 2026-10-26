@@ -1,4 +1,8 @@
-"""A WSGI application for gunicorn, which reports the server it runs under."""
+"""A WSGI application for gunicorn, which reports the server it runs under.
+
+`native` says whether Muru's own workers built the environ, for the
+cutover from gunicorn to native workers.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
             "pid": os.getpid(),
             "path": environ["PATH_INFO"],
             "forwarded_for": environ.get("HTTP_X_FORWARDED_FOR", ""),
+            "native": "muru.client_class" in environ,
         }
     ).encode()
     start_response(

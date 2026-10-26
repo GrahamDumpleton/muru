@@ -1,0 +1,16 @@
+entrypoint = "pooled:wsgi_app"
+threads = 2
+
+[mounts.fixed]
+path = "/fixed"
+entrypoint = "pooled:fixed_app"
+threads = 2
+
+[mounts.borrowing]
+path = "/borrowing"
+entrypoint = "pooled:borrowing_app"
+threads = { reserved = 1, max = 2 }
+
+[mounts.events]
+path = "/events"
+entrypoint = "pooled:asgi_app"

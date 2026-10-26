@@ -6,7 +6,9 @@
 //! in the daemon (ADR 0002).
 
 pub mod api;
+pub mod budget;
 pub mod client;
+pub mod clients;
 pub mod config;
 pub mod daemon;
 pub mod dashboard;
@@ -19,6 +21,7 @@ pub mod logs;
 pub mod metrics;
 pub mod model;
 pub mod notify;
+pub mod overlays;
 pub mod rollouts;
 pub mod rotation;
 pub mod scaling;
@@ -26,3 +29,4 @@ pub mod secrets;
 pub mod servers;
 pub mod sinks;
 pub mod store;
+pub mod triggers;

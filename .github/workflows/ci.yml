@@ -109,7 +109,11 @@ jobs:
           # an extension built for 3.15 and import nothing.
           key: ${{ matrix.python }}
       - run: uv python install ${{ matrix.python }}
-      - run: uv sync --only-group dev --only-group fixtures --python ${{ matrix.python }}
+      # grpcio has no free-threaded wheels: gRPC mounts are unavailable there
+      # (section 6.13), and their tests say they are skipped.
+      - if: endsWith(matrix.python, 't')
+        run: echo "UV_NO_GROUP=grpc" >> "$GITHUB_ENV"
+      - run: uv sync --only-group dev --only-group fixtures ${{ !endsWith(matrix.python, 't') && '--only-group grpc' || '' }} --python ${{ matrix.python }}
       - run: cd packages/muru && uv run --project ../.. maturin develop
       - run: cargo build -p muructl
       - run: bash packaging/dev/fetch-h2spec.sh
@@ -133,6 +137,8 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
+      - if: endsWith(matrix.python, 't')
+        run: echo "UV_NO_GROUP=grpc" >> "$GITHUB_ENV"
       - run: uv sync --only-group dev
       - run: uv run pytest
 

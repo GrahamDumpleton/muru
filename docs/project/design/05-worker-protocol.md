@@ -40,7 +40,7 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | END | 5 | both | End | Ends a body when no BODY frame carried the END flag. Carries trailers, or an error when the body is incomplete. Sent in place of RESPONSE when the application failed before producing a head, with the reason and detail the edge's error page shows (section 4.12) |
 | ABORT | 6 | edge to worker | Abort | The edge has no more use for the request: the client has gone, or the response ended before the request body did (section 5.5) |
 | CONTINUE | 7 | worker to edge | empty | The application has started reading the request body, so the edge may send 100 Continue (section 4.6). Sent only when the request head says the client is waiting for it |
-| MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6) |
+| MESSAGE | 8 | both | bytes | One WebSocket message. TEXT flag for text, otherwise binary (section 5.6). On a gRPC call, one whole gRPC message (section 6.13) |
 | CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason (section 5.6) |
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
 | FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame (section 5.7). Phase 2 |
@@ -50,9 +50,9 @@ Flags: END (0x01) on the last frame of a direction; TEXT (0x02) on a text MESSAG
 
 The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
-- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size. The edge sends only its version.
+- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size, and the gRPC methods the worker's mounts registered, each with its mount and whether its requests and responses stream (section 6.13), and the mounts with threads of their own, each with its reserved threads and the most requests it runs at once (section 6.7). The edge sends only its version.
 
-- **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, and the scope (http or websocket).
+- **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, the scope (http, websocket or grpc), and whether the request borrowed a thread of the shared pool for a mount with threads of its own (section 6.7).
 
 - **ResponseHead:** status, ordered headers, flush policy override.
 
@@ -138,7 +138,7 @@ File descriptors travel on the link itself, attached with SCM_RIGHTS to the fram
 
 - **Worker to edge:** FILE frames for wsgi.file_wrapper and the ASGI pathsend and zerocopysend extensions (sections 4.9 and 6.5). The worker sends a duplicate of the open descriptor with an offset and length, closes its own copy, and the application thread is free. The edge sends the range to the client itself.
 
-- **Edge to worker:** offloaded upload files (section 4.11) attached to the REQUEST frame, matched to the upload references in the head by order.
+- **Edge to worker:** offloaded upload files (section 4.11) attached to the REQUEST frame, matched to the upload references in the head by order. Each UploadRef carries the ref, the form field (empty for a raw upload), the client's file name and content type, the size, the digests by algorithm and, where the spool file has a name, its path. One message carries at most 64 descriptors, so a request with more spreads them over its first bytes, one message each.
 
 The channel works across container boundaries because both sides share the kernel. Log pipes are passed by the daemon when it spawns the host, not on the link.
 

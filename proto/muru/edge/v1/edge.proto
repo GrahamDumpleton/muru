@@ -27,6 +27,9 @@ service EdgeControl {
   rpc GetRecent(RecentRequest) returns (RecentRequests);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
+  // Section 7.4: the groups scaled to zero that requests are waiting
+  // for, as they wait, for the daemon to wake.
+  rpc WatchWakes(WatchWakesRequest) returns (stream Wake);
 }
 
 message Snapshot {
@@ -42,6 +45,53 @@ message Snapshot {
   repeated Upstream upstreams = 10;     // section 4.13: the HTTP upstreams routes may name
   string default_app = 11;              // the application the default workers belong to; found by sockets when empty
   string default_release = 12;          // and its release
+  repeated ClientClass client_classes = 13; // section 4.14: classification rules, in order
+  repeated RateLimit rate_limits = 14;  // section 4.15: the rate limits hosts and routes name
+  Traffic default_traffic = 15;         // with no host declared, the default application's policy: its rollout's share (section 9.3)
+  repeated H2cPolicy h2c = 16;          // section 6.13: listeners that limit cleartext HTTP/2; every client elsewhere
+}
+
+// Section 6.13: who may speak HTTP/2 in cleartext on a listener without
+// TLS; the others are served HTTP/1.1.
+message H2cPolicy {
+  string listener = 1;                  // the listener's address, as IP:PORT
+  repeated string allowed = 2;          // addresses, ranges, loopback or private; none when empty
+}
+
+// Section 4.14: a client classification rule, with its list files read.
+// Every input it names must match, an input matching when any of its
+// entries does.
+message ClientClass {
+  string name = 1;
+  repeated string user_agents = 2;      // substrings, compared without regard to case, the list file's included
+  repeated string user_agent_regexes = 3;
+  repeated string addresses = 4;        // addresses and networks, the list file's included
+  map<string, string> headers = 5;      // lower-case header name to a regular expression its value must match
+  map<string, string> cookies = 6;      // cookie name to a regular expression its value must match
+  repeated string verify_domains = 7;   // reverse and forward DNS must confirm a name in one of these; no verification when empty
+  repeated string ja4 = 8;              // JA4 fingerprints, or prefixes ending in *, the list file's included
+  bool empty_list = 9;                  // an input whose entries all come from a list file holding none: the rule matches nothing
+}
+
+// Section 4.15: a token bucket for each key, which requests of the
+// matching classes draw from.
+message RateLimit {
+  string name = 1;
+  repeated string classes = 2;          // the classes it applies to; all when empty
+  repeated string key = 3;              // address, client_class, header:NAME or cookie:NAME, combined
+  double per_second = 4;                // tokens added each second
+  uint32 burst = 5;                     // the bucket's size
+  string action = 6;                    // reject, delay or log
+  uint64 max_delay_ms = 7;              // the longest hold under delay
+  uint32 ipv4_prefix = 8;
+  uint32 ipv6_prefix = 9;
+  bool headers = 10;                    // RateLimit-Policy and RateLimit fields on a 429
+}
+
+// Section 4.15: methods a route refuses.
+message Methods {
+  repeated string deny = 1;
+  bool not_allowed = 2;                 // 405 method_not_allowed rather than 503 read_only
 }
 
 // Section 4.13: an unmanaged HTTP server that routes, fallbacks, traffic
@@ -131,6 +181,7 @@ message Host {
   bool default = 9;                     // answers requests whose host matches no host
   repeated ErrorPage error_pages = 10;  // section 4.12: the host's pages
   ErrorOverride error_override = 11;
+  repeated string rate_limits = 12;     // section 4.15: applied to every request for the host
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -156,6 +207,22 @@ message Route {
   Auth auth = 18;                       // section 4.16: the decision asked for before the route is served
   string upstream = 19;                 // section 4.13: the upstream that takes the requests, instead of an application
   string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
+  Upload upload = 21;                   // section 4.11: uploads received and stored by the edge; off when absent
+  uint64 max_body_size = 22;            // section 4.6: the route's body limit; the edge's own when 0
+  repeated string rate_limits = 23;     // section 4.15: applied after the host's
+  Methods methods = 24;                 // methods the route refuses; none when absent
+  string mode = 25;                     // the site mode the application sees as muru.mode; none when empty
+  repeated string client_classes = 26;  // section 4.14: the classes the route takes; every request when empty
+}
+
+// Section 4.11: how a route's uploads are received before dispatch.
+message Upload {
+  string mode = 1;                      // multipart or raw
+  uint64 max_file_size = 2;             // bytes per file; no limit when 0
+  uint32 max_files = 3;                 // files per request; 100 when 0
+  repeated string hash = 4;             // digests computed while receiving: sha256, sha384, sha512 or sha1; none when empty
+  bool precheck = 5;                    // ask the application with the headers alone first
+  uint64 spool_quota = 6;               // bytes the application's stored uploads may hold at once; no limit when 0
 }
 
 // A route's authentication sub-request (section 4.16): a bodiless GET to
@@ -179,6 +246,7 @@ message Traffic {
   string salt = 3;
   bool sticky = 4;                      // a cookie keeps a client on the release it first got
   uint64 sticky_grace_s = 5;
+  map<string, string> classes = 6;      // section 4.14: a client class to the release, or upstream:NAME, that takes all of its requests
 }
 
 message Share {
@@ -205,6 +273,8 @@ message AppWorkers {
   Upstream server = 12;                 // section 9.9: a managed HTTP release's instances, routed as an upstream; no sockets then
   repeated string sendfile_roots = 13;  // section 4.9: directories the default mount's X-Muru-Sendfile paths must lie in
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
+  repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
+  repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
 }
 
 message Mount {
@@ -222,6 +292,7 @@ message Group {
   string name = 1;
   repeated string paths = 2;            // prefixes, with an optional trailing *
   repeated string sockets = 3;
+  repeated string client_classes = 4;   // section 4.14: the classes the group takes, ahead of groups naming none
 }
 
 message Applied {
@@ -247,6 +318,15 @@ message StopRequest {}
 message Stopped {}
 
 message MetricsRequest {}
+
+message WatchWakesRequest {}
+
+// A group with no workers that a request is waiting for.
+message Wake {
+  string app = 1;
+  string release = 2;
+  string group = 3;
+}
 
 message MetricsReport {
   repeated Sample samples = 1;

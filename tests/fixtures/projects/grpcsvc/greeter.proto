@@ -1,0 +1,24 @@
+// The services of the gRPC mount fixture (design specification section
+// 6.13). The tests generate greeter_pb2 and greeter_pb2_grpc from it.
+
+syntax = "proto3";
+
+package demo;
+
+service Greeter {
+  rpc SayHello (Hello) returns (Reply);
+  rpc Whoami (Hello) returns (Reply);
+  rpc Count (Hello) returns (stream Reply);
+  rpc CountSync (Hello) returns (stream Reply);
+  rpc Total (stream Hello) returns (Reply);
+  rpc Chat (stream Hello) returns (stream Reply);
+}
+
+message Hello {
+  string name = 1;
+  int32 count = 2;
+}
+
+message Reply {
+  string message = 1;
+}

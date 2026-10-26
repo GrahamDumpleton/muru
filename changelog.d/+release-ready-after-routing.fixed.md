@@ -1,1 +1,0 @@
-A release is now `ready` only once the edge has been given it, so a request made as soon as `muructl release wait` returns reaches the new release; before, the wait could return a moment before the edge routed to it, and the request was answered 503.

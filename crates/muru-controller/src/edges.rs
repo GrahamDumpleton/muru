@@ -10,6 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -17,6 +18,7 @@ use hyper_util::rt::TokioIo;
 use muru_proto::edge::v1 as pb;
 use muru_proto::edge::v1::edge_control_client::EdgeControlClient;
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 /// A listener the daemon bound for the edge.
@@ -47,6 +49,8 @@ pub struct EdgeSpec {
     pub access_log: Option<PathBuf>,
     /// The limits the edge enforces.
     pub limits: muru_edge::Limits,
+    /// Where upload routes store files (section 4.11).
+    pub spool: PathBuf,
     /// Whom the edge runs as, when the daemon is root (ADR 0026): the
     /// service user, never root.
     pub identity: Option<crate::host::Identity>,
@@ -57,6 +61,9 @@ pub struct EdgeProcess {
     spec: EdgeSpec,
     process: Process,
     snapshot: pb::Snapshot,
+    /// The control socket as of the last snapshot, for the wake watcher,
+    /// which follows the edge through respawns and upgrades.
+    control_now: Arc<Mutex<PathBuf>>,
 }
 
 /// An edge this daemon spawned, or one it adopted from a previous daemon.
@@ -78,6 +85,10 @@ pub fn directory(run_dir: &Path) -> PathBuf {
     run_dir.join("edge")
 }
 
+/// The file of the rate limits' shared buckets in the edges' directory,
+/// named for its layout.
+pub const BUCKETS_FILE: &str = "rate-buckets-v1";
+
 /// The control socket and the listener-return socket of an edge of the
 /// given generation, in the edges' directory.
 pub fn socket_paths(directory: &Path, generation: u32) -> (PathBuf, PathBuf) {
@@ -92,6 +103,7 @@ impl EdgeProcess {
     pub async fn spawn(spec: EdgeSpec) -> anyhow::Result<Self> {
         let child = launch(&spec, &[]).await?;
         Ok(Self {
+            control_now: Arc::new(Mutex::new(spec.control.clone())),
             spec,
             process: Process::Child(child),
             snapshot: pb::Snapshot::default(),
@@ -113,6 +125,7 @@ impl EdgeProcess {
         log: PathBuf,
         access_log: Option<PathBuf>,
         limits: muru_edge::Limits,
+        spool: PathBuf,
         identity: Option<crate::host::Identity>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::host::alive(pid), "the edge process {pid} is gone");
@@ -145,6 +158,7 @@ impl EdgeProcess {
         anyhow::ensure!(!listeners.is_empty(), "the edge handed no listener back");
 
         Ok(Self {
+            control_now: Arc::new(Mutex::new(control.clone())),
             spec: EdgeSpec {
                 executable,
                 listeners,
@@ -154,6 +168,7 @@ impl EdgeProcess {
                 log,
                 access_log,
                 limits,
+                spool,
                 identity,
             },
             process: Process::Adopted(pid),
@@ -259,6 +274,7 @@ impl EdgeProcess {
             version: self.snapshot.version + 1,
             ..snapshot
         };
+        *self.control_now.lock().expect("control poisoned") = self.spec.control.clone();
         let mut client = connect(&self.spec.control).await?;
         client
             .apply(self.snapshot.clone())
@@ -267,6 +283,32 @@ impl EdgeProcess {
                 anyhow::anyhow!("the edge refused the snapshot: {}", status.message())
             })?;
         Ok(())
+    }
+
+    /// Section 7.4: send each group a request is waiting to wake to
+    /// `wakes`, from whichever edge serves, until the receiver closes.
+    pub fn watch_wakes(&self, wakes: mpsc::Sender<pb::Wake>) {
+        let current = Arc::clone(&self.control_now);
+
+        tokio::spawn(async move {
+            while !wakes.is_closed() {
+                let control = current.lock().expect("control poisoned").clone();
+
+                if let Ok(mut client) = connect(&control).await
+                    && let Ok(response) = client.watch_wakes(pb::WatchWakesRequest {}).await
+                {
+                    let mut stream = response.into_inner();
+
+                    while let Ok(Some(wake)) = stream.message().await {
+                        if wakes.send(wake).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
     }
 
     /// The version of the snapshot the edge was last given.
@@ -503,7 +545,22 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg("--max-requests-per-connection")
         .arg(spec.limits.max_requests_per_connection.to_string())
         .arg("--http2-max-concurrent-streams")
-        .arg(spec.limits.http2_max_concurrent_streams.to_string());
+        .arg(spec.limits.http2_max_concurrent_streams.to_string())
+        .arg("--spool")
+        .arg(&spec.spool)
+        .arg("--spool-quota")
+        .arg(spec.limits.spool_quota.to_string());
+
+    // Section 4.15: the rate limits' buckets, in the edges' directory,
+    // which every generation of the edge maps, so a replacement draws
+    // from the buckets of the edge it replaces.
+
+    if let Some(directory) = spec.control.parent() {
+        command
+            .arg("--rate-buckets")
+            .arg(directory.join(BUCKETS_FILE));
+    }
+
     for (name, duration) in [
         ("queue", spec.limits.queue_timeout),
         ("deadline", spec.limits.request_deadline),

@@ -6,20 +6,29 @@
 
 use std::sync::Arc;
 
-use muru_dashboard::{EventRow, EventsSource, History, NodeMetricsSource, NodeSource, Reading};
+use muru_dashboard::{
+    Action, Actions, EventRow, EventsSource, History, NodeMetricsSource, NodeSource, Reading,
+    Sessions,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::daemon::Command;
 use crate::events::Events;
 
-/// Serve the dashboard on the listener until accepting fails.
+/// Serve the dashboard on the listener until accepting fails, taking
+/// actions from the sessions given, when it is.
 pub async fn serve(
     listener: TcpListener,
     commands: mpsc::Sender<Command>,
     history: Arc<History>,
     events: Events,
+    sessions: Option<Arc<Sessions>>,
 ) -> anyhow::Result<()> {
+    let actions = sessions.map(|sessions| Actions {
+        sessions,
+        sink: action_sink(commands.clone(), events.clone()),
+    });
     let data_commands = commands.clone();
     let source: NodeSource = Arc::new(move || {
         let commands = data_commands.clone();
@@ -68,9 +77,38 @@ pub async fn serve(
         }
     });
     let live: EventsSource = Arc::new(move || rows.subscribe());
-    muru_dashboard::serve_node(listener, source, metrics, history, live).await
+    muru_dashboard::serve_node(listener, source, metrics, history, live, actions).await
 }
 
+/// Section 10.7: carry out a dashboard action as the admin API would,
+/// recording who asked as a `dashboard.action` event.
+fn action_sink(commands: mpsc::Sender<Command>, events: Events) -> muru_dashboard::ActionSink {
+    Arc::new(move |action, session| {
+        let commands = commands.clone();
+        let events = events.clone();
+        Box::pin(async move {
+            let Action::Maintenance { app, on } = action;
+            let (done_tx, done_rx) = oneshot::channel();
+            commands
+                .send(Command::SetMaintenance {
+                    app: app.clone(),
+                    on,
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| "the daemon is stopping".to_owned())?;
+            done_rx
+                .await
+                .map_err(|_| "the daemon is stopping".to_owned())??;
+            let what = format!(
+                "maintenance {} for {app} from the dashboard, session {session}",
+                if on { "on" } else { "off" }
+            );
+            events.emit("dashboard.action", &app, "notice", &what);
+            Ok(what)
+        })
+    })
+}
 /// A reading of the request counters for the history, from the samples
 /// the edge reports: requests and 5xx responses completed, the total
 /// time histogram, requests in flight.

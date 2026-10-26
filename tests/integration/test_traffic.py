@@ -190,3 +190,45 @@ def test_header_and_client_keys_and_invalid_policies(daemon: Daemon, tmp_path: P
         assert refused.returncode != 0 and complaint in refused.stdout + refused.stderr, (
             refused.stdout + refused.stderr
         )
+
+
+def test_a_cohort_and_a_route_take_releases_of_their_own(daemon: Daemon, tmp_path: Path) -> None:
+    daemon.deploy("shop", SHOP)
+    daemon.deploy("shop", SHOP)
+    config = tmp_path / "cohorts.toml"
+    config.write_text(
+        """[[client_class]]
+name = 'beta'
+cookies = { plan = '^beta$' }
+
+[host.shop]
+names = ["shop.test"]
+default = true
+
+[[route]]
+host = "shop"
+app = "shop"
+traffic = { classes = { beta = 'r1' } }
+
+[[route]]
+host = "shop"
+path = "/legacy"
+app = "shop"
+traffic = { split = { r1 = 100 } }
+"""
+    )
+    applied = daemon.muructl("apply", "-f", str(config))
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    # The beta cohort, known by its cookie, gets r1, and everyone else the
+    # serving release.
+
+    assert {served_by(daemon, Cookie="plan=beta")[0] for _ in range(5)} == {"r1"}
+    others = {served_by(daemon, Cookie=f"plan=free; muru_id=c{n}")[0] for n in range(20)}
+    assert others == {"r2"}
+
+    # One route of the application stays on r1 for everyone.
+
+    for n in range(10):
+        response = daemon.request("/legacy", host="shop.test", headers={"Cookie": f"muru_id=l{n}"})
+        assert json.loads(response.body)["release"] == "r1"

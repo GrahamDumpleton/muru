@@ -18,7 +18,7 @@ default-members = [
 
 [workspace.package]
 # The only place the project version is stated. Change it with `just bump`.
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -29,6 +29,7 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 brotli = "8"
 bytes = "1.10"
@@ -44,8 +45,10 @@ hyper = { version = "1.7", features = ["http1", "http2", "server", "client"] }
 ignore = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client", "client-legacy", "http1", "http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "webpki-tokio"] }
+jiff = "0.2"
 libc = "0.2"
 mime_guess = "2"
+multer = "3.1"
 muru-common = { path = "crates/muru-common" }
 muru-dashboard = { path = "crates/muru-dashboard" }
 muru-config = { path = "crates/muru-config" }
@@ -59,6 +62,7 @@ pyo3 = { version = "0.30", features = ["extension-module"] }
 # TLS runs on the ring provider everywhere (ADR 0024): no aws-lc-rs, so no
 # cmake. Keep every rustls-family crate on the same provider features.
 rusqlite = { version = "0.40", features = ["bundled"] }
+regex = "1"
 ring = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -74,7 +78,7 @@ webpki-roots = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "channel", "router"] }
-zstd = "0.13"
+zstd = "0.14.3"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tower = "0.5"

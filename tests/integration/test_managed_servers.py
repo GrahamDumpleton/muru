@@ -19,6 +19,7 @@ from pathlib import Path
 from support import server as support
 from support.daemon import SHOP, Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
+from support.load import Load
 
 daemon = daemon_fixture
 
@@ -334,6 +335,78 @@ app = "legacy"
     wait_for(lambda: states().get("legacy@r1") == ("stopped", ""), 30)
     wait_for(lambda: not alive(pid))
     assert not list((daemon.run_dir / "apps" / "legacy" / "r1").glob("**/server-*.sock"))
+
+
+def test_a_gunicorn_deployment_cuts_over_to_native_workers_under_load(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    """The exit criterion of phase 3 (section 14): an application served
+    by gunicorn runs unchanged as a managed release, then is canaried to
+    native workers, promoted, and its server drained, with no request
+    failing throughout."""
+
+    try:
+        __import__("gunicorn")
+    except ImportError:
+        support.unavailable("gunicorn is not installed")
+
+    line = daemon.muructl(
+        "deploy",
+        "legacy",
+        str(LEGACY),
+        "--server",
+        "gunicorn",
+        "--",
+        sys.executable,
+        "-m",
+        "gunicorn",
+        "--workers",
+        "2",
+        "legacy:application",
+    ).stdout.strip()
+    assert line == "muru: release legacy@r1 is ready and serving"
+    assert not report(daemon)["native"]
+
+    def states() -> dict[str, tuple[str, str]]:
+        return {row["release"]: (row["state"], row["serving"]) for row in daemon.releases("legacy")}
+
+    with Load(daemon.port, clients=4) as load:
+        # The same application on native workers, held, then canaried
+        # against gunicorn and promoted once the gates pass.
+
+        held = daemon.muructl(
+            "deploy",
+            "legacy",
+            str(LEGACY),
+            "--entrypoint",
+            "legacy:application",
+            "--python",
+            sys.executable,
+            "--hold",
+        ).stdout.strip()
+        assert held == "muru: release legacy@r2 is ready and held: not serving"
+        daemon.muructl(
+            "rollout",
+            "canary",
+            "legacy@r2",
+            "--steps",
+            "50",
+            "--hold",
+            "2s",
+            "--min-requests",
+            "20",
+        )
+        wait_for(lambda: states().get("legacy@r2") == ("ready", "yes"), 60)
+        wait_for(lambda: states().get("legacy@r1") == ("retained", ""), 30)
+
+        # gunicorn is drained for good.
+
+        daemon.muructl("drain", "legacy@r1")
+        wait_for(lambda: states().get("legacy@r1") == ("stopped", ""), 30)
+        time.sleep(0.5)
+
+    load.check("the cutover from gunicorn to native workers", at_least=200)
+    assert report(daemon)["native"]
 
 
 def test_declared_servers_are_applied_exported_and_checked(daemon: Daemon, tmp_path: Path) -> None:

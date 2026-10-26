@@ -50,11 +50,13 @@ muructl drain shop@r2
 muructl events --follow
 ```
 
-A release that a deploy replaces is drained and then kept warm, with
-its workers untouched, for a retention window of 30 minutes (`deploy
---retain` changes it; `--retain 0` stops it as soon as it has drained),
-so `rollback` within the window is instant: traffic moves back to the
-workers that were already serving. After the window, or when another
+A release that a deploy replaces is drained and then kept warm for a
+retention window of 30 minutes (`deploy --retain` changes it; `--retain
+0` stops it as soon as it has drained), with one worker in each of its
+groups (`deploy --retain-workers` changes it; `--retain-workers 0` keeps
+the host alone), so `rollback` within the window is instant: traffic
+moves back to the warm workers at once, and the groups grow back to
+their counts by forking from the host. After the window, or when another
 deploy supersedes it again, the retained release is stopped. One release
 per application is retained at a time. `rollback` to a release that was
 stopped starts it again first and moves traffic when it is ready; the
@@ -124,10 +126,34 @@ a header naming the daemon's version, the node, the time and the state
 version. It writes the release that serves each application, every key
 spelled out, so applying the file back to the daemon it came from changes
 nothing; `--all-releases` writes every release, `--app NAME` one
-application, and `--json` the same document as JSON. `muructl config
-diff -f FILE` compares a file with desired state in both directions,
-listing what the file would add and what the daemon holds that the file
-does not, with exit code 2 when they differ.
+application, and `--json` the same document as JSON. A
+[rollout](rollouts.md) under way is not part of the file; with
+`--resolve-rollouts` it is written as where it stands, the candidate
+declared beside the serving release and the application's routes
+splitting traffic between them at the candidate's current share.
+`muructl config diff -f FILE` compares a file with desired state in
+both directions, listing what the file would add and what the daemon
+holds that the file does not, with exit code 2 when they differ.
+
+`muructl config show [APP] --effective` writes the same document headed
+by each serving release's settings and where each came from: the
+release table of an applied file or the deploy's flags, the source's
+`[tool.muru]` table, the source's `.venv` for the interpreter, the
+previous release, or the default:
+
+```console
+$ muructl config show shop --effective
+# Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
+# No active overlay changes this configuration.
+
+# The releases' settings, and the layer each came from:
+#   shop@r3: entrypoint = shop.wsgi:application ([tool.muru])
+#   shop@r3: python = /srv/shop/.venv/bin/python (the source's .venv)
+#   shop@r3: processes = 4 (deploy flags)
+#   shop@r3: threads = 8 (the previous release)
+#   shop@r3: sync_threads = 8 (default)
+...
+```
 
 ## Where things live
 
@@ -163,8 +189,11 @@ status` and `muructl status` show the daemon, its edge process, its
 listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
 in the configuration file, serves Prometheus metrics on an internal
 address; the [metrics guide](metrics.md) lists them. `--dashboard
-ADDRESS`, or a `[dashboard]` table, serves the read-only [dashboard and
-JSON gateway](dashboard.md) on a loopback address.
+ADDRESS`, or a `[dashboard]` table, serves the [dashboard and JSON
+gateway](dashboard.md) on a loopback address, read-only unless the
+table turns its actions on. An `[overlay_webhook]`
+table serves the [signed webhook](overlays.md#the-webhook) that
+monitoring systems activate and end overlays with.
 
 The daemon binds the listening sockets itself and hands them to an edge
 process started from the same executable, which carries the traffic;
@@ -217,7 +246,8 @@ a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
 daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
 configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
-and `[error_override]` tables. The [systemd
+and `[error_override]` tables and the [node's
+budget](scaling.md#the-nodes-budget). The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else the
 socket in the runtime directory.

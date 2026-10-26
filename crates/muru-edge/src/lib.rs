@@ -31,16 +31,23 @@ use tokio_rustls::TlsAcceptor;
 
 pub mod access;
 pub mod auth;
+pub mod buckets;
+pub mod classify;
 pub mod compression;
 pub mod connections;
 pub mod errors;
+pub mod grpc;
+pub mod ja4;
 pub mod link;
 pub mod metrics;
 pub mod proxy;
+pub mod ratelimit;
 pub mod routing;
 pub mod static_files;
 pub mod tls;
+pub mod uploads;
 pub mod upstream;
+pub mod wake;
 pub mod websocket;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -71,6 +78,9 @@ pub struct Config {
     pub cgi_local_redirect: bool,
     /// The default mount's file hints by path (section 4.9).
     pub sendfile: Arc<routing::Sendfile>,
+    /// The origins whose pages may call it through gRPC-Web (section
+    /// 6.13).
+    pub grpc_web_origins: Vec<String>,
     /// The application's error pages and override (section 4.12).
     pub errors: Arc<errors::ErrorPolicy>,
     /// Development mode: error pages show tracebacks (section 4.12).
@@ -83,6 +93,13 @@ pub struct Config {
     pub compression: compression::Compression,
     /// The HTTPS listener, when TLS is on.
     pub https: Option<Https>,
+    /// Where upload routes store files (section 4.11); a route that
+    /// takes uploads without one passes its bodies through.
+    pub spool: Option<Arc<uploads::Spool>>,
+    /// The table of the rate limits' buckets, shared with the node's
+    /// other edge processes (section 4.15); the process's own buckets
+    /// when absent, or when the table cannot be mapped.
+    pub rate_buckets: Option<PathBuf>,
 }
 
 /// An HTTPS listener next to the HTTP one (section 13.1 in development).
@@ -142,6 +159,9 @@ pub struct Limits {
     pub max_requests_per_connection: u64,
     /// Concurrent streams per HTTP/2 connection.
     pub http2_max_concurrent_streams: u32,
+    /// What stored uploads may hold at once across every application
+    /// (section 4.11), else 507 upload_spool_full; 0 for no limit.
+    pub spool_quota: u64,
 }
 
 impl Default for Limits {
@@ -164,6 +184,7 @@ impl Default for Limits {
             websocket_max_message_size: 1024 * 1024,
             websocket_ping_interval: Duration::from_secs(30),
             websocket_idle_timeout: Duration::from_secs(300),
+            spool_quota: 0,
         }
     }
 }
@@ -189,9 +210,12 @@ impl Pools {
         self.apply(routing::Routing::single(pools).with_compression(self.compression.clone()));
     }
 
-    /// Switch to the tables of a new snapshot.
+    /// Switch to the tables of a new snapshot, handing the pools of woken
+    /// groups to the requests waiting for them (section 7.4).
     pub fn apply(&self, routing: routing::Routing) {
+        let pools = routing.group_pools();
         *self.current.write().expect("pools poisoned") = Arc::new(routing);
+        wake::wakes().publish(&pools);
     }
 }
 
@@ -235,6 +259,13 @@ struct Shared {
     /// Each listener's connection counts and limits (section 4.18), in
     /// listener order.
     admission: Vec<Arc<connections::Connections>>,
+    /// Where upload routes store files (section 4.11).
+    spool: Option<Arc<uploads::Spool>>,
+    /// Claimed crawlers' confirmed names (section 4.14), kept across
+    /// snapshots.
+    verifier: Arc<classify::Verifier>,
+    /// The rate limits' buckets (section 4.15), kept across snapshots.
+    buckets: ratelimit::Buckets,
 }
 
 /// Stops an edge accepting and lets its connections finish (section
@@ -358,7 +389,8 @@ impl Edge {
                     )
                     .await?
                     .with_errors(Arc::clone(&config.errors))
-                    .with_sendfile(Arc::clone(&config.sendfile)),
+                    .with_sendfile(Arc::clone(&config.sendfile))
+                    .with_grpc_web(&config.grpc_web_origins),
                 )
                 .with_compression(config.compression.clone()),
             )),
@@ -422,6 +454,23 @@ impl Edge {
                 draining: tokio::sync::watch::channel(false).0,
                 connections: Arc::new(()),
                 admission,
+                spool: config.spool,
+                verifier: classify::Verifier::new(),
+                buckets: config
+                    .rate_buckets
+                    .as_deref()
+                    .and_then(|path| {
+                        ratelimit::Buckets::shared(path)
+                            .map_err(|error| {
+                                tracing::warn!(
+                                    %error,
+                                    path = %path.display(),
+                                    "the shared rate limit buckets are unusable; this process keeps its own"
+                                );
+                            })
+                            .ok()
+                    })
+                    .unwrap_or_default(),
             }),
         })
     }
@@ -454,7 +503,8 @@ pub struct ConnectionCounts {
 }
 
 impl ConnectionCounts {
-    /// Every listener's connection samples (section 4.18).
+    /// Every listener's connection samples (section 4.18), with what the
+    /// upload spool holds (section 4.11).
     pub fn samples(&self) -> Vec<metrics::Sample> {
         self.shared.connection_samples()
     }
@@ -462,10 +512,17 @@ impl ConnectionCounts {
 
 impl Shared {
     fn connection_samples(&self) -> Vec<metrics::Sample> {
-        self.admission
+        let mut samples: Vec<metrics::Sample> = self
+            .admission
             .iter()
             .flat_map(|connections| connections.samples())
-            .collect()
+            .collect();
+
+        if let Some(spool) = &self.spool {
+            samples.extend(spool.samples());
+        }
+
+        samples
     }
 }
 
@@ -600,24 +657,39 @@ async fn accept(
 
         match acceptor.clone() {
             None => {
-                tokio::spawn(serve(
-                    stream, peer, local, None, shared, token, guard, trusted,
-                ));
+                tokio::spawn(async move {
+                    // Section 6.13: a listener may keep cleartext HTTP/2
+                    // to some clients.
+
+                    if !shared.pools.current().allows_h2c(&local, &peer)
+                        && opens_http2(&stream, shared.limits.header_read_timeout).await
+                    {
+                        refuse_http2(stream).await;
+                        return;
+                    }
+
+                    serve(stream, peer, local, None, shared, token, guard, trusted).await;
+                });
             }
             Some(acceptor) => {
                 tokio::spawn(async move {
                     // A client that never finishes its handshake is cut off
                     // as one that never finishes its request head would be.
 
-                    let handshake = tokio::time::timeout(
-                        shared.limits.header_read_timeout,
-                        acceptor.accept(stream),
-                    )
-                    .await;
+                    let handshake =
+                        tokio::time::timeout(shared.limits.header_read_timeout, async {
+                            // Section 4.14: the ClientHello's fingerprint, read
+                            // before the handshake takes it.
+
+                            let ja4 = ja4::peek(&stream, shared.limits.header_read_timeout).await;
+                            acceptor.accept(stream).await.map(|stream| (stream, ja4))
+                        })
+                        .await;
 
                     match handshake {
-                        Ok(Ok(stream)) => {
-                            let info = tls::info(stream.get_ref().1);
+                        Ok(Ok((stream, ja4))) => {
+                            let mut info = tls::info(stream.get_ref().1);
+                            info.ja4 = ja4.unwrap_or_default();
                             serve(
                                 stream,
                                 peer,
@@ -639,6 +711,48 @@ async fn accept(
             }
         }
     }
+}
+
+/// The connection preface an HTTP/2 client opens with (RFC 9113).
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Whether a plain connection opens with the HTTP/2 preface, looked at
+/// without taking it from the socket, within `timeout`.
+async fn opens_http2(stream: &tokio::net::TcpStream, timeout: Duration) -> bool {
+    let mut buffer = [0u8; HTTP2_PREFACE.len()];
+
+    tokio::time::timeout(timeout, async {
+        loop {
+            let read = stream.peek(&mut buffer).await.ok()?;
+
+            if read == 0 || buffer[..read] != HTTP2_PREFACE[..read] {
+                return Some(false);
+            }
+
+            if read == HTTP2_PREFACE.len() {
+                return Some(true);
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// Answer a client that may not speak HTTP/2 in cleartext with 505, in
+/// HTTP/1.1, and close.
+async fn refuse_http2(mut stream: tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    let _ = stream.shutdown().await;
 }
 
 /// Serve one connection, cleartext or already inside TLS. The token is
@@ -703,6 +817,17 @@ async fn serve<I>(
             let redirect_to = redirect_to.filter(|_| !secure);
             let client = forwarded.client.unwrap_or(peer);
             let proxy = forwarded.client.map(|_| peer);
+
+            // Section 4.14: the client's class, from the address and
+            // headers the request arrived with, and the TLS fingerprint
+            // when the client connected itself rather than through a
+            // trusted proxy.
+
+            let ja4 = tls
+                .as_ref()
+                .filter(|tls| proxy.is_none() && !tls.ja4.is_empty())
+                .map(|tls| tls.ja4.as_str());
+            let client_class = routing.classify(client.ip(), &parts.headers, ja4, &shared.verifier);
             let client_target = parts
                 .uri
                 .path_and_query()
@@ -734,6 +859,7 @@ async fn serve<I>(
             let mut issued: Vec<String> = Vec::new();
             let mut handling: Option<Handling> = None;
             let mut checks = 0usize;
+            let mut admitted = false;
 
             let response = loop {
                 let decision = routing.select(
@@ -746,6 +872,7 @@ async fn serve<I>(
                         peer: client.ip(),
                         secure,
                         ids: &shared.request_ids,
+                        client_class: &client_class,
                     },
                     origin.as_ref(),
                 );
@@ -765,8 +892,13 @@ async fn serve<I>(
                     _ => None,
                 };
 
-                let errors =
-                    routing.errors_for(host.as_deref(), parts.uri.path(), &listener, located);
+                let errors = routing.errors_for(
+                    host.as_deref(),
+                    parts.uri.path(),
+                    &client_class,
+                    &listener,
+                    located,
+                );
                 let mut context = link::Context {
                     request_id: &request_id,
                     peer: client,
@@ -785,6 +917,7 @@ async fn serve<I>(
                     mount: String::new(),
                     mount_path: String::new(),
                     sendfile: Arc::default(),
+                    grpc_web: Arc::default(),
                     forwarded_host: forwarded.host.clone(),
                     forwarded_port: forwarded.port,
                     prefix: forwarded.prefix.clone(),
@@ -794,7 +927,54 @@ async fn serve<I>(
                     hops: hops.clone(),
                     errors,
                     handler: handling.as_ref().map(|_| link::HANDLER_TIMEOUT),
+                    upload: None,
+                    spool: shared.spool.clone(),
+                    client_class: Arc::clone(&client_class),
+                    mode: None,
                 };
+
+                // Section 4.15: a client's own request draws from the
+                // host's and the route's rate limits, then meets the
+                // route's method restrictions.
+
+                if !admitted && origin.is_none() && handling.is_none() && redirect_to.is_none() {
+                    admitted = true;
+                    let outcome = shared.buckets.check(
+                        decision.limits(),
+                        &client_class,
+                        client.ip(),
+                        &parts.headers,
+                        Instant::now(),
+                    );
+
+                    for (limit, result) in &outcome.counted {
+                        shared
+                            .access_log
+                            .metrics()
+                            .count_rate_limit(limit, &client_class, result);
+                    }
+
+                    match outcome.verdict {
+                        ratelimit::Verdict::Allow => {}
+                        ratelimit::Verdict::Delay(wait) => tokio::time::sleep(wait).await,
+                        ratelimit::Verdict::Reject { limit, retry_after } => {
+                            break link::reject(
+                                &parts,
+                                &context,
+                                ratelimit::rejected(&limit, retry_after),
+                            );
+                        }
+                    }
+
+                    if let routing::Decision::Serve {
+                        methods: Some(methods),
+                        ..
+                    } = &decision
+                        && let Some(problem) = methods.refuse(&parts.method)
+                    {
+                        break link::reject(&parts, &context, problem);
+                    }
+                }
 
                 // Section 4.16: a guarded route is served only once its
                 // handler allows the client's request; a sub-request of
@@ -829,6 +1009,7 @@ async fn serve<I>(
                                 peer: client.ip(),
                                 secure,
                                 ids: &shared.request_ids,
+                                client_class: &client_class,
                             },
                         },
                     )
@@ -895,6 +1076,11 @@ async fn serve<I>(
                             server_name,
                             cookies,
                             auth: _,
+                            upload,
+                            max_body_size,
+                            limits: _,
+                            methods: _,
+                            mode,
                         },
                     ) => {
                         // Section 4.12: an application does not serve its
@@ -911,6 +1097,7 @@ async fn serve<I>(
                         context.server_name = server_name;
                         context.app = selection.app;
                         context.release = selection.release;
+                        context.mode = mode;
 
                         if origin.is_none()
                             && let Some(maintenance) = &selection.maintenance
@@ -929,6 +1116,22 @@ async fn serve<I>(
                             context.mount = selection.mount;
                             context.mount_path = selection.script_name;
                             context.sendfile = selection.sendfile;
+                            context.grpc_web = selection.grpc_web;
+
+                            // Sections 4.6 and 4.11: the route's body limit
+                            // and uploads apply to a client's own request,
+                            // whose body has not been read yet.
+
+                            if origin.is_none() {
+                                if let Some(size) = max_body_size {
+                                    let mut limits = (*context.limits).clone();
+                                    limits.max_body_size = size;
+                                    context.limits = Arc::new(limits);
+                                }
+
+                                context.upload = upload;
+                            }
+
                             dispatch(
                                 &mut parts,
                                 body.take(),
@@ -996,6 +1199,7 @@ async fn serve<I>(
                             server_name,
                             cookies,
                             auth: _,
+                            limits: _,
                         },
                     ) => {
                         // Section 4.9: the file, or the fallback application
@@ -1042,6 +1246,7 @@ async fn serve<I>(
                                 context.mount = selection.mount.clone();
                                 context.mount_path = selection.script_name.clone();
                                 context.sendfile = Arc::clone(&selection.sendfile);
+                                context.grpc_web = Arc::clone(&selection.grpc_web);
                                 dispatch(
                                     &mut parts,
                                     body.take(),
@@ -1538,6 +1743,8 @@ pub(crate) fn request_head(
         http_version: format!("{:?}", parts.version),
         expect_continue: expects_continue(parts) && content_length != Some(0),
         server_name: context.server_name.clone().unwrap_or_default(),
+        client_class: context.client_class.to_string(),
+        mode: context.mode.as_deref().unwrap_or_default().to_owned(),
         internal: context
             .internal
             .as_ref()

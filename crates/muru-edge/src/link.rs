@@ -17,6 +17,7 @@
 //! is told to send a streamed body only once the worker's CONTINUE frame
 //! says the application is reading it.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,9 +61,9 @@ pub(crate) type Reader = BufReader<FdReader>;
 pub(crate) type Writer = OwnedWriteHalf;
 
 /// One idle connection to a worker.
-struct Conn {
-    reader: Reader,
-    writer: Writer,
+pub(crate) struct Conn {
+    pub(crate) reader: Reader,
+    pub(crate) writer: Writer,
 }
 
 struct WorkerSlots {
@@ -75,7 +76,141 @@ struct WorkerSlots {
     /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
     semaphore: Arc<Semaphore>,
+    /// Section 6.7: the mounts with threads of their own, by name.
+    mounts: HashMap<String, MountSlots>,
     idle: Mutex<Vec<Conn>>,
+}
+
+/// A mount's own threads on one worker (section 6.7): its reserved slots,
+/// and for one that borrows, its allowance of the shared pool's.
+struct MountSlots {
+    reserved: usize,
+    own: Arc<Semaphore>,
+    allowance: Option<Arc<Semaphore>>,
+}
+
+impl WorkerSlots {
+    fn new(path: PathBuf, hello: pb::Hello, conn: Conn) -> Self {
+        let slots = capacity(&hello);
+        let mounts = hello
+            .mount_pools
+            .iter()
+            .map(|pool| {
+                let reserved = usize::try_from(pool.reserved).unwrap_or(usize::MAX);
+                let max = usize::try_from(pool.max).unwrap_or(usize::MAX);
+                let slots = MountSlots {
+                    reserved,
+                    own: Arc::new(Semaphore::new(reserved)),
+                    allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
+                };
+                (pool.mount.clone(), slots)
+            })
+            .collect();
+        Self {
+            path,
+            worker_type: hello.worker_type,
+            websockets: hello.websockets,
+            slots,
+            semaphore: Arc::new(Semaphore::new(slots)),
+            mounts,
+            idle: Mutex::new(vec![conn]),
+        }
+    }
+
+    /// Its slots: the shared pool's and the mounts' reserved ones.
+    fn slots(&self) -> usize {
+        self.slots
+            + self
+                .mounts
+                .values()
+                .map(|mount| mount.reserved)
+                .sum::<usize>()
+    }
+
+    /// Requests it is running, on the shared pool and the mounts' own.
+    fn in_flight(&self) -> usize {
+        self.slots - self.semaphore.available_permits()
+            + self
+                .mounts
+                .values()
+                .map(|mount| mount.reserved - mount.own.available_permits())
+                .sum::<usize>()
+    }
+
+    /// Slots free for a request to the mount: its own and what it may
+    /// borrow, or the shared pool's for a mount without threads.
+    fn free(&self, mount: &str) -> usize {
+        let shared = self.semaphore.available_permits();
+
+        let Some(slots) = self.mounts.get(mount) else {
+            return shared;
+        };
+
+        slots.own.available_permits()
+            + slots
+                .allowance
+                .as_ref()
+                .map_or(0, |allowance| allowance.available_permits().min(shared))
+    }
+
+    /// Take a slot for a request to the mount, waiting for one: one of
+    /// its own first, else a shared one within its allowance, else the
+    /// shared pool's for a mount without threads. Says whether the slot
+    /// was borrowed.
+    async fn take(&self, mount: &str) -> io::Result<(Slot, bool)> {
+        let closed = |_| io::Error::other("pool closed");
+
+        let Some(slots) = self.mounts.get(mount) else {
+            let permit = Arc::clone(&self.semaphore)
+                .acquire_owned()
+                .await
+                .map_err(closed)?;
+            return Ok((Slot::new(permit, None), false));
+        };
+
+        if let Ok(permit) = Arc::clone(&slots.own).try_acquire_owned() {
+            return Ok((Slot::new(permit, None), false));
+        }
+
+        let Some(allowance) = &slots.allowance else {
+            let permit = Arc::clone(&slots.own)
+                .acquire_owned()
+                .await
+                .map_err(closed)?;
+            return Ok((Slot::new(permit, None), false));
+        };
+
+        let borrowed = async {
+            let allowed = Arc::clone(allowance).acquire_owned().await?;
+            let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
+            Ok::<_, tokio::sync::AcquireError>(Slot::new(permit, Some(allowed)))
+        };
+
+        tokio::select! {
+            biased;
+            permit = Arc::clone(&slots.own).acquire_owned() => {
+                Ok((Slot::new(permit.map_err(closed)?, None), false))
+            }
+            slot = borrowed => Ok((slot.map_err(closed)?, true)),
+        }
+    }
+}
+
+/// A request's hold on a worker (section 6.7): a slot of the shared pool
+/// or of its mount's own, and for a borrowed shared slot, the place in
+/// the mount's allowance it takes. Dropped, both are given back.
+pub(crate) struct Slot {
+    _permit: OwnedSemaphorePermit,
+    _allowance: Option<OwnedSemaphorePermit>,
+}
+
+impl Slot {
+    fn new(permit: OwnedSemaphorePermit, allowance: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            _permit: permit,
+            _allowance: allowance,
+        }
+    }
 }
 
 /// What a worker's pool looks like right now.
@@ -99,6 +234,12 @@ pub struct LinkPool {
     next: AtomicUsize,
     /// Requests waiting for a slot, for the metrics.
     waiting: AtomicUsize,
+    /// The gRPC methods the workers' mounts registered, from HELLO
+    /// (section 6.13).
+    grpc: Vec<pb::GrpcMethod>,
+    /// Section 7.4: for a pool with no workers, the group a request waits
+    /// to be woken, when it can be.
+    wake: Option<crate::wake::Key>,
 }
 
 /// One request's place in the queue for a slot, given back when it gets
@@ -112,12 +253,18 @@ impl Drop for Waiting<'_> {
 }
 
 /// A connection taken from the pool for one request.
-struct Lease {
-    conn: Conn,
-    permit: OwnedSemaphorePermit,
-    worker: usize,
+pub(crate) struct Lease {
+    pub(crate) conn: Conn,
+    pub(crate) permit: Slot,
+    pub(crate) worker: usize,
+    /// Section 6.7: the slot is a shared one the request's mount borrows,
+    /// which the request head tells the worker.
+    pub(crate) borrowed: bool,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
+    /// The pool the connection came from, when it is not the one asked:
+    /// a woken group's (section 7.4).
+    pub(crate) woken: Option<Arc<LinkPool>>,
 }
 
 impl LinkPool {
@@ -126,27 +273,57 @@ impl LinkPool {
     /// on the kind of worker. The first connection stays in the pool.
     pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
         let mut workers = Vec::with_capacity(sockets.len());
+        let mut grpc = Vec::new();
 
         for path in sockets {
             let (conn, hello) = connect(path)
                 .await
                 .with_context(|| format!("connecting to the worker at {}", path.display()))?;
 
-            let slots = capacity(&hello);
-            workers.push(WorkerSlots {
-                path: path.clone(),
-                worker_type: hello.worker_type,
-                websockets: hello.websockets,
-                slots,
-                semaphore: Arc::new(Semaphore::new(slots)),
-                idle: Mutex::new(vec![conn]),
-            });
+            // Every worker of a release registers the same methods.
+
+            if grpc.is_empty() {
+                grpc = hello.grpc_methods.clone();
+            }
+
+            workers.push(WorkerSlots::new(path.clone(), hello, conn));
         }
 
         Ok(Self {
             workers,
             next: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
+            grpc,
+            wake: None,
+        })
+    }
+
+    /// Whether the workers serve gRPC methods (section 6.13).
+    pub(crate) fn serves_grpc(&self) -> bool {
+        !self.grpc.is_empty()
+    }
+
+    /// The registered gRPC method at `path`, or the whole service it
+    /// belongs to when only that was registered.
+    pub(crate) fn grpc_method(&self, path: &str) -> Option<&pb::GrpcMethod> {
+        self.grpc
+            .iter()
+            .find(|method| method.path == path)
+            .or_else(|| {
+                self.grpc.iter().find(|method| {
+                    method.path.ends_with('/') && path.starts_with(method.path.as_str())
+                })
+            })
+    }
+
+    /// Whether a gRPC service of this name is registered.
+    pub(crate) fn grpc_service(&self, name: &str) -> bool {
+        self.grpc.iter().any(|method| {
+            method
+                .path
+                .strip_prefix('/')
+                .and_then(|path| path.split_once('/'))
+                .is_some_and(|(service, _)| service == name)
         })
     }
 
@@ -159,8 +336,8 @@ impl LinkPool {
                 index,
                 path: worker.path.clone(),
                 worker_type: worker.worker_type.clone(),
-                slots: worker.slots,
-                in_flight: worker.slots - worker.semaphore.available_permits(),
+                slots: worker.slots(),
+                in_flight: worker.in_flight(),
             })
             .collect()
     }
@@ -172,7 +349,23 @@ impl LinkPool {
             workers: Vec::new(),
             next: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
+            grpc: Vec::new(),
+            wake: None,
         }
+    }
+
+    /// Section 7.4: a pool with no workers for a group scaled to zero: a
+    /// request waits for the group to be woken, until its queue timeout.
+    pub fn waking(key: crate::wake::Key) -> Self {
+        Self {
+            wake: Some(key),
+            ..Self::empty()
+        }
+    }
+
+    /// The group a request waits for, for a pool that wakes one.
+    pub fn wakes(&self) -> Option<&crate::wake::Key> {
+        self.wake.as_ref()
     }
 
     /// Requests waiting for a slot right now.
@@ -187,26 +380,36 @@ impl LinkPool {
 
     /// Requests in flight across every worker.
     pub fn in_flight(&self) -> usize {
-        self.workers
-            .iter()
-            .map(|worker| worker.slots - worker.semaphore.available_permits())
-            .sum()
+        self.workers.iter().map(WorkerSlots::in_flight).sum()
     }
 
-    /// Take a connection from the worker with the most free slots, waiting
-    /// for one if every worker is busy.
-    async fn acquire(&self) -> io::Result<Lease> {
+    /// Take a connection from the worker with the most free slots for the
+    /// mount, waiting for one if every worker is busy.
+    pub(crate) async fn acquire(&self, mount: &str) -> io::Result<Lease> {
         if self.workers.is_empty() {
-            return Err(io::Error::other("no release is serving"));
+            let Some(key) = &self.wake else {
+                return Err(io::Error::other("no release is serving"));
+            };
+
+            // The request counts as waiting here, where the metrics see
+            // it, until the woken group's pool takes it.
+
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            let waiting = Waiting(&self.waiting);
+            let pool = crate::wake::wakes().wait(key).await?;
+            drop(waiting);
+            let mut lease = Box::pin(pool.acquire(mount)).await?;
+            lease.woken.get_or_insert(pool);
+            return Ok(lease);
         }
 
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut best = start;
-        let mut best_free = self.workers[start].semaphore.available_permits();
+        let mut best_free = self.workers[start].free(mount);
 
         for offset in 1..self.workers.len() {
             let index = (start + offset) % self.workers.len();
-            let free = self.workers[index].semaphore.available_permits();
+            let free = self.workers[index].free(mount);
 
             if free > best_free {
                 best = index;
@@ -217,10 +420,7 @@ impl LinkPool {
         let worker = &self.workers[best];
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let waiting = Waiting(&self.waiting);
-        let permit = Arc::clone(&worker.semaphore)
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::other("pool closed"))?;
+        let (permit, borrowed) = worker.take(mount).await?;
         drop(waiting);
         let idle = worker.idle.lock().expect("pool poisoned").pop();
 
@@ -233,7 +433,9 @@ impl LinkPool {
             conn,
             permit,
             worker: best,
+            borrowed,
             websockets: worker.websockets,
+            woken: None,
         })
     }
 
@@ -292,7 +494,7 @@ pub(crate) struct Return {
     state: Mutex<ReturnState>,
     /// Signalled when the request direction should stop: the response has
     /// ended, or failed.
-    abort: Notify,
+    pub(crate) abort: Notify,
     /// Signalled when the worker has sent CONTINUE: the application is
     /// reading the body, so a waiting client may be told to send it.
     proceed: Notify,
@@ -301,6 +503,8 @@ pub(crate) struct Return {
     client_stalled: AtomicBool,
     /// Set once the response direction has ended, intact or not.
     ended: AtomicBool,
+    /// The request's stored uploads (section 4.11), dropped with it.
+    uploads: Mutex<Option<crate::uploads::Received>>,
 }
 
 struct ReturnState {
@@ -308,11 +512,11 @@ struct ReturnState {
     writer: Option<Writer>,
     broken: bool,
     reported: u8,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<Slot>,
 }
 
 impl Return {
-    fn new(pool: Arc<LinkPool>, worker: usize, permit: OwnedSemaphorePermit) -> Arc<Self> {
+    pub(crate) fn new(pool: Arc<LinkPool>, worker: usize, permit: Slot) -> Arc<Self> {
         Arc::new(Self {
             pool,
             worker,
@@ -328,11 +532,17 @@ impl Return {
             proceeded: AtomicBool::new(false),
             client_stalled: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            uploads: Mutex::new(None),
         })
     }
 
+    /// Keep the request's stored uploads until the request ends.
+    fn hold(&self, uploads: crate::uploads::Received) {
+        *self.uploads.lock().expect("uploads poisoned") = Some(uploads);
+    }
+
     /// Tell the body pump, if it is still running, to send ABORT and stop.
-    fn abort_request(&self) {
+    pub(crate) fn abort_request(&self) {
         self.abort.notify_one();
     }
 
@@ -466,6 +676,9 @@ pub struct Context<'a> {
     /// The file hints by path the mount, upstream or server may give
     /// (section 4.9).
     pub sendfile: Arc<Sendfile>,
+    /// The origins whose pages may call the release through gRPC-Web
+    /// (section 6.13).
+    pub grpc_web: Arc<crate::grpc::WebOrigins>,
     /// How the request arrived by internal redirect (section 4.10), for
     /// the request head; none for a client's own request.
     pub internal: Option<Internal>,
@@ -485,6 +698,15 @@ pub struct Context<'a> {
     /// errors are never replaced, and it is logged as a hop of the
     /// request it serves.
     pub handler: Option<Duration>,
+    /// How the route's uploads are received (section 4.11); none for a
+    /// route without uploads and for any request but a client's own.
+    pub upload: Option<Arc<crate::uploads::Policy>>,
+    /// Where uploads are stored.
+    pub spool: Option<Arc<crate::uploads::Spool>>,
+    /// The client's class (section 4.14).
+    pub client_class: Arc<str>,
+    /// The route's site mode (section 4.15), for the application.
+    pub mode: Option<Arc<str>>,
 }
 
 impl<'a> Context<'a> {
@@ -516,6 +738,7 @@ impl<'a> Context<'a> {
             mount: String::new(),
             mount_path: String::new(),
             sendfile: Arc::default(),
+            grpc_web: Arc::default(),
             forwarded_host: self.forwarded_host.clone(),
             forwarded_port: self.forwarded_port,
             prefix: self.prefix.clone(),
@@ -525,6 +748,10 @@ impl<'a> Context<'a> {
             hops: self.hops.clone(),
             errors: errors::Chain::default(),
             handler: Some(budget),
+            upload: None,
+            spool: self.spool.clone(),
+            client_class: Arc::clone(&self.client_class),
+            mode: None,
         }
     }
 }
@@ -678,6 +905,7 @@ impl Recording {
                 application: Duration::ZERO,
                 total: Duration::ZERO,
                 redirects: context.hops.clone(),
+                client_class: context.client_class.to_string(),
             },
             started: Instant::now(),
         }
@@ -795,8 +1023,70 @@ pub async fn handle(
     context: &Context<'_>,
     flags: RedirectFlags,
 ) -> Handled {
+    // Section 6.13: a client's gRPC call to a release that registered
+    // gRPC methods takes its own path.
+
+    if context.internal.is_none() && context.handler.is_none() && pool.serves_grpc() {
+        if context.grpc_web.is_preflight(parts) {
+            let response = context.grpc_web.preflight(parts);
+            Recording::new(context, parts).complete(response.status().as_u16(), "", 0);
+            return Handled::Response(response);
+        }
+
+        if let Some(protocol) = crate::grpc::Protocol::of(&parts.headers) {
+            let mut response = crate::grpc::handle(parts, body, pool, context, protocol).await;
+
+            if protocol.is_web() {
+                context.grpc_web.decorate(&parts.headers, &mut response);
+            }
+
+            return Handled::Response(response);
+        }
+    }
+
+    // Section 4.11: an upload route with precheck asks the application
+    // with the headers alone before the body is read, and anything but a
+    // 2xx is the answer; the client is told to send its body only after.
+
+    if let Some(policy) = &context.upload
+        && policy.precheck
+        && buffered.is_none()
+        && body.as_ref().is_some_and(|body| !body.is_end_stream())
+    {
+        let mut redirected = None;
+        let response = handle_inner(
+            parts,
+            None,
+            None,
+            Arc::clone(&pool),
+            context,
+            flags,
+            true,
+            &mut redirected,
+        )
+        .await;
+
+        if let Some(redirect) = redirected {
+            return Handled::Redirect(redirect);
+        }
+
+        if !response.status().is_success() {
+            return Handled::Response(response);
+        }
+    }
+
     let mut redirected = None;
-    let response = handle_inner(parts, body, buffered, pool, context, flags, &mut redirected).await;
+    let response = handle_inner(
+        parts,
+        body,
+        buffered,
+        pool,
+        context,
+        flags,
+        false,
+        &mut redirected,
+    )
+    .await;
 
     match redirected {
         Some(redirect) => Handled::Redirect(redirect),
@@ -805,8 +1095,9 @@ pub async fn handle(
 }
 
 /// `handle` itself: a redirect is reported through `redirected`, with a
-/// placeholder response the caller discards.
-#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
+/// placeholder response the caller discards. A `precheck` request goes
+/// with the headers alone and is logged as a hop when it is allowed.
+#[allow(clippy::too_many_arguments)] // two call sites; each argument is a distinct part of the request
 async fn handle_inner(
     parts: &mut http::request::Parts,
     mut body: Option<Incoming>,
@@ -814,17 +1105,23 @@ async fn handle_inner(
     pool: Arc<LinkPool>,
     context: &Context<'_>,
     flags: RedirectFlags,
+    precheck: bool,
     redirected: &mut Option<Box<Redirect>>,
 ) -> Response<ResponseBody> {
     let upgrade = crate::websocket::detect(parts);
     let mut head = request_head(parts, context);
     let limits = &context.limits;
 
+    if precheck {
+        head.precheck = true;
+        head.expect_continue = false;
+    }
+
     // Sections 4.12 and 4.16: an application asked for an error page or
     // an authorisation decision gets the handler's budget out of what is
     // left of the deadline, queueing included.
 
-    let (deadline, queue_timeout) = if let Some(budget) = context.handler {
+    let (mut deadline, queue_timeout) = if let Some(budget) = context.handler {
         (
             (context.arrived + limits.request_deadline).min(Instant::now() + budget),
             limits.queue_timeout.min(budget),
@@ -835,14 +1132,7 @@ async fn handle_inner(
             limits.queue_timeout,
         )
     };
-    head.deadline_unix_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64)
-        .saturating_add(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64,
-        );
+    head.deadline_unix_ms = unix_deadline(deadline);
     let mut recording = Recording::new(context, parts);
     let failing = Failing {
         request_id: context.request_id,
@@ -877,6 +1167,78 @@ async fn handle_inner(
         head.body_buffered = true;
     }
 
+    // Section 4.11: an upload route receives the body into the spool
+    // first. The application sees the rewritten form, or an empty body
+    // for a raw upload, with the files by descriptor, and the request
+    // deadline runs from when the upload has arrived.
+
+    let mut received: Option<crate::uploads::Received> = None;
+
+    if !precheck
+        && buffered.is_none()
+        && let Some(policy) = context.upload.as_ref()
+        && let Some(incoming) = body.as_mut()
+        && !incoming.is_end_stream()
+    {
+        let outcome = match context.spool.as_ref() {
+            Some(spool) => {
+                crate::uploads::receive(
+                    policy,
+                    spool,
+                    &context.app,
+                    &parts.headers,
+                    incoming,
+                    limits.max_body_size,
+                    limits.body_idle_timeout,
+                )
+                .await
+            }
+            None => Err(crate::uploads::Refusal::SpoolFull(Some(
+                std::io::Error::other("the edge has no spool directory"),
+            ))),
+        };
+
+        match outcome {
+            Ok(Some(upload)) => {
+                let length = upload.body.len() as u64;
+                set_content_length(&mut head, length);
+                head.content_length = Some(length);
+                head.body_buffered = true;
+                head.expect_continue = false;
+                head.uploads = upload.refs();
+                buffered = Some(upload.body.clone());
+                received = Some(upload);
+                deadline = Instant::now() + limits.request_deadline;
+                head.deadline_unix_ms = unix_deadline(deadline);
+            }
+            Ok(None) => {}
+            Err(crate::uploads::Refusal::BodyTooLarge) => {
+                *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                return failing.too_large();
+            }
+            Err(refusal) => {
+                match &refusal {
+                    crate::uploads::Refusal::SpoolFull(Some(error)) => {
+                        tracing::warn!(%error, app = %context.app, "storing an upload failed");
+                    }
+                    crate::uploads::Refusal::SpoolFull(None) => {
+                        tracing::warn!(app = %context.app, "an upload was refused: the spool quota is reached");
+                    }
+                    crate::uploads::Refusal::Malformed(error) => {
+                        tracing::debug!(%error, "a multipart upload could not be parsed");
+                    }
+                    _ => {}
+                }
+
+                let problem = refusal
+                    .problem()
+                    .expect("only a body over max_body_size has none");
+                *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                return failing.close(problem);
+            }
+        }
+    }
+
     if buffered.is_none()
         && let Some(incoming) = body.as_mut()
         && !incoming.is_end_stream()
@@ -908,7 +1270,7 @@ async fn handle_inner(
 
     let queued = Instant::now();
 
-    let lease = match tokio::time::timeout(queue_timeout, pool.acquire()).await {
+    let lease = match tokio::time::timeout(queue_timeout, pool.acquire(&head.mount)).await {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
             tracing::warn!(%error, "no worker connection");
@@ -939,8 +1301,12 @@ async fn handle_inner(
         conn,
         permit,
         worker,
+        borrowed,
         websockets,
+        woken,
     } = lease;
+    head.borrowed = borrowed;
+    let pool = woken.unwrap_or(pool);
     let Conn {
         mut reader,
         mut writer,
@@ -966,20 +1332,40 @@ async fn handle_inner(
     let kept = buffered.clone();
     let frame_flags = if end { flag::END } else { 0 };
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
-    if let Err(error) = frame::write(
-        &mut writer,
-        kind::REQUEST,
-        frame_flags,
-        head.encode_to_vec().into(),
-    )
-    .await
-    {
+
+    // Section 5.7: stored uploads go with the request head, attached to
+    // its first bytes.
+
+    let written = match &received {
+        Some(upload) if !upload.files.is_empty() => {
+            let encoded = frame::encode(kind::REQUEST, frame_flags, &head.encode_to_vec());
+            muru_proto::descriptors::write_with_fds(&mut writer, &encoded, &upload.fds()).await
+        }
+        _ => {
+            frame::write(
+                &mut writer,
+                kind::REQUEST,
+                frame_flags,
+                head.encode_to_vec().into(),
+            )
+            .await
+        }
+    };
+
+    if let Err(error) = written {
         tracing::warn!(%error, "writing the request head failed");
         drop(permit);
         return failing.worker_crashed("The worker is not available.");
     }
 
     let back = Return::new(pool, worker, permit);
+
+    // The stored files stay until the request ends: an unnamed one
+    // vanishes with its last descriptor, a named one is removed.
+
+    if let Some(upload) = received {
+        back.hold(upload);
+    }
 
     match buffered {
         _ if upgrade.is_some() => back.give_writer(Some(writer)),
@@ -1073,6 +1459,11 @@ async fn handle_inner(
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
+
+        // Section 4.11: a precheck the application allows is a hop of the
+        // request that follows it; one it refuses is the answer.
+
+        recording.silent |= precheck && (200..300).contains(&recording.record.status);
     }
 
     // Section 4.10: an internal redirect is not a response for the client
@@ -1611,6 +2002,28 @@ pub(crate) enum BodyError {
 }
 
 /// Read a request body in full, up to the size limit.
+/// A deadline as Unix milliseconds, for the request head.
+pub(crate) fn unix_deadline(deadline: Instant) -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+        .saturating_add(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        )
+}
+
+/// Replace the head's Content-Length with the body the application gets.
+fn set_content_length(head: &mut pb::RequestHead, length: u64) {
+    head.headers
+        .retain(|header| header.name.as_ref() != b"content-length");
+    head.headers.push(pb::Header {
+        name: Bytes::from_static(b"content-length"),
+        value: Bytes::from(length.to_string()),
+    });
+}
+
 pub(crate) async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result<Bytes, BodyError> {
     let mut data = BytesMut::new();
 

@@ -9,6 +9,7 @@ release is declared.
 
 from __future__ import annotations
 
+import re
 import sys
 import threading
 import time
@@ -137,6 +138,26 @@ min_lifetime = '1s'
     assert any("scale in from" in line for line in events), events
     assert all("advisory" not in line for line in events), events
 
+    # Section 7.3: a decision says what holds the group back, here
+    # threads busy sleeping rather than computing, and the status shows
+    # the workers' own signals.
+
+    scaled_out = [line for line in events if "scale out from 1" in line]
+    assert "diagnosis: I/O bound with exhausted slots" in scaled_out[0], scaled_out
+
+    # The signals need two reports of the same worker, a few seconds
+    # apart, so a group that has just changed waits for them.
+
+    deadline = time.monotonic() + 20
+    shown = daemon.muructl("scale", "status", "shop").stdout
+
+    while not re.search(r"workers: cpu \d+%", shown) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        shown = daemon.muructl("scale", "status", "shop").stdout
+
+    assert re.search(r"workers: cpu \d+%", shown), shown
+    assert "diagnosis: " in shown, shown
+
     # The metrics carry the autoscaler's gauges and counters.
 
     metrics = daemon.muructl("metrics").stdout
@@ -146,6 +167,7 @@ min_lifetime = '1s'
         in metrics
     )
     assert "muru_churn_reaps_total" in metrics
+    assert "muru_worker_cpu_seconds_total" in metrics
 
 
 def test_a_pin_overrides_the_autoscaler_and_survives_a_restart(tmp_path: Path) -> None:
@@ -230,7 +252,9 @@ def test_a_policy_is_validated_when_declared(daemon: Daemon, tmp_path: Path) -> 
         return completed.stdout + completed.stderr
 
     assert "needs max_workers" in refused("mode = 'spare'")
-    assert "scale to zero" in refused("mode = 'spare'\nmax_workers = 4\nmin_workers = 0")
+    assert "host_idle_timeout needs min_workers = 0" in refused(
+        "mode = 'spare'\nmax_workers = 4\nhost_idle_timeout = '1h'"
+    )
     assert "max_spare must be at least min_spare + 2" in refused(
         "mode = 'spare'\nmax_workers = 8\nmin_spare = 2\nmax_spare = 3"
     )

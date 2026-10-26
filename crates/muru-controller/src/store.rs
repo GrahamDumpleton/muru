@@ -8,9 +8,11 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use muru_config::{Host as VirtualHost, Route, Upstream};
+use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
 
-use crate::model::{App, Event, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms};
+use crate::model::{
+    App, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms,
+};
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -95,13 +97,36 @@ CREATE TABLE IF NOT EXISTS upstreams (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS overlays (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS overlay_state (
+    name TEXT PRIMARY KEY,
+    active INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    since_unix_ms INTEGER NOT NULL,
+    until_unix_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS client_classes (
+    name TEXT PRIMARY KEY,
+    position INTEGER NOT NULL,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS rate_limits (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 9;
 
 /// The store.
 pub struct Store {
@@ -123,7 +148,11 @@ impl Store {
         // which the CREATE statements above supply to an older store;
         // version 4 added the application's user, group and umask, which
         // are added to an older table here; version 5 added the
-        // applications in maintenance mode (section 4.12).
+        // applications in maintenance mode (section 4.12), version 6 the
+        // HTTP upstreams, version 7 overlays and their state (section
+        // 9.10), version 8 the client classes and rate limits of applied
+        // files (sections 4.14 and 4.15) and version 9 the application's
+        // priority (section 7.4), added to an older table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -169,7 +198,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask FROM apps ORDER BY name",
+                 user, grp, umask, priority FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -183,7 +212,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask FROM apps WHERE name = ?1",
+                     user, grp, umask, priority FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -206,6 +235,24 @@ impl Store {
                 "UPDATE apps SET user = ?2, grp = ?3, umask = ?4, \
                  resource_version = resource_version + 1 WHERE name = ?1",
                 params![name, user, group, umask],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("application {name}")));
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Set the priority by which the node's budget admits an
+    /// application's scale-ups (section 7.4).
+    pub fn set_app_priority(&self, name: &str, priority: i32) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE apps SET priority = ?2, resource_version = resource_version + 1 \
+                 WHERE name = ?1",
+                params![name, priority],
             )?;
 
             if changed == 0 {
@@ -448,6 +495,188 @@ impl Store {
         })
     }
 
+    /// The client classes of applied files with their positions, in the
+    /// order their rules are tried (section 4.14).
+    pub fn client_classes(&self) -> Result<Vec<(i64, ClientClass)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT position, spec FROM client_classes ORDER BY position, name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut classes = Vec::new();
+
+            for row in rows {
+                let (position, encoded) = row?;
+                classes.push((position, decode(&encoded)?));
+            }
+
+            Ok(classes)
+        })
+    }
+
+    /// Create or replace a client class, its rule tried at `position`
+    /// among the applied ones.
+    pub fn put_client_class(&self, class: &ClientClass, position: i64) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(class).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO client_classes (name, position, spec) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET position = excluded.position, \
+                 spec = excluded.spec, resource_version = resource_version + 1",
+                params![class.name, position, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a client class.
+    pub fn delete_client_class(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM client_classes WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// The rate limits of applied files, by name (section 4.15).
+    pub fn rate_limits(&self) -> Result<Vec<(String, RateLimit)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM rate_limits ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut limits = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                limits.push((name, decode(&encoded)?));
+            }
+
+            Ok(limits)
+        })
+    }
+
+    /// Create or replace a rate limit.
+    pub fn put_rate_limit(&self, name: &str, limit: &RateLimit) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(limit).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO rate_limits (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a rate limit.
+    pub fn delete_rate_limit(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM rate_limits WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Every overlay declared, by name (section 9.10).
+    pub fn overlays(&self) -> Result<Vec<(String, Overlay)>, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, spec FROM overlays ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut overlays = Vec::new();
+
+            for row in rows {
+                let (name, encoded) = row?;
+                overlays.push((name, decode(&encoded)?));
+            }
+
+            Ok(overlays)
+        })
+    }
+
+    /// Create or replace an overlay's declaration.
+    pub fn put_overlay(&self, name: &str, overlay: &Overlay) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(overlay).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO overlays (name, spec) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+                params![name, encoded],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove an overlay's declaration and its state.
+    pub fn delete_overlay(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM overlays WHERE name = ?1", [name])?;
+            connection.execute("DELETE FROM overlay_state WHERE name = ?1", [name])?;
+            Ok(())
+        })
+    }
+
+    /// Every overlay's state: active, or ended for a while.
+    pub fn overlay_states(&self) -> Result<Vec<OverlayState>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT name, active, source, since_unix_ms, until_unix_ms \
+                 FROM overlay_state ORDER BY name",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(OverlayState {
+                    name: row.get(0)?,
+                    active: row.get::<_, i64>(1)? != 0,
+                    source: row.get(2)?,
+                    since_unix_ms: row.get::<_, i64>(3)? as u64,
+                    until_unix_ms: row.get::<_, Option<i64>>(4)?.map(|until| until as u64),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Record an overlay's state, or clear it with `None`.
+    pub fn set_overlay_state(
+        &self,
+        name: &str,
+        state: Option<&OverlayState>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            match state {
+                Some(state) => {
+                    connection.execute(
+                        "INSERT INTO overlay_state (name, active, source, since_unix_ms, until_unix_ms) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(name) DO UPDATE SET \
+                         active = excluded.active, source = excluded.source, \
+                         since_unix_ms = excluded.since_unix_ms, until_unix_ms = excluded.until_unix_ms",
+                        params![
+                            name,
+                            i64::from(state.active),
+                            state.source,
+                            state.since_unix_ms as i64,
+                            state.until_unix_ms.map(|until| until as i64)
+                        ],
+                    )?;
+                }
+                None => {
+                    connection.execute("DELETE FROM overlay_state WHERE name = ?1", [name])?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     /// Every route, by host then path.
     pub fn routes(&self) -> Result<Vec<Route>, StoreError> {
         self.with(|connection| {
@@ -464,7 +693,8 @@ impl Store {
         })
     }
 
-    /// Create or replace a route, identified by its host and path.
+    /// Create or replace a route, identified by its host and key: the
+    /// path, and the client classes it is for (section 4.14).
     pub fn put_route(&self, route: &Route) -> Result<(), StoreError> {
         let encoded =
             toml::to_string(route).map_err(|error| StoreError::Decode(error.to_string()))?;
@@ -473,7 +703,7 @@ impl Store {
                 "INSERT INTO routes (host, path, spec) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(host, path) DO UPDATE SET spec = excluded.spec, \
                  resource_version = resource_version + 1",
-                params![route.host, route.path, encoded],
+                params![route.host, route.key(), encoded],
             )?;
             Ok(())
         })
@@ -612,7 +842,7 @@ impl Store {
         })
     }
 
-    /// Remove a route.
+    /// Remove a route, by its host and key.
     pub fn delete_route(&self, host: &str, path: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute(
@@ -761,20 +991,26 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         user: row.get(5)?,
         group: row.get(6)?,
         umask: row.get(7)?,
+        priority: row.get::<_, Option<i64>>(8)?.unwrap_or(0) as i32,
     })
 }
 
-/// Add the identity columns of version 4 to an applications table that
-/// predates them.
+/// Add the identity columns of version 4, and the priority of version
+/// 9, to an applications table that predates them.
 fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection.prepare("PRAGMA table_info(apps)")?;
     let columns: Vec<String> = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    for column in ["user", "grp", "umask"] {
+    for (column, kind) in [
+        ("user", "TEXT"),
+        ("grp", "TEXT"),
+        ("umask", "TEXT"),
+        ("priority", "INTEGER"),
+    ] {
         if !columns.iter().any(|name| name == column) {
-            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} TEXT"), [])?;
+            connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} {kind}"), [])?;
         }
     }
 
@@ -835,6 +1071,8 @@ mod tests {
             preload: Preload::Auto,
             hooks: None,
             factory: None,
+            reflection: false,
+            grpc_web_origins: Vec::new(),
             groups: Vec::new(),
             mounts: Vec::new(),
             logging: Default::default(),
@@ -852,6 +1090,7 @@ mod tests {
             error_override: None,
             maintenance: None,
             http: None,
+            layers: crate::model::Layers::default(),
         }
     }
 
@@ -907,5 +1146,41 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].kind, "release.failed");
         assert_eq!(after[0].level, "error");
+    }
+
+    #[test]
+    fn client_classes_keep_their_order_and_limits_their_names() {
+        let store = Store::in_memory().unwrap();
+        let class = |name: &str| ClientClass {
+            name: name.to_owned(),
+            user_agent: vec![name.to_owned()],
+            ..ClientClass::default()
+        };
+        store.put_client_class(&class("zeta"), 0).unwrap();
+        store.put_client_class(&class("alpha"), 1).unwrap();
+        store.put_client_class(&class("zeta"), 2).unwrap();
+
+        let names: Vec<String> = store
+            .client_classes()
+            .unwrap()
+            .into_iter()
+            .map(|(_, class)| class.name)
+            .collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+
+        store.delete_client_class("alpha").unwrap();
+        assert_eq!(store.client_classes().unwrap().len(), 1);
+
+        let limit = RateLimit {
+            rate: "2/s".to_owned(),
+            ..RateLimit::default()
+        };
+        store.put_rate_limit("crawlers", &limit).unwrap();
+        assert_eq!(
+            store.rate_limits().unwrap(),
+            [("crawlers".to_owned(), limit)]
+        );
+        store.delete_rate_limit("crawlers").unwrap();
+        assert!(store.rate_limits().unwrap().is_empty());
     }
 }

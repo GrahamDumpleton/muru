@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 from support.daemon import SHOP, Daemon
@@ -163,6 +164,89 @@ def test_a_failing_gate_rolls_the_canary_back(daemon: Daemon, tmp_path: Path) ->
     assert releases_seen(daemon, 20, "after") == {"r1"}
     events = daemon.events()
     assert "rollout.gate_failed" in events and "rollout.rolled_back" in events
+
+
+def test_a_worker_crash_rolls_the_canary_back_at_once(daemon: Daemon, tmp_path: Path) -> None:
+    prepare(daemon, tmp_path)
+    daemon.muructl("rollout", "canary", "shop@r2", "--steps", "50", "--hold", "60s")
+
+    # One crash, long before the step has the requests the other gates
+    # need, decides.
+
+    crashed = daemon.request("/crash", host="shop.test", headers={"Muru-Preview": "r2"})
+    assert crashed.status >= 500, crashed.status
+    wait_for_rollout(daemon, "rolled_back")
+    status = daemon.muructl("rollout", "status", "shop").stdout
+    assert "gate failed at 50%: 1 worker crashes and timeout kills" in status, status
+
+
+def test_a_probe_failing_on_the_candidate_alone_rolls_back(daemon: Daemon, tmp_path: Path) -> None:
+    prepare(daemon, tmp_path)
+    probe = f"http://127.0.0.1:{daemon.port}/fails-on/r2"
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "50", "--hold", "60s", "--probe", probe
+    )
+
+    # No request at all, and the probe decides.
+
+    wait_for_rollout(daemon, "rolled_back")
+    status = daemon.muructl("rollout", "status", "shop").stdout
+    assert "gate failed at 50%: 1 failed probes (baseline 0)" in status, status
+    assert f"{probe} answered 500" in status, status
+
+    refused = daemon.muructl("rollout", "canary", "shop@r2", "--probe", "/health", check=False)
+    assert "not an http or https URL with a host" in refused.stderr
+
+
+def test_a_rollout_needs_no_route_for_the_default_application(daemon: Daemon) -> None:
+    daemon.deploy("shop", SHOP)
+    daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "50", "--hold", "60s", "--min-requests", "1000"
+    )
+
+    # With no host declared, the application's requests are shared
+    # between the releases as a route's would be, and a preview reaches
+    # the candidate.
+
+    def release(**headers: str) -> str:
+        response = daemon.request("/", headers=headers)
+        assert response.status == 200, response.body
+        served: str = json.loads(response.body)["release"]
+        return served
+
+    seen = {release(Cookie=f"muru_id=default-{n}") for n in range(40)}
+    assert seen == {"r1", "r2"}, seen
+    assert release(**{"Muru-Preview": "r2", "Cookie": "muru_id=default-0"}) == "r2"
+
+    daemon.muructl("rollout", "abort", "shop")
+    assert {release(Cookie=f"muru_id=default-{n}") for n in range(20)} == {"r1"}
+
+
+def test_an_export_can_resolve_a_rollout_where_it_stands(daemon: Daemon, tmp_path: Path) -> None:
+    prepare(daemon, tmp_path)
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "30", "--hold", "60s", "--min-requests", "1000"
+    )
+
+    # The plain export has the serving release alone and no split.
+
+    plain = tomllib.loads(daemon.muructl("config", "export").stdout)
+    assert list(plain["app"]["shop"]["release"]) == ["r1"]
+    assert "traffic" not in plain["route"][0]
+
+    resolved = tomllib.loads(daemon.muructl("config", "export", "--resolve-rollouts").stdout)
+    assert sorted(resolved["app"]["shop"]["release"]) == ["r1", "r2"]
+    assert resolved["route"][0]["traffic"]["split"] == {"r1": 70, "r2": 30}
+
+    # Applied back, the split holds the same share once the rollout ends.
+
+    exported = tmp_path / "resolved.toml"
+    exported.write_text(daemon.muructl("config", "export", "--resolve-rollouts").stdout)
+    daemon.muructl("rollout", "abort", "shop")
+    daemon.muructl("apply", "-f", str(exported))
+    seen = releases_seen(daemon, 60, "resolved")
+    assert seen == {"r1", "r2"}, seen
 
 
 def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_path: Path) -> None:

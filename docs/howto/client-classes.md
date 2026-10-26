@@ -1,0 +1,268 @@
+# Client classes and rate limits
+
+```{admonition} Status
+:class: note
+
+Client classes, routing by class, rate limits, method restrictions and
+route site modes, under the daemon, with classes and limits declared in
+the daemon's own configuration file or in applied files.
+```
+
+The edge gives every request a client class, which the access log,
+metrics, rate limits and the application see. Classification is for
+protecting capacity and routing, not a web application firewall: a
+deployment that needs serious bot defence puts a CDN or WAF in front and
+feeds its verdict in as a header.
+
+## Classes
+
+`[[client_class]]` rules go in the daemon's configuration file or in the
+files `muructl apply` reads. They are tried in order, the daemon's
+file's first; the first whose inputs all match names the class, and a
+request that matches none is class `default`.
+
+```toml
+[[client_class]]
+name = 'search_bot_verified'
+user_agent = ['Googlebot', 'bingbot', 'DuckDuckBot', 'Applebot']
+verify = 'dns'
+verify_domains = ['googlebot.com', 'google.com', 'search.msn.com', 'duckduckgo.com', 'applebot.apple.com']
+
+[[client_class]]
+name = 'ai_crawler'
+user_agent_list = 'lists/ai-crawlers.txt'
+
+[[client_class]]
+name = 'unverified_bot'
+user_agent = ['bot', 'crawler', 'spider', 'Googlebot']
+
+[[client_class]]
+name = 'partner'
+addresses = ['203.0.113.0/24']
+```
+
+| Input | Matches when |
+| --- | --- |
+| `user_agent` | the User-Agent contains one of the substrings, without regard to case |
+| `user_agent_regex` | the User-Agent matches one of the regular expressions |
+| `user_agent_list` | the User-Agent contains a substring from the file |
+| `addresses` | the client's address is one of these addresses or networks; `loopback` and `private` work too |
+| `address_list` | the client's address is in a network from the file |
+| `ja4` | the JA4 fingerprint of the client's TLS ClientHello is one of these, or begins with one ending in `*` |
+| `ja4_list` | the JA4 fingerprint is one from the file, or begins with one ending in `*` |
+| `headers` | each named header is present and matches its regular expression |
+| `cookies` | each named cookie is present and matches its regular expression |
+
+A rule's inputs must all match, and an input with several entries
+matches when any of them does; `user_agent`, `user_agent_regex` and
+`user_agent_list` together are one input. The client's address is the
+one a [trusted proxy](behind-a-proxy.md) forwarded, so a CDN's verdict
+header, say `headers = { 'X-Bot-Score' = '^[0-2]?[0-9]$' }`, classifies
+what reaches you through it. Class names are lower case letters, digits,
+`_` and `-`.
+
+JA4 is FoxIO's fingerprint of how a client opens a TLS connection, such
+as `t13d1516h2_8daaf6152771_b186095e22b6`: it names the TLS library a
+client uses whatever its User-Agent says, so a script claiming to be a
+browser still has its library's fingerprint. The edge reads it from each
+TLS connection made to it directly, and the application finds it as
+`muru.tls["ja4"]`. A request that came through a trusted proxy has none
+to match, since the proxy made the connection; a CDN that computes JA4
+can send it in a header for the `headers` input instead. Plain HTTP
+requests have no fingerprint, so a rule with `ja4` never matches them.
+
+```toml
+[[client_class]]
+name = 'scripted'
+ja4_list = 'lists/scripted-ja4.txt'
+user_agent = ['Mozilla']
+```
+
+Here a request is `scripted` when its User-Agent claims a browser and
+its fingerprint is one from the list.
+
+`verify = 'dns'` confirms a claimed crawler: the client's address must
+reverse-resolve to a name that is, or ends in, one of `verify_domains`,
+and that name must resolve back to the address. A lookup never holds a
+request. The first request from an address starts one, and until it has
+confirmed the address the rule does not match, so the request falls
+through to the later rules, the `unverified_bot` above for instance.
+Confirmed names are remembered for 24 hours and failures for an hour.
+
+List files hold one entry a line; blank lines and lines starting with
+`#` are ignored. An input whose only entries come from a list that holds
+none matches nothing, so its rule matches nothing until the list has
+entries. A path in the daemon's file is relative to its
+directory, and one in an applied file is absolute. A list that changes
+is read again within a second, which
+the `client_class.list_reloaded` event records. Community lists of AI
+crawler user agents or a provider's address ranges can be dropped in as
+they are.
+
+The class appears in the access log as `class=` (for anything but
+`default`) and as `client_class` in JSON lines, as the `client_class`
+label of `muru_requests_total`, and to the application as
+`muru.client_class` in the environ or `client_class` in the scope's
+`extensions["muru"]`.
+
+## Routing by class
+
+A route, a traffic policy and a worker group can each be for some
+classes, so crawlers can be kept off the capacity that serves people.
+
+A route with `match` takes only the requests of its classes. Several
+routes may share a path when no class is in two of them, and at the same
+path the route for the request's class comes before the route for every
+class. Here partners' requests for anything on the site get a static
+snapshot:
+
+```toml
+[[route]]
+host = 'shop'
+path = '/'
+app = 'shop'
+
+[[route]]
+host = 'shop'
+path = '/'
+static = '/srv/shop/snapshot'
+match = { client_class = ['ai_crawler', 'unverified_bot'] }
+```
+
+A longer path still wins over a shorter one, whatever the classes: with
+these two routes and a third for `/api`, a crawler's request for
+`/api/items` takes the `/api` route.
+
+A traffic policy's `classes` gives a class a release of its own, such as
+an older, cheaper one kept running for it. A preview header or cookie
+still comes first, but the class's release comes before a sticky cookie
+and the split:
+
+```toml
+[[route]]
+host = 'shop'
+app = 'shop'
+traffic = { classes = { ai_crawler = 'r41' } }
+```
+
+The release stays running while a policy names it. A value of
+`upstream:NAME` sends the class to an [upstream](upstreams.md)
+instead.
+
+A worker group with `match` takes its classes' requests for its paths,
+or for every path when it has none, ahead of the groups for every class.
+The group's workers then carry the crawlers' load and nothing else:
+
+```toml
+[app.shop.release.r42.groups.crawlers]
+match = { client_class = ['ai_crawler'] }
+processes = 1
+threads = 4
+```
+
+`muructl apply` refuses a class that is not defined; `default` always
+is. `muructl route list` shows the classes a
+route is for, as `[for ai_crawler]`, and the releases its policy gives
+classes.
+
+An [overlay](overlays.md) can give a class a route for a while, such as
+sending crawlers to a snapshot only when they become a burden, with
+`client_routes`.
+
+## Rate limits
+
+A `[rate_limit.NAME]` table, in the daemon's file or an applied one, is
+a token bucket for each key, and hosts and routes name the limits their requests draw from:
+
+```toml
+[rate_limit.crawlers]
+match = { client_class = ['ai_crawler', 'unverified_bot'] }
+key = 'address'
+rate = '2/s'
+burst = 10
+action = 'reject'
+headers = true
+```
+
+```toml
+[host.shop]
+names = ['shop.example.com']
+rate_limits = ['crawlers']
+
+[[route]]
+host = 'shop'
+path = '/search'
+app = 'shop'
+rate_limits = ['search']
+```
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `match.client_class` | every class | the classes whose requests draw from the limit |
+| `key` | `address` | what a bucket is kept for: `address`, `client_class`, `header:NAME`, `cookie:NAME`, or a list combining them |
+| `rate` | required | how fast a bucket fills: `2/s`, `100/m` or `1000/h` |
+| `burst` | the rate's count | how many requests a full bucket allows at once |
+| `action` | `reject` | `reject` answers 429; `delay` holds the request until a token comes, up to `max_delay`, and refuses beyond it; `log` only counts |
+| `max_delay` | `1s` | the longest hold under `delay` |
+| `ipv4_prefix`, `ipv6_prefix` | 32, 64 | how much of an address makes the key, so that an IPv6 client's /64 shares one bucket |
+| `headers` | false | send the `RateLimit-Policy` and `RateLimit` fields with a 429 |
+
+A request draws from the host's limits, then the route's. A refusal is
+429 `rate_limited` with `Retry-After`, and a page configured for 429 or
+`429:rate_limited` replaces the built-in one (see the [error pages
+guide](error-pages.md)). Every refusal, hold and logged request counts in
+`muru_rate_limited_total` by limit, class and action, so `action = 'log'`
+shows what a limit would do before it is enforced, and the
+`ratelimit.enforcing` event records a limit beginning to refuse or hold
+requests after a quiet minute.
+
+Under the daemon the buckets are in shared memory, so they outlast the
+edge process: an edge replaced by an upgrade or restarted after a crash
+draws from the buckets its predecessor left, and both draw from the
+same buckets while they overlap. In development mode they belong to the
+`muructl run` process.
+
+## Method restrictions and site modes
+
+A route can refuse methods, answered with 503 `read_only` or, with
+`answer = 'method_not_allowed'`, with 405 and the remaining methods in
+`Allow`:
+
+```toml
+[[route]]
+host = 'shop'
+path = '/'
+app = 'shop'
+methods = { deny = ['POST', 'PUT', 'PATCH', 'DELETE'] }
+mode = 'read-only'
+```
+
+A route's `mode` is any short word, passed to the application as
+`muru.mode` in the environ or `mode` in the scope's `extensions["muru"]`,
+so it can hide or disable what the mode rules out. Both are the usual
+way to take a site read-only for maintenance of its database, and
+`muructl apply` checks them, and that the rate limits a host or route
+names are defined. An [overlay](overlays.md) sets them for a while, on
+one route or on every route of an application.
+
+## Changing them
+
+`muructl daemon reload`, or SIGHUP, reads the daemon's file again and
+gives the edge changed classes and limits without a restart.
+
+Classes and limits in applied files reach the edge when they are
+applied, and `muructl config export` writes them out. An applied class's
+rule keeps its place among the applied rules when it changes, and a new
+one goes after them; with `--prune` they take the file's order, and
+those the file leaves out are removed. A name the daemon's file defines
+is refused, and a list file must be an absolute path:
+
+```toml
+[[client_class]]
+name = 'ai_crawler'
+user_agent_list = '/srv/shop/lists/ai-crawlers.txt'
+
+[rate_limit.crawlers]
+match = { client_class = ['ai_crawler'] }
+rate = '2/s'
+```

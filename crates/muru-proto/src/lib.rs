@@ -21,6 +21,14 @@ pub mod worker {
 
         /// The protocol version announced in HELLO frames and request heads.
         pub const PROTOCOL_VERSION: &str = "1.0";
+
+        /// Section 7.3: the upper bounds, in microseconds, of the GIL
+        /// wait and event loop lag histograms a worker reports to its
+        /// host, each reported as the cumulative count at or below each
+        /// bound and then the count of all.
+        pub const SIGNAL_BOUNDS_US: [u64; 10] = [
+            100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+        ];
     }
 }
 

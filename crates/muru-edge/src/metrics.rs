@@ -96,7 +96,7 @@ pub const FAMILIES: &[Family] = &[
     Family {
         name: "muru_requests_total",
         kind: Kind::Counter,
-        help: "Requests completed, by status class and the reason when the edge generated the response.",
+        help: "Requests completed, by status class, the reason when the edge generated the response, and the client class.",
     },
     Family {
         name: "muru_request_duration_seconds",
@@ -107,6 +107,16 @@ pub const FAMILIES: &[Family] = &[
         name: "muru_requests_in_flight",
         kind: Kind::Gauge,
         help: "Requests the edge has taken and not yet answered.",
+    },
+    Family {
+        name: "muru_upload_spool_bytes",
+        kind: Kind::Gauge,
+        help: "Bytes of uploads the edge holds for requests in progress, by application.",
+    },
+    Family {
+        name: "muru_rate_limited_total",
+        kind: Kind::Counter,
+        help: "Requests a rate limit refused, delayed or only logged, by limit, client class and action.",
     },
     Family {
         name: "muru_auth_requests_total",
@@ -162,6 +172,11 @@ pub const FAMILIES: &[Family] = &[
         name: "muru_worker_requests_in_flight",
         kind: Kind::Gauge,
         help: "Requests a worker was serving when it last reported.",
+    },
+    Family {
+        name: "muru_worker_cpu_seconds_total",
+        kind: Kind::Counter,
+        help: "CPU time a worker has used, user and system, as it last reported.",
     },
     Family {
         name: "muru_worker_memory_bytes",
@@ -266,6 +281,7 @@ struct RequestKey {
     mount: String,
     status: String,
     reason: String,
+    client_class: String,
 }
 
 /// The labels of a release's histograms and in-flight gauge.
@@ -317,6 +333,7 @@ struct Inner {
     in_flight: BTreeMap<ReleaseKey, i64>,
     /// Authentication sub-requests by result (section 4.16).
     auth: BTreeMap<String, u64>,
+    rate_limited: BTreeMap<(String, String, String), u64>,
 }
 
 /// The request metrics of one edge, fed by the access log as each request
@@ -357,6 +374,7 @@ impl Metrics {
             mount: record.mount.clone(),
             status: format!("{}xx", record.status / 100),
             reason: record.reason.clone(),
+            client_class: record.client_class.clone(),
         };
         *inner.requests.entry(key).or_default() += 1;
         let durations = inner
@@ -382,6 +400,14 @@ impl Metrics {
         *inner.auth.entry(result.to_owned()).or_default() += 1;
     }
 
+    /// Count a rate limit's decision about a request (section 4.15):
+    /// `rejected`, `delayed` or `logged`.
+    pub fn count_rate_limit(&self, limit: &str, client_class: &str, action: &str) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        let key = (limit.to_owned(), client_class.to_owned(), action.to_owned());
+        *inner.rate_limited.entry(key).or_default() += 1;
+    }
+
     /// Every sample of the request metrics.
     pub fn samples(&self) -> Vec<Sample> {
         let inner = self.inner.lock().expect("metrics poisoned");
@@ -397,6 +423,7 @@ impl Metrics {
                     ("mount".to_owned(), key.mount.clone()),
                     ("status".to_owned(), key.status.clone()),
                     ("reason".to_owned(), key.reason.clone()),
+                    ("client_class".to_owned(), key.client_class.clone()),
                 ],
                 value: *count as f64,
             });
@@ -426,6 +453,18 @@ impl Metrics {
             samples.push(Sample {
                 name: "muru_auth_requests_total".to_owned(),
                 labels: vec![("result".to_owned(), result.clone())],
+                value: *count as f64,
+            });
+        }
+
+        for ((limit, client_class, action), count) in &inner.rate_limited {
+            samples.push(Sample {
+                name: "muru_rate_limited_total".to_owned(),
+                labels: vec![
+                    ("limit".to_owned(), limit.clone()),
+                    ("client_class".to_owned(), client_class.clone()),
+                    ("action".to_owned(), action.clone()),
+                ],
                 value: *count as f64,
             });
         }
@@ -656,6 +695,7 @@ mod tests {
             application: Duration::from_millis(total_ms / 2),
             total: Duration::from_millis(total_ms),
             redirects: Vec::new(),
+            client_class: "default".to_owned(),
         }
     }
 
@@ -668,13 +708,13 @@ mod tests {
         let text = render(&metrics.samples());
         assert!(
             text.contains(
-                "muru_requests_total{app=\"shop\",release=\"r1\",group=\"default\",mount=\"default\",status=\"2xx\"} 2\n"
+                "muru_requests_total{app=\"shop\",release=\"r1\",group=\"default\",mount=\"default\",status=\"2xx\",client_class=\"default\"} 2\n"
             ),
             "{text}"
         );
         assert!(
             text.contains(
-                "muru_requests_total{app=\"shop\",release=\"r1\",group=\"default\",mount=\"default\",status=\"5xx\",reason=\"no_workers\"} 1\n"
+                "muru_requests_total{app=\"shop\",release=\"r1\",group=\"default\",mount=\"default\",status=\"5xx\",reason=\"no_workers\",client_class=\"default\"} 1\n"
             ),
             "{text}"
         );

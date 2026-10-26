@@ -18,7 +18,14 @@ def serve(
     on_exit: Callable[[], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
     lifeline: int | None = None,
-    mounts: list[tuple[str, Callable[..., Any], Callable[[Any, Channel], None] | None]] = [],
+    mounts: list[
+        tuple[
+            str,
+            Callable[..., Any],
+            Callable[[Any, Channel], None] | None,
+            tuple[int, int] | None,
+        ]
+    ] = [],
     report: int | None = None,
     on_reclaim: Callable[[], Any] | None = None,
     memory_interval_ms: int = 5000,
@@ -26,6 +33,7 @@ def serve(
     on_control: Callable[[str, list[dict[str, Any]], dict[int, str]], str] | None = None,
     soft_timeout_ms: int | None = None,
     timeout_error: type[BaseException] | None = None,
+    grpc_methods: list[tuple[str, str, bool, bool]] = [],
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -42,8 +50,22 @@ def serve(
     None for a WSGI mount; event_loop is needed when any mount is ASGI.
     soft_timeout_ms is the soft timeout, after which a request is
     interrupted by raising timeout_error (muru.RequestTimeout) in its
-    thread or cancelling its task.
+    thread or cancelling its task. grpc_methods are the methods the gRPC
+    mounts registered, as (path, mount, client streaming, server streaming)
+    tuples, which HELLO declares to the edge.
     """
+
+def memory_usage() -> dict[str, int] | None:
+    """Return the worker's rss, pss and uss in bytes, or None where unmeasured."""
+
+def requests() -> list[dict[str, Any]]:
+    """Return the requests in flight: id, method, path, elapsed ms and thread."""
+
+def suspend_timeouts() -> bool:
+    """Take the calling thread's request out of the timeouts while a debugger holds it."""
+
+def loop_beat() -> None:
+    """Tell the loop stall watchdog that the event loop has run."""
 
 def resolve_future(future: Any, value: Any) -> None:
     """Complete an asyncio future with a value unless it is already done."""

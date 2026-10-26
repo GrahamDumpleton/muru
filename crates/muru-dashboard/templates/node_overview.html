@@ -8,11 +8,11 @@
 </div>
 <h2 style="margin-top:1rem">Applications and releases</h2>
 <table>
-  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th></tr>
+  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
-    <td>{{ app.name }}@{{ release.id }}</td>
+    <td>{{ app.name }}@{{ release.id }}{% if !app.maintenance_since.is_empty() && release.serving %} <span class="state-draining">maintenance since {{ app.maintenance_since }}</span>{% endif %}</td>
     <td class="state-{{ release.state }}">{{ release.state }}</td>
     <td>{% if release.serving %}yes{% endif %}</td>
     <td class="num">{{ release.workers }}</td>
@@ -21,10 +21,35 @@
     <td class="num">{{ release.waiting }}</td>
     <td>{{ release.created }}</td>
     <td>{{ release.message }}</td>
+    {% if let Some(token) = csrf %}
+    <td>{% if release.serving %}<form method="post" action="/actions/maintenance">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="app" value="{{ app.name }}">
+      {% if app.maintenance_since.is_empty() %}<input type="hidden" name="state" value="on"><button>Maintenance on</button>{% else %}<input type="hidden" name="state" value="off"><button>Maintenance off</button>{% endif %}
+    </form>{% endif %}</td>
+    {% endif %}
   </tr>
   {% endfor %}
   {% endfor %}
 </table>
+{% if !data.rollouts.is_empty() %}
+<h3>Rollouts</h3>
+<table>
+  <tr><th>Rollout</th><th>Candidate</th><th>Baseline</th><th>State</th><th class="num">Share</th><th>Updated</th><th>Message</th></tr>
+  {% for rollout in data.rollouts %}
+  <tr><td>{{ rollout.app }} {{ rollout.id }}</td><td>{{ rollout.candidate }}</td><td>{{ rollout.baseline }}</td><td class="rollout-{{ rollout.state }}">{{ rollout.state }}</td><td class="num">{{ rollout.percent }}%</td><td>{{ rollout.updated }}</td><td>{{ rollout.message }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if !data.scaling.is_empty() %}
+<h3>Scaling</h3>
+<table>
+  <tr><th>Group</th><th>Workers</th><th>Policy</th><th class="num">CPU</th><th class="num">GIL wait p95</th><th class="num">Loop lag p95</th><th>Diagnosis</th><th>Last decision</th></tr>
+  {% for row in data.scaling %}
+  <tr><td>{{ row.release }} {{ row.group }}</td><td>{{ row.workers }}</td><td>{{ row.policy }}</td><td class="num">{{ row.cpu }}</td><td class="num">{{ row.gil_wait }}</td><td class="num">{{ row.loop_lag }}</td><td>{{ row.diagnosis }}{% if !row.advice.is_empty() %}<br><small>{{ row.advice }}</small>{% endif %}</td><td>{{ row.last_decision }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
 {% if !data.hosts.is_empty() %}
 <h3>Virtual hosts</h3>
 <table>

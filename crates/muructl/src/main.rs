@@ -11,6 +11,7 @@ mod admin;
 mod dashboard;
 mod devcert;
 mod edge;
+mod pstats;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -116,11 +117,24 @@ enum Command {
     /// Pin a worker group's count, or show the autoscaler's state.
     Scale(admin::ScaleArgs),
 
+    /// Overlays: list them, activate or end one by hand, preview what
+    /// one changes, or make one's changes permanent (section 9.10).
+    Overlay {
+        #[command(subcommand)]
+        command: admin::OverlayCommand,
+    },
+
     /// Serve an application's maintenance page at the edge, or serve it
     /// as usual again.
     Maintenance {
         #[command(subcommand)]
         command: admin::MaintenanceCommand,
+    },
+
+    /// The daemon's dashboard.
+    Dashboard {
+        #[command(subcommand)]
+        command: admin::DashboardCommand,
     },
 
     /// Show the daemon's status.
@@ -271,12 +285,15 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         accel_redirect: false,
         cgi_local_redirect: false,
         sendfile: Arc::default(),
+        grpc_web_origins: Vec::new(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
         access_log,
         limits: muru_edge::Limits::default(),
         compression: compression.clone(),
         https: None,
+        spool: None,
+        rate_buckets: None,
     })
     .await
     .map_err(|error| explain_bind_error(error, SocketAddr::new(args.bind.ip, 0)))?;
@@ -327,7 +344,8 @@ struct RunArgs {
     app: Option<String>,
 
     /// The interface the entrypoint speaks: auto (detected from the
-    /// callable), wsgi or asgi.
+    /// callable), wsgi, asgi, or grpc for a function that registers gRPC
+    /// services.
     #[arg(long, value_name = "NAME")]
     interface: Option<muru_config::Interface>,
 
@@ -398,10 +416,11 @@ struct RunArgs {
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
-    /// (off), hard (off), hard_drain_grace (10s) or shutdown (5s) in the
-    /// host, which interrupts a request that runs past the soft timeout
-    /// and replaces a worker whose request runs past the hard timeout.
-    /// Repeatable.
+    /// (off), hard (off), hard_drain_grace (10s), shutdown (5s) or
+    /// loop_stall (10s) in the host, which interrupts a request that runs
+    /// past the soft timeout and replaces a worker whose request runs
+    /// past the hard timeout, or whose event loop stalls past
+    /// loop_stall. Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -733,15 +752,29 @@ fn main() -> anyhow::Result<()> {
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
+        Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
+        Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
         Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
             admin::ConfigCommand::Export {
                 app,
                 all_releases,
+                resolve_rollouts,
                 json,
                 socket,
-            } => runtime.block_on(admin::config_export(app, all_releases, json, socket)),
+            } => runtime.block_on(admin::config_export(
+                app,
+                all_releases,
+                resolve_rollouts,
+                json,
+                socket,
+            )),
+            admin::ConfigCommand::Show {
+                app,
+                effective,
+                socket,
+            } => runtime.block_on(admin::config_show(app, effective, socket)),
             admin::ConfigCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
@@ -800,13 +833,14 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard",
         "hard_drain_grace",
         "shutdown",
+        "loop_stall",
     ]
     .contains(&name)
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
-             response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace or \
-             shutdown"
+             response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
+             shutdown or loop_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -945,6 +979,8 @@ pub(crate) struct HostTimeouts {
     pub hard_drain_grace: Duration,
     /// The time before a stopping worker is killed.
     pub shutdown: Duration,
+    /// How long an ASGI worker's event loop may stall.
+    pub loop_stall: Duration,
 }
 
 impl HostTimeouts {
@@ -955,6 +991,7 @@ impl HostTimeouts {
             hard_timeout: self.hard.map(muru_config::format_duration),
             hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
             shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
+            loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
         }
     }
 }
@@ -984,6 +1021,11 @@ pub(crate) fn worker_timeouts(
             parse(&table.shutdown_timeout, "shutdown_timeout")
         })?
         .unwrap_or(Duration::from_secs(5));
+    let mut loop_stall = table
+        .map_or(Ok(None), |table| {
+            parse(&table.loop_stall_timeout, "loop_stall_timeout")
+        })?
+        .unwrap_or(Duration::from_secs(10));
 
     for (name, duration) in timeouts {
         match name.as_str() {
@@ -991,6 +1033,7 @@ pub(crate) fn worker_timeouts(
             "hard" => hard = Some(*duration),
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
+            "loop_stall" => loop_stall = *duration,
             _ => {}
         }
     }
@@ -1001,6 +1044,10 @@ pub(crate) fn worker_timeouts(
     anyhow::ensure!(
         soft != Some(Duration::ZERO),
         "soft_timeout must be longer than nothing"
+    );
+    anyhow::ensure!(
+        loop_stall > Duration::ZERO,
+        "loop_stall_timeout must be longer than nothing"
     );
 
     if let (Some(soft), Some(hard)) = (soft, hard) {
@@ -1015,6 +1062,7 @@ pub(crate) fn worker_timeouts(
         hard,
         hard_drain_grace: grace,
         shutdown,
+        loop_stall,
     })
 }
 
@@ -1066,6 +1114,10 @@ struct Resolved {
     entrypoint: String,
     interface: muru_config::Interface,
     factory: Option<muru_config::FactoryPhase>,
+    /// Whether gRPC server reflection is served (section 6.13).
+    reflection: bool,
+    /// The origins whose pages may call it through gRPC-Web.
+    grpc_web_origins: Vec<String>,
     processes: usize,
     threads: usize,
     sync_threads: usize,
@@ -1192,6 +1244,13 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     } else {
         None
     };
+    muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
+
+    for (name, mount) in &table.mounts {
+        muru_config::check_mount_threads(mount.threads, mount.interface)
+            .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
+    }
+
     Ok(Resolved {
         entrypoint,
         interface: args
@@ -1199,6 +1258,8 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .or(table.interface)
             .unwrap_or(muru_config::Interface::Auto),
         factory,
+        reflection: table.reflection.unwrap_or(false),
+        grpc_web_origins: table.grpc_web_origins.clone(),
         processes: args
             .processes
             .or(table.processes)
@@ -1256,16 +1317,19 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     let mut listeners = vec![Listener {
         address: http.to_string(),
         tls: false,
+        h2c: None,
     }];
 
     if args.https || args.https_only || args.tls_cert.is_some() {
         listeners.push(Listener {
             address: https.to_string(),
             tls: true,
+            h2c: None,
         });
     }
 
     let release = Release {
+        grpc_web_origins: resolved.grpc_web_origins.clone(),
         kind: None,
         profile: None,
         command: Vec::new(),
@@ -1278,6 +1342,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         entrypoint: resolved.entrypoint.clone(),
         interface: (resolved.interface != muru_config::Interface::Auto)
             .then_some(resolved.interface),
+        reflection: resolved.reflection.then_some(true),
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
         python: Some(
@@ -1353,6 +1418,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             http2: Some(muru_config::Http2Limits {
                 max_concurrent_streams: Some(limits.http2_max_concurrent_streams),
             }),
+            spool_quota: None,
         }),
         app: std::collections::BTreeMap::from([(
             name,
@@ -1393,6 +1459,11 @@ fn group_sockets_from(
             paths: groups
                 .get(name)
                 .map(|group| group.paths.clone())
+                .unwrap_or_default(),
+            client_classes: groups
+                .get(name)
+                .and_then(|group| group.matches.as_ref())
+                .map(|matches| matches.client_class.clone())
                 .unwrap_or_default(),
             sockets: sockets.clone(),
         })
@@ -1591,6 +1662,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         release: None,
         interface: resolved.interface,
         factory: resolved.factory,
+        reflection: resolved.reflection,
         processes: resolved.processes,
         threads: resolved.threads,
         sync_threads: resolved.sync_threads,
@@ -1620,6 +1692,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 path: mount.path.clone(),
                 entrypoint: mount.entrypoint.clone(),
                 interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+                threads: mount.threads,
             })
             .collect(),
         logging: resolved
@@ -1633,6 +1706,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         hard_timeout: timeouts.hard,
         hard_drain_grace: timeouts.hard_drain_grace,
         shutdown_timeout: timeouts.shutdown,
+        loop_stall_timeout: timeouts.loop_stall,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
         env: resolved
             .env
@@ -1709,6 +1783,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
         sendfile: Arc::clone(&sendfile),
+        grpc_web_origins: resolved.grpc_web_origins.clone(),
         errors: Arc::clone(&error_policy),
         development,
         access_log,
@@ -1719,6 +1794,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             muru_edge::compression::Compression::default()
         },
         https: tls.as_ref().map(|tls| tls.https.clone()),
+        spool: None,
+        rate_buckets: None,
     })
     .await
     {
@@ -1877,6 +1954,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             pools
                                 .with_errors(Arc::clone(&error_policy))
                                 .with_sendfile(Arc::clone(&sendfile))
+                                .with_grpc_web(&resolved.grpc_web_origins)
                         });
 
                         match connected {
@@ -1931,6 +2009,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     pools
                                         .with_errors(Arc::clone(&error_policy))
                                         .with_sendfile(Arc::clone(&sendfile))
+                                        .with_grpc_web(&resolved.grpc_web_origins)
                                 });
 
                                 match connected {

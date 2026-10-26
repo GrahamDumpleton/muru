@@ -27,6 +27,16 @@ REQUEST_MARK: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+def hold_the_interpreter(seconds: int) -> None:
+    """Sleep in C without letting go of the interpreter, as a stuck
+    extension would: no other thread of the worker runs Python meanwhile."""
+
+    import ctypes
+    import ctypes.util
+
+    ctypes.PyDLL(ctypes.util.find_library("c")).sleep(seconds)
+
+
 def umask_of_process() -> int:
     """Read the file creation mask without changing it for long."""
 
@@ -156,6 +166,11 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         time.sleep(float(query.get("seconds", "0.1")))
         start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "5")])
         return [b"slept"]
+
+    if path == "/hold":
+        hold_the_interpreter(int(query.get("seconds", "1")))
+        start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "4")])
+        return [b"held"]
 
     if path == "/busy":
         # Runs Python bytecode for the time, so the soft timeout's

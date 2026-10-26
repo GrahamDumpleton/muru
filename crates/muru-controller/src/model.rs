@@ -135,6 +135,9 @@ pub struct MountSpec {
     /// A second header honoured as X-Muru-Sendfile is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sendfile_header: Option<String>,
+    /// Threads of the mount's own; the worker's shared pool when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<muru_config::MountThreads>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -145,6 +148,10 @@ pub struct GroupSpec {
     pub name: String,
     /// Path prefixes it serves, with an optional trailing `*`.
     pub paths: Vec<String>,
+    /// The client classes it takes (section 4.14), ahead of the groups
+    /// that name none; their requests for every path without `paths`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<String>,
     /// Worker processes.
     pub processes: u32,
     /// Application threads per worker.
@@ -184,6 +191,13 @@ pub struct ReleaseSpec {
     pub hooks: Option<String>,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<FactoryPhase>,
+    /// The origins whose pages may call it through gRPC-Web, answered
+    /// with CORS (section 6.13).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_web_origins: Vec<String>,
+    /// Whether gRPC server reflection is served (section 6.13).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reflection: bool,
     /// Named worker groups beside the default one.
     #[serde(default)]
     pub groups: Vec<GroupSpec>,
@@ -242,7 +256,35 @@ pub struct ReleaseSpec {
     /// its command runs in, and the worker settings are unused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpServerSpec>,
+    /// Section 3.3: the layer each setting came from, by key.
+    #[serde(default, skip_serializing_if = "Layers::is_empty")]
+    pub layers: Layers,
 }
+
+/// Section 3.3: where each of a release's settings came from, by key:
+/// the release table or deploy flags, the source's [tool.muru] table,
+/// the previous release, or the default. It records how the settings
+/// were reached, not what they are, so two specs are equal whatever
+/// their layers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Layers(pub BTreeMap<String, String>);
+
+impl Layers {
+    /// Whether nothing is recorded, as for a release made before
+    /// layers were.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl PartialEq for Layers {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Layers {}
 
 /// Section 9.9: a release that runs an HTTP server of its own instead
 /// of Muru workers, started from a command and routed to as an upstream.
@@ -353,6 +395,11 @@ pub struct ScalingSpec {
     pub churn_budget: u32,
     /// Decide and report without acting.
     pub advisory: bool,
+    /// How long the host stays once every group has scaled to zero, for
+    /// the default group's spec; it stays while the release runs when
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_idle_timeout_ms: Option<u64>,
 }
 
 impl Default for ScalingSpec {
@@ -374,6 +421,7 @@ impl Default for ScalingSpec {
             max_step_up: 4,
             churn_budget: 6,
             advisory: false,
+            host_idle_timeout_ms: None,
         }
     }
 }
@@ -485,6 +533,10 @@ pub struct WorkerTimeouts {
     /// How long a worker told to stop gets before it is killed.
     #[serde(default = "default_shutdown_timeout_ms")]
     pub shutdown_timeout_ms: u64,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced.
+    #[serde(default = "default_loop_stall_timeout_ms")]
+    pub loop_stall_timeout_ms: u64,
 }
 
 impl Default for WorkerTimeouts {
@@ -494,6 +546,7 @@ impl Default for WorkerTimeouts {
             hard_timeout_ms: None,
             hard_drain_grace_ms: default_hard_drain_grace_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
+            loop_stall_timeout_ms: default_loop_stall_timeout_ms(),
         }
     }
 }
@@ -504,6 +557,10 @@ fn default_hard_drain_grace_ms() -> u64 {
 
 fn default_shutdown_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_loop_stall_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Section 9.3: where a rollout is.
@@ -560,6 +617,20 @@ pub struct RolloutGates {
     pub max_error_rate: f64,
     /// The 95th percentile of total request time, when set.
     pub max_p95_ms: Option<u64>,
+    /// The 99th percentile of total request time, when set.
+    #[serde(default)]
+    pub max_p99_ms: Option<u64>,
+    /// Worker crashes and timeout kills, which need no request count to
+    /// judge.
+    #[serde(default)]
+    pub max_worker_faults: u64,
+    /// The 95th percentile of the wait for a worker thread, when set.
+    #[serde(default)]
+    pub max_queue_wait_p95_ms: Option<u64>,
+    /// URLs requested through the edge from each release in turn, by
+    /// preview; one failing on the candidate alone rolls back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<String>,
     /// Requests the candidate must have served before the gates judge.
     pub min_requests: u64,
 }
@@ -655,6 +726,9 @@ pub struct App {
     pub group: Option<String>,
     /// The file creation mask, in octal.
     pub umask: Option<String>,
+    /// Which applications' scale-ups the node's budget admits first, the
+    /// highest first (section 7.4).
+    pub priority: i32,
 }
 
 impl App {
@@ -696,6 +770,25 @@ pub struct Event {
     pub level: &'static str,
     /// The sentence.
     pub message: String,
+}
+
+/// An overlay's state (section 9.10): active, with what made it so, or
+/// held inactive after a person ended it, its preconditions failed or it
+/// was promoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayState {
+    /// The overlay.
+    pub name: String,
+    /// Whether it is applied.
+    pub active: bool,
+    /// `schedule` or `manual` while active; `ended`, `skipped` or
+    /// `promoted` while held.
+    pub source: String,
+    /// When it became active or was held, Unix milliseconds.
+    pub since_unix_ms: u64,
+    /// When it ends, while active, or may activate again, while held;
+    /// never without one.
+    pub until_unix_ms: Option<u64>,
 }
 
 /// Check a name against section 3.2: lowercase letters, digits and

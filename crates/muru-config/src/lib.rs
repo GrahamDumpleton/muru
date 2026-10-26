@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod cron;
+
 /// The interface an entrypoint speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +27,9 @@ pub enum Interface {
     Wsgi,
     /// ASGI 3.
     Asgi,
+    /// gRPC services: the entrypoint is a registration function given a
+    /// server to add grpcio servicers to (section 6.13).
+    Grpc,
 }
 
 /// Whether the application is imported in the host before forking (section 6.1).
@@ -99,7 +104,7 @@ macro_rules! words {
     };
 }
 
-words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi" });
+words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi", Grpc => "grpc" });
 words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
@@ -204,6 +209,33 @@ pub struct ParseError {
     pub value: String,
     /// What is accepted.
     pub accepted: &'static [&'static str],
+}
+
+/// Section 6.13: check the origins gRPC-Web is answered with CORS for:
+/// `*`, or an http or https scheme with a host and an optional port, and
+/// nothing after.
+pub fn check_origins(origins: &[String]) -> Result<(), String> {
+    for origin in origins {
+        if origin == "*" {
+            continue;
+        }
+
+        let rest = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .ok_or_else(|| {
+                format!("grpc_web_origins: {origin:?} is not * or http(s)://HOST[:PORT]")
+            })?;
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+
+        if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
+            return Err(format!(
+                "grpc_web_origins: {origin:?} is not * or http(s)://HOST[:PORT]"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse a size such as 10MB, 512KB, 1GB or a plain number of bytes.
@@ -319,7 +351,9 @@ pub fn format_duration(duration: Duration) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
-    /// The path prefix; the longest wins, on segment boundaries.
+    /// The path prefix; the longest wins, on segment boundaries. A gRPC
+    /// mount has none: its calls are matched by service name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
     /// The application as module:callable.
     pub entrypoint: String,
@@ -352,6 +386,94 @@ pub struct Mount {
     /// as `X-Sendfile` (default the release's setting, else none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sendfile_header: Option<String>,
+    /// Threads of the mount's own, for a WSGI or gRPC mount; it shares
+    /// the worker's pool when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<MountThreads>,
+}
+
+/// A mount's own threads (section 6.7): a fixed pool, `threads = 4`, or a
+/// reserved minimum that borrows threads of the shared pool up to a
+/// maximum, `threads = { reserved = 2, max = 6 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MountThreads {
+    /// A pool of this many threads, used by the mount alone.
+    Fixed(usize),
+    /// Reserved threads, and shared ones borrowed up to a maximum.
+    Borrowing(BorrowedThreads),
+}
+
+/// The table form of a mount's threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BorrowedThreads {
+    /// Threads only the mount uses.
+    pub reserved: usize,
+    /// The most requests the mount runs at once, on its reserved threads
+    /// and borrowed ones together.
+    pub max: usize,
+}
+
+impl MountThreads {
+    /// Threads only the mount uses.
+    pub fn reserved(self) -> usize {
+        match self {
+            Self::Fixed(threads) => threads,
+            Self::Borrowing(threads) => threads.reserved,
+        }
+    }
+
+    /// The most requests the mount runs at once.
+    pub fn max(self) -> usize {
+        match self {
+            Self::Fixed(threads) => threads,
+            Self::Borrowing(threads) => threads.max,
+        }
+    }
+
+    /// As written in a table: `4`, or `{ reserved = 2, max = 6 }`.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Fixed(threads) => threads.to_string(),
+            Self::Borrowing(threads) => format!(
+                "{{ reserved = {}, max = {} }}",
+                threads.reserved, threads.max
+            ),
+        }
+    }
+}
+
+/// Section 6.7: check a mount's own threads against its interface. A
+/// fixed pool has at least one thread; a borrowing one may reserve none
+/// and has a maximum of at least one and no less than it reserves. An
+/// ASGI mount runs on the event loop and has no threads, and a gRPC
+/// mount's threads are a fixed pool for its handlers.
+pub fn check_mount_threads(
+    threads: Option<MountThreads>,
+    interface: Option<Interface>,
+) -> Result<(), String> {
+    let Some(threads) = threads else {
+        return Ok(());
+    };
+
+    match (threads, interface) {
+        (_, Some(Interface::Asgi)) => {
+            Err("threads: an ASGI mount runs on the event loop and has no threads".to_owned())
+        }
+        (MountThreads::Borrowing(_), Some(Interface::Grpc)) => Err(
+            "threads: a gRPC mount's threads are a fixed pool, a number, not reserved and max"
+                .to_owned(),
+        ),
+        (MountThreads::Fixed(0), _) => Err("threads: a mount's pool needs a thread".to_owned()),
+        (MountThreads::Borrowing(limits), _) if limits.max == 0 || limits.max < limits.reserved => {
+            Err(format!(
+                "threads: max {} must be at least 1 and no less than reserved {}",
+                limits.max, limits.reserved
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
@@ -365,6 +487,11 @@ pub struct Group {
     /// match across all groups wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// The client classes (section 4.14) the group takes: their requests
+    /// for its paths, or for every path without `paths`, ahead of the
+    /// groups that name no class.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<ClientMatch>,
     /// Worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processes: Option<usize>,
@@ -432,6 +559,15 @@ pub struct Release {
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Interface>,
+    /// Serve gRPC server reflection for the services the release's gRPC
+    /// mounts register (section 6.13, default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<bool>,
+    /// The origins whose pages may call the release's gRPC methods
+    /// through gRPC-Web, answered with CORS (section 6.13): scheme, host
+    /// and port, or `*`; none when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_web_origins: Vec<String>,
     /// Whether the entrypoint is a factory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<bool>,
@@ -606,6 +742,12 @@ pub struct Scaling {
     /// Decide and report without acting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advisory: Option<bool>,
+    /// How long the release's host stays once every group has scaled to
+    /// zero, after which it stops too and the next request starts it
+    /// again; it stays while the release runs when omitted. In the
+    /// release's own scaling table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_idle_timeout: Option<String>,
 }
 
 /// The `[memory]` table of a release or a `[tool.muru]` table (section
@@ -694,7 +836,7 @@ pub struct Logs {
 
 /// The `[daemon]` table of the daemon's file: how the daemon itself runs
 /// (ADR 0026).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Daemon {
     /// The service user: whom a daemon that runs as root starts the edge,
@@ -702,6 +844,29 @@ pub struct Daemon {
     /// `muru`). Never root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Allow `muructl debug exec`, which runs code in a worker (section
+    /// 11.7); off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_exec: Option<bool>,
+    /// The node's budget across every application (section 7.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+}
+
+/// The `[daemon.budget]` table (section 7.4): what the releases on the
+/// node may hold between them. Each limit is off when omitted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    /// Worker processes and managed server instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<u32>,
+    /// Memory for the hosts and workers, as a size such as 12GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// CPU cores the workers use, as measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
 }
 
 /// The `[secrets]` table of the daemon's file (section 10.8).
@@ -757,6 +922,11 @@ pub struct Timeouts {
     /// (default 5s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced as for the hard timeout (default
+    /// 10s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_stall_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -790,7 +960,7 @@ pub struct Logging {
 }
 
 /// The `[dashboard]` table (section 10.7): where the daemon serves its
-/// read-only dashboard and JSON gateway.
+/// dashboard and JSON gateway, and whether it takes actions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dashboard {
@@ -798,6 +968,26 @@ pub struct Dashboard {
     /// 127.0.0.1:8090; not served when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
+    /// Whether a person signed in with `muructl dashboard login` may act
+    /// from the dashboard; read-only when false, the default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub actions: bool,
+}
+
+/// The `[overlay_webhook]` table (section 9.10): where the daemon takes
+/// signed requests from monitoring and alerting systems to activate and
+/// end the overlays that declare the external trigger.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayWebhook {
+    /// The address served, such as 0.0.0.0:9466.
+    pub listen: String,
+    /// The key requests are signed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// A file holding the key, in place of `secret`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_file: Option<String>,
 }
 
 /// An `[[events.sink]]` entry (section 11.5): a webhook that receives
@@ -895,6 +1085,10 @@ pub struct Limits {
     /// HTTP/2 settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http2: Option<Http2Limits>,
+    /// What stored uploads may hold at once across every application
+    /// (section 4.11); no limit without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spool_quota: Option<String>,
 }
 
 /// The `[limits.http2]` table (section 4.18).
@@ -939,6 +1133,12 @@ pub struct Listener {
     /// virtual hosts it serves, chosen by SNI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tls: bool,
+    /// Section 6.13: on a listener without TLS, the clients that may
+    /// speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or
+    /// private; every client when omitted, none when empty. The others
+    /// are served HTTP/1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2c: Option<Vec<String>>,
 }
 
 /// How forwarding headers are left after they have been applied.
@@ -1033,6 +1233,10 @@ pub struct Host {
     /// (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_override: Option<ErrorOverride>,
+    /// The `[rate_limit.NAME]` tables applied to every request for the
+    /// host (section 4.15), before a route's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<String>,
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
@@ -1051,11 +1255,20 @@ pub struct HostTls {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    /// A name for the route, unique among routes, by which overlays
+    /// change it (section 9.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The virtual host.
     pub host: String,
     /// The path prefix, `/` for everything. The longest prefix wins.
     #[serde(default = "root_path")]
     pub path: String,
+    /// The client classes (section 4.14) the route takes; every request
+    /// without it. Among routes with the same path, one naming the
+    /// request's class comes first.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<ClientMatch>,
     /// The application whose serving release takes the requests; empty
     /// for a static or upstream route.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1111,7 +1324,1206 @@ pub struct Route {
     /// it serves the route (section 4.16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    /// The largest request body, for example 1GB, replacing the daemon's
+    /// `[limits]` value for the route (section 4.6). On an upload route
+    /// it bounds the body as received, files included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<String>,
+    /// Section 4.11: `multipart` or `raw` makes the edge receive and store
+    /// uploads before the application sees the request; off without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<String>,
+    /// The largest uploaded file, for example 512MB; no limit without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_size: Option<String>,
+    /// The most files in one request (100 by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<u32>,
+    /// The digests computed while receiving: sha256 (the default),
+    /// sha384, sha512 or sha1; an empty list for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Vec<String>>,
+    /// Ask the application with the request's headers alone first, and
+    /// read the body only when it answers 2xx (false by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precheck: Option<bool>,
+    /// What the application's stored uploads may hold at once when a
+    /// request on the route arrives (10GB by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spool_quota: Option<String>,
+    /// The `[rate_limit.NAME]` tables applied to the route's requests
+    /// (section 4.15), after the host's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<String>,
+    /// Methods the route refuses (section 4.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Methods>,
+    /// The site mode passed to the application as muru.mode, for example
+    /// read-only (section 4.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
+
+impl Route {
+    /// The client classes the route is for, empty for every request.
+    pub fn classes(&self) -> &[String] {
+        self.matches
+            .as_ref()
+            .map_or(&[], |matches| matches.client_class.as_slice())
+    }
+
+    /// What identifies the route within its host: the path, followed by
+    /// the classes it is for, so routes for different classes may share
+    /// a path.
+    pub fn key(&self) -> String {
+        let mut classes = self.classes().to_vec();
+
+        if classes.is_empty() {
+            return self.path.clone();
+        }
+
+        classes.sort();
+        classes.dedup();
+        format!("{} client_class={}", self.path, classes.join(","))
+    }
+}
+
+/// A route's method restrictions (section 4.15).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Methods {
+    /// The methods refused, for example POST, PUT, PATCH and DELETE.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// `read_only` (the default) answers 503 read_only;
+    /// `method_not_allowed` answers 405 with the methods left in Allow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+}
+
+/// Check a route's rate limit names, method restrictions and mode.
+/// Whether the rate limits exist is for the daemon to check.
+pub fn check_route_policies(route: &Route) -> Result<(), String> {
+    for name in &route.rate_limits {
+        check_policy_name("rate_limits", name)?;
+    }
+
+    check_client_match(route.matches.as_ref())?;
+
+    for class in route
+        .traffic
+        .iter()
+        .flat_map(|traffic| traffic.classes.keys())
+    {
+        check_policy_name("traffic.classes", class)?;
+    }
+
+    if let Some(methods) = &route.methods {
+        if methods.deny.is_empty() {
+            return Err("methods.deny names no method".to_owned());
+        }
+
+        for method in &methods.deny {
+            if method.is_empty() || !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+                return Err(format!(
+                    "methods.deny: {method:?} is not a method such as POST"
+                ));
+            }
+        }
+
+        if let Some(answer) = &methods.answer
+            && answer != "read_only"
+            && answer != "method_not_allowed"
+        {
+            return Err(format!(
+                "methods.answer must be read_only or method_not_allowed, not {answer:?}"
+            ));
+        }
+    }
+
+    if let Some(mode) = &route.mode
+        && (mode.is_empty() || mode.len() > 64 || !mode.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(format!(
+            "mode: {mode:?} must be a short word such as read-only"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check a route's or worker group's `match`: it names at least one
+/// client class, each a valid name. `default` is the class of requests
+/// no rule matches, and may be named.
+pub fn check_client_match(matches: Option<&ClientMatch>) -> Result<(), String> {
+    let Some(matches) = matches else {
+        return Ok(());
+    };
+
+    if matches.client_class.is_empty() {
+        return Err("match.client_class names no class".to_owned());
+    }
+
+    for class in &matches.client_class {
+        check_policy_name("match.client_class", class)?;
+    }
+
+    Ok(())
+}
+
+/// A client class or rate limit name: lower case letters, digits, `_`
+/// and `-`, as `ai_crawler` or `crawlers`.
+fn check_policy_name(key: &str, name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        });
+
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key}: {name:?} must be lower case letters, digits, _ and -"
+        ))
+    }
+}
+
+/// A `[[client_class]]` rule (section 4.14). A request gets the class
+/// when every input the rule names matches, each input matching when any
+/// of its entries does; rules are tried in order and a request that
+/// matches none is class `default`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientClass {
+    /// The class's name, as logs, metrics, rate limits and applications
+    /// see it.
+    pub name: String,
+    /// User-Agent substrings, compared without regard to case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent: Vec<String>,
+    /// User-Agent regular expressions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_regex: Vec<String>,
+    /// A file of User-Agent substrings, one a line, relative to the
+    /// configuration file's directory and read again when it changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent_list: Option<String>,
+    /// Client addresses and networks, such as 203.0.113.0/24.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    /// A file of addresses and networks, one a line, as for
+    /// `user_agent_list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_list: Option<String>,
+    /// JA4 fingerprints of the client's TLS ClientHello, or their
+    /// beginnings ending in `*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ja4: Vec<String>,
+    /// A file of JA4 fingerprints, one a line, as for `user_agent_list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_list: Option<String>,
+    /// Request headers by name, each value matched by a regular
+    /// expression: a CDN's verdict, say.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Cookies by name, each value matched by a regular expression.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cookies: BTreeMap<String, String>,
+    /// `dns` confirms the client's address by reverse and forward lookup
+    /// against `verify_domains`; until it is confirmed the rule does not
+    /// match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<String>,
+    /// The domains a verified name must be, or end in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_domains: Vec<String>,
+}
+
+/// The class a request matching no rule gets.
+pub const DEFAULT_CLIENT_CLASS: &str = "default";
+
+/// An `[overlay.NAME]` table (section 9.10): changes to named routes and
+/// to applications, applied over the base configuration while the
+/// overlay is active, by its schedule or by hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Overlay {
+    /// Changes to routes, by the route's `name`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, RouteOverlay>,
+    /// Changes to applications, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, AppOverlay>,
+    /// When the overlay is active on its own; by hand only without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<OverlayTrigger>,
+    /// What must hold for the overlay to activate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Preconditions>,
+    /// Which of two active overlays setting the same field wins: the
+    /// higher. Overlays that would conflict must both set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    /// Once its schedule activates it, it stays active past the window
+    /// until a person ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latch: Option<bool>,
+    /// Its schedule only raises overlay.would_activate events; it is
+    /// activated by hand only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<bool>,
+    /// What to start ahead of its schedule's windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_up: Option<WarmUp>,
+}
+
+/// An overlay's warm-up: for `lead` before each window of its schedule,
+/// `start_release` runs, so a switch to it lands on warm workers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmUp {
+    /// How long before the window, such as 30m.
+    pub lead: String,
+    /// The release to start, as app@release, or as release when the
+    /// overlay changes routes of one application only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_release: Option<String>,
+}
+
+/// What an overlay changes on a route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteOverlay {
+    /// The site mode (section 4.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Methods refused, as the route's `methods.deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<Vec<String>>,
+    /// How refused methods are answered, as the route's `methods.answer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// The traffic policy: a pin sends every request to one release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<TrafficOverlay>,
+    /// What serves the route instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RouteTarget>,
+    /// The rate limits, in place of the route's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<Vec<String>>,
+    /// Error pages (section 4.12), by status or status:reason, each in
+    /// place of the route's page for the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_pages: Option<BTreeMap<String, ErrorPage>>,
+    /// Routes for client classes (section 4.14) at the route's host and
+    /// path, by class: each a copy of the route with these changes, or the
+    /// route for that class already there with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_routes: Option<BTreeMap<String, RouteOverlay>>,
+}
+
+/// An overlay's traffic policy for a route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrafficOverlay {
+    /// Send every request to this release of the route's application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// Shares by release, in place of the route's split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<BTreeMap<String, u32>>,
+}
+
+/// What serves a route under an overlay: one of an application, a
+/// static directory or an upstream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTarget {
+    /// An application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// A directory the edge serves (section 4.9).
+    #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
+    pub static_dir: Option<String>,
+    /// An HTTP upstream (section 4.13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+}
+
+/// What an overlay changes on an application: its maintenance mode, and
+/// the capacity of section 7.5, for its default worker group or `group`.
+/// Capacity does not conflict between overlays: the highest floor and
+/// ceiling stand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppOverlay {
+    /// Maintenance mode (section 4.12) while the overlay is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<bool>,
+    /// The site mode (section 4.15) on each of the application's routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Methods refused on each of the application's routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<Vec<String>>,
+    /// How refused methods are answered, as a route's `methods.answer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// The worker group the capacity applies to; the default group
+    /// without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The fewest workers, a floor over the group's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workers: Option<u32>,
+    /// The most workers, a ceiling over the group's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<u32>,
+    /// `hold` keeps the group from scaling in; `normal` (the default)
+    /// leaves it to the autoscaler's rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_in: Option<String>,
+    /// Refuse deploys and rollouts of the application unless overridden
+    /// (section 9.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_deploys: Option<bool>,
+}
+
+impl AppOverlay {
+    /// Whether it sets any capacity.
+    pub fn sets_capacity(&self) -> bool {
+        self.min_workers.is_some() || self.max_workers.is_some() || self.scale_in.is_some()
+    }
+}
+
+/// An `[[app.NAME.schedule]]` entry (section 7.5): capacity for a window,
+/// shorthand for an overlay named `APP.NAME` that sets only the floor,
+/// the ceiling, how scale-in behaves and a deploy freeze.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacitySchedule {
+    /// The schedule's name, unique within the application.
+    pub name: String,
+    /// A one-off window's start, as for an overlay's schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// A one-off window's end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// A recurring window's start times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// A recurring window's length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    /// The time zone of local times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// The worker group; the default group without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workers: Option<u32>,
+    /// The ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<u32>,
+    /// How long before each window the floor applies, such as 30m.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_up: Option<String>,
+    /// `hold` or `normal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_in: Option<String>,
+    /// Refuse deploys and rollouts during the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_deploys: Option<bool>,
+}
+
+impl CapacitySchedule {
+    /// The overlay the schedule stands for, on application `app`.
+    pub fn overlay(&self, app: &str) -> Overlay {
+        let change = AppOverlay {
+            maintenance: None,
+            group: self.group.clone(),
+            min_workers: self.min_workers,
+            max_workers: self.max_workers,
+            scale_in: self.scale_in.clone(),
+            freeze_deploys: self.freeze_deploys,
+            ..AppOverlay::default()
+        };
+        let schedule = OverlaySchedule {
+            start: self.start.clone(),
+            end: self.end.clone(),
+            cron: self.cron.clone(),
+            duration: self.duration.clone(),
+            timezone: self.timezone.clone(),
+        };
+        Overlay {
+            apps: BTreeMap::from([(app.to_owned(), change)]),
+            trigger: Some(OverlayTrigger {
+                schedule: Some(schedule),
+                external: None,
+            }),
+            warm_up: self.warm_up.clone().map(|lead| WarmUp {
+                lead,
+                start_release: None,
+            }),
+            ..Overlay::default()
+        }
+    }
+
+    /// The schedule an overlay named `APP.NAME` stands for, as (APP,
+    /// schedule), when it is one.
+    pub fn from_overlay(name: &str, overlay: &Overlay) -> Option<(String, Self)> {
+        let (app, schedule_name) = name.split_once('.')?;
+        let change = overlay.apps.get(app)?;
+        let schedule = overlay.trigger.as_ref()?.schedule.as_ref()?;
+        let found = Self {
+            name: schedule_name.to_owned(),
+            start: schedule.start.clone(),
+            end: schedule.end.clone(),
+            cron: schedule.cron.clone(),
+            duration: schedule.duration.clone(),
+            timezone: schedule.timezone.clone(),
+            group: change.group.clone(),
+            min_workers: change.min_workers,
+            max_workers: change.max_workers,
+            warm_up: overlay.warm_up.as_ref().map(|warm_up| warm_up.lead.clone()),
+            scale_in: change.scale_in.clone(),
+            freeze_deploys: change.freeze_deploys,
+        };
+        (found.overlay(app) == *overlay).then(|| (app.to_owned(), found))
+    }
+}
+
+/// When an overlay is active on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayTrigger {
+    /// A window in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<OverlaySchedule>,
+    /// Whether the signed webhook of the `[overlay_webhook]` table may
+    /// activate and end it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
+}
+
+/// A window in time: one-off, from `start` until `end` when it has one,
+/// or recurring, from each time `cron` names for `duration`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlaySchedule {
+    /// When it starts, as a local date and time such as
+    /// 2026-11-02T09:00, or with an offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// When it ends; it stays active until ended or promoted without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// When each window starts, as a cron expression such as
+    /// '0 2 * * *' (see [`cron::Cron`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// How long each recurring window lasts, such as 1h.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    /// The time zone local times are in, such as Australia/Sydney; the
+    /// daemon's own zone without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// What must hold for an overlay to activate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preconditions {
+    /// A release that must be ready, as app@release, or as release when
+    /// the overlay changes routes of one application only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_ready: Option<String>,
+}
+
+/// Check an overlay on its own: its name, the changes, the schedule and
+/// the preconditions. Whether the routes, applications, releases and
+/// limits it names exist is for the daemon to check.
+pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
+    if overlay.routes.is_empty() && overlay.apps.is_empty() {
+        return Err(format!(
+            "overlay {name}: changes no route and no application"
+        ));
+    }
+
+    for (route, change) in &overlay.routes {
+        check_route_overlay(change, true)
+            .map_err(|error| format!("overlay {name}: routes.{route}: {error}"))?;
+    }
+
+    let schedule = overlay
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.schedule.as_ref());
+
+    if let Some(schedule) = schedule {
+        check_schedule(schedule).map_err(|error| format!("overlay {name}: schedule: {error}"))?;
+    }
+
+    if let Some(warm_up) = &overlay.warm_up {
+        if schedule.is_none() {
+            return Err(format!(
+                "overlay {name}: warm_up needs a schedule to start ahead of"
+            ));
+        }
+
+        parse_duration(&warm_up.lead)
+            .map_err(|error| format!("overlay {name}: warm_up.lead: {error}"))?;
+    }
+
+    for (app, change) in &overlay.apps {
+        check_app_overlay(change)
+            .map_err(|error| format!("overlay {name}: apps.{app}: {error}"))?;
+    }
+
+    if (overlay.latch.is_some() || overlay.advisory.is_some()) && schedule.is_none() {
+        return Err(format!(
+            "overlay {name}: latch and advisory apply to a schedule, and it has none"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check what an overlay sets on a route, and on the routes for client
+/// classes in `client_routes` when `outer`.
+fn check_route_overlay(change: &RouteOverlay, outer: bool) -> Result<(), String> {
+    let methods = change.deny.as_ref().map(|deny| Methods {
+        deny: deny.clone(),
+        answer: change.answer.clone(),
+    });
+    let probe = Route {
+        mode: change.mode.clone(),
+        methods,
+        rate_limits: change.rate_limits.clone().unwrap_or_default(),
+        ..Route::default()
+    };
+    check_route_policies(&probe)?;
+
+    if change.answer.is_some() && change.deny.is_none() {
+        return Err("answer needs deny".to_owned());
+    }
+
+    if let Some(pages) = &change.error_pages {
+        if pages.is_empty() {
+            return Err("error_pages names no page".to_owned());
+        }
+
+        check_error_pages(pages, false)?;
+    }
+
+    if let Some(traffic) = &change.traffic
+        && traffic.pin.is_some() == traffic.split.is_some()
+    {
+        return Err("traffic sets one of pin and split".to_owned());
+    }
+
+    if let Some(target) = &change.target {
+        let named = usize::from(target.app.is_some())
+            + usize::from(target.static_dir.is_some())
+            + usize::from(target.upstream.is_some());
+
+        if named != 1 {
+            return Err("target names one of app, static and upstream".to_owned());
+        }
+    }
+
+    let Some(routes) = &change.client_routes else {
+        return Ok(());
+    };
+
+    if !outer {
+        return Err("client_routes is set on a route, not on a client class's".to_owned());
+    }
+
+    if routes.is_empty() {
+        return Err("client_routes names no class".to_owned());
+    }
+
+    for (class, route) in routes {
+        check_policy_name("client_routes", class)?;
+
+        if route == &RouteOverlay::default() {
+            return Err(format!("client_routes.{class} sets nothing"));
+        }
+
+        check_route_overlay(route, false)
+            .map_err(|error| format!("client_routes.{class}: {error}"))?;
+    }
+
+    Ok(())
+}
+
+/// Check what an overlay sets on an application: a floor of at least
+/// one, no higher than the ceiling, and a known `scale_in`.
+fn check_app_overlay(change: &AppOverlay) -> Result<(), String> {
+    if change.maintenance.is_none()
+        && !change.sets_capacity()
+        && change.freeze_deploys.is_none()
+        && change.mode.is_none()
+        && change.deny.is_none()
+    {
+        return Err("sets nothing".to_owned());
+    }
+
+    // Section 4.15: the site mode and methods, as a route's.
+
+    let probe = Route {
+        mode: change.mode.clone(),
+        methods: change.deny.as_ref().map(|deny| Methods {
+            deny: deny.clone(),
+            answer: change.answer.clone(),
+        }),
+        ..Route::default()
+    };
+    check_route_policies(&probe)?;
+
+    if change.answer.is_some() && change.deny.is_none() {
+        return Err("answer needs deny".to_owned());
+    }
+
+    if change.group.is_some() && !change.sets_capacity() {
+        return Err("group names where capacity applies, and none is set".to_owned());
+    }
+
+    if change.min_workers == Some(0) {
+        return Err("min_workers must be at least 1".to_owned());
+    }
+
+    if let (Some(min), Some(max)) = (change.min_workers, change.max_workers)
+        && max < min
+    {
+        return Err(format!("max_workers {max} is below min_workers {min}"));
+    }
+
+    if let Some(scale_in) = &change.scale_in
+        && !matches!(scale_in.as_str(), "hold" | "normal")
+    {
+        return Err(format!("scale_in {scale_in:?} is not hold or normal"));
+    }
+
+    Ok(())
+}
+
+/// Check a schedule: a `start` with an optional `end`, or a `cron` with
+/// a `duration`, in a time zone that exists.
+pub fn check_schedule(schedule: &OverlaySchedule) -> Result<(), String> {
+    let zone = schedule.timezone.as_deref();
+
+    match (&schedule.start, &schedule.cron) {
+        (Some(start), None) => {
+            if schedule.duration.is_some() {
+                return Err("duration goes with cron; a start has an end".to_owned());
+            }
+
+            let start = parse_moment(start, zone).map_err(|error| format!("start: {error}"))?;
+
+            if let Some(end) = &schedule.end {
+                let end = parse_moment(end, zone).map_err(|error| format!("end: {error}"))?;
+
+                if end <= start {
+                    return Err("end must be after its start".to_owned());
+                }
+            }
+        }
+        (None, Some(expression)) => {
+            if schedule.end.is_some() {
+                return Err("end goes with start; cron has a duration".to_owned());
+            }
+
+            let Some(duration) = &schedule.duration else {
+                return Err("cron needs a duration, such as 1h".to_owned());
+            };
+
+            if parse_duration(duration).map_err(|error| format!("duration: {error}"))?
+                < Duration::from_secs(60)
+            {
+                return Err("duration must be at least a minute".to_owned());
+            }
+
+            let cron = cron::Cron::parse(expression)?;
+            let zone = time_zone(zone)?;
+
+            if cron.next(jiff::Timestamp::now(), &zone).is_none() {
+                return Err(format!("cron {expression:?} never occurs"));
+            }
+        }
+        _ => return Err("give one of start and cron".to_owned()),
+    }
+
+    Ok(())
+}
+
+/// The window of a schedule that `now` falls in, else the next one, as
+/// Unix milliseconds: from its start, until its end when it has one. None
+/// when no window is to come, or for a schedule that does not parse.
+pub fn schedule_window(schedule: &OverlaySchedule, now: i64) -> Option<(i64, Option<i64>)> {
+    let zone = schedule.timezone.as_deref();
+
+    if let Some(start) = &schedule.start {
+        let start = parse_moment(start, zone).ok()?;
+
+        let end = match &schedule.end {
+            Some(end) => Some(parse_moment(end, zone).ok()?),
+            None => None,
+        };
+
+        return Some((start, end));
+    }
+
+    let cron = cron::Cron::parse(schedule.cron.as_deref()?).ok()?;
+    let length = parse_duration(schedule.duration.as_deref()?)
+        .ok()?
+        .as_millis() as i64;
+    let zone = time_zone(zone).ok()?;
+    let at = jiff::Timestamp::from_millisecond(now).ok()?;
+
+    // The latest start covers now if any does, as each window is as long.
+
+    if let Some(last) = cron.previous(at, &zone) {
+        let start = last.as_millisecond();
+
+        if now < start + length {
+            return Some((start, Some(start + length)));
+        }
+    }
+
+    let next = cron.next(at, &zone)?.as_millisecond();
+    Some((next, Some(next + length)))
+}
+
+/// A time zone by its IANA name, or the system's without one.
+pub fn time_zone(name: Option<&str>) -> Result<jiff::tz::TimeZone, String> {
+    match name {
+        Some(name) => jiff::tz::TimeZone::get(name)
+            .map_err(|_| format!("{name:?} is not a time zone such as Australia/Sydney")),
+        None => Ok(jiff::tz::TimeZone::system()),
+    }
+}
+
+/// A schedule as the reports show it.
+pub fn describe_schedule(schedule: &OverlaySchedule) -> String {
+    let when = match (&schedule.start, &schedule.cron) {
+        (Some(start), _) => format!(
+            "from {start}{}",
+            schedule
+                .end
+                .as_ref()
+                .map(|end| format!(" until {end}"))
+                .unwrap_or_default()
+        ),
+        (None, Some(cron)) => format!(
+            "cron '{cron}' for {}",
+            schedule.duration.as_deref().unwrap_or_default()
+        ),
+        (None, None) => String::new(),
+    };
+
+    match &schedule.timezone {
+        Some(zone) => format!("{when} {zone}"),
+        None => when,
+    }
+}
+
+/// A moment as Unix milliseconds: an RFC 3339 time with an offset, or a
+/// local date and time (seconds optional) in `timezone`, the system's
+/// zone without one. A local time that a daylight saving change skips or
+/// repeats takes the later or earlier instant as Temporal's compatible
+/// rule does.
+pub fn parse_moment(text: &str, timezone: Option<&str>) -> Result<i64, String> {
+    let text = text.trim();
+
+    if let Ok(instant) = text.parse::<jiff::Timestamp>() {
+        return Ok(instant.as_millisecond());
+    }
+
+    let zone = time_zone(timezone)?;
+
+    let civil: jiff::civil::DateTime = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a date and time such as 2026-11-02T09:00"))?;
+    let zoned = civil
+        .to_zoned(zone)
+        .map_err(|error| format!("{text:?}: {error}"))?;
+    Ok(zoned.timestamp().as_millisecond())
+}
+
+/// Check a `[[client_class]]` rule: a name, at least one input, regular
+/// expressions that compile and a verification with its domains. Whether
+/// the list files can be read is for the daemon to check.
+pub fn check_client_class(class: &ClientClass) -> Result<(), String> {
+    check_policy_name("client_class", &class.name)?;
+
+    if class.name == DEFAULT_CLIENT_CLASS {
+        return Err("client_class: default is the class of requests no rule matches".to_owned());
+    }
+
+    let inputs = !class.user_agent.is_empty()
+        || !class.user_agent_regex.is_empty()
+        || class.user_agent_list.is_some()
+        || !class.addresses.is_empty()
+        || class.address_list.is_some()
+        || !class.ja4.is_empty()
+        || class.ja4_list.is_some()
+        || !class.headers.is_empty()
+        || !class.cookies.is_empty();
+
+    if !inputs {
+        return Err(format!(
+            "client_class {}: names nothing to match",
+            class.name
+        ));
+    }
+
+    if let Some(fingerprint) = class
+        .ja4
+        .iter()
+        .find(|fingerprint| fingerprint.is_empty() || fingerprint.contains(char::is_whitespace))
+    {
+        return Err(format!(
+            "client_class {}: {fingerprint:?} is not a JA4 fingerprint",
+            class.name
+        ));
+    }
+
+    for pattern in class
+        .user_agent_regex
+        .iter()
+        .chain(class.headers.values())
+        .chain(class.cookies.values())
+    {
+        regex::Regex::new(pattern).map_err(|error| {
+            format!(
+                "client_class {}: {pattern:?} is not a regular expression: {error}",
+                class.name
+            )
+        })?;
+    }
+
+    match class.verify.as_deref() {
+        None if !class.verify_domains.is_empty() => {
+            return Err(format!(
+                "client_class {}: verify_domains needs verify = 'dns'",
+                class.name
+            ));
+        }
+        None => {}
+        Some("dns") if class.verify_domains.is_empty() => {
+            return Err(format!(
+                "client_class {}: verify = 'dns' needs verify_domains",
+                class.name
+            ));
+        }
+        Some("dns") => {}
+        Some(other) => {
+            return Err(format!(
+                "client_class {}: verify must be dns, not {other:?}",
+                class.name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// A `[rate_limit.NAME]` table (section 4.15): a token bucket for each
+/// key, which requests of the matching classes draw from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    /// Which requests draw from the buckets; all of them without it.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<ClientMatch>,
+    /// What a bucket is kept for: `address` (the default),
+    /// `client_class`, `header:NAME`, `cookie:NAME`, or a list of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<RateLimitKey>,
+    /// How fast a bucket fills, for example 2/s, 100/m or 1000/h.
+    pub rate: String,
+    /// How many requests a full bucket allows at once (the rate's count
+    /// by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+    /// `reject` (the default) answers 429, `delay` holds the request up
+    /// to `max_delay` first, `log` only counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// The longest a request is held under `delay` (1s by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<String>,
+    /// The leading bits of an IPv4 address that make the key (32).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_prefix: Option<u8>,
+    /// The leading bits of an IPv6 address that make the key (64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_prefix: Option<u8>,
+    /// Send the RateLimit-Policy and RateLimit fields with a 429.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<bool>,
+}
+
+/// The requests a rate limit, route or worker group applies to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientMatch {
+    /// Client classes (section 4.14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<String>,
+}
+
+/// One key part or several.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RateLimitKey {
+    /// A single part.
+    One(String),
+    /// Parts combined.
+    Many(Vec<String>),
+}
+
+/// A rate limit with its defaults in place, as `check_rate_limit`
+/// resolves it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitSettings {
+    /// The classes it applies to; every class when empty.
+    pub classes: Vec<String>,
+    /// The key's parts.
+    pub key: Vec<String>,
+    /// Tokens added each second.
+    pub per_second: f64,
+    /// The bucket's size.
+    pub burst: u32,
+    /// reject, delay or log.
+    pub action: String,
+    /// The longest hold under delay.
+    pub max_delay: std::time::Duration,
+    /// The address prefixes.
+    pub ipv4_prefix: u8,
+    /// The address prefixes.
+    pub ipv6_prefix: u8,
+    /// Whether a 429 carries the RateLimit fields.
+    pub headers: bool,
+}
+
+/// Parse a rate such as 2/s, 100/m or 1000/h into the count and the
+/// period's seconds.
+pub fn parse_rate(text: &str) -> Result<(u32, u64), String> {
+    let (count, period) = text
+        .split_once('/')
+        .ok_or_else(|| format!("{text:?} is not a rate such as 2/s, 100/m or 1000/h"))?;
+    let count: u32 = count
+        .trim()
+        .parse()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| format!("{text:?} is not a rate such as 2/s, 100/m or 1000/h"))?;
+
+    let seconds = match period.trim() {
+        "s" | "second" => 1,
+        "m" | "minute" => 60,
+        "h" | "hour" => 3600,
+        _ => {
+            return Err(format!(
+                "{text:?} is not a rate such as 2/s, 100/m or 1000/h"
+            ));
+        }
+    };
+
+    Ok((count, seconds))
+}
+
+/// Check a `[rate_limit.NAME]` table and resolve it with its defaults.
+pub fn check_rate_limit(name: &str, limit: &RateLimit) -> Result<RateLimitSettings, String> {
+    check_policy_name("rate_limit", name)?;
+    let (count, seconds) =
+        parse_rate(&limit.rate).map_err(|error| format!("rate_limit {name}: rate: {error}"))?;
+
+    let key = match &limit.key {
+        None => vec!["address".to_owned()],
+        Some(RateLimitKey::One(part)) => vec![part.clone()],
+        Some(RateLimitKey::Many(parts)) => parts.clone(),
+    };
+
+    if key.is_empty() {
+        return Err(format!("rate_limit {name}: key names no part"));
+    }
+
+    for part in &key {
+        let valid = matches!(part.as_str(), "address" | "client_class")
+            || part
+                .strip_prefix("header:")
+                .or_else(|| part.strip_prefix("cookie:"))
+                .is_some_and(|rest| !rest.is_empty());
+
+        if !valid {
+            return Err(format!(
+                "rate_limit {name}: key {part:?} must be address, client_class, header:NAME or cookie:NAME"
+            ));
+        }
+    }
+
+    let action = limit.action.clone().unwrap_or_else(|| "reject".to_owned());
+
+    if !matches!(action.as_str(), "reject" | "delay" | "log") {
+        return Err(format!(
+            "rate_limit {name}: action must be reject, delay or log, not {action:?}"
+        ));
+    }
+
+    let max_delay = match &limit.max_delay {
+        Some(_) if action != "delay" => {
+            return Err(format!(
+                "rate_limit {name}: max_delay needs action = 'delay'"
+            ));
+        }
+        Some(text) => parse_duration(text)
+            .map_err(|error| format!("rate_limit {name}: max_delay: {error}"))?,
+        None => std::time::Duration::from_secs(1),
+    };
+
+    let ipv4_prefix = limit.ipv4_prefix.unwrap_or(32);
+    let ipv6_prefix = limit.ipv6_prefix.unwrap_or(64);
+
+    if ipv4_prefix == 0 || ipv4_prefix > 32 || ipv6_prefix == 0 || ipv6_prefix > 128 {
+        return Err(format!(
+            "rate_limit {name}: ipv4_prefix is 1 to 32 and ipv6_prefix 1 to 128"
+        ));
+    }
+
+    let classes = limit
+        .matches
+        .as_ref()
+        .map(|matches| matches.client_class.clone())
+        .unwrap_or_default();
+
+    for class in &classes {
+        check_policy_name("match.client_class", class)?;
+    }
+
+    Ok(RateLimitSettings {
+        classes,
+        key,
+        per_second: f64::from(count) / seconds as f64,
+        burst: limit.burst.unwrap_or(count).max(1),
+        action,
+        max_delay,
+        ipv4_prefix,
+        ipv6_prefix,
+        headers: limit.headers.unwrap_or(false),
+    })
+}
+
+/// The upload settings of a route with their defaults in place (section
+/// 4.11), as `check_upload` resolves them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadSettings {
+    /// `multipart` or `raw`.
+    pub mode: String,
+    /// Bytes per file; no limit when none.
+    pub max_file_size: Option<u64>,
+    /// Files per request.
+    pub max_files: u32,
+    /// Digest algorithms, in the order given.
+    pub hash: Vec<String>,
+    /// Ask the application first.
+    pub precheck: bool,
+    /// Bytes the application's stored uploads may hold at once.
+    pub spool_quota: u64,
+}
+
+/// The digest algorithms an upload route may ask for.
+pub const UPLOAD_HASHES: [&str; 4] = ["sha256", "sha384", "sha512", "sha1"];
+
+/// Files per upload request unless the route says otherwise.
+pub const DEFAULT_MAX_FILES: u32 = 100;
+
+/// What an application's stored uploads may hold unless the route says
+/// otherwise.
+pub const DEFAULT_SPOOL_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Check a route's body limit and upload keys, and resolve the upload
+/// settings with their defaults: none when the route takes no uploads.
+/// The upload keys other than `upload` need it, and `max_files` stays
+/// within what one request can pass to a worker.
+pub fn check_upload(route: &Route) -> Result<Option<UploadSettings>, String> {
+    if let Some(size) = &route.max_body_size {
+        parse_size(size).map_err(|error| format!("max_body_size: {error}"))?;
+    }
+
+    let Some(mode) = &route.upload else {
+        let stray = [
+            ("max_file_size", route.max_file_size.is_some()),
+            ("max_files", route.max_files.is_some()),
+            ("hash", route.hash.is_some()),
+            ("precheck", route.precheck.is_some()),
+            ("spool_quota", route.spool_quota.is_some()),
+        ];
+
+        return match stray.iter().find(|(_, set)| *set) {
+            Some((key, _)) => Err(format!("{key} needs upload = 'multipart' or 'raw'")),
+            None => Ok(None),
+        };
+    };
+
+    if mode != "multipart" && mode != "raw" {
+        return Err(format!("upload must be multipart or raw, not {mode:?}"));
+    }
+
+    let max_file_size = route
+        .max_file_size
+        .as_deref()
+        .map(parse_size)
+        .transpose()
+        .map_err(|error| format!("max_file_size: {error}"))?;
+    let max_files = route.max_files.unwrap_or(DEFAULT_MAX_FILES);
+
+    if max_files == 0 || max_files > MAX_UPLOAD_FILES {
+        return Err(format!(
+            "max_files must be from 1 to {MAX_UPLOAD_FILES}, not {max_files}"
+        ));
+    }
+
+    let hash = route
+        .hash
+        .clone()
+        .unwrap_or_else(|| vec!["sha256".to_owned()]);
+
+    for name in &hash {
+        if !UPLOAD_HASHES.contains(&name.as_str()) {
+            return Err(format!(
+                "hash: {name:?} is not one of {}",
+                UPLOAD_HASHES.join(", ")
+            ));
+        }
+    }
+
+    let spool_quota = match &route.spool_quota {
+        Some(size) => parse_size(size).map_err(|error| format!("spool_quota: {error}"))?,
+        None => DEFAULT_SPOOL_QUOTA,
+    };
+
+    Ok(Some(UploadSettings {
+        mode: mode.clone(),
+        max_file_size,
+        max_files,
+        hash,
+        precheck: route.precheck.unwrap_or(false),
+        spool_quota,
+    }))
+}
+
+/// The most files one request may carry to a worker.
+pub const MAX_UPLOAD_FILES: u32 = 500;
 
 /// A route's authentication sub-request (section 4.16): the edge sends a
 /// bodiless GET to an application path and serves the route only when
@@ -1181,6 +2593,11 @@ pub struct Traffic {
     /// alive, for example 10m (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky_grace: Option<String>,
+    /// The release, by id, or `upstream:NAME`, that takes every request
+    /// of a client class (section 4.14), ahead of stickiness and the
+    /// split.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub classes: BTreeMap<String, String>,
 }
 
 /// A static route's fallback (section 4.9): an application, or a file
@@ -1672,6 +3089,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                 timeouts.soft_timeout.is_some()
                     || timeouts.hard_timeout.is_some()
                     || timeouts.hard_drain_grace.is_some()
+                    || timeouts.loop_stall_timeout.is_some()
             }),
         ),
     ];
@@ -1877,6 +3295,9 @@ pub struct App {
     /// Releases by identifier.
     #[serde(default)]
     pub release: BTreeMap<String, Release>,
+    /// Scheduled capacity (section 7.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule: Vec<CapacitySchedule>,
     /// The user the application's hosts and workers run as, when the
     /// daemon runs as root (section 10.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1887,6 +3308,10 @@ pub struct App {
     /// The file creation mask, in octal, for example 027.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub umask: Option<String>,
+    /// Which applications' scale-ups the node's budget admits first, the
+    /// highest first (section 7.4); 0 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -1944,9 +3369,23 @@ pub struct Document {
     /// The dashboard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard: Option<Dashboard>,
+    /// The overlays' external trigger (section 9.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_webhook: Option<OverlayWebhook>,
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
+    /// Client classification rules, in order (section 4.14), from the
+    /// daemon's own file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<ClientClass>,
+    /// Rate limits by name (section 4.15), from the daemon's own file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rate_limit: BTreeMap<String, RateLimit>,
+    /// Overlays by name (section 9.10): partial configuration laid over
+    /// the routes and applications while active.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overlay: BTreeMap<String, Overlay>,
     /// Routes, in the order written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<Route>,
@@ -1977,6 +3416,23 @@ impl Document {
     pub fn merge(&mut self, other: Document) -> Result<(), String> {
         self.listener.extend(other.listener);
         self.route.extend(other.route);
+        self.client_class.extend(other.client_class);
+
+        for (name, limit) in other.rate_limit {
+            if self.rate_limit.contains_key(&name) {
+                return Err(format!("rate_limit {name} is declared twice"));
+            }
+
+            self.rate_limit.insert(name, limit);
+        }
+
+        for (name, overlay) in other.overlay {
+            if self.overlay.contains_key(&name) {
+                return Err(format!("overlay {name} is declared twice"));
+            }
+
+            self.overlay.insert(name, overlay);
+        }
 
         if other.limits.is_some() {
             self.limits = other.limits;
@@ -1998,9 +3454,31 @@ impl Document {
             self.dashboard = other.dashboard;
         }
 
+        if other.overlay_webhook.is_some() {
+            self.overlay_webhook = other.overlay_webhook;
+        }
+
         if other.proxy.is_some() {
             self.proxy = other.proxy;
         }
+
+        if other.compression.is_some() {
+            self.compression = other.compression;
+        }
+
+        if other.error_override.is_some() {
+            self.error_override = other.error_override;
+        }
+
+        if other.secrets.is_some() {
+            self.secrets = other.secrets;
+        }
+
+        if other.logs.is_some() {
+            self.logs = other.logs;
+        }
+
+        self.error_pages.extend(other.error_pages);
 
         for (name, host) in other.host {
             if self.host.contains_key(&name) {
@@ -2030,12 +3508,27 @@ impl Document {
                 entry.umask = app.umask;
             }
 
+            if app.priority.is_some() {
+                entry.priority = app.priority;
+            }
+
             for (id, release) in app.release {
                 if entry.release.contains_key(&id) {
                     return Err(format!("release {name}@{id} is declared twice"));
                 }
 
                 entry.release.insert(id, release);
+            }
+
+            for schedule in app.schedule {
+                if entry.schedule.iter().any(|seen| seen.name == schedule.name) {
+                    return Err(format!(
+                        "schedule {} of {name} is declared twice",
+                        schedule.name
+                    ));
+                }
+
+                entry.schedule.push(schedule);
             }
         }
 
@@ -2055,6 +3548,13 @@ pub struct ToolMuru {
     /// The interface the entrypoint speaks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Interface>,
+    /// Serve gRPC server reflection for the registered services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<bool>,
+    /// The origins whose pages may call the gRPC methods through
+    /// gRPC-Web, or `*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grpc_web_origins: Vec<String>,
     /// Whether the entrypoint is a factory returning the application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<bool>,
@@ -2228,6 +3728,321 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 mod tests {
     use super::*;
 
+    fn upload_route(keys: &str) -> Route {
+        toml::from_str(&format!("host = 'shop'\napp = 'shop'\n{keys}")).unwrap()
+    }
+
+    #[test]
+    fn upload_settings_resolve_with_their_defaults() {
+        let settings = check_upload(&upload_route("upload = 'raw'"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.mode, "raw");
+        assert_eq!(settings.max_file_size, None);
+        assert_eq!(settings.max_files, DEFAULT_MAX_FILES);
+        assert_eq!(settings.hash, vec!["sha256".to_owned()]);
+        assert!(!settings.precheck);
+        assert_eq!(settings.spool_quota, DEFAULT_SPOOL_QUOTA);
+
+        let settings = check_upload(&upload_route(
+            "upload = 'multipart'\nmax_file_size = '5MB'\nhash = ['sha512', 'sha1']\nspool_quota = '1GB'",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(settings.max_file_size, Some(5 * 1024 * 1024));
+        assert_eq!(settings.hash, vec!["sha512".to_owned(), "sha1".to_owned()]);
+        assert_eq!(settings.spool_quota, 1024 * 1024 * 1024);
+        assert_eq!(check_upload(&upload_route("")).unwrap(), None);
+    }
+
+    #[test]
+    fn moments_are_read_in_their_time_zone() {
+        // 09:00 in Sydney in November is 22:00 UTC the day before.
+
+        assert_eq!(
+            parse_moment("2026-11-02T09:00", Some("Australia/Sydney")),
+            Ok(1_793_570_400_000)
+        );
+        assert_eq!(
+            parse_moment("2026-11-01T22:00:00Z", Some("Australia/Sydney")),
+            Ok(1_793_570_400_000)
+        );
+
+        // 02:30 does not exist on the morning clocks go forward in New
+        // York; it is read as 03:30.
+
+        assert_eq!(
+            parse_moment("2026-03-08T02:30", Some("America/New_York")),
+            parse_moment("2026-03-08T03:30", Some("America/New_York"))
+        );
+        assert!(parse_moment("2026-11-02T09:00", Some("Mars/Olympus")).is_err());
+        assert!(parse_moment("tomorrow", None).is_err());
+    }
+
+    #[test]
+    fn overlays_are_checked() {
+        let overlay = |text: &str| -> Overlay { toml::from_str(text).unwrap() };
+        assert!(check_overlay(
+            "backup",
+            &overlay("routes.shop-root = { mode = 'read-only', deny = ['POST'], error_pages = { '503:read_only' = { template = '<p>Back at 3</p>' } } }\ntrigger = { schedule = { start = '2026-11-02T02:00', end = '2026-11-02T03:00', timezone = 'UTC' } }")
+        )
+        .is_ok());
+        assert!(check_overlay(
+            "crawler-surge",
+            &overlay("routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }")
+        )
+        .is_ok());
+        assert!(check_overlay(
+            "nightly",
+            &overlay("apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *', duration = '1h', timezone = 'Australia/Sydney' } }\nwarm_up = { lead = '30m' }\nadvisory = true")
+        )
+        .is_ok());
+
+        for (text, expected) in [
+            ("priority = 1", "changes no route"),
+            ("routes.a = { deny = ['post'] }", "not a method"),
+            ("routes.a = { answer = 'read_only' }", "answer needs deny"),
+            ("routes.a = { traffic = {} }", "one of pin and split"),
+            ("routes.a = { error_pages = {} }", "names no page"),
+            ("routes.a = { client_routes = {} }", "names no class"),
+            (
+                "routes.a = { client_routes = { bot = {} } }",
+                "bot sets nothing",
+            ),
+            (
+                "routes.a = { client_routes = { 'Bot' = { mode = 'read-only' } } }",
+                "client_routes",
+            ),
+            (
+                "routes.a = { client_routes = { bot = { client_routes = { x = { mode = 'read-only' } } } } }",
+                "not on a client class's",
+            ),
+            (
+                "routes.a = { client_routes = { bot = { target = {} } } }",
+                "client_routes.bot: target names one of",
+            ),
+            (
+                "routes.a = { error_pages = { '503' = { file = 'down.html' } } }",
+                "absolute",
+            ),
+            (
+                "routes.a = { target = { app = 'x', upstream = 'y' } }",
+                "one of app, static",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = 'soon' } }",
+                "schedule: start",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *' } }",
+                "cron needs a duration",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *', start = '2026-11-02T09:00' } }",
+                "one of start and cron",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 25 * * *', duration = '1h' } }",
+                "hour \"25\"",
+            ),
+            (
+                "apps.shop = { maintenance = true }\nwarm_up = { lead = '30m' }",
+                "warm_up needs a schedule",
+            ),
+            (
+                "apps.shop = { maintenance = true }\nlatch = true",
+                "latch and advisory apply to a schedule",
+            ),
+            ("apps.shop = {}", "apps.shop: sets nothing"),
+            ("apps.shop = { min_workers = 0 }", "at least 1"),
+            (
+                "apps.shop = { min_workers = 4, max_workers = 2 }",
+                "below min_workers",
+            ),
+            ("apps.shop = { scale_in = 'never' }", "not hold or normal"),
+            (
+                "apps.shop = { group = 'reports', maintenance = true }",
+                "none is set",
+            ),
+            (
+                "apps.shop = { maintenance = true }\ntrigger = { schedule = { start = '2026-11-02T09:00', end = '2026-11-02T08:00', timezone = 'UTC' } }",
+                "end must be after",
+            ),
+        ] {
+            let error = check_overlay("o", &overlay(text)).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn capacity_schedules_are_overlays_and_back() {
+        let document = Document::parse(
+            "[[app.shop.schedule]]\nname = 'black-friday'\nstart = '2026-11-27T00:00'\nend = '2026-11-30T23:59'\ntimezone = 'America/New_York'\nmin_workers = 24\nmax_workers = 48\nwarm_up = '30m'\nscale_in = 'hold'\nfreeze_deploys = true\n",
+        )
+        .unwrap();
+        let schedule = &document.app["shop"].schedule[0];
+        let overlay = schedule.overlay("shop");
+        assert!(check_overlay("shop.black-friday", &overlay).is_ok());
+        assert_eq!(overlay.apps["shop"].min_workers, Some(24));
+        assert_eq!(overlay.warm_up.as_ref().unwrap().lead, "30m");
+        assert_eq!(
+            CapacitySchedule::from_overlay("shop.black-friday", &overlay),
+            Some(("shop".to_owned(), schedule.clone()))
+        );
+        assert_eq!(CapacitySchedule::from_overlay("backup", &overlay), None);
+
+        let mut merged = document.clone();
+        let error = merged.merge(document).unwrap_err();
+        assert!(error.contains("schedule black-friday of shop is declared twice"));
+    }
+
+    #[test]
+    fn rates_are_parsed() {
+        assert_eq!(parse_rate("2/s"), Ok((2, 1)));
+        assert_eq!(parse_rate("100 / m"), Ok((100, 60)));
+        assert_eq!(parse_rate("1000/hour"), Ok((1000, 3600)));
+
+        for bad in ["2", "0/s", "2/d", "x/s"] {
+            assert!(parse_rate(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rate_limits_resolve_with_their_defaults() {
+        let limit: RateLimit = toml::from_str("rate = '120/m'").unwrap();
+        let settings = check_rate_limit("crawlers", &limit).unwrap();
+        assert_eq!(settings.key, vec!["address".to_owned()]);
+        assert!((settings.per_second - 2.0).abs() < f64::EPSILON);
+        assert_eq!(settings.burst, 120);
+        assert_eq!(settings.action, "reject");
+        assert_eq!((settings.ipv4_prefix, settings.ipv6_prefix), (32, 64));
+
+        let limit: RateLimit = toml::from_str(
+            "rate = '2/s'\nburst = 10\nkey = ['client_class', 'header:x-api-key']\naction = 'delay'\nmax_delay = '500ms'\nmatch = { client_class = ['ai_crawler'] }",
+        )
+        .unwrap();
+        let settings = check_rate_limit("crawlers", &limit).unwrap();
+        assert_eq!(settings.classes, vec!["ai_crawler".to_owned()]);
+        assert_eq!(settings.key.len(), 2);
+        assert_eq!(settings.max_delay, std::time::Duration::from_millis(500));
+
+        for (text, expected) in [
+            ("rate = '2/s'\nkey = 'path'", "key \"path\""),
+            ("rate = '2/s'\naction = 'drop'", "action must be"),
+            ("rate = '2/s'\nmax_delay = '1s'", "max_delay needs"),
+            ("rate = '2/s'\nipv6_prefix = 0", "ipv6_prefix"),
+            ("rate = 'often'", "rate:"),
+        ] {
+            let limit: RateLimit = toml::from_str(text).unwrap();
+            let error = check_rate_limit("crawlers", &limit).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+
+        assert!(check_rate_limit("Crawlers", &RateLimit::default()).is_err());
+    }
+
+    #[test]
+    fn client_classes_are_checked() {
+        let class = |text: &str| -> ClientClass { toml::from_str(text).unwrap() };
+        assert!(
+            check_client_class(&class("name = 'partner'\naddresses = ['203.0.113.0/24']")).is_ok()
+        );
+
+        for (text, expected) in [
+            ("name = 'partner'", "names nothing"),
+            (
+                "name = 'default'\nuser_agent = ['x']",
+                "default is the class",
+            ),
+            (
+                "name = 'bot'\nuser_agent_regex = ['(']",
+                "not a regular expression",
+            ),
+            (
+                "name = 'bot'\nuser_agent = ['x']\nverify = 'dns'",
+                "needs verify_domains",
+            ),
+            (
+                "name = 'bot'\nuser_agent = ['x']\nverify_domains = ['a.com']",
+                "needs verify = 'dns'",
+            ),
+            (
+                "name = 'bot'\nuser_agent = ['x']\nverify = 'whois'\nverify_domains = ['a.com']",
+                "verify must be dns",
+            ),
+        ] {
+            let error = check_client_class(&class(text)).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn route_policies_are_checked() {
+        let route = |keys: &str| upload_route(keys);
+        assert!(
+            check_route_policies(&route(
+                "rate_limits = ['crawlers']\nmode = 'read-only'\nmethods = { deny = ['POST'] }"
+            ))
+            .is_ok()
+        );
+
+        for (keys, expected) in [
+            ("methods = { deny = [] }", "names no method"),
+            ("methods = { deny = ['post'] }", "not a method"),
+            (
+                "methods = { deny = ['POST'], answer = 'teapot' }",
+                "methods.answer",
+            ),
+            ("mode = 'read only'", "mode:"),
+            ("rate_limits = ['Bad']", "rate_limits:"),
+            ("match = { client_class = [] }", "names no class"),
+            ("match = { client_class = ['AI'] }", "match.client_class:"),
+            (
+                "traffic = { classes = { 'Bots' = 'r1' } }",
+                "traffic.classes:",
+            ),
+        ] {
+            let error = check_route_policies(&route(keys)).unwrap_err();
+            assert!(error.contains(expected), "{keys}: {error}");
+        }
+    }
+
+    #[test]
+    fn routes_for_classes_have_keys_of_their_own() {
+        let route = |keys: &str| upload_route(keys);
+        assert_eq!(route("").key(), "/");
+        assert_eq!(
+            route("match = { client_class = ['partner', 'ai_crawler', 'partner'] }").key(),
+            "/ client_class=ai_crawler,partner"
+        );
+        assert!(
+            check_route_policies(&route(
+                "match = { client_class = ['default'] }
+traffic = { classes = { ai_crawler = 'r1' } }"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn upload_keys_are_checked() {
+        for (keys, expected) in [
+            ("upload = 'stream'", "upload must be multipart or raw"),
+            ("precheck = true", "precheck needs upload"),
+            ("upload = 'raw'\nmax_files = 0", "max_files must be from 1"),
+            (
+                "upload = 'raw'\nmax_files = 501",
+                "max_files must be from 1",
+            ),
+            ("upload = 'raw'\nhash = ['md5']", "hash: \"md5\""),
+            ("upload = 'raw'\nmax_file_size = 'big'", "max_file_size:"),
+            ("max_body_size = 'lots'", "max_body_size:"),
+        ] {
+            let error = check_upload(&upload_route(keys)).unwrap_err();
+            assert!(error.contains(expected), "{keys}: {error}");
+        }
+    }
+
     #[test]
     fn words_round_trip() {
         for word in Preload::ALL {
@@ -2268,6 +4083,7 @@ mod tests {
             listener: vec![Listener {
                 address: "127.0.0.1:8080".to_owned(),
                 tls: false,
+                h2c: Some(vec!["loopback".to_owned()]),
             }],
             limits: Some(Limits {
                 max_body_size: Some("100MB".to_owned()),
@@ -2312,8 +4128,10 @@ mod tests {
             },
         );
         document.route.push(Route {
+            name: Some("shop-root".to_owned()),
             host: "shop".to_owned(),
             path: "/".to_owned(),
+            matches: None,
             app: "shop".to_owned(),
             upstream: String::new(),
             static_dir: None,
@@ -2332,8 +4150,26 @@ mod tests {
                 sticky: Some(true),
                 ..Traffic::default()
             }),
+            max_body_size: Some("1GB".to_owned()),
+            upload: Some("multipart".to_owned()),
+            max_file_size: None,
+            max_files: Some(5),
+            hash: Some(Vec::new()),
+            precheck: Some(true),
+            spool_quota: None,
+            rate_limits: vec!["crawlers".to_owned()],
+            methods: Some(Methods {
+                deny: vec!["POST".to_owned()],
+                answer: None,
+            }),
+            mode: Some("read-only".to_owned()),
         });
         let text = document.to_toml().unwrap();
+        assert!(text.contains("name = \"shop-root\""), "{text}");
+        assert!(text.contains("rate_limits = [\"crawlers\"]"), "{text}");
+        assert!(text.contains("mode = \"read-only\""), "{text}");
+        assert!(text.contains("upload = \"multipart\""), "{text}");
+        assert!(text.contains("hash = []"), "{text}");
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
         assert!(text.contains("[app.shop.release.r1.scaling]"), "{text}");
         assert!(text.contains("mode = \"spare\""), "{text}");
@@ -2459,6 +4295,36 @@ mod tests {
         let table = parse_muru_toml("entrypoint = 'app:app'\nthreads = 8\n").unwrap();
         assert_eq!(table.entrypoint.as_deref(), Some("app:app"));
         assert_eq!(table.threads, Some(8));
+    }
+
+    #[test]
+    fn a_mount_takes_a_pool_of_its_own_or_reserves_and_borrows() {
+        let table = parse_muru_toml(
+            "[mounts.fixed]\npath = '/f'\nentrypoint = 'a:b'\nthreads = 4\n\n\
+             [mounts.borrowing]\npath = '/b'\nentrypoint = 'a:c'\n\
+             threads = { reserved = 2, max = 6 }\n",
+        )
+        .unwrap();
+        let fixed = table.mounts["fixed"].threads.unwrap();
+        let borrowing = table.mounts["borrowing"].threads.unwrap();
+        assert_eq!((fixed.reserved(), fixed.max()), (4, 4));
+        assert_eq!((borrowing.reserved(), borrowing.max()), (2, 6));
+        assert_eq!(borrowing.describe(), "{ reserved = 2, max = 6 }");
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Wsgi)).is_ok());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Grpc)).is_ok());
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Grpc)).is_err());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Asgi)).is_err());
+        assert!(check_mount_threads(Some(MountThreads::Fixed(0)), None).is_err());
+
+        let reserving_none = MountThreads::Borrowing(BorrowedThreads {
+            reserved: 0,
+            max: 2,
+        });
+        assert!(check_mount_threads(Some(reserving_none), None).is_ok());
+        assert!(
+            parse_muru_toml("[mounts.x]\npath = '/x'\nentrypoint = 'a:b'\nthreads = { min = 1 }\n")
+                .is_err()
+        );
     }
 
     #[test]

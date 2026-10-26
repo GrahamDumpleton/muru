@@ -4,9 +4,10 @@ A deploy moves traffic to the new release as soon as it is ready. A
 rollout does it in stages: the release is started without traffic, gets a
 share of the application's requests step by step, is judged at each step
 against the release that still serves, and is promoted when every step
-passes or rolled back when one fails. Rollouts need a route to the
-application, since the shares are applied on the application's routes
-(see [virtual hosts](virtual-hosts.md)).
+passes or rolled back when one fails. The shares are applied on the
+application's routes (see [virtual hosts](virtual-hosts.md)), or, on a
+daemon with no host declared, to every request the application takes
+as the default one.
 
 ## Holding a release
 
@@ -59,6 +60,10 @@ rollout.
 | `--hold` | `2m` | How long each step lasts before its gates decide |
 | `--max-error-rate` | `1` | The candidate's 5xx rate over the step, in percent |
 | `--max-p95` | none | The candidate's 95th percentile request time over the step |
+| `--max-p99` | none | The candidate's 99th percentile request time over the step |
+| `--max-worker-faults` | `0` | The candidate's worker crashes and timeout kills over the step |
+| `--max-queue-wait` | none | The candidate's 95th percentile wait for a worker thread over the step |
+| `--probe` | none | A URL requested from the candidate and the baseline every 5 seconds; repeatable |
 | `--min-requests` | `100` | Requests the candidate must serve in a step before the gates judge |
 | `--approve-each-step` | off | Wait for `rollout resume` before each step after the first |
 
@@ -88,6 +93,27 @@ A step whose hold has passed with too few requests to judge holds on
 until there are enough, saying so in its message. A quiet application can
 be promoted by hand instead.
 
+A worker that crashes, or that the [hard timeout](timeouts.md#the-hard-timeout)
+or the loop stall timeout replaces, counts against its release at once,
+whatever the step's request count: by default one more than the baseline
+had over the step rolls the candidate back.
+
+A probe is a URL the daemon requests through the edge every 5 seconds
+while the rollout runs, once from the candidate and once from the
+baseline, each by preview with the `Muru-Preview` header. A probe passes
+with a 2xx or 3xx answer within 5 seconds. Like a crash, a failed probe
+counts at once: one more failure on the candidate than on the baseline
+over the step rolls it back, so a health check failing on both
+releases, as during a database outage, does not. Give the URL of
+a listener the edge serves the application's route on:
+
+```console
+$ muructl rollout canary shop@r2 --probe http://127.0.0.1:8080/health --probe http://127.0.0.1:8080/cart
+```
+
+Probe requests count as requests of their release, as any other request
+does.
+
 ## Controlling a rollout
 
 | Command | Effect |
@@ -102,10 +128,30 @@ With `--approve-each-step`, the rollout stops before each step after the
 first with the state `awaiting_approval` and the previous step's share
 still in force, until `rollout resume` approves it.
 
+A rollout is not part of the configuration `muructl config export`
+writes. `config export --resolve-rollouts` writes it as where it stands:
+the candidate declared beside the serving release, and the
+application's routes splitting traffic between them at the candidate's
+current share, which a file in version control can keep.
+
 An application has at most one rollout under way. A rollout's candidate
 is kept running while the rollout lasts, a deploy or rollback that would
 drain it leaves it in place, and `muructl config export` does not include
 its share, which is live state rather than declared configuration.
+
+## Deploy freezes
+
+While an overlay or a [schedule](scaling.md#scheduled-capacity) with
+`freeze_deploys = true` is active for an application, its deploys and
+rollouts are refused: `muructl deploy`, `muructl apply` when it would
+deploy a release of the application, `muructl rollout canary`,
+`bluegreen` and `promote`. A rollout already under way holds its step
+until the freeze ends. Rolling back, pausing and aborting are never
+frozen.
+
+Each of those commands takes `--override-freeze` to go ahead anyway,
+which is recorded as a `deploy.freeze_overridden` event at warning level,
+saying what was done and which overlay froze it.
 
 ## Events
 

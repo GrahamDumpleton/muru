@@ -4,8 +4,9 @@
 :class: note
 
 The edge's timeouts, the soft timeout, which interrupts a request that
-runs too long, and the hard timeout, which replaces a worker whose
-request never returns. The loop stall timeout is still to come.
+runs too long, the hard timeout, which replaces a worker whose request
+never returns, and the loop stall timeout, which replaces an ASGI worker
+whose event loop is held.
 ```
 
 Every timeout has a name, a default, and a response the client sees when
@@ -34,7 +35,18 @@ request, so the right value is the slowest legitimate one plus margin.
 
 A request past its deadline keeps running in the worker after the client
 has been answered, unless a soft timeout interrupts it or a hard timeout
-replaces its worker. Both are off by default.
+replaces its worker. Both are off by default. The application can see
+the deadline coming: `environ["muru.deadline"]`, or `deadline` in an
+ASGI scope's `extensions["muru"]`, is when the edge gives up, in seconds
+since the epoch, so a handler can skip work it has no time left for:
+
+```python
+import time
+
+def application(environ, start_response):
+    if environ["muru.deadline"] - time.time() < 2:
+        ...  # answer from the cache instead
+```
 
 ## The soft timeout
 
@@ -119,6 +131,7 @@ soft_timeout = "30s"
 hard_timeout = "60s"
 hard_drain_grace = "10s"
 shutdown_timeout = "5s"
+loop_stall_timeout = "10s"
 ```
 
 Set the hard timeout above the edge's `deadline`, so that a slow request
@@ -129,6 +142,27 @@ a request the soft timeout could not interrupt, such as one stuck in a C
 call that never returns. The [worker recycling guide](recycling.md)
 describes the replacement itself, which is the same path a recycled
 worker takes.
+
+## The loop stall timeout
+
+An ASGI application's requests share one event loop in each worker, so
+code that blocks without awaiting, a `time.sleep` or a synchronous
+database call in an `async def`, holds every request in the worker. The
+loop beats twice a second, and a watchdog outside Python notices when it
+has not beaten for the loop stall timeout. The worker is then replaced
+as for the hard timeout, stacks and all, with a `worker.loop_stalled`
+event before the `worker.timeout_killed` one.
+
+| Name | Default | Measured | When it fires |
+| --- | --- | --- | --- |
+| `loop_stall` | 10s | since the event loop last ran | the worker is replaced |
+
+```
+muructl run app:application --timeout loop_stall=5s
+```
+
+A worker being debugged is pinned, so a `breakpoint()` in a coroutine,
+which holds the loop while it waits, does not cost the worker.
 
 The body size limit is a limit rather than a timeout, but lives beside
 them: `--max-body-size 100MB` (the development default; 10 MB with

@@ -2,6 +2,7 @@
 //! `muru.admin.v1` service over the admin Unix socket, which muructl and
 //! the dashboard's gateway speak.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
@@ -70,6 +71,15 @@ impl Admin for Service {
         let info = &self.handle.info;
         let apps = self.handle.store.apps().map_err(internal)?;
         let releases = self.handle.store.releases(None).map_err(internal)?;
+        let budget = {
+            let view = &info.defined.read().expect("defined names poisoned").budget;
+
+            if view.budget.is_set() {
+                view.budget.describe(&view.used)
+            } else {
+                String::new()
+            }
+        };
 
         Ok(Response::new(pb::Status {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -96,6 +106,7 @@ impl Admin for Service {
                 .dashboard
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
+            budget,
         }))
     }
 
@@ -135,6 +146,31 @@ impl Admin for Service {
         Ok(Response::new(app_message(app, on)))
     }
 
+    async fn dashboard_login(
+        &self,
+        _request: Request<pb::DashboardLoginRequest>,
+    ) -> Result<Response<pb::DashboardLoginLink>, Status> {
+        let info = &self.handle.info;
+        let (Some(address), Some(sessions)) = (info.dashboard, info.dashboard_sessions.as_ref())
+        else {
+            return Err(Status::failed_precondition(
+                "the dashboard's actions are off; set actions = true in the [dashboard] table",
+            ));
+        };
+
+        let code = sessions.issue_code();
+        self.handle.events.emit(
+            "dashboard.login_issued",
+            "dashboard",
+            "notice",
+            "a login link for the dashboard's actions was issued over the admin socket",
+        );
+        Ok(Response::new(pb::DashboardLoginLink {
+            url: format!("http://{address}/login?code={code}"),
+            expires_in_s: muru_dashboard::actions::CODE_LIFETIME.as_secs(),
+        }))
+    }
+
     async fn set_maintenance(
         &self,
         request: Request<pb::SetMaintenanceRequest>,
@@ -167,6 +203,7 @@ impl Admin for Service {
         request: Request<pb::DeployRequest>,
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
+        self.check_freeze(&request.app, "deploy", request.override_freeze)?;
         let previous = self
             .handle
             .store
@@ -185,9 +222,14 @@ impl Admin for Service {
                 app: request.app.clone(),
                 spec: Box::new(spec),
                 id: (!request.release.is_empty()).then(|| request.release.clone()),
-                retain: request
-                    .retain_ms
-                    .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                retain: crate::daemon::Retention {
+                    lasts: request
+                        .retain_ms
+                        .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                    workers: request
+                        .retain_workers
+                        .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                },
                 hold: request.hold,
                 created: created_tx,
                 done: done_tx,
@@ -511,6 +553,16 @@ impl Admin for Service {
             serde_json::from_str(&request.args_json)
                 .map_err(|error| Status::invalid_argument(format!("args: {error}")))?
         };
+
+        // Section 11.7: an operation over a period has the host wait for
+        // it, and this waits for the host.
+
+        let wait = args
+            .get("timeout_s")
+            .and_then(serde_json::Value::as_f64)
+            .map_or(Duration::from_secs(20), |seconds| {
+                Duration::from_secs_f64(seconds.clamp(0.0, 3600.0)) + Duration::from_secs(15)
+            });
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -524,9 +576,14 @@ impl Admin for Service {
             })
             .await
             .map_err(|_| Status::unavailable("the daemon is stopping"))?;
-        let answered = tokio::time::timeout(Duration::from_secs(20), done_rx)
+        let answered = tokio::time::timeout(wait, done_rx)
             .await
-            .map_err(|_| Status::deadline_exceeded("the host did not answer in 20 seconds"))?
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "the host did not answer in {} seconds",
+                    wait.as_secs()
+                ))
+            })?
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(pb::DebugResponse {
@@ -541,6 +598,122 @@ impl Admin for Service {
                 })
                 .collect(),
             release,
+        }))
+    }
+
+    async fn list_overlays(
+        &self,
+        _: Request<pb::ListOverlaysRequest>,
+    ) -> Result<Response<pb::ListOverlaysResponse>, Status> {
+        let store = &self.handle.store;
+        let states: std::collections::HashMap<String, crate::model::OverlayState> = store
+            .overlay_states()
+            .map_err(internal)?
+            .into_iter()
+            .map(|state| (state.name.clone(), state))
+            .collect();
+        let now = crate::model::now_unix_ms();
+        let overlays = store
+            .overlays()
+            .map_err(internal)?
+            .into_iter()
+            .map(|(name, overlay)| {
+                let state = states.get(&name);
+                let window = crate::overlays::window(&overlay, now);
+                pb::OverlayInfo {
+                    active: state.is_some_and(|state| state.active),
+                    state: state.map(|state| state.source.clone()).unwrap_or_default(),
+                    since_unix_ms: state.map_or(0, |state| state.since_unix_ms),
+                    until_unix_ms: state.and_then(|state| state.until_unix_ms).unwrap_or(0),
+                    trigger: crate::overlays::describe_trigger(&overlay),
+                    changes: overlay
+                        .routes
+                        .keys()
+                        .map(|route| format!("route {route}"))
+                        .chain(overlay.apps.keys().map(|app| format!("app {app}")))
+                        .collect(),
+                    starts_unix_ms: window
+                        .map(|(start, _)| start)
+                        .filter(|start| *start > now)
+                        .unwrap_or(0),
+                    name,
+                }
+            })
+            .collect();
+        Ok(Response::new(pb::ListOverlaysResponse { overlays }))
+    }
+
+    async fn control_overlay(
+        &self,
+        request: Request<pb::ControlOverlayRequest>,
+    ) -> Result<Response<pb::ControlOverlayResponse>, Status> {
+        let request = request.into_inner();
+
+        let action = match request.action.as_str() {
+            "activate" => crate::daemon::OverlayAction::Activate {
+                until: (request.until_unix_ms > 0).then_some(request.until_unix_ms),
+            },
+            "end" => crate::daemon::OverlayAction::End,
+            "promote" => crate::daemon::OverlayAction::Promote,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "{other:?} is not activate, end or promote"
+                )));
+            }
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Overlay {
+                name: request.name,
+                action,
+                external: false,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let message = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(pb::ControlOverlayResponse { message }))
+    }
+
+    async fn preview_overlay(
+        &self,
+        request: Request<pb::PreviewOverlayRequest>,
+    ) -> Result<Response<pb::PreviewOverlayResponse>, Status> {
+        let name = request.into_inner().name;
+        let store = &self.handle.store;
+        let overlays = store.overlays().map_err(internal)?;
+        let overlay = overlays
+            .iter()
+            .find(|(declared, _)| *declared == name)
+            .map(|(_, overlay)| overlay.clone())
+            .ok_or_else(|| Status::not_found(format!("no overlay is named {name}")))?;
+
+        // Against the routes as they stand now, with the other active
+        // overlays applied.
+
+        let states = store.overlay_states().map_err(internal)?;
+        let others: Vec<(String, muru_config::Overlay)> = overlays
+            .iter()
+            .filter(|(declared, _)| *declared != name)
+            .cloned()
+            .collect();
+        let active = crate::overlays::ordered(&others, &states);
+        let mut routes = store.routes().map_err(internal)?;
+        crate::overlays::apply_routes(&mut routes, &active);
+        let base: std::collections::BTreeSet<String> = store
+            .maintenance()
+            .map_err(internal)?
+            .into_iter()
+            .map(|(app, _)| app)
+            .collect();
+        let maintenance = crate::overlays::apply_maintenance(&base, &active);
+        Ok(Response::new(pb::PreviewOverlayResponse {
+            changes: crate::overlays::preview(&overlay, &routes, &maintenance),
         }))
     }
 
@@ -587,6 +760,7 @@ impl Admin for Service {
         request: Request<pb::StartRolloutRequest>,
     ) -> Result<Response<pb::Rollout>, Status> {
         let request = request.into_inner();
+        self.check_freeze(&request.app, "start a rollout", request.override_freeze)?;
         let steps = request
             .steps
             .iter()
@@ -602,6 +776,11 @@ impl Admin for Service {
                 0.01
             },
             max_p95_ms: (request.max_p95_ms > 0).then_some(request.max_p95_ms),
+            max_p99_ms: (request.max_p99_ms > 0).then_some(request.max_p99_ms),
+            max_worker_faults: request.max_worker_faults,
+            max_queue_wait_p95_ms: (request.max_queue_wait_p95_ms > 0)
+                .then_some(request.max_queue_wait_p95_ms),
+            probes: request.probes,
             min_requests: if request.min_requests > 0 {
                 request.min_requests
             } else {
@@ -676,7 +855,9 @@ impl Admin for Service {
         &self,
         request: Request<pb::RolloutControlRequest>,
     ) -> Result<Response<pb::Rollout>, Status> {
-        self.control_rollout(request.into_inner().app, RolloutAction::Promote)
+        let request = request.into_inner();
+        self.check_freeze(&request.app, "promote", request.override_freeze)?;
+        self.control_rollout(request.app, RolloutAction::Promote)
             .await
     }
 
@@ -693,6 +874,7 @@ impl Admin for Service {
         request: Request<pb::PromoteReleaseRequest>,
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
+        self.check_freeze(&request.app, "promote", request.override_freeze)?;
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -722,6 +904,36 @@ impl Admin for Service {
         } else {
             request.group.clone()
         };
+
+        // Section 7.5: a floor until a time is a temporary schedule over
+        // the application, whichever release serves.
+
+        if let Some(min_workers) = request.min_workers {
+            let (done_tx, done_rx) = oneshot::channel();
+            self.handle
+                .commands
+                .send(Command::ScaleFloor {
+                    app: request.app.clone(),
+                    group,
+                    min_workers,
+                    max_workers: request.max_workers,
+                    until: request.until_unix_ms,
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| Status::unavailable(STOPPING))?;
+            done_rx
+                .await
+                .map_err(|_| Status::unavailable(STOPPING))?
+                .map_err(Status::failed_precondition)?;
+            return self
+                .get_scale_status(Request::new(pb::GetScaleStatusRequest {
+                    app: request.app,
+                    release,
+                }))
+                .await;
+        }
+
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
             .commands
@@ -820,6 +1032,12 @@ impl Admin for Service {
             routes: routes
                 .into_iter()
                 .map(|route| pb::Route {
+                    client_classes: route.classes().to_vec(),
+                    traffic_classes: route
+                        .traffic
+                        .as_ref()
+                        .map(|traffic| traffic.classes.clone().into_iter().collect())
+                        .unwrap_or_default(),
                     traffic: route
                         .traffic
                         .as_ref()
@@ -851,6 +1069,12 @@ impl Admin for Service {
                         .as_ref()
                         .map(|auth| format!("{} {}", config::auth_handler(auth), auth.path))
                         .unwrap_or_default(),
+                    upload: match (&route.upload, route.precheck) {
+                        (Some(mode), Some(true)) => format!("{mode}, precheck"),
+                        (Some(mode), _) => mode.clone(),
+                        (None, _) => String::new(),
+                    },
+                    max_body_size: route.max_body_size.clone().unwrap_or_default(),
                     host: route.host,
                     path: route.path,
                     app: route.app,
@@ -881,8 +1105,44 @@ impl Admin for Service {
             Err(error) => return Ok(Response::new(parse_failure(error))),
         };
 
-        let plan = config::plan(&self.handle.store, &document, request.prune);
+        let defined = self
+            .handle
+            .info
+            .defined
+            .read()
+            .expect("defined names poisoned")
+            .clone();
+        let mut plan = config::plan(&self.handle.store, &document, request.prune, &defined);
+        let frozen = self.frozen().map_err(internal)?;
+        let mut overridden = BTreeMap::new();
+
+        for change in &plan.changes {
+            if let Action::Deploy { app, id, .. } = &change.action
+                && let Some(by) = frozen.get(app)
+            {
+                if request.override_freeze {
+                    overridden.insert(app.clone(), (id.clone(), by.join(", ")));
+                } else {
+                    plan.errors.push(format!(
+                        "{app}@{id}: deploys of {app} are frozen by overlay {}; give --override-freeze to deploy anyway",
+                        by.join(", ")
+                    ));
+                }
+            }
+        }
+
         let mut report = report_message(&plan);
+
+        if !request.dry_run && plan.errors.is_empty() {
+            for (app, (id, by)) in &overridden {
+                self.handle.events.emit(
+                    "deploy.freeze_overridden",
+                    app,
+                    "warning",
+                    &format!("apply deploys {app}@{id} despite the freeze set by overlay {by}"),
+                );
+            }
+        }
 
         if !plan.errors.is_empty() || request.dry_run {
             return Ok(Response::new(report));
@@ -944,7 +1204,14 @@ impl Admin for Service {
         // A diff shows both directions: what the document would add and
         // what desired state holds beyond it.
 
-        let plan = config::plan(&self.handle.store, &document, true);
+        let defined = self
+            .handle
+            .info
+            .defined
+            .read()
+            .expect("defined names poisoned")
+            .clone();
+        let plan = config::plan(&self.handle.store, &document, true, &defined);
         Ok(Response::new(report_message(&plan)))
     }
 
@@ -954,8 +1221,22 @@ impl Admin for Service {
     ) -> Result<Response<pb::ExportConfigResponse>, Status> {
         let request = request.into_inner();
         let app = (!request.app.is_empty()).then_some(request.app.as_str());
-        let document =
+        let mut document =
             config::export(&self.handle.store, app, request.all_releases).map_err(not_found)?;
+
+        if request.resolve_rollouts {
+            config::resolve_rollouts(&self.handle.store, &mut document).map_err(internal)?;
+        }
+
+        let (attributions, layers) = if request.effective {
+            (
+                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?,
+                config::release_layers(&self.handle.store, &document).map_err(internal)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         let text = document.to_toml().map_err(internal)?;
 
         Ok(Response::new(pb::ExportConfigResponse {
@@ -964,6 +1245,8 @@ impl Admin for Service {
             node: config::hostname(),
             time_unix_ms: now_unix_ms(),
             state_version: self.handle.store.state_version().map_err(internal)?,
+            attributions,
+            layers,
         }))
     }
 }
@@ -988,6 +1271,10 @@ impl Service {
                 .set_app_identity(app, user.as_deref(), group.as_deref(), umask.as_deref())
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::SetAppPriority { app, priority } => store
+                .set_app_priority(app, *priority)
+                .map(|()| "set".to_owned())
+                .map_err(|error| error.to_string()),
             Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
@@ -1007,7 +1294,7 @@ impl Service {
                     .routes()
                     .unwrap_or_default()
                     .into_iter()
-                    .find(|stored| stored.host == route.host && stored.path == route.path)
+                    .find(|stored| stored.host == route.host && stored.key() == route.key())
                     .and_then(|stored| stored.traffic);
 
                 // Section 9.4: a changed policy is an event of its own.
@@ -1015,7 +1302,7 @@ impl Service {
                 if before != route.traffic {
                     self.handle.events.emit(
                         "traffic_policy.changed",
-                        &format!("route {} {}", route.host, route.path),
+                        &format!("route {} {}", route.host, route.key()),
                         "notice",
                         &crate::config::describe_traffic(route.traffic.as_ref()),
                     );
@@ -1042,6 +1329,34 @@ impl Service {
                 .delete_upstream(name)
                 .map(|()| "removed".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::PutOverlay { name, overlay, new } => store
+                .put_overlay(name, overlay)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveOverlay { name } => store
+                .delete_overlay(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutClientClass {
+                class,
+                position,
+                new,
+            } => store
+                .put_client_class(class, *position)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveClientClass { name } => store
+                .delete_client_class(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
+            Action::PutRateLimit { name, limit, new } => store
+                .put_rate_limit(name, limit)
+                .map(|()| if *new { "created" } else { "updated" }.to_owned())
+                .map_err(|error| error.to_string()),
+            Action::RemoveRateLimit { name } => store
+                .delete_rate_limit(name)
+                .map(|()| "removed".to_owned())
+                .map_err(|error| error.to_string()),
         };
 
         outcome.unwrap_or_else(|error| format!("failed: {error}"))
@@ -1063,7 +1378,7 @@ impl Service {
                 app: app.to_owned(),
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
-                retain: crate::daemon::RETENTION,
+                retain: crate::daemon::Retention::default(),
                 hold: false,
                 created: created_tx,
                 done: done_tx,
@@ -1175,12 +1490,49 @@ fn app_message(app: crate::model::App, maintenance: bool) -> pb::App {
         group: app.group.unwrap_or_default(),
         umask: app.umask.unwrap_or_default(),
         maintenance,
+        priority: app.priority,
     }
 }
 
 impl Service {
     /// The release named, or the application's current release when none
     /// is; checked to exist.
+    /// Section 9.6: the applications whose deploys and rollouts an active
+    /// overlay freezes, with the overlays that do.
+    fn frozen(&self) -> Result<BTreeMap<String, Vec<String>>, crate::store::StoreError> {
+        let overlays = self.handle.store.overlays()?;
+        let states = self.handle.store.overlay_states()?;
+        Ok(crate::overlays::freezes(&crate::overlays::ordered(
+            &overlays, &states,
+        )))
+    }
+
+    /// Refuse to `what` an application an active overlay freezes, unless
+    /// overridden, which is recorded as a warning event.
+    fn check_freeze(&self, app: &str, what: &str, override_freeze: bool) -> Result<(), Status> {
+        let frozen = self.frozen().map_err(internal)?;
+
+        let Some(by) = frozen.get(app) else {
+            return Ok(());
+        };
+
+        let by = by.join(", ");
+
+        if !override_freeze {
+            return Err(Status::failed_precondition(format!(
+                "deploys of {app} are frozen by overlay {by}; give --override-freeze to {what} anyway"
+            )));
+        }
+
+        self.handle.events.emit(
+            "deploy.freeze_overridden",
+            app,
+            "warning",
+            &format!("{what} despite the freeze set by overlay {by}"),
+        );
+        Ok(())
+    }
+
     fn current_release(&self, app: &str, release: &str) -> Result<String, Status> {
         let release = if release.is_empty() {
             let record = self.handle.store.app(app).map_err(not_found)?;
@@ -1261,6 +1613,23 @@ fn scale_message(
                 policy: status.spec.describe(),
                 scale_outs: status.decisions.0,
                 scale_ins: status.decisions.1,
+                floor: status.floor,
+                ceiling: status.ceiling,
+                capacity_from: status
+                    .capacity
+                    .as_ref()
+                    .map(|capacity| capacity.sources.clone())
+                    .unwrap_or_default(),
+                scale_in_held: status
+                    .capacity
+                    .as_ref()
+                    .is_some_and(|capacity| capacity.hold),
+                worker_cpu: status.workers.worker_cpu,
+                gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
+                loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
+                bottleneck: status.diagnosis.bottleneck.to_owned(),
+                diagnosis: status.diagnosis.summary.to_owned(),
+                advice: status.diagnosis.advice.to_owned(),
             })
             .collect(),
     }
@@ -1289,6 +1658,10 @@ fn rollout_message(rollout: &Rollout) -> pb::Rollout {
         updated_unix_ms: rollout.updated_unix_ms,
         max_error_rate: rollout.gates.max_error_rate,
         max_p95_ms: rollout.gates.max_p95_ms.unwrap_or(0),
+        max_p99_ms: rollout.gates.max_p99_ms.unwrap_or(0),
+        max_worker_faults: rollout.gates.max_worker_faults,
+        max_queue_wait_p95_ms: rollout.gates.max_queue_wait_p95_ms.unwrap_or(0),
+        probes: rollout.gates.probes.clone(),
         min_requests: rollout.gates.min_requests,
         approve_each_step: rollout.approve_each_step,
     }
