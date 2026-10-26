@@ -398,9 +398,10 @@ oldest request was, and a memory recycle names the commonest objects.
 Debugger attach followed: `breakpoint()` in a worker waits for `muructl
 debug attach`, out of the timeouts, and `debug attach` carries a pdb
 session line by line through the daemon and the host, at the breakpoint
-or on a thread of its own, allowed where exec is. Still to come: DAP,
-draining and pinning the debugged worker, `--requests` and `--path`,
-pstats output, and reading from outside with PEP 768.
+or on a thread of its own, allowed where exec is, and the debugged
+worker is out of routing and pinned while the session lasts. Still to
+come: DAP, `--requests` and `--path`, pstats output, and reading from
+outside with PEP 768.
 
 Overlays (section 9.10) are in, activated by hand or by a one-off or
 recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach

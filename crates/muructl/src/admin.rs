@@ -1215,6 +1215,8 @@ fn print_status(response: &pb::DebugResponse) {
 
         let state = if result["replaced"].as_bool() == Some(true) {
             "replaced"
+        } else if result["debugging"].as_bool() == Some(true) {
+            "debugging"
         } else if result["ready"].as_bool() == Some(true) {
             "ready"
         } else {

@@ -7,8 +7,8 @@ Status, stacks, tasks, inspect, logger levels, profiling, tracing,
 memory, running a snippet, a pdb session with `breakpoint()`, and the
 automatic captures, answered from inside each worker by the runtime's
 control thread, with faulthandler when a worker cannot answer. The Debug
-Adapter Protocol for IDEs, draining the debugged worker, and reading a
-worker from outside with PEP 768 on Python 3.14 are still to come.
+Adapter Protocol for IDEs and reading a worker from outside with PEP 768
+on Python 3.14 are still to come.
 ```
 
 `muructl debug` looks into the workers of a release through the daemon,
@@ -167,6 +167,11 @@ ends the session; so does the end of input, as does an hour in all or ten
 minutes without a line. In a worker with no breakpoint waiting, the
 session has a thread of its own, from which the worker's modules and
 state can be examined.
+
+While a session is open its worker takes no new requests, and nothing
+replaces it: recycling, the hard timeout, the memory limits and scaling
+in all wait until the session ends, when the worker serves again.
+`muructl debug status` shows it as `debugging` meanwhile.
 
 A debugger runs code in the worker, so attaching needs `debug_exec =
 true` as running a snippet does. Each session is the event

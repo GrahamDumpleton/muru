@@ -1,0 +1,1 @@
+Added draining and pinning of a debugged worker: while a `muructl debug attach` session is open the worker takes no new requests and is not recycled, killed or scaled in, and `muructl debug status` shows it as `debugging`.

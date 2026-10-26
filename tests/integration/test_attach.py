@@ -1,12 +1,14 @@
 """Debugger attach (design specification section 11.7): `breakpoint()` in a
 worker waits for `muructl debug attach`, which carries a pdb session line
 by line through the daemon and the host; with no breakpoint waiting the
-session gets a thread of its own. A debugger runs code in the worker, so
-it is off unless the daemon's file allows exec.
+session gets a thread of its own. While a session is open its worker is
+out of routing and pinned. A debugger runs code in the worker, so it is
+off unless the daemon's file allows exec.
 """
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -19,8 +21,15 @@ from support.daemon import daemon as daemon_fixture
 daemon = daemon_fixture
 
 APP = """
+import os
+
+
 def application(environ, start_response):
     value = 20
+
+    if environ["PATH_INFO"] == "/pid":
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [str(os.getpid()).encode()]
 
     if environ["PATH_INFO"] == "/pause":
         breakpoint(timeout=float(environ.get("QUERY_STRING") or 30))
@@ -104,5 +113,62 @@ def test_a_session_debugs_the_request_at_its_breakpoint(tmp_path: Path) -> None:
         assert allowed.get("/pause?1").body == b"value=20"
         assert time.monotonic() - started >= 1
         wait_for(lambda: "debug.breakpoint_expired" in allowed.events())
+    finally:
+        allowed.stop()
+
+
+def worker_states(daemon: Daemon) -> dict[int, tuple[str, str]]:
+    """Each worker's pid and state, from muructl debug status, by index."""
+
+    states = {}
+
+    for line in daemon.muructl("debug", "status", "paused").stdout.splitlines()[1:]:
+        fields = line.split()
+        states[int(fields[0])] = (fields[1], fields[-1])
+
+    return states
+
+
+def test_a_debugged_worker_leaves_routing_until_the_session_ends(tmp_path: Path) -> None:
+    allowed = start_daemon(tmp_path, config_extra="[daemon]\ndebug_exec = true\n")
+    muructl = support.muructl_path()
+    assert muructl is not None
+
+    def served_by() -> set[str]:
+        return {allowed.get("/pid").body.decode() for _ in range(8)}
+
+    try:
+        deploy_paused(allowed, tmp_path / "source")
+        debugged = worker_states(allowed)[1][0]
+        session = subprocess.Popen(
+            [
+                str(muructl),
+                "debug",
+                "attach",
+                "paused",
+                "--worker",
+                "1",
+                "--socket",
+                str(allowed.run_dir / "admin.sock"),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+        try:
+            wait_for(lambda: worker_states(allowed)[1][1] == "debugging")
+            wait_for(lambda: debugged not in served_by())
+            assert debugged not in served_by()
+        finally:
+            assert session.stdin is not None
+            session.stdin.close()
+            session.wait(30)
+
+        # The session over, the same worker serves again.
+
+        wait_for(lambda: worker_states(allowed)[1] == (debugged, "ready"))
+        wait_for(lambda: debugged in served_by())
     finally:
         allowed.stop()

@@ -426,6 +426,11 @@ class WorkerState:
     over_soft_since: float | None = None
     reclaimed_at: float | None = None
 
+    # Section 11.7: the debugger sessions open in the worker, which keep
+    # it out of routing and from being replaced.
+
+    debug_sessions: int = 0
+
 
 @dataclass
 class Pending:
@@ -1340,6 +1345,7 @@ class Host:
             for state in self.states.values()
             if state.ready
             and not state.replaced
+            and not state.debug_sessions
             and state.index not in self.replacing
             and self.placement[state.index][0] is group
         ]
@@ -1369,6 +1375,7 @@ class Host:
                 "socket": state.path,
                 "ready": state.ready,
                 "replaced": state.replaced,
+                "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
                 "in_flight": state.in_flight,
@@ -1466,6 +1473,13 @@ class Host:
 
         self.pending.pop(pending.id, None)
 
+        if pending.op == "attach":
+            for pid, answer in pending.answers.items():
+                state = self.states.get(pid)
+
+                if state is not None and answer.get("ok"):
+                    self.debugging(state, 1)
+
         if pending.then is not None:
             pending.then(pending)
             return
@@ -1477,6 +1491,28 @@ class Host:
                 "workers": sorted(pending.answers.values(), key=lambda answer: answer["index"]),
             }
         )
+
+    def debugging(self, state: WorkerState, change: int) -> None:
+        """Count a debugger session opening or ending in a worker.
+
+        Section 11.7: while any is open the worker is out of routing and
+        pinned, so no policy replaces it; it serves again after the last.
+        """
+
+        before = state.debug_sessions
+        state.debug_sessions = max(0, before + change)
+
+        if state.replaced or (before > 0) == (state.debug_sessions > 0):
+            return
+
+        if state.debug_sessions:
+            self.routed[state.index] = None
+            log(f"worker {state.index} (pid {state.pid}) leaves routing while it is debugged")
+        else:
+            self.routed[state.index] = state.path
+            log(f"worker {state.index} (pid {state.pid}) serves again: no debugger is attached")
+
+        self.announce()
 
     # Sections 7.6 and 7.7: reports, policies and replacements.
 
@@ -1519,6 +1555,10 @@ class Host:
                     str(report.get("level", "warning")),
                     f"worker {state.index} (pid {state.pid}): {report.get('message', '')}",
                 )
+
+                if report["event"] == "debug.detached":
+                    self.debugging(state, -1)
+
                 continue
 
             state.requests = int(report.get("requests", state.requests))
@@ -1702,8 +1742,12 @@ class Host:
         """Start replacing a worker with a fresh one on a new socket.
 
         For a hard timeout the old worker leaves routing at once and its
-        stacks are recorded.
+        stacks are recorded. A worker being debugged is pinned: the policy
+        applies once the last session ends.
         """
+
+        if state.debug_sessions:
+            return
 
         if self.control_listener is None:
             if not getattr(self, "_warned_no_control", False):
