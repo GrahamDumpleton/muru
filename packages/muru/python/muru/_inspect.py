@@ -101,6 +101,7 @@ def handle(
                 bool(args.get("trace", False)),
                 float(args.get("duration_s", 10.0)),
                 int(args.get("top", 20)),
+                str(args.get("snapshot", "")),
             )
         elif op == "exec":
             result = run_code(str(args.get("code", "")))
@@ -297,11 +298,78 @@ def trace(duration: float, force: bool, busy: int, slots: int, top: int) -> dict
     }
 
 
-def memory(tracing: bool, duration: float, top: int) -> dict[str, Any]:
+# Section 11.7: a tracemalloc snapshot kept from one request to a later
+# one, so the allocations between two chosen points can be compared, and
+# whether keeping it started tracemalloc.
+
+_kept: Any = None
+_kept_started = False
+
+
+def _sites(after: Any, before: Any, top: int) -> list[dict[str, Any]]:
+    """List the sites that allocated most between two snapshots."""
+
+    return [
+        {
+            "site": str(stat.traceback[0]) if stat.traceback else "?",
+            "size_diff": stat.size_diff,
+            "count_diff": stat.count_diff,
+            "size": stat.size,
+        }
+        for stat in after.compare_to(before, "lineno")[:top]
+    ]
+
+
+def snapshot(action: str, top: int) -> dict[str, Any]:
+    """Keep a tracemalloc snapshot, compare the present with it, or drop it.
+
+    `take` starts tracemalloc when it is off and keeps a snapshot, in
+    place of one kept before; `diff` reports the sites that allocated
+    most since it was taken, keeping it; `drop` lets it go and stops
+    tracemalloc when taking it started it.
+    """
+
+    import tracemalloc
+
+    global _kept, _kept_started
+
+    if action == "take":
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(10)
+            _kept_started = True
+
+        _kept = tracemalloc.take_snapshot()
+        current, peak = tracemalloc.get_traced_memory()
+        return {"snapshot": "taken", "traced": current, "peak": peak}
+
+    if action == "diff":
+        if _kept is None or not tracemalloc.is_tracing():
+            raise RuntimeError("no snapshot is kept; take one with --snapshot")
+
+        return {
+            "snapshot": "compared",
+            "allocations": _sites(tracemalloc.take_snapshot(), _kept, top),
+        }
+
+    if action == "drop":
+        had = _kept is not None
+        _kept = None
+
+        if _kept_started:
+            tracemalloc.stop()
+            _kept_started = False
+
+        return {"snapshot": "dropped" if had else "none"}
+
+    raise ValueError(f"unknown snapshot action {action!r}")
+
+
+def memory(tracing: bool, duration: float, top: int, keep: str = "") -> dict[str, Any]:
     """Report the worker's memory, the gc's state and the most common objects.
 
     With `tracing`, tracemalloc runs for `duration` seconds and the sites
-    that allocated most in that time are reported too.
+    that allocated most in that time are reported too. With `keep`, a
+    snapshot is taken, compared with or dropped (see `snapshot`) instead.
     """
 
     from muru import _native
@@ -311,6 +379,10 @@ def memory(tracing: bool, duration: float, top: int) -> dict[str, Any]:
         "gc": {"counts": list(gc.get_count()), "collections": gc.get_stats()},
         "objects": Counter(type(item).__qualname__ for item in gc.get_objects()).most_common(top),
     }
+
+    if keep:
+        result.update(snapshot(keep, top))
+        return result
 
     if tracing:
         import tracemalloc
@@ -328,15 +400,7 @@ def memory(tracing: bool, duration: float, top: int) -> dict[str, Any]:
             if started:
                 tracemalloc.stop()
 
-        result["allocations"] = [
-            {
-                "site": str(stat.traceback[0]) if stat.traceback else "?",
-                "size_diff": stat.size_diff,
-                "count_diff": stat.count_diff,
-                "size": stat.size,
-            }
-            for stat in after.compare_to(before, "lineno")[:top]
-        ]
+        result["allocations"] = _sites(after, before, top)
 
     return result
 

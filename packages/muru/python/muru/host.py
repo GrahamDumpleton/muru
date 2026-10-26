@@ -606,6 +606,7 @@ class Host:
 
         self.outside = _outside.Reader()
         self.outside_errors: dict[int, str] = {}
+        self.traced: dict[int, list[WorkerState]] = {}
         self.wake_write: int | None = None
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
@@ -1327,6 +1328,9 @@ class Host:
         if op == "profile" and not chosen and self.profile_from_outside(request_id, targets, args):
             return
 
+        if op == "trace":
+            self.trace_started(request_id, targets)
+
         pending = Pending(request_id, op, targets)
         pending.deadline = time.monotonic() + float(args.get("timeout_s", CONTROL_TIMEOUT_SECONDS))
         self.pending[request_id] = pending
@@ -1554,6 +1558,9 @@ class Host:
 
         self.pending.pop(pending.id, None)
 
+        if pending.op == "trace":
+            self.trace_ended(pending.id)
+
         if pending.op == "attach":
             for pid, answer in pending.answers.items():
                 state = self.states.get(pid)
@@ -1572,6 +1579,59 @@ class Host:
                 "workers": sorted(pending.answers.values(), key=lambda answer: answer["index"]),
             }
         )
+
+    def trace_started(self, request_id: int, targets: dict[int, int]) -> None:
+        """Take traced workers out of routing while their trace lasts.
+
+        Section 11.7: tracing slows a worker, so the edge's requests go to
+        the others of its group meanwhile. A worker stays in routing when
+        it is the last of its group that is, and finishes the requests it
+        has either way.
+        """
+
+        taken = []
+
+        for pid in targets:
+            state = self.states.get(pid)
+
+            if state is None or self.routed.get(state.index) is None:
+                continue
+
+            group = self.placement[state.index][0]
+            others = [
+                other
+                for other in self.states.values()
+                if other.pid != pid
+                and self.placement[other.index][0] is group
+                and self.routed.get(other.index) is not None
+            ]
+
+            if not others:
+                continue
+
+            self.routed[state.index] = None
+            taken.append(state)
+            log(f"worker {state.index} (pid {state.pid}) leaves routing while it is traced")
+
+        if taken:
+            self.traced[request_id] = taken
+            self.announce()
+
+    def trace_ended(self, request_id: int) -> None:
+        """Put workers back in routing once their trace has answered."""
+
+        returned = False
+
+        for state in self.traced.pop(request_id, []):
+            if state.replaced or state.debug_sessions or state.pid not in self.states:
+                continue
+
+            self.routed[state.index] = state.path
+            returned = True
+            log(f"worker {state.index} (pid {state.pid}) serves again: its trace has ended")
+
+        if returned:
+            self.announce()
 
     def debugging(self, state: WorkerState, change: int) -> None:
         """Count a debugger session opening or ending in a worker.

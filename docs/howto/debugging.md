@@ -120,7 +120,9 @@ time spent in each, with sys.monitoring, for `--for` (10 s), and prints
 the functions that took longest with their call counts. It needs Python
 3.12 or later. Exact counts cost the worker more than sampling, so a
 worker serving requests in more than half its slots is refused unless
-`--force` is given.
+`--force` is given. While the trace runs the worker takes no new
+requests, which go to the other workers of its group; one that is the
+last of its group in service keeps serving.
 
 ## Memory
 
@@ -132,6 +134,19 @@ objects added:
 
 ```
 muructl debug memory shop --trace --for 1m --top 30
+```
+
+To compare two moments of your choosing, such as before and after a
+batch job, `--snapshot` keeps a tracemalloc snapshot in each worker,
+starting tracemalloc if it is off, and `--diff` later shows the sites
+that allocated most since then. The snapshot is kept for further
+`--diff`s until `--drop`, which also stops tracemalloc if `--snapshot`
+started it:
+
+```
+muructl debug memory shop --snapshot
+muructl debug memory shop --diff
+muructl debug memory shop --drop
 ```
 
 ## Running code

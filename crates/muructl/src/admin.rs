@@ -593,7 +593,8 @@ pub enum DebugCommand {
     Trace(TraceArgs),
 
     /// Each worker's memory, gc state and most common object types, and
-    /// with --trace the sites that allocated most over a period.
+    /// with --trace the sites that allocated most over a period, or with
+    /// --diff since a snapshot kept with --snapshot.
     Memory(MemoryArgs),
 
     /// Run Python code in the workers and print its output and value;
@@ -694,8 +695,21 @@ pub struct MemoryArgs {
     common: DebugArgs,
 
     /// Trace allocations with tracemalloc for the period.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["snapshot", "diff", "drop"])]
     trace: bool,
+
+    /// Keep a tracemalloc snapshot in each worker, starting tracemalloc
+    /// if it is off, for a later --diff.
+    #[arg(long, conflicts_with_all = ["diff", "drop"])]
+    snapshot: bool,
+
+    /// Show the sites that allocated most since the kept snapshot.
+    #[arg(long, conflicts_with = "drop")]
+    diff: bool,
+
+    /// Drop the kept snapshot, stopping tracemalloc if --snapshot started it.
+    #[arg(long)]
+    drop: bool,
 
     /// How long to trace allocations.
     #[arg(long = "for", value_name = "DURATION", default_value = "30s", value_parser = muru_config::parse_duration)]
@@ -800,6 +814,15 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
             &memory.common,
             serde_json::json!({
                 "trace": memory.trace,
+                "snapshot": if memory.snapshot {
+                    "take"
+                } else if memory.diff {
+                    "diff"
+                } else if memory.drop {
+                    "drop"
+                } else {
+                    ""
+                },
                 "duration_s": memory.duration.as_secs_f64(),
                 "top": memory.top,
                 "timeout_s": if memory.trace { period(memory.duration) } else { 30.0 },
@@ -1167,8 +1190,23 @@ fn print_memory(response: &pb::DebugResponse) {
             );
         }
 
+        match result["snapshot"].as_str() {
+            Some("taken") => println!(
+                "  snapshot kept; tracemalloc holds {} (peak {})",
+                muru_config::format_size(result["traced"].as_u64().unwrap_or(0)),
+                muru_config::format_size(result["peak"].as_u64().unwrap_or(0))
+            ),
+            Some("dropped") => println!("  snapshot dropped"),
+            Some("none") => println!("  no snapshot was kept"),
+            _ => {}
+        }
+
         if let Some(allocations) = result["allocations"].as_array() {
-            println!("  allocated over the period:");
+            if result["snapshot"] == "compared" {
+                println!("  allocated since the snapshot:");
+            } else {
+                println!("  allocated over the period:");
+            }
 
             for site in allocations {
                 println!(

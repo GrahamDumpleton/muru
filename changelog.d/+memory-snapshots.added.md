@@ -1,0 +1,1 @@
+Added `muructl debug memory --snapshot`, `--diff` and `--drop`, to compare a worker's allocations between two chosen moments, and a traced worker taking no new requests while another worker of its group can.

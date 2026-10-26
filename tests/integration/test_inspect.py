@@ -445,6 +445,54 @@ def test_memory_reports_objects_and_traces_allocations(daemon: Daemon) -> None:
     assert "plain_wsgi.py" in traced
 
 
+def test_memory_compares_with_a_snapshot_kept_between_two_points(daemon: Daemon) -> None:
+    deploy_plain(daemon, processes=1)
+    kept = daemon.muructl("debug", "memory", "plain", "--snapshot").stdout
+    assert "snapshot kept; tracemalloc holds" in kept
+
+    for _ in range(3):
+        daemon.get("/grow?mb=1")
+
+    compared = daemon.muructl("debug", "memory", "plain", "--diff").stdout
+    assert "allocated since the snapshot:" in compared
+    assert "plain_wsgi.py" in compared
+
+    # Kept until dropped; then there is nothing to compare with.
+
+    assert "plain_wsgi.py" in daemon.muructl("debug", "memory", "plain", "--diff").stdout
+    assert "snapshot dropped" in daemon.muructl("debug", "memory", "plain", "--drop").stdout
+    refused = daemon.muructl("debug", "memory", "plain", "--diff").stdout
+    assert "no snapshot is kept; take one with --snapshot" in refused
+
+
+def test_a_traced_worker_leaves_routing_while_the_trace_lasts(daemon: Daemon) -> None:
+    if sys.version_info < (3, 12):
+        support.unavailable("trace needs Python 3.12 or later, for sys.monitoring")
+
+    deploy_plain(daemon, processes=2)
+
+    def serving() -> set[int]:
+        return {json.loads(daemon.get("/info").body)["pid"] for _ in range(20)}
+
+    wait_for(lambda: len(serving()) == 2)
+    tracing = threading.Thread(
+        target=daemon.muructl, args=("debug", "trace", "plain", "--worker", "0", "--for", "4s")
+    )
+    tracing.start()
+
+    try:
+        wait_for(lambda: len(serving()) == 1, timeout=3)
+        during = serving()
+    finally:
+        tracing.join()
+
+    assert len(during) == 1
+    wait_for(lambda: len(serving()) == 2)
+    log = daemon.muructl("logs", "plain").stdout
+    assert "leaves routing while it is traced" in log
+    assert "serves again: its trace has ended" in log
+
+
 def test_exec_is_off_unless_the_daemon_allows_it(daemon: Daemon, tmp_path: Path) -> None:
     deploy_plain(daemon, processes=1)
     refused = daemon.muructl("debug", "exec", "plain", "--", "1 + 1", check=False)

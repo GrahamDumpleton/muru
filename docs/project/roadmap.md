@@ -427,6 +427,8 @@ and `--format pstats` writes the samples as pstats. On Linux with
 Python 3.14 and later, stacks and profiles are read from outside the
 worker with PEP 768, so a worker holding the interpreter still shows
 them; macOS, which allows that only to root, asks the worker (ADR 0028).
+`debug memory --snapshot` and `--diff` compare two chosen moments, and a
+traced worker takes no new requests while its group has another.
 
 Overlays (section 9.10) are in, activated by hand or by a one-off or
 recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach
