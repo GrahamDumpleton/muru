@@ -214,7 +214,14 @@ trigger = {{ schedule = {{ start = '{at(3)}', end = '{at(7)}' }} }}
 
 def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None:
     site.apply(OVERLAYS, prune=True)
-    assert "No active overlay" in site.daemon.muructl("config", "show", "--effective").stdout
+    shown = site.daemon.muructl("config", "show", "--effective").stdout
+    assert "No active overlay" in shown
+
+    # Each serving release's settings say which layer they came from.
+
+    assert "#   clients@r2: entrypoint = clients:wsgi_app ([tool.muru])" in shown
+    assert "#   clients@r2: processes = 1 (the release table)" in shown
+    assert "#   clients@r2: threads = 4 (default)" in shown
 
     site.overlay("activate", "read-only")
     shown = site.daemon.muructl("config", "show", "--effective").stdout

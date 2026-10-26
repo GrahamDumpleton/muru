@@ -129,6 +129,26 @@ diff -f FILE` compares a file with desired state in both directions,
 listing what the file would add and what the daemon holds that the file
 does not, with exit code 2 when they differ.
 
+`muructl config show [APP] --effective` writes the same document headed
+by each serving release's settings and where each came from: the
+release table of an applied file or the deploy's flags, the source's
+`[tool.muru]` table, the source's `.venv` for the interpreter, the
+previous release, or the default:
+
+```console
+$ muructl config show shop --effective
+# Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
+# No active overlay changes this configuration.
+
+# The releases' settings, and the layer each came from:
+#   shop@r3: entrypoint = shop.wsgi:application ([tool.muru])
+#   shop@r3: python = /srv/shop/.venv/bin/python (the source's .venv)
+#   shop@r3: processes = 4 (deploy flags)
+#   shop@r3: threads = 8 (the previous release)
+#   shop@r3: sync_threads = 8 (default)
+...
+```
+
 ## Where things live
 
 The daemon keeps its state store, run directory and logs in the user

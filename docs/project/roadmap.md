@@ -426,8 +426,9 @@ overlays with `trigger.external`, `muructl config show --effective`
 attributes what active overlays set, and the daemon warns when the clock
 schedules follow is not synchronised. An overlay's `error_pages` choose
 a route's pages while it is active, and its `client_routes` give client
-classes routes of their own. Still to come: the release settings' layers
-in `config show`; condition triggers are phase 4.
+classes routes of their own, and `config show --effective` also says
+which layer each release setting came from. Condition triggers are
+phase 4.
 
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as

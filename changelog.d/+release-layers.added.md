@@ -1,0 +1,1 @@
+Added the release settings' layers to `muructl config show --effective`: each serving release's entrypoint, interpreter, sizes, recycling limits, timeouts, memory policy and redirect settings, with whether each came from the release table or deploy flags, `[tool.muru]`, the source's `.venv`, the previous release or the default.

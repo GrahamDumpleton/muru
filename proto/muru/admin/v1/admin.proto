@@ -527,6 +527,7 @@ message ExportConfigResponse {
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
   repeated string attributions = 6; // with effective: what each active overlay sets that is in force
+  repeated string layers = 7;       // with effective: each release setting and the layer it came from (section 3.3)
 }
 
 message ListHostsRequest {}

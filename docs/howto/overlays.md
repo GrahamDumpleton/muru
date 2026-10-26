@@ -214,7 +214,9 @@ muructl overlay promote cutover-r43
 `preview` shows what activating it now would change, field by field.
 `muructl config show --effective`, for every application or one, writes
 the configuration with the active overlays' changes in the routes,
-headed by what each active overlay sets that is in force:
+headed by what each active overlay sets that is in force, and then by
+where each release setting came from (see the
+[daemon guide](daemon.md#declaring-applications-in-files)):
 
 ```console
 $ muructl config show shop --effective

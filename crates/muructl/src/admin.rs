@@ -3523,6 +3523,16 @@ pub async fn config_show(
         println!();
     }
 
+    if !export.layers.is_empty() {
+        println!("# The releases' settings, and the layer each came from:");
+
+        for line in &export.layers {
+            println!("#   {line}");
+        }
+
+        println!();
+    }
+
     print!("{}", export.document);
     Ok(())
 }

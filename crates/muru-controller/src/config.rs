@@ -457,6 +457,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
             error_override: table.error_override.as_ref(),
             maintenance: table.maintenance.as_ref(),
+            declared: true,
         };
 
         let spec = match resolve_spec(&request_from(name, table, source), None, &tables) {
@@ -2070,6 +2071,22 @@ pub struct Tables<'a> {
     pub error_override: Option<&'a muru_config::ErrorOverride>,
     /// Maintenance exemptions (section 4.12).
     pub maintenance: Option<&'a muru_config::Maintenance>,
+    /// Whether the request is a declared release's table rather than a
+    /// deploy's flags, which names its layer (section 3.3).
+    pub declared: bool,
+}
+
+/// Section 3.3: the layer a release setting came from, the first of
+/// the request, the source's [tool.muru] table and the previous release
+/// that gives it, else the default.
+fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static str {
+    match (given, table, previous) {
+        (true, _, _) if declared => "the release table",
+        (true, _, _) => "deploy flags",
+        (_, true, _) => "[tool.muru]",
+        (_, _, true) => "the previous release",
+        _ => "default",
+    }
 }
 
 /// Resolve a deploy request into a release spec: the request's settings,
@@ -2457,6 +2474,8 @@ pub fn resolve_spec(
         &source,
     )?;
 
+    let layers = resolve_layers(request, &table, previous, tables.declared, &source);
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -2502,7 +2521,337 @@ pub fn resolve_spec(
         error_override,
         maintenance,
         http: None,
+        layers,
     })
+}
+
+/// Section 3.3: where each of a release's settings comes from, by the
+/// keys `release_settings` shows.
+fn resolve_layers(
+    request: &pb::DeployRequest,
+    table: &muru_config::ToolMuru,
+    previous: Option<&ReleaseSpec>,
+    declared: bool,
+    source: &Path,
+) -> crate::model::Layers {
+    let timeouts = table.timeouts.clone().unwrap_or_default();
+    let memory = table.memory.clone().unwrap_or_default();
+    let before = previous.is_some();
+    let venv = source.join(".venv").join("bin").join("python").is_file();
+
+    let python = if request.python.is_empty() && venv {
+        "the source's .venv"
+    } else {
+        layer(!request.python.is_empty(), false, before, declared)
+    };
+
+    let keys = [
+        (
+            "entrypoint",
+            layer(
+                !request.entrypoint.is_empty(),
+                table.entrypoint.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        ("python", python),
+        (
+            "interface",
+            layer(
+                !request.interface.is_empty(),
+                table.interface.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "preload",
+            layer(
+                !request.preload.is_empty(),
+                table.preload.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "processes",
+            layer(
+                request.processes.is_some(),
+                table.processes.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        (
+            "threads",
+            layer(
+                request.threads.is_some(),
+                table.threads.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        (
+            "sync_threads",
+            layer(
+                request.sync_threads.is_some(),
+                table.sync_threads.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "concurrency",
+            layer(
+                request.concurrency.is_some(),
+                table.concurrency.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "max_requests",
+            layer(
+                request.max_requests.is_some(),
+                table.max_requests.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "max_lifetime",
+            layer(
+                request.max_lifetime_ms.is_some(),
+                table.max_lifetime.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.soft_timeout",
+            layer(
+                request.soft_timeout_ms.is_some(),
+                timeouts.soft_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.hard_timeout",
+            layer(
+                request.hard_timeout_ms.is_some(),
+                timeouts.hard_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.hard_drain_grace",
+            layer(
+                request.hard_drain_grace_ms.is_some(),
+                timeouts.hard_drain_grace.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.shutdown_timeout",
+            layer(
+                request.shutdown_timeout_ms.is_some(),
+                timeouts.shutdown_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.loop_stall_timeout",
+            layer(
+                request.loop_stall_timeout_ms.is_some(),
+                timeouts.loop_stall_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.measure",
+            layer(
+                !request.memory_measure.is_empty(),
+                memory.measure.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.soft_limit",
+            layer(
+                request.memory_soft_limit.is_some(),
+                memory.soft_limit.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.soft_for",
+            layer(
+                request.memory_soft_for_ms.is_some(),
+                memory.soft_for.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.reclaim_first",
+            layer(
+                request.memory_reclaim_first.is_some(),
+                memory.reclaim_first.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.hard_limit",
+            layer(
+                request.memory_hard_limit.is_some(),
+                memory.hard_limit.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.check_interval",
+            layer(
+                request.memory_check_interval_ms.is_some(),
+                memory.check_interval.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "accel_redirect",
+            layer(
+                request.accel_redirect.is_some(),
+                table.accel_redirect.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "cgi_local_redirect",
+            layer(
+                request.cgi_local_redirect.is_some(),
+                table.cgi_local_redirect.is_some(),
+                false,
+                declared,
+            ),
+        ),
+    ];
+
+    crate::model::Layers(
+        keys.into_iter()
+            .map(|(key, layer)| (key.to_owned(), layer.to_owned()))
+            .collect(),
+    )
+}
+
+/// Section 3.3: a release's settings as `config show --effective`
+/// shows them beside their layers, by key.
+fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
+    let optional = |value: Option<u64>, format: fn(u64) -> String| {
+        value.map_or_else(|| "off".to_owned(), format)
+    };
+
+    vec![
+        ("entrypoint", spec.entrypoint.clone()),
+        ("python", spec.python.display().to_string()),
+        ("interface", spec.interface.to_string()),
+        ("preload", spec.preload.to_string()),
+        ("processes", spec.processes.to_string()),
+        ("threads", spec.threads.to_string()),
+        ("sync_threads", spec.sync_threads.to_string()),
+        ("concurrency", spec.concurrency.to_string()),
+        (
+            "max_requests",
+            optional(spec.max_requests, |value| value.to_string()),
+        ),
+        ("max_lifetime", optional(spec.max_lifetime_ms, format_ms)),
+        (
+            "timeouts.soft_timeout",
+            optional(spec.timeouts.soft_timeout_ms, format_ms),
+        ),
+        (
+            "timeouts.hard_timeout",
+            optional(spec.timeouts.hard_timeout_ms, format_ms),
+        ),
+        (
+            "timeouts.hard_drain_grace",
+            format_ms(spec.timeouts.hard_drain_grace_ms),
+        ),
+        (
+            "timeouts.shutdown_timeout",
+            format_ms(spec.timeouts.shutdown_timeout_ms),
+        ),
+        (
+            "timeouts.loop_stall_timeout",
+            format_ms(spec.timeouts.loop_stall_timeout_ms),
+        ),
+        ("memory.measure", spec.memory.measure.to_string()),
+        (
+            "memory.soft_limit",
+            optional(spec.memory.soft_limit, muru_config::format_size),
+        ),
+        ("memory.soft_for", format_ms(spec.memory.soft_for_ms)),
+        (
+            "memory.reclaim_first",
+            spec.memory.reclaim_first.to_string(),
+        ),
+        (
+            "memory.hard_limit",
+            optional(spec.memory.hard_limit, muru_config::format_size),
+        ),
+        (
+            "memory.check_interval",
+            format_ms(spec.memory.check_interval_ms),
+        ),
+        ("accel_redirect", spec.accel_redirect.to_string()),
+        ("cgi_local_redirect", spec.cgi_local_redirect.to_string()),
+    ]
+}
+
+/// Section 3.3: each setting of the releases an exported document
+/// declares, with the layer it came from, one line a setting, for
+/// `config show --effective`.
+pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
+    let mut lines = Vec::new();
+
+    for (app, table) in &document.app {
+        for id in table.release.keys() {
+            let release = store.release(app, id)?;
+
+            if release.spec.http.is_some() {
+                continue;
+            }
+
+            if release.spec.layers.is_empty() {
+                lines.push(format!(
+                    "{app}@{id}: made before Muru recorded where settings come from"
+                ));
+                continue;
+            }
+
+            for (key, value) in release_settings(&release.spec) {
+                let layer = release
+                    .spec
+                    .layers
+                    .0
+                    .get(key)
+                    .map_or("not recorded", String::as_str);
+                lines.push(format!("{app}@{id}: {key} = {value} ({layer})"));
+            }
+        }
+    }
+
+    Ok(lines)
 }
 
 /// Section 10.8: the environment, the table's entries with the
@@ -2757,6 +3106,7 @@ fn resolve_http_spec(
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
         }),
+        layers: crate::model::Layers::default(),
     })
 }
 
@@ -3835,6 +4185,53 @@ mod tests {
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.changes.is_empty(), "{:?}", plan.changes);
         assert_eq!(plan.unchanged, 1);
+    }
+
+    #[test]
+    fn a_release_records_the_layer_each_setting_came_from() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let document = export(&store, None, false).unwrap();
+        let lines = release_layers(&store, &document).unwrap();
+        let line = |key: &str| {
+            lines
+                .iter()
+                .find(|line| line.starts_with(&format!("shop@r1: {key} = ")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            line("entrypoint"),
+            "shop@r1: entrypoint = shop.wsgi:application (deploy flags)"
+        );
+        assert_eq!(line("threads"), "shop@r1: threads = 4 (default)");
+        assert_eq!(
+            line("timeouts.soft_timeout"),
+            "shop@r1: timeouts.soft_timeout = off (default)"
+        );
+
+        // A deploy takes what it does not give from the release before;
+        // a declared release names its table.
+
+        let previous = store.release("shop", "r1").unwrap().spec;
+        let request = pb::DeployRequest {
+            app: "shop".to_owned(),
+            source: source.display().to_string(),
+            threads: Some(2),
+            ..Default::default()
+        };
+        let next = resolve_spec(&request, Some(&previous), &Tables::default()).unwrap();
+        assert_eq!(next.layers.0["entrypoint"], "the previous release");
+        assert_eq!(next.layers.0["threads"], "deploy flags");
+        assert_eq!(next.layers.0["sync_threads"], "default");
+
+        let declared = Tables {
+            declared: true,
+            ..Tables::default()
+        };
+        let spec = resolve_spec(&request, Some(&previous), &declared).unwrap();
+        assert_eq!(spec.layers.0["threads"], "the release table");
+        assert_eq!(spec, next, "layers are not settings");
     }
 
     #[test]

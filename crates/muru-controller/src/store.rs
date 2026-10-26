@@ -1064,6 +1064,7 @@ mod tests {
             error_override: None,
             maintenance: None,
             http: None,
+            layers: crate::model::Layers::default(),
         }
     }
 

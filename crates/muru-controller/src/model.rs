@@ -249,7 +249,35 @@ pub struct ReleaseSpec {
     /// its command runs in, and the worker settings are unused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpServerSpec>,
+    /// Section 3.3: the layer each setting came from, by key.
+    #[serde(default, skip_serializing_if = "Layers::is_empty")]
+    pub layers: Layers,
 }
+
+/// Section 3.3: where each of a release's settings came from, by key:
+/// the release table or deploy flags, the source's [tool.muru] table,
+/// the previous release, or the default. It records how the settings
+/// were reached, not what they are, so two specs are equal whatever
+/// their layers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Layers(pub BTreeMap<String, String>);
+
+impl Layers {
+    /// Whether nothing is recorded, as for a release made before
+    /// layers were.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl PartialEq for Layers {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Layers {}
 
 /// Section 9.9: a release that runs an HTTP server of its own instead
 /// of Muru workers, started from a command and routed to as an upstream.

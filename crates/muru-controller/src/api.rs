@@ -1181,10 +1181,13 @@ impl Admin for Service {
         let mut document =
             config::export(&self.handle.store, app, request.all_releases).map_err(not_found)?;
 
-        let attributions = if request.effective {
-            config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?
+        let (attributions, layers) = if request.effective {
+            (
+                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?,
+                config::release_layers(&self.handle.store, &document).map_err(internal)?,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         let text = document.to_toml().map_err(internal)?;
@@ -1196,6 +1199,7 @@ impl Admin for Service {
             time_unix_ms: now_unix_ms(),
             state_version: self.handle.store.state_version().map_err(internal)?,
             attributions,
+            layers,
         }))
     }
 }
