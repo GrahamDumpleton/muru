@@ -64,6 +64,7 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_workers_ready` | gauge | app, release, group | workers listening for requests (under the daemon) |
 | `muru_worker_requests_total` | counter | app, release, group, worker | requests a worker has served, as it last reported (under the daemon) |
 | `muru_worker_requests_in_flight` | gauge | app, release, group, worker | requests a worker was serving when it last reported |
+| `muru_worker_cpu_seconds_total` | counter | app, release, group, worker | CPU time a worker has used, user and system, as it last reported every `check_interval` of its memory policy |
 | `muru_worker_memory_bytes` | gauge | app, release, group, worker, measure | a worker's memory as `rss`, `pss` or `uss`, measured every `check_interval` of its [memory policy](memory.md) |
 | `muru_connections_open` | gauge | listener | connections open on a listener |
 | `muru_connections_refused_total` | counter | listener, reason | connections a listener refused: `client_limit`, `overloaded` (answered 503) or `paused` (closed), see the [connections guide](connections.md) |

@@ -10,6 +10,7 @@ mod asgi;
 mod link;
 mod memory;
 mod pool;
+mod signals;
 mod uploads;
 mod wsgi;
 

@@ -174,6 +174,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests a worker was serving when it last reported.",
     },
     Family {
+        name: "muru_worker_cpu_seconds_total",
+        kind: Kind::Counter,
+        help: "CPU time a worker has used, user and system, as it last reported.",
+    },
+    Family {
         name: "muru_worker_memory_bytes",
         kind: Kind::Gauge,
         help: "A worker's memory as it last reported it, by measure: rss, pss or uss.",

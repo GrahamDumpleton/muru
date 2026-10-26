@@ -283,9 +283,11 @@ spent; every decision is a `scaling.decision` event with its reasons,
 and `--unpin` hands it back, and `advisory = true` reports without
 acting. The decision engine is a module with an injectable clock, driven
 through step, ramp, sawtooth, bursty and budget scenarios in unit tests.
-Still to come: the node budget manager across applications, the worker
-CPU, GIL wait and loop lag signals with the diagnosis table, and scale
-to zero.
+The workers' CPU, GIL wait and event loop lag followed, reported to the
+host with their memory and turned into rates by the daemon, with the
+diagnosis table naming each group's bottleneck in every decision and in
+`muructl scale status`. Still to come: the node budget manager across
+applications, and scale to zero.
 
 Scheduled capacity (section 7.5) is in: `[[app.NAME.schedule]]` entries,
 one-off or recurring, raise a worker group's floor and ceiling for their

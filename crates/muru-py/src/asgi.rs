@@ -283,7 +283,10 @@ impl Channel {
 
     /// Complete a waiting future on the loop's thread.
     fn wake(&self, waiter: Py<PyAny>, message: &Message) {
+        let ready = std::time::Instant::now();
+
         Python::attach(|py| {
+            crate::signals::GIL_WAIT.record(ready.elapsed());
             let delivered =
                 message_dict(py, message, self.websocket, self.grpc).and_then(|value| {
                     self.event_loop.bind(py).call_method1(
@@ -1382,7 +1385,10 @@ pub fn start(
     tx: mpsc::Sender<Outgoing>,
     request: u64,
 ) -> Result<Py<Channel>, String> {
+    let ready = std::time::Instant::now();
+
     Python::attach(|py| {
+        crate::signals::GIL_WAIT.record(ready.elapsed());
         let channel = Channel::new(py, asgi, tx, head, Arc::clone(shared), request);
         let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
         shared.request_channel(request, channel.clone().unbind());

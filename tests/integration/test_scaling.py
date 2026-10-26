@@ -9,6 +9,7 @@ release is declared.
 
 from __future__ import annotations
 
+import re
 import sys
 import threading
 import time
@@ -137,6 +138,16 @@ min_lifetime = '1s'
     assert any("scale in from" in line for line in events), events
     assert all("advisory" not in line for line in events), events
 
+    # Section 7.3: a decision says what holds the group back, here
+    # threads busy sleeping rather than computing, and the status shows
+    # the workers' own signals.
+
+    scaled_out = [line for line in events if "scale out from 1" in line]
+    assert "diagnosis: I/O bound with exhausted slots" in scaled_out[0], scaled_out
+    shown = daemon.muructl("scale", "status", "shop").stdout
+    assert re.search(r"workers: cpu \d+%", shown), shown
+    assert "diagnosis: " in shown, shown
+
     # The metrics carry the autoscaler's gauges and counters.
 
     metrics = daemon.muructl("metrics").stdout
@@ -146,6 +157,7 @@ min_lifetime = '1s'
         in metrics
     )
     assert "muru_churn_reaps_total" in metrics
+    assert "muru_worker_cpu_seconds_total" in metrics
 
 
 def test_a_pin_overrides_the_autoscaler_and_survives_a_restart(tmp_path: Path) -> None:

@@ -4,9 +4,10 @@
 :class: note
 
 The spare and target modes with their windows and churn budget, pins,
-scheduled capacity and `muructl scale status`, under the daemon. Node
-budgets across applications, worker CPU and GIL signals, and scale to
-zero are still to come.
+scheduled capacity, the workers' CPU, GIL wait and event loop lag with
+a diagnosis of each group, and `muructl scale status`, under the
+daemon. Node budgets across applications and scale to zero are still
+to come.
 ```
 
 A worker group has a fixed number of processes unless it is given a
@@ -181,20 +182,49 @@ $ muructl scale status shop
 shop@r42
 GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
 default      3 -> 5       12/12      -1.0    230 ms     0/6        spare 2-12 workers, 1-4 idle
+  workers: cpu 12%, gil wait p95 1 ms, loop lag p95 -
+  diagnosis: I/O bound with exhausted slots; for the next release, more threads per worker, or more concurrency for an ASGI application
   last: scale out from 3 to 5 workers: short by 1.0 workers for 5s (2s ago)
 reports      1            0/1        1.0     -          0/6        target 1-6 workers, 80% of slots busy
+  workers: cpu 2%, gil wait p95 1 ms, loop lag p95 -
+  diagnosis: idle
 ```
 
 `WORKERS` shows the workers the edge routes to and, while they differ, the
-count the group is being brought to. While a schedule sets capacity, a
+count the group is being brought to. The `workers` line is what the
+group's workers report about themselves every `check_interval` of the
+[memory policy](memory.md) (5 seconds by default), over the time since
+their last report: their CPU time per second as a share of what a
+worker can use (one core with the GIL, a core per thread on a
+free-threaded interpreter without it), the 95th percentile wait of a
+thread for the GIL when it has work to run, and the 95th percentile
+lateness of an ASGI worker's event loop, which beats twice a second.
+
+The `diagnosis` line names what holds the group back and what to change
+in the next release:
+
+| Diagnosis | When | Suggested |
+| --- | --- | --- |
+| memory bound | a worker within 10% of its soft memory limit | fewer threads per worker, or a higher memory limit |
+| event loop held by blocking code | loop lag p95 of 100 ms or more | await blocking calls, or run them in a thread |
+| GIL bound | GIL wait p95 of 10 ms or more | more processes with fewer threads each |
+| CPU bound | CPU at 80% or more of what a worker can use | more processes, up to the node's cores |
+| I/O bound with exhausted slots | 80% or more of the slots busy, CPU lower | more threads per worker, or more concurrency |
+| a few heavy requests | queue wait p95 of 100 ms or more with under half the slots busy | a worker group of their own for the slow paths |
+| idle | under 10% of the slots busy and no queue | |
+| within capacity | anything else | |
+
+The first that applies is the diagnosis. While a schedule sets capacity, a
 line below the group's says so, as `scheduled: 24-48 workers, no
 scale-in from shop.black-friday`. `IDLE` is the idle worker
 equivalents, negative when the group is short. `REAPS` is the churn budget
 used in the last hour, with `halt` while scale-in is suspended.
 
-Every decision is a `scaling.decision` event with its reasons, and
-`muru_workers_desired`, `muru_scaling_decisions_total` and
-`muru_churn_reaps_total` are in the metrics beside `muru_workers_ready`.
+Every decision is a `scaling.decision` event with its reasons and the
+diagnosis, and `muru_workers_desired`, `muru_scaling_decisions_total`
+and `muru_churn_reaps_total` are in the metrics beside
+`muru_workers_ready`, with each worker's CPU time as
+`muru_worker_cpu_seconds_total`.
 
 A pin overrides the autoscaler:
 

@@ -107,6 +107,175 @@ impl Signals {
     }
 }
 
+/// Section 7.3: what a group's workers say about themselves between two
+/// of their host's reports.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkerSignals {
+    /// CPU seconds per wall second, averaged over the workers, as a share
+    /// of what a worker can use: one core with a GIL, a core per thread
+    /// without.
+    pub worker_cpu: Option<f64>,
+    /// The 95th percentile wait for the GIL, in milliseconds.
+    pub gil_wait_p95_ms: Option<f64>,
+    /// The 95th percentile lateness of the event loop, in milliseconds.
+    pub loop_lag_p95_ms: Option<f64>,
+}
+
+impl WorkerSignals {
+    /// The group's signals from two reports `elapsed` apart, each worker
+    /// compared with itself by pid; a worker in only one is left out.
+    /// `threads` is what a worker without a GIL can run at once.
+    pub fn between(
+        before: &[crate::host::WorkerStatus],
+        after: &[crate::host::WorkerStatus],
+        group: &str,
+        elapsed: Duration,
+        threads: u32,
+    ) -> Self {
+        let mut cpu = Vec::new();
+        let mut gil_wait = Vec::new();
+        let mut loop_lag = Vec::new();
+        let wall_ms = elapsed.as_millis() as f64;
+
+        for worker in after.iter().filter(|worker| worker.group == group) {
+            let Some(earlier) = before.iter().find(|earlier| earlier.pid == worker.pid) else {
+                continue;
+            };
+
+            if let (Some(now), Some(then)) = (worker.cpu_ms, earlier.cpu_ms)
+                && wall_ms > 0.0
+            {
+                let cores = if worker.gil_enabled {
+                    1.0
+                } else {
+                    threads.max(1) as f64
+                };
+                cpu.push(now.saturating_sub(then) as f64 / wall_ms / cores);
+            }
+
+            add_growth(&mut gil_wait, &worker.gil_wait, &earlier.gil_wait);
+            add_growth(&mut loop_lag, &worker.loop_lag, &earlier.loop_lag);
+        }
+
+        Self {
+            worker_cpu: (!cpu.is_empty()).then(|| cpu.iter().sum::<f64>() / cpu.len() as f64),
+            gil_wait_p95_ms: p95_ms(&gil_wait),
+            loop_lag_p95_ms: p95_ms(&loop_lag),
+        }
+    }
+}
+
+/// Add one worker's histogram growth to a group's.
+fn add_growth(sum: &mut Vec<u64>, now: &[u64], then: &[u64]) {
+    if now.len() != then.len() {
+        return;
+    }
+
+    sum.resize(sum.len().max(now.len()), 0);
+
+    for (index, (now, then)) in now.iter().zip(then).enumerate() {
+        sum[index] += now.saturating_sub(*then);
+    }
+}
+
+/// The 95th percentile of a histogram over the signal bounds, in
+/// milliseconds: the bound of the first count holding 95 percent of all,
+/// the last bound for what lies beyond it, or none without observations.
+fn p95_ms(counts: &[u64]) -> Option<f64> {
+    let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
+    let total = *counts.last()?;
+
+    if total == 0 {
+        return None;
+    }
+
+    let target = total as f64 * 0.95;
+    let index = counts.iter().position(|count| *count as f64 >= target)?;
+    let bound = bounds.get(index).or(bounds.last())?;
+    Some(*bound as f64 / 1000.0)
+}
+
+/// Section 7.3: what holds a group back, and what would help the next
+/// release, from its slots, its queue and its workers' own signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnosis {
+    /// The bottleneck: cpu, gil, io, heavy, loop, memory, idle or none.
+    pub bottleneck: &'static str,
+    /// The bottleneck in words.
+    pub summary: &'static str,
+    /// The tuning it suggests, when any.
+    pub advice: &'static str,
+}
+
+/// Classify a group's bottleneck. `utilization` is busy slots over all,
+/// and `memory_near_limit` whether its workers are within 10 percent of
+/// their soft memory limit.
+pub fn diagnose(
+    utilization: f64,
+    queue_wait_p95_ms: Option<f64>,
+    signals: &WorkerSignals,
+    memory_near_limit: bool,
+) -> Diagnosis {
+    let cpu = signals.worker_cpu.unwrap_or(0.0);
+    let gil_wait = signals.gil_wait_p95_ms.unwrap_or(0.0);
+    let queued = queue_wait_p95_ms.unwrap_or(0.0);
+    let diagnosis = |bottleneck, summary, advice| Diagnosis {
+        bottleneck,
+        summary,
+        advice,
+    };
+
+    if memory_near_limit {
+        return diagnosis(
+            "memory",
+            "memory bound",
+            "fewer threads per worker, or a higher memory limit",
+        );
+    }
+
+    if signals.loop_lag_p95_ms.unwrap_or(0.0) >= 100.0 {
+        return diagnosis(
+            "loop",
+            "event loop held by blocking code",
+            "await blocking calls, or run them in a thread, so the loop keeps serving",
+        );
+    }
+
+    if gil_wait >= 10.0 {
+        return diagnosis("gil", "GIL bound", "more processes with fewer threads each");
+    }
+
+    if cpu >= 0.8 {
+        return diagnosis(
+            "cpu",
+            "CPU bound",
+            "more processes, up to the node's cores; more threads will not help",
+        );
+    }
+
+    if utilization >= 0.8 {
+        return diagnosis(
+            "io",
+            "I/O bound with exhausted slots",
+            "more threads per worker, or more concurrency for an ASGI application",
+        );
+    }
+
+    if queued >= 100.0 && utilization < 0.5 {
+        return diagnosis(
+            "heavy",
+            "a few heavy requests",
+            "a worker group of their own for the slow paths",
+        );
+    }
+
+    if utilization < 0.1 && queued < 1.0 {
+        return diagnosis("idle", "idle", "");
+    }
+
+    diagnosis("none", "within capacity", "")
+}
+
 /// What the autoscaler decided for a group.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
@@ -175,6 +344,8 @@ pub struct Scaler {
     signals: Signals,
     queue_wait_p95_ms: Option<f64>,
     decisions: (u64, u64),
+    workers: WorkerSignals,
+    memory_near_limit: bool,
 }
 
 /// The scaler's state for the admin API and the dashboard.
@@ -210,6 +381,10 @@ pub struct ScaleStatus {
     pub suspended: bool,
     /// Scale-outs and scale-ins decided since the scaler began.
     pub decisions: (u64, u64),
+    /// What the workers say about themselves (section 7.3).
+    pub workers: WorkerSignals,
+    /// What holds the group back.
+    pub diagnosis: Diagnosis,
 }
 
 impl Scaler {
@@ -238,6 +413,8 @@ impl Scaler {
             },
             queue_wait_p95_ms: None,
             decisions: (0, 0),
+            workers: WorkerSignals::default(),
+            memory_near_limit: false,
         }
     }
 
@@ -334,7 +511,32 @@ impl Scaler {
             reaps: self.reaps(),
             suspended: self.suspended,
             decisions: self.decisions,
+            workers: self.workers.clone(),
+            diagnosis: self.diagnosis(),
         }
+    }
+
+    /// Section 7.3: take what the group's workers last said about
+    /// themselves, and whether they are near their memory limit.
+    pub fn set_workers(&mut self, workers: WorkerSignals, memory_near_limit: bool) {
+        self.workers = workers;
+        self.memory_near_limit = memory_near_limit;
+    }
+
+    /// What holds the group back, from the latest signals.
+    pub fn diagnosis(&self) -> Diagnosis {
+        let utilization = if self.signals.total > 0.0 {
+            self.signals.busy / self.signals.total
+        } else {
+            0.0
+        };
+
+        diagnose(
+            utilization,
+            self.queue_wait_p95_ms,
+            &self.workers,
+            self.memory_near_limit,
+        )
     }
 
     /// Take one observation and decide; none means hold.
@@ -1225,5 +1427,102 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn worker(
+        pid: u32,
+        cpu_ms: u64,
+        gil_wait: Vec<u64>,
+        gil_enabled: bool,
+    ) -> crate::host::WorkerStatus {
+        crate::host::WorkerStatus {
+            index: 0,
+            pid,
+            group: "default".to_owned(),
+            requests: 0,
+            in_flight: 0,
+            oldest_ms: 0,
+            rss: None,
+            pss: None,
+            uss: None,
+            cpu_ms: Some(cpu_ms),
+            gil_enabled,
+            gil_wait,
+            loop_lag: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_signals_are_the_growth_between_two_reports() {
+        let zeros = vec![0; 11];
+
+        // Two workers over ten seconds: one used 9 s of CPU, the other 7 s;
+        // 100 GIL waits arrived, 96 of them within 5 ms.
+
+        let before = [
+            worker(1, 1_000, zeros.clone(), true),
+            worker(2, 500, zeros.clone(), true),
+        ];
+        let after = [
+            worker(
+                1,
+                10_000,
+                vec![0, 0, 50, 96, 96, 100, 100, 100, 100, 100, 100],
+                true,
+            ),
+            worker(2, 7_500, zeros.clone(), true),
+            worker(3, 99_000, zeros.clone(), true),
+        ];
+        let signals =
+            WorkerSignals::between(&before, &after, "default", Duration::from_secs(10), 4);
+        assert_eq!(signals.worker_cpu, Some(0.8));
+        assert_eq!(signals.gil_wait_p95_ms, Some(5.0));
+        assert_eq!(signals.loop_lag_p95_ms, None);
+
+        // Without a GIL a worker can use a core per thread.
+
+        let free = WorkerSignals::between(
+            &[worker(1, 0, zeros.clone(), false)],
+            &[worker(1, 8_000, zeros, false)],
+            "default",
+            Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(free.worker_cpu, Some(0.2));
+    }
+
+    #[test]
+    fn the_diagnosis_names_the_bottleneck() {
+        let quiet = WorkerSignals::default();
+        let busy_cpu = WorkerSignals {
+            worker_cpu: Some(0.95),
+            ..WorkerSignals::default()
+        };
+        let contended = WorkerSignals {
+            worker_cpu: Some(0.6),
+            gil_wait_p95_ms: Some(50.0),
+            ..WorkerSignals::default()
+        };
+        let lagging = WorkerSignals {
+            loop_lag_p95_ms: Some(500.0),
+            ..WorkerSignals::default()
+        };
+
+        assert_eq!(diagnose(0.9, None, &busy_cpu, false).bottleneck, "cpu");
+        assert_eq!(diagnose(0.9, None, &contended, false).bottleneck, "gil");
+        assert_eq!(diagnose(0.9, Some(200.0), &quiet, false).bottleneck, "io");
+        assert_eq!(
+            diagnose(0.3, Some(200.0), &quiet, false).bottleneck,
+            "heavy"
+        );
+        assert_eq!(diagnose(0.05, None, &quiet, false).bottleneck, "idle");
+        assert_eq!(diagnose(0.5, None, &quiet, false).bottleneck, "none");
+        assert_eq!(diagnose(0.5, None, &lagging, false).bottleneck, "loop");
+        assert_eq!(diagnose(0.9, None, &busy_cpu, true).bottleneck, "memory");
+        assert!(
+            diagnose(0.9, None, &quiet, false)
+                .advice
+                .contains("more threads")
+        );
     }
 }

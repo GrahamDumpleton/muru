@@ -618,8 +618,14 @@ fn thread_main(receiver: &Mutex<mpsc::Receiver<Job>>) {
         loop {
             // Wait for work with the interpreter detached. Only one idle
             // thread holds the receiver at a time; the others wait for it.
+            // From the job arriving to holding the GIL again is the
+            // thread's GIL wait (section 7.3).
 
-            let next = py.detach(|| receiver.lock().expect("pool receiver poisoned").recv());
+            let (next, ready) = py.detach(|| {
+                let next = receiver.lock().expect("pool receiver poisoned").recv();
+                (next, std::time::Instant::now())
+            });
+            crate::signals::GIL_WAIT.record(ready.elapsed());
 
             match next {
                 Ok(job) => run_in_context(py, job),

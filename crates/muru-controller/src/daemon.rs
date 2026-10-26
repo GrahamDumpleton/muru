@@ -421,6 +421,11 @@ struct GroupScaling {
     /// The count last asked of the host, so a count the host has not
     /// reached yet is not asked for again every second.
     requested: Option<u32>,
+    /// The threads a worker can run Python on at once without a GIL,
+    /// for its CPU share (section 7.3).
+    threads: u32,
+    /// The soft memory limit and what it measures, when one is set.
+    memory_limit: Option<(muru_config::Measure, u64)>,
 }
 
 /// What the API needs to talk to a running daemon.
@@ -566,8 +571,9 @@ struct Running {
     held: bool,
     /// The host's control connection, once it is up.
     control: Option<HostControl>,
-    /// What the workers last reported, for metrics.
+    /// What the workers last reported, for metrics, and when.
     status: Vec<crate::host::WorkerStatus>,
+    status_at: Option<Instant>,
     /// Section 7.4: each worker group's autoscaler, the default first.
     scalers: Vec<GroupScaling>,
     /// When each worker socket entered routing, for the age of the
@@ -2409,6 +2415,15 @@ impl Daemon {
                     ("group", worker.group.as_str()),
                     ("worker", index.as_str()),
                 ];
+
+                if let Some(cpu_ms) = worker.cpu_ms {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_cpu_seconds_total",
+                        &labels,
+                        cpu_ms as f64 / 1000.0,
+                    ));
+                }
+
                 samples.push(muru_edge::metrics::Sample::new(
                     "muru_worker_requests_total",
                     &labels,
@@ -2569,6 +2584,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        status_at: None,
                         scalers,
                         ready_at,
                     },
@@ -2653,6 +2669,7 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        status_at: None,
                         scalers: Vec::new(),
                         ready_at: HashMap::new(),
                     },
@@ -3186,6 +3203,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                status_at: None,
                 scalers,
                 ready_at,
             },
@@ -3376,6 +3394,7 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                status_at: None,
                 scalers: Vec::new(),
                 ready_at: HashMap::new(),
             },
@@ -4613,20 +4632,19 @@ impl Daemon {
                 );
 
                 match group.scaler.observe(now, signals) {
-                    Some(Decision::ScaleOut { to, reason }) => {
+                    Some(Decision::ScaleOut { to, reason } | Decision::ScaleIn { to, reason }) => {
+                        let diagnosis = group.scaler.diagnosis();
                         emitted.push((
                             "scaling.decision",
                             subject.clone(),
                             "info",
-                            decision_message(&group.name, ready, to, &reason, advisory),
-                        ));
-                    }
-                    Some(Decision::ScaleIn { to, reason }) => {
-                        emitted.push((
-                            "scaling.decision",
-                            subject.clone(),
-                            "info",
-                            decision_message(&group.name, ready, to, &reason, advisory),
+                            decision_message(
+                                &group.name,
+                                ready,
+                                to,
+                                &format!("{reason}; {}", describe_diagnosis(&diagnosis)),
+                                advisory,
+                            ),
                         ));
                     }
                     Some(Decision::Suspended { reason }) => {
@@ -5364,7 +5382,39 @@ impl Daemon {
             }
             HostMessage::Status { workers } => {
                 if let Some(running) = self.running.get_mut(&key) {
+                    // Section 7.3: the workers' own signals, from what
+                    // grew since the last report.
+
+                    let now = Instant::now();
+
+                    if let Some(at) = running.status_at {
+                        let elapsed = now.saturating_duration_since(at);
+
+                        for group in &mut running.scalers {
+                            let signals = crate::scaling::WorkerSignals::between(
+                                &running.status,
+                                &workers,
+                                &group.name,
+                                elapsed,
+                                group.threads,
+                            );
+                            let near = group.memory_limit.is_some_and(|(measure, limit)| {
+                                workers
+                                    .iter()
+                                    .filter(|worker| worker.group == group.name)
+                                    .filter_map(|worker| match measure {
+                                        muru_config::Measure::Uss => worker.uss,
+                                        muru_config::Measure::Pss => worker.pss,
+                                        muru_config::Measure::Rss => worker.rss,
+                                    })
+                                    .any(|used| used.saturating_mul(10) >= limit.saturating_mul(9))
+                            });
+                            group.scaler.set_workers(signals, near);
+                        }
+                    }
+
                     running.status = workers;
+                    running.status_at = Some(now);
                 }
             }
             HostMessage::Response { id, workers, error } => {
@@ -5732,11 +5782,20 @@ fn scalers_for(
             threads as f64
         }
     };
+    let threads = |threads: u32, sync_threads: u32| {
+        if asgi { sync_threads + 1 } else { threads }
+    };
+    let memory_limit = spec
+        .memory
+        .soft_limit
+        .map(|limit| (spec.memory.measure, limit));
     let mut scalers = vec![GroupScaling {
         name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
         scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
         slots_per_worker: slots(spec.threads, spec.concurrency),
         requested: None,
+        threads: threads(spec.threads, spec.sync_threads),
+        memory_limit,
     }];
 
     for group in &spec.groups {
@@ -5749,6 +5808,8 @@ fn scalers_for(
             scaler: Scaler::new(group.scaling.clone(), current as u32),
             slots_per_worker: slots(group.threads, group.concurrency),
             requested: None,
+            threads: threads(group.threads, group.sync_threads),
+            memory_limit,
         });
     }
 
@@ -5817,6 +5878,18 @@ fn clock_event(
 }
 
 /// A scaling decision as its event says it.
+/// Section 7.3: a diagnosis as words for an event or a status line.
+fn describe_diagnosis(diagnosis: &crate::scaling::Diagnosis) -> String {
+    if diagnosis.advice.is_empty() {
+        format!("diagnosis: {}", diagnosis.summary)
+    } else {
+        format!(
+            "diagnosis: {}; for the next release, {}",
+            diagnosis.summary, diagnosis.advice
+        )
+    }
+}
+
 fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
     let verb = if to > from { "scale out" } else { "scale in" };
 

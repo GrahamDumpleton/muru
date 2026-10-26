@@ -426,6 +426,11 @@ class WorkerState:
     over_soft_since: float | None = None
     reclaimed_at: float | None = None
 
+    # Section 7.3: the last scaling signals, relayed to the supervisor as
+    # the worker reported them.
+
+    signals: dict[str, Any] = field(default_factory=dict)
+
     # Section 11.7: the debugger sessions open in the worker, which keep
     # it out of routing and from being replaced.
 
@@ -1588,6 +1593,14 @@ class Host:
                     key: int(report[key]) for key in ("rss", "pss", "uss") if key in report
                 }
 
+            if "cpu_ms" in report:
+                measured = True
+                state.signals = {
+                    key: report[key]
+                    for key in ("cpu_ms", "gil_enabled", "gil_wait", "loop_lag")
+                    if key in report
+                }
+
         if not state.ready:
             state.ready = True
             self.worker_ready(state)
@@ -1686,6 +1699,7 @@ class Host:
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
                         **state.memory,
+                        **state.signals,
                     }
                     for state in sorted(self.states.values(), key=lambda state: state.index)
                     if not state.replaced

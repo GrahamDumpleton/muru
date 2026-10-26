@@ -2469,6 +2469,29 @@ fn print_scale_status(status: &pb::ScaleStatus) {
             );
         }
 
+        // Section 7.3: the workers' own signals, and what they say.
+
+        let measured = |value: Option<f64>, unit: &str| {
+            value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
+        };
+        println!(
+            "  workers: cpu {}, gil wait p95 {}, loop lag p95 {}",
+            measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+            measured(group.gil_wait_p95_ms, " ms"),
+            measured(group.loop_lag_p95_ms, " ms")
+        );
+
+        if !group.diagnosis.is_empty() {
+            if group.advice.is_empty() {
+                println!("  diagnosis: {}", group.diagnosis);
+            } else {
+                println!(
+                    "  diagnosis: {}; for the next release, {}",
+                    group.diagnosis, group.advice
+                );
+            }
+        }
+
         if !group.last_decision.is_empty() {
             println!(
                 "  last: {} ({} ago)",

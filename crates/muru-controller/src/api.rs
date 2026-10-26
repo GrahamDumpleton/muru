@@ -1579,6 +1579,12 @@ fn scale_message(
                     .capacity
                     .as_ref()
                     .is_some_and(|capacity| capacity.hold),
+                worker_cpu: status.workers.worker_cpu,
+                gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
+                loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
+                bottleneck: status.diagnosis.bottleneck.to_owned(),
+                diagnosis: status.diagnosis.summary.to_owned(),
+                advice: status.diagnosis.advice.to_owned(),
             })
             .collect(),
     }

@@ -88,6 +88,24 @@ pub struct WorkerStatus {
     pub pss: Option<u64>,
     /// Unique set size in bytes, when measured.
     pub uss: Option<u64>,
+    /// CPU time used since it started, in milliseconds, when measured
+    /// (section 7.3).
+    pub cpu_ms: Option<u64>,
+    /// Whether its interpreter runs with a GIL.
+    pub gil_enabled: bool,
+    /// Its GIL waits, cumulative at or below each of the worker
+    /// protocol's signal bounds, then the count of all.
+    pub gil_wait: Vec<u64>,
+    /// Its event loop's lateness, likewise.
+    pub loop_lag: Vec<u64>,
+}
+
+/// A histogram's counts from a status line, or none.
+fn counts(value: &serde_json::Value) -> Vec<u64> {
+    value
+        .as_array()
+        .map(|items| items.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default()
 }
 
 impl HostMessage {
@@ -172,6 +190,10 @@ impl HostMessage {
                                 rss: worker["rss"].as_u64(),
                                 pss: worker["pss"].as_u64(),
                                 uss: worker["uss"].as_u64(),
+                                cpu_ms: worker["cpu_ms"].as_u64(),
+                                gil_enabled: worker["gil_enabled"].as_bool().unwrap_or(true),
+                                gil_wait: counts(&worker["gil_wait"]),
+                                loop_lag: counts(&worker["loop_lag"]),
                             })
                             .collect()
                     })

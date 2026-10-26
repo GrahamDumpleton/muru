@@ -270,9 +270,19 @@ fn clock_ms() -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Record that the event loop has run (section 7.6).
+/// How often the event loop beats.
+const LOOP_BEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Record that the event loop has run (section 7.6), and how much later
+/// than due it ran (section 7.3).
 pub fn loop_beat() {
-    LOOP_BEAT_MS.store(clock_ms().max(1), Ordering::Relaxed);
+    let now = clock_ms().max(1);
+    let last = LOOP_BEAT_MS.swap(now, Ordering::Relaxed);
+
+    if last > 0 {
+        let interval = Duration::from_millis(now.saturating_sub(last));
+        crate::signals::LOOP_LAG.record(interval.saturating_sub(LOOP_BEAT_INTERVAL));
+    }
 }
 
 /// Tell the host, once a stall, when the event loop has gone longer than
@@ -515,6 +525,8 @@ async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
                     memory.rss, memory.pss, memory.uss
                 ));
             }
+
+            line.push_str(&crate::signals::report_fields());
         }
 
         line.push_str("}\n");
