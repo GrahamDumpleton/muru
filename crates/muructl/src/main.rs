@@ -1243,6 +1243,12 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         None
     };
     muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
+
+    for (name, mount) in &table.mounts {
+        muru_config::check_mount_threads(mount.threads, mount.interface)
+            .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
+    }
+
     Ok(Resolved {
         entrypoint,
         interface: args
@@ -1684,6 +1690,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 path: mount.path.clone(),
                 entrypoint: mount.entrypoint.clone(),
                 interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
+                threads: mount.threads,
             })
             .collect(),
         logging: resolved

@@ -27,6 +27,16 @@ message Hello {
   bool files = 6;                   // accepts FILE frames
   uint32 max_message_size = 7;      // largest WebSocket message, bytes
   repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
+  repeated MountPool mount_pools = 9; // mounts with threads of their own (section 6.7)
+}
+
+// A mount's own threads (section 6.7): reserved threads only it uses, and
+// the most requests it runs at once. Requests beyond the reserved threads,
+// up to the maximum, borrow threads of the shared pool.
+message MountPool {
+  string mount = 1;
+  uint32 reserved = 2;
+  uint32 max = 3;
 }
 
 // A gRPC method a worker serves (section 6.13). A path ending in / is a
@@ -70,6 +80,7 @@ message RequestHead {
   string server_name = 27;          // the virtual host name matched, or its canonical name (section 4.3); SERVER_NAME when set
   string client_class = 28;         // section 4.14: the class the edge assigned, default when no rule matched
   string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
+  bool borrowed = 30;               // section 6.7: the edge gave the request a shared thread its mount borrows
 }
 
 // What a REQUEST frame opens (sections 5.6 and 6.13). A gRPC call's

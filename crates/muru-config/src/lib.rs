@@ -386,6 +386,94 @@ pub struct Mount {
     /// as `X-Sendfile` (default the release's setting, else none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sendfile_header: Option<String>,
+    /// Threads of the mount's own, for a WSGI or gRPC mount; it shares
+    /// the worker's pool when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<MountThreads>,
+}
+
+/// A mount's own threads (section 6.7): a fixed pool, `threads = 4`, or a
+/// reserved minimum that borrows threads of the shared pool up to a
+/// maximum, `threads = { reserved = 2, max = 6 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MountThreads {
+    /// A pool of this many threads, used by the mount alone.
+    Fixed(usize),
+    /// Reserved threads, and shared ones borrowed up to a maximum.
+    Borrowing(BorrowedThreads),
+}
+
+/// The table form of a mount's threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BorrowedThreads {
+    /// Threads only the mount uses.
+    pub reserved: usize,
+    /// The most requests the mount runs at once, on its reserved threads
+    /// and borrowed ones together.
+    pub max: usize,
+}
+
+impl MountThreads {
+    /// Threads only the mount uses.
+    pub fn reserved(self) -> usize {
+        match self {
+            Self::Fixed(threads) => threads,
+            Self::Borrowing(threads) => threads.reserved,
+        }
+    }
+
+    /// The most requests the mount runs at once.
+    pub fn max(self) -> usize {
+        match self {
+            Self::Fixed(threads) => threads,
+            Self::Borrowing(threads) => threads.max,
+        }
+    }
+
+    /// As written in a table: `4`, or `{ reserved = 2, max = 6 }`.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Fixed(threads) => threads.to_string(),
+            Self::Borrowing(threads) => format!(
+                "{{ reserved = {}, max = {} }}",
+                threads.reserved, threads.max
+            ),
+        }
+    }
+}
+
+/// Section 6.7: check a mount's own threads against its interface. A
+/// fixed pool has at least one thread; a borrowing one may reserve none
+/// and has a maximum of at least one and no less than it reserves. An
+/// ASGI mount runs on the event loop and has no threads, and a gRPC
+/// mount's threads are a fixed pool for its handlers.
+pub fn check_mount_threads(
+    threads: Option<MountThreads>,
+    interface: Option<Interface>,
+) -> Result<(), String> {
+    let Some(threads) = threads else {
+        return Ok(());
+    };
+
+    match (threads, interface) {
+        (_, Some(Interface::Asgi)) => {
+            Err("threads: an ASGI mount runs on the event loop and has no threads".to_owned())
+        }
+        (MountThreads::Borrowing(_), Some(Interface::Grpc)) => Err(
+            "threads: a gRPC mount's threads are a fixed pool, a number, not reserved and max"
+                .to_owned(),
+        ),
+        (MountThreads::Fixed(0), _) => Err("threads: a mount's pool needs a thread".to_owned()),
+        (MountThreads::Borrowing(limits), _) if limits.max == 0 || limits.max < limits.reserved => {
+            Err(format!(
+                "threads: max {} must be at least 1 and no less than reserved {}",
+                limits.max, limits.reserved
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A worker group, the `[app.NAME.release.ID.groups.NAME]` or
@@ -4187,6 +4275,36 @@ traffic = { classes = { ai_crawler = 'r1' } }"
         let table = parse_muru_toml("entrypoint = 'app:app'\nthreads = 8\n").unwrap();
         assert_eq!(table.entrypoint.as_deref(), Some("app:app"));
         assert_eq!(table.threads, Some(8));
+    }
+
+    #[test]
+    fn a_mount_takes_a_pool_of_its_own_or_reserves_and_borrows() {
+        let table = parse_muru_toml(
+            "[mounts.fixed]\npath = '/f'\nentrypoint = 'a:b'\nthreads = 4\n\n\
+             [mounts.borrowing]\npath = '/b'\nentrypoint = 'a:c'\n\
+             threads = { reserved = 2, max = 6 }\n",
+        )
+        .unwrap();
+        let fixed = table.mounts["fixed"].threads.unwrap();
+        let borrowing = table.mounts["borrowing"].threads.unwrap();
+        assert_eq!((fixed.reserved(), fixed.max()), (4, 4));
+        assert_eq!((borrowing.reserved(), borrowing.max()), (2, 6));
+        assert_eq!(borrowing.describe(), "{ reserved = 2, max = 6 }");
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Wsgi)).is_ok());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Grpc)).is_ok());
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Grpc)).is_err());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Asgi)).is_err());
+        assert!(check_mount_threads(Some(MountThreads::Fixed(0)), None).is_err());
+
+        let reserving_none = MountThreads::Borrowing(BorrowedThreads {
+            reserved: 0,
+            max: 2,
+        });
+        assert!(check_mount_threads(Some(reserving_none), None).is_ok());
+        assert!(
+            parse_muru_toml("[mounts.x]\npath = '/x'\nentrypoint = 'a:b'\nthreads = { min = 1 }\n")
+                .is_err()
+        );
     }
 
     #[test]

@@ -50,9 +50,9 @@ Flags: END (0x01) on the last frame of a direction; TEXT (0x02) on a text MESSAG
 
 The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
-- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size, and the gRPC methods the worker's mounts registered, each with its mount and whether its requests and responses stream (section 6.13). The edge sends only its version.
+- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size, and the gRPC methods the worker's mounts registered, each with its mount and whether its requests and responses stream (section 6.13), and the mounts with threads of their own, each with its reserved threads and the most requests it runs at once (section 6.7). The edge sends only its version.
 
-- **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, and the scope (http, websocket or grpc).
+- **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, the scope (http, websocket or grpc), and whether the request borrowed a thread of the shared pool for a mount with threads of its own (section 6.7).
 
 - **ResponseHead:** status, ordered headers, flush policy override.
 

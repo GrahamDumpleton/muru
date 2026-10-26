@@ -17,6 +17,7 @@
 //! is told to send a streamed body only once the worker's CONTINUE frame
 //! says the application is reading it.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -75,7 +76,141 @@ struct WorkerSlots {
     /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
     semaphore: Arc<Semaphore>,
+    /// Section 6.7: the mounts with threads of their own, by name.
+    mounts: HashMap<String, MountSlots>,
     idle: Mutex<Vec<Conn>>,
+}
+
+/// A mount's own threads on one worker (section 6.7): its reserved slots,
+/// and for one that borrows, its allowance of the shared pool's.
+struct MountSlots {
+    reserved: usize,
+    own: Arc<Semaphore>,
+    allowance: Option<Arc<Semaphore>>,
+}
+
+impl WorkerSlots {
+    fn new(path: PathBuf, hello: pb::Hello, conn: Conn) -> Self {
+        let slots = capacity(&hello);
+        let mounts = hello
+            .mount_pools
+            .iter()
+            .map(|pool| {
+                let reserved = usize::try_from(pool.reserved).unwrap_or(usize::MAX);
+                let max = usize::try_from(pool.max).unwrap_or(usize::MAX);
+                let slots = MountSlots {
+                    reserved,
+                    own: Arc::new(Semaphore::new(reserved)),
+                    allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
+                };
+                (pool.mount.clone(), slots)
+            })
+            .collect();
+        Self {
+            path,
+            worker_type: hello.worker_type,
+            websockets: hello.websockets,
+            slots,
+            semaphore: Arc::new(Semaphore::new(slots)),
+            mounts,
+            idle: Mutex::new(vec![conn]),
+        }
+    }
+
+    /// Its slots: the shared pool's and the mounts' reserved ones.
+    fn slots(&self) -> usize {
+        self.slots
+            + self
+                .mounts
+                .values()
+                .map(|mount| mount.reserved)
+                .sum::<usize>()
+    }
+
+    /// Requests it is running, on the shared pool and the mounts' own.
+    fn in_flight(&self) -> usize {
+        self.slots - self.semaphore.available_permits()
+            + self
+                .mounts
+                .values()
+                .map(|mount| mount.reserved - mount.own.available_permits())
+                .sum::<usize>()
+    }
+
+    /// Slots free for a request to the mount: its own and what it may
+    /// borrow, or the shared pool's for a mount without threads.
+    fn free(&self, mount: &str) -> usize {
+        let shared = self.semaphore.available_permits();
+
+        let Some(slots) = self.mounts.get(mount) else {
+            return shared;
+        };
+
+        slots.own.available_permits()
+            + slots
+                .allowance
+                .as_ref()
+                .map_or(0, |allowance| allowance.available_permits().min(shared))
+    }
+
+    /// Take a slot for a request to the mount, waiting for one: one of
+    /// its own first, else a shared one within its allowance, else the
+    /// shared pool's for a mount without threads. Says whether the slot
+    /// was borrowed.
+    async fn take(&self, mount: &str) -> io::Result<(Slot, bool)> {
+        let closed = |_| io::Error::other("pool closed");
+
+        let Some(slots) = self.mounts.get(mount) else {
+            let permit = Arc::clone(&self.semaphore)
+                .acquire_owned()
+                .await
+                .map_err(closed)?;
+            return Ok((Slot::new(permit, None), false));
+        };
+
+        if let Ok(permit) = Arc::clone(&slots.own).try_acquire_owned() {
+            return Ok((Slot::new(permit, None), false));
+        }
+
+        let Some(allowance) = &slots.allowance else {
+            let permit = Arc::clone(&slots.own)
+                .acquire_owned()
+                .await
+                .map_err(closed)?;
+            return Ok((Slot::new(permit, None), false));
+        };
+
+        let borrowed = async {
+            let allowed = Arc::clone(allowance).acquire_owned().await?;
+            let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
+            Ok::<_, tokio::sync::AcquireError>(Slot::new(permit, Some(allowed)))
+        };
+
+        tokio::select! {
+            biased;
+            permit = Arc::clone(&slots.own).acquire_owned() => {
+                Ok((Slot::new(permit.map_err(closed)?, None), false))
+            }
+            slot = borrowed => Ok((slot.map_err(closed)?, true)),
+        }
+    }
+}
+
+/// A request's hold on a worker (section 6.7): a slot of the shared pool
+/// or of its mount's own, and for a borrowed shared slot, the place in
+/// the mount's allowance it takes. Dropped, both are given back.
+pub(crate) struct Slot {
+    _permit: OwnedSemaphorePermit,
+    _allowance: Option<OwnedSemaphorePermit>,
+}
+
+impl Slot {
+    fn new(permit: OwnedSemaphorePermit, allowance: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            _permit: permit,
+            _allowance: allowance,
+        }
+    }
 }
 
 /// What a worker's pool looks like right now.
@@ -120,8 +255,11 @@ impl Drop for Waiting<'_> {
 /// A connection taken from the pool for one request.
 pub(crate) struct Lease {
     pub(crate) conn: Conn,
-    pub(crate) permit: OwnedSemaphorePermit,
+    pub(crate) permit: Slot,
     pub(crate) worker: usize,
+    /// Section 6.7: the slot is a shared one the request's mount borrows,
+    /// which the request head tells the worker.
+    pub(crate) borrowed: bool,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
     /// The pool the connection came from, when it is not the one asked:
@@ -148,15 +286,7 @@ impl LinkPool {
                 grpc = hello.grpc_methods.clone();
             }
 
-            let slots = capacity(&hello);
-            workers.push(WorkerSlots {
-                path: path.clone(),
-                worker_type: hello.worker_type,
-                websockets: hello.websockets,
-                slots,
-                semaphore: Arc::new(Semaphore::new(slots)),
-                idle: Mutex::new(vec![conn]),
-            });
+            workers.push(WorkerSlots::new(path.clone(), hello, conn));
         }
 
         Ok(Self {
@@ -206,8 +336,8 @@ impl LinkPool {
                 index,
                 path: worker.path.clone(),
                 worker_type: worker.worker_type.clone(),
-                slots: worker.slots,
-                in_flight: worker.slots - worker.semaphore.available_permits(),
+                slots: worker.slots(),
+                in_flight: worker.in_flight(),
             })
             .collect()
     }
@@ -250,15 +380,12 @@ impl LinkPool {
 
     /// Requests in flight across every worker.
     pub fn in_flight(&self) -> usize {
-        self.workers
-            .iter()
-            .map(|worker| worker.slots - worker.semaphore.available_permits())
-            .sum()
+        self.workers.iter().map(WorkerSlots::in_flight).sum()
     }
 
-    /// Take a connection from the worker with the most free slots, waiting
-    /// for one if every worker is busy.
-    pub(crate) async fn acquire(&self) -> io::Result<Lease> {
+    /// Take a connection from the worker with the most free slots for the
+    /// mount, waiting for one if every worker is busy.
+    pub(crate) async fn acquire(&self, mount: &str) -> io::Result<Lease> {
         if self.workers.is_empty() {
             let Some(key) = &self.wake else {
                 return Err(io::Error::other("no release is serving"));
@@ -271,18 +398,18 @@ impl LinkPool {
             let waiting = Waiting(&self.waiting);
             let pool = crate::wake::wakes().wait(key).await?;
             drop(waiting);
-            let mut lease = Box::pin(pool.acquire()).await?;
+            let mut lease = Box::pin(pool.acquire(mount)).await?;
             lease.woken.get_or_insert(pool);
             return Ok(lease);
         }
 
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut best = start;
-        let mut best_free = self.workers[start].semaphore.available_permits();
+        let mut best_free = self.workers[start].free(mount);
 
         for offset in 1..self.workers.len() {
             let index = (start + offset) % self.workers.len();
-            let free = self.workers[index].semaphore.available_permits();
+            let free = self.workers[index].free(mount);
 
             if free > best_free {
                 best = index;
@@ -293,10 +420,7 @@ impl LinkPool {
         let worker = &self.workers[best];
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let waiting = Waiting(&self.waiting);
-        let permit = Arc::clone(&worker.semaphore)
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::other("pool closed"))?;
+        let (permit, borrowed) = worker.take(mount).await?;
         drop(waiting);
         let idle = worker.idle.lock().expect("pool poisoned").pop();
 
@@ -309,6 +433,7 @@ impl LinkPool {
             conn,
             permit,
             worker: best,
+            borrowed,
             websockets: worker.websockets,
             woken: None,
         })
@@ -387,15 +512,11 @@ struct ReturnState {
     writer: Option<Writer>,
     broken: bool,
     reported: u8,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<Slot>,
 }
 
 impl Return {
-    pub(crate) fn new(
-        pool: Arc<LinkPool>,
-        worker: usize,
-        permit: OwnedSemaphorePermit,
-    ) -> Arc<Self> {
+    pub(crate) fn new(pool: Arc<LinkPool>, worker: usize, permit: Slot) -> Arc<Self> {
         Arc::new(Self {
             pool,
             worker,
@@ -1149,7 +1270,7 @@ async fn handle_inner(
 
     let queued = Instant::now();
 
-    let lease = match tokio::time::timeout(queue_timeout, pool.acquire()).await {
+    let lease = match tokio::time::timeout(queue_timeout, pool.acquire(&head.mount)).await {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
             tracing::warn!(%error, "no worker connection");
@@ -1180,9 +1301,11 @@ async fn handle_inner(
         conn,
         permit,
         worker,
+        borrowed,
         websockets,
         woken,
     } = lease;
+    head.borrowed = borrowed;
     let pool = woken.unwrap_or(pool);
     let Conn {
         mut reader,

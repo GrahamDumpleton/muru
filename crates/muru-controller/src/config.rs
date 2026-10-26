@@ -2458,6 +2458,8 @@ pub fn resolve_spec(
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
             .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_threads(mount.threads, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
         // as the defaults.
@@ -2473,6 +2475,7 @@ pub fn resolve_spec(
             cgi_local_redirect: mount.cgi_local_redirect.unwrap_or(cgi_local_redirect),
             sendfile_roots: mount_roots,
             sendfile_header: mount_header,
+            threads: mount.threads,
         });
     }
 
@@ -3763,6 +3766,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         sendfile_header: (mount.sendfile_header != spec.sendfile_header)
                             .then(|| mount.sendfile_header.clone())
                             .flatten(),
+                        threads: mount.threads,
                     },
                 )
             })
@@ -4273,6 +4277,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
             if !mount.sendfile_roots.is_empty() {
                 flags.push(format!("sendfile from {}", mount.sendfile_roots.join(", ")));
+            }
+
+            if let Some(threads) = mount.threads {
+                flags.push(format!("threads {}", threads.describe()));
             }
 
             let flags = if flags.is_empty() {

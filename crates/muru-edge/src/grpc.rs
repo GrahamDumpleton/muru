@@ -321,7 +321,7 @@ pub(crate) async fn handle(
             .min(at.saturating_duration_since(queued))
     });
 
-    let lease = match tokio::time::timeout(queue_timeout, pool.acquire()).await {
+    let lease = match tokio::time::timeout(queue_timeout, pool.acquire(&head.mount)).await {
         Ok(Ok(lease)) => lease,
         Ok(Err(error)) => {
             tracing::warn!(%error, "no worker connection for a gRPC call");

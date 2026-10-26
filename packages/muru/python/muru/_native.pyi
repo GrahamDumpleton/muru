@@ -18,7 +18,14 @@ def serve(
     on_exit: Callable[[], Any] | None = None,
     on_reopen_logs: Callable[[], Any] | None = None,
     lifeline: int | None = None,
-    mounts: list[tuple[str, Callable[..., Any], Callable[[Any, Channel], None] | None]] = [],
+    mounts: list[
+        tuple[
+            str,
+            Callable[..., Any],
+            Callable[[Any, Channel], None] | None,
+            tuple[int, int] | None,
+        ]
+    ] = [],
     report: int | None = None,
     on_reclaim: Callable[[], Any] | None = None,
     memory_interval_ms: int = 5000,

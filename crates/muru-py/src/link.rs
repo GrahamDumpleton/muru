@@ -201,7 +201,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     // everything stops.
 
     Lifecycle::call(lifecycle.on_drain.as_ref());
-    shared.pool.shutdown();
+    shared.shutdown_pools();
 
     // The pool joins its threads; the loop's requests are waited for here.
 
@@ -619,6 +619,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         files: true,
         max_message_size: MAX_MESSAGE_SIZE,
         grpc_methods: shared.grpc_methods.clone(),
+        mount_pools: shared.mount_pools(),
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -757,6 +758,14 @@ async fn handle_request(
         .await;
     }
 
+    // Section 6.7: a mount with threads of its own runs on them, unless
+    // the edge gave the request a shared thread the mount borrows.
+
+    let pool: &crate::pool::Pool = match &mount.pool {
+        Some(own) if !head.borrowed => own,
+        _ => &shared.pool,
+    };
+
     let app = mount.app;
     let cancelled = Arc::new(AtomicBool::new(false));
     let (body_tx, body_rx) = mpsc::channel::<Bytes>(8);
@@ -765,7 +774,7 @@ async fn handle_request(
     let (request_id, interrupt) = shared.request_started(&head);
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
-    let queued = shared.pool.spawn(Box::new(move |py| {
+    let queued = pool.spawn(Box::new(move |py| {
         worker_shared.request_on_this_thread(request_id);
         let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
         wsgi::run(

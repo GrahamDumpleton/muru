@@ -186,6 +186,12 @@ pub struct Mount {
     pub app: Py<PyAny>,
     /// The runner, when the mount is ASGI.
     pub runner: Option<Py<PyAny>>,
+    /// The mount's own threads, when it has them: those it reserves and
+    /// the most requests it runs at once.
+    pub threads: Option<(usize, usize)>,
+    /// The pool of its reserved threads, for a WSGI mount that reserves
+    /// any; its other requests run on the shared pool.
+    pub pool: Option<Arc<Pool>>,
 }
 
 impl Mount {
@@ -194,6 +200,8 @@ impl Mount {
         Self {
             app: self.app.clone_ref(py),
             runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
+            threads: self.threads,
+            pool: self.pool.clone(),
         }
     }
 }
@@ -258,7 +266,7 @@ impl Shared {
             threads,
             multiprocess,
             asgi,
-            pool: Pool::start(threads)?,
+            pool: Pool::start("muru-app", threads)?,
             soft_timeout,
             loop_stall: None,
             grpc_methods: Vec::new(),
@@ -278,12 +286,51 @@ impl Shared {
                 runner: self.asgi.as_ref().and_then(|asgi| {
                     Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
                 }),
+                threads: None,
+                pool: None,
             });
         }
 
         self.mounts
             .get(name)
             .map(|mount| Python::attach(|py| mount.clone_ref(py)))
+    }
+
+    /// wsgi.multithread for a request to the mount (section 6.5): whether
+    /// the pool serving it has more than one thread.
+    pub fn multithread(&self, mount: &str) -> bool {
+        match self.mounts.get(mount).and_then(|mount| mount.threads) {
+            Some((_, max)) => max > 1,
+            None => self.threads > 1,
+        }
+    }
+
+    /// The mounts' own threads, for HELLO (section 6.7).
+    pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
+        self.mounts
+            .iter()
+            .filter_map(|(name, mount)| {
+                mount
+                    .threads
+                    .map(|(reserved, max)| muru_proto::worker::v1::MountPool {
+                        mount: name.clone(),
+                        reserved: u32::try_from(reserved).unwrap_or(u32::MAX),
+                        max: u32::try_from(max).unwrap_or(u32::MAX),
+                    })
+            })
+            .collect()
+    }
+
+    /// Stop the shared pool and the mounts' own, letting their queued
+    /// requests finish. Called with the interpreter detached.
+    pub fn shutdown_pools(&self) {
+        self.pool.shutdown();
+
+        for mount in self.mounts.values() {
+            if let Some(pool) = &mount.pool {
+                pool.shutdown();
+            }
+        }
     }
 
     /// Count a request as started, returning its id for when it finishes
@@ -563,8 +610,8 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Start `threads` application threads.
-    pub fn start(threads: usize) -> std::io::Result<Self> {
+    /// Start `threads` application threads, named for the pool.
+    pub fn start(name: &str, threads: usize) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
 
@@ -573,7 +620,7 @@ impl Pool {
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
             let handle = std::thread::Builder::new()
-                .name(format!("muru-app-{index}"))
+                .name(format!("{name}-{index}"))
                 .spawn(move || thread_main(&receiver))?;
             handles.push(handle);
         }

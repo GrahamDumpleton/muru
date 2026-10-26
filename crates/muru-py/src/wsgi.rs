@@ -856,7 +856,10 @@ fn build_environ<'py>(
 
     environ.set_item(intern!(py, "wsgi.input"), input)?;
     environ.set_item(intern!(py, "wsgi.errors"), shared.errors.bind(py))?;
-    environ.set_item(intern!(py, "wsgi.multithread"), shared.threads > 1)?;
+    environ.set_item(
+        intern!(py, "wsgi.multithread"),
+        shared.multithread(&head.mount),
+    )?;
     environ.set_item(intern!(py, "wsgi.multiprocess"), shared.multiprocess)?;
     environ.set_item(intern!(py, "wsgi.run_once"), false)?;
     environ.set_item(intern!(py, "wsgi.input_terminated"), true)?;

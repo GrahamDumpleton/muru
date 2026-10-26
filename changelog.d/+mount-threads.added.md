@@ -1,0 +1,1 @@
+Added threads of a mount's own: a WSGI mount's `threads` is a pool only it uses, or `{ reserved, max }` to reserve some and borrow the shared threads beyond them, and a gRPC mount's `threads` sizes its handlers' pool.

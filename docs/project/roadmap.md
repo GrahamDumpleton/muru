@@ -529,5 +529,7 @@ grpcio-reflection, and gRPC-Web, binary and text, is translated at the
 edge. grpcio has no free-threaded wheels, so gRPC mounts are unavailable
 on those builds. A listener's `h2c` limits cleartext HTTP/2 to the
 clients it names, and a release's `grpc_web_origins` has the edge answer
-gRPC-Web with CORS, preflights included. Still to come: per-mount thread
-pools.
+gRPC-Web with CORS, preflights included. A WSGI mount takes threads of
+its own, a fixed pool or a reserved minimum that borrows the shared
+pool's threads up to a maximum, with the edge holding slots per pool, and
+a gRPC mount's `threads` sizes the pool of its handlers.

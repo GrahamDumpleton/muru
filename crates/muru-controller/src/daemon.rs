@@ -3396,6 +3396,7 @@ impl Daemon {
                     path: mount.path.clone(),
                     entrypoint: mount.entrypoint.clone(),
                     interface: mount.interface,
+                    threads: mount.threads,
                 })
                 .collect(),
         };

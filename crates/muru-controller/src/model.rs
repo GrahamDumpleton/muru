@@ -135,6 +135,9 @@ pub struct MountSpec {
     /// A second header honoured as X-Muru-Sendfile is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sendfile_header: Option<String>,
+    /// Threads of the mount's own; the worker's shared pool when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<muru_config::MountThreads>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The

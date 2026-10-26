@@ -320,29 +320,49 @@ class Mount:
     """A named mount (section 6.7): a path served by another entrypoint.
 
     The mount's application is loaded and realised like the release's own,
-    without hooks of its own, and shares the worker's threads and loop.
+    without hooks of its own, and shares the worker's loop. It shares the
+    worker's threads too, unless it has threads of its own: the threads
+    it reserves and the most requests it runs at once.
     """
 
     name: str
     path: str
     release: Release
+    threads: tuple[int, int] | None = None
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
-        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE]; a gRPC mount's PATH is empty."""
+        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]].
 
+        A gRPC mount's PATH is empty.
+        """
+
+        form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]"
         parts = text.split("=")
-        interface = parts[3] if len(parts) == 4 else "auto"
+        interface = parts[3] if len(parts) >= 4 else "auto"
         path_given = parts[1].startswith("/") if len(parts) > 1 else False
 
-        if len(parts) not in (3, 4) or not parts[0] or path_given == (interface == "grpc"):
-            raise argparse.ArgumentTypeError(f"{text!r} is not NAME=PATH=ENTRYPOINT[=INTERFACE]")
+        if len(parts) not in (3, 4, 5) or not parts[0] or path_given == (interface == "grpc"):
+            raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
 
         if interface not in INTERFACES:
             raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
 
+        own: tuple[int, int] | None = None
+
+        if len(parts) == 5:
+            try:
+                reserved, most = (int(part) for part in parts[4].split(","))
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+            if reserved < 0 or most < max(reserved, 1):
+                raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+
+            own = (reserved, most)
+
         release = Release(parts[2], None, context, threads=threads, interface=interface)
-        return cls(parts[0], parts[1], release)
+        return cls(parts[0], parts[1], release, own)
 
 
 @dataclass(frozen=True)
@@ -854,10 +874,30 @@ class Host:
             # startup for each ASGI application before the worker is ready.
 
             realised = [
-                (mount.name, mount.release.realise(), mount.release) for mount in self.mounts
+                (mount.name, mount.release.realise(), mount.release, mount.threads)
+                for mount in self.mounts
             ]
             any_asgi = release.resolved in ("asgi", "grpc") or any(
-                mounted.resolved in ("asgi", "grpc") for _, _, mounted in realised
+                mounted.resolved in ("asgi", "grpc") for _, _, mounted, _ in realised
+            )
+
+            for name, _, mounted, own in realised:
+                if own is not None and mounted.resolved == "asgi":
+                    raise ValueError(
+                        f"mount {name}: an ASGI mount runs on the event loop and has no threads"
+                    )
+
+            # Section 6.5: the shared pool serves a WSGI default mount and
+            # every WSGI mount that has no threads of its own or borrows.
+
+            shared_threads = (
+                group.threads
+                if release.resolved not in ("asgi", "grpc")
+                or any(
+                    mounted.resolved not in ("asgi", "grpc") and (own is None or own[0] < own[1])
+                    for _, _, mounted, own in realised
+                )
+                else 1
             )
 
             if any_asgi:
@@ -869,7 +909,7 @@ class Host:
                 lifespan.startup()
 
             lifespans: list[_asgi.Lifespan] = []
-            served_mounts: list[tuple[str, Any, Any]] = []
+            served_mounts: list[tuple[str, Any, Any, tuple[int, int] | None]] = []
 
             # Section 6.13: a gRPC application is served by a dispatcher on
             # the loop, which runs synchronous handlers on threads of the
@@ -885,22 +925,24 @@ class Host:
                 app = _grpc.Dispatcher(app, group.threads)
                 grpc_runner = _asgi.runner(app, loop, {})
 
-            for name, mounted_app, mounted in realised:
+            for name, mounted_app, mounted, own in realised:
                 if loop is not None and mounted.resolved == "grpc":
                     from muru import _grpc
 
                     grpc_servers.append((name, mounted_app))
-                    dispatcher = _grpc.Dispatcher(mounted_app, group.threads)
+                    dispatcher = _grpc.Dispatcher(
+                        mounted_app, group.threads if own is None else own[0]
+                    )
                     runner = _asgi.runner(dispatcher, loop, {})
-                    served_mounts.append((name, dispatcher, runner))
+                    served_mounts.append((name, dispatcher, runner, own))
                 elif loop is not None and mounted.resolved == "asgi":
                     mounted_lifespan = _asgi.Lifespan(mounted_app, loop, mounted.spec)
                     mounted_lifespan.startup()
                     lifespans.append(mounted_lifespan)
                     runner = _asgi.runner(mounted_app, loop, mounted_lifespan.state)
-                    served_mounts.append((name, mounted_app, runner))
+                    served_mounts.append((name, mounted_app, runner, None))
                 else:
-                    served_mounts.append((name, mounted_app, None))
+                    served_mounts.append((name, mounted_app, None, own))
 
             if grpc_servers and self.reflection:
                 from muru import _grpc
@@ -975,7 +1017,7 @@ class Host:
             _native.serve(
                 path or self.socket_path(index),
                 app,
-                group.threads if loop is None else 1,
+                shared_threads,
                 # Section 6.5: False only for a single-process development run.
                 multiprocess=self.worker_count > 1,
                 on_drain=lambda: hooks.call_logged("on_drain", context),
@@ -2297,7 +2339,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--mount",
         action="append",
         default=[],
-        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE]",
+        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]",
         help="a named mount served by another entrypoint at a path (section 6.7)",
     )
     parser.add_argument(

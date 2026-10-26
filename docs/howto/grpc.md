@@ -5,8 +5,7 @@
 
 gRPC mounts beside WSGI and ASGI, gRPC-only releases, the four kinds of
 call over h2 and h2c, h2c limited to some clients, gRPC-Web with CORS,
-the health service and reflection. Per-mount thread pools are still to
-come.
+the health service, reflection and threads of a mount's own.
 ```
 
 A release can serve gRPC services from the same workers as its WSGI or
@@ -74,8 +73,9 @@ A plain HTTP request to a gRPC-only release is answered 404. With
 
 All four kinds of call work: unary, server streaming, client streaming
 and bidirectional streaming. A synchronous handler runs on one of the
-worker's `threads`; an `async def` handler or async generator runs on
-the worker's event loop. Each call is balanced across the workers on its
+worker's `threads`, or of the mount's own when it has `threads` of its
+own (a number, see [Mounts](mounts.md)); an `async def` handler or
+async generator runs on the worker's event loop. Each call is balanced across the workers on its
 own, so one client connection spreads its calls over all of them.
 
 Clients connect with HTTP/2 over TLS (h2) on an HTTPS listener, or over

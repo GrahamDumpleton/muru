@@ -44,8 +44,12 @@ fn version() -> &'static str {
 /// a descriptor whose end of file also stops the server: the read end of a
 /// pipe the host holds the write end of, so a worker never outlives it.
 /// `mounts` are the named mounts (section 6.7) as (name, application,
-/// runner) tuples, the runner None for a WSGI mount; `event_loop` is
-/// needed when any mount is ASGI, `runner` when the default one is.
+/// runner, threads) tuples, the runner None for a WSGI mount and the
+/// threads, when the mount has its own, as (reserved, max): a WSGI
+/// mount runs on a pool of the reserved threads, borrowing the shared
+/// pool's beyond them, and a gRPC mount's are declared for the edge;
+/// `event_loop` is needed when any mount is ASGI, `runner` when the
+/// default one is.
 /// `report` is a descriptor the worker writes a status line to every
 /// second, for the host's timeouts and recycling (sections 7.6 and 7.7),
 /// with its memory measured every `memory_interval_ms`; `on_reclaim`
@@ -78,7 +82,7 @@ fn serve(
     on_exit: Option<Py<PyAny>>,
     on_reopen_logs: Option<Py<PyAny>>,
     lifeline: Option<i32>,
-    mounts: Vec<(String, Py<PyAny>, Option<Py<PyAny>>)>,
+    mounts: Vec<(String, Py<PyAny>, Option<Py<PyAny>>, Option<(usize, usize)>)>,
     report: Option<i32>,
     on_reclaim: Option<Py<PyAny>>,
     memory_interval_ms: u64,
@@ -124,14 +128,36 @@ fn serve(
 
     let mut named = std::collections::HashMap::new();
 
-    for (name, app, runner) in mounts {
+    for (name, app, runner, threads) in mounts {
         if runner.is_some() && asgi.is_none() {
             return Err(PyTypeError::new_err(format!(
                 "mount {name:?} is ASGI, so an event_loop is needed"
             )));
         }
 
-        named.insert(name, pool::Mount { app, runner });
+        if threads.is_some_and(|(reserved, max)| max == 0 || max < reserved) {
+            return Err(PyTypeError::new_err(format!(
+                "mount {name:?} has threads that cannot run"
+            )));
+        }
+
+        let pool = match threads {
+            Some((reserved, _)) if reserved > 0 && runner.is_none() => Some(Arc::new(
+                pool::Pool::start(&format!("muru-app-{name}"), reserved)
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            )),
+            _ => None,
+        };
+
+        named.insert(
+            name,
+            pool::Mount {
+                app,
+                runner,
+                threads,
+                pool,
+            },
+        );
     }
 
     let mut shared = pool::Shared::new(

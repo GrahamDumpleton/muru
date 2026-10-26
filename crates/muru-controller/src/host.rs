@@ -430,6 +430,8 @@ pub struct HostMount {
     pub entrypoint: String,
     /// The interface the entrypoint speaks.
     pub interface: muru_config::Interface,
+    /// Threads of the mount's own (section 6.7).
+    pub threads: Option<muru_config::MountThreads>,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -552,13 +554,19 @@ impl HostProcess {
         }
 
         for mount in &spec.mounts {
-            command.arg("--mount").arg(format!(
+            let mut text = format!(
                 "{}={}={}={}",
                 mount.name,
                 mount.path,
                 mount.entrypoint,
                 mount.interface.as_str()
-            ));
+            );
+
+            if let Some(threads) = mount.threads {
+                text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
+            }
+
+            command.arg("--mount").arg(text);
         }
 
         for group in &spec.groups {
