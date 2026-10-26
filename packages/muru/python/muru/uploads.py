@@ -36,6 +36,12 @@ __all__ = ["Upload", "files", "get", "is_precheck"]
 
 _BLOCK = 1024 * 1024
 
+# Where a process finds its own descriptors by path. Linux's entries can
+# be linked to give the file a name; those of /dev/fd elsewhere cannot.
+
+_LINUX = sys.platform.startswith("linux")
+_FD_DIRECTORY = "/proc/self/fd" if _LINUX else "/dev/fd"
+
 
 def files(request: Mapping[str, Any]) -> list[Upload]:
     """Return every upload of a WSGI environ or ASGI scope, in the order they arrived."""
@@ -126,10 +132,7 @@ class Upload:
         request lasts and only in this process.
         """
 
-        if sys.platform.startswith("linux"):
-            return f"/proc/self/fd/{self._fd}"
-
-        return f"/dev/fd/{self._fd}"
+        return f"{_FD_DIRECTORY}/{self._fd}"
 
     def open(self) -> io.BufferedReader:
         """Open a readable, seekable binary file over the upload, from its start.
@@ -176,8 +179,8 @@ class Upload:
         if self._spool_path is not None:
             return self._spool_path
 
-        if sys.platform.startswith("linux"):
-            return f"/proc/self/fd/{self._fd}"
+        if _LINUX:
+            return f"{_FD_DIRECTORY}/{self._fd}"
 
         return None
 
@@ -209,17 +212,36 @@ class Upload:
 
 def _link(source: str, target: str, overwrite: bool) -> None:
     if not overwrite:
-        os.link(source, target)
+        _hard_link(source, target)
         return
 
     temporary = _temporary_name(target)
-    os.link(source, temporary)
+    _hard_link(source, temporary)
 
     try:
         os.replace(temporary, target)
     except BaseException:
         os.unlink(temporary)
         raise
+
+
+def _hard_link(source: str, target: str) -> None:
+    if not _LINUX:
+        os.link(source, target)
+        return
+
+    # Before Python 3.14, os.link calls link(2) unless a directory is
+    # given by descriptor, and Linux's link(2) does not follow a symbolic
+    # link such as a /proc/self/fd entry. With the source's directory
+    # given, it is linkat(2) with AT_SYMLINK_FOLLOW on every version.
+
+    directory, name = os.path.split(source)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    try:
+        os.link(name, target, src_dir_fd=fd, follow_symlinks=True)
+    finally:
+        os.close(fd)
 
 
 def _temporary_name(target: str) -> str:

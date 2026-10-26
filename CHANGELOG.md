@@ -58,6 +58,11 @@ breaking changes, which are listed under each release.
 - Fixed a client class rule whose `user_agent_list` or `address_list` held no entries matching every request: an input from an empty list now matches nothing.
 - Fixed a native deploy after a managed server release failing to start: it took the server release's worker count of zero as its own.
 - Fixed a worker whose default mount is WSGI running on a single thread when it also had an ASGI or gRPC mount: it now has its `threads`.
+- `Upload.save()` on Linux with Python 3.13 and earlier now links an upload without a spool path into place, as it does on 3.14, instead of copying it.
+
+### Security
+
+- Updated the zstd library the edge and the daemon use to 0.14.3, for RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403.
 
 ### Documentation
 

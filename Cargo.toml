@@ -78,7 +78,7 @@ webpki-roots = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "channel", "router"] }
-zstd = "0.13"
+zstd = "0.14.3"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tower = "0.5"

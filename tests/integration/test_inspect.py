@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from support import server as support
 from support.daemon import Daemon, start_daemon
 from support.daemon import daemon as daemon_fixture
@@ -213,9 +214,7 @@ def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
 
 def test_stacks_are_read_from_outside_a_worker_holding_the_interpreter(daemon: Daemon) -> None:
     if not readable_from_outside():
-        support.unavailable(
-            "reading a worker from outside needs Python 3.14 or later, and root on macOS"
-        )
+        pytest.skip("reading a worker from outside needs Python 3.14 or later, and root on macOS")
 
     deploy_plain(daemon, processes=1)
     threads = in_background(daemon, "/hold?seconds=4")

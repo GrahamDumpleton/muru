@@ -25,6 +25,10 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// A mount as `serve` takes it: the path prefix, the application, its
+/// runner, and its own threads as (reserved, max) when it has any.
+type MountArgument = (String, Py<PyAny>, Option<Py<PyAny>>, Option<(usize, usize)>);
+
 /// Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 ///
 /// Called by a worker process after fork. `app` is the application and
@@ -82,7 +86,7 @@ fn serve(
     on_exit: Option<Py<PyAny>>,
     on_reopen_logs: Option<Py<PyAny>>,
     lifeline: Option<i32>,
-    mounts: Vec<(String, Py<PyAny>, Option<Py<PyAny>>, Option<(usize, usize)>)>,
+    mounts: Vec<MountArgument>,
     report: Option<i32>,
     on_reclaim: Option<Py<PyAny>>,
     memory_interval_ms: u64,
