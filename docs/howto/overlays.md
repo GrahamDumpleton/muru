@@ -7,9 +7,10 @@ Overlays activated by hand or by a one-off or recurring schedule, over
 routes and applications: site modes, method restrictions, traffic pins
 and splits, route targets, rate limits and maintenance mode, with
 preconditions, warm-up, advisory and latched schedules, previews and
-promotion, and the capacity and deploy freezes of
-[schedules](scaling.md#scheduled-capacity). The external trigger and
-overlays that activate on conditions are still to come.
+promotion, the capacity and deploy freezes of
+[schedules](scaling.md#scheduled-capacity), a signed webhook for
+monitoring systems, and `config show --effective`. Overlays that activate
+on conditions are still to come.
 ```
 
 An overlay is a named piece of configuration laid over the routes and
@@ -95,7 +96,51 @@ first to the end of the last.
 
 The daemon works out which overlays should be active from the time and
 what it has recorded, every second, so one restarted in the middle of a
-window carries on with it.
+window carries on with it. Schedules follow the system clock, so while
+any are declared the daemon checks every ten minutes that the clock is
+synchronised, and raises a `clock.unsynchronised` warning when it is not
+(and `clock.synchronised` once it is again).
+
+## The webhook
+
+Monitoring and alerting systems can activate and end overlays that
+declare `trigger = { external = true }`, beside a schedule or alone,
+through a signed webhook. It is served on its own address, given in the
+daemon's configuration file:
+
+```toml
+[overlay_webhook]
+listen = '0.0.0.0:9466'
+secret_file = '/etc/muru/overlay-webhook.key'
+```
+
+A request is `POST /v1/overlays/NAME:trigger` with a JSON body:
+
+```json
+{"action": "activate", "time": "2026-11-02T09:00:00Z", "for": "2h"}
+```
+
+`action` is `activate` or `end`; an activation may take `for` (a
+duration) or `until` (an RFC 3339 time), and without either lasts until
+it is ended. `time` is when the request was made, as an RFC 3339 time,
+and must be within five minutes of the daemon's clock, so a captured
+request cannot be replayed later. The `X-Muru-Signature` header is
+`sha256=` and the hex HMAC-SHA256 of the body with the secret, as the
+[event sinks](events.md) sign what they send:
+
+```console
+$ body='{"action": "end", "time": "2026-11-02T11:00:00Z"}'
+$ signature=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$(cat /etc/muru/overlay-webhook.key)" | sed 's/^.* //')
+$ curl -H "X-Muru-Signature: sha256=$signature" -d "$body" http://shop.internal:9466/v1/overlays/db-outage:trigger
+{"overlay":"db-outage","message":"ended by the webhook"}
+```
+
+The answer is JSON: 200 with what happened; 401 `bad_signature` or
+`stale`; 404 for an overlay that does not take the trigger; 409
+`refused`, with why, when the overlay is already in that state or its
+preconditions do not hold; and 400 for a body that cannot be read. The
+webhook carries no secrets, but put it on an address only monitoring
+systems reach, or behind a proxy that adds TLS.
 
 ## Advisory and latched schedules
 
@@ -142,6 +187,19 @@ muructl overlay promote cutover-r43
 
 `list` shows each overlay's state, its trigger and what it changes.
 `preview` shows what activating it now would change, field by field.
+`muructl config show --effective`, for every application or one, writes
+the configuration with the active overlays' changes in the routes,
+headed by what each active overlay sets that is in force:
+
+```console
+$ muructl config show shop --effective
+# Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
+# The active overlays set, and the routes below include:
+#   route shop-root: methods.deny = POST, PUT, PATCH, DELETE (overlay nightly-backup)
+#   route shop-root: mode = read-only (overlay nightly-backup)
+#   app shop: group default: at least 6 workers (schedule shop.weekday-mornings)
+```
+
 `promote` folds an active overlay's changes into the base configuration,
 the routes and maintenance settings as the overlay leaves them, and ends
 it for good, which is how a timed switch becomes the new normal. Remove a

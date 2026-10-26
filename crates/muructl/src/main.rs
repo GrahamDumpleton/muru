@@ -751,6 +751,11 @@ fn main() -> anyhow::Result<()> {
                 json,
                 socket,
             } => runtime.block_on(admin::config_export(app, all_releases, json, socket)),
+            admin::ConfigCommand::Show {
+                app,
+                effective,
+                socket,
+            } => runtime.block_on(admin::config_show(app, effective, socket)),
             admin::ConfigCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }

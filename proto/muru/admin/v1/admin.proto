@@ -511,6 +511,7 @@ message ConfigChange {
 message ExportConfigRequest {
   string app = 1;                   // one application, else all
   bool all_releases = 2;            // every release, not only the one that serves
+  bool effective = 3;               // routes as the active overlays leave them (section 9.10)
 }
 
 message ExportConfigResponse {
@@ -519,6 +520,7 @@ message ExportConfigResponse {
   string node = 3;                  // the host name
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
+  repeated string attributions = 6; // with effective: what each active overlay sets that is in force
 }
 
 message ListHostsRequest {}

@@ -14,6 +14,7 @@ import json
 import shutil
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -209,6 +210,26 @@ trigger = {{ schedule = {{ start = '{at(3)}', end = '{at(7)}' }} }}
     events = site.daemon.muructl("events").stdout
     assert "its schedule's window began" in events
     assert "ended: its schedule" in events
+
+
+def test_config_show_effective_attributes_values_to_overlays(site: Site) -> None:
+    site.apply(OVERLAYS, prune=True)
+    assert "No active overlay" in site.daemon.muructl("config", "show", "--effective").stdout
+
+    site.overlay("activate", "read-only")
+    shown = site.daemon.muructl("config", "show", "--effective").stdout
+    assert "#   route root: mode = read-only (overlay read-only)" in shown
+    assert "#   route root: methods.deny = POST, PUT (overlay read-only)" in shown
+    effective = tomllib.loads(shown)
+    assert effective["route"][0]["mode"] == "read-only"
+    assert "overlay" not in effective
+
+    # The base is unchanged.
+
+    base = tomllib.loads(site.daemon.muructl("config", "show").stdout)
+    assert "mode" not in base["route"][0]
+    assert "route root" in site.daemon.muructl("config", "show", "clients", "--effective").stdout
+    site.overlay("end", "read-only")
 
 
 def test_a_recurring_schedule_covers_each_window(site: Site) -> None:

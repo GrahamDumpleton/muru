@@ -806,6 +806,22 @@ pub struct Dashboard {
     pub listen: Option<String>,
 }
 
+/// The `[overlay_webhook]` table (section 9.10): where the daemon takes
+/// signed requests from monitoring and alerting systems to activate and
+/// end the overlays that declare the external trigger.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayWebhook {
+    /// The address served, such as 0.0.0.0:9466.
+    pub listen: String,
+    /// The key requests are signed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// A file holding the key, in place of `secret`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_file: Option<String>,
+}
+
 /// An `[[events.sink]]` entry (section 11.5): a webhook that receives
 /// events as signed CloudEvents requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1490,6 +1506,7 @@ impl CapacitySchedule {
             apps: BTreeMap::from([(app.to_owned(), change)]),
             trigger: Some(OverlayTrigger {
                 schedule: Some(schedule),
+                external: None,
             }),
             warm_up: self.warm_up.clone().map(|lead| WarmUp {
                 lead,
@@ -1530,6 +1547,10 @@ pub struct OverlayTrigger {
     /// A window in time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<OverlaySchedule>,
+    /// Whether the signed webhook of the `[overlay_webhook]` table may
+    /// activate and end it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
 }
 
 /// A window in time: one-off, from `start` until `end` when it has one,
@@ -3011,6 +3032,9 @@ pub struct Document {
     /// The dashboard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard: Option<Dashboard>,
+    /// The overlays' external trigger (section 9.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_webhook: Option<OverlayWebhook>,
     /// Virtual hosts by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host: BTreeMap<String, Host>,
@@ -3091,6 +3115,10 @@ impl Document {
 
         if other.dashboard.is_some() {
             self.dashboard = other.dashboard;
+        }
+
+        if other.overlay_webhook.is_some() {
+            self.overlay_webhook = other.overlay_webhook;
         }
 
         if other.proxy.is_some() {

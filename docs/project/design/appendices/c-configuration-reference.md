@@ -21,6 +21,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[proxy]` | daemon, host or listener | trusted proxies and header types |
 | `[metrics]` | daemon file | the internal address `/metrics` is served on (`listen`), none by default |
 | `[dashboard]` | daemon file | the loopback address the dashboard and JSON gateway are served on (`listen`), none by default |
+| `[overlay_webhook]` | daemon file | the address of the overlays' signed webhook (`listen`) and its key (`secret` or `secret_file`), none by default |
 | `[limits]` | global, host, route, mount, group | request limits and timeouts |
 | `[logging.access]`, `[logging.apps]`, `[logging.python]` | global, application, release | sinks, formats, rotation, Python defaults |
 | `[[events.sink]]` | daemon file | event sinks |
@@ -111,7 +112,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
-| Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened |
+| Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |

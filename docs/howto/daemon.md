@@ -164,7 +164,9 @@ listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
 in the configuration file, serves Prometheus metrics on an internal
 address; the [metrics guide](metrics.md) lists them. `--dashboard
 ADDRESS`, or a `[dashboard]` table, serves the read-only [dashboard and
-JSON gateway](dashboard.md) on a loopback address.
+JSON gateway](dashboard.md) on a loopback address. An `[overlay_webhook]`
+table serves the [signed webhook](overlays.md#the-webhook) that
+monitoring systems activate and end overlays with.
 
 The daemon binds the listening sockets itself and hands them to an edge
 process started from the same executable, which carries the traffic;

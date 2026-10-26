@@ -261,6 +261,13 @@ pub fn plan(store: &Store, document: &Document, prune: bool, rate_limits: &[Stri
         );
     }
 
+    if document.overlay_webhook.is_some() {
+        plan.warnings.push(
+            "the [overlay_webhook] table belongs in the daemon configuration file and was not applied"
+                .to_owned(),
+        );
+    }
+
     if !document.error_pages.is_empty() || document.error_override.is_some() {
         plan.warnings.push(
             "the node-wide [error_pages] and [error_override] tables belong in the daemon \
@@ -1580,6 +1587,46 @@ pub fn export(
     }
 
     Ok(document)
+}
+
+/// Section 9.10: turn an exported document into the effective one, its
+/// routes as the active overlays leave them and without the overlays,
+/// and say what each sets that is in force, for `app` alone when given.
+pub fn make_effective(
+    store: &Store,
+    document: &mut Document,
+    app: Option<&str>,
+) -> Result<Vec<String>, StoreError> {
+    let overlays = store.overlays()?;
+    let states = store.overlay_states()?;
+    let active = crate::overlays::ordered(&overlays, &states);
+    let maintenance: BTreeSet<String> = store
+        .maintenance()?
+        .into_iter()
+        .map(|(app, _)| app)
+        .collect();
+    let routes = store.routes()?;
+    let attributions = crate::overlays::attribute(&routes, &maintenance, &active);
+    crate::overlays::apply_routes(&mut document.route, &active);
+    document.overlay.clear();
+
+    // With one application asked for, only what is about it or its
+    // routes.
+
+    let Some(app) = app else {
+        return Ok(attributions);
+    };
+
+    let subjects: Vec<String> = routes
+        .iter()
+        .filter(|route| route.app == app)
+        .filter_map(|route| route.name.as_ref().map(|name| format!("route {name}: ")))
+        .chain([format!("app {app}: ")])
+        .collect();
+    Ok(attributions
+        .into_iter()
+        .filter(|line| subjects.iter().any(|subject| line.starts_with(subject)))
+        .collect())
 }
 
 /// A host for the report: its names, and whether it has TLS.

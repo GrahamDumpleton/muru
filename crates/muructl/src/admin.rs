@@ -223,6 +223,12 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let metrics = metrics_from(&document, args.metrics)?;
     let dashboard = dashboard_from(&document, args.dashboard)?;
     let sinks = sinks_from(&document)?;
+    let overlay_webhook = document
+        .overlay_webhook
+        .as_ref()
+        .map(muru_controller::triggers::Webhook::from_config)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("[overlay_webhook]: {error}"))?;
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -275,6 +281,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         access_log,
         metrics,
         dashboard,
+        overlay_webhook,
         sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
         upgrade_arguments: upgrade_arguments(),
@@ -3168,6 +3175,20 @@ pub enum ConfigCommand {
         socket: SocketArgs,
     },
 
+    /// Show desired state; with --effective, as the active overlays leave
+    /// it, with what each sets that is in force.
+    Show {
+        /// One application rather than all.
+        app: Option<String>,
+
+        /// Apply the active overlays and attribute what they set.
+        #[arg(long)]
+        effective: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
     /// Compare a file, or a directory of files, with desired state.
     Diff {
         /// The file, or a directory whose .toml files are read together.
@@ -3195,6 +3216,7 @@ pub async fn config_export(
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
             all_releases,
+            effective: false,
         })
         .await
         .map_err(explain)?
@@ -3215,6 +3237,53 @@ pub async fn config_export(
         format_time(export.time_unix_ms),
         export.state_version
     );
+    print!("{}", export.document);
+    Ok(())
+}
+
+/// Show desired state, or with `effective` the state the active overlays
+/// make of it, headed by what each sets that is in force.
+pub async fn config_show(
+    app: Option<String>,
+    effective: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let export = client
+        .export_config(pb::ExportConfigRequest {
+            app: app.unwrap_or_default(),
+            all_releases: false,
+            effective,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if !effective {
+        print!("{}", export.document);
+        return Ok(());
+    }
+
+    println!(
+        "# Muru effective state: muructl {} on {}, {}, state version {}.",
+        export.version,
+        export.node,
+        format_time(export.time_unix_ms),
+        export.state_version
+    );
+
+    if export.attributions.is_empty() {
+        println!("# No active overlay changes this configuration.\n");
+    } else {
+        println!("# The active overlays set, and the routes below include:");
+
+        for line in &export.attributions {
+            println!("#   {line}");
+        }
+
+        println!();
+    }
+
     print!("{}", export.document);
     Ok(())
 }

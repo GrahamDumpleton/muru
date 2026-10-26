@@ -93,6 +93,8 @@ pub struct Config {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
     pub dashboard: Option<SocketAddr>,
+    /// The overlays' signed webhook (section 9.10), or none.
+    pub overlay_webhook: Option<crate::triggers::Webhook>,
     /// The webhooks events are delivered to (section 11.5).
     pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
@@ -326,6 +328,8 @@ pub enum Command {
         name: String,
         /// What to do.
         action: OverlayAction,
+        /// Whether the signed webhook asks, rather than a person.
+        external: bool,
         /// Answered with a sentence about what happened.
         done: oneshot::Sender<Result<String, String>>,
     },
@@ -610,6 +614,9 @@ struct Daemon {
     /// Section 9.10: the overlays in the warm-up lead before a window,
     /// with the release each keeps running meanwhile.
     warm_ups: BTreeMap<String, Option<(String, String)>>,
+    /// Section 9.10: when the clock's synchronisation was last checked,
+    /// and whether the daemon has warned that it is not synchronised.
+    clock: (Option<Instant>, bool),
     /// The secret stores releases may refer to (section 10.8).
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
@@ -844,6 +851,28 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         None => None,
     };
 
+    // The overlays' external trigger (section 9.10), on its own address.
+
+    let triggers = match config.overlay_webhook.take() {
+        Some(webhook) => {
+            let listener = tokio::net::TcpListener::bind(webhook.address)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot listen for the overlay webhook on {}",
+                        webhook.address
+                    )
+                })?;
+            Some(tokio::spawn(crate::triggers::serve(
+                listener,
+                webhook.secret,
+                Arc::clone(&handle.store),
+                handle.commands.clone(),
+            )))
+        }
+        None => None,
+    };
+
     let socket = locations.admin_socket();
     let (api_stop, api_stopped) = oneshot::channel();
     let api = crate::api::serve(socket.clone(), handle, api_stopped).await?;
@@ -891,6 +920,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
         warm_ups: BTreeMap::new(),
+        clock: (None, false),
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
@@ -999,6 +1029,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.autoscale(samples.as_deref()).await;
                 daemon.refresh_client_lists().await;
                 daemon.reconcile_overlays().await;
+                daemon.check_clock();
                 daemon.watch_rate_limits(samples.as_deref());
             }
         }
@@ -1061,6 +1092,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     if let Some(pages) = pages {
         pages.abort();
+    }
+
+    if let Some(triggers) = triggers {
+        triggers.abort();
     }
 
     let _ = std::fs::remove_file(&socket);
@@ -1953,6 +1988,36 @@ impl Daemon {
         }
     }
 
+    /// Section 9.10: warn, every ten minutes while schedules are declared,
+    /// when the system clock is not synchronised, as their windows follow
+    /// it, and say so once it is again.
+    fn check_clock(&mut self) {
+        let (checked, warned) = self.clock;
+
+        if checked.is_some_and(|at| at.elapsed() < CLOCK_CHECK) {
+            return;
+        }
+
+        let scheduled = self
+            .store
+            .overlays()
+            .unwrap_or_default()
+            .iter()
+            .any(|(_, overlay)| {
+                overlay
+                    .trigger
+                    .as_ref()
+                    .is_some_and(|trigger| trigger.schedule.is_some())
+            });
+        let event = clock_event(clock_synchronised(), warned, scheduled);
+        self.clock = (Some(Instant::now()), warned);
+
+        if let Some((kind, level, message)) = event {
+            self.clock.1 = kind == "clock.unsynchronised";
+            self.events.emit(kind, "daemon", level, message);
+        }
+    }
+
     /// Section 9.10: the overlays in the lead before a window of their
     /// schedule, with the release each warm-up starts.
     fn warm_ups(
@@ -2040,11 +2105,13 @@ impl Daemon {
         Ok(detail)
     }
 
-    /// Section 9.10: what a person asks of an overlay.
+    /// Section 9.10: what a person, or with `external` the signed webhook,
+    /// asks of an overlay.
     async fn control_overlay(
         &mut self,
         name: &str,
         action: OverlayAction,
+        external: bool,
     ) -> Result<String, String> {
         let overlay = self
             .store
@@ -2064,6 +2131,12 @@ impl Daemon {
         let subject = format!("overlay {name}");
         let now = now_unix_ms();
 
+        let (source, by) = if external {
+            ("external", "by the webhook")
+        } else {
+            ("manual", "by hand")
+        };
+
         let message = match action {
             OverlayAction::Activate { until } => {
                 if active {
@@ -2075,14 +2148,14 @@ impl Daemon {
                 let state = crate::model::OverlayState {
                     name: name.to_owned(),
                     active: true,
-                    source: "manual".to_owned(),
+                    source: source.to_owned(),
                     since_unix_ms: now,
                     until_unix_ms: until,
                 };
                 self.store
                     .set_overlay_state(name, Some(&state))
                     .map_err(|error| error.to_string())?;
-                let detail = "activated by hand".to_owned();
+                let detail = format!("activated {by}");
                 self.events
                     .emit("overlay.activated", &subject, "notice", &detail);
                 detail
@@ -2114,7 +2187,7 @@ impl Daemon {
                         .map_err(|error| error.to_string())?;
                 }
 
-                let detail = "ended by hand".to_owned();
+                let detail = format!("ended {by}");
                 self.events
                     .emit("overlay.ended", &subject, "notice", &detail);
                 detail
@@ -2731,8 +2804,13 @@ impl Daemon {
                     }
                 }
             }
-            Command::Overlay { name, action, done } => {
-                let _ = done.send(self.control_overlay(&name, action).await);
+            Command::Overlay {
+                name,
+                action,
+                external,
+                done,
+            } => {
+                let _ = done.send(self.control_overlay(&name, action, external).await);
             }
             Command::ScaleFloor {
                 app,
@@ -5491,6 +5569,61 @@ fn scalers_for(
     scalers
 }
 
+/// How often the clock's synchronisation is checked.
+const CLOCK_CHECK: Duration = Duration::from_secs(600);
+
+/// Whether the system clock is synchronised, as the kernel's NTP state
+/// says, or none where that cannot be told.
+fn clock_synchronised() -> Option<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // SAFETY: timex is plain data for which all zeroes is a valid
+        // value, and with modes 0 the call only reads the clock's state
+        // into it.
+
+        let state = unsafe {
+            let mut timex: libc::timex = std::mem::zeroed();
+
+            #[cfg(target_os = "linux")]
+            let state = libc::adjtimex(&mut timex);
+
+            #[cfg(target_os = "macos")]
+            let state = libc::ntp_adjtime(&mut timex);
+
+            state
+        };
+
+        if state >= 0 {
+            return Some(state != libc::TIME_ERROR);
+        }
+    }
+
+    None
+}
+
+/// The event a clock check raises: a warning when the clock is not
+/// synchronised while schedules depend on it, once, and a notice when it
+/// is synchronised again after one.
+fn clock_event(
+    synchronised: Option<bool>,
+    warned: bool,
+    scheduled: bool,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match synchronised {
+        Some(false) if scheduled && !warned => Some((
+            "clock.unsynchronised",
+            "warning",
+            "the system clock is not synchronised; overlay schedules and scheduled capacity follow it",
+        )),
+        Some(true) if warned => Some((
+            "clock.synchronised",
+            "notice",
+            "the system clock is synchronised again",
+        )),
+        _ => None,
+    }
+}
+
 /// A scaling decision as its event says it.
 fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
     let verb = if to > from { "scale out" } else { "scale in" };
@@ -5623,5 +5756,31 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
             muru_config::format_duration(Duration::from_millis(current.hold_ms))
         ),
         None => format!("step {} of {}", step + 1, steps.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_clock_warning_is_raised_once_and_only_for_schedules() {
+        assert_eq!(
+            clock_event(Some(false), false, true).map(|(kind, ..)| kind),
+            Some("clock.unsynchronised")
+        );
+        assert_eq!(clock_event(Some(false), true, true), None);
+        assert_eq!(clock_event(Some(false), false, false), None);
+        assert_eq!(
+            clock_event(Some(true), true, true).map(|(kind, ..)| kind),
+            Some("clock.synchronised")
+        );
+        assert_eq!(clock_event(Some(true), false, true), None);
+        assert_eq!(clock_event(None, false, true), None);
+    }
+
+    #[test]
+    fn the_clock_state_can_be_read_here() {
+        assert!(clock_synchronised().is_some());
     }
 }

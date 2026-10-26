@@ -68,15 +68,28 @@ pub fn warming(overlay: &Overlay, now: u64) -> bool {
 
 /// What starts an overlay, as the reports show it.
 pub fn describe_trigger(overlay: &Overlay) -> String {
+    let external = overlay
+        .trigger
+        .as_ref()
+        .is_some_and(|trigger| trigger.external == Some(true));
+
     let Some(schedule) = overlay
         .trigger
         .as_ref()
         .and_then(|trigger| trigger.schedule.as_ref())
     else {
-        return "by hand".to_owned();
+        return if external {
+            "by hand or webhook".to_owned()
+        } else {
+            "by hand".to_owned()
+        };
     };
 
     let mut text = muru_config::describe_schedule(schedule);
+
+    if external {
+        text.push_str(", webhook");
+    }
 
     if overlay.advisory == Some(true) {
         text.push_str(", advisory");
@@ -402,17 +415,127 @@ pub fn conflicts(overlays: &BTreeMap<String, Overlay>) -> Vec<String> {
     errors
 }
 
+/// One field an overlay changes, against the routes and maintenance set
+/// as they stand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldChange {
+    /// What it is on: `route NAME` or `app NAME`.
+    pub subject: String,
+    /// The field, or a phrase for what it sets.
+    pub field: String,
+    /// The value before, for a field that has one.
+    pub before: Option<String>,
+    /// The value after.
+    pub after: String,
+}
+
+impl FieldChange {
+    fn line(&self) -> String {
+        let show = |value: &str| {
+            if value.is_empty() {
+                "(none)".to_owned()
+            } else {
+                value.to_owned()
+            }
+        };
+
+        match &self.before {
+            Some(before) => format!(
+                "{}: {} {} -> {}",
+                self.subject,
+                self.field,
+                show(before),
+                show(&self.after)
+            ),
+            None if self.after.is_empty() => format!("{}: {}", self.subject, self.field),
+            None => format!("{}: {}: {}", self.subject, self.field, self.after),
+        }
+    }
+}
+
 /// What activating `overlay` would change, one line per field, against
 /// the routes as they stand.
 pub fn preview(overlay: &Overlay, routes: &[Route], maintenance: &BTreeSet<String>) -> Vec<String> {
-    let mut lines = Vec::new();
+    changes(overlay, routes, maintenance)
+        .iter()
+        .map(FieldChange::line)
+        .collect()
+}
+
+/// Section 9.10: what the active overlays set that is in force, one line
+/// per field, for `config show --effective`. They apply in order, so a
+/// later overlay's setting of a field replaces an earlier one's.
+pub fn attribute(
+    routes: &[Route],
+    maintenance: &BTreeSet<String>,
+    active: &[&(String, Overlay)],
+) -> Vec<String> {
+    let mut current = routes.to_vec();
+    let mut maintained = maintenance.clone();
+    let mut found: BTreeMap<(String, String), (FieldChange, String)> = BTreeMap::new();
+
+    for pair in active {
+        let (name, overlay) = (&pair.0, &pair.1);
+
+        for change in changes(overlay, &current, &maintained) {
+            // Capacity and freezes add up rather than replace, so each
+            // overlay's stays listed.
+
+            let key = match change.before {
+                Some(_) => (change.subject.clone(), change.field.clone()),
+                None => (change.subject.clone(), format!("{} {name}", change.field)),
+            };
+
+            found.insert(key, (change, name.clone()));
+        }
+
+        apply_routes(&mut current, &[*pair]);
+        maintained = apply_maintenance(&maintained, &[*pair]);
+    }
+
+    found
+        .into_values()
+        .map(|(change, name)| {
+            let what = if is_schedule(&name) {
+                "schedule"
+            } else {
+                "overlay"
+            };
+
+            let line = match &change.before {
+                Some(_) if change.after.is_empty() => {
+                    format!("{}: {} = (none)", change.subject, change.field)
+                }
+                Some(_) => format!("{}: {} = {}", change.subject, change.field, change.after),
+                None => change.line(),
+            };
+
+            format!("{line} ({what} {name})")
+        })
+        .collect()
+}
+
+/// The fields `overlay` changes against the routes and maintenance set.
+fn changes(
+    overlay: &Overlay,
+    routes: &[Route],
+    maintenance: &BTreeSet<String>,
+) -> Vec<FieldChange> {
+    let mut found = Vec::new();
 
     for name in overlay.routes.keys() {
+        let subject = format!("route {name}");
+
         let Some(before) = routes
             .iter()
             .find(|route| route.name.as_deref() == Some(name))
         else {
-            lines.push(format!("route {name}: no route has this name"));
+            found.push(FieldChange {
+                subject,
+                field: "no route has this name".to_owned(),
+                before: None,
+                after: String::new(),
+            });
             continue;
         };
 
@@ -420,13 +543,6 @@ pub fn preview(overlay: &Overlay, routes: &[Route], maintenance: &BTreeSet<Strin
         let mut after = [before.clone()];
         apply_routes(&mut after, &[&pair]);
         let after = &after[0];
-        let show = |value: String| {
-            if value.is_empty() {
-                "(none)".to_owned()
-            } else {
-                value
-            }
-        };
 
         let fields = [
             (
@@ -462,45 +578,59 @@ pub fn preview(overlay: &Overlay, routes: &[Route], maintenance: &BTreeSet<Strin
 
         for (field, was, will) in fields {
             if was != will {
-                lines.push(format!(
-                    "route {name}: {field} {} -> {}",
-                    show(was),
-                    show(will)
-                ));
+                found.push(FieldChange {
+                    subject: subject.clone(),
+                    field: field.to_owned(),
+                    before: Some(was),
+                    after: will,
+                });
             }
         }
     }
 
     for (app, change) in &overlay.apps {
+        let subject = format!("app {app}");
+
         if let Some(on) = change.maintenance {
             let was = maintenance.contains(app);
+            let state = |on: bool| if on { "on" } else { "off" }.to_owned();
 
             if was != on {
-                lines.push(format!(
-                    "app {app}: maintenance {} -> {}",
-                    if was { "on" } else { "off" },
-                    if on { "on" } else { "off" }
-                ));
+                found.push(FieldChange {
+                    subject: subject.clone(),
+                    field: "maintenance".to_owned(),
+                    before: Some(state(was)),
+                    after: state(on),
+                });
             }
         }
 
         if change.sets_capacity() {
-            lines.push(format!(
-                "app {app}: group {}: {}",
-                change
-                    .group
-                    .as_deref()
-                    .unwrap_or(muru_edge::routing::DEFAULT_GROUP),
-                describe_capacity(change)
-            ));
+            found.push(FieldChange {
+                subject: subject.clone(),
+                field: format!(
+                    "group {}",
+                    change
+                        .group
+                        .as_deref()
+                        .unwrap_or(muru_edge::routing::DEFAULT_GROUP)
+                ),
+                before: None,
+                after: describe_capacity(change),
+            });
         }
 
         if change.freeze_deploys == Some(true) {
-            lines.push(format!("app {app}: deploys and rollouts frozen"));
+            found.push(FieldChange {
+                subject,
+                field: "deploys and rollouts frozen".to_owned(),
+                before: None,
+                after: String::new(),
+            });
         }
     }
 
-    lines
+    found
 }
 
 /// The capacity an overlay sets on an application, as a phrase.
@@ -822,6 +952,35 @@ mod tests {
         declared.get_mut("a").unwrap().priority = Some(1);
         declared.get_mut("b").unwrap().priority = Some(2);
         assert!(conflicts(&declared).is_empty());
+    }
+
+    #[test]
+    fn the_effective_values_are_attributed_to_the_overlay_in_force() {
+        let declared = [
+            (
+                "limited".to_owned(),
+                overlay("routes.root = { mode = 'limited', deny = ['POST'] }\npriority = 1"),
+            ),
+            (
+                "read-only".to_owned(),
+                overlay("routes.root = { mode = 'read-only' }\npriority = 2"),
+            ),
+            (
+                "shop.surge".to_owned(),
+                overlay("apps.shop = { min_workers = 4, freeze_deploys = true }"),
+            ),
+        ];
+        let active: Vec<&(String, Overlay)> = declared.iter().collect();
+        let lines = attribute(&[route("root", "shop")], &BTreeSet::new(), &active);
+        assert_eq!(
+            lines,
+            [
+                "app shop: deploys and rollouts frozen (schedule shop.surge)",
+                "app shop: group default: at least 4 workers (schedule shop.surge)",
+                "route root: methods.deny = POST (overlay limited)",
+                "route root: mode = read-only (overlay read-only)",
+            ]
+        );
     }
 
     #[test]

@@ -628,6 +628,7 @@ impl Admin for Service {
             .send(Command::Overlay {
                 name: request.name,
                 action,
+                external: false,
                 done: done_tx,
             })
             .await
@@ -1169,8 +1170,15 @@ impl Admin for Service {
     ) -> Result<Response<pb::ExportConfigResponse>, Status> {
         let request = request.into_inner();
         let app = (!request.app.is_empty()).then_some(request.app.as_str());
-        let document =
+        let mut document =
             config::export(&self.handle.store, app, request.all_releases).map_err(not_found)?;
+
+        let attributions = if request.effective {
+            config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?
+        } else {
+            Vec::new()
+        };
+
         let text = document.to_toml().map_err(internal)?;
 
         Ok(Response::new(pb::ExportConfigResponse {
@@ -1179,6 +1187,7 @@ impl Admin for Service {
             node: config::hostname(),
             time_unix_ms: now_unix_ms(),
             state_version: self.handle.store.state_version().map_err(internal)?,
+            attributions,
         }))
     }
 }
