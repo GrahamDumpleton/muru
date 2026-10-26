@@ -2199,23 +2199,19 @@ impl Daemon {
                     return Err(format!("overlay {name} is not active; activate it first"));
                 }
 
-                // Its changes become the base: the named routes as the
-                // overlay leaves them, and its maintenance settings.
+                // Its changes become the base: the routes as the overlay
+                // leaves them, with those it adds for client classes, and
+                // its maintenance settings.
 
                 let pair = (name.to_owned(), overlay.clone());
+                let before = self.store.routes().unwrap_or_default();
+                let mut changed = before.clone();
+                crate::overlays::apply_routes(&mut changed, &[&pair]);
 
-                for route in self.store.routes().unwrap_or_default() {
-                    if route
-                        .name
-                        .as_ref()
-                        .is_some_and(|route_name| overlay.routes.contains_key(route_name))
-                    {
-                        let mut changed = [route];
-                        crate::overlays::apply_routes(&mut changed, &[&pair]);
-                        self.store
-                            .put_route(&changed[0])
-                            .map_err(|error| error.to_string())?;
-                    }
+                for route in changed.iter().filter(|route| !before.contains(route)) {
+                    self.store
+                        .put_route(route)
+                        .map_err(|error| error.to_string())?;
                 }
 
                 for (app, change) in &overlay.apps {

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use muru_config::{Methods, Overlay, Route, Traffic};
+use muru_config::{ClientMatch, Methods, Overlay, Route, RouteOverlay, Traffic};
 
 use crate::model::OverlayState;
 use crate::scaling::Capacity;
@@ -216,59 +216,89 @@ pub fn ordered<'a>(
     chosen
 }
 
-/// Lay the overlays' route changes over `routes`, in order.
-pub fn apply_routes(routes: &mut [Route], overlays: &[&(String, Overlay)]) {
+/// Lay the overlays' route changes over `routes`, in order. Each route
+/// `client_routes` names for a class is the route for that class alone at
+/// the route's host and path, or else a copy of the route, changed, added
+/// ahead of it.
+pub fn apply_routes(routes: &mut Vec<Route>, overlays: &[&(String, Overlay)]) {
     for (_, overlay) in overlays {
-        for route in routes.iter_mut() {
-            let Some(change) = route
-                .name
-                .as_ref()
-                .and_then(|name| overlay.routes.get(name))
+        for (name, change) in &overlay.routes {
+            let Some(mut index) = routes
+                .iter()
+                .position(|route| route.name.as_ref() == Some(name))
             else {
                 continue;
             };
 
-            if let Some(mode) = &change.mode {
-                route.mode = Some(mode.clone());
-            }
+            change_route(&mut routes[index], change);
 
-            if let Some(deny) = &change.deny {
-                route.methods = Some(Methods {
-                    deny: deny.clone(),
-                    answer: change.answer.clone(),
+            for (class, class_change) in change.client_routes.iter().flatten() {
+                let named = &routes[index];
+                let found = routes.iter().position(|route| {
+                    route.host == named.host
+                        && route.path == named.path
+                        && route.classes() == std::slice::from_ref(class)
                 });
-            }
 
-            if let Some(limits) = &change.rate_limits {
-                route.rate_limits = limits.clone();
-            }
-
-            // Section 4.12: each page replaces the route's for its key.
-
-            for (key, page) in change.error_pages.iter().flatten() {
-                route.error_pages.insert(key.clone(), page.clone());
-            }
-
-            if let Some(target) = &change.target {
-                route.app = target.app.clone().unwrap_or_default();
-                route.static_dir = target.static_dir.clone();
-                route.upstream = target.upstream.clone().unwrap_or_default();
-
-                if target.app.is_none() {
-                    route.traffic = None;
+                match found {
+                    Some(at) => change_route(&mut routes[at], class_change),
+                    None => {
+                        let mut added = routes[index].clone();
+                        added.name = None;
+                        added.matches = Some(ClientMatch {
+                            client_class: vec![class.clone()],
+                        });
+                        change_route(&mut added, class_change);
+                        routes.insert(index, added);
+                        index += 1;
+                    }
                 }
             }
-
-            if let Some(traffic) = &change.traffic {
-                let mut policy = route.traffic.clone().unwrap_or_else(Traffic::default);
-                policy.split = match (&traffic.pin, &traffic.split) {
-                    (Some(release), _) => BTreeMap::from([(release.clone(), 100)]),
-                    (None, Some(split)) => split.clone(),
-                    (None, None) => policy.split,
-                };
-                route.traffic = Some(policy);
-            }
         }
+    }
+}
+
+/// Lay one overlay's change over a route.
+fn change_route(route: &mut Route, change: &RouteOverlay) {
+    if let Some(mode) = &change.mode {
+        route.mode = Some(mode.clone());
+    }
+
+    if let Some(deny) = &change.deny {
+        route.methods = Some(Methods {
+            deny: deny.clone(),
+            answer: change.answer.clone(),
+        });
+    }
+
+    if let Some(limits) = &change.rate_limits {
+        route.rate_limits = limits.clone();
+    }
+
+    // Section 4.12: each page replaces the route's for its key.
+
+    for (key, page) in change.error_pages.iter().flatten() {
+        route.error_pages.insert(key.clone(), page.clone());
+    }
+
+    if let Some(target) = &change.target {
+        route.app = target.app.clone().unwrap_or_default();
+        route.static_dir = target.static_dir.clone();
+        route.upstream = target.upstream.clone().unwrap_or_default();
+
+        if target.app.is_none() {
+            route.traffic = None;
+        }
+    }
+
+    if let Some(traffic) = &change.traffic {
+        let mut policy = route.traffic.clone().unwrap_or_default();
+        policy.split = match (&traffic.pin, &traffic.split) {
+            (Some(release), _) => BTreeMap::from([(release.clone(), 100)]),
+            (None, Some(split)) => split.clone(),
+            (None, None) => policy.split,
+        };
+        route.traffic = Some(policy);
     }
 }
 
@@ -349,14 +379,35 @@ pub fn pinned_apps(routes: &[Route], overlays: &[&(String, Overlay)]) -> BTreeSe
 
     for (_, overlay) in overlays {
         for route in routes {
-            if route
+            let Some(change) = route
                 .name
                 .as_ref()
                 .and_then(|name| overlay.routes.get(name))
-                .is_some_and(|change| change.traffic.is_some())
-                && !route.app.is_empty()
-            {
-                apps.insert(route.app.clone());
+            else {
+                continue;
+            };
+
+            // A route for a class serves the application its target
+            // names, or the route's.
+
+            let for_classes = change
+                .client_routes
+                .iter()
+                .flatten()
+                .map(|(_, class_change)| {
+                    class_change
+                        .target
+                        .as_ref()
+                        .map_or(Some(&route.app), |target| target.app.as_ref())
+                        .filter(|_| class_change.traffic.is_some())
+                });
+
+            let route_app = change.traffic.is_some().then_some(&route.app);
+
+            for app in std::iter::once(route_app).chain(for_classes).flatten() {
+                if !app.is_empty() {
+                    apps.insert(app.clone());
+                }
             }
         }
     }
@@ -391,6 +442,13 @@ pub fn conflicts(overlays: &BTreeMap<String, Overlay>) -> Vec<String> {
             for key in change.error_pages.iter().flat_map(BTreeMap::keys) {
                 setters
                     .entry(format!("routes.{route}.error_pages.{key}"))
+                    .or_default()
+                    .push((name, overlay.priority));
+            }
+
+            for class in change.client_routes.iter().flat_map(BTreeMap::keys) {
+                setters
+                    .entry(format!("routes.{route}.client_routes.{class}"))
                     .or_default()
                     .push((name, overlay.priority));
             }
@@ -535,8 +593,11 @@ fn changes(
     maintenance: &BTreeSet<String>,
 ) -> Vec<FieldChange> {
     let mut found = Vec::new();
+    let pair = (String::new(), overlay.clone());
+    let mut changed = routes.to_vec();
+    apply_routes(&mut changed, &[&pair]);
 
-    for name in overlay.routes.keys() {
+    for (name, change) in &overlay.routes {
         let subject = format!("route {name}");
 
         let Some(before) = routes
@@ -552,10 +613,12 @@ fn changes(
             continue;
         };
 
-        let pair = (String::new(), overlay.clone());
-        let mut after = [before.clone()];
-        apply_routes(&mut after, &[&pair]);
-        let after = &after[0];
+        let Some(after) = changed
+            .iter()
+            .find(|route| route.name.as_deref() == Some(name))
+        else {
+            continue;
+        };
 
         let fields = [
             (
@@ -589,11 +652,9 @@ fn changes(
             ),
         ];
 
-        let pages = overlay
-            .routes
-            .get(name)
-            .and_then(|change| change.error_pages.as_ref())
-            .into_iter()
+        let pages = change
+            .error_pages
+            .iter()
             .flat_map(BTreeMap::keys)
             .map(|key| {
                 (
@@ -603,10 +664,33 @@ fn changes(
                 )
             });
 
+        // A route for a class, at the route's host and path.
+
+        let for_class = |all: &[Route], class: &String| {
+            describe_route(all.iter().find(|route| {
+                route.host == before.host
+                    && route.path == before.path
+                    && route.classes() == std::slice::from_ref(class)
+            }))
+        };
+
+        let classes = change
+            .client_routes
+            .iter()
+            .flat_map(BTreeMap::keys)
+            .map(|class| {
+                (
+                    format!("client_routes.{class}"),
+                    for_class(routes, class),
+                    for_class(&changed, class),
+                )
+            });
+
         for (field, was, will) in fields
             .into_iter()
             .map(|(field, was, will)| (field.to_owned(), was, will))
             .chain(pages)
+            .chain(classes)
         {
             if was != will {
                 found.push(FieldChange {
@@ -696,6 +780,36 @@ fn describe_page(page: Option<&muru_config::ErrorPage>) -> String {
     } else {
         "a template".to_owned()
     }
+}
+
+/// A route for a client class as one phrase: what serves it, and the
+/// policies it has.
+fn describe_route(route: Option<&Route>) -> String {
+    let Some(route) = route else {
+        return String::new();
+    };
+
+    let mut parts = vec![describe_target(route)];
+
+    if let Some(mode) = &route.mode {
+        parts.push(format!("mode {mode}"));
+    }
+
+    if let Some(methods) = &route.methods {
+        parts.push(format!("deny {}", methods.deny.join(", ")));
+    }
+
+    if !route.rate_limits.is_empty() {
+        parts.push(format!("rate limits {}", route.rate_limits.join(", ")));
+    }
+
+    let split = describe_split(route.traffic.as_ref());
+
+    if !split.is_empty() {
+        parts.push(format!("traffic {split}"));
+    }
+
+    parts.join("; ")
 }
 
 fn describe_target(route: &Route) -> String {
@@ -1030,6 +1144,76 @@ mod tests {
                 "overlays notice, outage all set routes.root.error_pages.503: give each a different priority"
             ]
         );
+    }
+
+    #[test]
+    fn client_routes_add_or_change_the_route_for_a_class() {
+        let surge = (
+            "surge".to_owned(),
+            overlay(
+                "routes.root = { mode = 'read-only', client_routes = { ai_crawler = { target = { static = '/srv/snapshot' } }, partner = { rate_limits = ['slow'] } } }",
+            ),
+        );
+        let partner = Route {
+            host: "site".to_owned(),
+            path: "/".to_owned(),
+            matches: Some(ClientMatch {
+                client_class: vec!["partner".to_owned()],
+            }),
+            static_dir: Some("/srv/partner".to_owned()),
+            ..Route::default()
+        };
+        let mut routes = vec![route("root", "shop"), partner];
+
+        assert_eq!(
+            preview(&surge.1, &routes, &BTreeSet::new()),
+            [
+                "route root: mode (none) -> read-only",
+                "route root: client_routes.ai_crawler (none) -> static /srv/snapshot; mode read-only",
+                "route root: client_routes.partner static /srv/partner -> static /srv/partner; rate limits slow",
+            ]
+        );
+
+        // The crawlers' route is a copy of the route, ahead of it; the
+        // partners' route is the one already there.
+
+        let later = (
+            "later".to_owned(),
+            overlay("priority = 1\nroutes.root.client_routes.ai_crawler = { mode = 'degraded' }"),
+        );
+        apply_routes(&mut routes, &[&surge, &later]);
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0].name, None);
+        assert_eq!(routes[0].classes(), ["ai_crawler"]);
+        assert_eq!(routes[0].static_dir.as_deref(), Some("/srv/snapshot"));
+        assert_eq!(routes[0].mode.as_deref(), Some("degraded"));
+        assert_eq!(routes[1].name.as_deref(), Some("root"));
+        assert_eq!(routes[1].mode.as_deref(), Some("read-only"));
+        assert_eq!(routes[2].rate_limits, ["slow"]);
+
+        let declared = BTreeMap::from([
+            surge.clone(),
+            (
+                "pinned".to_owned(),
+                overlay("routes.root.client_routes.ai_crawler = { traffic = { pin = 'r1' } }"),
+            ),
+        ]);
+        assert_eq!(
+            conflicts(&declared),
+            [
+                "overlays pinned, surge all set routes.root.client_routes.ai_crawler: give each a different priority"
+            ]
+        );
+
+        // A class's pin holds the application's rollout as the route's
+        // would.
+
+        let pinned = ("pinned".to_owned(), declared["pinned"].clone());
+        assert_eq!(
+            pinned_apps(&[route("root", "shop")], &[&pinned]),
+            BTreeSet::from(["shop".to_owned()])
+        );
+        assert!(pinned_apps(&[route("root", "shop")], &[&surge]).is_empty());
     }
 
     #[test]

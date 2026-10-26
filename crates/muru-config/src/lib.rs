@@ -1450,6 +1450,11 @@ pub struct RouteOverlay {
     /// place of the route's page for the same key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_pages: Option<BTreeMap<String, ErrorPage>>,
+    /// Routes for client classes (section 4.14) at the route's host and
+    /// path, by class: each a copy of the route with these changes, or the
+    /// route for that class already there with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_routes: Option<BTreeMap<String, RouteOverlay>>,
 }
 
 /// An overlay's traffic policy for a route.
@@ -1675,53 +1680,8 @@ pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
     }
 
     for (route, change) in &overlay.routes {
-        let methods = change.deny.as_ref().map(|deny| Methods {
-            deny: deny.clone(),
-            answer: change.answer.clone(),
-        });
-        let probe = Route {
-            mode: change.mode.clone(),
-            methods,
-            rate_limits: change.rate_limits.clone().unwrap_or_default(),
-            ..Route::default()
-        };
-        check_route_policies(&probe)
+        check_route_overlay(change, true)
             .map_err(|error| format!("overlay {name}: routes.{route}: {error}"))?;
-
-        if change.answer.is_some() && change.deny.is_none() {
-            return Err(format!("overlay {name}: routes.{route}: answer needs deny"));
-        }
-
-        if let Some(pages) = &change.error_pages {
-            if pages.is_empty() {
-                return Err(format!(
-                    "overlay {name}: routes.{route}: error_pages names no page"
-                ));
-            }
-
-            check_error_pages(pages, false)
-                .map_err(|error| format!("overlay {name}: routes.{route}: {error}"))?;
-        }
-
-        if let Some(traffic) = &change.traffic
-            && traffic.pin.is_some() == traffic.split.is_some()
-        {
-            return Err(format!(
-                "overlay {name}: routes.{route}: traffic sets one of pin and split"
-            ));
-        }
-
-        if let Some(target) = &change.target {
-            let named = usize::from(target.app.is_some())
-                + usize::from(target.static_dir.is_some())
-                + usize::from(target.upstream.is_some());
-
-            if named != 1 {
-                return Err(format!(
-                    "overlay {name}: routes.{route}: target names one of app, static and upstream"
-                ));
-            }
-        }
     }
 
     let schedule = overlay
@@ -1753,6 +1713,75 @@ pub fn check_overlay(name: &str, overlay: &Overlay) -> Result<(), String> {
         return Err(format!(
             "overlay {name}: latch and advisory apply to a schedule, and it has none"
         ));
+    }
+
+    Ok(())
+}
+
+/// Check what an overlay sets on a route, and on the routes for client
+/// classes in `client_routes` when `outer`.
+fn check_route_overlay(change: &RouteOverlay, outer: bool) -> Result<(), String> {
+    let methods = change.deny.as_ref().map(|deny| Methods {
+        deny: deny.clone(),
+        answer: change.answer.clone(),
+    });
+    let probe = Route {
+        mode: change.mode.clone(),
+        methods,
+        rate_limits: change.rate_limits.clone().unwrap_or_default(),
+        ..Route::default()
+    };
+    check_route_policies(&probe)?;
+
+    if change.answer.is_some() && change.deny.is_none() {
+        return Err("answer needs deny".to_owned());
+    }
+
+    if let Some(pages) = &change.error_pages {
+        if pages.is_empty() {
+            return Err("error_pages names no page".to_owned());
+        }
+
+        check_error_pages(pages, false)?;
+    }
+
+    if let Some(traffic) = &change.traffic
+        && traffic.pin.is_some() == traffic.split.is_some()
+    {
+        return Err("traffic sets one of pin and split".to_owned());
+    }
+
+    if let Some(target) = &change.target {
+        let named = usize::from(target.app.is_some())
+            + usize::from(target.static_dir.is_some())
+            + usize::from(target.upstream.is_some());
+
+        if named != 1 {
+            return Err("target names one of app, static and upstream".to_owned());
+        }
+    }
+
+    let Some(routes) = &change.client_routes else {
+        return Ok(());
+    };
+
+    if !outer {
+        return Err("client_routes is set on a route, not on a client class's".to_owned());
+    }
+
+    if routes.is_empty() {
+        return Err("client_routes names no class".to_owned());
+    }
+
+    for (class, route) in routes {
+        check_policy_name("client_routes", class)?;
+
+        if route == &RouteOverlay::default() {
+            return Err(format!("client_routes.{class} sets nothing"));
+        }
+
+        check_route_overlay(route, false)
+            .map_err(|error| format!("client_routes.{class}: {error}"))?;
     }
 
     Ok(())
@@ -3535,6 +3564,11 @@ mod tests {
         )
         .is_ok());
         assert!(check_overlay(
+            "crawler-surge",
+            &overlay("routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }")
+        )
+        .is_ok());
+        assert!(check_overlay(
             "nightly",
             &overlay("apps.shop = { maintenance = true }\ntrigger = { schedule = { cron = '0 2 * * *', duration = '1h', timezone = 'Australia/Sydney' } }\nwarm_up = { lead = '30m' }\nadvisory = true")
         )
@@ -3546,6 +3580,23 @@ mod tests {
             ("routes.a = { answer = 'read_only' }", "answer needs deny"),
             ("routes.a = { traffic = {} }", "one of pin and split"),
             ("routes.a = { error_pages = {} }", "names no page"),
+            ("routes.a = { client_routes = {} }", "names no class"),
+            (
+                "routes.a = { client_routes = { bot = {} } }",
+                "bot sets nothing",
+            ),
+            (
+                "routes.a = { client_routes = { 'Bot' = { mode = 'read-only' } } }",
+                "client_routes",
+            ),
+            (
+                "routes.a = { client_routes = { bot = { client_routes = { x = { mode = 'read-only' } } } } }",
+                "not on a client class's",
+            ),
+            (
+                "routes.a = { client_routes = { bot = { target = {} } } }",
+                "client_routes.bot: target names one of",
+            ),
             (
                 "routes.a = { error_pages = { '503' = { file = 'down.html' } } }",
                 "absolute",

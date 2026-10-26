@@ -304,7 +304,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
     plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
-    plan_overlays(store, document, &defined.rate_limits, prune, &mut plan);
+    plan_overlays(store, document, defined, prune, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -1098,7 +1098,7 @@ fn stored_routes_named(
 fn plan_overlays(
     store: &Store,
     document: &Document,
-    rate_limits: &[String],
+    defined: &Defined,
     prune: bool,
     plan: &mut Plan,
 ) {
@@ -1163,20 +1163,39 @@ fn plan_overlays(
                 errors.push(format!("overlay {name}: no route is named {route}"));
             }
 
-            for limit in change.rate_limits.iter().flatten() {
-                if !rate_limits.contains(limit) {
-                    errors.push(format!(
-                        "overlay {name}: routes.{route}: no rate limit named {limit} in the daemon configuration file"
-                    ));
-                }
-            }
+            // The route's own changes, then each route for a class.
 
-            if let Some(target) = &change.target {
+            let changes = std::iter::once((format!("routes.{route}"), change)).chain(
+                change
+                    .client_routes
+                    .iter()
+                    .flatten()
+                    .map(|(class, class_change)| {
+                        (
+                            format!("routes.{route}.client_routes.{class}"),
+                            class_change,
+                        )
+                    }),
+            );
+
+            for (field, change) in changes {
+                for limit in change.rate_limits.iter().flatten() {
+                    if !defined.rate_limits.contains(limit) {
+                        errors.push(format!(
+                            "overlay {name}: {field}: no rate limit named {limit} in the daemon configuration file"
+                        ));
+                    }
+                }
+
+                let Some(target) = &change.target else {
+                    continue;
+                };
+
                 if let Some(app) = &target.app
                     && !known_app(app)
                 {
                     errors.push(format!(
-                        "overlay {name}: routes.{route}: no application named {app}"
+                        "overlay {name}: {field}: no application named {app}"
                     ));
                 }
 
@@ -1184,7 +1203,7 @@ fn plan_overlays(
                     && !known_upstream(upstream)
                 {
                     errors.push(format!(
-                        "overlay {name}: routes.{route}: no upstream named {upstream}"
+                        "overlay {name}: {field}: no upstream named {upstream}"
                     ));
                 }
 
@@ -1192,7 +1211,15 @@ fn plan_overlays(
                     && !Path::new(directory).is_dir()
                 {
                     errors.push(format!(
-                        "overlay {name}: routes.{route}: {directory} is not a directory"
+                        "overlay {name}: {field}: {directory} is not a directory"
+                    ));
+                }
+            }
+
+            for class in change.client_routes.iter().flat_map(BTreeMap::keys) {
+                if class != "default" && !defined.client_classes.contains(class) {
+                    errors.push(format!(
+                        "overlay {name}: routes.{route}.client_routes: no client class named {class} in the daemon configuration file"
                     ));
                 }
             }

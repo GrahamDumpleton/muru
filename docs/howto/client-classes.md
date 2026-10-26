@@ -140,6 +140,10 @@ threads = 4
 route is for, as `[for ai_crawler]`, and the releases its policy gives
 classes.
 
+An [overlay](overlays.md) can give a class a route for a while, such as
+sending crawlers to a snapshot only when they become a burden, with
+`client_routes`.
+
 ## Rate limits
 
 A `[rate_limit.NAME]` table in the daemon's file is a token bucket for

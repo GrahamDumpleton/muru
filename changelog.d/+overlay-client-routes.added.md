@@ -1,0 +1,1 @@
+Added client class routes to overlays: `routes.NAME.client_routes` gives a client class a route of its own at the route's host and path while the overlay is active, changing the route for that class alone or adding a copy of the route, and `muructl overlay preview`, `promote` and `config show --effective` cover them.
