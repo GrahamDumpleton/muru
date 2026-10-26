@@ -1,0 +1,1 @@
+Added reading workers from outside with PEP 768 on Linux and Python 3.14 or later: `muructl debug stacks`, the stacks captured before a hard-timeout kill, and `muructl debug profile` read the worker without its cooperation, so a worker holding the interpreter still shows its stacks.

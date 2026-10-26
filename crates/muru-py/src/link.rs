@@ -447,6 +447,21 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // Section 11.7: the bookkeeping is answered here, without the
+        // interpreter, so a worker whose threads hold it still says which
+        // request each thread serves while its stacks are read from
+        // outside.
+
+        if let Some(id) = bookkeeping_request(&line) {
+            let text = bookkeeping_answer(id, &shared);
+
+            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+                break;
+            }
+
+            continue;
+        }
+
         let answer = Python::attach(|py| {
             let active = shared.active_requests(py)?;
             let names = crate::pool::thread_names(py)?;
@@ -466,6 +481,54 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             break;
         }
     }
+}
+
+/// The id of a request line asking for the bookkeeping, as the host
+/// writes it: `{"id": N, "op": "bookkeeping", ...}`.
+fn bookkeeping_request(line: &str) -> Option<i64> {
+    if !line.contains("\"op\": \"bookkeeping\"") {
+        return None;
+    }
+
+    let rest = line.split_once("\"id\": ")?.1;
+    let end = rest
+        .find(|c: char| c != '-' && !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// The requests in flight, with the thread serving each, and the
+/// runtime's thread names, as an answer line.
+fn bookkeeping_answer(id: i64, shared: &Shared) -> String {
+    let requests: Vec<String> = shared
+        .active_summary()
+        .into_iter()
+        .map(|request| {
+            format!(
+                "{{\"request_id\":{},\"method\":{},\"path\":{},\"elapsed_ms\":{},\"thread\":{},\"native\":{}}}",
+                serde_json_string(&request.request_id),
+                serde_json_string(&request.method),
+                serde_json_string(&request.path),
+                request.elapsed_ms,
+                request
+                    .thread
+                    .map_or_else(|| "null".to_owned(), |thread| thread.to_string()),
+                request
+                    .native
+                    .map_or_else(|| "null".to_owned(), |native| native.to_string())
+            )
+        })
+        .collect();
+    let names: Vec<String> = crate::pool::thread_name_list()
+        .into_iter()
+        .map(|(ident, name)| format!("\"{ident}\":{}", serde_json_string(&name)))
+        .collect();
+
+    format!(
+        "{{\"id\":{id},\"ok\":true,\"result\":{{\"active\":[{}],\"names\":{{{}}}}}}}",
+        requests.join(","),
+        names.join(",")
+    )
 }
 
 /// A string as a JSON literal, escaped by hand so the runtime needs no

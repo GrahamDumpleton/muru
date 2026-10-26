@@ -127,6 +127,12 @@ def handle(
     return json.dumps({"id": request_id, "ok": True, "result": result}, default=str)
 
 
+def _parked(frame: Any) -> bool:
+    """Say whether a thread waits for work in the runtime's own frame."""
+
+    return bool(frame.f_code.co_filename.endswith(os.path.join("muru", "_pool.py")))
+
+
 def _label(code: Any) -> str:
     """Name a function as a profile shows it: its qualified name and where it starts."""
 
@@ -185,7 +191,7 @@ def profile(
                 break
 
         for ident, frame in sys._current_frames().items():
-            if ident in skipped or (serving is not None and ident not in serving):
+            if ident in skipped or (serving is not None and ident not in serving) or _parked(frame):
                 continue
 
             stack = []
@@ -378,7 +384,7 @@ def stacks(active: list[dict[str, Any]], names: dict[int, str]) -> dict[str, Any
     own = threading.get_ident()
 
     for ident, frame in sys._current_frames().items():
-        if ident == own:
+        if ident == own or _parked(frame):
             continue
 
         thread = known.get(ident)

@@ -49,6 +49,7 @@ import selectors
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -56,7 +57,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import RequestTimeout, _asgi, _inspect, preload
+from muru import RequestTimeout, _asgi, _inspect, _outside, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -598,6 +599,14 @@ class Host:
         # from the supervisor's.
 
         self.own_requests = 0
+
+        # Section 11.7: the reader of the workers' stacks from outside,
+        # and the pipe a profile sampled on a thread of its own wakes the
+        # loop with.
+
+        self.outside = _outside.Reader()
+        self.outside_errors: dict[int, str] = {}
+        self.wake_write: int | None = None
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
@@ -1054,6 +1063,7 @@ class Host:
         os.set_blocking(wake_write, False)
         signal.set_wakeup_fd(wake_write, warn_on_full_buffer=False)
         selector.register(wake_read, selectors.EVENT_READ)
+        self.wake_write = wake_write
 
         def request_stop(signum: int, _frame: Any) -> None:
             if not self.stopping:
@@ -1302,6 +1312,19 @@ class Host:
             self.send_to_supervisor(
                 {"type": "response", "id": request_id, "workers": [], "error": "no such worker"}
             )
+            return
+
+        # Section 11.7: stacks, and a profile of everything a worker runs,
+        # are read from outside where the interpreter allows it, so they
+        # work on a worker whose threads hold the interpreter; elsewhere
+        # the worker is asked.
+
+        if op == "stacks" and self.stacks_from_outside(request_id, targets):
+            return
+
+        chosen = args.get("requests") or args.get("path")
+
+        if op == "profile" and not chosen and self.profile_from_outside(request_id, targets, args):
             return
 
         pending = Pending(request_id, op, targets)
@@ -1808,9 +1831,11 @@ class Host:
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
 
+        # A profile sampled from outside is answered by its thread, so it is
+        # looked at here as well as when its time is up.
+
         for pending in list(self.pending.values()):
-            if now >= pending.deadline:
-                self.finish_if_answered(pending, expired=True)
+            self.finish_if_answered(pending, expired=now >= pending.deadline)
 
     def replace(self, state: WorkerState, reason: str, kind: str, hard: bool = False) -> None:
         """Start replacing a worker with a fresh one on a new socket.
@@ -1870,28 +1895,172 @@ class Host:
     ) -> None:
         """Ask one worker something for the host itself; `then` gets the answer."""
 
+        self.ask_workers({state.pid: state.index}, op, args, timeout, then)
+
+    def ask_workers(
+        self,
+        targets: dict[int, int],
+        op: str,
+        args: dict[str, Any],
+        timeout: float,
+        then: Callable[[Pending], None],
+    ) -> None:
+        """Ask workers something for the host itself; `then` gets the answers."""
+
         self.own_requests -= 1
-        pending = Pending(self.own_requests, op, {state.pid: state.index}, then=then)
+        pending = Pending(self.own_requests, op, dict(targets), then=then)
         pending.deadline = time.monotonic() + timeout
         self.pending[pending.id] = pending
-        control = self.control_sockets.get(state.pid)
+        line = json.dumps({"id": pending.id, "op": op, "args": args}).encode() + b"\n"
+
+        for pid in targets:
+            control = self.control_sockets.get(pid)
+
+            try:
+                if control is None:
+                    raise OSError("no control connection")
+
+                control.sendall(line)
+            except OSError as error:
+                pending.answers[pid] = {"ok": False, "error": str(error)}
+
+        self.finish_if_answered(pending)
+
+    def read_outside(self, pid: int) -> list[tuple[int, list[dict[str, Any]]]] | None:
+        """Read a worker's threads from outside, or return None.
+
+        The first time reading is found impossible is logged.
+        """
+
+        known = self.outside.unreadable
 
         try:
-            if control is None:
-                raise OSError("no control connection")
+            return self.outside.stacks(pid)
+        except _outside.Unreadable as error:
+            self.outside_errors[pid] = str(error)
 
-            control.sendall(json.dumps({"id": pending.id, "op": op, "args": args}).encode() + b"\n")
-        except OSError as error:
-            pending.answers[state.pid] = {"ok": False, "error": str(error)}
-            self.finish_if_answered(pending)
+            if known is None and self.outside.unreadable is not None:
+                log(f"workers are read from inside, since they cannot be from outside: {error}")
+
+            return None
+
+    def stacks_from_outside(self, request_id: int, targets: dict[int, int]) -> bool:
+        """Answer a stacks request from outside, or return False.
+
+        Each worker's frames are read now, and its bookkeeping, which the
+        runtime gives without the interpreter, names the threads and the
+        requests. False means reading from outside is not possible here.
+        """
+
+        read = {pid: self.read_outside(pid) for pid in targets}
+
+        if self.outside.unreadable is not None:
+            return False
+
+        def answered(pending: Pending) -> None:
+            workers = []
+
+            for pid, index in targets.items():
+                threads = read.get(pid)
+                answer = pending.answers.get(pid, {})
+                bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
+
+                if threads is None:
+                    error = self.outside_errors.pop(pid, "")
+                    workers.append(
+                        {
+                            "index": index,
+                            "pid": pid,
+                            "ok": False,
+                            "error": f"could not be read from outside: {error}",
+                        }
+                    )
+                    continue
+
+                workers.append(
+                    {
+                        "index": index,
+                        "pid": pid,
+                        "ok": True,
+                        "result": _outside.stacks_result(threads, bookkeeping),
+                    }
+                )
+
+            self.send_to_supervisor(
+                {
+                    "type": "response",
+                    "id": request_id,
+                    "workers": sorted(workers, key=lambda worker: worker["index"]),
+                }
+            )
+
+        self.ask_workers(targets, "bookkeeping", {}, 1.0, answered)
+        return True
+
+    def profile_from_outside(
+        self, request_id: int, targets: dict[int, int], args: dict[str, Any]
+    ) -> bool:
+        """Sample the workers from outside, or return False.
+
+        The sampling runs on a thread of the host's, which costs the
+        workers nothing. False means reading from outside is not possible
+        here.
+        """
+
+        if self.read_outside(next(iter(targets))) is None and self.outside.unreadable is not None:
+            return False
+
+        duration = float(args.get("duration_s", 10.0))
+        interval = float(args.get("interval_ms", 10.0)) / 1000
+        pending = Pending(request_id, "profile", dict(targets))
+        pending.deadline = time.monotonic() + duration + 10
+        self.pending[request_id] = pending
+
+        def sample(names: dict[int, dict[str, str]]) -> None:
+            results = self.outside.profile(list(targets), duration, interval, names)
+
+            for pid, answer in results.items():
+                pending.answers[pid] = {"index": targets[pid], "pid": pid, **answer}
+
+            if self.wake_write is not None:
+                try:
+                    os.write(self.wake_write, b"\0")
+                except OSError:
+                    pass
+
+        def named(bookkeeping: Pending) -> None:
+            names = {
+                pid: answer.get("result", {}).get("names", {})
+                for pid, answer in bookkeeping.answers.items()
+                if answer.get("ok")
+            }
+            threading.Thread(target=sample, args=(names,), name="muru-profile", daemon=True).start()
+
+        self.ask_workers(targets, "bookkeeping", {}, 1.0, named)
+        return True
 
     def capture_stacks(self, state: WorkerState, replacement: Replacement) -> None:
         """Take a worker's stacks before it is killed for the hard timeout.
 
         Section 11.7: the stacks go to the log and where the oldest request
-        was goes to the event. A worker that cannot answer within a second
-        gets SIGQUIT, and faulthandler writes its stacks to the log instead.
+        was goes to the event. They are read from outside where that is
+        possible; otherwise the worker is asked, and one that cannot answer
+        within a second gets SIGQUIT, and faulthandler writes its stacks to
+        the log instead.
         """
+
+        outside = self.read_outside(state.pid)
+
+        if outside is not None:
+
+            def read(pending: Pending) -> None:
+                answer = pending.answers.get(state.pid, {})
+                bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
+                result = _outside.stacks_result(outside, bookkeeping)
+                self.record_capture(state, replacement, result["threads"])
+
+            self.ask(state, "bookkeeping", {}, 1.0, read)
+            return
 
         def answered(pending: Pending) -> None:
             answer = pending.answers.get(state.pid, {})
@@ -1900,29 +2069,34 @@ class Host:
                 replacement.capture = "its stacks were written to the log by faulthandler"
                 return
 
-            threads = answer.get("result", {}).get("threads", [])
-
-            for thread in threads:
-                frames = "".join(
-                    f"\n    {frame['file']}:{frame['line']} in {frame['function']}"
-                    for frame in thread.get("frames", [])
-                )
-                log(f"worker {state.index} (pid {state.pid}) {thread.get('name')}:{frames}")
-
-            stuck = max(
-                (thread for thread in threads if thread.get("request")),
-                key=lambda thread: thread["request"].get("elapsed_ms", 0),
-                default=None,
-            )
-
-            if stuck is not None and stuck.get("frames"):
-                innermost = stuck["frames"][-3:][::-1]
-                replacement.capture = "at " + ", called from ".join(
-                    f"{os.path.basename(frame['file'])} line {frame['line']} in {frame['function']}"
-                    for frame in innermost
-                )
+            self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
 
         self.ask(state, "stacks", {}, 1.0, answered)
+
+    def record_capture(
+        self, state: WorkerState, replacement: Replacement, threads: list[dict[str, Any]]
+    ) -> None:
+        """Log a worker's stacks and note where its oldest request was."""
+
+        for thread in threads:
+            frames = "".join(
+                f"\n    {frame['file']}:{frame['line']} in {frame['function']}"
+                for frame in thread.get("frames", [])
+            )
+            log(f"worker {state.index} (pid {state.pid}) {thread.get('name')}:{frames}")
+
+        stuck = max(
+            (thread for thread in threads if thread.get("request")),
+            key=lambda thread: thread["request"].get("elapsed_ms", 0),
+            default=None,
+        )
+
+        if stuck is not None and stuck.get("frames"):
+            innermost = stuck["frames"][-3:][::-1]
+            replacement.capture = "at " + ", called from ".join(
+                f"{os.path.basename(frame['file'])} line {frame['line']} in {frame['function']}"
+                for frame in innermost
+            )
 
     def capture_objects(self, state: WorkerState, replacement: Replacement) -> None:
         """Count a worker's commonest objects before it is recycled for memory.

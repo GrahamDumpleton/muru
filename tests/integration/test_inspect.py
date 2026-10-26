@@ -11,6 +11,7 @@ import json
 import os
 import pstats
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -160,6 +161,29 @@ def test_tasks_list_an_asgi_workers_event_loop(daemon: Daemon) -> None:
     assert json.loads(plain)["workers"][0]["result"]["lag_ms"] is not None
 
 
+def readable_from_outside() -> bool:
+    """Whether this user can read a child interpreter's stacks with PEP
+    768, as a host reads its workers': Python 3.14 or later, and root on
+    macOS."""
+
+    try:
+        import _remote_debugging  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    try:
+        time.sleep(0.5)
+        _remote_debugging.RemoteUnwinder(child.pid, all_threads=True).get_stack_trace()
+        return True
+    except (OSError, RuntimeError):
+        return False
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
     pid = json.loads(daemon.get("/info").body)["pid"]
@@ -167,14 +191,57 @@ def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
 
     try:
         started = time.monotonic()
-        text = daemon.muructl("debug", "stacks", "plain").stdout
+        answer = json.loads(daemon.muructl("debug", "stacks", "plain", "--json").stdout)
+        worker = answer["workers"][0]
         assert time.monotonic() - started < 15
-        assert "did not answer in 5 s; its stacks were written to the log by faulthandler" in text
     finally:
         os.kill(pid, signal.SIGCONT)
 
-    wait_for(lambda: "File " in daemon.muructl("logs", "plain").stdout)
+    # Read from outside, a stopped worker's stacks are there all the same;
+    # otherwise faulthandler writes them to the log.
+
+    if readable_from_outside():
+        assert worker["ok"] and worker["result"]["outside"], worker
+        assert any(thread["name"] == "MainThread" for thread in worker["result"]["threads"])
+    else:
+        error = worker["error"]
+        assert "did not answer in 5 s; its stacks were written to the log by faulthandler" in error
+        wait_for(lambda: "File " in daemon.muructl("logs", "plain").stdout)
+
     assert daemon.get("/").status == 200
+
+
+def test_stacks_are_read_from_outside_a_worker_holding_the_interpreter(daemon: Daemon) -> None:
+    if not readable_from_outside():
+        support.unavailable(
+            "reading a worker from outside needs Python 3.14 or later, and root on macOS"
+        )
+
+    deploy_plain(daemon, processes=1)
+    threads = in_background(daemon, "/hold?seconds=4")
+
+    try:
+        started = time.monotonic()
+        answer = json.loads(daemon.muructl("debug", "stacks", "plain", "--json").stdout)
+        elapsed = time.monotonic() - started
+        text = daemon.muructl("debug", "stacks", "plain").stdout
+    finally:
+        for thread in threads:
+            thread.join()
+
+    # The worker's own control thread could not have answered: the
+    # interpreter is held. The stacks come from outside at once, and the
+    # runtime's bookkeeping, kept without the interpreter, names the
+    # request.
+
+    assert elapsed < 4, elapsed
+    result = answer["workers"][0]["result"]
+    assert result["outside"]
+    holding = next(thread for thread in result["threads"] if thread["request"])
+    assert holding["request"]["path"] == "/hold?seconds=4"
+    assert holding["name"].startswith("muru-app-")
+    assert any(frame["function"] == "hold_the_interpreter" for frame in holding["frames"])
+    assert "serving GET /hold?seconds=4 for" in text
 
 
 def test_logging_level_changes_a_logger_for_a_period(daemon: Daemon) -> None:

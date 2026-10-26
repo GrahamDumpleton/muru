@@ -423,8 +423,10 @@ or on a thread of its own, allowed where exec is, and the debugged
 worker is out of routing and pinned while the session lasts, and
 `--dap` carries the Debug Adapter Protocol to debugpy for an IDE.
 `debug profile --path` and `--requests` sample only the requests chosen,
-and `--format pstats` writes the samples as pstats. Still to come:
-reading from outside with PEP 768.
+and `--format pstats` writes the samples as pstats. On Linux with
+Python 3.14 and later, stacks and profiles are read from outside the
+worker with PEP 768, so a worker holding the interpreter still shows
+them; macOS, which allows that only to root, asks the worker (ADR 0028).
 
 Overlays (section 9.10) are in, activated by hand or by a one-off or
 recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach

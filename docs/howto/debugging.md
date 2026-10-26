@@ -7,8 +7,8 @@ Status, stacks, tasks, inspect, logger levels, profiling, tracing,
 memory, running a snippet, a pdb session with `breakpoint()`, and the
 automatic captures, answered from inside each worker by the runtime's
 control thread, with faulthandler when a worker cannot answer, and the
-Debug Adapter Protocol for IDEs. Reading a worker from outside with PEP
-768 on Python 3.14 is still to come.
+Debug Adapter Protocol for IDEs, and stacks and profiles read from
+outside the worker with PEP 768 on Linux.
 ```
 
 `muructl debug` looks into the workers of a release through the daemon,
@@ -51,10 +51,15 @@ muru-app-0 in worker 1:
     rows = cursor.fetchall()
 ```
 
-A worker that cannot answer in five seconds, because something holds the
-interpreter, is reported as such, and the host sends it SIGQUIT so that
-`faulthandler`, which needs no interpreter, writes every thread's stack
-to the release's log instead; `muructl logs APP` shows it.
+On Linux with Python 3.14 or later the host reads the stacks from
+outside the worker (PEP 768), so a worker stuck in C code with the
+interpreter held, or stopped altogether, shows them at once. Elsewhere,
+on older interpreters and on macOS, where reading another process needs
+root, the worker is asked. A worker asked that cannot answer in five
+seconds, because something holds the interpreter, is reported as such,
+and the host sends it SIGQUIT so that `faulthandler`, which needs no
+interpreter, writes every thread's stack to the release's log instead;
+`muructl logs APP` shows it.
 
 ## Tasks
 

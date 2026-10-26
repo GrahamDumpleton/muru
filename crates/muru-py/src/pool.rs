@@ -84,6 +84,8 @@ pub struct RequestInfo {
     pub path: String,
     /// The Python thread serving it, once one has picked it up.
     pub thread: Option<u64>,
+    /// That thread's native identifier, for a reader from outside.
+    pub native: Option<u64>,
     /// The channel of an ASGI request, whose task the soft timeout cancels.
     pub channel: Option<Py<Channel>>,
     /// Wakes a bridge call the application thread is blocked in.
@@ -153,17 +155,94 @@ pub type Job = Box<dyn for<'py> FnOnce(Python<'py>) + Send + 'static>;
 /// does not know them.
 static THREAD_NAMES: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
 
-/// Record the calling thread's name under its Python identifier.
+/// The same names by the threads' native identifiers, which is how a
+/// reader from outside (PEP 768) knows threads on Linux (section 11.7).
+static NATIVE_THREAD_NAMES: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
+
+/// Record the calling thread's name under its Python identifier and its
+/// native one.
 pub fn name_this_thread(name: &str) {
     // SAFETY: PyThread_get_thread_ident reads the calling thread's
     // identifier and needs no interpreter state.
 
     let ident = unsafe { ffi::PyThread_get_thread_ident() } as u64;
-    THREAD_NAMES
-        .lock()
-        .expect("thread names poisoned")
-        .get_or_insert_with(HashMap::new)
-        .insert(ident, name.to_owned());
+
+    for (map, key) in [
+        (&THREAD_NAMES, ident),
+        (&NATIVE_THREAD_NAMES, native_thread_id()),
+    ] {
+        map.lock()
+            .expect("thread names poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(key, name.to_owned());
+    }
+}
+
+/// The calling thread's native identifier, as `threading.get_native_id()`
+/// gives it.
+pub fn native_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid has no preconditions.
+
+        (unsafe { libc::gettid() }) as u64
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut id: u64 = 0;
+
+        // SAFETY: a null thread asks about the calling thread, and the
+        // result is written to a u64 we own.
+
+        unsafe {
+            libc::pthread_threadid_np(0, &mut id);
+        }
+
+        id
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
+/// The runtime's thread names by Python identifier, without the
+/// interpreter.
+pub fn thread_name_list() -> Vec<(u64, String)> {
+    [&THREAD_NAMES, &NATIVE_THREAD_NAMES]
+        .into_iter()
+        .flat_map(|map| {
+            map.lock()
+                .expect("thread names poisoned")
+                .as_ref()
+                .map(|known| {
+                    known
+                        .iter()
+                        .map(|(ident, name)| (*ident, name.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// A request in flight, as the bookkeeping reports it without the
+/// interpreter (section 11.7).
+pub struct RequestSummary {
+    /// The edge's request id.
+    pub request_id: String,
+    /// The method.
+    pub method: String,
+    /// The path and query.
+    pub path: String,
+    /// How long it has run.
+    pub elapsed_ms: u64,
+    /// The Python thread serving it, once one has picked it up.
+    pub thread: Option<u64>,
+    /// That thread's native identifier.
+    pub native: Option<u64>,
 }
 
 /// The runtime's thread names by Python identifier, as a dict.
@@ -363,6 +442,7 @@ impl Shared {
                         )
                     },
                     thread: None,
+                    native: None,
                     channel: None,
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
@@ -516,6 +596,7 @@ impl Shared {
             .get_mut(&id)
         {
             info.thread = Some(thread as u64);
+            info.native = Some(native_thread_id());
         }
     }
 
@@ -545,6 +626,24 @@ impl Shared {
         }
 
         Ok(list)
+    }
+
+    /// The requests in flight, read without the interpreter.
+    pub fn active_summary(&self) -> Vec<RequestSummary> {
+        let now = Instant::now();
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+            .map(|info| RequestSummary {
+                request_id: info.request_id.clone(),
+                method: info.method.clone(),
+                path: info.path.clone(),
+                elapsed_ms: now.saturating_duration_since(info.started).as_millis() as u64,
+                thread: info.thread,
+                native: info.native,
+            })
+            .collect()
     }
 
     /// Count a request as finished. For a WSGI request this runs on its
@@ -621,7 +720,7 @@ impl Pool {
             let receiver = Arc::clone(&receiver);
             let handle = std::thread::Builder::new()
                 .name(format!("{name}-{index}"))
-                .spawn(move || thread_main(&receiver))?;
+                .spawn(move || thread_main(receiver))?;
             handles.push(handle);
         }
 
@@ -655,31 +754,57 @@ impl Pool {
     }
 }
 
-/// One application thread: attach once, then run jobs until the pool closes.
-fn thread_main(receiver: &Mutex<mpsc::Receiver<Job>>) {
+/// One application thread: attach once, then run jobs until the pool
+/// closes, inside `muru._pool.serve_jobs`, so the thread always has a
+/// Python frame that a reader from outside can start from (section 11.7).
+fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
     if let Some(name) = std::thread::current().name() {
         name_this_thread(name);
     }
 
     Python::attach(|py| {
-        loop {
-            // Wait for work with the interpreter detached. Only one idle
-            // thread holds the receiver at a time; the others wait for it.
-            // From the job arriving to holding the GIL again is the
-            // thread's GIL wait (section 7.3).
+        let started = Arc::new(AtomicBool::new(false));
+        let inner = Arc::clone(&receiver);
+        let entered = Arc::clone(&started);
+        let framed = py.import("muru._pool").and_then(|module| {
+            let serve = pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _| {
+                entered.store(true, Ordering::SeqCst);
+                serve_jobs(args.py(), &inner);
+            })?;
+            module.call_method1("serve_jobs", (serve,))
+        });
 
-            let (next, ready) = py.detach(|| {
-                let next = receiver.lock().expect("pool receiver poisoned").recv();
-                (next, std::time::Instant::now())
-            });
-            crate::signals::GIL_WAIT.record(ready.elapsed());
+        // Without the module the thread serves all the same, only without
+        // the frame; once it has served, an error is only the way out.
 
-            match next {
-                Ok(job) => run_in_context(py, job),
-                Err(_) => break,
-            }
+        if let Err(error) = framed
+            && !started.load(Ordering::SeqCst)
+        {
+            tracing::warn!(%error, "application thread without its waiting frame");
+            serve_jobs(py, &receiver);
         }
     });
+}
+
+/// Run jobs until the pool closes.
+fn serve_jobs(py: Python<'_>, receiver: &Mutex<mpsc::Receiver<Job>>) {
+    loop {
+        // Wait for work with the interpreter detached. Only one idle
+        // thread holds the receiver at a time; the others wait for it.
+        // From the job arriving to holding the GIL again is the thread's
+        // GIL wait (section 7.3).
+
+        let (next, ready) = py.detach(|| {
+            let next = receiver.lock().expect("pool receiver poisoned").recv();
+            (next, std::time::Instant::now())
+        });
+        crate::signals::GIL_WAIT.record(ready.elapsed());
+
+        match next {
+            Ok(job) => run_in_context(py, job),
+            Err(_) => break,
+        }
+    }
 }
 
 /// Run a job inside a fresh copy of the thread's context variables.
