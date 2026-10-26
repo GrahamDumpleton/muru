@@ -497,6 +497,7 @@ class Host:
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
+        loop_stall_timeout: float = 10.0,
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
     ) -> None:
@@ -516,6 +517,7 @@ class Host:
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
+        self.loop_stall_timeout = loop_stall_timeout
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
@@ -949,6 +951,14 @@ class Host:
                 "soft_timeout_ms": int(self.soft_timeout * 1000),
                 "timeout_error": RequestTimeout,
             }
+
+        # Section 7.6: the event loop beats twice a second, and a native
+        # watchdog tells the host when it has stopped beating for longer
+        # than the loop stall timeout.
+
+        if loop is not None:
+            timeout_arguments["loop_stall_timeout_ms"] = int(self.loop_stall_timeout * 1000)
+            _asgi.heartbeat(loop.loop)
 
         # Section 11.7: breakpoint() waits for muructl debug attach.
 
@@ -1558,6 +1568,13 @@ class Host:
 
                 if report["event"] == "debug.detached":
                     self.debugging(state, -1)
+                elif report["event"] == "worker.loop_stalled":
+                    self.replace(
+                        state,
+                        f"its event loop stalled past the loop stall timeout of "
+                        f"{self.loop_stall_timeout:g} s",
+                        "worker.timeout_killed",
+                    )
 
                 continue
 
@@ -2335,6 +2352,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="how long a replaced worker gets to finish its other requests",
     )
     parser.add_argument(
+        "--loop-stall-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="replace an ASGI worker whose event loop has not run for this long (section 7.6)",
+    )
+    parser.add_argument(
         "--shutdown-timeout",
         type=float,
         default=5.0,
@@ -2534,6 +2558,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
+        loop_stall_timeout=args.loop_stall_timeout,
         memory=MemoryPolicy(
             measure=args.memory_measure,
             soft_limit=args.memory_soft_limit,

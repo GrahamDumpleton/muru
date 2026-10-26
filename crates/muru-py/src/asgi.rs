@@ -1279,10 +1279,11 @@ fn build_scope<'py>(
         muru.set_item("max_body_size", head.max_body_size)?;
     }
 
-    // Section 6.13: a gRPC call's deadline, for time_remaining(), in
-    // seconds since the epoch.
+    // Section 7.6: when the edge gives up on the request, in seconds
+    // since the epoch, which a gRPC call's time_remaining() reads too
+    // (section 6.13).
 
-    if grpc && head.deadline_unix_ms != 0 {
+    if head.deadline_unix_ms != 0 {
         muru.set_item("deadline", head.deadline_unix_ms as f64 / 1000.0)?;
     }
 

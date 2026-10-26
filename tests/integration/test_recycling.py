@@ -146,6 +146,41 @@ def test_a_request_past_the_hard_timeout_replaces_its_worker() -> None:
         server.stop()
 
 
+def test_an_event_loop_that_stalls_replaces_its_worker() -> None:
+    server = support.start(
+        "plain_asgi:application",
+        workers=1,
+        args=[
+            "--timeout",
+            "loop_stall=1s",
+            "--timeout",
+            "hard_drain_grace=1s",
+            "--timeout",
+            "shutdown=1s",
+        ],
+    )
+
+    try:
+        stalled_pid = json.loads(server.get("/info").body)["pid"]
+        thread = threading.Thread(target=lambda: server.get("/block?seconds=30"), daemon=True)
+        thread.start()
+
+        # The loop beats no more, so the native watchdog tells the host,
+        # which replaces the worker as for the hard timeout, stacks and
+        # all.
+
+        wait_for(lambda: "worker.loop_stalled" in server.log(), timeout=30)
+        wait_for(lambda: "worker.timeout_killed" in server.log(), timeout=30)
+        log = server.log()
+        assert "past the loop stall timeout of 1 s" in log
+        assert "plain_asgi.py" in log, "no stack dump"
+
+        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != stalled_pid, timeout=30)
+        assert server.get("/").status == 200
+    finally:
+        server.stop()
+
+
 def test_recycling_under_the_daemon_moves_traffic_with_no_request_failed(
     tmp_path: Path,
 ) -> None:

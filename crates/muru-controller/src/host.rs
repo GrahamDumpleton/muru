@@ -322,6 +322,9 @@ pub struct HostSpec {
     pub hard_drain_grace: Duration,
     /// How long a worker told to stop gets before it is killed.
     pub shutdown_timeout: Duration,
+    /// How long an ASGI worker's event loop may stall before the worker
+    /// is replaced (section 7.6).
+    pub loop_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
     /// Environment variables for the host and its workers (section
@@ -584,7 +587,9 @@ impl HostProcess {
             .arg("--hard-drain-grace")
             .arg(spec.hard_drain_grace.as_secs_f64().to_string())
             .arg("--shutdown-timeout")
-            .arg(spec.shutdown_timeout.as_secs_f64().to_string());
+            .arg(spec.shutdown_timeout.as_secs_f64().to_string())
+            .arg("--loop-stall-timeout")
+            .arg(spec.loop_stall_timeout.as_secs_f64().to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());

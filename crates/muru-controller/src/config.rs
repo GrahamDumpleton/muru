@@ -2362,6 +2362,12 @@ pub fn resolve_spec(
             "shutdown_timeout",
         )?
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
+        loop_stall_timeout_ms: duration_ms(
+            request.loop_stall_timeout_ms,
+            table_timeouts.loop_stall_timeout.as_ref(),
+            "loop_stall_timeout",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().loop_stall_timeout_ms),
     };
 
     if max_lifetime_ms == Some(0) {
@@ -2604,7 +2610,8 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
     let timeouts_given = request.soft_timeout_ms.is_some()
         || request.hard_timeout_ms.is_some()
         || request.hard_drain_grace_ms.is_some()
-        || request.shutdown_timeout_ms.is_some();
+        || request.shutdown_timeout_ms.is_some()
+        || request.loop_stall_timeout_ms.is_some();
     let memory_given = !request.memory_measure.is_empty()
         || request.memory_soft_limit.is_some()
         || request.memory_soft_for_ms.is_some()
@@ -2645,6 +2652,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             hard_timeout: request.hard_timeout_ms.map(format_ms),
             hard_drain_grace: request.hard_drain_grace_ms.map(format_ms),
             shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
+            loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
         }),
         memory: memory_given.then(muru_config::Memory::default),
         env: BTreeMap::new(),
@@ -3088,6 +3096,12 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|t| t.shutdown_timeout.as_ref()),
         ),
+        loop_stall_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.loop_stall_timeout.as_ref()),
+        ),
         memory_measure: table
             .memory
             .as_ref()
@@ -3266,6 +3280,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.shutdown_timeout_ms,
                 ))),
+                loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.loop_stall_timeout_ms,
+                ))),
             }
         }),
         env: env_table_from(&spec.env),
@@ -3321,6 +3338,10 @@ fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
 pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
     if timeouts.soft_timeout_ms == Some(0) {
         return Err("soft_timeout must be longer than nothing".to_owned());
+    }
+
+    if timeouts.loop_stall_timeout_ms == 0 {
+        return Err("loop_stall_timeout must be longer than nothing".to_owned());
     }
 
     if let (Some(soft), Some(hard)) = (timeouts.soft_timeout_ms, timeouts.hard_timeout_ms)
@@ -3520,6 +3541,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "shutdown_timeout",
         describe_ms(Some(declared.timeouts.shutdown_timeout_ms)),
         describe_ms(Some(recorded.timeouts.shutdown_timeout_ms)),
+    );
+    compare(
+        "loop_stall_timeout",
+        describe_ms(Some(declared.timeouts.loop_stall_timeout_ms)),
+        describe_ms(Some(recorded.timeouts.loop_stall_timeout_ms)),
     );
     compare(
         "memory",

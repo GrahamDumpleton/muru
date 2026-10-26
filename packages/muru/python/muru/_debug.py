@@ -324,7 +324,16 @@ def breakpoint_hook(*args: Any, timeout: float = BREAKPOINT_TIMEOUT, **kwargs: A
         f"--worker {index}",
     )
 
-    waiting.ready.wait(timeout)
+    # Waiting in a coroutine holds the event loop, so the wait beats for
+    # it, and the loop stall timeout does not replace the worker.
+
+    deadline = time.monotonic() + timeout
+
+    while not waiting.ready.wait(min(1.0, max(0.0, deadline - time.monotonic()))):
+        _native.loop_beat()
+
+        if time.monotonic() >= deadline:
+            break
 
     # An attach takes the waiting entry and sets its session under the
     # lock, so either it has both or this gives up.

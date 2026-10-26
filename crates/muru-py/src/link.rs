@@ -15,8 +15,8 @@
 use std::io;
 use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -165,6 +165,16 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                 .spawn(move || watchdog_loop(&watchdog_shared, timeout, &stop, report))?;
         }
 
+        // Section 7.6: the loop stall watchdog needs no interpreter, so it
+        // notices a loop held by code that never lets go.
+
+        if let Some(timeout) = accepting.loop_stall {
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-loop-watch".to_owned())
+                .spawn(move || loop_watch(timeout, &stop, report))?;
+        }
+
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -243,6 +253,63 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, rep
             if let Some(fd) = report {
                 report_event(fd, "request.soft_timeout", "warning", &message);
             }
+        }
+    }
+}
+
+/// When the event loop last beat, in milliseconds since the first look
+/// at the clock, or 0 before it first did.
+static LOOP_BEAT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How often the loop stall watchdog looks at the heartbeat.
+const LOOP_WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+fn clock_ms() -> u64 {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    let started = STARTED.get_or_init(Instant::now);
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Record that the event loop has run (section 7.6).
+pub fn loop_beat() {
+    LOOP_BEAT_MS.store(clock_ms().max(1), Ordering::Relaxed);
+}
+
+/// Tell the host, once a stall, when the event loop has gone longer than
+/// `timeout` without beating, so that it replaces the worker as for the
+/// hard timeout (section 7.6).
+fn loop_watch(timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
+    let mut reported = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(LOOP_WATCH_INTERVAL);
+        let beat = LOOP_BEAT_MS.load(Ordering::Relaxed);
+
+        if beat == 0 {
+            continue;
+        }
+
+        let silent = Duration::from_millis(clock_ms().saturating_sub(beat));
+
+        if silent <= timeout {
+            reported = false;
+            continue;
+        }
+
+        if reported {
+            continue;
+        }
+
+        reported = true;
+        let message = format!(
+            "the event loop has not run for {:.1} s, past the loop stall timeout of {}",
+            silent.as_secs_f64(),
+            wsgi::describe_seconds(timeout)
+        );
+        eprintln!("muru: {message}");
+
+        if let Some(fd) = report {
+            report_event(fd, "worker.loop_stalled", "error", &message);
         }
     }
 }

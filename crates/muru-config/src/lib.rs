@@ -777,6 +777,11 @@ pub struct Timeouts {
     /// (default 5s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced as for the hard timeout (default
+    /// 10s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_stall_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -2878,6 +2883,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                 timeouts.soft_timeout.is_some()
                     || timeouts.hard_timeout.is_some()
                     || timeouts.hard_drain_grace.is_some()
+                    || timeouts.loop_stall_timeout.is_some()
             }),
         ),
     ];

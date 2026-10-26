@@ -492,6 +492,10 @@ pub struct WorkerTimeouts {
     /// How long a worker told to stop gets before it is killed.
     #[serde(default = "default_shutdown_timeout_ms")]
     pub shutdown_timeout_ms: u64,
+    /// How long an ASGI worker's event loop may go without running
+    /// before the worker is replaced.
+    #[serde(default = "default_loop_stall_timeout_ms")]
+    pub loop_stall_timeout_ms: u64,
 }
 
 impl Default for WorkerTimeouts {
@@ -501,6 +505,7 @@ impl Default for WorkerTimeouts {
             hard_timeout_ms: None,
             hard_drain_grace_ms: default_hard_drain_grace_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
+            loop_stall_timeout_ms: default_loop_stall_timeout_ms(),
         }
     }
 }
@@ -511,6 +516,10 @@ fn default_hard_drain_grace_ms() -> u64 {
 
 fn default_shutdown_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_loop_stall_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Section 9.3: where a rollout is.

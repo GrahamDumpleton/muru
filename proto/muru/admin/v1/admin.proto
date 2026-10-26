@@ -189,6 +189,7 @@ message DeployRequest {
   optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
   bool override_freeze = 43;                // deploy although an overlay freezes the application's deploys (section 9.6)
   optional bool reflection = 44;            // section 6.13: serve gRPC server reflection; the table's when absent
+  optional uint64 loop_stall_timeout_ms = 45; // section 7.6: how long an ASGI worker's loop may stall before it is replaced
 }
 
 // One environment variable: a value, or a secret reference.

@@ -112,7 +112,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- |
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
 | Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden |
-| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, server.started, server.exited, server.failed |
+| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, worker.loop_stalled, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |

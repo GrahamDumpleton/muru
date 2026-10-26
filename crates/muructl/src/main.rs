@@ -407,10 +407,11 @@ struct RunArgs {
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
-    /// (off), hard (off), hard_drain_grace (10s) or shutdown (5s) in the
-    /// host, which interrupts a request that runs past the soft timeout
-    /// and replaces a worker whose request runs past the hard timeout.
-    /// Repeatable.
+    /// (off), hard (off), hard_drain_grace (10s), shutdown (5s) or
+    /// loop_stall (10s) in the host, which interrupts a request that runs
+    /// past the soft timeout and replaces a worker whose request runs
+    /// past the hard timeout, or whose event loop stalls past
+    /// loop_stall. Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -815,13 +816,14 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard",
         "hard_drain_grace",
         "shutdown",
+        "loop_stall",
     ]
     .contains(&name)
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
-             response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace or \
-             shutdown"
+             response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
+             shutdown or loop_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -960,6 +962,8 @@ pub(crate) struct HostTimeouts {
     pub hard_drain_grace: Duration,
     /// The time before a stopping worker is killed.
     pub shutdown: Duration,
+    /// How long an ASGI worker's event loop may stall.
+    pub loop_stall: Duration,
 }
 
 impl HostTimeouts {
@@ -970,6 +974,7 @@ impl HostTimeouts {
             hard_timeout: self.hard.map(muru_config::format_duration),
             hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
             shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
+            loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
         }
     }
 }
@@ -999,6 +1004,11 @@ pub(crate) fn worker_timeouts(
             parse(&table.shutdown_timeout, "shutdown_timeout")
         })?
         .unwrap_or(Duration::from_secs(5));
+    let mut loop_stall = table
+        .map_or(Ok(None), |table| {
+            parse(&table.loop_stall_timeout, "loop_stall_timeout")
+        })?
+        .unwrap_or(Duration::from_secs(10));
 
     for (name, duration) in timeouts {
         match name.as_str() {
@@ -1006,6 +1016,7 @@ pub(crate) fn worker_timeouts(
             "hard" => hard = Some(*duration),
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
+            "loop_stall" => loop_stall = *duration,
             _ => {}
         }
     }
@@ -1016,6 +1027,10 @@ pub(crate) fn worker_timeouts(
     anyhow::ensure!(
         soft != Some(Duration::ZERO),
         "soft_timeout must be longer than nothing"
+    );
+    anyhow::ensure!(
+        loop_stall > Duration::ZERO,
+        "loop_stall_timeout must be longer than nothing"
     );
 
     if let (Some(soft), Some(hard)) = (soft, hard) {
@@ -1030,6 +1045,7 @@ pub(crate) fn worker_timeouts(
         hard,
         hard_drain_grace: grace,
         shutdown,
+        loop_stall,
     })
 }
 
@@ -1659,6 +1675,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         hard_timeout: timeouts.hard,
         hard_drain_grace: timeouts.hard_drain_grace,
         shutdown_timeout: timeouts.shutdown,
+        loop_stall_timeout: timeouts.loop_stall,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
         env: resolved
             .env

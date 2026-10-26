@@ -306,10 +306,11 @@ application catches the exception and answers for itself, an injection
 the request outruns is withdrawn before its thread serves again, and
 streaming responses and WebSockets are exempt from the soft and the hard
 timeout once their head goes out. The hard timeout must exceed the soft
-one by 5 s, checked on `muructl run`, `deploy` and `apply`. Still to
-come: the loop stall timeout, the host's stack capture attached to the
-event when a request passes the soft timeout (section 11.7), and
-`muru.deadline` in the environ.
+one by 5 s, checked on `muructl run`, `deploy` and `apply`. Where a
+request was when it passed the soft timeout followed with worker
+inspection (section 11.7), then `muru.deadline` in the environ and the
+scope, and the loop stall timeout, which replaces an ASGI worker whose
+event loop has not run for 10 s.
 
 Internal redirects (section 4.10) are in: an application's response with
 `X-Muru-Redirect` (always), `X-Accel-Redirect` or a CGI local redirect
@@ -380,8 +381,8 @@ its path with the route for every class, a traffic policy's `classes`
 gives a class a release or upstream of its own, kept running for it,
 and a worker group's `match` takes a class's requests ahead of the other
 groups, and classes and limits may be declared in applied files too.
-Still to come: the application-level mode (section 9.10), buckets shared between several
-edge processes, and TLS fingerprints as an input.
+Still to come: the application-level mode (section 9.10), buckets shared
+between several edge processes, and TLS fingerprints as an input.
 
 Worker inspection's phase 3 commands (section 11.7) are in, through the
 in-process control thread of ADR 0025: `muructl debug profile` samples

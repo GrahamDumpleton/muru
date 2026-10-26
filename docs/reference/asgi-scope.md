@@ -43,6 +43,7 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | `request_id` | The request identifier, also in `X-Request-ID` and the access log |
 | `max_body_size` | The body size limit in force, in bytes |
 | `uploads` | Only on an [upload route](../howto/uploads.md) whose request brought files: their descriptions, which `muru.uploads.files(scope)` turns into upload objects |
+| `deadline` | When the edge gives up on the request and answers 504 `deadline`, in seconds since the epoch, as `time.time()` counts them; see [timeouts](../howto/timeouts.md) |
 | `client_class` | The request's [client class](../howto/client-classes.md), `default` when no rule matched |
 | `mode` | Only when the route has a [site mode](../howto/client-classes.md#method-restrictions-and-site-modes), such as `read-only` |
 | `precheck` | `True` on an upload route's precheck, the request's headers sent before its body |

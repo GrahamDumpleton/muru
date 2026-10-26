@@ -63,7 +63,7 @@ fn version() -> &'static str {
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new()))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -86,6 +86,7 @@ fn serve(
     soft_timeout_ms: Option<u64>,
     timeout_error: Option<Py<PyAny>>,
     grpc_methods: Vec<(String, String, bool, bool)>,
+    loop_stall_timeout_ms: Option<u64>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -142,6 +143,9 @@ fn serve(
         soft_timeout,
     )
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    shared.loop_stall = loop_stall_timeout_ms
+        .filter(|&ms| ms > 0 && shared.asgi.is_some())
+        .map(std::time::Duration::from_millis);
     shared.grpc_methods = grpc_methods
         .into_iter()
         .map(|(path, mount, client_streaming, server_streaming)| {
@@ -175,6 +179,13 @@ fn serve(
 /// from its threads.
 static SERVING: std::sync::Mutex<std::sync::Weak<pool::Shared>> =
     std::sync::Mutex::new(std::sync::Weak::new());
+
+/// Section 7.6: the event loop's heartbeat, which the loop stall
+/// watchdog waits for.
+#[pyfunction]
+fn loop_beat() {
+    link::loop_beat();
+}
 
 /// Take the request the calling thread serves out of the soft and hard
 /// timeouts, for as long as a debugger holds it (section 11.7). Returns
@@ -216,6 +227,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(memory_usage, m)?)?;
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
+    m.add_function(wrap_pyfunction!(loop_beat, m)?)?;
     m.add_class::<wsgi::Input>()?;
     m.add_class::<wsgi::StartResponse>()?;
     m.add_class::<wsgi::FileWrapper>()?;

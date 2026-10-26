@@ -17,12 +17,28 @@ from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-__all__ = ["Lifespan", "LifespanFailed", "Loop", "runner"]
+__all__ = ["Lifespan", "LifespanFailed", "Loop", "heartbeat", "runner"]
 
 ASGIApp = Callable[[MutableMapping[str, Any], Any, Any], Awaitable[None]]
 
 STARTUP_TIMEOUT = 60.0
 SHUTDOWN_TIMEOUT = 10.0
+
+# Section 7.6: how often the loop tells the native watchdog it still runs.
+
+HEARTBEAT_INTERVAL = 0.5
+
+
+def heartbeat(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the loop beat for the native watchdog from now until it stops."""
+
+    from muru import _native
+
+    def beat() -> None:
+        _native.loop_beat()
+        loop.call_later(HEARTBEAT_INTERVAL, beat)
+
+    loop.call_soon_threadsafe(beat)
 
 
 class Loop:

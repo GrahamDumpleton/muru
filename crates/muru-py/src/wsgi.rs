@@ -884,6 +884,16 @@ fn build_environ<'py>(
         environ.set_item(intern!(py, "muru.precheck"), true)?;
     }
 
+    // Section 7.6: when the edge gives up on the request, in seconds
+    // since the epoch.
+
+    if head.deadline_unix_ms != 0 {
+        environ.set_item(
+            intern!(py, "muru.deadline"),
+            head.deadline_unix_ms as f64 / 1000.0,
+        )?;
+    }
+
     // Sections 4.14 and 4.15: the client's class, and the route's site
     // mode when it has one.
 

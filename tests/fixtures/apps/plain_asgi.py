@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
@@ -339,6 +340,11 @@ async def application(scope: Scope, receive: Receive, send: Send) -> None:
     elif path == "/sleep":
         await asyncio.sleep(float(query.get("seconds", "0.5")))
         await respond(send, 200, b"slept\n")
+    elif path == "/block":
+        # Section 7.6: hold the event loop, as code that never awaits does.
+
+        time.sleep(float(query.get("seconds", "0.5")))
+        await respond(send, 200, b"blocked\n")
     elif path == "/state":
         # The scope's state is a copy per request: changes stay here.
 

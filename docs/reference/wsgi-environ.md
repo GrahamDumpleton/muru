@@ -44,6 +44,7 @@ it adds.
 | `muru.uploads` | Present only on an [upload route](../howto/uploads.md) whose request brought files: their descriptions, which `muru.uploads.files(environ)` turns into upload objects |
 | `muru.client_class` | The request's [client class](../howto/client-classes.md), `default` when no rule matched |
 | `muru.mode` | Present only when the route has a [site mode](../howto/client-classes.md#method-restrictions-and-site-modes), such as `read-only` |
+| `muru.deadline` | When the edge gives up on the request and answers 504 `deadline`, in seconds since the epoch, as `time.time()` counts them; see [timeouts](../howto/timeouts.md) |
 | `muru.precheck` | `True` on an upload route's precheck, the request's headers sent before its body; absent otherwise |
 | `muru.proxy_addr` | Present only when a trusted proxy forwarded the request (see [behind a proxy](../howto/behind-a-proxy.md)): the address of the proxy that connected, while `REMOTE_ADDR` is the client it forwarded |
 | `muru.internal` | `True` on a request that arrived by internal redirect, absent otherwise; `muru.is_internal(environ)` reads it |

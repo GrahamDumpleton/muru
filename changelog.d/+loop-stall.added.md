@@ -1,0 +1,1 @@
+Added the loop stall timeout: an ASGI worker whose event loop has not run for `loop_stall_timeout` (10 s by default, `--timeout loop_stall=`) is replaced as for the hard timeout, with the event `worker.loop_stalled`.

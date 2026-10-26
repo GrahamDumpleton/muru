@@ -3075,6 +3075,7 @@ impl Daemon {
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
+            loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             memory: spec.memory.clone(),
             env,
             identity,
