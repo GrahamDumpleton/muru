@@ -5,8 +5,8 @@
 
 The spare and target modes with their windows and churn budget, pins,
 scheduled capacity, the workers' CPU, GIL wait and event loop lag with
-a diagnosis of each group, `muructl scale status` and the node's budget
-across applications, under the daemon. Scale to zero is still to come.
+a diagnosis of each group, `muructl scale status`, the node's budget
+across applications and scale to zero, under the daemon.
 ```
 
 A worker group has a fixed number of processes unless it is given a
@@ -81,6 +81,47 @@ counted across its groups' scale-ins. When it is spent, scale-in is
 suspended until the hour passes, a `churn_budget.exhausted` warning is
 raised, and the scale-in window is doubled until no reap remains in the
 last hour. Timeout kills and recycles do not count against it.
+
+## Scale to zero
+
+A spare or target group with `min_workers = 0` drains its last worker
+once it is idle, by the usual slow scale-in rules: in spare mode once no
+request has come for `idle_reap_after`, in target mode once nothing was
+busy over the scale-in window. The host stays, so the next request waits
+at the edge while one worker forks from it, and is then served:
+
+```toml
+[app.docs.release.r3.scaling]
+mode = 'spare'
+min_workers = 0
+max_workers = 4
+idle_reap_after = '15m'
+```
+
+The wake is a `scaling.decision` event, `scale out from 0 to 1 workers: a
+request is waiting for a group scaled to zero`, and the node's budget
+admits it as any scale-out. A request waits for its worker up to the
+queue timeout of the `[limits]` table, and is answered 503 if none
+arrives by then.
+
+With `host_idle_timeout`, the host stops too once every group of the
+release has been at zero for that long, and the next request starts it
+again, waiting through the application's import:
+
+```toml
+[app.docs.release.r3.scaling]
+mode = 'spare'
+min_workers = 0
+max_workers = 4
+host_idle_timeout = '1h'
+```
+
+`host_idle_timeout` goes in the release's own scaling table, and every
+worker group of the release must have `min_workers = 0`. The events are
+`release.idle` when the host stops and `release.woken` when a request
+starts it, and `muructl release list` shows the release as ready, idle.
+gRPC calls are matched by the services a worker registered, so a gRPC
+mount needs at least one worker to be reached.
 
 ## Groups and the declared release
 

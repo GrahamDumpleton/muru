@@ -854,6 +854,37 @@ impl AppPools {
         (&self.app, &self.release)
     }
 
+    /// Section 7.4: the same pools, with each named group that has no
+    /// workers waiting to be woken instead of refusing requests.
+    pub fn with_waking(mut self, groups: &[String]) -> Self {
+        let key = |group: &str| (self.app.clone(), self.release.clone(), group.to_owned());
+
+        if self.default.is_empty() && groups.iter().any(|name| name == DEFAULT_GROUP) {
+            self.default = Arc::new(LinkPool::waking(key(DEFAULT_GROUP)));
+        }
+
+        let mut waking: Vec<(String, Arc<LinkPool>)> = Vec::new();
+
+        for group in &mut self.groups {
+            if !group.pool.is_empty() || !groups.contains(&group.name) {
+                continue;
+            }
+
+            let pool = match waking.iter().find(|(name, _)| name == &group.name) {
+                Some((_, pool)) => Arc::clone(pool),
+                None => {
+                    let pool = Arc::new(LinkPool::waking(key(&group.name)));
+                    waking.push((group.name.clone(), Arc::clone(&pool)));
+                    pool
+                }
+            };
+
+            group.pool = pool;
+        }
+
+        self
+    }
+
     /// Every group's pool once, by group name, the default group first.
     pub fn pools(&self) -> Vec<(String, Arc<LinkPool>)> {
         let mut pools = vec![(DEFAULT_GROUP.to_owned(), Arc::clone(&self.default))];
@@ -1059,7 +1090,8 @@ impl Routing {
             .await?
             .with_errors(Arc::new(errors))
             .with_maintenance(maintenance)
-            .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header));
+            .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header))
+            .with_waking(&app.waking_groups);
 
             // Section 9.9: a managed HTTP release's instances stand in
             // for its workers, as an upstream named after the release.
@@ -1408,6 +1440,22 @@ impl Routing {
     /// dashboard counts.
     pub fn default_pool(&self) -> Arc<LinkPool> {
         self.default.default_pool()
+    }
+
+    /// Section 7.4: every named release's groups with their pools, for
+    /// handing woken groups to the requests waiting for them.
+    pub fn group_pools(&self) -> Vec<(crate::wake::Key, Arc<LinkPool>)> {
+        self.app_pools()
+            .iter()
+            .filter(|pools| !pools.labels().0.is_empty())
+            .flat_map(|pools| {
+                let (app, release) = pools.labels();
+                pools
+                    .pools()
+                    .into_iter()
+                    .map(|(group, pool)| ((app.to_owned(), release.to_owned(), group), pool))
+            })
+            .collect()
     }
 
     /// Every application's pools once: the named applications, and the

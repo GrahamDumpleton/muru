@@ -622,6 +622,12 @@ pub struct Scaling {
     /// Decide and report without acting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advisory: Option<bool>,
+    /// How long the release's host stays once every group has scaled to
+    /// zero, after which it stops too and the next request starts it
+    /// again; it stays while the release runs when omitted. In the
+    /// release's own scaling table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_idle_timeout: Option<String>,
 }
 
 /// The `[memory]` table of a release or a `[tool.muru]` table (section

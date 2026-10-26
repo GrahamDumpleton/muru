@@ -293,7 +293,14 @@ report, and scale-outs are admitted against it, the highest application
 `priority` first and in part when only part fits, each shortfall a
 `scaling.denied_by_budget` event; a release is not started when its
 memory does not fit, after the retained releases have made way, and
-`muructl daemon status` shows what is held. Still to come: scale to zero.
+`muructl daemon status` shows what is held. Scale to zero, brought
+forward from phase 4, followed: a group with `min_workers = 0` drains its
+last worker once idle, the edge holds the next request and tells the
+daemon over a WatchWakes stream, and the group gets a worker at once;
+with `host_idle_timeout` the host stops too, and the next request starts
+it again. A superseded release keeps one worker per group while it is
+retained (`deploy --retain-workers`), dropping to its host alone and
+then stopping under memory pressure.
 
 Scheduled capacity (section 7.5) is in: `[[app.NAME.schedule]]` entries,
 one-off or recurring, raise a worker group's floor and ceiling for their

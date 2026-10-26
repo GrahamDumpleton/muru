@@ -27,6 +27,9 @@ service EdgeControl {
   rpc GetRecent(RecentRequest) returns (RecentRequests);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
+  // Section 7.4: the groups scaled to zero that requests are waiting
+  // for, as they wait, for the daemon to wake.
+  rpc WatchWakes(WatchWakesRequest) returns (stream Wake);
 }
 
 message Snapshot {
@@ -260,6 +263,7 @@ message AppWorkers {
   Upstream server = 12;                 // section 9.9: a managed HTTP release's instances, routed as an upstream; no sockets then
   repeated string sendfile_roots = 13;  // section 4.9: directories the default mount's X-Muru-Sendfile paths must lie in
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
+  repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
 }
 
 message Mount {
@@ -303,6 +307,15 @@ message StopRequest {}
 message Stopped {}
 
 message MetricsRequest {}
+
+message WatchWakesRequest {}
+
+// A group with no workers that a request is waiting for.
+message Wake {
+  string app = 1;
+  string release = 2;
+  string group = 3;
+}
 
 message MetricsReport {
   repeated Sample samples = 1;

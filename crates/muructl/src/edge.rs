@@ -484,4 +484,43 @@ impl EdgeControl for Control {
         let _ = self.stop.try_send(());
         Ok(Response::new(pb::Stopped {}))
     }
+
+    type WatchWakesStream = tokio_stream::wrappers::ReceiverStream<Result<pb::Wake, Status>>;
+
+    async fn watch_wakes(
+        &self,
+        _: Request<pb::WatchWakesRequest>,
+    ) -> Result<Response<Self::WatchWakesStream>, Status> {
+        let mut wakes = muru_edge::wake::wakes().subscribe();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    () = sender.closed() => return,
+                    received = wakes.recv() => received,
+                };
+
+                let (app, release, group) = match received {
+                    Ok(key) => key,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return,
+                };
+
+                let wake = pb::Wake {
+                    app,
+                    release,
+                    group,
+                };
+
+                if sender.send(Ok(wake)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        )))
+    }
 }

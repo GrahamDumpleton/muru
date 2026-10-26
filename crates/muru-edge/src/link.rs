@@ -102,6 +102,9 @@ pub struct LinkPool {
     /// The gRPC methods the workers' mounts registered, from HELLO
     /// (section 6.13).
     grpc: Vec<pb::GrpcMethod>,
+    /// Section 7.4: for a pool with no workers, the group a request waits
+    /// to be woken, when it can be.
+    wake: Option<crate::wake::Key>,
 }
 
 /// One request's place in the queue for a slot, given back when it gets
@@ -121,6 +124,9 @@ pub(crate) struct Lease {
     pub(crate) worker: usize,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
+    /// The pool the connection came from, when it is not the one asked:
+    /// a woken group's (section 7.4).
+    pub(crate) woken: Option<Arc<LinkPool>>,
 }
 
 impl LinkPool {
@@ -158,6 +164,7 @@ impl LinkPool {
             next: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
             grpc,
+            wake: None,
         })
     }
 
@@ -213,7 +220,22 @@ impl LinkPool {
             next: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
             grpc: Vec::new(),
+            wake: None,
         }
+    }
+
+    /// Section 7.4: a pool with no workers for a group scaled to zero: a
+    /// request waits for the group to be woken, until its queue timeout.
+    pub fn waking(key: crate::wake::Key) -> Self {
+        Self {
+            wake: Some(key),
+            ..Self::empty()
+        }
+    }
+
+    /// The group a request waits for, for a pool that wakes one.
+    pub fn wakes(&self) -> Option<&crate::wake::Key> {
+        self.wake.as_ref()
     }
 
     /// Requests waiting for a slot right now.
@@ -238,7 +260,20 @@ impl LinkPool {
     /// for one if every worker is busy.
     pub(crate) async fn acquire(&self) -> io::Result<Lease> {
         if self.workers.is_empty() {
-            return Err(io::Error::other("no release is serving"));
+            let Some(key) = &self.wake else {
+                return Err(io::Error::other("no release is serving"));
+            };
+
+            // The request counts as waiting here, where the metrics see
+            // it, until the woken group's pool takes it.
+
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            let waiting = Waiting(&self.waiting);
+            let pool = crate::wake::wakes().wait(key).await?;
+            drop(waiting);
+            let mut lease = Box::pin(pool.acquire()).await?;
+            lease.woken.get_or_insert(pool);
+            return Ok(lease);
         }
 
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
@@ -275,6 +310,7 @@ impl LinkPool {
             permit,
             worker: best,
             websockets: worker.websockets,
+            woken: None,
         })
     }
 
@@ -1131,7 +1167,9 @@ async fn handle_inner(
         permit,
         worker,
         websockets,
+        woken,
     } = lease;
+    let pool = woken.unwrap_or(pool);
     let Conn {
         mut reader,
         mut writer,

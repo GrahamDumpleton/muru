@@ -50,11 +50,13 @@ muructl drain shop@r2
 muructl events --follow
 ```
 
-A release that a deploy replaces is drained and then kept warm, with
-its workers untouched, for a retention window of 30 minutes (`deploy
---retain` changes it; `--retain 0` stops it as soon as it has drained),
-so `rollback` within the window is instant: traffic moves back to the
-workers that were already serving. After the window, or when another
+A release that a deploy replaces is drained and then kept warm for a
+retention window of 30 minutes (`deploy --retain` changes it; `--retain
+0` stops it as soon as it has drained), with one worker in each of its
+groups (`deploy --retain-workers` changes it; `--retain-workers 0` keeps
+the host alone), so `rollback` within the window is instant: traffic
+moves back to the warm workers at once, and the groups grow back to
+their counts by forking from the host. After the window, or when another
 deploy supersedes it again, the retained release is stopped. One release
 per application is retained at a time. `rollback` to a release that was
 stopped starts it again first and moves traffic when it is ready; the

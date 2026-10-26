@@ -10,6 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -17,6 +18,7 @@ use hyper_util::rt::TokioIo;
 use muru_proto::edge::v1 as pb;
 use muru_proto::edge::v1::edge_control_client::EdgeControlClient;
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 /// A listener the daemon bound for the edge.
@@ -59,6 +61,9 @@ pub struct EdgeProcess {
     spec: EdgeSpec,
     process: Process,
     snapshot: pb::Snapshot,
+    /// The control socket as of the last snapshot, for the wake watcher,
+    /// which follows the edge through respawns and upgrades.
+    control_now: Arc<Mutex<PathBuf>>,
 }
 
 /// An edge this daemon spawned, or one it adopted from a previous daemon.
@@ -94,6 +99,7 @@ impl EdgeProcess {
     pub async fn spawn(spec: EdgeSpec) -> anyhow::Result<Self> {
         let child = launch(&spec, &[]).await?;
         Ok(Self {
+            control_now: Arc::new(Mutex::new(spec.control.clone())),
             spec,
             process: Process::Child(child),
             snapshot: pb::Snapshot::default(),
@@ -148,6 +154,7 @@ impl EdgeProcess {
         anyhow::ensure!(!listeners.is_empty(), "the edge handed no listener back");
 
         Ok(Self {
+            control_now: Arc::new(Mutex::new(control.clone())),
             spec: EdgeSpec {
                 executable,
                 listeners,
@@ -263,6 +270,7 @@ impl EdgeProcess {
             version: self.snapshot.version + 1,
             ..snapshot
         };
+        *self.control_now.lock().expect("control poisoned") = self.spec.control.clone();
         let mut client = connect(&self.spec.control).await?;
         client
             .apply(self.snapshot.clone())
@@ -271,6 +279,32 @@ impl EdgeProcess {
                 anyhow::anyhow!("the edge refused the snapshot: {}", status.message())
             })?;
         Ok(())
+    }
+
+    /// Section 7.4: send each group a request is waiting to wake to
+    /// `wakes`, from whichever edge serves, until the receiver closes.
+    pub fn watch_wakes(&self, wakes: mpsc::Sender<pb::Wake>) {
+        let current = Arc::clone(&self.control_now);
+
+        tokio::spawn(async move {
+            while !wakes.is_closed() {
+                let control = current.lock().expect("control poisoned").clone();
+
+                if let Ok(mut client) = connect(&control).await
+                    && let Ok(response) = client.watch_wakes(pb::WatchWakesRequest {}).await
+                {
+                    let mut stream = response.into_inner();
+
+                    while let Ok(Some(wake)) = stream.message().await {
+                        if wakes.send(wake).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
     }
 
     /// The version of the snapshot the edge was last given.

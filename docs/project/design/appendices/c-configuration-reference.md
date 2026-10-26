@@ -56,6 +56,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |
 | budget.workers, budget.memory, budget.cpu | `[daemon]` | off | 7.4 |
+| min_workers = 0 (scale to zero), host_idle_timeout | group; host_idle_timeout in the release's own scaling table | none, off | 7.4 |
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
@@ -113,7 +114,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Category | Types (prefix dev.muru.) |
 | --- | --- |
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
-| Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden |
+| Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, worker.loop_stalled, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |

@@ -2357,6 +2357,13 @@ pub fn resolve_spec(
             group.processes.map_or(processes, |value| value as u32),
             &format!("worker group {name}: scaling"),
         )?;
+
+        if group_scaling.host_idle_timeout_ms.is_some() {
+            return Err(format!(
+                "worker group {name}: host_idle_timeout belongs in the release's own scaling table"
+            ));
+        }
+
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
@@ -2588,6 +2595,17 @@ pub fn resolve_spec(
 
     let (scaling, processes) =
         resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
+
+    if scaling.host_idle_timeout_ms.is_some()
+        && let Some(group) = resolved_groups
+            .iter()
+            .find(|group: &&GroupSpec| group.scaling.is_static() || group.scaling.min_workers > 0)
+    {
+        return Err(format!(
+            "scaling.host_idle_timeout needs every worker group to scale to zero, and worker group {} keeps workers",
+            group.name
+        ));
+    }
 
     let (error_pages, error_override, maintenance) = resolve_error_tables(
         tables,
@@ -3280,12 +3298,6 @@ fn resolve_scaling(
     };
     let min_workers = table.min_workers.unwrap_or(1);
 
-    if min_workers == 0 {
-        return Err(format!(
-            "{what}: min_workers must be at least 1; scale to zero is not supported yet"
-        ));
-    }
-
     if max_workers < min_workers {
         return Err(format!(
             "{what}: max_workers {max_workers} is below min_workers {min_workers}"
@@ -3378,7 +3390,18 @@ fn resolve_scaling(
         max_step_up: max_step_up as u32,
         churn_budget: churn_budget as u32,
         advisory: table.advisory.unwrap_or(false),
+        host_idle_timeout_ms: match &table.host_idle_timeout {
+            Some(text) => Some(duration("host_idle_timeout", Some(text), 0)?),
+            None => None,
+        },
     };
+
+    if spec.host_idle_timeout_ms.is_some() && spec.min_workers > 0 {
+        return Err(format!(
+            "{what}: host_idle_timeout needs min_workers = 0, so the group can scale to zero"
+        ));
+    }
+
     let initial = processes.max(spec.min_workers);
     Ok((spec, initial))
 }
@@ -3409,6 +3432,7 @@ fn scaling_table(spec: &ScalingSpec) -> Option<muru_config::Scaling> {
         max_step_up: Some(spec.max_step_up as usize),
         churn_budget: Some(spec.churn_budget as usize),
         advisory: spec.advisory.then_some(true),
+        host_idle_timeout: spec.host_idle_timeout_ms.and_then(duration),
     })
 }
 
@@ -3488,6 +3512,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         app: app.to_owned(),
         source: source.to_owned(),
         override_freeze: false,
+        retain_workers: None,
         kind: table
             .kind
             .map(|value| value.as_str().to_owned())
@@ -4686,6 +4711,34 @@ mod tests {
                 1
             )
             .contains("queue_wait_p95")
+        );
+
+        // Section 7.4: a group may scale to zero, and only one that does
+        // may stop its host when idle.
+
+        let to_zero = muru_config::Scaling {
+            mode: Some(ScalingMode::Spare),
+            min_workers: Some(0),
+            max_workers: Some(4),
+            host_idle_timeout: Some("10m".to_owned()),
+            ..muru_config::Scaling::default()
+        };
+        let (spec, processes) = resolve_scaling(Some(&to_zero), 1, "scaling").unwrap();
+        assert_eq!((spec.min_workers, processes), (0, 1));
+        assert_eq!(spec.host_idle_timeout_ms, Some(600_000));
+        assert_eq!(
+            scaling_table(&spec).unwrap().host_idle_timeout.as_deref(),
+            Some("600s")
+        );
+        assert!(
+            refused(
+                muru_config::Scaling {
+                    min_workers: Some(1),
+                    ..to_zero
+                },
+                1
+            )
+            .contains("host_idle_timeout needs min_workers = 0")
         );
     }
 }

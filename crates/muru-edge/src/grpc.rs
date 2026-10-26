@@ -250,7 +250,11 @@ pub(crate) async fn handle(
         return recorded(recording, trailers_only(protocol, &status));
     }
 
-    let back = Return::new(Arc::clone(&pool), lease.worker, lease.permit);
+    let back = Return::new(
+        lease.woken.unwrap_or_else(|| Arc::clone(&pool)),
+        lease.worker,
+        lease.permit,
+    );
     let failure = Arc::new(Mutex::new(None::<Status>));
 
     tokio::spawn(pump_messages(

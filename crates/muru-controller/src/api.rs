@@ -222,9 +222,14 @@ impl Admin for Service {
                 app: request.app.clone(),
                 spec: Box::new(spec),
                 id: (!request.release.is_empty()).then(|| request.release.clone()),
-                retain: request
-                    .retain_ms
-                    .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                retain: crate::daemon::Retention {
+                    lasts: request
+                        .retain_ms
+                        .map_or(crate::daemon::RETENTION, Duration::from_millis),
+                    workers: request
+                        .retain_workers
+                        .unwrap_or(crate::daemon::RETAIN_WORKERS),
+                },
                 hold: request.hold,
                 created: created_tx,
                 done: done_tx,
@@ -1373,7 +1378,7 @@ impl Service {
                 app: app.to_owned(),
                 spec: Box::new(spec.clone()),
                 id: Some(id.to_owned()),
-                retain: crate::daemon::RETENTION,
+                retain: crate::daemon::Retention::default(),
                 hold: false,
                 created: created_tx,
                 done: done_tx,

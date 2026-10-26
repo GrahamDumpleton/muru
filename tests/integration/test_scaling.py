@@ -252,7 +252,9 @@ def test_a_policy_is_validated_when_declared(daemon: Daemon, tmp_path: Path) -> 
         return completed.stdout + completed.stderr
 
     assert "needs max_workers" in refused("mode = 'spare'")
-    assert "scale to zero" in refused("mode = 'spare'\nmax_workers = 4\nmin_workers = 0")
+    assert "host_idle_timeout needs min_workers = 0" in refused(
+        "mode = 'spare'\nmax_workers = 4\nhost_idle_timeout = '1h'"
+    )
     assert "max_spare must be at least min_spare + 2" in refused(
         "mode = 'spare'\nmax_workers = 8\nmin_spare = 2\nmax_spare = 3"
     )

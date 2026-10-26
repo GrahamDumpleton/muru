@@ -45,6 +45,7 @@ pub mod static_files;
 pub mod tls;
 pub mod uploads;
 pub mod upstream;
+pub mod wake;
 pub mod websocket;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -200,9 +201,12 @@ impl Pools {
         self.apply(routing::Routing::single(pools).with_compression(self.compression.clone()));
     }
 
-    /// Switch to the tables of a new snapshot.
+    /// Switch to the tables of a new snapshot, handing the pools of woken
+    /// groups to the requests waiting for them (section 7.4).
     pub fn apply(&self, routing: routing::Routing) {
+        let pools = routing.group_pools();
         *self.current.write().expect("pools poisoned") = Arc::new(routing);
+        wake::wakes().publish(&pools);
     }
 }
 

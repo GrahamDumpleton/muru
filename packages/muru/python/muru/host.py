@@ -1286,7 +1286,8 @@ class Host:
         self.finish_if_answered(pending)
 
     # Section 7.4: the supervisor's scaling of one group, carried out by
-    # forking workers at new indices or draining the group's youngest.
+    # forking workers at new indices or draining the group's youngest; a
+    # group scaled to zero keeps the host, which forks again when asked.
 
     def scale_group(self, request_id: int, args: dict[str, Any]) -> None:
         """Bring a group to the worker count the supervisor asks for."""
@@ -1298,8 +1299,8 @@ class Host:
 
         if group is None:
             error = f"no worker group {name}"
-        elif wanted < 1:
-            error = "processes must be at least 1"
+        elif wanted < 0:
+            error = "processes must be at least 0"
 
         if error:
             self.send_to_supervisor(

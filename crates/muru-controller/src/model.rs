@@ -388,6 +388,11 @@ pub struct ScalingSpec {
     pub churn_budget: u32,
     /// Decide and report without acting.
     pub advisory: bool,
+    /// How long the host stays once every group has scaled to zero, for
+    /// the default group's spec; it stays while the release runs when
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_idle_timeout_ms: Option<u64>,
 }
 
 impl Default for ScalingSpec {
@@ -409,6 +414,7 @@ impl Default for ScalingSpec {
             max_step_up: 4,
             churn_budget: 6,
             advisory: false,
+            host_idle_timeout_ms: None,
         }
     }
 }

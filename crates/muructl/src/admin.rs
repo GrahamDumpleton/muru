@@ -1695,6 +1695,11 @@ pub struct DeployArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     retain: Option<Duration>,
 
+    /// The workers each group of the release this one replaces keeps
+    /// while it stays warm (default 1; 0 keeps the host alone).
+    #[arg(long, value_name = "N")]
+    retain_workers: Option<u32>,
+
     /// Replace a worker after this many requests, with jitter.
     #[arg(long, value_name = "N")]
     max_requests: Option<u64>,
@@ -2061,6 +2066,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         override_freeze: args.override_freeze,
         reflection: None,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
+        retain_workers: args.retain_workers,
         max_requests: args.max_requests,
         max_lifetime_ms: args
             .max_lifetime

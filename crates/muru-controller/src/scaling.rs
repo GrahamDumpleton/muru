@@ -639,6 +639,12 @@ impl Scaler {
             return Some(decision);
         }
 
+        if (self.signals.queue_depth > 0.0 || self.signals.busy > 0.0)
+            && let Some(decision) = self.wake(now)
+        {
+            return Some(decision);
+        }
+
         if let Some(decision) = self.scale_out(now, idle) {
             return Some(decision);
         }
@@ -660,6 +666,25 @@ impl Scaler {
 
         self.suspended = false;
         self.scale_in(now)
+    }
+
+    /// Section 7.4: a group scaled to zero that a request is waiting for
+    /// gets a worker at once, without waiting out a window; none when it
+    /// has workers or is pinned.
+    pub fn wake(&mut self, now: Instant) -> Option<Decision> {
+        if self.desired > 0 || self.pinned.is_some() || self.spec.is_static() {
+            return None;
+        }
+
+        let reason = "a request is waiting for a group scaled to zero".to_owned();
+        self.desired = 1;
+        self.last_step = 1;
+        self.last_out = Some(now);
+        self.requested_at = Some(now);
+        self.out_since = None;
+        self.decisions.0 += 1;
+        self.last = Some((now, format!("woken: {reason}")));
+        Some(Decision::ScaleOut { to: 1, reason })
     }
 
     /// Section 7.5: bring the group up to a schedule's floor in staggered
@@ -821,6 +846,13 @@ impl Scaler {
         } else {
             0.0
         };
+
+        // A group scaled to zero stays there until a request wakes it.
+
+        if self.desired == 0 {
+            self.out_since = None;
+            return None;
+        }
 
         let (short, why) = match self.spec.mode {
             ScalingMode::Spare => (
@@ -1014,7 +1046,12 @@ impl Scaler {
             ScalingMode::Target => {
                 let points = covered(window)?;
                 let peak = points.iter().map(|point| point.busy).fold(0.0, f64::max);
-                let needed = self.workers_for(peak, per_worker).max(1);
+
+                // The last worker goes only when the floor allows it and
+                // nothing was busy over the window.
+
+                let least = u32::from(self.floor() > 0 || peak > 0.0);
+                let needed = self.workers_for(peak, per_worker).max(least);
 
                 if needed >= self.desired {
                     return None;
@@ -1355,6 +1392,35 @@ mod tests {
         scaler.limit(1, 3, start + SECOND * 25, "the node's memory budget");
         assert_eq!(scaler.desired(), 3);
         assert_eq!(scaler.status(start + SECOND * 25).decisions, (1, 0));
+    }
+
+    #[test]
+    fn a_group_with_no_floor_scales_to_zero_and_a_request_wakes_it() {
+        let spec = ScalingSpec {
+            min_workers: 0,
+            idle_reap_after_ms: 10_000,
+            reap_interval_ms: 1_000,
+            min_lifetime_ms: Some(1_000),
+            hold_after_growth_ms: 1_000,
+            ..spare()
+        };
+        let mut group = Group::new(spec, 2, 1.0);
+        group.run(Duration::ZERO, MINUTE, |_| 0.0);
+        assert_eq!(group.scaler.desired(), 0, "{:?}", group.log);
+        assert_eq!(group.ins().len(), 2);
+        let idle_until = group.ins()[0].0;
+        assert!(idle_until >= SECOND * 10, "{:?}", group.ins());
+
+        // Idle at zero, it stays there: the spare rule wants nothing of a
+        // group nobody is calling.
+
+        group.run(MINUTE, MINUTE, |_| 0.0);
+        assert_eq!(group.outs(), []);
+
+        // A request waits: a worker at once, without a window.
+
+        group.run(MINUTE * 2, SECOND * 2, |_| 1.0);
+        assert_eq!(group.outs(), [(MINUTE * 2, 1)]);
     }
 
     #[test]
