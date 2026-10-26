@@ -185,16 +185,77 @@ def readable_from_outside() -> bool:
         child.wait()
 
 
-def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
+def diagnose(daemon: Daemon, host: int) -> str:
+    """Describe a host that has not answered: whether the daemon answers,
+    the host's Python stacks read as root, and the processes' states.
+
+    Temporary, to find why a stacks request sometimes goes unanswered.
+    """
+
+    notes = []
+    started = time.monotonic()
+    listed = daemon.muructl("release", "list", "plain", check=False)
+    notes.append(f"release list took {time.monotonic() - started:.1f} s: {listed.returncode}")
+    started = time.monotonic()
+    status = daemon.muructl("debug", "status", "plain", "--json", check=False)
+    notes.append(
+        f"debug status took {time.monotonic() - started:.1f} s: {status.stdout[:300]}"
+        f"{status.stderr[:300]}"
+    )
+    reader = (
+        "import _remote_debugging, sys\n"
+        "trace = _remote_debugging.RemoteUnwinder(int(sys.argv[1]), all_threads=True)"
+        ".get_stack_trace()\n"
+        "for interpreter in trace:\n"
+        "    for thread in interpreter.threads:\n"
+        "        print('thread', thread.thread_id)\n"
+        "        for frame in thread.frame_info:\n"
+        "            print('   ', frame)\n"
+    )
+    dump = subprocess.run(
+        ["sudo", "-n", sys.executable, "-c", reader, str(host)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    notes.append(f"host {host} stacks:\n{dump.stdout}{dump.stderr}")
+    listing = subprocess.run(
+        ["ps", "-ax", "-o", "pid,ppid,stat,wchan,command"], capture_output=True, text=True
+    ).stdout
+    notes.append("\n".join(line for line in listing.splitlines() if "muru" in line))
+    return "\n".join(notes)
+
+
+@pytest.mark.parametrize("attempt", range(5))
+def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon, attempt: int) -> None:
     deploy_plain(daemon, processes=1)
     pid = json.loads(daemon.get("/info").body)["pid"]
+    host = int(
+        subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout
+    )
     os.kill(pid, signal.SIGSTOP)
+    outcome: list[subprocess.CompletedProcess[str]] = []
 
     try:
         started = time.monotonic()
-        answer = json.loads(daemon.muructl("debug", "stacks", "plain", "--json").stdout)
+        asking = threading.Thread(
+            target=lambda: outcome.append(
+                daemon.muructl("debug", "stacks", "plain", "--json", check=False)
+            )
+        )
+        asking.start()
+        asking.join(timeout=10)
+        notes = "" if outcome else diagnose(daemon, host)
+        asking.join()
+        elapsed = time.monotonic() - started
+        assert outcome[0].returncode == 0 and elapsed < 15, (
+            f"after {elapsed:.1f} s: {outcome[0].stderr}\n{notes}\n--- daemon log\n"
+            f"{daemon.log()[-3000:]}\n--- release log\n"
+            f"{daemon.muructl('logs', 'plain', check=False).stdout[-6000:]}"
+        )
+        answer = json.loads(outcome[0].stdout)
         worker = answer["workers"][0]
-        assert time.monotonic() - started < 15
     finally:
         os.kill(pid, signal.SIGCONT)
 
