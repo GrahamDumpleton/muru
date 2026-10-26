@@ -2152,6 +2152,17 @@ pub enum RolloutCommand {
         #[arg(long = "max-worker-faults", value_name = "COUNT", default_value = "0")]
         max_worker_faults: u64,
 
+        /// The 95th percentile wait for a worker thread the candidate
+        /// may not exceed.
+        #[arg(long = "max-queue-wait", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        max_queue_wait: Option<Duration>,
+
+        /// A URL requested through the edge from the candidate and the
+        /// baseline every few seconds, by preview; one failing on the
+        /// candidate alone rolls back. Repeatable.
+        #[arg(long = "probe", value_name = "URL")]
+        probes: Vec<String>,
+
         /// Requests the candidate must serve in a step before the gates
         /// judge it.
         #[arg(long = "min-requests", value_name = "COUNT", default_value = "100")]
@@ -2481,6 +2492,8 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             max_p95,
             max_p99,
             max_worker_faults,
+            max_queue_wait,
+            probes,
             min_requests,
             approve_each_step,
             wait,
@@ -2504,6 +2517,8 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                     max_p95_ms: max_p95.map_or(0, |p95| p95.as_millis() as u64),
                     max_p99_ms: max_p99.map_or(0, |p99| p99.as_millis() as u64),
                     max_worker_faults,
+                    max_queue_wait_p95_ms: max_queue_wait.map_or(0, |wait| wait.as_millis() as u64),
+                    probes,
                     min_requests,
                     approve_each_step,
                     override_freeze,

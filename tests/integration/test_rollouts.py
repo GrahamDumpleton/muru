@@ -179,6 +179,24 @@ def test_a_worker_crash_rolls_the_canary_back_at_once(daemon: Daemon, tmp_path: 
     assert "gate failed at 50%: 1 worker crashes and timeout kills" in status, status
 
 
+def test_a_probe_failing_on_the_candidate_alone_rolls_back(daemon: Daemon, tmp_path: Path) -> None:
+    prepare(daemon, tmp_path)
+    probe = f"http://127.0.0.1:{daemon.port}/fails-on/r2"
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "50", "--hold", "60s", "--probe", probe
+    )
+
+    # No request at all, and the probe decides.
+
+    wait_for_rollout(daemon, "rolled_back")
+    status = daemon.muructl("rollout", "status", "shop").stdout
+    assert "gate failed at 50%: 1 failed probes (baseline 0)" in status, status
+    assert f"{probe} answered 500" in status, status
+
+    refused = daemon.muructl("rollout", "canary", "shop@r2", "--probe", "/health", check=False)
+    assert "not an http or https URL with a host" in refused.stderr
+
+
 def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_path: Path) -> None:
     prepare(daemon, tmp_path)
     daemon.muructl(

@@ -1,28 +1,50 @@
 //! Canary gates (design specification section 9.3): the request counters
-//! of a release read from the edge's metrics, and the verdict on a
-//! candidate against the baseline over the same window.
+//! of a release read from the edge's metrics, the verdict on a candidate
+//! against the baseline over the same window, and the probes the daemon
+//! sends each release through the edge.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::Empty;
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use muru_edge::metrics::Sample;
 
 use crate::model::RolloutGates;
 
+/// How often each release's probes are requested.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a probe has to answer.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cumulative histogram buckets: the upper bound's bits, then the bound
+/// in seconds and the count at or below it.
+pub type Buckets = BTreeMap<u64, (f64, f64)>;
+
 /// A release's request counters: how many requests it answered, how many
-/// with a 5xx status, and the cumulative histogram of total request time
-/// by upper bound in seconds, with its workers' crashes and timeout kills,
-/// which the daemon counts from the host's events.
+/// with a 5xx status, and the cumulative histograms of total request time
+/// and of the wait for a worker thread, with its workers' crashes and
+/// timeout kills and its failed probes, which the daemon counts.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Counters {
     /// Requests answered.
     pub total: f64,
     /// Requests answered with a 5xx status.
     pub errors: f64,
-    /// Histogram buckets: the upper bound's bits, then the bound in
-    /// seconds and the cumulative count at or below it.
-    pub buckets: BTreeMap<u64, (f64, f64)>,
+    /// Total request time.
+    pub buckets: Buckets,
+    /// The wait for a worker thread.
+    pub queue_buckets: Buckets,
     /// Worker crashes and timeout kills.
     pub faults: f64,
+    /// Probes that failed.
+    pub probe_failures: f64,
+    /// How the latest failed probe failed.
+    pub probe_error: Option<String>,
 }
 
 impl Counters {
@@ -52,19 +74,20 @@ impl Counters {
                         counters.errors += sample.value;
                     }
                 }
-                "muru_request_duration_seconds_bucket"
-                    if label(sample, "phase").as_deref() == Some("total") =>
-                {
+                "muru_request_duration_seconds_bucket" => {
+                    let buckets = match label(sample, "phase").as_deref() {
+                        Some("total") => &mut counters.buckets,
+                        Some("queue") => &mut counters.queue_buckets,
+                        _ => continue,
+                    };
+
                     let bound = match label(sample, "le").as_deref() {
                         Some("+Inf") => f64::INFINITY,
                         Some(text) => text.parse().unwrap_or(f64::INFINITY),
                         None => continue,
                     };
 
-                    let entry = counters
-                        .buckets
-                        .entry(bound.to_bits())
-                        .or_insert((bound, 0.0));
+                    let entry = buckets.entry(bound.to_bits()).or_insert((bound, 0.0));
                     entry.1 += sample.value;
                 }
                 _ => {}
@@ -76,18 +99,24 @@ impl Counters {
 
     /// What happened since `start`: the counters' growth.
     pub fn since(&self, start: &Counters) -> Counters {
-        let mut buckets = BTreeMap::new();
-
-        for (key, (bound, count)) in &self.buckets {
-            let before = start.buckets.get(key).map_or(0.0, |(_, count)| *count);
-            buckets.insert(*key, (*bound, (count - before).max(0.0)));
-        }
+        let growth = |now: &Buckets, before: &Buckets| -> Buckets {
+            now.iter()
+                .map(|(key, (bound, count))| {
+                    let earlier = before.get(key).map_or(0.0, |(_, count)| *count);
+                    (*key, (*bound, (count - earlier).max(0.0)))
+                })
+                .collect()
+        };
+        let probe_failures = (self.probe_failures - start.probe_failures).max(0.0);
 
         Counters {
             total: (self.total - start.total).max(0.0),
             errors: (self.errors - start.errors).max(0.0),
-            buckets,
+            buckets: growth(&self.buckets, &start.buckets),
+            queue_buckets: growth(&self.queue_buckets, &start.queue_buckets),
             faults: (self.faults - start.faults).max(0.0),
+            probe_failures,
+            probe_error: self.probe_error.clone().filter(|_| probe_failures > 0.0),
         }
     }
 
@@ -103,33 +132,39 @@ impl Counters {
     /// The 95th percentile of total request time in milliseconds, or
     /// none without requests.
     pub fn p95_ms(&self) -> Option<f64> {
-        self.percentile_ms(0.95)
+        percentile_ms(&self.buckets, 0.95)
     }
 
     /// The 99th percentile of total request time in milliseconds, or
     /// none without requests.
     pub fn p99_ms(&self) -> Option<f64> {
-        self.percentile_ms(0.99)
+        percentile_ms(&self.buckets, 0.99)
     }
 
-    /// A percentile of total request time in milliseconds: the upper
-    /// bound of the first bucket holding that share of the requests the
-    /// histogram counted, or none without requests.
-    fn percentile_ms(&self, share: f64) -> Option<f64> {
-        let mut ordered: Vec<(f64, f64)> = self.buckets.values().copied().collect();
-        ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let counted = ordered.last().map(|(_, count)| *count).unwrap_or(0.0);
-
-        if counted <= 0.0 {
-            return None;
-        }
-
-        let target = counted * share;
-        ordered
-            .iter()
-            .find(|(_, count)| *count >= target)
-            .map(|(bound, _)| bound * 1000.0)
+    /// The 95th percentile of the wait for a worker thread in
+    /// milliseconds, or none without requests.
+    pub fn queue_wait_p95_ms(&self) -> Option<f64> {
+        percentile_ms(&self.queue_buckets, 0.95)
     }
+}
+
+/// A percentile of a histogram in milliseconds: the upper bound of the
+/// first bucket holding that share of the requests it counted, or none
+/// without requests.
+fn percentile_ms(buckets: &Buckets, share: f64) -> Option<f64> {
+    let mut ordered: Vec<(f64, f64)> = buckets.values().copied().collect();
+    ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let counted = ordered.last().map(|(_, count)| *count).unwrap_or(0.0);
+
+    if counted <= 0.0 {
+        return None;
+    }
+
+    let target = counted * share;
+    ordered
+        .iter()
+        .find(|(_, count)| *count >= target)
+        .map(|(bound, _)| bound * 1000.0)
 }
 
 /// What the gates say about a step so far.
@@ -156,6 +191,15 @@ pub fn judge(candidate: &Counters, baseline: &Counters, gates: &RolloutGates) ->
         return Verdict::Fail(format!(
             "{} worker crashes and timeout kills, over the limit of {} (baseline {})",
             candidate.faults, gates.max_worker_faults, baseline.faults
+        ));
+    }
+
+    if candidate.probe_failures > baseline.probe_failures {
+        return Verdict::Fail(format!(
+            "{} failed probes (baseline {}): {}",
+            candidate.probe_failures,
+            baseline.probe_failures,
+            candidate.probe_error.as_deref().unwrap_or("no answer")
         ));
     }
 
@@ -201,7 +245,66 @@ pub fn judge(candidate: &Counters, baseline: &Counters, gates: &RolloutGates) ->
         ));
     }
 
+    if let Some(limit) = gates.max_queue_wait_p95_ms
+        && let Some(wait) = candidate.queue_wait_p95_ms()
+        && wait > limit as f64
+        && (!compared || baseline.queue_wait_p95_ms().is_none_or(|base| wait > base))
+    {
+        return Verdict::Fail(format!(
+            "p95 queue wait {wait:.0} ms over the limit of {limit} ms (baseline {})",
+            baseline
+                .queue_wait_p95_ms()
+                .map_or("none".to_owned(), |base| format!("{base:.0} ms"))
+        ));
+    }
+
     Verdict::Pass
+}
+
+/// The client the daemon sends probes with.
+pub type ProbeClient = Client<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+
+/// A client for probes, over HTTP or HTTPS.
+pub fn probe_client() -> ProbeClient {
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector)
+}
+
+/// Whether a probe URL can be requested: http or https, with a host.
+pub fn check_probe(url: &str) -> Result<(), String> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|error| format!("probe {url}: {error}"))?;
+
+    match (uri.scheme_str(), uri.host()) {
+        (Some("http" | "https"), Some(_)) => Ok(()),
+        _ => Err(format!("probe {url}: not an http or https URL with a host")),
+    }
+}
+
+/// Request a probe URL from one release by preview: a 2xx or 3xx answer
+/// within the timeout passes, and anything else says how it failed.
+pub async fn probe(client: &ProbeClient, url: &str, release: &str) -> Result<(), String> {
+    let request = http::Request::get(url)
+        .header(muru_edge::routing::PREVIEW_HEADER, release)
+        .header(http::header::USER_AGENT, "muru-probe")
+        .body(Empty::new())
+        .map_err(|error| format!("{url}: {error}"))?;
+
+    match tokio::time::timeout(PROBE_TIMEOUT, client.request(request)).await {
+        Ok(Ok(response))
+            if response.status().is_success() || response.status().is_redirection() =>
+        {
+            Ok(())
+        }
+        Ok(Ok(response)) => Err(format!("{url} answered {}", response.status())),
+        Ok(Err(error)) => Err(format!("{url}: {error}")),
+        Err(_) => Err(format!("{url} did not answer within {PROBE_TIMEOUT:?}")),
+    }
 }
 
 #[cfg(test)]
@@ -227,8 +330,9 @@ mod tests {
         Counters {
             total,
             errors,
+            queue_buckets: buckets.clone(),
             buckets,
-            faults: 0.0,
+            ..Counters::default()
         }
     }
 
@@ -238,6 +342,8 @@ mod tests {
             max_p95_ms: Some(500),
             max_p99_ms: None,
             max_worker_faults: 0,
+            max_queue_wait_p95_ms: None,
+            probes: Vec::new(),
             min_requests: 10,
         }
     }
@@ -374,5 +480,47 @@ mod tests {
             Verdict::Fail(reason) => assert!(reason.contains("p99 1000 ms"), "{reason}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_probe_decides_at_once_and_queue_wait_is_a_gate() {
+        let good = counters(100.0, 0.0, 100.0);
+        let mut probed = counters(2.0, 0.0, 2.0);
+        probed.probe_failures = 1.0;
+        probed.probe_error = Some("http://shop.test/health answered 500".to_owned());
+
+        match judge(&probed, &good, &gates()) {
+            Verdict::Fail(reason) => {
+                assert!(reason.contains("1 failed probes (baseline 0)"), "{reason}");
+                assert!(reason.contains("answered 500"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Probes failing on both releases are not the candidate's.
+
+        let mut both = good.clone();
+        both.probe_failures = 1.0;
+        assert_eq!(judge(&both, &both, &gates()), Verdict::Pass);
+
+        // Half the requests wait a second for a thread.
+
+        let queued = RolloutGates {
+            max_p95_ms: None,
+            max_queue_wait_p95_ms: Some(500),
+            ..gates()
+        };
+        let mut waiting = good.clone();
+        waiting.queue_buckets = counters(100.0, 0.0, 50.0).buckets;
+        assert_eq!(judge(&waiting, &good, &gates()), Verdict::Pass);
+
+        match judge(&waiting, &good, &queued) {
+            Verdict::Fail(reason) => assert!(reason.contains("p95 queue wait 1000 ms"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+
+        assert!(check_probe("http://127.0.0.1:8080/health").is_ok());
+        assert!(check_probe("/health").is_err());
+        assert!(check_probe("ftp://example.com/").is_err());
     }
 }

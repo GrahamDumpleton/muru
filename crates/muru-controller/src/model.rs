@@ -611,6 +611,13 @@ pub struct RolloutGates {
     /// judge.
     #[serde(default)]
     pub max_worker_faults: u64,
+    /// The 95th percentile of the wait for a worker thread, when set.
+    #[serde(default)]
+    pub max_queue_wait_p95_ms: Option<u64>,
+    /// URLs requested through the edge from each release in turn, by
+    /// preview; one failing on the candidate alone rolls back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<String>,
     /// Requests the candidate must have served before the gates judge.
     pub min_requests: u64,
 }

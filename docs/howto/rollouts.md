@@ -61,6 +61,8 @@ rollout.
 | `--max-p95` | none | The candidate's 95th percentile request time over the step |
 | `--max-p99` | none | The candidate's 99th percentile request time over the step |
 | `--max-worker-faults` | `0` | The candidate's worker crashes and timeout kills over the step |
+| `--max-queue-wait` | none | The candidate's 95th percentile wait for a worker thread over the step |
+| `--probe` | none | A URL requested from the candidate and the baseline every 5 seconds; repeatable |
 | `--min-requests` | `100` | Requests the candidate must serve in a step before the gates judge |
 | `--approve-each-step` | off | Wait for `rollout resume` before each step after the first |
 
@@ -94,6 +96,22 @@ A worker that crashes, or that the [hard timeout](timeouts.md#the-hard-timeout)
 or the loop stall timeout replaces, counts against its release at once,
 whatever the step's request count: by default one more than the baseline
 had over the step rolls the candidate back.
+
+A probe is a URL the daemon requests through the edge every 5 seconds
+while the rollout runs, once from the candidate and once from the
+baseline, each by preview with the `Muru-Preview` header. A probe passes
+with a 2xx or 3xx answer within 5 seconds. Like a crash, a failed probe
+counts at once: one more failure on the candidate than on the baseline
+over the step rolls it back, so a health check failing on both
+releases, as during a database outage, does not. Give the URL of
+a listener the edge serves the application's route on:
+
+```console
+$ muructl rollout canary shop@r2 --probe http://127.0.0.1:8080/health --probe http://127.0.0.1:8080/cart
+```
+
+Probe requests count as requests of their release, as any other request
+does.
 
 ## Controlling a rollout
 

@@ -129,6 +129,10 @@ pub enum RolloutAction {
     Abort,
 }
 
+/// Section 9.3: each release's failed probes, by application and
+/// release, and how the latest failed.
+type ProbeFailures = Arc<std::sync::Mutex<HashMap<(String, String), (u64, String)>>>;
+
 /// Where a rollout's current step started from: the releases' counters
 /// at that moment, so the gates judge the step alone.
 #[derive(Debug, Clone)]
@@ -642,6 +646,13 @@ struct Daemon {
     /// Section 9.3: each release's worker crashes and timeout kills, from
     /// the host's events, for the gates.
     worker_faults: HashMap<(String, String), u64>,
+    /// Section 9.3: each release's failed probes and how the latest
+    /// failed, written by the probe tasks.
+    probe_failures: ProbeFailures,
+    /// When each application's rollout probes were last sent.
+    probed: HashMap<String, Instant>,
+    /// The client probes are sent with.
+    probe_client: crate::rollouts::ProbeClient,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
@@ -941,6 +952,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         running: HashMap::new(),
         rollout_runs: HashMap::new(),
         worker_faults: HashMap::new(),
+        probe_failures: Arc::default(),
+        probed: HashMap::new(),
+        probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
         default_app: None,
         owns_log,
@@ -3917,6 +3931,10 @@ impl Daemon {
             return Err("a rollout needs at least one step".to_owned());
         }
 
+        for url in &gates.probes {
+            crate::rollouts::check_probe(url)?;
+        }
+
         for (index, step) in steps.iter().enumerate() {
             if step.percent == 0 || step.percent > 100 {
                 return Err(format!(
@@ -3979,20 +3997,74 @@ impl Daemon {
     }
 
     /// Section 9.3: a release's counters for the gates, the edge's with
-    /// its workers' crashes and timeout kills.
+    /// its workers' crashes and timeout kills and its failed probes.
     fn counters(
         &self,
         samples: &[muru_edge::metrics::Sample],
         app: &str,
         release: &str,
     ) -> Counters {
+        let key = (app.to_owned(), release.to_owned());
         let mut counters = Counters::from_samples(samples, app, release);
-        counters.faults = self
-            .worker_faults
-            .get(&(app.to_owned(), release.to_owned()))
-            .copied()
-            .unwrap_or(0) as f64;
+        counters.faults = self.worker_faults.get(&key).copied().unwrap_or(0) as f64;
+
+        if let Some((failures, error)) = self
+            .probe_failures
+            .lock()
+            .expect("probe failures poisoned")
+            .get(&key)
+        {
+            counters.probe_failures = *failures as f64;
+            counters.probe_error = Some(error.clone());
+        }
+
         counters
+    }
+
+    /// Section 9.3: send a running rollout's probes to the candidate and
+    /// the baseline, each through the edge by preview, when the interval
+    /// has passed; a task sends them and records the round's failures
+    /// together, so a fault both releases share is never judged half
+    /// seen.
+    fn send_probes(&mut self, rollout: &Rollout) {
+        if rollout.gates.probes.is_empty()
+            || self
+                .probed
+                .get(&rollout.app)
+                .is_some_and(|sent| sent.elapsed() < crate::rollouts::PROBE_INTERVAL)
+        {
+            return;
+        }
+
+        self.probed.insert(rollout.app.clone(), Instant::now());
+        let client = self.probe_client.clone();
+        let failures = self.probe_failures.clone();
+        let urls = rollout.gates.probes.clone();
+        let app = rollout.app.clone();
+        let releases = [rollout.candidate.clone(), rollout.baseline.clone()];
+
+        tokio::spawn(async move {
+            let mut failed = Vec::new();
+
+            for release in releases {
+                for url in &urls {
+                    if let Err(error) = crate::rollouts::probe(&client, url, &release).await {
+                        tracing::debug!(%app, %release, %error, "a rollout probe failed");
+                        failed.push((release.clone(), error));
+                    }
+                }
+            }
+
+            let mut failures = failures.lock().expect("probe failures poisoned");
+
+            for (release, error) in failed {
+                let entry = failures
+                    .entry((app.clone(), release))
+                    .or_insert((0, String::new()));
+                entry.0 += 1;
+                entry.1 = error;
+            }
+        });
     }
 
     /// Section 9.3: mark where a rollout's current step starts from, once
@@ -4119,6 +4191,7 @@ impl Daemon {
     ) -> Result<(), String> {
         let subject = format!("{}@{}", rollout.app, rollout.candidate);
         self.rollout_runs.remove(&rollout.app);
+        self.probed.remove(&rollout.app);
 
         let record = |rollout: &mut Rollout, store: &Store| -> Result<(), String> {
             rollout.state = state;
@@ -4256,6 +4329,7 @@ impl Daemon {
                 }
             };
 
+            self.send_probes(&rollout);
             let candidate = self
                 .counters(samples, &app, &rollout.candidate)
                 .since(&run.candidate);

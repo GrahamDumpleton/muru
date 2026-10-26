@@ -260,11 +260,11 @@ bluegreen` moves all traffic at once; every change is a `rollout.*`
 event, and a daemon restart continues a rollout with its current step
 starting afresh. Still to
 come in this part of the phase: A/B cohorts by header and cookie
-matches, per-route policies for one application, probe URL and queue
-wait gates, `config export --resolve-rollouts`, and rollouts for an
-application reached as the default with no route. Scheduled freezes
-came with capacity schedules, and the worker crash and p99 gates
-followed.
+matches, per-route policies for one application,
+`config export --resolve-rollouts`, and rollouts for an application
+reached as the default with no route. Scheduled freezes came with
+capacity schedules, and the worker crash, p99, queue wait and probe URL
+gates followed.
 
 The autoscaler (sections 7.2 to 7.4) followed: a `scaling` table on a
 release or a worker group gives the group a policy, spare mode keeping

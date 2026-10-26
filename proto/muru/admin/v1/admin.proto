@@ -243,6 +243,8 @@ message StartRolloutRequest {
   bool override_freeze = 8;         // start although an overlay freezes the application's deploys (section 9.6)
   uint64 max_p99_ms = 9;            // a gate: the candidate's p99 over the step; none when 0
   uint64 max_worker_faults = 10;    // a gate: the candidate's worker crashes and timeout kills over the step
+  uint64 max_queue_wait_p95_ms = 11; // a gate: the candidate's p95 wait for a worker thread; none when 0
+  repeated string probes = 12;      // a gate: http or https URLs requested through the edge from each release by preview
 }
 
 message RolloutStep {
@@ -268,6 +270,8 @@ message Rollout {
   bool approve_each_step = 15;
   uint64 max_p99_ms = 16;
   uint64 max_worker_faults = 17;
+  uint64 max_queue_wait_p95_ms = 18;
+  repeated string probes = 19;
 }
 
 message GetRolloutRequest {
