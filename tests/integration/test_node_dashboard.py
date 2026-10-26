@@ -141,9 +141,16 @@ def test_the_dashboard_is_loopback_only(tmp_path: Path) -> None:
         start_daemon(tmp_path, arguments=["--dashboard", "0.0.0.0:0"])
 
 
-def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0, count: int = 1) -> str:
+def read_sse(
+    port: int,
+    path: str,
+    wanted: str,
+    timeout: float = 15.0,
+    count: int = 1,
+    containing: tuple[str, ...] = (),
+) -> str:
     """Read a Server-Sent Events stream until `count` messages of `wanted` type
-    have arrived."""
+    have arrived, and one of `containing` with them when it names any."""
 
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
 
@@ -165,7 +172,10 @@ def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0, count: in
 
             complete = collected.rsplit(b"\n\n", 1)[0] + b"\n\n" if b"\n\n" in collected else b""
 
-            if complete.count(f"event: {wanted}\n".encode()) >= count:
+            enough = complete.count(f"event: {wanted}\n".encode()) >= count
+            found = not containing or any(text.encode() in complete for text in containing)
+
+            if enough and found:
                 return collected.decode()
 
         raise AssertionError(f"no {wanted} event in {collected!r}")
@@ -228,7 +238,10 @@ def test_events_stream_as_rows_and_json(served: tuple[Daemon, int]) -> None:
     outcome: list[str] = []
 
     def listen() -> None:
-        outcome.append(read_sse(port, "/v1/events/stream", "json"))
+        # A worker's own events can come first, so read on to the drain's.
+
+        kinds = ('"kind":"release.', '"kind":"traffic.')
+        outcome.append(read_sse(port, "/v1/events/stream", "json", containing=kinds))
 
     listener = threading.Thread(target=listen)
     listener.start()
