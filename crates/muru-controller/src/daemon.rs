@@ -121,7 +121,8 @@ pub struct Config {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
     pub dashboard: Option<SocketAddr>,
-    /// Whether the dashboard takes actions from signed-in sessions.
+    /// Whether a dashboard session may be given the actions, which
+    /// `muructl dashboard login --actions` asks for.
     pub dashboard_actions: bool,
     /// The overlays' signed webhook (section 9.10), or none.
     pub overlay_webhook: Option<crate::triggers::Webhook>,
@@ -493,9 +494,11 @@ pub struct Info {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
     pub dashboard: Option<SocketAddr>,
-    /// The dashboard's login codes and sessions, when it takes actions
+    /// The dashboard's login codes and sessions, when it is served
     /// (section 10.7).
     pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
+    /// Whether a dashboard session may be given the actions.
+    pub dashboard_actions: bool,
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
@@ -842,8 +845,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
-    let dashboard_sessions =
-        (dashboard.is_some() && config.dashboard_actions).then(muru_dashboard::Sessions::new);
+    let dashboard_sessions = dashboard.is_some().then(muru_dashboard::Sessions::new);
+    let dashboard_actions = config.dashboard_actions;
     let sinks = std::mem::take(&mut config.sinks);
     let locations = config.locations;
 
@@ -974,6 +977,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
+        dashboard_actions,
         defined: std::sync::RwLock::new(crate::config::Defined {
             budget: crate::budget::View {
                 budget: config.budget,
@@ -1020,7 +1024,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 handle.commands.clone(),
                 Arc::clone(&history),
                 events.clone(),
-                dashboard_sessions,
+                dashboard_sessions.unwrap_or_else(muru_dashboard::Sessions::new),
             )))
         }
         None => None,

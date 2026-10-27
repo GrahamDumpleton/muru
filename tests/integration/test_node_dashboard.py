@@ -1,11 +1,12 @@
 """The daemon's dashboard and JSON gateway (design specification section
 10.7): the node, its applications and releases, hosts and routes, recent
 requests, events and log tails, as pages and as JSON on a loopback
-address the daemon serves itself."""
+address the daemon serves itself, for a signed-in session."""
 
 from __future__ import annotations
 
 import http.client
+import http.server
 import json
 import re
 import sys
@@ -29,11 +30,23 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
         time.sleep(0.05)
 
 
-def fetch(port: int, path: str) -> tuple[int, dict[str, str], bytes]:
+# The bearer token each test's dashboard was signed in with, by port, so
+# the helpers send it unless told not to.
+
+TOKENS: dict[int, str] = {}
+
+
+def fetch(
+    port: int, path: str, headers: dict[str, str] | None = None, signed: bool = True
+) -> tuple[int, dict[str, str], bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    sent = dict(headers or {})
+
+    if signed and port in TOKENS:
+        sent.setdefault("Authorization", f"Bearer {TOKENS[port]}")
 
     try:
-        connection.request("GET", path)
+        connection.request("GET", path, headers=sent)
         response = connection.getresponse()
         return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
     finally:
@@ -47,16 +60,24 @@ def fetch_json(port: int, path: str) -> Any:
     return json.loads(body)
 
 
+def sign_in(daemon: Daemon, port: int) -> None:
+    """Have the helpers send a token that may look."""
+
+    TOKENS[port] = daemon.muructl("dashboard", "login", "--token").stdout.strip()
+
+
 @pytest.fixture
 def served(tmp_path: Path) -> Iterator[tuple[Daemon, int]]:
-    """A daemon with its dashboard on a free loopback port."""
+    """A daemon with its dashboard on a free loopback port, signed in."""
 
     port = support.free_port()
     instance = start_daemon(tmp_path, arguments=["--dashboard", f"127.0.0.1:{port}"])
 
     try:
+        sign_in(instance, port)
         yield instance, port
     finally:
+        TOKENS.pop(port, None)
         instance.stop()
 
 
@@ -153,9 +174,10 @@ def read_sse(
     have arrived, and one of `containing` with them when it names any."""
 
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    headers = {"Authorization": f"Bearer {TOKENS[port]}"} if port in TOKENS else {}
 
     try:
-        connection.request("GET", path)
+        connection.request("GET", path, headers=headers)
         response = connection.getresponse()
         assert response.status == 200
         assert response.getheader("Content-Type") == "text/event-stream"
@@ -219,7 +241,9 @@ def test_the_history_grows_and_streams_for_the_charts(served: tuple[Daemon, int]
     status, headers, body = fetch(port, "/")
     assert status == 200
     page = body.decode()
-    assert 'id="charts"' in page and "/static/charts.js" in page and "/static/uplot.min.js" in page
+    assert (
+        'id="charts"' in page and '"static/charts.js"' in page and '"static/uplot.min.js"' in page
+    )
     assert "style-src 'self' 'unsafe-inline'" in headers["content-security-policy"]
 
     for asset, kind in [
@@ -253,7 +277,7 @@ def test_events_stream_as_rows_and_json(served: tuple[Daemon, int]) -> None:
     assert "event: event\ndata: <tr class=" in text
     assert '"kind":"release.' in text or '"kind":"traffic.' in text
     page = fetch(port, "/")[2].decode()
-    assert 'sse-connect="/v1/events/stream"' in page and 'id="event-rows"' in page
+    assert 'sse-connect="v1/events/stream"' in page and 'id="event-rows"' in page
 
 
 def test_scaling_rollouts_and_maintenance_are_shown(served: tuple[Daemon, int]) -> None:
@@ -313,25 +337,27 @@ def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) 
 
     try:
         assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
-        assert "Maintenance on" not in fetch(port, "/")[2].decode()
         refused = post_form(port, "/actions/maintenance", {"app": "shop", "state": "on"}, origin)
         assert refused[0] == 403 and b"not signed in" in refused[1]
 
-        # A login link from the admin socket signs a browser in, once.
+        # A login link from the admin socket signs a browser in, once, back
+        # to the page wherever it is served, with a cookie for that path.
 
-        link = daemon.muructl("dashboard", "login").stdout.strip()
+        link = daemon.muructl("dashboard", "login", "--actions").stdout.strip()
         assert link.startswith(f"http://127.0.0.1:{port}/login?code=")
         path = link.removeprefix(f"http://127.0.0.1:{port}")
         status, headers, _ = fetch(port, path)
-        assert status == 303 and headers["location"] == "/"
+        assert status == 303 and headers["location"] == "./"
         cookie = headers["set-cookie"].split(";")[0]
         assert "HttpOnly" in headers["set-cookie"] and "SameSite=Strict" in headers["set-cookie"]
+        assert "Path=" not in headers["set-cookie"]
         assert fetch(port, path)[0] == 403
 
         page = fetch_with(port, "/", {"Cookie": cookie})
         assert "Maintenance on" in page
         token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
         assert token is not None
+        assert 'action="actions/maintenance"' in page
         form = {"csrf": token.group(1), "app": "shop", "state": "on"}
 
         # The session's token and the page's own origin are both needed.
@@ -350,9 +376,13 @@ def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) 
             == 403
         )
         assert post_form(port, "/actions/maintenance", form, signed)[0] == 403
+        cross = {**signed, **origin, "Sec-Fetch-Site": "cross-site"}
+        assert post_form(port, "/actions/maintenance", form, cross)[0] == 403
 
-        status, _ = post_form(port, "/actions/maintenance", form, {**signed, **origin})
-        assert status == 303
+        status, headers = post_form_headers(
+            port, "/actions/maintenance", form, {**signed, **origin}
+        )
+        assert status == 303 and headers["location"] == "../"
         assert daemon.request("/").status == 503
         assert "Maintenance off" in fetch_with(port, "/", {"Cookie": cookie})
         events = daemon.muructl("events").stdout
@@ -360,10 +390,45 @@ def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) 
             "dashboard.action" in events and "maintenance on for shop from the dashboard" in events
         )
 
-        post_form(port, "/actions/maintenance", {**form, "state": "off"}, {**signed, **origin})
+        # A browser's Sec-Fetch-Site vouches for the page whatever Host and
+        # Origin a proxy in front leaves.
+
+        proxied = {**signed, "Origin": "https://jupyter.test", "Sec-Fetch-Site": "same-origin"}
+        off = {**form, "state": "off"}
+        assert post_form(port, "/actions/maintenance", off, proxied)[0] == 303
         assert daemon.request("/").status == 200
+
+        # A script's token that may act needs no form token.
+
+        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
+        scripted = {"Authorization": f"Bearer {bearer}"}
+        assert (
+            post_form(port, "/actions/maintenance", {"app": "shop", "state": "on"}, scripted)[0]
+            == 303
+        )
+        assert daemon.request("/").status == 503
+        post_form(port, "/actions/maintenance", {"app": "shop", "state": "off"}, scripted)
     finally:
         daemon.stop()
+
+
+def post_form_headers(
+    port: int, path: str, fields: dict[str, str], headers: dict[str, str]
+) -> tuple[int, dict[str, str]]:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+
+    try:
+        connection.request(
+            "POST",
+            path,
+            body=urllib.parse.urlencode(fields),
+            headers={"Content-Type": "application/x-www-form-urlencoded", **headers},
+        )
+        response = connection.getresponse()
+        response.read()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}
+    finally:
+        connection.close()
 
 
 def fetch_with(port: int, path: str, headers: dict[str, str]) -> str:
@@ -376,8 +441,178 @@ def fetch_with(port: int, path: str, headers: dict[str, str]) -> str:
         connection.close()
 
 
-def test_login_links_need_the_actions_turned_on(served: tuple[Daemon, int]) -> None:
+def test_everything_but_the_metrics_and_assets_needs_a_session(
+    served: tuple[Daemon, int],
+) -> None:
     daemon, port = served
-    refused = daemon.muructl("dashboard", "login", check=False)
-    assert refused.returncode != 0 and "actions are off" in refused.stderr
-    assert fetch(port, "/login?code=anything")[0] == 404
+    status, headers, body = fetch(port, "/", signed=False)
+    assert status == 401 and headers["content-type"].startswith("text/html")
+    assert "muructl dashboard login" in body.decode()
+
+    for path in (
+        "/fragment/node/overview",
+        "/v1/status",
+        "/v1/apps",
+        "/v1/history",
+        "/v1/history/stream",
+        "/v1/events/stream",
+    ):
+        status, _, body = fetch(port, path, signed=False)
+        assert status == 401 and b"not signed in" in body, path
+
+    assert fetch(port, "/v1/apps", {"Authorization": "Bearer " + "0" * 64}, signed=False)[0] == 401
+    assert fetch(port, "/metrics", signed=False)[0] == 200
+    assert fetch(port, "/static/htmx.min.js", signed=False)[0] == 200
+
+    # A session from a plain login may look, and not act.
+
+    assert fetch(port, "/v1/apps")[0] == 200
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    assert "Maintenance on" not in fetch(port, "/")[2].decode()
+    refused = post_form(
+        port,
+        "/actions/maintenance",
+        {"app": "shop", "state": "on"},
+        {"Authorization": f"Bearer {TOKENS[port]}"},
+    )
+    assert refused[0] == 403 and b"may only look" in refused[1]
+
+    # Actions need the daemon's file to allow them.
+
+    refused_login = daemon.muructl("dashboard", "login", "--actions", check=False)
+    assert refused_login.returncode != 0 and "actions are off" in refused_login.stderr
+    assert fetch(port, "/login?code=anything", signed=False)[0] == 403
+
+    # A link for a dashboard reached at another address.
+
+    link = daemon.muructl(
+        "dashboard", "login", "--url", "https://jupyter.test/proxy/8090/"
+    ).stdout.strip()
+    assert re.fullmatch(r"https://jupyter\.test/proxy/8090/login\?code=[0-9a-f]{64}", link), link
+
+
+class PrefixProxy(http.server.ThreadingHTTPServer):
+    """Serve a backend under `/proxy/PORT/`, as jupyter-server-proxy does,
+    rewriting the Host header to the backend's."""
+
+    def __init__(self, backend: int) -> None:
+        self.backend = backend
+        super().__init__(("127.0.0.1", 0), PrefixProxyHandler)
+
+
+class PrefixProxyHandler(http.server.BaseHTTPRequestHandler):
+    server: PrefixProxy
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+    def forward(self) -> None:
+        prefix = f"/proxy/{self.server.backend}"
+        assert self.path.startswith(prefix + "/"), self.path
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else None
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.backend, timeout=10)
+
+        try:
+            connection.request(self.command, self.path[len(prefix) :], body=body, headers=headers)
+            response = connection.getresponse()
+            payload = response.read()
+            self.send_response(response.status)
+
+            for name, value in response.getheaders():
+                if name.lower() not in ("transfer-encoding", "connection", "content-length"):
+                    self.send_header(name, value)
+
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        finally:
+            connection.close()
+
+    do_GET = forward
+    do_POST = forward
+
+
+def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
+    port = support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        arguments=["--dashboard", f"127.0.0.1:{port}"],
+        config_extra="[dashboard]\nactions = true\n",
+    )
+    proxy = PrefixProxy(port)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    proxy_port = proxy.server_address[1]
+    base = f"http://127.0.0.1:{proxy_port}/proxy/{port}/"
+
+    def through(
+        url: str, headers: dict[str, str] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
+        parsed = urllib.parse.urlsplit(url)
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        return fetch(proxy_port, target, headers, signed=False)
+
+    try:
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+
+        # Signing in through the proxy lands on the page under the prefix.
+
+        link = daemon.muructl("dashboard", "login", "--actions", "--url", base).stdout.strip()
+        assert link.startswith(base + "login?code=")
+        status, headers, _ = through(link)
+        assert status == 303
+        page_url = urllib.parse.urljoin(link, headers["location"])
+        assert page_url == base
+        cookie = {"Cookie": headers["set-cookie"].split(";")[0]}
+
+        status, _, body = through(page_url, cookie)
+        assert status == 200
+        page = body.decode()
+
+        # Every address the page names resolves under the prefix.
+
+        addresses = re.findall(r'(?:href|src|hx-get|sse-connect)="([^"]+)"', page)
+        assert addresses and not [address for address in addresses if address.startswith("/")]
+
+        for address in addresses:
+            url = urllib.parse.urljoin(page_url, address)
+            assert url.startswith(base), url
+
+            if "stream" not in address:
+                assert through(url, cookie)[0] == 200, url
+
+        history = urllib.parse.urljoin(page_url, "v1/history?range=1h")
+        assert json.loads(through(history, cookie)[2])["range"] == "1h"
+
+        # An action posted from the page comes back to it.
+
+        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
+        action = re.search(r'<form method="post" action="([^"]+)"', page)
+        assert token is not None and action is not None
+        action_url = urllib.parse.urljoin(page_url, action.group(1))
+        connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+
+        try:
+            connection.request(
+                "POST",
+                urllib.parse.urlsplit(action_url).path,
+                body=urllib.parse.urlencode({"csrf": token.group(1), "app": "shop", "state": "on"}),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": f"http://127.0.0.1:{proxy_port}",
+                    "Sec-Fetch-Site": "same-origin",
+                    **cookie,
+                },
+            )
+            response = connection.getresponse()
+            response.read()
+            assert response.status == 303
+            assert urllib.parse.urljoin(action_url, response.getheader("Location", "")) == base
+        finally:
+            connection.close()
+
+        assert daemon.request("/").status == 503
+    finally:
+        proxy.shutdown()
+        daemon.stop()

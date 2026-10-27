@@ -22,7 +22,7 @@
     <td>{{ release.created }}</td>
     <td>{{ release.message }}</td>
     {% if let Some(token) = csrf %}
-    <td>{% if release.serving %}<form method="post" action="/actions/maintenance">
+    <td>{% if release.serving %}<form method="post" action="actions/maintenance">
       <input type="hidden" name="csrf" value="{{ token }}">
       <input type="hidden" name="app" value="{{ app.name }}">
       {% if app.maintenance_since.is_empty() %}<input type="hidden" name="state" value="on"><button>Maintenance on</button>{% else %}<input type="hidden" name="state" value="off"><button>Maintenance off</button>{% endif %}

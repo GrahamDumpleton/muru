@@ -1834,7 +1834,7 @@ pub(crate) fn warn_about_hsts(headers: &http::HeaderMap, host: &str, target: &st
     {
         tracing::warn!(
             "the application sent Strict-Transport-Security on {target}; browsers will apply it \
-             to every server on {host}, so leave HSTS to production (section 13.1)"
+             to every server on {host}, so leave HSTS to production"
         );
     }
 }

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Muru: {{ data.app }}</title>
-<link rel="stylesheet" href="/static/uplot.min.css">
+<link rel="stylesheet" href="static/uplot.min.css">
 <style>
 :root { color-scheme: light dark; }
 body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }
@@ -48,23 +48,23 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
   {% if let Some(https) = data.https %}<span>https://{{ https }}</span>{% endif %}
 </header>
 <main>
-  <section id="overview" hx-get="/fragment/overview" hx-trigger="every 2s" hx-swap="innerHTML">
+  <section id="overview" hx-get="fragment/overview" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "overview.html" %}
   </section>
   <section id="charts">
-    <div class="ranges"><a href="/?range=1h" data-range="1h">last hour</a><a href="/?range=24h" data-range="24h">last day</a></div>
+    <div class="ranges"><a href="?range=1h" data-range="1h">last hour</a><a href="?range=24h" data-range="24h">last day</a></div>
     <h2>Over time</h2>
     <div class="charts"><div id="chart-rate" class="chart"></div><div id="chart-latency" class="chart"></div></div>
   </section>
-  <section id="requests" hx-get="/fragment/requests" hx-trigger="every 2s" hx-swap="innerHTML">
+  <section id="requests" hx-get="fragment/requests" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "requests.html" %}
   </section>
-  <section id="logs" hx-get="/fragment/logs" hx-trigger="every 2s" hx-swap="innerHTML">
+  <section id="logs" hx-get="fragment/logs" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "logs.html" %}
   </section>
 </main>
-<script src="/static/htmx.min.js"></script>
-<script src="/static/uplot.min.js"></script>
-<script src="/static/charts.js"></script>
+<script src="static/htmx.min.js"></script>
+<script src="static/uplot.min.js"></script>
+<script src="static/charts.js"></script>
 </body>
 </html>

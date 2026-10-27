@@ -2480,7 +2480,11 @@ def elapsed_ms(since: float) -> str:
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the host's command line."""
 
-    parser = argparse.ArgumentParser(prog="python -m muru.host", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="python -m muru.host",
+        description="The host process muructl starts for a release: it imports the application "
+        "once and forks its workers.",
+    )
     parser.add_argument("--app", required=True, help="application as module:callable")
     parser.add_argument(
         "--name",
@@ -2501,12 +2505,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--reflection",
         action="store_true",
-        help="serve gRPC server reflection for the registered services (section 6.13)",
+        help="serve gRPC server reflection for the registered services",
     )
     parser.add_argument(
         "--factory",
         action="store_true",
-        help="the entrypoint is a factory returning the application (section 6.8)",
+        help="the entrypoint is a factory returning the application",
     )
     parser.add_argument(
         "--factory-phase",
@@ -2537,7 +2541,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--single",
         action="store_true",
-        help="serve in this process with one thread and no fork, for debuggers (section 13.1)",
+        help="serve in this process with one thread and no fork, for debuggers",
     )
     parser.add_argument(
         "--tcp-base-port",
@@ -2548,7 +2552,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--preload-gc-collect",
         action="store_true",
-        help="run one full collection after preload (section 6.2 step 2)",
+        help="run one full collection after preload",
     )
     parser.add_argument(
         "--detach",
@@ -2567,20 +2571,20 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=[],
         type=Group.parse,
         metavar="NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY",
-        help="a named worker group beside the default one (section 7.1)",
+        help="a named worker group beside the default one",
     )
     parser.add_argument(
         "--mount",
         action="append",
         default=[],
         metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]",
-        help="a named mount served by another entrypoint at a path (section 6.7)",
+        help="a named mount served by another entrypoint at a path",
     )
     parser.add_argument(
         "--log-level",
         choices=LOG_LEVELS,
         default=None,
-        help="the root logger's level (section 11.4); Python's WARNING when not given",
+        help="the root logger's level; Python's WARNING when not given",
     )
     parser.add_argument(
         "--log-format",
@@ -2612,28 +2616,28 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=int,
         default=None,
         metavar="N",
-        help="replace a worker after this many requests, with jitter (section 7.7)",
+        help="replace a worker after this many requests, with jitter",
     )
     parser.add_argument(
         "--max-lifetime",
         type=float,
         default=None,
         metavar="SECONDS",
-        help="replace a worker after this long, with jitter (section 7.7)",
+        help="replace a worker after this long, with jitter",
     )
     parser.add_argument(
         "--soft-timeout",
         type=float,
         default=None,
         metavar="SECONDS",
-        help="interrupt a request that has run this long with muru.RequestTimeout (section 7.6)",
+        help="interrupt a request that has run this long with muru.RequestTimeout",
     )
     parser.add_argument(
         "--hard-timeout",
         type=float,
         default=None,
         metavar="SECONDS",
-        help="replace a worker whose request has run this long (section 7.6)",
+        help="replace a worker whose request has run this long",
     )
     parser.add_argument(
         "--hard-drain-grace",
@@ -2647,7 +2651,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=float,
         default=10.0,
         metavar="SECONDS",
-        help="replace an ASGI worker whose event loop has not run for this long (section 7.6)",
+        help="replace an ASGI worker whose event loop has not run for this long",
     )
     parser.add_argument(
         "--shutdown-timeout",
@@ -2660,7 +2664,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--memory-measure",
         choices=("uss", "pss", "rss"),
         default="uss",
-        help="what the memory limits measure (section 7.7)",
+        help="what the memory limits measure",
     )
     parser.add_argument(
         "--memory-soft-limit",

@@ -18,6 +18,13 @@ repos:
         language: system
         types_or: [python, rust]
 
+      - id: user-text
+        stages: [pre-commit]
+        name: text users see names no design section, phase or ADR
+        entry: uv run python scripts/check-user-text.py
+        language: system
+        types_or: [python, rust]
+
       - id: commit-message
         name: commit message has no agent attribution
         entry: sh scripts/check-commit-message.sh

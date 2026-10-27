@@ -118,7 +118,7 @@ enum Command {
     Scale(admin::ScaleArgs),
 
     /// Overlays: list them, activate or end one by hand, preview what
-    /// one changes, or make one's changes permanent (section 9.10).
+    /// one changes, or make one's changes permanent.
     Overlay {
         #[command(subcommand)]
         command: admin::OverlayCommand,
@@ -152,7 +152,7 @@ enum Command {
         command: admin::ConfigCommand,
     },
 
-    /// Manage the file secret stores (section 10.8).
+    /// Manage the file secret stores.
     Secret {
         #[command(subcommand)]
         command: admin::SecretCommand,
@@ -194,7 +194,7 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
-    /// Serve a directory of files with no configuration (section 4.9),
+    /// Serve a directory of files with no configuration,
     /// for a built front end or a documentation build.
     ServeStatic(Box<ServeStaticArgs>),
 
@@ -425,7 +425,7 @@ struct RunArgs {
     timeouts: Vec<(String, Duration)>,
 
     /// Open connections the listener holds at once (default 65536);
-    /// beyond it clients get a fast 503 (section 4.18).
+    /// beyond it clients get a fast 503.
     #[arg(long, value_name = "N")]
     max_connections: Option<usize>,
 
@@ -458,7 +458,7 @@ struct RunArgs {
     #[arg(long, value_name = "ADDRESS")]
     dashboard: Option<String>,
 
-    /// Do not compress responses (section 4.17); they are compressed for
+    /// Do not compress responses; they are compressed for
     /// clients that accept br, zstd or gzip otherwise.
     #[arg(long)]
     no_compression: bool,
@@ -1608,7 +1608,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         anyhow::bail!(
             "muructl run serves loopback addresses only, because it is development mode: error \
              pages show tracebacks and nothing is persisted. --allow-public serves {} with those \
-             behaviours off, but production is the daemon's job (section 13.3, phase 2)",
+             behaviours off, but production is the daemon's job (muructl daemon start)",
             args.bind.ip
         );
     }
@@ -1835,12 +1835,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     if development {
         println!(
             "muru: development mode: error pages show tracebacks, nothing is persisted and only \
-             loopback is served; production runs under the daemon, which arrives in phase 2"
+             loopback is served; production runs under the daemon (muructl daemon start)"
         );
     } else {
         println!(
             "muru: --allow-public: development behaviours are off, but muructl run is not the \
-             supported way to run in production; that is the daemon, which arrives in phase 2"
+             supported way to run in production; that is the daemon (muructl daemon start)"
         );
     }
 
@@ -2071,5 +2071,64 @@ fn describe(paths: &[PathBuf]) -> String {
     match paths.len() {
         0 | 1 => first,
         more => format!("{first} and {} more", more - 1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::Cli;
+
+    /// Whether a line names a part of the design documents: a section, a
+    /// phase or an ADR, followed by its number.
+    fn names_design(line: &str) -> bool {
+        let lower = line.to_lowercase();
+
+        ["section ", "sections ", "phase ", "adr "]
+            .iter()
+            .any(|word| {
+                lower.match_indices(word).any(|(at, _)| {
+                    let starts_word = lower[..at]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|before| !before.is_alphanumeric());
+                    let numbered = lower[at + word.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|after| after.is_ascii_digit());
+                    starts_word && numbered
+                })
+            })
+    }
+
+    /// Help is for users, so it names no part of the design documents.
+    #[test]
+    fn help_names_no_design_documents() {
+        // Built here, so the strings themselves do not trip the
+        // repository's check of message text.
+
+        assert!(names_design(&format!("Deploy anyway ({} 9.6)", "section")));
+        assert!(names_design(&format!("arrives in {} 2", "Phase")));
+        assert!(!names_design(
+            "the subsection of the page, and phase out 9 times"
+        ));
+
+        let mut found = Vec::new();
+        let mut pending = vec![(String::from("muructl"), Cli::command())];
+
+        while let Some((path, mut command)) = pending.pop() {
+            let help = command.render_long_help().to_string();
+
+            for line in help.lines().filter(|line| names_design(line)) {
+                found.push(format!("{path}: {}", line.trim()));
+            }
+
+            for sub in command.get_subcommands() {
+                pending.push((format!("{path} {}", sub.get_name()), sub.clone()));
+            }
+        }
+
+        assert!(found.is_empty(), "{}", found.join("\n"));
     }
 }

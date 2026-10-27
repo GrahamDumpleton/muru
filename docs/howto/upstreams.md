@@ -56,8 +56,7 @@ less hop-by-hop ones, names with underscores and `X-Muru-*` headers, with
 `X-Forwarded-Host`, `X-Real-IP` and `X-Request-ID` added. A body without
 a declared length is read in full first and sent with a `Content-Length`;
 a declared length is streamed. A message carrying both `Content-Length`
-and `Transfer-Encoding` is read by its `Transfer-Encoding` and re-framed
-([ADR 0027](../project/adr/0027-ambiguous-framing-is-reframed-not-rejected.md)),
+and `Transfer-Encoding` is read by its `Transfer-Encoding` and re-framed,
 and an invalid `Content-Length` is refused with 400 before routing. The
 path arrives as the client sent it, prefix included.
 
