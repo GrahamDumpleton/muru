@@ -50,6 +50,12 @@ pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 /// (section 9.1).
 pub const RETAIN_WORKERS: u32 = 1;
 
+/// How long to wait for a release's processes to stop, given its stop
+/// budget: never less than the drain timeout.
+fn stop_wait(budget: Duration) -> Duration {
+    DRAIN_TIMEOUT.max(crate::host::stop_wait(budget))
+}
+
 /// The open WebSockets the dashboard lists, the longest open first.
 const DASHBOARD_SOCKETS: u32 = 200;
 
@@ -579,11 +585,12 @@ impl Backend {
         }
     }
 
-    /// Stop the processes; `grace` is what a managed server's instances
-    /// get before SIGKILL.
+    /// Stop the processes; `grace` is the release's stop budget: what a
+    /// managed server's instances, or a host's workers, get before
+    /// SIGKILL.
     async fn stop(self, grace: Duration) {
         match self {
-            Self::Host(host) => host.stop().await,
+            Self::Host(host) => host.stop(grace).await,
             Self::Servers(servers) => servers.stop(grace).await,
             Self::Dormant => {}
         }
@@ -3427,6 +3434,7 @@ impl Daemon {
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
+            websocket_drain_grace: Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             memory: spec.memory.clone(),
             env,
@@ -3470,7 +3478,7 @@ impl Daemon {
 
         if let Err(error) = host.wait_ready(START_TIMEOUT).await {
             let message = format!("{error:#}");
-            host.stop().await;
+            host.stop(release.spec.timeouts.stop_budget()).await;
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
@@ -4267,8 +4275,8 @@ impl Daemon {
         );
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let record = running.backend.record_path(&run_dir);
-        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
-        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
+        let grace = release.spec.timeouts.stop_budget();
+        let stopped = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
 
         if stopped.is_err() {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
@@ -5323,10 +5331,10 @@ impl Daemon {
             .store
             .release(app, id)
             .map_or(Duration::from_secs(5), |release| {
-                Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+                release.spec.timeouts.stop_budget()
             });
 
-        if tokio::time::timeout(DRAIN_TIMEOUT, backend.stop(grace))
+        if tokio::time::timeout(stop_wait(grace), backend.stop(grace))
             .await
             .is_err()
         {
@@ -6491,9 +6499,9 @@ impl Daemon {
             let grace = self
                 .store
                 .release(&app, &id)
-                .map(|release| Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms))
+                .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
-            let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
+            let _ = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
 
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");

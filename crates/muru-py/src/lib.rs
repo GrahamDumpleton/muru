@@ -72,7 +72,7 @@ type MountArgument = (String, Py<PyAny>, Option<Py<PyAny>>, Option<(usize, usize
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -96,6 +96,8 @@ fn serve(
     timeout_error: Option<Py<PyAny>>,
     grpc_methods: Vec<(String, String, bool, bool)>,
     loop_stall_timeout_ms: Option<u64>,
+    websocket_drain_ms: u64,
+    drain_ms: u64,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -200,6 +202,8 @@ fn serve(
         memory_interval: std::time::Duration::from_millis(memory_interval_ms.max(1000)),
         control,
         on_control,
+        websocket_drain: std::time::Duration::from_millis(websocket_drain_ms),
+        drain: std::time::Duration::from_millis(drain_ms),
     };
 
     py.detach(move || link::serve(&socket_path, shared, lifecycle))

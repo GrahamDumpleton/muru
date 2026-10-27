@@ -77,6 +77,9 @@ struct SendState {
     closed: bool,
 }
 
+/// The reason a WebSocket closed because its worker is stopping carries.
+const DRAIN_REASON: &str = "the server is going away";
+
 /// Body chunks held for the application before the link stops reading.
 const INBOX_CAPACITY: usize = 8;
 
@@ -231,6 +234,34 @@ impl Channel {
     /// `receive()` and every one after it gets `http.disconnect`.
     pub fn disconnect(&self) {
         self.disconnect_with(1005, "");
+    }
+
+    /// The worker is stopping: close an accepted WebSocket with 1001, as
+    /// the application would have, marked as a drain for the edge, and
+    /// give the application `websocket.disconnect` with the same code. A
+    /// socket the application has already closed is left alone.
+    pub fn close_for_drain(&self) {
+        {
+            let mut state = self.state.lock().expect("send state poisoned");
+
+            if state.closed || state.body_ended || !state.accepted {
+                return;
+            }
+
+            state.closed = true;
+        }
+
+        let tx = self.tx.clone();
+        self.runtime.spawn(async move {
+            let _ = tx
+                .send(Outgoing::Close {
+                    code: 1001,
+                    reason: DRAIN_REASON.to_owned(),
+                    draining: true,
+                })
+                .await;
+        });
+        self.disconnect_with(1001, DRAIN_REASON);
     }
 
     /// The WebSocket has ended with a close code: the next `receive()` and
@@ -592,9 +623,14 @@ impl Channel {
                     )?));
                 }
 
-                Ok(Some(
-                    self.enqueue(py, vec![Outgoing::Close { code, reason }])?,
-                ))
+                Ok(Some(self.enqueue(
+                    py,
+                    vec![Outgoing::Close {
+                        code,
+                        reason,
+                        draining: false,
+                    }],
+                )?))
             }
             "websocket.http.response.start" | "websocket.http.response.body" => {
                 if state.accepted {
@@ -857,6 +893,7 @@ impl Channel {
                 vec![Outgoing::Close {
                     code: 1000,
                     reason: String::new(),
+                    draining: false,
                 }],
             );
             return;
@@ -897,6 +934,7 @@ impl Channel {
                 vec![Outgoing::Close {
                     code: 1011,
                     reason: "internal error".to_owned(),
+                    draining: false,
                 }],
             );
             return;

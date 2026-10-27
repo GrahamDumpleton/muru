@@ -420,11 +420,11 @@ struct RunArgs {
     /// Override a timeout as NAME=DURATION: queue (5s), deadline (300s),
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
-    /// (off), hard (off), hard_drain_grace (10s), shutdown (5s) or
-    /// loop_stall (10s) in the host, which interrupts a request that runs
-    /// past the soft timeout and replaces a worker whose request runs
-    /// past the hard timeout, or whose event loop stalls past
-    /// loop_stall. Repeatable.
+    /// (off), hard (off), hard_drain_grace (10s), shutdown (5s),
+    /// websocket_drain_grace (0s) or loop_stall (10s) in the host, which
+    /// interrupts a request that runs past the soft timeout and replaces
+    /// a worker whose request runs past the hard timeout, or whose event
+    /// loop stalls past loop_stall. Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -841,6 +841,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "hard",
         "hard_drain_grace",
         "shutdown",
+        "websocket_drain_grace",
         "loop_stall",
     ]
     .contains(&name)
@@ -848,7 +849,7 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
              response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
-             shutdown or loop_stall"
+             shutdown, websocket_drain_grace or loop_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -985,8 +986,11 @@ pub(crate) struct HostTimeouts {
     pub hard: Option<Duration>,
     /// The grace for a replaced worker's other requests.
     pub hard_drain_grace: Duration,
-    /// The time before a stopping worker is killed.
+    /// The time before a stopping worker is killed, from when its
+    /// WebSockets are closed.
     pub shutdown: Duration,
+    /// How long a stopping worker keeps its open WebSockets.
+    pub websocket_drain_grace: Duration,
     /// How long an ASGI worker's event loop may stall.
     pub loop_stall: Duration,
 }
@@ -999,6 +1003,7 @@ impl HostTimeouts {
             hard_timeout: self.hard.map(muru_config::format_duration),
             hard_drain_grace: Some(muru_config::format_duration(self.hard_drain_grace)),
             shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
+            websocket_drain_grace: Some(muru_config::format_duration(self.websocket_drain_grace)),
             loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
         }
     }
@@ -1029,6 +1034,11 @@ pub(crate) fn worker_timeouts(
             parse(&table.shutdown_timeout, "shutdown_timeout")
         })?
         .unwrap_or(Duration::from_secs(5));
+    let mut websocket_drain_grace = table
+        .map_or(Ok(None), |table| {
+            parse(&table.websocket_drain_grace, "websocket_drain_grace")
+        })?
+        .unwrap_or_default();
     let mut loop_stall = table
         .map_or(Ok(None), |table| {
             parse(&table.loop_stall_timeout, "loop_stall_timeout")
@@ -1041,6 +1051,7 @@ pub(crate) fn worker_timeouts(
             "hard" => hard = Some(*duration),
             "hard_drain_grace" => grace = *duration,
             "shutdown" => shutdown = *duration,
+            "websocket_drain_grace" => websocket_drain_grace = *duration,
             "loop_stall" => loop_stall = *duration,
             _ => {}
         }
@@ -1070,6 +1081,7 @@ pub(crate) fn worker_timeouts(
         hard,
         hard_drain_grace: grace,
         shutdown,
+        websocket_drain_grace,
         loop_stall,
     })
 }
@@ -1730,6 +1742,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
@@ -1781,6 +1794,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         hard_timeout: timeouts.hard,
         hard_drain_grace: timeouts.hard_drain_grace,
         shutdown_timeout: timeouts.shutdown,
+        websocket_drain_grace: timeouts.websocket_drain_grace,
         loop_stall_timeout: timeouts.loop_stall,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
         env: resolved
@@ -1837,7 +1851,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
-        current.stop().await;
+        current.stop(stop_budget).await;
         let _ = std::fs::remove_dir_all(&run_dir);
         return Err(error);
     }
@@ -1876,7 +1890,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     {
         Ok(edge) => edge,
         Err(error) => {
-            current.stop().await;
+            current.stop(stop_budget).await;
             let _ = std::fs::remove_dir_all(&run_dir);
             return Err(explain_bind_error(error, https_address));
         }
@@ -2114,7 +2128,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     Ok(connected) => pools.replace(connected),
                                     Err(error) => {
                                         println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
-                                        next.stop().await;
+                                        next.stop(stop_budget).await;
                                         break;
                                     }
                                 }
@@ -2122,13 +2136,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 println!("muru: switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
-                                tokio::spawn(previous.stop());
+                                tokio::spawn(previous.stop(stop_budget));
                                 (control, host_messages) = host_control(&current).await;
                                 break;
                             }
                             Err(error) => {
                                 println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
-                                next.stop().await;
+                                next.stop(stop_budget).await;
                                 break;
                             }
                         },
@@ -2139,7 +2153,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             let mut paths = vec![path];
                             settle(&mut changed, &mut paths).await;
                             println!("muru: {} changed again, restarting the reload", describe(&paths));
-                            next.stop().await;
+                            next.stop(stop_budget).await;
                         }
                     }
                 }
@@ -2147,7 +2161,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     };
 
-    current.stop().await;
+    current.stop(stop_budget).await;
     let _ = std::fs::remove_dir_all(&run_dir);
     outcome
 }

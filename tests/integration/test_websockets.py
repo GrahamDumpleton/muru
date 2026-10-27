@@ -298,3 +298,46 @@ python = '{sys.executable}'
         assert "websocket=closed by=client code=1000 received=1 sent=1" in access
     finally:
         daemon.stop()
+
+
+@pytest.mark.parametrize("grace", [0.0, 2.0])
+def test_a_drained_release_closes_its_websockets_with_1001(tmp_path: Path, grace: float) -> None:
+    daemon = start_daemon(tmp_path)
+    config = tmp_path / "chat.toml"
+    config.write_text(
+        f"""[app.chat.release.r1]
+source = '{support.FIXTURES}'
+entrypoint = 'plain_asgi:application'
+interface = 'asgi'
+python = '{sys.executable}'
+
+[app.chat.release.r1.timeouts]
+websocket_drain_grace = '{grace}s'
+"""
+    )
+
+    try:
+        assert "ready and serving" in daemon.muructl("apply", "-f", str(config)).stdout
+
+        with connect(f"ws://127.0.0.1:{daemon.port}/ws/echo", open_timeout=10) as socket_:
+            socket_.send("hello")
+            assert socket_.recv() == "hello"
+            started = time.monotonic()
+
+            # The worker keeps the socket for its grace, then closes it
+            # with 1001 itself, and the drain is over once it has.
+
+            assert "is stopped" in daemon.muructl("drain", "chat@r1").stdout
+            drained = time.monotonic() - started
+            assert grace <= drained < grace + 3, drained
+
+            with pytest.raises(ConnectionClosed) as closed:
+                socket_.recv()
+
+        assert closed.value.rcvd is not None
+        assert closed.value.rcvd.code == 1001
+        assert "websocket disconnected with 1001" in daemon.muructl("logs", "chat@r1").stdout
+        assert "websocket=closed by=edge code=1001" in daemon.muructl("logs", "--access").stdout
+        assert 'by="edge",close="drained"} 1' in daemon.muructl("metrics").stdout
+    finally:
+        daemon.stop()

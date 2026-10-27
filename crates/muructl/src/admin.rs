@@ -1896,9 +1896,10 @@ pub struct DeployArgs {
 
     /// A host timeout as NAME=DURATION: soft (interrupt a request that
     /// runs this long; off), hard (replace a worker whose request runs
-    /// this long; off), hard_drain_grace (10s), shutdown (5s) or
-    /// loop_stall (replace an ASGI worker whose event loop stalls this
-    /// long; 10s). Repeatable.
+    /// this long; off), hard_drain_grace (10s), shutdown (5s),
+    /// websocket_drain_grace (how long a stopping worker keeps its open
+    /// WebSockets; 0s) or loop_stall (replace an ASGI worker whose event
+    /// loop stalls this long; 10s). Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -2168,10 +2169,19 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example hard=60s"))?;
     let name = name.trim();
 
-    if !["soft", "hard", "hard_drain_grace", "shutdown", "loop_stall"].contains(&name) {
+    if ![
+        "soft",
+        "hard",
+        "hard_drain_grace",
+        "shutdown",
+        "websocket_drain_grace",
+        "loop_stall",
+    ]
+    .contains(&name)
+    {
         return Err(format!(
-            "{name:?} is not a host timeout name: soft, hard, hard_drain_grace, shutdown or \
-             loop_stall"
+            "{name:?} is not a host timeout name: soft, hard, hard_drain_grace, shutdown, \
+             websocket_drain_grace or loop_stall"
         ));
     }
 
@@ -2266,6 +2276,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
+        websocket_drain_grace_ms: timeout_ms(&args.timeouts, "websocket_drain_grace"),
         loop_stall_timeout_ms: timeout_ms(&args.timeouts, "loop_stall"),
         memory_measure: memory_setting(&args.memory, "measure").unwrap_or_default(),
         memory_soft_limit: memory_setting(&args.memory, "soft_limit")

@@ -105,6 +105,14 @@ client that has been quiet for 30 seconds and closes a socket that stays
 silent for five minutes with 1001. Open sockets count against the worker's
 `--concurrency`, not against any thread count.
 
+A worker that stops, because its release is drained or replaced or the
+worker itself is recycled, closes its open sockets with 1001 ("the server
+is going away") after the `websocket_drain_grace` timeout, none by
+default: the application gets `websocket.disconnect` with 1001 and the
+client the same close, after which it can reconnect to the release that
+serves. [Stopping a worker](timeouts.md#stopping-a-worker) has the
+sequence.
+
 ## Watching WebSockets
 
 A WebSocket's handshake is logged and counted as a request when the

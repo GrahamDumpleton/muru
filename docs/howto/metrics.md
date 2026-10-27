@@ -55,7 +55,7 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_request_duration_seconds` | histogram | app, release, phase | time in the `queue` (waiting for a worker slot), in the `application` (until the response head arrived) and in `total`; the first two only for requests a worker served |
 | `muru_requests_in_flight` | gauge | app, release | requests taken and not yet answered; a WebSocket counts until the application accepts it |
 | `muru_websocket_connections` | gauge | app, release, group, mount | WebSockets open |
-| `muru_websockets_closed_total` | counter | app, release, group, mount, by, close | WebSockets closed: `by` is the side that closed first (`client`, `application` or `edge`) and `close` how, one of `normal`, `going_away`, `idle_timeout`, `abnormal` (gone without a close frame), `too_large`, `protocol_error`, `server_error` or `other` |
+| `muru_websockets_closed_total` | counter | app, release, group, mount, by, close | WebSockets closed: `by` is the side that closed first (`client`, `application`, or `edge` for Muru itself) and `close` how, one of `normal`, `going_away`, `idle_timeout`, `drained` (its worker was stopping), `abnormal` (gone without a close frame), `too_large`, `protocol_error`, `server_error` or `other` |
 | `muru_websocket_duration_seconds` | histogram | app, release, group | how long WebSockets stayed open, in buckets from a second to a day |
 | `muru_rate_limited_total` | counter | limit, client_class, action | requests a [rate limit](client-classes.md) refused (`rejected`), held (`delayed`) or only counted (`logged`) |
 | `muru_upload_spool_bytes` | gauge | app | bytes the edge holds for each application's [uploads](uploads.md) in progress |

@@ -157,15 +157,20 @@ struct Closing {
     /// The client was cut off in the middle of a message, so the rest of
     /// it is still arriving and is read away before the socket is dropped.
     drain_client: bool,
-    /// The side that closed first, and its code: client, application or
-    /// edge.
-    first: Option<(&'static str, u16)>,
+    /// The side that closed first, its code and the outcome: client,
+    /// application or edge.
+    first: Option<(&'static str, u16, &'static str)>,
 }
 
 impl Closing {
     /// Note who closed and with what code, unless a side already has.
     fn ended(&mut self, by: &'static str, code: u16) {
-        self.first.get_or_insert((by, code));
+        self.ended_as(by, code, crate::access::close_outcome(by, code));
+    }
+
+    /// As `ended`, with an outcome the code does not tell.
+    fn ended_as(&mut self, by: &'static str, code: u16, close: &'static str) {
+        self.first.get_or_insert((by, code, close));
     }
 
     /// Both sides have closed in order: the link connection can be reused.
@@ -329,7 +334,16 @@ pub(crate) async fn relay(relay: Relay) {
 
                     let close = pb::Close::decode(next.payload).unwrap_or_default();
                     let code = u16::try_from(close.code).unwrap_or(1000);
-                    closing.ended("application", code);
+
+                    // A worker on its way to stopping closes its sockets
+                    // itself, which is Muru's doing, not the application's.
+
+                    if close.draining {
+                        closing.ended_as("edge", code, "drained");
+                    } else {
+                        closing.ended("application", code);
+                    }
+
                     closing.worker_closed = true;
 
                     if !closing.told_client && !closing.stream_done {
@@ -381,8 +395,8 @@ pub(crate) async fn relay(relay: Relay) {
     back.give_reader(intact.then_some(reader));
 
     if let Some(counted) = counted {
-        let (by, code) = closing.first.unwrap_or(("edge", 1006));
-        counted.close(by, code);
+        let (by, code, close) = closing.first.unwrap_or(("edge", 1006, "abnormal"));
+        counted.close_as(by, code, close);
     }
 }
 
@@ -521,6 +535,7 @@ async fn send_close(writer: &mut Writer, code: u16, reason: &str) -> std::io::Re
     let close = pb::Close {
         code: u32::from(code),
         reason: reason.to_owned(),
+        draining: false,
     };
     frame::write(writer, kind::CLOSE, 0, close.encode_to_vec().into()).await
 }

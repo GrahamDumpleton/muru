@@ -126,7 +126,7 @@ pub struct WebSocketEnd {
     /// The close code.
     pub code: u16,
     /// The outcome, from a fixed set: normal, going_away, idle_timeout,
-    /// abnormal, too_large, protocol_error, server_error or other.
+    /// drained, abnormal, too_large, protocol_error, server_error or other.
     pub close: &'static str,
     /// Messages received from the client.
     pub received: u64,
@@ -236,7 +236,7 @@ pub struct WebSocket {
     log: Arc<AccessLog>,
     id: u64,
     socket: Arc<Socket>,
-    end: Option<(&'static str, u16)>,
+    end: Option<(&'static str, u16, &'static str)>,
 }
 
 impl WebSocket {
@@ -255,17 +255,22 @@ impl WebSocket {
     }
 
     /// The socket has closed, `by` the side that closed first with `code`.
-    pub fn close(mut self, by: &'static str, code: u16) {
-        self.end = Some((by, code));
+    pub fn close(self, by: &'static str, code: u16) {
+        self.close_as(by, code, close_outcome(by, code));
+    }
+
+    /// The socket has closed with an outcome its code does not tell, such
+    /// as `drained` for one its worker closed on its way to stopping.
+    pub fn close_as(mut self, by: &'static str, code: u16, close: &'static str) {
+        self.end = Some((by, code, close));
     }
 }
 
 impl Drop for WebSocket {
     fn drop(&mut self) {
-        let (by, code) = self.end.unwrap_or(("edge", 1006));
+        let (by, code, close) = self.end.unwrap_or(("edge", 1006, "abnormal"));
         let socket = &self.socket;
         let lifetime = socket.opened.elapsed();
-        let close = close_outcome(by, code);
         self.log
             .websockets
             .lock()

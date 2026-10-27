@@ -65,7 +65,6 @@ from muru.hooks import Hooks
 
 WSGIApplication = Callable[..., Any]
 
-SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
 
 # How long a replacement waits for the supervisor to say the edge routes
@@ -529,6 +528,7 @@ class Host:
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
+        websocket_drain_grace: float = 0.0,
         loop_stall_timeout: float = 10.0,
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
@@ -549,6 +549,7 @@ class Host:
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
+        self.websocket_drain_grace = websocket_drain_grace
         self.loop_stall_timeout = loop_stall_timeout
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
@@ -1022,13 +1023,18 @@ class Host:
         # Section 7.6: the soft timeout interrupts a request by raising
         # muru.RequestTimeout in its thread, or cancelling its task.
 
-        timeout_arguments: dict[str, Any] = {}
+        # Told to stop, a worker keeps its open WebSockets for their grace,
+        # then closes them with 1001 and gives what is left the shutdown
+        # timeout, before the host kills it.
+
+        timeout_arguments: dict[str, Any] = {
+            "websocket_drain_ms": int(self.websocket_drain_grace * 1000),
+            "drain_ms": int(self.shutdown_timeout * 1000),
+        }
 
         if self.soft_timeout is not None:
-            timeout_arguments = {
-                "soft_timeout_ms": int(self.soft_timeout * 1000),
-                "timeout_error": RequestTimeout,
-            }
+            timeout_arguments["soft_timeout_ms"] = int(self.soft_timeout * 1000)
+            timeout_arguments["timeout_error"] = RequestTimeout
 
         # Section 7.6: the event loop beats twice a second, and a native
         # watchdog tells the host when it has stopped beating for longer
@@ -2232,7 +2238,7 @@ class Host:
             and now >= replacement.terminate_at
         ):
             replacement.terminated = True
-            replacement.kill_at = now + self.shutdown_timeout
+            replacement.kill_at = now + self.stop_budget()
             self.signal(replacement.old_pid, signal.SIGTERM)
 
         if (
@@ -2412,8 +2418,16 @@ class Host:
                 del self.restart_after[index]
                 self.spawn(index, replacing=index in self.starting)
 
+    def stop_budget(self) -> float:
+        """Return how long a worker told to stop may take before it is killed.
+
+        That is the WebSockets' grace, then the shutdown timeout.
+        """
+
+        return self.websocket_drain_grace + self.shutdown_timeout
+
     def terminate_all(self) -> None:
-        """Stop every worker: SIGTERM, a grace period, then SIGKILL."""
+        """Stop every worker: SIGTERM, its stop budget, then SIGKILL."""
 
         for pid in self.workers:
             try:
@@ -2423,7 +2437,7 @@ class Host:
 
         # Reap whatever exits within the grace period.
 
-        deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+        deadline = time.monotonic() + self.stop_budget()
 
         while self.workers and time.monotonic() < deadline:
             try:
@@ -2695,7 +2709,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=float,
         default=5.0,
         metavar="SECONDS",
-        help="how long a worker told to stop gets before it is killed",
+        help="how long a worker told to stop gets before it is killed, after its WebSockets close",
+    )
+    parser.add_argument(
+        "--websocket-drain-grace",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="how long a worker told to stop keeps its open WebSockets before closing them",
     )
     parser.add_argument(
         "--memory-measure",
@@ -2897,6 +2918,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
+        websocket_drain_grace=args.websocket_drain_grace,
         loop_stall_timeout=args.loop_stall_timeout,
         memory=MemoryPolicy(
             measure=args.memory_measure,

@@ -35,10 +35,6 @@ use crate::asgi;
 use crate::pool::Shared;
 use crate::wsgi::{self, Outgoing};
 
-/// How long the event loop's requests may take to finish on drain, until
-/// drain timeouts arrive with the daemon.
-const DRAIN_WAIT: Duration = Duration::from_secs(30);
-
 /// Errors from the link server.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -80,6 +76,12 @@ pub struct Lifecycle {
     /// Answers a control request: called with the request line and the
     /// requests in flight, returns the response line.
     pub on_control: Option<Py<PyAny>>,
+    /// How long open WebSockets keep running once the worker is told to
+    /// stop, before they are closed with 1001.
+    pub websocket_drain: Duration,
+    /// How long the event loop's requests then get to finish, the host's
+    /// shutdown timeout, before the worker stops waiting for them.
+    pub drain: Duration,
 }
 
 /// What a signal asks of the worker.
@@ -204,13 +206,19 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     shared.shutdown_pools();
 
     // The pool joins its threads; the loop's requests are waited for here.
+    // Open WebSockets keep running for their grace, then are closed with
+    // 1001 (section 5.6), and what is left gets the shutdown timeout.
 
     if shared.asgi.is_some() {
-        let deadline = Instant::now() + DRAIN_WAIT;
+        let wait = |deadline: Instant| {
+            while shared.in_flight() > 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
 
-        while shared.in_flight() > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait(Instant::now() + lifecycle.websocket_drain);
+        shared.close_websockets();
+        wait(Instant::now() + lifecycle.drain);
     }
 
     stop_watchdog.store(true, Ordering::Relaxed);
@@ -1083,16 +1091,26 @@ async fn handle_websocket(
 ) -> io::Result<Option<frame::Frame>> {
     use tokio::io::AsyncBufReadExt;
 
+    let mut draining = shared.draining();
+    let mut drained = false;
+
     let read_side = async {
         channel.deliver_connect().await;
 
         loop {
             // Before the accept, the response ending (a decline) ends the
-            // request; after it, only the edge's CLOSE does.
+            // request; after it, only the edge's CLOSE does. A worker told
+            // to stop closes an accepted socket itself and waits for the
+            // edge's CLOSE in answer.
 
             let ended = tokio::select! {
                 biased;
                 _ = done.notified(), if !channel.accepted() => None,
+                _ = draining.wait_for(|draining| *draining), if channel.accepted() && !drained => {
+                    drained = true;
+                    channel.close_for_drain();
+                    continue;
+                }
                 buffered = reader.fill_buf() => Some(buffered.map(|buffered| buffered.is_empty())),
             };
 
@@ -1373,7 +1391,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                 }
 
                 if upgraded {
-                    return write_close(writer, 1000, "").await;
+                    return write_close(writer, 1000, "", false).await;
                 }
 
                 if !buffer.is_empty() {
@@ -1577,9 +1595,13 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
             Some(Some(Outgoing::Trailers(_))) => {
                 // Only a gRPC call sends trailers, through its own writer.
             }
-            Some(Some(Outgoing::Close { code, reason })) => {
+            Some(Some(Outgoing::Close {
+                code,
+                reason,
+                draining,
+            })) => {
                 if upgraded {
-                    return write_close(writer, code, &reason).await;
+                    return write_close(writer, code, &reason, draining).await;
                 }
             }
             Some(Some(Outgoing::Abort {
@@ -1593,7 +1615,7 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
 
                 if upgraded {
                     eprintln!("muru: {error}");
-                    return write_close(writer, 1011, "internal error").await;
+                    return write_close(writer, 1011, "internal error", false).await;
                 }
 
                 if !buffer.is_empty() {
@@ -1627,10 +1649,16 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
 }
 
 /// End a WebSocket from the worker's side (section 5.6).
-async fn write_close(writer: &mut Writer, code: u16, reason: &str) -> io::Result<()> {
+async fn write_close(
+    writer: &mut Writer,
+    code: u16,
+    reason: &str,
+    draining: bool,
+) -> io::Result<()> {
     let close = pb::Close {
         code: u32::from(code),
         reason: reason.to_owned(),
+        draining,
     };
     frame::write(writer, kind::CLOSE, 0, close.encode_to_vec().into()).await
 }
