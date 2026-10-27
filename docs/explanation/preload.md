@@ -5,7 +5,7 @@
 
 Everything on this page is implemented in development mode: the preload
 modes, the import check and its fallback, the lifecycle hooks and
-`muru.context()`. The daemon will use the same host code.
+`muru.context()`. The daemon uses the same host code.
 ```
 
 Muru imports your application once, in a host process, and forks workers

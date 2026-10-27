@@ -3,8 +3,9 @@
 ```{admonition} Status
 :class: note
 
-This tutorial covers development mode, which is what exists today. It uses
-the pre-releases on PyPI; while Muru has only pre-releases, pip and uv
+This tutorial covers development mode; the [daemon](../howto/daemon.md)
+guide takes an application on to production. It uses the pre-releases on
+PyPI; while Muru has only pre-releases, pip and uv
 install the newest one without being asked for `--pre`.
 ```
 
@@ -178,5 +179,5 @@ on loopback only and is read-only.
   check that runs before workers are forked, and the message you will see
   when an import opens a connection too early.
 - Development mode serves loopback only and is not for production, which
-  is the daemon's job in the next phase; the [roadmap](../project/roadmap.md)
-  says when.
+  is the daemon's job: the [daemon](../howto/daemon.md) guide starts one
+  and deploys an application to it.

@@ -1,13 +1,9 @@
 # The worker protocol
 
 ```{admonition} Status
-:class: warning
+:class: note
 
-This page describes the design Muru is being built to. Today the link
-carries WSGI requests and responses between one edge and its workers,
-including the abort described below. WebSockets, file passing and most of
-the capability exchange are not implemented yet. The
-[roadmap](../project/roadmap.md) says what comes when.
+Everything on this page is implemented, for WSGI and ASGI workers.
 ```
 
 The edge and each worker talk over a private link: a Unix socket that the

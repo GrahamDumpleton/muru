@@ -1,14 +1,11 @@
 # Architecture
 
 ```{admonition} Status
-:class: warning
+:class: note
 
-This page describes the design Muru is being built to, so that the shape of
-the system can be understood before it ships. Today a single edge process
-and a host with forked workers serve WSGI applications in development mode,
-over the worker link described here. The daemon, releases and traffic
-policies do not exist yet. The [roadmap](../project/roadmap.md) says what
-comes when.
+Everything on this page is implemented, on one node with one edge
+process. Several edge processes and more than one node are still to
+come; the [roadmap](../project/roadmap.md) says when.
 ```
 
 Muru splits serving a Python web application into three kinds of process

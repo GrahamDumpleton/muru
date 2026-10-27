@@ -1,14 +1,10 @@
 # How-to guides
 
-Recipes for specific tasks, assuming you already know the basics. These pages
-are written as each capability lands.
+Recipes for specific tasks, assuming you already know the basics.
 
-Still to be written, as their features land:
+Still to be written:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
-- Uploads, including upload adapters for Django, Flask and Starlette.
-- Scaling and schedules.
-- Log rotation.
 - Containers and images.
 - uv and Python versions.
 - OpenTelemetry export.

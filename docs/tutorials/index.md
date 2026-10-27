@@ -1,9 +1,11 @@
 # Tutorials
 
 Step-by-step lessons that take you from installing muructl to running your
-first canary. These pages are written as each capability lands.
+first canary. Until the later ones are written, the
+[daemon](../howto/daemon.md) and [rollouts](../howto/rollouts.md) guides
+cover the same ground.
 
-Still to be written, as their features land:
+Still to be written:
 
 - Run an ASGI app with WebSockets.
 - Deploy with the daemon and roll back.

@@ -14,20 +14,23 @@ rollback are policy changes, not restarts.
 ```{admonition} Status
 :class: warning
 
-Muru is early in its life. What works today is development mode:
-`muructl run` serves a WSGI or ASGI application on your machine with
-HTTP/1.1, HTTP/2, HTTPS and WebSockets, forked workers, lifecycle hooks
-and ASGI lifespan, watch reload, an access log and a small dashboard, and
-it has been tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI. The daemon deploys releases from source directories with
-blue/green switches, rollback and drains, serves them by virtual host
-with TLS, and applies, exports and compares declarative configuration
-files. Traffic management and the rest of the daemon are still to come.
-The [tutorial](tutorials/first-wsgi-app.md) shows what exists, the
-[design specification](project/design/index.md) describes what is being built
-and the [roadmap](project/roadmap.md) describes in what order. Pre-releases
-of the 0.1.0 line are on PyPI: `uv tool install muructl` for the command and
-`muru` in your application's environment for the runtime library.
+Muru is in alpha: the 0.1.0 pre-releases are on PyPI, and commands and
+configuration may still change between them. Development mode,
+`muructl run`, serves a WSGI or ASGI application on your machine. The
+daemon serves applications on one node: releases with blue/green
+switches, canaries with gates, traffic policies, previews, rollback and
+drains, virtual hosts with TLS, worker groups that scale, overlays and
+schedules, uploads, mounts, upstreams, client classes, metrics, logs,
+events and a dashboard, declared in files or on the command line. Both
+are tested with plain WSGI and ASGI, Flask, Django, Starlette and
+FastAPI. Still to come are uv provisioning of interpreters, container
+releases, ACME certificates, HTTP/3, OpenTelemetry export, several edge
+processes and more than one node. The
+[tutorial](tutorials/first-wsgi-app.md) is the place to start, the
+[how-to guides](howto/index.md) cover each feature and the
+[roadmap](project/roadmap.md) says what comes next. Run
+`uv tool install muructl` for the command, and add `muru` to your
+application's environment for the runtime library.
 ```
 
 ```{admonition} A note on how Muru is built

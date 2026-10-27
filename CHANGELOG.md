@@ -9,6 +9,22 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a8 (2026-10-27)
+
+### Changed
+
+- Both dashboards may now be shown in a frame by a page of the same origin,
+  such as a JupyterLab pane through jupyter-server-proxy; other sites still
+  may not frame them.
+
+### Documentation
+
+- The README and the documentation now describe what the daemon does today,
+  with canaries, traffic policies, scaling and the other features added in
+  0.1.0a5 and 0.1.0a6, instead of describing development mode as the only
+  part that works.
+
+
 ## 0.1.0a7 (2026-10-27)
 
 ### Added

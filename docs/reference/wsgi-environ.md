@@ -3,8 +3,8 @@
 ```{admonition} Status
 :class: note
 
-These are the keys development mode sets today. Keys that arrive with
-mounts, virtual hosts, trusted proxies and the daemon are listed in
+These are the keys Muru sets, in development mode and under the daemon.
+Keys still to come are listed with the rest in
 [appendix D](../project/design/appendices/d-environ-keys-scope-extensions-and-environment-variables.md)
 of the design specification.
 ```
@@ -17,7 +17,7 @@ it adds.
 
 | Key | Value |
 | --- | --- |
-| `REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING` | From the request line. `SCRIPT_NAME` is empty until mounts arrive |
+| `REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING` | From the request line. `SCRIPT_NAME` is the prefix a [trusted proxy](../howto/behind-a-proxy.md) stripped joined with the [mount's](../howto/mounts.md) path, empty when there is neither |
 | `SERVER_PROTOCOL` | `HTTP/1.0`, `HTTP/1.1` or `HTTP/2.0`, the client's protocol |
 | `SERVER_NAME`, `SERVER_PORT` | The listener's address and port |
 | `REMOTE_ADDR`, `REMOTE_PORT` | The client's address and port |
