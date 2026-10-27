@@ -4,13 +4,14 @@
 :class: note
 
 The daemon serves one or more applications on one node, each deployed
-from a source directory with the blue/green strategy, with rollback,
-drains and an event log, through an edge process of its own, and it can
-be stopped and started again without interrupting traffic. Applications,
-releases, virtual hosts and routes can be declared in files and applied,
-exported and compared, and TLS listeners serve each host's certificate.
-What is still to come: canaries, worker groups, and the rest of the
-roadmap.
+from a source directory, with rollback, drains and an event log, through
+an edge process of its own, and it can be stopped and started again
+without interrupting traffic. Applications, releases, virtual hosts and
+routes can be declared in files and applied, exported and compared.
+This page covers starting the daemon and deploying; the other how-to
+guides cover what it does with a deployed application, from
+[rollouts](rollouts.md) to [scaling](scaling.md). Several edge processes
+and more than one node are still to come.
 ```
 
 `muructl run` is for development. For an application that stays up, start

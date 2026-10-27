@@ -93,6 +93,7 @@ def test_pages_show_the_node_its_releases_requests_events_and_logs(
     assert status == 200
     assert headers["content-type"].startswith("text/html")
     assert "default-src 'none'" in headers["content-security-policy"]
+    assert "frame-ancestors 'self'" in headers["content-security-policy"]
     page = body.decode()
     assert "<title>Muru: daemon</title>" in page
     assert f"http://127.0.0.1:{daemon.port}" in page

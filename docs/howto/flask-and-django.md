@@ -3,8 +3,9 @@
 ```{admonition} Status
 :class: note
 
-Development mode. Both frameworks are part of Muru's own test suite, so
-what this page describes is exercised on every change.
+Both frameworks are part of Muru's own test suite, so what this page
+describes is exercised on every change. The examples use development
+mode; under the [daemon](daemon.md) the same entrypoint is deployed.
 ```
 
 Nothing in either framework needs to know about Muru. Point `muructl run`

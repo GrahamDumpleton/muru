@@ -45,6 +45,7 @@ def test_page_shows_workers_requests_and_logs(dashboard: tuple[support.Server, i
     assert status == 200
     assert headers["content-type"].startswith("text/html")
     assert "default-src 'none'" in headers["content-security-policy"]
+    assert "frame-ancestors 'self'" in headers["content-security-policy"]
     page = body.decode()
     assert "<title>Muru: wsgi_conformance:application</title>" in page
     assert "release r1" in page

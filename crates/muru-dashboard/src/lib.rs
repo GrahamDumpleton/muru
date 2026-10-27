@@ -590,11 +590,13 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Body> {
 
     // Section 10.7: a strict content security policy; the only scripts
     // and stylesheets are the embedded ones, the page's own styles are
-    // inline, and the streams connect back to the same origin.
+    // inline, and the streams connect back to the same origin. A page of
+    // the same origin may show the dashboard in a frame, as JupyterLab
+    // does through jupyter-server-proxy; no other site may.
 
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'"
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'self'"
             .parse()
             .expect("static"),
     );

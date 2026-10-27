@@ -169,7 +169,7 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "ADDRESS")]
     metrics: Option<SocketAddr>,
 
-    /// Serve the read-only dashboard and JSON gateway on this loopback
+    /// Serve the dashboard and JSON gateway on this loopback
     /// address, instead of the [dashboard] table's listen address (none
     /// by default).
     #[arg(long, value_name = "ADDRESS")]

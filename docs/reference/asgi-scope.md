@@ -3,9 +3,9 @@
 ```{admonition} Status
 :class: note
 
-These are the keys development mode sets today, for `http` and
-`websocket` scopes. The `tls` extension and the keys that arrive with
-mounts, virtual hosts and the daemon are listed in
+These are the keys Muru sets, in development mode and under the daemon,
+for `http` and `websocket` scopes. Keys still to come are listed with the
+rest in
 [appendix D](../project/design/appendices/d-environ-keys-scope-extensions-and-environment-variables.md)
 of the design specification.
 ```
@@ -26,7 +26,7 @@ Muru fills them and what it adds.
 | `path` | The request path, percent-decoded, including `root_path` |
 | `raw_path` | The path as received, bytes, still encoded |
 | `query_string` | The query string, bytes, still encoded |
-| `root_path` | Empty until mounts arrive |
+| `root_path` | The prefix a [trusted proxy](../howto/behind-a-proxy.md) stripped joined with the [mount's](../howto/mounts.md) path, empty when there is neither |
 | `headers` | A list of `(name, value)` byte pairs, names lower case, in the order received. Hop-by-hop headers never appear. A body sent without `Content-Length` (chunked) is buffered by the edge, which adds a `content-length` pair for it |
 | `client` | `(address, port)` of the client |
 | `server` | `(address, port)` of the listener |
