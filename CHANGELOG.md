@@ -59,6 +59,7 @@ breaking changes, which are listed under each release.
 - Fixed a native deploy after a managed server release failing to start: it took the server release's worker count of zero as its own.
 - Fixed a worker whose default mount is WSGI running on a single thread when it also had an ASGI or gRPC mount: it now has its `threads`.
 - `Upload.save()` on Linux with Python 3.13 and earlier now links an upload without a spool path into place, as it does on 3.14, instead of copying it.
+- Fixed the daemon freezing when the routing changed while a worker was stopped or frozen: the edge now gives up on a worker that has not answered HELLO within 5 s and keeps its routing, the change fails naming the worker, and the daemon waits at most 30 s for an edge to apply a snapshot.
 
 ### Security
 

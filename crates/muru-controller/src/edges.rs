@@ -89,6 +89,11 @@ pub fn directory(run_dir: &Path) -> PathBuf {
 /// named for its layout.
 pub const BUCKETS_FILE: &str = "rate-buckets-v1";
 
+/// How long the daemon waits for the edge to apply a snapshot. The edge
+/// connects to every worker it names first, each within its own bound, so
+/// this only guards the daemon's loop against an edge that never answers.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The control socket and the listener-return socket of an edge of the
 /// given generation, in the edges' directory.
 pub fn socket_paths(directory: &Path, generation: u32) -> (PathBuf, PathBuf) {
@@ -276,12 +281,19 @@ impl EdgeProcess {
         };
         *self.control_now.lock().expect("control poisoned") = self.spec.control.clone();
         let mut client = connect(&self.spec.control).await?;
-        client
-            .apply(self.snapshot.clone())
+
+        tokio::time::timeout(APPLY_TIMEOUT, client.apply(self.snapshot.clone()))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the edge did not apply the snapshot within {} s",
+                    APPLY_TIMEOUT.as_secs()
+                )
+            })?
             .map_err(|status| {
                 anyhow::anyhow!("the edge refused the snapshot: {}", status.message())
             })?;
+
         Ok(())
     }
 

@@ -27,6 +27,8 @@ The edge talks to each worker over a private link: a Unix socket the worker list
 
 - **Both ends in Rust.** The worker side is in the Rust extension, started after fork. Nothing on the link involves Python until a request is handed to an application thread or the event loop.
 
+- **Details fixed by the implementation.** A worker has 5 s to answer HELLO on a new connection, since one that is stopped or frozen accepts the connection and never answers. The edge connects to every worker a snapshot names before it replaces the last one, so a snapshot naming such a worker is refused, the edge keeps its last good snapshot (section 2.4), and the change that pushed it fails naming the worker. The daemon waits at most 30 s for an edge to apply a snapshot.
+
 ## 5.2 Frames and messages
 
 Every frame is a six byte header followed by its payload: a 32 bit little-endian payload length, a kind byte and a flags byte. Payloads are at most 16 MiB. Structured payloads are protobuf messages from muru.worker.v1; BODY and MESSAGE payloads are raw bytes.

@@ -212,6 +212,32 @@ def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
     assert daemon.get("/").status == 200
 
 
+def test_a_stopped_worker_does_not_hold_up_the_daemon(daemon: Daemon) -> None:
+    deploy_plain(daemon, processes=1)
+    pid = json.loads(daemon.get("/info").body)["pid"]
+    os.kill(pid, signal.SIGSTOP)
+
+    # A snapshot names the stopped worker, which accepts the edge's
+    # connection and never answers HELLO: the edge gives up on it, keeping
+    # its last snapshot, and the daemon goes on answering.
+
+    try:
+        started = time.monotonic()
+        refused = daemon.muructl("maintenance", "on", "plain", check=False)
+        assert time.monotonic() - started < 15
+        assert "did not answer HELLO within 5 s" in refused.stderr, refused.stderr
+
+        started = time.monotonic()
+        assert "plain@r1" in daemon.muructl("release", "list", "plain").stdout
+        daemon.muructl("debug", "status", "plain")
+        assert time.monotonic() - started < 5
+    finally:
+        os.kill(pid, signal.SIGCONT)
+
+    daemon.muructl("maintenance", "off", "plain")
+    assert daemon.get("/").status == 200
+
+
 def test_stacks_are_read_from_outside_a_worker_holding_the_interpreter(daemon: Daemon) -> None:
     if not readable_from_outside():
         pytest.skip("reading a worker from outside needs Python 3.14 or later, and root on macOS")

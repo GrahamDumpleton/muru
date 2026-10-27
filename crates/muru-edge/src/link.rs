@@ -51,6 +51,12 @@ use crate::{BoxError, Limits, ResponseBody, close_after, request_head};
 const DISCARD_LIMIT: usize = 1024 * 1024;
 const DISCARD_DELAY: Duration = Duration::from_secs(2);
 
+/// How long a worker has to answer HELLO on a new connection. A worker
+/// that is stopped or frozen accepts the connection but never answers, and
+/// without a bound a snapshot naming it would never be applied (section
+/// 5.1).
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The largest request body accepted by default (max_body_size in section 4.6, with
 /// the same default as mod_wsgi-express). A declared length beyond it is
 /// refused before anything is read; an undeclared one as soon as it is
@@ -461,6 +467,20 @@ fn capacity(hello: &pb::Hello) -> usize {
 }
 
 async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
+    tokio::time::timeout(HELLO_TIMEOUT, handshake(path))
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the worker did not answer HELLO within {} s",
+                    HELLO_TIMEOUT.as_secs()
+                ),
+            ))
+        })
+}
+
+async fn handshake(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     let stream = UnixStream::connect(path).await?;
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::with_capacity(32 * 1024, FdReader::new(read_half));
