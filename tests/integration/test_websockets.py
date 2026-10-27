@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import json
 import socket
-from collections.abc import Iterator
+import sys
+import time
+import urllib.request
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 from support import server as support
+from support.daemon import start_daemon
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import ClientConnection, connect
 
@@ -176,3 +181,163 @@ def test_upgrade_to_a_wsgi_application_is_an_ordinary_request() -> None:
 
     assert answer.startswith(b"HTTP/1.1 200")
     assert b"Hello, world!" in answer
+
+
+def metric(text: str, name: str, *labels: str) -> float:
+    """Sum the samples of `name` whose labels include each of `labels`."""
+
+    total = 0.0
+
+    for line in text.splitlines():
+        if (
+            line.startswith(name)
+            and line[len(name)] in "{ "
+            and all(label in line for label in labels)
+        ):
+            total += float(line.rsplit(" ", 1)[1])
+
+    return total
+
+
+def wait_for(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def test_open_websockets_are_counted_apart_from_requests() -> None:
+    port = support.free_port()
+    instance = support.start(
+        "plain_asgi:application", workers=1, threads=None, args=["--dashboard", f"127.0.0.1:{port}"]
+    )
+    dashboard = f"http://127.0.0.1:{port}"
+
+    def read(path: str) -> str:
+        with urllib.request.urlopen(dashboard + path, timeout=10) as response:
+            body: bytes = response.read()
+            return body.decode()
+
+    try:
+        assert instance.wait_for_log(f"dashboard on {dashboard}/")
+
+        with (
+            open_socket(instance, "/ws/echo") as first,
+            open_socket(instance, "/ws/echo") as second,
+        ):
+            first.send("hello")
+            assert first.recv() == "hello"
+            second.send("there")
+            assert second.recv() == "there"
+
+            # The handshake is a request that ended when it was accepted:
+            # its line is written then, and it no longer counts in flight.
+
+            assert instance.wait_for_log("101 GET /ws/echo")
+            metrics = read("/metrics")
+            assert metric(metrics, "muru_websocket_connections", 'mount="default"') == 2
+            assert metric(metrics, "muru_requests_in_flight") == 0
+            assert metric(metrics, "muru_requests_total", 'status="1xx"') == 2
+
+            view = json.loads(read("/v1/websockets"))
+            assert view["open"] == 2
+            assert [(row["pattern"], row["open"]) for row in view["endpoints"]] == [("/ws/echo", 2)]
+            assert {socket_["path"] for socket_ in view["sockets"]} == {"/ws/echo"}
+            assert view["sockets"][0]["received"] == 1 and view["sockets"][0]["sent"] == 1
+            assert "WebSockets open" in read("/fragment/overview")
+
+        # Each close is a line of its own, with who closed, the code and
+        # the messages each way; the lifetime goes to its own histogram.
+
+        assert instance.wait_for_log("websocket=closed by=client code=1000 received=1 sent=1")
+        wait_for(lambda: metric(read("/metrics"), "muru_websocket_connections") == 0)
+        metrics = read("/metrics")
+        assert metric(metrics, "muru_websockets_closed_total", 'by="client"', 'close="normal"') == 2
+        assert metric(metrics, "muru_websocket_duration_seconds_count") == 2
+        assert json.loads(read("/v1/websockets"))["open"] == 0
+    finally:
+        instance.stop()
+
+
+def test_the_daemon_counts_and_lists_open_websockets(tmp_path: Path) -> None:
+    daemon = start_daemon(tmp_path)
+    config = tmp_path / "chat.toml"
+    config.write_text(
+        f"""[app.chat.release.r1]
+source = '{support.FIXTURES}'
+entrypoint = 'plain_asgi:application'
+interface = 'asgi'
+python = '{sys.executable}'
+"""
+    )
+
+    def words(*command: str) -> str:
+        return " ".join(daemon.muructl(*command).stdout.split())
+
+    try:
+        assert "ready and serving" in daemon.muructl("apply", "-f", str(config)).stdout
+        assert words("websockets") == "no WebSockets open"
+
+        with connect(f"ws://127.0.0.1:{daemon.port}/ws/echo/42", open_timeout=10) as socket_:
+            socket_.send("hello")
+            assert socket_.recv() == "hello"
+
+            assert "APP ENDPOINT OPEN chat /ws/echo/{id} 1" in words("websockets")
+            listed = words("websockets", "chat", "--list")
+            assert "chat@r1 /ws/echo/42" in listed and " 1 1 0 " in listed
+
+            # The counts in status and release show are sampled each second.
+
+            wait_for(lambda: "websockets 1 open" in words("status"))
+            assert "websockets 1 open" in words("release", "show", "chat@r1")
+
+        wait_for(lambda: words("websockets") == "no WebSockets open")
+        access = daemon.muructl("logs", "--access").stdout
+        assert "101 GET /ws/echo/42" in access
+        assert "websocket=closed by=client code=1000 received=1 sent=1" in access
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("grace", [0.0, 2.0])
+def test_a_drained_release_closes_its_websockets_with_1001(tmp_path: Path, grace: float) -> None:
+    daemon = start_daemon(tmp_path)
+    config = tmp_path / "chat.toml"
+    config.write_text(
+        f"""[app.chat.release.r1]
+source = '{support.FIXTURES}'
+entrypoint = 'plain_asgi:application'
+interface = 'asgi'
+python = '{sys.executable}'
+
+[app.chat.release.r1.timeouts]
+websocket_drain_grace = '{grace}s'
+"""
+    )
+
+    try:
+        assert "ready and serving" in daemon.muructl("apply", "-f", str(config)).stdout
+
+        with connect(f"ws://127.0.0.1:{daemon.port}/ws/echo", open_timeout=10) as socket_:
+            socket_.send("hello")
+            assert socket_.recv() == "hello"
+            started = time.monotonic()
+
+            # The worker keeps the socket for its grace, then closes it
+            # with 1001 itself, and the drain is over once it has.
+
+            assert "is stopped" in daemon.muructl("drain", "chat@r1").stdout
+            drained = time.monotonic() - started
+            assert grace <= drained < grace + 3, drained
+
+            with pytest.raises(ConnectionClosed) as closed:
+                socket_.recv()
+
+        assert closed.value.rcvd is not None
+        assert closed.value.rcvd.code == 1001
+        assert "websocket disconnected with 1001" in daemon.muructl("logs", "chat@r1").stdout
+        assert "websocket=closed by=edge code=1001" in daemon.muructl("logs", "--access").stdout
+        assert 'by="edge",close="drained"} 1' in daemon.muructl("metrics").stdout
+    finally:
+        daemon.stop()

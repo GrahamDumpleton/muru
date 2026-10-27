@@ -919,9 +919,13 @@ pub struct Timeouts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_drain_grace: Option<String>,
     /// How long a worker told to stop is given before it is killed
-    /// (default 5s).
+    /// (default 5s), counted from when its WebSockets are closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
+    /// How long a worker told to stop keeps its open WebSockets before it
+    /// closes them with 1001 (default 0s, at once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_drain_grace: Option<String>,
     /// How long an ASGI worker's event loop may go without running
     /// before the worker is replaced as for the hard timeout (default
     /// 10s).
@@ -3089,6 +3093,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                 timeouts.soft_timeout.is_some()
                     || timeouts.hard_timeout.is_some()
                     || timeouts.hard_drain_grace.is_some()
+                    || timeouts.websocket_drain_grace.is_some()
                     || timeouts.loop_stall_timeout.is_some()
             }),
         ),

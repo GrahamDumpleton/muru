@@ -50,6 +50,15 @@ pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 /// (section 9.1).
 pub const RETAIN_WORKERS: u32 = 1;
 
+/// How long to wait for a release's processes to stop, given its stop
+/// budget: never less than the drain timeout.
+fn stop_wait(budget: Duration) -> Duration {
+    DRAIN_TIMEOUT.max(crate::host::stop_wait(budget))
+}
+
+/// The open WebSockets the dashboard lists, the longest open first.
+const DASHBOARD_SOCKETS: u32 = 200;
+
 /// Section 9.1: how long a superseded release stays warm, and the
 /// workers each of its groups keeps meanwhile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +198,15 @@ pub enum Command {
     Metrics {
         /// Answered with the text.
         done: oneshot::Sender<String>,
+    },
+    /// The WebSockets open on the edge.
+    WebSockets {
+        /// Only this application's; all when empty.
+        app: String,
+        /// How many to list, the longest open first.
+        limit: u32,
+        /// Answered with the edge's report.
+        done: oneshot::Sender<anyhow::Result<pb::WebSockets>>,
     },
     /// Create a release and apply the blue/green strategy.
     Deploy {
@@ -502,7 +520,17 @@ pub struct Info {
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
+    /// WebSockets open by application and release, from the edge's
+    /// metrics as last sampled.
+    pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
+    /// What each release's entrypoints were detected as, by application
+    /// and release, then by mount, the default mount's under the empty
+    /// name: as its host last announced them.
+    pub interfaces: std::sync::Mutex<Interfaces>,
 }
+
+/// Detected interfaces by application and release, then by mount.
+pub type Interfaces = HashMap<(String, String), Vec<(String, String)>>;
 
 /// What a ReopenLogs command reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -557,11 +585,12 @@ impl Backend {
         }
     }
 
-    /// Stop the processes; `grace` is what a managed server's instances
-    /// get before SIGKILL.
+    /// Stop the processes; `grace` is the release's stop budget: what a
+    /// managed server's instances, or a host's workers, get before
+    /// SIGKILL.
     async fn stop(self, grace: Duration) {
         match self {
-            Self::Host(host) => host.stop().await,
+            Self::Host(host) => host.stop(grace).await,
             Self::Servers(servers) => servers.stop(grace).await,
             Self::Dormant => {}
         }
@@ -985,6 +1014,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             },
             ..client_rules.defined()
         }),
+        interfaces: std::sync::Mutex::new(Interfaces::new()),
+        websockets: std::sync::Mutex::new(HashMap::new()),
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -1750,9 +1781,21 @@ impl Daemon {
             }
         };
 
+        let websockets = match self.edge.websockets("", DASHBOARD_SOCKETS).await {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::debug!(%error, "the edge's WebSockets could not be read");
+                pb::WebSockets::default()
+            }
+        };
+
+        // A WebSocket's closing record carries how long it was open, which
+        // is not a request's time.
+
         let mut totals: Vec<u64> = recent
             .records
             .iter()
+            .filter(|record| record.websocket_close.is_empty())
             .map(|record| record.total_us)
             .collect();
         totals.sort_unstable();
@@ -1772,7 +1815,12 @@ impl Daemon {
             p50: percentile(0.5),
             p95: percentile(0.95),
             errors: recent.minute_errors,
-            in_flight: recent.pools.iter().map(|pool| pool.busy as usize).sum(),
+            in_flight: recent
+                .pools
+                .iter()
+                .map(|pool| pool.busy.saturating_sub(pool.websockets) as usize)
+                .sum(),
+            websockets: websockets.open as usize,
         };
 
         let mut apps = Vec::new();
@@ -1803,6 +1851,7 @@ impl Daemon {
                     message: release.message.clone(),
                     workers,
                     slots_busy: pools.iter().map(|pool| pool.busy as usize).sum(),
+                    websockets: pools.iter().map(|pool| pool.websockets as usize).sum(),
                     slots_total: pools.iter().map(|pool| pool.slots as usize).sum(),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: clock_hms(release.created_unix_ms),
@@ -1918,7 +1967,11 @@ impl Daemon {
                 time: clock_hms(record.started_unix_ms),
                 status: record.status as u16,
                 status_class: (record.status / 100) as u16,
-                reason: record.reason.clone(),
+                reason: if record.websocket_close.is_empty() {
+                    record.reason.clone()
+                } else {
+                    format!("websocket {}", record.websocket_close)
+                },
                 method: record.method.clone(),
                 target: record.target.clone(),
                 release: if record.app.is_empty() {
@@ -2000,6 +2053,7 @@ impl Daemon {
             scaling,
             rollouts,
             requests,
+            websockets: crate::dashboard::websockets_view(websockets),
             events,
             logs,
         }
@@ -3038,6 +3092,9 @@ impl Daemon {
             Command::Metrics { done } => {
                 let _ = done.send(self.metrics().await);
             }
+            Command::WebSockets { app, limit, done } => {
+                let _ = done.send(self.edge.websockets(&app, limit).await);
+            }
             Command::Dashboard { done } => {
                 let _ = done.send(self.dashboard_data().await);
             }
@@ -3377,6 +3434,7 @@ impl Daemon {
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
+            websocket_drain_grace: Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             memory: spec.memory.clone(),
             env,
@@ -3420,7 +3478,7 @@ impl Daemon {
 
         if let Err(error) = host.wait_ready(START_TIMEOUT).await {
             let message = format!("{error:#}");
-            host.stop().await;
+            host.stop(release.spec.timeouts.stop_budget()).await;
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
                 .emit("release.failed", &subject, "error", &message);
@@ -4217,8 +4275,8 @@ impl Daemon {
         );
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let record = running.backend.record_path(&run_dir);
-        let grace = Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms);
-        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
+        let grace = release.spec.timeouts.stop_budget();
+        let stopped = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
 
         if stopped.is_err() {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
@@ -5273,10 +5331,10 @@ impl Daemon {
             .store
             .release(app, id)
             .map_or(Duration::from_secs(5), |release| {
-                Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+                release.spec.timeouts.stop_budget()
             });
 
-        if tokio::time::timeout(DRAIN_TIMEOUT, backend.stop(grace))
+        if tokio::time::timeout(stop_wait(grace), backend.stop(grace))
             .await
             .is_err()
         {
@@ -6227,7 +6285,16 @@ impl Daemon {
                 version,
                 sockets,
                 groups,
+                interfaces,
             } => {
+                if !interfaces.is_empty() {
+                    self.info
+                        .interfaces
+                        .lock()
+                        .expect("interfaces poisoned")
+                        .insert(key.clone(), interfaces);
+                }
+
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
@@ -6432,9 +6499,9 @@ impl Daemon {
             let grace = self
                 .store
                 .release(&app, &id)
-                .map(|release| Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms))
+                .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
-            let _ = tokio::time::timeout(DRAIN_TIMEOUT, running.backend.stop(grace)).await;
+            let _ = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
 
             if let Ok(release) = self.store.release(&app, &id) {
                 self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
@@ -6460,7 +6527,7 @@ impl Daemon {
     /// pass SIGUSR1 on to its workers, whose on_reopen_logs hook handles
     /// files the application opened itself.
     /// Section 10.7: one point of history a second, from the edge's
-    /// counters.
+    /// counters, and the WebSockets open by release for status.
     async fn sample_history(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
         let Some(samples) = samples else {
             return;
@@ -6480,6 +6547,26 @@ impl Daemon {
             .sum::<usize>() as u64;
         let reading = crate::dashboard::reading(samples, workers);
         let now = crate::model::now_unix_ms() / 1000;
+        let mut websockets: HashMap<(String, String), u64> = HashMap::new();
+
+        for sample in samples
+            .iter()
+            .filter(|sample| sample.name == "muru_websocket_connections")
+        {
+            let label = |name: &str| {
+                sample
+                    .labels
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            };
+            *websockets
+                .entry((label("app"), label("release")))
+                .or_default() += sample.value.max(0.0) as u64;
+        }
+
+        *self.info.websockets.lock().expect("websockets poisoned") = websockets;
 
         if let Some(point) = self.sampler.observe(now, reading) {
             self.history.record(point);

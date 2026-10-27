@@ -35,6 +35,7 @@ pub mod buckets;
 pub mod classify;
 pub mod compression;
 pub mod connections;
+pub mod endpoints;
 pub mod errors;
 pub mod grpc;
 pub mod ja4;

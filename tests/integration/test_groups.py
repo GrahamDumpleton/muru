@@ -63,6 +63,14 @@ def test_paths_reach_their_groups_in_development(development: support.Server) ->
     assert served_by(development.get("/"))["worker"] == 0
 
 
+def test_the_start_up_output_names_each_group(development: support.Server) -> None:
+    log = development.log()
+    assert "muru: serving grouped:application on" in log
+    assert "with 1 worker of 2 threads" in log
+    assert "muru: group reports serves /reports/* with 2 workers of 1 thread" in log
+    assert "muru: group status serves /api/status with 1 worker of 8 threads" in log
+
+
 def test_print_config_writes_the_groups() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
@@ -99,6 +107,9 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
     assert served_by(daemon.request("/reports/x"))["group"] == "reports"
     assert served_by(daemon.request("/"))["group"] == "default"
     assert "4 workers ready" in daemon.muructl("events").stdout
+    shown = daemon.muructl("release", "show", "grouped@r1").stdout
+    assert "workers 1 process of 2 threads group reports" in " ".join(shown.split())
+    assert "group reports /reports/*: 2 processes of 1 thread" in " ".join(shown.split())
 
     # A declared release's groups replace the table's, and resolve their
     # sizes from the release where silent; the export writes them whole.

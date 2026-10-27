@@ -81,7 +81,19 @@ def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> No
         "version": 3,
         "sockets": ["/a"],
         "groups": [{"name": "api", "sockets": ["/api-0"]}],
+        "interfaces": {},
     }
+
+    # The interfaces the host settled go with it, the default mount's
+    # under the empty name; a mount its workers settle is left out.
+
+    context = host.Context(app="plain_wsgi")
+    settled = host.Mount.parse("ws=/ws=plain_asgi:application", context, 1)
+    unsettled = host.Mount.parse("other=/other=plain_wsgi:application", context, 1)
+    release.resolved = "wsgi"
+    settled.release.resolved = "asgi"
+    instance.mounts = [settled, unsettled]
+    assert instance.workers_message()["interfaces"] == {"": "wsgi", "ws": "asgi"}
 
 
 def test_a_mount_takes_threads_of_its_own() -> None:

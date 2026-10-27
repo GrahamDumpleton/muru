@@ -54,6 +54,20 @@ from the release's own application, or from one its
 `cgi_local_redirect` say which redirect forms its responses may use,
 with the release's own setting as the default.
 
+When `muructl run` starts, the host says what each entrypoint is served
+as, and a line for each mount says where it is. A WSGI release with an
+ASGI mount has an event loop in every worker beside the threads, and the
+serving line says so:
+
+```
+muru.host[4242]: chat.wsgi:application is served as WSGI
+muru.host[4242]: mount ws: chat.asgi:websocket_app is served as ASGI
+muru.host[4242]: mount reports: chat.reports:application is served as WSGI
+muru: serving chat.wsgi:application on http://127.0.0.1:8080 with 1 worker of 16 threads and an event loop of concurrency 1000
+muru: mount reports serves /reports from chat.reports:application
+muru: mount ws serves /ws from chat.asgi:websocket_app
+```
+
 ## What the application sees
 
 The mount's path is `SCRIPT_NAME` and the rest of the path is `PATH_INFO`
@@ -113,4 +127,5 @@ globals need separate releases.
 apply` from the release's `mounts` tables when present. Mounts are part
 of the release, so a declared release whose mounts differ from what is
 recorded is refused, and `muructl config export` writes them with the
-release.
+release. `muructl release show` lists a release's mounts with their
+paths, entrypoints and interfaces, as declared or as detected.

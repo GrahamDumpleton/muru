@@ -27,7 +27,8 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::Limits;
-use crate::link::{Reader, Recording, Return, Writer};
+use crate::access::WebSocket;
+use crate::link::{Reader, Return, Writer};
 
 /// A request that asks to become a WebSocket.
 pub(crate) struct Upgrade {
@@ -136,7 +137,8 @@ pub(crate) struct Relay {
     pub reader: Reader,
     pub writer: Writer,
     pub back: Arc<Return>,
-    pub recording: Option<Recording>,
+    /// The open socket as the access log lists and counts it.
+    pub socket: Option<WebSocket>,
     pub limits: Arc<Limits>,
 }
 
@@ -155,9 +157,22 @@ struct Closing {
     /// The client was cut off in the middle of a message, so the rest of
     /// it is still arriving and is read away before the socket is dropped.
     drain_client: bool,
+    /// The side that closed first, its code and the outcome: client,
+    /// application or edge.
+    first: Option<(&'static str, u16, &'static str)>,
 }
 
 impl Closing {
+    /// Note who closed and with what code, unless a side already has.
+    fn ended(&mut self, by: &'static str, code: u16) {
+        self.ended_as(by, code, crate::access::close_outcome(by, code));
+    }
+
+    /// As `ended`, with an outcome the code does not tell.
+    fn ended_as(&mut self, by: &'static str, code: u16, close: &'static str) {
+        self.first.get_or_insert((by, code, close));
+    }
+
     /// Both sides have closed in order: the link connection can be reused.
     fn complete(&self) -> bool {
         self.stream_done && self.worker_closed && self.told_worker
@@ -180,7 +195,7 @@ pub(crate) async fn relay(relay: Relay) {
         mut reader,
         mut writer,
         back,
-        recording,
+        socket: counted,
         limits,
     } = relay;
 
@@ -193,7 +208,11 @@ pub(crate) async fn relay(relay: Relay) {
             let _ = send_close(&mut writer, 1006, "the client went away").await;
             back.give_writer(None);
             back.give_reader(None);
-            finish(recording, 0);
+
+            if let Some(counted) = counted {
+                counted.close("client", 1006);
+            }
+
             return;
         }
     };
@@ -206,7 +225,6 @@ pub(crate) async fn relay(relay: Relay) {
 
     let mut closing = Closing::default();
     let mut intact = true;
-    let mut bytes: u64 = 0;
     let mut last_activity = Instant::now();
     let mut ping = tokio::time::interval(limits.websocket_ping_interval);
     ping.tick().await;
@@ -239,6 +257,7 @@ pub(crate) async fn relay(relay: Relay) {
             Err(_) => {
                 // Nothing from the client for the idle timeout.
 
+                closing.ended("edge", 1001);
                 closing.told_client |= close_client(&mut socket, 1001, "idle").await.is_ok();
 
                 if !closing.told_worker {
@@ -252,6 +271,7 @@ pub(crate) async fn relay(relay: Relay) {
                     && !closing.winding_down()
                     && socket.send(Message::Ping(Bytes::new())).await.is_err()
                 {
+                    closing.ended("client", 1006);
                     closing.stream_done = true;
                 }
             }
@@ -260,7 +280,12 @@ pub(crate) async fn relay(relay: Relay) {
                 let outcome = client_step(incoming, &mut socket, &mut writer, &mut closing).await;
 
                 match outcome {
-                    Ok(relayed) => bytes += relayed,
+                    Ok(Some(relayed)) => {
+                        if let Some(counted) = &counted {
+                            counted.received(relayed);
+                        }
+                    }
+                    Ok(None) => {}
                     Err(()) => {
                         intact = false;
                         break;
@@ -269,7 +294,7 @@ pub(crate) async fn relay(relay: Relay) {
             }
             Ok(Step::Worker(next)) => match next {
                 Ok(Some(next)) if next.kind == kind::MESSAGE => {
-                    bytes += next.payload.len() as u64;
+                    let size = next.payload.len() as u64;
 
                     let message = if next.flags & flag::TEXT != 0 {
                         match std::str::from_utf8(&next.payload) {
@@ -280,9 +305,18 @@ pub(crate) async fn relay(relay: Relay) {
                         Message::Binary(next.payload)
                     };
 
-                    if !closing.stream_done && socket.send(message).await.is_err() {
+                    if closing.stream_done {
+                        continue;
+                    }
+
+                    if socket.send(message).await.is_ok() {
+                        if let Some(counted) = &counted {
+                            counted.sent(size);
+                        }
+                    } else {
                         // The client is gone; the worker learns by CLOSE.
 
+                        closing.ended("client", 1006);
                         closing.stream_done = true;
 
                         if !closing.told_worker {
@@ -300,6 +334,16 @@ pub(crate) async fn relay(relay: Relay) {
 
                     let close = pb::Close::decode(next.payload).unwrap_or_default();
                     let code = u16::try_from(close.code).unwrap_or(1000);
+
+                    // A worker on its way to stopping closes its sockets
+                    // itself, which is Muru's doing, not the application's.
+
+                    if close.draining {
+                        closing.ended_as("edge", code, "drained");
+                    } else {
+                        closing.ended("application", code);
+                    }
+
                     closing.worker_closed = true;
 
                     if !closing.told_client && !closing.stream_done {
@@ -318,11 +362,13 @@ pub(crate) async fn relay(relay: Relay) {
                 }
                 Ok(Some(next)) => {
                     tracing::warn!(kind = next.kind, "unexpected frame on a WebSocket link");
+                    closing.ended("edge", 1011);
                     intact = false;
                     break;
                 }
                 Ok(None) | Err(_) => {
                     let _ = close_client(&mut socket, 1011, "the worker went away").await;
+                    closing.ended("application", 1011);
                     intact = false;
                     break;
                 }
@@ -347,18 +393,22 @@ pub(crate) async fn relay(relay: Relay) {
     let _ = socket.close(None).await;
     back.give_writer(intact.then_some(writer));
     back.give_reader(intact.then_some(reader));
-    finish(recording, bytes);
+
+    if let Some(counted) = counted {
+        let (by, code, close) = closing.first.unwrap_or(("edge", 1006, "abnormal"));
+        counted.close_as(by, code, close);
+    }
 }
 
 /// Handle one item from the client's stream: a message to relay, a close
 /// frame, a protocol failure or the end of the stream. Returns the bytes
-/// relayed, or Err when the link writer failed.
+/// of a message relayed, or Err when the link writer failed.
 async fn client_step<S>(
     incoming: Option<Result<Message, WsError>>,
     socket: &mut WebSocketStream<S>,
     writer: &mut Writer,
     closing: &mut Closing,
-) -> Result<u64, ()>
+) -> Result<Option<u64>, ()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -384,31 +434,31 @@ where
             let size = payload.len() as u64;
 
             if closing.told_worker {
-                return Ok(0);
+                return Ok(None);
             }
 
             frame::write(writer, kind::MESSAGE, flag::TEXT, payload)
                 .await
                 .map_err(|_| ())?;
-            Ok(size)
+            Ok(Some(size))
         }
         Some(Ok(Message::Binary(data))) => {
             let size = data.len() as u64;
 
             if closing.told_worker {
-                return Ok(0);
+                return Ok(None);
             }
 
             frame::write(writer, kind::MESSAGE, 0, data)
                 .await
                 .map_err(|_| ())?;
-            Ok(size)
+            Ok(Some(size))
         }
         Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
             // tungstenite queues the pong itself; flushing sends it now.
 
             let _ = socket.flush().await;
-            Ok(0)
+            Ok(None)
         }
         Some(Ok(Message::Close(close))) => {
             // tungstenite queues the reply itself; the stream ends once it
@@ -418,53 +468,59 @@ where
                 .map(|close| (u16::from(close.code), close.reason.to_string()))
                 .unwrap_or((1005, String::new()));
             let _ = socket.flush().await;
+            closing.ended("client", code);
             closing.told_client = true;
             tell_worker(writer, closing, code, &reason).await?;
-            Ok(0)
+            Ok(None)
         }
         Some(Err(WsError::Capacity(_))) => {
             // Section 4.18: a message over the limit is 1009. The stream has
             // ended at the frame layer with the message still arriving.
 
             let _ = close_client(socket, 1009, "message too large").await;
+            closing.ended("edge", 1009);
             closing.told_client = true;
             closing.stream_done = true;
             closing.drain_client = true;
             tell_worker(writer, closing, 1009, "message too large").await?;
-            Ok(0)
+            Ok(None)
         }
         Some(Err(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake))) => {
             // Gone without a close frame: 1006 to the application.
 
+            closing.ended("client", 1006);
             closing.stream_done = true;
             tell_worker(writer, closing, 1006, "the client went away").await?;
-            Ok(0)
+            Ok(None)
         }
         Some(Err(WsError::Protocol(error))) => {
             // A protocol failure: close with 1002 and end the stream.
 
             let reason = error.to_string();
             let _ = close_client(socket, 1002, &reason).await;
+            closing.ended("edge", 1002);
             closing.told_client = true;
             closing.stream_done = true;
             closing.drain_client = true;
             tell_worker(writer, closing, 1002, &reason).await?;
-            Ok(0)
+            Ok(None)
         }
         Some(Err(WsError::Utf8(_))) => {
             let _ = close_client(socket, 1007, "invalid UTF-8").await;
+            closing.ended("edge", 1007);
             closing.told_client = true;
             closing.stream_done = true;
             closing.drain_client = true;
             tell_worker(writer, closing, 1007, "invalid UTF-8").await?;
-            Ok(0)
+            Ok(None)
         }
         Some(Err(_)) | None => {
             // The stream has ended, in order after a close or not.
 
+            closing.ended("client", 1006);
             closing.stream_done = true;
             tell_worker(writer, closing, 1006, "the client went away").await?;
-            Ok(0)
+            Ok(None)
         }
     }
 }
@@ -479,6 +535,7 @@ async fn send_close(writer: &mut Writer, code: u16, reason: &str) -> std::io::Re
     let close = pb::Close {
         code: u32::from(code),
         reason: reason.to_owned(),
+        draining: false,
     };
     frame::write(writer, kind::CLOSE, 0, close.encode_to_vec().into()).await
 }
@@ -512,13 +569,6 @@ where
             Ok(Ok(read)) if read > 0 => {}
             _ => break,
         }
-    }
-}
-
-/// Record the socket in the access log as the 101 it began with.
-fn finish(recording: Option<Recording>, bytes: u64) {
-    if let Some(recording) = recording {
-        recording.complete(101, "", bytes);
     }
 }
 

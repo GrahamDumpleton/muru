@@ -1486,6 +1486,12 @@ impl Routing {
         self.default.default_pool()
     }
 
+    /// The default application's pools, by group name, the default group
+    /// first: what a development run reports when it starts.
+    pub fn default_pools(&self) -> Vec<(String, Arc<LinkPool>)> {
+        self.default.pools()
+    }
+
     /// Section 7.4: every named release's groups with their pools, for
     /// handing woken groups to the requests waiting for them.
     pub fn group_pools(&self) -> Vec<(crate::wake::Key, Arc<LinkPool>)> {

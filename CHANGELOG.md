@@ -9,6 +9,54 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a9 (2026-10-27)
+
+### Added
+
+- Added `muructl release show`, which prints one release's state, source,
+  interpreter, entrypoint and sizes, with its worker groups and mounts, and the
+  interface each entrypoint was detected as when it is declared `auto`.
+- Open WebSockets are now visible: the `muru_websocket_connections` gauge,
+  `muru_websockets_closed_total` by who closed and how, and the
+  `muru_websocket_duration_seconds` histogram; `muructl websockets`, which
+  counts open sockets by endpoint with identifiers in paths folded together,
+  or lists them with `--list`; the count in `muructl status` and
+  `muructl release show`; and the dashboards' WebSockets table, tile, chart
+  and `/v1/websockets`.
+
+### Changed
+
+- A WebSocket's request now ends when the application accepts it: its
+  access log line is written then, with the handshake's time, and a second
+  line with the same request id is written when it closes. Its lifetime no
+  longer goes into `muru_request_duration_seconds`, the latency charts or
+  the rollout gates, and it no longer counts in `muru_requests_in_flight`
+  once accepted.
+- `muructl run` now prints a line for each worker group and each mount when it
+  starts, the host says what each mount's entrypoint is served as (also when
+  the workers import the application themselves), the serving line names the
+  event loop a WSGI release has beside its threads when a mount is ASGI, and
+  counts of one are singular: "1 worker of 4 threads".
+
+### Fixed
+
+- A worker told to stop no longer leaves its open WebSockets to be cut off:
+  after the new `websocket_drain_grace` timeout (none by default) it closes
+  each with 1001, which the application sees as `websocket.disconnect` and
+  the client as a close it can reconnect after, where before the client got
+  1011 once the worker was killed or gave up 30 seconds later. Workers are
+  now killed `websocket_drain_grace` plus `shutdown_timeout` after being
+  told to stop, as the timeouts guide says, and a drained release's workers
+  no longer outlive the release being reported stopped.
+
+### Documentation
+
+- The Flask and Django guide no longer says a Flask client sees Muru's error
+  page for an exception: Flask answers with its own page unless
+  `PROPAGATE_EXCEPTIONS` is set, and Django unless `DEBUG_PROPAGATE_EXCEPTIONS`
+  is set, as the guide now shows.
+
+
 ## 0.1.0a8 (2026-10-27)
 
 ### Changed

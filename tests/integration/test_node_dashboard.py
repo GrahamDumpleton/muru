@@ -226,7 +226,7 @@ def test_the_history_grows_and_streams_for_the_charts(served: tuple[Daemon, int]
     assert history["range"] == "1h" and history["step_s"] == 1
     points = history["points"]
     assert len(points) >= 2
-    assert all(len(point) == 7 for point in points)
+    assert all(len(point) == 8 for point in points)
     assert points[-1][0] > points[0][0], "seconds in order"
     assert any(point[6] == 2 for point in points), "two workers listening"
     assert fetch_json(port, "/v1/history?range=24h")["step_s"] == 60

@@ -530,9 +530,14 @@ pub struct WorkerTimeouts {
     /// How long a replaced worker gets to finish its other requests.
     #[serde(default = "default_hard_drain_grace_ms")]
     pub hard_drain_grace_ms: u64,
-    /// How long a worker told to stop gets before it is killed.
+    /// How long a worker told to stop gets before it is killed, from
+    /// when its WebSockets are closed.
     #[serde(default = "default_shutdown_timeout_ms")]
     pub shutdown_timeout_ms: u64,
+    /// How long a worker told to stop keeps its open WebSockets before it
+    /// closes them with 1001.
+    #[serde(default)]
+    pub websocket_drain_grace_ms: u64,
     /// How long an ASGI worker's event loop may go without running
     /// before the worker is replaced.
     #[serde(default = "default_loop_stall_timeout_ms")]
@@ -546,8 +551,20 @@ impl Default for WorkerTimeouts {
             hard_timeout_ms: None,
             hard_drain_grace_ms: default_hard_drain_grace_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
+            websocket_drain_grace_ms: 0,
             loop_stall_timeout_ms: default_loop_stall_timeout_ms(),
         }
+    }
+}
+
+impl WorkerTimeouts {
+    /// How long a worker told to stop may take before it is killed: the
+    /// WebSockets' grace, then the shutdown timeout.
+    pub fn stop_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.websocket_drain_grace_ms
+                .saturating_add(self.shutdown_timeout_ms),
+        )
     }
 }
 

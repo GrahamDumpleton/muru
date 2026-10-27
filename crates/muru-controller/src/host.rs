@@ -26,6 +26,9 @@ pub enum HostMessage {
         sockets: Vec<PathBuf>,
         /// Each named group's sockets.
         groups: Vec<(String, Vec<PathBuf>)>,
+        /// The interfaces the host settled, by mount, the default mount's
+        /// under the empty name; none when the workers settle them.
+        interfaces: Vec<(String, String)>,
     },
     /// An event about a worker, for the event log.
     Event {
@@ -142,6 +145,17 @@ impl HostMessage {
                                     .filter_map(|item| item.as_str().map(PathBuf::from))
                                     .collect();
                                 Some((name, sockets))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                interfaces: value["interfaces"]
+                    .as_object()
+                    .map(|interfaces| {
+                        interfaces
+                            .iter()
+                            .filter_map(|(mount, interface)| {
+                                Some((mount.clone(), interface.as_str()?.to_owned()))
                             })
                             .collect()
                     })
@@ -284,6 +298,16 @@ impl HostControl {
     }
 }
 
+/// How much longer than its workers' stop budget a host is given to
+/// stop them and exit, before it is killed in turn.
+pub const STOP_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long to wait for a host to stop, given its workers' stop budget:
+/// long enough for it to kill them and to be killed itself.
+pub fn stop_wait(budget: Duration) -> Duration {
+    budget + STOP_MARGIN * 2
+}
+
 /// What every host of a run is started with.
 pub struct HostSpec {
     /// The interpreter with the muru runtime library installed.
@@ -342,8 +366,12 @@ pub struct HostSpec {
     pub hard_timeout: Option<Duration>,
     /// How long a replaced worker gets to finish its other requests.
     pub hard_drain_grace: Duration,
-    /// How long a worker told to stop gets before it is killed.
+    /// How long a worker told to stop gets before it is killed, from
+    /// when its WebSockets are closed.
     pub shutdown_timeout: Duration,
+    /// How long a worker told to stop keeps its open WebSockets before it
+    /// closes them with 1001.
+    pub websocket_drain_grace: Duration,
     /// How long an ASGI worker's event loop may stall before the worker
     /// is replaced (section 7.6).
     pub loop_stall_timeout: Duration,
@@ -618,6 +646,8 @@ impl HostProcess {
             .arg(spec.hard_drain_grace.as_secs_f64().to_string())
             .arg("--shutdown-timeout")
             .arg(spec.shutdown_timeout.as_secs_f64().to_string())
+            .arg("--websocket-drain-grace")
+            .arg(spec.websocket_drain_grace.as_secs_f64().to_string())
             .arg("--loop-stall-timeout")
             .arg(spec.loop_stall_timeout.as_secs_f64().to_string());
 
@@ -843,7 +873,11 @@ impl HostProcess {
 
     /// Stop the host: SIGTERM and its stdin closed, then SIGKILL after a
     /// grace period. Its workers finish the requests they are serving.
-    pub async fn stop(mut self) {
+    /// Stop the host and its workers. The host gives its workers `budget`,
+    /// the WebSockets' grace and the shutdown timeout, before it kills
+    /// them, and is itself killed if it has not exited `STOP_MARGIN`
+    /// after that.
+    pub async fn stop(mut self, budget: Duration) {
         if let Some(pid) = self.pid() {
             // SAFETY: kill(2) with a valid pid and signal has no memory-safety
             // preconditions; the pid is a host this daemon started or adopted.
@@ -855,7 +889,7 @@ impl HostProcess {
 
         drop(self.stdin.take());
 
-        let grace = Duration::from_secs(10);
+        let grace = budget + STOP_MARGIN;
 
         match &mut self.process {
             Process::Child(child) => {

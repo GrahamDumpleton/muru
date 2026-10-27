@@ -76,12 +76,15 @@ pub enum Outgoing {
     /// The trailers that end a gRPC call (section 6.13), its status
     /// among them.
     Trailers(Vec<(Vec<u8>, Vec<u8>)>),
-    /// The application closes the WebSocket (section 5.6).
+    /// The application closes the WebSocket (section 5.6), or the worker
+    /// does because it is stopping.
     Close {
         /// The close code.
         code: u16,
         /// The reason, possibly empty.
         reason: String,
+        /// The worker closed it because it is stopping.
+        draining: bool,
     },
     /// The request is over: the application returned and its iterable was
     /// closed. Sent explicitly, because the `start_response` object that

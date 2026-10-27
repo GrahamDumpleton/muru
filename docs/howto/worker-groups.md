@@ -59,6 +59,15 @@ the requests of those [client classes](client-classes.md#routing-by-class)
 for its paths, or for every path when it has none, ahead of the groups
 for every class.
 
+`muructl run` prints a line for each group when it starts, after the
+serving line, which describes the default group:
+
+```
+muru: serving shop.wsgi:application on http://127.0.0.1:8080 with 2 workers of 8 threads
+muru: group hot serves /api/status, /api/ping with 1 worker of 50 threads
+muru: group reports serves /reports/* with 6 workers of 1 thread
+```
+
 ## In the workers
 
 Each worker knows its group: `muru.context().group` is the group's name,
@@ -77,3 +86,5 @@ counts them all. Groups are part of the release, so a declared release
 whose groups differ from what is recorded is refused like any other
 changed setting; `muructl config export` writes each group with every size
 spelled out, and a restarted daemon takes every group's workers back.
+`muructl release show` lists a release's groups with their paths and
+sizes.

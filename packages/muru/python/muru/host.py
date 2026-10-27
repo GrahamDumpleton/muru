@@ -65,7 +65,6 @@ from muru.hooks import Hooks
 
 WSGIApplication = Callable[..., Any]
 
-SHUTDOWN_GRACE_SECONDS = 10.0
 RESTART_DELAY_SECONDS = 0.5
 
 # How long a replacement waits for the supervisor to say the edge routes
@@ -157,6 +156,12 @@ def detect_interface(app: Any) -> str:
     if call is not None and inspect.iscoroutinefunction(call):
         return "asgi"
     return "wsgi"
+
+
+def interface_name(interface: str) -> str:
+    """Return an interface as messages name it: WSGI, ASGI or gRPC."""
+
+    return "gRPC" if interface == "grpc" else interface.upper()
 
 
 def resolve_interface(spec: str, app: Any, interface: str) -> str:
@@ -523,6 +528,7 @@ class Host:
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
+        websocket_drain_grace: float = 0.0,
         loop_stall_timeout: float = 10.0,
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
@@ -543,6 +549,7 @@ class Host:
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
+        self.websocket_drain_grace = websocket_drain_grace
         self.loop_stall_timeout = loop_stall_timeout
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
@@ -852,6 +859,13 @@ class Host:
         loop: _asgi.Loop | None = None
         lifespan: _asgi.Lifespan | None = None
 
+        # Section 6.8: an interface not settled in the host, because the
+        # workers import the application or a factory makes it, is
+        # settled here, and each worker says what it serves.
+
+        known = release.resolved is not None
+        known_mounts = {mount.name for mount in self.mounts if mount.release.resolved is not None}
+
         try:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
@@ -871,12 +885,12 @@ class Host:
             # Section 6.8: a factory is called per worker, after post_fork,
             # and only then is the interface known for certain.
 
-            known = release.resolved is not None
             app = release.realise()
             context = replace(release.context, worker_id=within, group=group.name)
             set_context(context)
+
             if not known and release.resolved is not None:
-                log(f"worker {index} serves {release.spec} as {release.resolved.upper()}")
+                log(f"worker {index} serves {release.spec} as {interface_name(release.resolved)}")
 
             # Section 6.7: each mount's application is realised like the
             # release's own; section 6.6: one event loop per worker when
@@ -887,6 +901,14 @@ class Host:
                 (mount.name, mount.release.realise(), mount.release, mount.threads)
                 for mount in self.mounts
             ]
+
+            for name, _, mounted, _ in realised:
+                if name not in known_mounts and mounted.resolved is not None:
+                    log(
+                        f"worker {index} serves mount {name}: {mounted.spec} as "
+                        f"{interface_name(mounted.resolved)}"
+                    )
+
             any_asgi = release.resolved in ("asgi", "grpc") or any(
                 mounted.resolved in ("asgi", "grpc") for _, _, mounted, _ in realised
             )
@@ -1001,13 +1023,18 @@ class Host:
         # Section 7.6: the soft timeout interrupts a request by raising
         # muru.RequestTimeout in its thread, or cancelling its task.
 
-        timeout_arguments: dict[str, Any] = {}
+        # Told to stop, a worker keeps its open WebSockets for their grace,
+        # then closes them with 1001 and gives what is left the shutdown
+        # timeout, before the host kills it.
+
+        timeout_arguments: dict[str, Any] = {
+            "websocket_drain_ms": int(self.websocket_drain_grace * 1000),
+            "drain_ms": int(self.shutdown_timeout * 1000),
+        }
 
         if self.soft_timeout is not None:
-            timeout_arguments = {
-                "soft_timeout_ms": int(self.soft_timeout * 1000),
-                "timeout_error": RequestTimeout,
-            }
+            timeout_arguments["soft_timeout_ms"] = int(self.soft_timeout * 1000)
+            timeout_arguments["timeout_error"] = RequestTimeout
 
         # Section 7.6: the event loop beats twice a second, and a native
         # watchdog tells the host when it has stopped beating for longer
@@ -1260,7 +1287,23 @@ class Host:
                 for group in self.groups
                 if group.name != "default"
             ],
+            "interfaces": self.interfaces(),
         }
+
+    def interfaces(self) -> dict[str, str]:
+        """Return the interfaces settled in the host, by mount, the default as ``""``.
+
+        One that each worker settles, importing the application itself or
+        calling a factory, is not known here and is left out.
+        """
+
+        settled = {"": self.release.resolved} if self.release.resolved else {}
+
+        for mount in self.mounts:
+            if mount.release.resolved:
+                settled[mount.name] = mount.release.resolved
+
+        return settled
 
     def announce(self) -> int:
         """Tell the supervisor the worker sockets changed; return the version."""
@@ -2195,7 +2238,7 @@ class Host:
             and now >= replacement.terminate_at
         ):
             replacement.terminated = True
-            replacement.kill_at = now + self.shutdown_timeout
+            replacement.kill_at = now + self.stop_budget()
             self.signal(replacement.old_pid, signal.SIGTERM)
 
         if (
@@ -2375,8 +2418,16 @@ class Host:
                 del self.restart_after[index]
                 self.spawn(index, replacing=index in self.starting)
 
+    def stop_budget(self) -> float:
+        """Return how long a worker told to stop may take before it is killed.
+
+        That is the WebSockets' grace, then the shutdown timeout.
+        """
+
+        return self.websocket_drain_grace + self.shutdown_timeout
+
     def terminate_all(self) -> None:
-        """Stop every worker: SIGTERM, a grace period, then SIGKILL."""
+        """Stop every worker: SIGTERM, its stop budget, then SIGKILL."""
 
         for pid in self.workers:
             try:
@@ -2386,7 +2437,7 @@ class Host:
 
         # Reap whatever exits within the grace period.
 
-        deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+        deadline = time.monotonic() + self.stop_budget()
 
         while self.workers and time.monotonic() < deadline:
             try:
@@ -2658,7 +2709,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=float,
         default=5.0,
         metavar="SECONDS",
-        help="how long a worker told to stop gets before it is killed",
+        help="how long a worker told to stop gets before it is killed, after its WebSockets close",
+    )
+    parser.add_argument(
+        "--websocket-drain-grace",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="how long a worker told to stop keeps its open WebSockets before closing them",
     )
     parser.add_argument(
         "--memory-measure",
@@ -2801,7 +2859,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if release.resolved is not None:
             set_context(release.context)
-            log(f"{args.app} is served as {release.resolved.upper()}")
+            log(f"{args.app} is served as {interface_name(release.resolved)}")
+
+        for mount in mounts:
+            if mount.release.resolved is not None:
+                log(
+                    f"mount {mount.name}: {mount.release.spec} is served as "
+                    f"{interface_name(mount.release.resolved)}"
+                )
 
         findings = recorder.findings()
 
@@ -2853,6 +2918,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
+        websocket_drain_grace=args.websocket_drain_grace,
         loop_stall_timeout=args.loop_stall_timeout,
         memory=MemoryPolicy(
             measure=args.memory_measure,

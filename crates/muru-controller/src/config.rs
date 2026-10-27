@@ -2529,6 +2529,12 @@ pub fn resolve_spec(
             "shutdown_timeout",
         )?
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
+        websocket_drain_grace_ms: duration_ms(
+            request.websocket_drain_grace_ms,
+            table_timeouts.websocket_drain_grace.as_ref(),
+            "websocket_drain_grace",
+        )?
+        .unwrap_or_default(),
         loop_stall_timeout_ms: duration_ms(
             request.loop_stall_timeout_ms,
             table_timeouts.loop_stall_timeout.as_ref(),
@@ -2818,6 +2824,15 @@ fn resolve_layers(
             ),
         ),
         (
+            "timeouts.websocket_drain_grace",
+            layer(
+                request.websocket_drain_grace_ms.is_some(),
+                timeouts.websocket_drain_grace.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
             "timeouts.shutdown_timeout",
             layer(
                 request.shutdown_timeout_ms.is_some(),
@@ -2952,6 +2967,10 @@ fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
         (
             "timeouts.shutdown_timeout",
             format_ms(spec.timeouts.shutdown_timeout_ms),
+        ),
+        (
+            "timeouts.websocket_drain_grace",
+            format_ms(spec.timeouts.websocket_drain_grace_ms),
         ),
         (
             "timeouts.loop_stall_timeout",
@@ -3122,6 +3141,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         || request.hard_timeout_ms.is_some()
         || request.hard_drain_grace_ms.is_some()
         || request.shutdown_timeout_ms.is_some()
+        || request.websocket_drain_grace_ms.is_some()
         || request.loop_stall_timeout_ms.is_some();
     let memory_given = !request.memory_measure.is_empty()
         || request.memory_soft_limit.is_some()
@@ -3164,6 +3184,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             hard_timeout: request.hard_timeout_ms.map(format_ms),
             hard_drain_grace: request.hard_drain_grace_ms.map(format_ms),
             shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
+            websocket_drain_grace: request.websocket_drain_grace_ms.map(format_ms),
             loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
         }),
         memory: memory_given.then(muru_config::Memory::default),
@@ -3618,6 +3639,12 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|t| t.shutdown_timeout.as_ref()),
         ),
+        websocket_drain_grace_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.websocket_drain_grace.as_ref()),
+        ),
         loop_stall_timeout_ms: duration_field(
             table
                 .timeouts
@@ -3803,6 +3830,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
                 shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.shutdown_timeout_ms,
+                ))),
+                websocket_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.websocket_drain_grace_ms,
                 ))),
                 loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.loop_stall_timeout_ms,
@@ -4070,6 +4100,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "shutdown_timeout",
         describe_ms(Some(declared.timeouts.shutdown_timeout_ms)),
         describe_ms(Some(recorded.timeouts.shutdown_timeout_ms)),
+    );
+    compare(
+        "websocket_drain_grace",
+        describe_ms(Some(declared.timeouts.websocket_drain_grace_ms)),
+        describe_ms(Some(recorded.timeouts.websocket_drain_grace_ms)),
     );
     compare(
         "loop_stall_timeout",

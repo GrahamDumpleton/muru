@@ -324,6 +324,9 @@ pub struct Shared {
     /// The requests in flight, by id, for the timeouts (section 7.6)
     /// and for inspection (section 11.7).
     active: Mutex<HashMap<u64, RequestInfo>>,
+    /// Set when the worker closes its open WebSockets on its way to
+    /// stopping (section 5.6).
+    draining: tokio::sync::watch::Sender<bool>,
 }
 
 impl Shared {
@@ -353,7 +356,19 @@ impl Shared {
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             active: Mutex::new(HashMap::new()),
+            draining: tokio::sync::watch::channel(false).0,
         })
+    }
+
+    /// Whether the worker is closing its WebSockets to stop, for each
+    /// open WebSocket to watch.
+    pub fn draining(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.draining.subscribe()
+    }
+
+    /// Close every open WebSocket with 1001: the worker is stopping.
+    pub fn close_websockets(&self) {
+        self.draining.send_replace(true);
     }
 
     /// The application a request head names: the default mount for an

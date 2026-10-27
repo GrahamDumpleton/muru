@@ -65,7 +65,7 @@ def test_flags_override_the_table() -> None:
     server = start_project(str(PROJECTS / "shop"), "--processes", "1", "--threads", "2")
 
     try:
-        assert "with 1 workers of 2 threads" in server.log()
+        assert "with 1 worker of 2 threads" in server.log()
     finally:
         server.stop()
 
