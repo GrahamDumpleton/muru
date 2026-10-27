@@ -433,12 +433,17 @@ impl EdgeControl for Control {
         let minute = self.access_log.last_minute();
         let routing = self.pools.current();
         let mut pools = Vec::new();
+        let websockets = self.access_log.websocket_counts();
 
         for app_pools in routing.app_pools() {
             let (app, release) = app_pools.labels();
 
             for (group, pool) in app_pools.pools() {
                 let workers = pool.workers();
+                let open = websockets
+                    .get(&(app.to_owned(), release.to_owned(), group.clone()))
+                    .copied()
+                    .unwrap_or(0);
                 pools.push(pb::PoolState {
                     app: app.to_owned(),
                     release: release.to_owned(),
@@ -447,6 +452,7 @@ impl EdgeControl for Control {
                     slots: workers.iter().map(|worker| worker.slots as u32).sum(),
                     busy: workers.iter().map(|worker| worker.in_flight as u32).sum(),
                     waiting: pool.waiting() as u32,
+                    websockets: open as u32,
                 });
             }
         }
@@ -476,6 +482,10 @@ impl EdgeControl for Control {
                 queue_us: record.queue.as_micros() as u64,
                 application_us: record.application.as_micros() as u64,
                 total_us: record.total.as_micros() as u64,
+                websocket_close: record
+                    .websocket
+                    .map(|end| format!("closed by {}, code {}", end.by, end.code))
+                    .unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(pb::RecentRequests {
@@ -485,6 +495,18 @@ impl EdgeControl for Control {
             minute_seconds: minute.seconds,
             pools,
         }))
+    }
+
+    async fn get_web_sockets(
+        &self,
+        request: Request<pb::WebSocketsRequest>,
+    ) -> Result<Response<pb::WebSockets>, Status> {
+        let request = request.into_inner();
+        Ok(Response::new(muru_edge::endpoints::report(
+            &self.access_log,
+            &request.app,
+            request.limit as usize,
+        )))
     }
 
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {

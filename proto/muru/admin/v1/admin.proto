@@ -84,6 +84,9 @@ service Admin {
   // Metrics (section 11.1): the node's Prometheus text exposition.
   rpc GetMetrics(GetMetricsRequest) returns (MetricsText);
 
+  // The WebSockets open now, counted by endpoint and listed.
+  rpc ListWebSockets(ListWebSocketsRequest) returns (WebSocketList);
+
   // Re-read the daemon's configuration file for what can change while
   // running (section 13.3).
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
@@ -122,6 +125,43 @@ message Status {
   string metrics = 11;              // the metrics listener's address, or empty
   string dashboard = 12;            // the dashboard's address, or empty
   string budget = 13;               // what the releases hold of the node's budget (section 7.4), or empty without one
+  uint32 websockets = 14;           // WebSockets open on the edge, as last sampled
+}
+
+message ListWebSocketsRequest {
+  string app = 1;                   // only this application's; all when empty
+  uint32 limit = 2;                 // sockets listed, the longest open first; 0 for none
+}
+
+message WebSocketList {
+  uint32 open = 1;                  // open WebSockets, of the application asked for
+  repeated WebSocketEndpoint endpoints = 2;
+  repeated OpenWebSocket sockets = 3;
+}
+
+// Open WebSockets counted by endpoint: a path pattern where segments
+// that are identifiers are {id} and many distinct values *.
+message WebSocketEndpoint {
+  string app = 1;
+  string pattern = 2;
+  uint32 open = 3;
+}
+
+message OpenWebSocket {
+  string request_id = 1;            // its handshake's
+  string client = 2;
+  string app = 3;
+  string release = 4;
+  string host = 5;
+  string group = 6;
+  string mount = 7;
+  string path = 8;
+  int32 worker = 9;                 // -1 when not known
+  uint64 opened_unix_ms = 10;
+  uint64 received = 11;             // messages from the client
+  uint64 sent = 12;                 // messages to the client
+  uint64 received_bytes = 13;
+  uint64 sent_bytes = 14;
 }
 
 message ListAppsRequest {}
@@ -413,6 +453,35 @@ message Release {
   string profile = 19;              // the server of an http release
   uint32 instances = 20;            // instances of an http release's command
   repeated string command = 21;     // the command of an http release
+  repeated ReleaseMount mounts = 22; // named mounts beside the default one at / (section 6.7)
+  repeated ReleaseGroup groups = 23; // named worker groups beside the default one (section 7.1)
+  string detected_interface = 24;   // wsgi, asgi or grpc as the host settled it; empty until known
+  uint32 websockets = 25;           // WebSockets open on its workers, as last sampled
+}
+
+// A named mount of a release: a path served by another entrypoint in
+// the same workers.
+message ReleaseMount {
+  string name = 1;
+  string path = 2;                  // empty for a gRPC mount
+  string entrypoint = 3;
+  string interface = 4;             // as declared: auto, wsgi, asgi or grpc
+  bool internal = 5;                // reached only by internal redirects
+  uint32 threads = 6;               // threads of its own, 0 for the shared pool
+  uint32 max_threads = 7;           // the most it runs at once, borrowing shared ones
+  string detected_interface = 8;    // as the host settled it; empty until known
+}
+
+// A named worker group of a release: the paths and client classes it
+// serves, and its sizes.
+message ReleaseGroup {
+  string name = 1;
+  repeated string paths = 2;
+  repeated string client_classes = 3;
+  uint32 processes = 4;
+  uint32 threads = 5;
+  uint32 sync_threads = 6;
+  uint32 concurrency = 7;
 }
 
 message Worker {

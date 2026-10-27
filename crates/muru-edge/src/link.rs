@@ -81,6 +81,9 @@ struct WorkerSlots {
     /// Requests the worker takes at once, from its HELLO: its threads for
     /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
+    /// Requests its event loop holds at once, from its HELLO; 0 for a
+    /// worker with no loop.
+    async_slots: usize,
     semaphore: Arc<Semaphore>,
     /// Section 6.7: the mounts with threads of their own, by name.
     mounts: HashMap<String, MountSlots>,
@@ -117,6 +120,7 @@ impl WorkerSlots {
             worker_type: hello.worker_type,
             websockets: hello.websockets,
             slots,
+            async_slots: usize::try_from(hello.async_slots).unwrap_or(usize::MAX),
             semaphore: Arc::new(Semaphore::new(slots)),
             mounts,
             idle: Mutex::new(vec![conn]),
@@ -230,6 +234,9 @@ pub struct WorkerStatus {
     pub worker_type: String,
     /// Requests it can handle at once: threads, or the loop's concurrency.
     pub slots: usize,
+    /// Requests its event loop holds at once, 0 without a loop: beside
+    /// the threads, a WSGI worker has one when a mount is ASGI.
+    pub async_slots: usize,
     /// Requests it is handling now.
     pub in_flight: usize,
 }
@@ -343,6 +350,7 @@ impl LinkPool {
                 path: worker.path.clone(),
                 worker_type: worker.worker_type.clone(),
                 slots: worker.slots(),
+                async_slots: worker.async_slots,
                 in_flight: worker.in_flight(),
             })
             .collect()
@@ -926,6 +934,7 @@ impl Recording {
                 total: Duration::ZERO,
                 redirects: context.hops.clone(),
                 client_class: context.client_class.to_string(),
+                websocket: None,
             },
             started: Instant::now(),
         }
@@ -938,6 +947,18 @@ impl Recording {
         self.record.status = status;
         self.record.total = self.started.elapsed();
         self.log.record_hop(&self.record);
+    }
+
+    /// The worker accepted a WebSocket: the request ends here, its line
+    /// written with the handshake's time, and the socket is listed and
+    /// counted as open until the returned guard is closed.
+    pub(crate) fn open_websocket(mut self) -> crate::access::WebSocket {
+        self.record.status = 101;
+        self.record.total = self.started.elapsed();
+        let opened = self.record.clone();
+        let log = Arc::clone(&self.log);
+        log.record(self.record);
+        log.open_websocket(opened)
     }
 
     pub(crate) fn complete(mut self, status: u16, reason: &str, bytes: u64) {
@@ -1567,7 +1588,7 @@ async fn handle_inner(
             reader,
             writer,
             back,
-            recording,
+            socket: recording.map(Recording::open_websocket),
             limits: Arc::clone(&context.limits),
         }));
         return response;

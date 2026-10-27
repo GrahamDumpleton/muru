@@ -1671,6 +1671,93 @@ pub async fn metrics(socket: SocketArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `muructl websockets` shows.
+#[derive(Args)]
+pub struct WebSocketsArgs {
+    /// Only this application's WebSockets.
+    pub app: Option<String>,
+
+    /// List each open WebSocket, the longest open first, instead of
+    /// counting them by endpoint.
+    #[arg(long)]
+    pub list: bool,
+
+    /// How many to list with --list.
+    #[arg(long, default_value = "100", value_name = "COUNT")]
+    pub limit: u32,
+
+    #[command(flatten)]
+    pub socket: SocketArgs,
+}
+
+/// Show the WebSockets open now: counted by endpoint, where segments
+/// that are identifiers are {id} and many distinct values *, or listed.
+pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()).await?;
+    let list = client
+        .list_web_sockets(pb::ListWebSocketsRequest {
+            app: args.app.unwrap_or_default(),
+            limit: if args.list { args.limit } else { 0 },
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if list.open == 0 {
+        println!("no WebSockets open");
+        return Ok(());
+    }
+
+    if !args.list {
+        println!("{:<16} {:<40} {:>6}", "APP", "ENDPOINT", "OPEN");
+
+        for endpoint in &list.endpoints {
+            println!(
+                "{:<16} {:<40} {:>6}",
+                endpoint.app, endpoint.pattern, endpoint.open
+            );
+        }
+
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<9} {:<16} {:<32} {:<16} {:>8} {:>8} {:<6} REQUEST ID",
+        "OPENED", "FOR", "RELEASE", "PATH", "CLIENT", "RECEIVED", "SENT", "WORKER"
+    );
+
+    for socket in &list.sockets {
+        println!(
+            "{:<20} {:<9} {:<16} {:<32} {:<16} {:>8} {:>8} {:<6} {}",
+            format_time(socket.opened_unix_ms),
+            muru_dashboard::uptime(std::time::Duration::from_millis(
+                now_unix_ms().saturating_sub(socket.opened_unix_ms)
+            )),
+            format!("{}@{}", socket.app, socket.release),
+            socket.path,
+            socket.client,
+            socket.received,
+            socket.sent,
+            if socket.worker < 0 {
+                "-".to_owned()
+            } else {
+                socket.worker.to_string()
+            },
+            socket.request_id
+        );
+    }
+
+    if list.open as usize > list.sockets.len() {
+        println!(
+            "({} of {} open shown; --limit shows more)",
+            list.sockets.len(),
+            list.open
+        );
+    }
+
+    Ok(())
+}
+
 /// Re-read the daemon's configuration file.
 pub async fn daemon_reload(socket: SocketArgs) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()).await?;
@@ -1707,6 +1794,7 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
     println!("apps     {} ({} releases)", status.apps, status.releases);
+    println!("websockets {} open", status.websockets);
 
     if !status.budget.is_empty() {
         println!("budget   {}", status.budget);
@@ -3436,6 +3524,16 @@ pub enum ReleaseCommand {
         socket: SocketArgs,
     },
 
+    /// Show a release: its source and settings, and the mounts and
+    /// worker groups it serves.
+    Show {
+        /// The release, as app@release.
+        release: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
     /// Wait until a release reaches a state.
     Wait {
         /// The release, as app@release.
@@ -3495,6 +3593,231 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
     }
 
     Ok(())
+}
+
+/// Show one release.
+pub async fn release_show(release: String, socket: SocketArgs) -> anyhow::Result<()> {
+    let (app, id) = split_release(&release)?;
+    let mut client = client::connect(&socket.socket()).await?;
+    let release = client
+        .get_release(pb::GetReleaseRequest {
+            app: app.to_owned(),
+            release: id.to_owned(),
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    for (key, value) in release_details(&release) {
+        println!("{key:<12} {value}");
+    }
+
+    Ok(())
+}
+
+/// A release's details as the lines `release show` prints, key first.
+fn release_details(release: &pb::Release) -> Vec<(String, String)> {
+    let mut lines = vec![
+        (
+            "release".to_owned(),
+            format!("{}@{}", release.app, release.id),
+        ),
+        (
+            "state".to_owned(),
+            if release.serving {
+                format!("{}, serving", release.state)
+            } else {
+                release.state.clone()
+            },
+        ),
+    ];
+
+    if !release.message.is_empty() {
+        lines.push(("message".to_owned(), release.message.clone()));
+    }
+
+    lines.push(("source".to_owned(), release.source.clone()));
+
+    if release.websockets > 0 {
+        lines.push((
+            "websockets".to_owned(),
+            format!("{} open", release.websockets),
+        ));
+    }
+
+    if release.kind == "http" {
+        lines.push((
+            "server".to_owned(),
+            format!("{}, {} instances", release.profile, release.instances),
+        ));
+        lines.push(("command".to_owned(), release.command.join(" ")));
+        return lines;
+    }
+
+    // Which sizes apply follows from the interfaces: threads for WSGI,
+    // the event loop for ASGI and gRPC, both while one is not yet known.
+
+    let interfaces: Vec<&str> =
+        std::iter::once(effective(&release.interface, &release.detected_interface))
+            .chain(
+                release
+                    .mounts
+                    .iter()
+                    .map(|mount| effective(&mount.interface, &mount.detected_interface)),
+            )
+            .collect();
+    let uses = Uses {
+        threads: interfaces
+            .iter()
+            .any(|interface| matches!(*interface, "wsgi" | "auto")),
+        event_loop: interfaces.iter().any(|interface| *interface != "wsgi"),
+    };
+
+    lines.push(("python".to_owned(), release.python.clone()));
+    lines.push((
+        "entrypoint".to_owned(),
+        format!(
+            "{}, {}",
+            release.entrypoint,
+            interface(&release.interface, &release.detected_interface)
+        ),
+    ));
+    lines.push((
+        "workers".to_owned(),
+        group_size(
+            uses,
+            release.processes,
+            release.threads,
+            release.concurrency,
+            release.sync_threads,
+        ),
+    ));
+
+    for group in &release.groups {
+        let mut serves = group.paths.join(", ");
+
+        if !group.client_classes.is_empty() {
+            if !serves.is_empty() {
+                serves.push_str(" and ");
+            }
+
+            serves.push_str(&format!(
+                "client classes {}",
+                group.client_classes.join(", ")
+            ));
+        }
+
+        lines.push((
+            format!("group {}", group.name),
+            format!(
+                "{serves}: {}",
+                group_size(
+                    uses,
+                    group.processes,
+                    group.threads,
+                    group.concurrency,
+                    group.sync_threads
+                )
+            ),
+        ));
+    }
+
+    for mount in &release.mounts {
+        let mut serves = if mount.path.is_empty() {
+            format!("the gRPC services of {}", mount.entrypoint)
+        } else {
+            format!("{} from {}", mount.path, mount.entrypoint)
+        };
+        serves.push_str(&format!(
+            ", {}",
+            interface(&mount.interface, &mount.detected_interface)
+        ));
+
+        if mount.threads > 0 && mount.max_threads > mount.threads {
+            serves.push_str(&format!(
+                ", {} threads of its own, borrowing shared ones up to {}",
+                mount.threads, mount.max_threads
+            ));
+        } else if mount.threads > 0 {
+            serves.push_str(&format!(", {} threads of its own", mount.threads));
+        }
+
+        if mount.internal {
+            serves.push_str(", to internal redirects only");
+        }
+
+        lines.push((format!("mount {}", mount.name), serves));
+    }
+
+    lines
+}
+
+/// The interface an entrypoint is served with: as declared, or as
+/// detected once the host has settled it; `auto` until then.
+fn effective<'a>(declared: &'a str, detected: &'a str) -> &'a str {
+    if declared == "auto" && !detected.is_empty() {
+        detected
+    } else {
+        declared
+    }
+}
+
+/// An entrypoint's interface as `release show` names it.
+fn interface(declared: &str, detected: &str) -> String {
+    let name = |interface: &str| match interface {
+        "grpc" => "gRPC".to_owned(),
+        other => other.to_uppercase(),
+    };
+
+    match (declared, detected) {
+        ("auto", "") => "interface auto, not yet detected".to_owned(),
+        ("auto", detected) => format!("{} (detected)", name(detected)),
+        (declared, _) => name(declared),
+    }
+}
+
+/// Which of a release's sizes its workers use.
+#[derive(Clone, Copy)]
+struct Uses {
+    /// Application threads, for WSGI.
+    threads: bool,
+    /// The event loop, for ASGI and gRPC.
+    event_loop: bool,
+}
+
+/// A group's processes and what each takes at once: threads for WSGI,
+/// the event loop's concurrency and sync threads for ASGI.
+fn group_size(
+    uses: Uses,
+    processes: u32,
+    threads: u32,
+    concurrency: u32,
+    sync_threads: u32,
+) -> String {
+    let processes = counted(processes, "process", "processes");
+    let threads = counted(threads, "thread", "threads");
+    let event_loop = format!(
+        "an event loop of concurrency {concurrency} with {}",
+        counted(sync_threads, "sync thread", "sync threads")
+    );
+
+    match (uses.threads, uses.event_loop) {
+        (true, true) => format!("{processes} of {threads} and {event_loop}"),
+        (false, true) => format!("{processes} of {event_loop}"),
+        _ => format!("{processes} of {threads}"),
+    }
+}
+
+/// A count with its noun, singular for one.
+pub fn counted<T>(count: T, singular: &str, plural: &str) -> String
+where
+    T: std::fmt::Display + PartialEq + From<u8>,
+{
+    if count == T::from(1) {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 /// Wait for a release to reach a state.
@@ -4130,12 +4453,18 @@ fn format_access_line(line: &str) -> String {
         muru_edge::access::format_bytes(record.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0));
     let time = text("time");
     let clock = time.get(11..23).unwrap_or(time);
+    let total = Duration::from_secs_f64(number("total_ms") / 1000.0);
+
+    let total = if record.get("websocket").is_some_and(|v| !v.is_null()) {
+        muru_edge::access::format_lifetime(total)
+    } else {
+        muru_edge::access::format_duration(total)
+    };
     let mut out = format!(
-        "{clock} {} {} {} {bytes} {}",
+        "{clock} {} {} {} {bytes} {total}",
         number("status") as u64,
         text("method"),
         text("target"),
-        millis("total_ms")
     );
 
     if !text("app").is_empty() {
@@ -4146,7 +4475,19 @@ fn format_access_line(line: &str) -> String {
         out.push_str(&format!(" host={}", text("host")));
     }
 
-    if record.get("worker").is_some_and(|v| !v.is_null()) {
+    // A WebSocket's closing record says who closed, how and what passed;
+    // its total is how long the socket was open.
+
+    if let Some(end) = record.get("websocket").and_then(|v| v.as_object()) {
+        let field = |key: &str| end.get(key).map(|v| v.to_string()).unwrap_or_default();
+        out.push_str(&format!(
+            " websocket=closed by={} code={} received={} sent={}",
+            end.get("by").and_then(|v| v.as_str()).unwrap_or(""),
+            field("code"),
+            field("received"),
+            field("sent")
+        ));
+    } else if record.get("worker").is_some_and(|v| !v.is_null()) {
         out.push_str(&format!(
             " queue={} app={}",
             millis("queue_ms"),

@@ -5,6 +5,7 @@
   <div class="tile"><div class="label">p95</div><div class="value">{{ data.summary.p95 }}</div></div>
   <div class="tile"><div class="label">Errors (5xx)</div><div class="value">{{ data.summary.errors }}</div></div>
   <div class="tile"><div class="label">In flight</div><div class="value">{{ data.summary.in_flight }}</div></div>
+  <div class="tile"><div class="label">WebSockets open</div><div class="value">{{ data.summary.websockets }}</div></div>
 </div>
 <h2 style="margin-top:1rem">Workers</h2>
 <table>
@@ -13,3 +14,4 @@
   <tr><td>{{ worker.index }}</td><td>{{ worker.link }}</td><td class="num">{{ worker.slots }}</td><td class="num">{{ worker.in_flight }}</td></tr>
   {% endfor %}
 </table>
+{% include "websockets.html" %}

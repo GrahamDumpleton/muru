@@ -339,6 +339,20 @@ impl EdgeProcess {
             .into_inner())
     }
 
+    /// The WebSockets open on the edge, of one application or all when
+    /// `app` is empty: counted by endpoint, and the first `limit` listed.
+    pub async fn websockets(&self, app: &str, limit: u32) -> anyhow::Result<pb::WebSockets> {
+        let mut client = connect(&self.spec.control).await?;
+        Ok(client
+            .get_web_sockets(pb::WebSocketsRequest {
+                app: app.to_owned(),
+                limit,
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("the edge did not answer: {}", status.message()))?
+            .into_inner())
+    }
+
     /// The edge's metrics as samples (section 11.1).
     pub async fn metrics(&self) -> anyhow::Result<Vec<muru_edge::metrics::Sample>> {
         let mut client = connect(&self.spec.control).await?;

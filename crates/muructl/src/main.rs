@@ -194,6 +194,10 @@ enum Command {
         socket: admin::SocketArgs,
     },
 
+    /// Show the WebSockets open now: how many by endpoint, or each one
+    /// with --list.
+    Websockets(admin::WebSocketsArgs),
+
     /// Serve a directory of files with no configuration,
     /// for a built front end or a documentation build.
     ServeStatic(Box<ServeStaticArgs>),
@@ -730,6 +734,9 @@ fn main() -> anyhow::Result<()> {
                 admin::ReleaseCommand::List { app, socket } => {
                     admin::release_list(app, socket).await
                 }
+                admin::ReleaseCommand::Show { release, socket } => {
+                    admin::release_show(release, socket).await
+                }
                 admin::ReleaseCommand::Wait {
                     release,
                     states,
@@ -793,6 +800,7 @@ fn main() -> anyhow::Result<()> {
             }
         }),
         Command::Metrics { socket } => runtime.block_on(admin::metrics(socket)),
+        Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
@@ -1489,6 +1497,73 @@ async fn host_control(
     }
 }
 
+/// What a worker takes at once, as its HELLO declared it: threads, its
+/// event loop's concurrency, or both when the default mount is WSGI and
+/// a mount is ASGI.
+fn capacity(worker: Option<muru_edge::link::WorkerStatus>, threads: usize) -> String {
+    let threads_of = |count: usize| admin::counted(count, "thread", "threads");
+
+    match worker {
+        Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
+        Some(worker) if worker.async_slots > 0 => format!(
+            "{} and an event loop of concurrency {}",
+            threads_of(worker.slots),
+            worker.async_slots
+        ),
+        Some(worker) => threads_of(worker.slots),
+        None => threads_of(threads),
+    }
+}
+
+/// A count of workers and what each takes, for the start-up lines.
+fn workers(count: usize, capacity: &str) -> String {
+    format!(
+        "{} of {capacity}",
+        admin::counted(count, "worker", "workers")
+    )
+}
+
+/// What a named group serves: its path prefixes and client classes.
+fn group_serves(group: &muru_config::Group) -> String {
+    let classes = group
+        .matches
+        .as_ref()
+        .map(|matches| matches.client_class.join(", "))
+        .filter(|classes| !classes.is_empty());
+
+    match (group.paths.join(", "), classes) {
+        (paths, None) => paths,
+        (paths, Some(classes)) if paths.is_empty() => format!("client classes {classes}"),
+        (paths, Some(classes)) => format!("{paths} and client classes {classes}"),
+    }
+}
+
+/// What a named mount serves, from where, and on which threads.
+fn mount_serves(mount: &muru_config::Mount) -> String {
+    let mut serves = if mount.path.is_empty() {
+        format!("serves the gRPC services of {}", mount.entrypoint)
+    } else {
+        format!("serves {} from {}", mount.path, mount.entrypoint)
+    };
+
+    match mount.threads {
+        Some(muru_config::MountThreads::Fixed(threads)) => {
+            serves.push_str(&format!(" on {threads} threads of its own"));
+        }
+        Some(muru_config::MountThreads::Borrowing(threads)) => serves.push_str(&format!(
+            " on {} threads of its own, borrowing shared ones up to {}",
+            threads.reserved, threads.max
+        )),
+        None => {}
+    }
+
+    if mount.internal.unwrap_or(false) {
+        serves.push_str(", to internal redirects only");
+    }
+
+    serves
+}
+
 /// The named mounts as the edge selects them, with their redirect
 /// settings (section 4.10), the release's where a mount is silent.
 fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
@@ -1819,18 +1894,41 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     // The workers said in HELLO what they are and how much they take at
-    // once, which is also what the edge dispatches by.
+    // once, which is also what the edge dispatches by. Each named group
+    // and mount gets a line of its own.
 
-    let capacity = match edge.pools().current().default_pool().workers().first() {
-        Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
-        Some(worker) => format!("{} threads", worker.slots),
-        None => format!("{} threads", resolved.threads),
+    let pools = edge.pools().current().default_pools();
+    let capacity_of = |group: &str, threads: usize| {
+        let pool = pools.iter().find(|(name, _)| name == group);
+        capacity(
+            pool.and_then(|(_, pool)| pool.workers().first().cloned()),
+            threads,
+        )
     };
 
     println!(
-        "muru: serving {} on {addresses} with {} workers of {capacity}",
-        resolved.entrypoint, resolved.processes
+        "muru: serving {} on {addresses} with {}",
+        resolved.entrypoint,
+        workers(
+            resolved.processes,
+            &capacity_of(muru_edge::routing::DEFAULT_GROUP, resolved.threads)
+        )
     );
+
+    for (name, group) in &resolved.groups {
+        println!(
+            "muru: group {name} serves {} with {}",
+            group_serves(group),
+            workers(
+                group.processes.unwrap_or(resolved.processes),
+                &capacity_of(name, group.threads.unwrap_or(resolved.threads))
+            )
+        );
+    }
+
+    for (name, mount) in &resolved.mounts {
+        println!("muru: mount {name} {}", mount_serves(mount));
+    }
 
     if development {
         println!(
@@ -1940,7 +2038,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 // that it does before it stops the old one.
 
                 match message {
-                    muru_controller::host::HostMessage::Workers { version, sockets, groups } => {
+                    muru_controller::host::HostMessage::Workers { version, sockets, groups, .. } => {
                         let connected = muru_edge::routing::AppPools::connect(
                             &label,
                             &format!("r{}", current.release),

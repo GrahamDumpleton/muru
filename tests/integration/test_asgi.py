@@ -69,7 +69,7 @@ def test_served_as_asgi(server: support.Server) -> None:
     assert response.status == 200
     assert response.body == b"Hello, async world!\n"
     assert "plain_asgi:application is served as ASGI" in server.log()
-    assert "with 1 workers of concurrency 1000" in server.log()
+    assert "with 1 worker of concurrency 1000" in server.log()
 
 
 def test_scope_contents(server: support.Server) -> None:

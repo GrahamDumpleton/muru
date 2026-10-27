@@ -15,9 +15,9 @@ still to come.
 ## In development mode
 
 `muructl run` serves a dashboard at `http://127.0.0.1:8081/` with the
-workers, requests per second and latency over the last minute, charts
-of requests, errors and latency over time, recent requests and the
-host's and workers' output, refreshed every two seconds, with no
+workers, requests per second and latency over the last minute, the
+WebSockets open, charts of requests, errors, latency and what is open
+over time, recent requests and the host's and workers' output, refreshed every two seconds, with no
 sign-in. `--dashboard ADDRESS` moves it to another loopback address and
 `--dashboard off` turns it off; with `--allow-public` it is off unless
 asked for. `/metrics` on the same address is the Prometheus exposition
@@ -71,18 +71,21 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
 - the node: the daemon's pid and version, its uptime, the listeners, the
   edge process and the routing snapshot in force;
 - the last minute: requests per second, median and 95th percentile
-  total time, 5xx responses and requests in flight;
+  total time, 5xx responses, requests in flight and WebSockets open;
 - every application's releases with their state, whether traffic goes to
-  them, the workers listening, the slots busy and in all, and requests
-  waiting for a slot, with when maintenance mode began for an application
+  them, the workers listening, the slots busy (WebSockets hold one each),
+  the WebSockets open and the slots in all, and requests waiting for a
+  slot, with when maintenance mode began for an application
   in it, and the virtual hosts and routes when declared;
 - the [rollouts](rollouts.md) under way and the latest that ended, with
   the candidate's share and what each is doing or why it ended;
 - each running release's worker groups as the [autoscaler](scaling.md)
   sees them: workers, policy, the workers' CPU, GIL wait and event loop
   lag, the diagnosis with the tuning it suggests, and the last decision;
-- charts of requests and errors per second and of the median and 95th
-  percentile total time, over the last hour at one second or, with
+- the [WebSockets](asgi.md#watching-websockets) open, counted by endpoint
+  and the longest open listed;
+- charts of requests and errors per second, of the median and 95th
+  percentile total time, and of requests in flight and WebSockets open, over the last hour at one second or, with
   `?range=24h`, the last day at one minute;
 - recent requests across every release, the last fifty events (new ones
   arriving as they happen), and the tail of each serving release's log.
@@ -109,13 +112,15 @@ A token lasts twelve hours, or until the daemon restarts.
 | `/v1/rollouts` | rollouts, those under way first, then the latest ten |
 | `/v1/scaling` | each running release's worker groups, as `muructl scale status` shows them |
 | `/v1/requests` | recent requests, newest first |
+| `/v1/websockets` | the WebSockets open: `open`, `endpoints` counted by path pattern, and `sockets`, the longest open first |
 | `/v1/events` | recent events, newest first |
-| `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers]`, one a second for the last hour, or one a minute for the last day with `range=24h` |
+| `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers, WebSockets open]`, one a second for the last hour, or one a minute for the last day with `range=24h` |
 | `/v1/history/stream` | each new point as a Server-Sent Event of type `point` |
 | `/v1/events/stream` | each new event as it happens, as a rendered table row (type `event`) and as JSON (type `json`) |
 | `/metrics` | the Prometheus exposition, which needs no session |
 
-A development run serves `/v1/history` and `/v1/history/stream` too.
+A development run serves `/v1/history`, `/v1/history/stream` and
+`/v1/websockets` too.
 The history is computed from the edge's own counters once a second (the
 daemon asks its edge for them), so rates are exact and the percentiles
 come from the request histogram; a day's points fold each minute's

@@ -94,12 +94,23 @@ waiting for a worker thread, time in the application, the reason when Muru
 generated the response, the worker, and the request id that the
 `X-Request-ID` response header and the error page carry too.
 
+A WebSocket has two lines with the same request id. The first is written
+when the application accepts it, with the 101 and the handshake's time;
+the second when it closes, with how long it was open, the bytes sent to
+the client, the side that closed first, the close code, and the messages
+received from the client and sent to it:
+
+```
+05:42:23.010 101 GET /ws/chat/42 0B 0.8ms queue=0.0ms app=0.7ms worker=0 id=01M5P6WZD3740HFT2N80MAV4YV
+05:47:26.402 101 GET /ws/chat/42 12kB 5m03s websocket=closed by=client code=1000 received=12 sent=40 worker=0 id=01M5P6WZD3740HFT2N80MAV4YV
+```
+
 `--access-log` chooses where the lines go:
 
 | Value | Effect |
 | --- | --- |
 | `terminal` (default) | compact lines as above |
-| `errors` | only 4xx and 5xx responses and requests slower than `--slow` (default `1s`) |
+| `errors` | only 4xx and 5xx responses, requests slower than `--slow` (default `1s`), and WebSockets that closed other than normally or going away |
 | `off` | nothing |
 | a file path | JSON lines appended to the file, one object per request |
 
@@ -132,7 +143,11 @@ group](worker-groups.md) and [mount](mounts.md), and `snapshot` is the
 version of the routing the edge used (0 in development mode).
 `redirects` lists the targets of [internal redirects](internal-redirects.md)
 the request went through, and `client_class` is its [client
-class](client-classes.md). The compact line shows the group, the mount and
+class](client-classes.md). `websocket` is null except on a WebSocket's
+closing line, where it holds `event` (`closed`), `by`, `code`, `close`
+(the outcome the [metrics](metrics.md) name), `received`, `sent` and
+`received_bytes`; that line's `total_ms` is how long the socket was open
+and its `bytes` what was sent to the client. The compact line shows the group, the mount and
 the class (as `class=`) only when they are not `default`.
 
 ## Under the daemon

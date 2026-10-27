@@ -106,7 +106,22 @@ pub const FAMILIES: &[Family] = &[
     Family {
         name: "muru_requests_in_flight",
         kind: Kind::Gauge,
-        help: "Requests the edge has taken and not yet answered.",
+        help: "Requests the edge has taken and not yet answered; a WebSocket counts until its handshake is answered.",
+    },
+    Family {
+        name: "muru_websocket_connections",
+        kind: Kind::Gauge,
+        help: "WebSockets open, by application, release, group and mount.",
+    },
+    Family {
+        name: "muru_websockets_closed_total",
+        kind: Kind::Counter,
+        help: "WebSockets closed, by application, release, group and mount, which side closed, and how.",
+    },
+    Family {
+        name: "muru_websocket_duration_seconds",
+        kind: Kind::Histogram,
+        help: "How long WebSockets stayed open, by application, release and group.",
     },
     Family {
         name: "muru_upload_spool_bytes",
@@ -218,20 +233,51 @@ const BUCKETS: [(f64, &str); 13] = [
     (10.0, "10"),
 ];
 
+/// The buckets of a WebSocket's lifetime, in seconds: from a second to a
+/// day.
+const LIFETIME_BUCKETS: [(f64, &str); 9] = [
+    (1.0, "1"),
+    (10.0, "10"),
+    (60.0, "60"),
+    (300.0, "300"),
+    (900.0, "900"),
+    (1800.0, "1800"),
+    (3600.0, "3600"),
+    (14400.0, "14400"),
+    (86400.0, "86400"),
+];
+
 /// Cumulative counts per bucket, with the sum and count of what was
 /// observed.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct Histogram {
-    counts: [u64; BUCKETS.len()],
+    bounds: &'static [(f64, &'static str)],
+    counts: Vec<u64>,
     sum: f64,
     count: u64,
 }
 
+impl Default for Histogram {
+    /// A histogram of request times.
+    fn default() -> Self {
+        Self::with(&BUCKETS)
+    }
+}
+
 impl Histogram {
+    fn with(bounds: &'static [(f64, &'static str)]) -> Self {
+        Self {
+            bounds,
+            counts: vec![0; bounds.len()],
+            sum: 0.0,
+            count: 0,
+        }
+    }
+
     fn observe(&mut self, duration: Duration) {
         let seconds = duration.as_secs_f64();
 
-        for (index, (bound, _)) in BUCKETS.iter().enumerate() {
+        for (index, (bound, _)) in self.bounds.iter().enumerate() {
             if seconds <= *bound {
                 self.counts[index] += 1;
             }
@@ -242,7 +288,7 @@ impl Histogram {
     }
 
     fn samples(&self, name: &str, labels: &[(String, String)], into: &mut Vec<Sample>) {
-        for (index, (_, le)) in BUCKETS.iter().enumerate() {
+        for (index, (_, le)) in self.bounds.iter().enumerate() {
             let mut with_le = labels.to_vec();
             with_le.push(("le".to_owned(), (*le).to_owned()));
             into.push(Sample {
@@ -318,6 +364,30 @@ impl DurationKey {
     }
 }
 
+/// The labels of a WebSocket's gauge: where it was routed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SocketKey {
+    /// The application.
+    pub app: String,
+    /// The release.
+    pub release: String,
+    /// The worker group.
+    pub group: String,
+    /// The mount.
+    pub mount: String,
+}
+
+impl SocketKey {
+    fn labels(&self) -> Vec<(String, String)> {
+        vec![
+            ("app".to_owned(), self.app.clone()),
+            ("release".to_owned(), self.release.clone()),
+            ("group".to_owned(), self.group.clone()),
+            ("mount".to_owned(), self.mount.clone()),
+        ]
+    }
+}
+
 /// A group's three request histograms.
 #[derive(Debug, Default, Clone)]
 struct Durations {
@@ -331,6 +401,12 @@ struct Inner {
     requests: BTreeMap<RequestKey, u64>,
     durations: BTreeMap<DurationKey, Durations>,
     in_flight: BTreeMap<ReleaseKey, i64>,
+    /// WebSockets open, by where they were routed.
+    websockets: BTreeMap<SocketKey, i64>,
+    /// WebSockets closed, by where, which side closed and how.
+    websockets_closed: BTreeMap<(SocketKey, &'static str, &'static str), u64>,
+    /// How long WebSockets stayed open, by group.
+    websocket_lifetimes: BTreeMap<DurationKey, Histogram>,
     /// Authentication sub-requests by result (section 4.16).
     auth: BTreeMap<String, u64>,
     rate_limited: BTreeMap<(String, String, String), u64>,
@@ -393,6 +469,39 @@ impl Metrics {
         }
     }
 
+    /// Count a WebSocket as open, from its handshake until `close_websocket`.
+    pub fn open_websocket(&self, key: &SocketKey) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        *inner.websockets.entry(key.clone()).or_default() += 1;
+    }
+
+    /// The WebSocket opened with this key has closed: `by` the client,
+    /// the application or the edge, `how` as one of a fixed set of
+    /// outcomes, after `lifetime`.
+    pub fn close_websocket(
+        &self,
+        key: &SocketKey,
+        by: &'static str,
+        how: &'static str,
+        lifetime: Duration,
+    ) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        *inner.websockets.entry(key.clone()).or_default() -= 1;
+        *inner
+            .websockets_closed
+            .entry((key.clone(), by, how))
+            .or_default() += 1;
+        inner
+            .websocket_lifetimes
+            .entry(DurationKey {
+                app: key.app.clone(),
+                release: key.release.clone(),
+                group: key.group.clone(),
+            })
+            .or_insert_with(|| Histogram::with(&LIFETIME_BUCKETS))
+            .observe(lifetime);
+    }
+
     /// Count an authentication sub-request (section 4.16) by its result:
     /// allowed, cached, denied or unavailable.
     pub fn count_auth(&self, result: &str) {
@@ -447,6 +556,33 @@ impl Metrics {
                 labels: key.labels(),
                 value: *count as f64,
             });
+        }
+
+        for (key, count) in &inner.websockets {
+            samples.push(Sample {
+                name: "muru_websocket_connections".to_owned(),
+                labels: key.labels(),
+                value: *count as f64,
+            });
+        }
+
+        for ((key, by, how), count) in &inner.websockets_closed {
+            let mut labels = key.labels();
+            labels.push(("by".to_owned(), (*by).to_owned()));
+            labels.push(("close".to_owned(), (*how).to_owned()));
+            samples.push(Sample {
+                name: "muru_websockets_closed_total".to_owned(),
+                labels,
+                value: *count as f64,
+            });
+        }
+
+        for (key, histogram) in &inner.websocket_lifetimes {
+            histogram.samples(
+                "muru_websocket_duration_seconds",
+                &key.labels(),
+                &mut samples,
+            );
         }
 
         for (result, count) in &inner.auth {
@@ -696,6 +832,7 @@ mod tests {
             total: Duration::from_millis(total_ms),
             redirects: Vec::new(),
             client_class: "default".to_owned(),
+            websocket: None,
         }
     }
 

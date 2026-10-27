@@ -54,7 +54,7 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
   <section id="charts">
     <div class="ranges"><a href="?range=1h" data-range="1h">last hour</a><a href="?range=24h" data-range="24h">last day</a></div>
     <h2>Over time</h2>
-    <div class="charts"><div id="chart-rate" class="chart"></div><div id="chart-latency" class="chart"></div></div>
+    <div class="charts"><div id="chart-rate" class="chart"></div><div id="chart-latency" class="chart"></div><div id="chart-open" class="chart"></div></div>
   </section>
   <section id="requests" hx-get="fragment/requests" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "requests.html" %}

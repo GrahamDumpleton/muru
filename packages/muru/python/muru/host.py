@@ -159,6 +159,12 @@ def detect_interface(app: Any) -> str:
     return "wsgi"
 
 
+def interface_name(interface: str) -> str:
+    """Return an interface as messages name it: WSGI, ASGI or gRPC."""
+
+    return "gRPC" if interface == "grpc" else interface.upper()
+
+
 def resolve_interface(spec: str, app: Any, interface: str) -> str:
     """Return the interface the application is served with: ``wsgi``, ``asgi`` or ``grpc``.
 
@@ -852,6 +858,13 @@ class Host:
         loop: _asgi.Loop | None = None
         lifespan: _asgi.Lifespan | None = None
 
+        # Section 6.8: an interface not settled in the host, because the
+        # workers import the application or a factory makes it, is
+        # settled here, and each worker says what it serves.
+
+        known = release.resolved is not None
+        known_mounts = {mount.name for mount in self.mounts if mount.release.resolved is not None}
+
         try:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
@@ -871,12 +884,12 @@ class Host:
             # Section 6.8: a factory is called per worker, after post_fork,
             # and only then is the interface known for certain.
 
-            known = release.resolved is not None
             app = release.realise()
             context = replace(release.context, worker_id=within, group=group.name)
             set_context(context)
+
             if not known and release.resolved is not None:
-                log(f"worker {index} serves {release.spec} as {release.resolved.upper()}")
+                log(f"worker {index} serves {release.spec} as {interface_name(release.resolved)}")
 
             # Section 6.7: each mount's application is realised like the
             # release's own; section 6.6: one event loop per worker when
@@ -887,6 +900,14 @@ class Host:
                 (mount.name, mount.release.realise(), mount.release, mount.threads)
                 for mount in self.mounts
             ]
+
+            for name, _, mounted, _ in realised:
+                if name not in known_mounts and mounted.resolved is not None:
+                    log(
+                        f"worker {index} serves mount {name}: {mounted.spec} as "
+                        f"{interface_name(mounted.resolved)}"
+                    )
+
             any_asgi = release.resolved in ("asgi", "grpc") or any(
                 mounted.resolved in ("asgi", "grpc") for _, _, mounted, _ in realised
             )
@@ -1260,7 +1281,23 @@ class Host:
                 for group in self.groups
                 if group.name != "default"
             ],
+            "interfaces": self.interfaces(),
         }
+
+    def interfaces(self) -> dict[str, str]:
+        """Return the interfaces settled in the host, by mount, the default as ``""``.
+
+        One that each worker settles, importing the application itself or
+        calling a factory, is not known here and is left out.
+        """
+
+        settled = {"": self.release.resolved} if self.release.resolved else {}
+
+        for mount in self.mounts:
+            if mount.release.resolved:
+                settled[mount.name] = mount.release.resolved
+
+        return settled
 
     def announce(self) -> int:
         """Tell the supervisor the worker sockets changed; return the version."""
@@ -2801,7 +2838,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if release.resolved is not None:
             set_context(release.context)
-            log(f"{args.app} is served as {release.resolved.upper()}")
+            log(f"{args.app} is served as {interface_name(release.resolved)}")
+
+        for mount in mounts:
+            if mount.release.resolved is not None:
+                log(
+                    f"mount {mount.name}: {mount.release.spec} is served as "
+                    f"{interface_name(mount.release.resolved)}"
+                )
 
         findings = recorder.findings()
 

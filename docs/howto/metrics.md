@@ -53,12 +53,15 @@ Names start with `muru_`. Where they apply, labels name the application
 | --- | --- | --- | --- |
 | `muru_requests_total` | counter | app, release, group, mount, status, reason, client_class | requests completed; `status` is the class (`2xx`), `reason` is present when Muru generated the response, with the values the [error responses](../reference/errors.md) page lists, and `client_class` is the request's [class](client-classes.md) |
 | `muru_request_duration_seconds` | histogram | app, release, phase | time in the `queue` (waiting for a worker slot), in the `application` (until the response head arrived) and in `total`; the first two only for requests a worker served |
-| `muru_requests_in_flight` | gauge | app, release | requests taken and not yet answered |
+| `muru_requests_in_flight` | gauge | app, release | requests taken and not yet answered; a WebSocket counts until the application accepts it |
+| `muru_websocket_connections` | gauge | app, release, group, mount | WebSockets open |
+| `muru_websockets_closed_total` | counter | app, release, group, mount, by, close | WebSockets closed: `by` is the side that closed first (`client`, `application` or `edge`) and `close` how, one of `normal`, `going_away`, `idle_timeout`, `abnormal` (gone without a close frame), `too_large`, `protocol_error`, `server_error` or `other` |
+| `muru_websocket_duration_seconds` | histogram | app, release, group | how long WebSockets stayed open, in buckets from a second to a day |
 | `muru_rate_limited_total` | counter | limit, client_class, action | requests a [rate limit](client-classes.md) refused (`rejected`), held (`delayed`) or only counted (`logged`) |
 | `muru_upload_spool_bytes` | gauge | app | bytes the edge holds for each application's [uploads](uploads.md) in progress |
 | `muru_auth_requests_total` | counter | result | [authentication sub-requests](auth-subrequests.md) by result: `allowed`, `cached`, `denied` or `unavailable` |
 | `muru_queue_depth` | gauge | app, release, group | requests waiting for a slot |
-| `muru_slots_busy` | gauge | app, release, group | slots handling a request |
+| `muru_slots_busy` | gauge | app, release, group | slots handling a request or holding an open WebSocket |
 | `muru_slots_total` | gauge | app, release, group | slots across the workers: threads, or the event loop's concurrency |
 | `muru_upstream_health` | gauge | upstream, address | 1 for an [upstream](upstreams.md) address in service, 0 for one its probes found unhealthy or that was ejected after failed requests |
 | `muru_workers_ready` | gauge | app, release, group | workers listening for requests (under the daemon) |
@@ -83,7 +86,15 @@ muru_requests_total{app="shop",release="r1",group="default",mount="default",stat
 muru_request_duration_seconds_bucket{app="shop",release="r1",phase="total",le="0.005"} 1180
 ```
 
-The histogram buckets run from 1ms to 10s. Counters start from zero when
+A WebSocket is a request until the application accepts it: it is
+counted in `muru_requests_total` with a `1xx` status, and the handshake's
+time goes into `muru_request_duration_seconds`. From then on it is an
+open WebSocket, counted in its own gauge, and its lifetime goes into
+`muru_websocket_duration_seconds` when it closes, so long-lived sockets
+never stretch the request percentiles or the [rollout](rollouts.md)
+gates.
+
+The request histogram's buckets run from 1ms to 10s. Counters start from zero when
 an edge process starts, so a daemon restart keeps them and an edge
 replacement resets them, which `rate()` takes in its stride. A release
 that has drained and stopped keeps its counters for as long as the edge

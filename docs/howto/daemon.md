@@ -45,6 +45,7 @@ otherwise `--python`.
 
 ```
 muructl release list shop
+muructl release show shop@r3
 muructl release wait shop@r3
 muructl rollback shop
 muructl drain shop@r2
@@ -65,6 +66,31 @@ release it replaces is retained in turn. `drain` takes a release out of
 traffic and stops it; draining the serving release leaves the application
 answering 503 until the next deploy. `deploy --no-wait` returns once the
 release is recorded, and `release wait` waits for a state.
+
+`release show` prints one release: its state, source, interpreter,
+entrypoint and sizes, and its worker groups and mounts:
+
+```
+release      shop@r3
+state        ready, serving
+source       /srv/shop
+python       /srv/shop/.venv/bin/python
+entrypoint   shop.wsgi:application, WSGI (detected)
+workers      2 processes of 8 threads and an event loop of concurrency 1000 with 8 sync threads
+group reports /reports/*: 6 processes of 1 thread and an event loop of concurrency 1000 with 8 sync threads
+mount ws     /ws from shop.asgi:websocket_app, ASGI (detected)
+```
+
+While WebSockets are open on a release's workers, a `websockets` line
+says how many; [watching WebSockets](asgi.md#watching-websockets) shows
+how to list them.
+
+An interface declared `auto` is shown as the host detected it when it
+imported the application. When the workers import it themselves, with
+preload off or a factory called in each worker, it is `interface auto,
+not yet detected`, and the release's log (`muructl logs shop`) has each
+worker's line saying what it serves. The sizes shown are the ones the
+interfaces use: threads for WSGI, the event loop for ASGI and gRPC.
 
 A release whose host exits on its own is marked failed; if it was serving,
 the daemon starts it again. A deploy whose release fails to start leaves

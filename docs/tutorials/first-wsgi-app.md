@@ -65,8 +65,9 @@ The argument is `module:callable`. If the virtualenv is somewhere else,
 
 ```
 muru.host[12345]: preloaded app:application in 2 ms
+muru.host[12345]: app:application is served as WSGI
 muru.host[12345]: worker 0 started as pid 12346
-muru: serving app:application on http://127.0.0.1:8080 with 1 workers of 4 threads
+muru: serving app:application on http://127.0.0.1:8080 with 1 worker of 4 threads
 muru: development mode: error pages show tracebacks, nothing is persisted and only loopback is served; production runs under the daemon (muructl daemon start)
 muru: dashboard on http://127.0.0.1:8081/
 ```

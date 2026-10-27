@@ -28,7 +28,7 @@ count:
 
 ```
 muru.host[4242]: app:application is served as ASGI
-muru: serving app:application on http://127.0.0.1:8080 with 1 workers of concurrency 1000
+muru: serving app:application on http://127.0.0.1:8080 with 1 worker of concurrency 1000
 ```
 
 ## One event loop per worker
@@ -104,6 +104,38 @@ A message larger than 1 MiB closes the socket with 1009. The edge pings a
 client that has been quiet for 30 seconds and closes a socket that stays
 silent for five minutes with 1001. Open sockets count against the worker's
 `--concurrency`, not against any thread count.
+
+## Watching WebSockets
+
+A WebSocket's handshake is logged and counted as a request when the
+application accepts it, and the open socket is then counted on its own
+until it closes, when the [access log](logging.md#the-access-log) gets a
+second line saying who closed it, with what code, and what passed each
+way. The [metrics](metrics.md) have the open sockets as
+`muru_websocket_connections`, the closes by outcome and how long sockets
+stayed open, and the [dashboard](dashboard.md) shows them beside the
+requests.
+
+Under the daemon, `muructl websockets` counts the open sockets by
+endpoint. Path segments that look like identifiers (numbers, UUIDs,
+ULIDs, long hex or long tokens of letters and digits) are counted as
+`{id}`, and a segment with more than twenty distinct values under the
+same parent as `*`, so a socket per chat room is one row:
+
+```console
+$ muructl websockets
+APP              ENDPOINT                                   OPEN
+chat             /ws/rooms/{id}                              480
+chat             /ws/notify                                   20
+$ muructl websockets chat --list --limit 2
+OPENED               FOR       RELEASE          PATH                             CLIENT           RECEIVED     SENT WORKER REQUEST ID
+2026-10-27T05:42:23Z 12m 4s    chat@r3          /ws/rooms/1844                   203.0.113.9            12       40 0      01M5P6WZD3740HFT2N80MAV4YV
+2026-10-27T05:42:31Z 11m 56s   chat@r3          /ws/rooms/2013                   198.51.100.4            3        9 1      01M5P6WZE1740HFT2N80MAV4YV
+(2 of 500 open shown; --limit shows more)
+```
+
+`muructl status` and `muructl release show` give how many are open, which
+is what keeps a [draining](daemon.md#releases) release's workers busy.
 
 ## Frameworks
 

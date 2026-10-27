@@ -26,6 +26,9 @@ pub enum HostMessage {
         sockets: Vec<PathBuf>,
         /// Each named group's sockets.
         groups: Vec<(String, Vec<PathBuf>)>,
+        /// The interfaces the host settled, by mount, the default mount's
+        /// under the empty name; none when the workers settle them.
+        interfaces: Vec<(String, String)>,
     },
     /// An event about a worker, for the event log.
     Event {
@@ -142,6 +145,17 @@ impl HostMessage {
                                     .filter_map(|item| item.as_str().map(PathBuf::from))
                                     .collect();
                                 Some((name, sockets))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                interfaces: value["interfaces"]
+                    .as_object()
+                    .map(|interfaces| {
+                        interfaces
+                            .iter()
+                            .filter_map(|(mount, interface)| {
+                                Some((mount.clone(), interface.as_str()?.to_owned()))
                             })
                             .collect()
                     })

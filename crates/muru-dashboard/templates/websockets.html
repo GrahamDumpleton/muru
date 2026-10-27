@@ -1,0 +1,15 @@
+{% if data.websockets.open > 0 %}
+<h3>WebSockets</h3>
+<table>
+  <tr><th>Application</th><th>Endpoint</th><th class="num">Open</th></tr>
+  {% for endpoint in data.websockets.endpoints %}
+  <tr><td>{{ endpoint.app }}</td><td>{{ endpoint.pattern }}</td><td class="num">{{ endpoint.open }}</td></tr>
+  {% endfor %}
+</table>
+<table>
+  <tr><th>Opened</th><th class="num">Open for</th><th>Release</th><th>Path</th><th>Client</th><th class="num">Received</th><th class="num">Sent</th><th>Worker</th><th>Request id</th></tr>
+  {% for socket in data.websockets.sockets %}
+  <tr><td>{{ socket.opened }}</td><td class="num">{{ socket.age }}</td><td>{{ socket.release }}</td><td>{{ socket.path }}</td><td>{{ socket.client }}</td><td class="num">{{ socket.received }}</td><td class="num">{{ socket.sent }}</td><td>{{ socket.worker }}</td><td>{{ socket.request_id }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
