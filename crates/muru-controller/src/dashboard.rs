@@ -16,19 +16,19 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::daemon::Command;
 use crate::events::Events;
 
-/// Serve the dashboard on the listener until accepting fails, taking
-/// actions from the sessions given, when it is.
+/// Serve the dashboard on the listener until accepting fails, for the
+/// sessions given, which also take the actions when they may.
 pub async fn serve(
     listener: TcpListener,
     commands: mpsc::Sender<Command>,
     history: Arc<History>,
     events: Events,
-    sessions: Option<Arc<Sessions>>,
+    sessions: Arc<Sessions>,
 ) -> anyhow::Result<()> {
-    let actions = sessions.map(|sessions| Actions {
+    let actions = Actions {
         sessions,
         sink: action_sink(commands.clone(), events.clone()),
-    });
+    };
     let data_commands = commands.clone();
     let source: NodeSource = Arc::new(move || {
         let commands = data_commands.clone();

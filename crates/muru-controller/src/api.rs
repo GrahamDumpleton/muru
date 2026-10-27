@@ -148,26 +148,58 @@ impl Admin for Service {
 
     async fn dashboard_login(
         &self,
-        _request: Request<pb::DashboardLoginRequest>,
+        request: Request<pb::DashboardLoginRequest>,
     ) -> Result<Response<pb::DashboardLoginLink>, Status> {
+        let request = request.into_inner();
         let info = &self.handle.info;
         let (Some(address), Some(sessions)) = (info.dashboard, info.dashboard_sessions.as_ref())
         else {
             return Err(Status::failed_precondition(
-                "the dashboard's actions are off; set actions = true in the [dashboard] table",
+                "the dashboard is not served; set listen in the [dashboard] table",
             ));
         };
 
-        let code = sessions.issue_code();
+        if request.actions && !info.dashboard_actions {
+            return Err(Status::failed_precondition(
+                "the dashboard's actions are off; set actions = true in the [dashboard] table",
+            ));
+        }
+
+        let what = if request.actions {
+            "that may act"
+        } else {
+            "that may look"
+        };
+
+        if request.token {
+            let token = sessions.issue_token(request.actions);
+            self.handle.events.emit(
+                "dashboard.login_issued",
+                "dashboard",
+                "notice",
+                &format!(
+                    "a dashboard token {what} was issued over the admin socket, session {}",
+                    &token[..8]
+                ),
+            );
+            return Ok(Response::new(pb::DashboardLoginLink {
+                token,
+                ..Default::default()
+            }));
+        }
+
+        let code = sessions.issue_code(request.actions);
         self.handle.events.emit(
             "dashboard.login_issued",
             "dashboard",
             "notice",
-            "a login link for the dashboard's actions was issued over the admin socket",
+            &format!("a dashboard login link {what} was issued over the admin socket"),
         );
         Ok(Response::new(pb::DashboardLoginLink {
             url: format!("http://{address}/login?code={code}"),
             expires_in_s: muru_dashboard::actions::CODE_LIFETIME.as_secs(),
+            code,
+            token: String::new(),
         }))
     }
 

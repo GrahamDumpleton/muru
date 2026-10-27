@@ -320,11 +320,16 @@ message SetScaleRequest {
   uint64 until_unix_ms = 8;         // when the floor ends
 }
 
-message DashboardLoginRequest {}
+message DashboardLoginRequest {
+  bool actions = 1;                 // a session that may act, which the [dashboard] table must allow
+  bool token = 2;                   // a session at once, as a bearer token for scripts, in place of a link
+}
 
 message DashboardLoginLink {
   string url = 1;                   // open within expires_in_s, once
   uint64 expires_in_s = 2;
+  string code = 3;                  // the link's code, for a link under another address
+  string token = 4;                 // with token: the session's bearer token, good for twelve hours
 }
 
 message SetMaintenanceRequest {

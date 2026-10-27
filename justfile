@@ -41,6 +41,7 @@ lint: lint-text lint-rust lint-python
 
 lint-text:
     sh scripts/check-no-em-dashes.sh
+    uv run python scripts/check-user-text.py
     uv run python scripts/check-layout.py $(git ls-files --cached --others --exclude-standard '*.py' '*.rs')
 
 lint-rust:

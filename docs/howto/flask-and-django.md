@@ -48,10 +48,11 @@ If a settings module opens a database connection at import time, the
 [import check](../explanation/preload.md) says so and the workers import
 the application themselves instead.
 
-Static files: Django does not serve them in production and neither does
-Muru yet (static routes arrive in phase 2). In development, `DEBUG = True`
-with `django.contrib.staticfiles` serves them from the application as
-usual, or use WhiteNoise.
+Static files: Django does not serve them in production. Under the
+daemon, a [static route](static-files.md) serves `STATIC_ROOT` after
+`collectstatic`. In development, `DEBUG = True` with
+`django.contrib.staticfiles` serves them from the application as usual,
+or use WhiteNoise.
 
 ## Both
 

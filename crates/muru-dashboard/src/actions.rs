@@ -1,9 +1,11 @@
-//! The dashboard's mutating actions (design specification section 10.7),
-//! off unless the daemon's configuration enables them. A person signs in
-//! with a single-use link that `muructl dashboard login` asks the daemon
-//! for over the admin socket, so whoever may use the socket may act; the
-//! link gives the browser a session cookie, and every action is a POST
-//! carrying the session's own token, from a page of the same origin.
+//! Signing in to the daemon's dashboard and its mutating actions (design
+//! specification section 10.7). Every page under the daemon needs a
+//! session. A person signs in with a single-use link that `muructl
+//! dashboard login` asks the daemon for over the admin socket, so whoever
+//! may use the socket may look, and act when the link was asked for with
+//! actions; the link gives the browser a session cookie, and every action
+//! is a POST carrying the session's own token, from a page of the same
+//! origin. A script is given a session's id to send as a bearer token.
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -36,13 +38,15 @@ pub enum Action {
 pub type ActionSink =
     Arc<dyn Fn(Action, String) -> crate::BoxFuture<Result<String, String>> + Send + Sync>;
 
-/// A signed-in browser.
+/// A signed-in browser or script.
 #[derive(Debug, Clone)]
 pub struct Session {
     /// The token its forms carry.
     pub csrf: String,
     /// A short label for the audit trail: the start of the session's id.
     pub label: String,
+    /// Whether it may act, or only look.
+    pub actions: bool,
     expires: Instant,
 }
 
@@ -55,7 +59,8 @@ pub struct Sessions {
 
 #[derive(Debug, Default)]
 struct Inner {
-    codes: HashMap<String, Instant>,
+    /// Each code's expiry and whether its session may act.
+    codes: HashMap<String, (Instant, bool)>,
     sessions: HashMap<String, Session>,
 }
 
@@ -65,13 +70,16 @@ impl Sessions {
         Arc::new(Self::default())
     }
 
-    /// A single-use login code, good for five minutes.
-    pub fn issue_code(&self) -> String {
+    /// A single-use login code, good for five minutes, for a session
+    /// that may act when `actions` is true.
+    pub fn issue_code(&self, actions: bool) -> String {
         let code = random_token();
         let mut inner = self.inner.lock().expect("sessions poisoned");
         let now = Instant::now();
-        inner.codes.retain(|_, expires| *expires > now);
-        inner.codes.insert(code.clone(), now + CODE_LIFETIME);
+        inner.codes.retain(|_, (expires, _)| *expires > now);
+        inner
+            .codes
+            .insert(code.clone(), (now + CODE_LIFETIME, actions));
         code
     }
 
@@ -80,23 +88,16 @@ impl Sessions {
         let mut inner = self.inner.lock().expect("sessions poisoned");
         let now = Instant::now();
 
-        if inner
-            .codes
-            .remove(code)
-            .is_none_or(|expires| expires <= now)
-        {
-            return None;
+        match inner.codes.remove(code) {
+            Some((expires, actions)) if expires > now => Some(inner.open(actions, now)),
+            _ => None,
         }
+    }
 
-        inner.sessions.retain(|_, session| session.expires > now);
-        let id = random_token();
-        let session = Session {
-            csrf: random_token(),
-            label: id[..8].to_owned(),
-            expires: now + SESSION_LIFETIME,
-        };
-        inner.sessions.insert(id.clone(), session.clone());
-        Some((id, session))
+    /// A new session at once, for a script to name as a bearer token.
+    pub fn issue_token(&self, actions: bool) -> String {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        inner.open(actions, Instant::now()).0
     }
 
     /// The live session a cookie value names.
@@ -107,6 +108,21 @@ impl Sessions {
             .get(id)
             .filter(|session| session.expires > Instant::now())
             .cloned()
+    }
+}
+
+impl Inner {
+    fn open(&mut self, actions: bool, now: Instant) -> (String, Session) {
+        self.sessions.retain(|_, session| session.expires > now);
+        let id = random_token();
+        let session = Session {
+            csrf: random_token(),
+            label: id[..8].to_owned(),
+            actions,
+            expires: now + SESSION_LIFETIME,
+        };
+        self.sessions.insert(id.clone(), session.clone());
+        (id, session)
     }
 }
 
@@ -169,16 +185,34 @@ mod tests {
     #[test]
     fn a_code_signs_in_once_and_the_session_holds_its_token() {
         let sessions = Sessions::new();
-        let code = sessions.issue_code();
+        let code = sessions.issue_code(true);
         assert_eq!(code.len(), 64);
 
         let (id, session) = sessions.redeem(&code).expect("a fresh code");
         assert!(sessions.redeem(&code).is_none(), "codes are single-use");
         assert!(sessions.redeem("made-up").is_none());
         assert_eq!(sessions.session(&id).unwrap().csrf, session.csrf);
+        assert!(session.actions);
         assert!(sessions.session("made-up").is_none());
         assert!(same_token(&session.csrf, &session.csrf.clone()));
         assert!(!same_token(&session.csrf, &code));
+    }
+
+    #[test]
+    fn a_session_may_only_look_unless_asked_for_with_actions() {
+        let sessions = Sessions::new();
+        let code = sessions.issue_code(false);
+        let (_, session) = sessions.redeem(&code).expect("a fresh code");
+        assert!(!session.actions);
+
+        let token = sessions.issue_token(false);
+        assert!(!sessions.session(&token).expect("a live session").actions);
+        assert!(
+            sessions
+                .session(&sessions.issue_token(true))
+                .unwrap()
+                .actions
+        );
     }
 
     #[test]

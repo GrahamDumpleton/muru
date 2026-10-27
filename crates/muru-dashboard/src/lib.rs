@@ -145,8 +145,9 @@ pub type NodeSource = Arc<dyn Fn() -> BoxFuture<Option<NodeData>> + Send + Sync>
 /// or none when the daemon is stopping.
 pub type NodeMetricsSource = Arc<dyn Fn() -> BoxFuture<Option<String>> + Send + Sync>;
 
-/// The dashboard's actions when the daemon enables them (section 10.7):
-/// the sessions signed in, and what carries an action out.
+/// Signing in to the daemon's dashboard and acting from it (section
+/// 10.7): the sessions signed in, and what carries an action out for one
+/// that may act.
 #[derive(Clone)]
 pub struct Actions {
     /// Login codes and sessions, shared with the admin API.
@@ -495,7 +496,11 @@ fn respond(
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
 
-    if let Some(response) = shared_paths(request, history) {
+    if let Some(response) = asset_path(request.uri().path()) {
+        return response;
+    }
+
+    if let Some(response) = history_paths(request, history) {
         return response;
     }
 
@@ -509,15 +514,22 @@ fn respond(
     }
 }
 
-/// The paths both dashboards serve the same way: the embedded assets,
-/// the history and its stream.
-fn shared_paths(request: &Request<Incoming>, history: &Arc<History>) -> Option<Response<Body>> {
-    Some(match request.uri().path() {
+/// The embedded assets, which both dashboards serve to anyone: they are
+/// the vendored libraries and the charts' script, nothing of the node's.
+fn asset_path(path: &str) -> Option<Response<Body>> {
+    Some(match path {
         "/static/htmx.min.js" => asset(HTMX, "text/javascript"),
         "/static/sse.js" => asset(HTMX_SSE, "text/javascript"),
         "/static/uplot.min.js" => asset(UPLOT_JS, "text/javascript"),
         "/static/uplot.min.css" => asset(UPLOT_CSS, "text/css"),
         "/static/charts.js" => asset(CHARTS_JS, "text/javascript"),
+        _ => return None,
+    })
+}
+
+/// The history and its stream, which both dashboards serve the same way.
+fn history_paths(request: &Request<Incoming>, history: &Arc<History>) -> Option<Response<Body>> {
+    Some(match request.uri().path() {
         "/v1/history" => {
             let daily = request
                 .uri()
@@ -616,7 +628,7 @@ pub async fn serve_node(
     metrics: NodeMetricsSource,
     history: Arc<History>,
     events: EventsSource,
-    actions: Option<Actions>,
+    actions: Actions,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -655,39 +667,47 @@ async fn respond_node(
     metrics: &NodeMetricsSource,
     history: &Arc<History>,
     events: &EventsSource,
-    actions: Option<Actions>,
+    actions: Actions,
 ) -> Response<Body> {
-    // Section 10.7: signing in and the actions, when they are on.
+    // Section 10.7: signing in, and the actions for a session that may
+    // act.
 
     if request.method() == Method::POST && request.uri().path() == "/actions/maintenance" {
-        return act(request, actions.as_ref()).await;
+        return act(request, &actions).await;
     }
 
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
 
-    if request.uri().path() == "/login" {
-        return login(&request, actions.as_ref());
-    }
-
     let request = &request;
-    let csrf = actions
-        .as_ref()
-        .and_then(|actions| signed_in(request, actions))
-        .map(|session| session.csrf);
+    let path = request.uri().path();
 
-    if let Some(response) = shared_paths(request, history) {
-        return response;
+    if path == "/login" {
+        return login(request, &actions);
     }
 
-    let path = request.uri().path();
+    // The metrics are for Prometheus, which cannot sign in, and the
+    // assets hold nothing of the node's; everything else needs a session.
 
     if path == "/metrics" {
         return match metrics().await {
             Some(text) => metrics_response(text),
             None => plain(StatusCode::SERVICE_UNAVAILABLE, "the daemon is stopping\n"),
         };
+    }
+
+    if let Some(response) = asset_path(path) {
+        return response;
+    }
+
+    let Some((session, _)) = signed_in(request, &actions) else {
+        return sign_in_first(path);
+    };
+    let csrf = session.actions.then_some(session.csrf);
+
+    if let Some(response) = history_paths(request, history) {
+        return response;
     }
 
     if path == "/v1/events/stream" {
@@ -769,8 +789,22 @@ async fn respond_node(
     }
 }
 
-/// The session a request's cookie names, if it is live.
-fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<actions::Session> {
+/// The live session a request names, by a bearer token or its cookie,
+/// and whether it came as a bearer token.
+fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<(actions::Session, bool)> {
+    let bearer = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+
+    if let Some(token) = bearer {
+        return actions
+            .sessions
+            .session(token.trim())
+            .map(|session| (session, true));
+    }
+
     request
         .headers()
         .get_all(http::header::COOKIE)
@@ -780,14 +814,50 @@ fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<actions::
         .filter_map(|pair| pair.trim().split_once('='))
         .find(|(name, _)| *name == actions::SESSION_COOKIE)
         .and_then(|(_, id)| actions.sessions.session(id.trim()))
+        .map(|session| (session, false))
 }
 
-/// Redeem a login link: a session cookie and back to the page.
-fn login(request: &Request<Incoming>, actions: Option<&Actions>) -> Response<Body> {
-    let Some(actions) = actions else {
-        return plain(StatusCode::NOT_FOUND, "the dashboard's actions are off\n");
-    };
+/// What a request without a session gets: a page saying how to sign in
+/// for the dashboard itself, and a plain refusal for the rest.
+fn sign_in_first(path: &str) -> Response<Body> {
+    if path != "/" {
+        return plain(
+            StatusCode::UNAUTHORIZED,
+            "not signed in; muructl dashboard login gives a link, or with --token a token for scripts\n",
+        );
+    }
 
+    let mut response = page(Ok(SIGN_IN_PAGE.to_owned()));
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response
+}
+
+/// The page a browser without a session is shown.
+const SIGN_IN_PAGE: &str = "<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Muru: sign in</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0; font: 15px/1.45 system-ui, sans-serif; }
+main { max-width: 36rem; margin: 4rem auto; padding: 0 1.5rem; }
+code { font-size: 0.95em; }
+</style>
+</head>
+<body>
+<main>
+<h1>Sign in to the Muru dashboard</h1>
+<p>Run <code>muructl dashboard login</code> where the daemon runs, and open the link it prints within five minutes.
+Add <code>--actions</code> for a session that may act, such as turning maintenance mode on and off.</p>
+</main>
+</body>
+</html>
+";
+
+/// Redeem a login link: a session cookie and back to the page.
+fn login(request: &Request<Incoming>, actions: &Actions) -> Response<Body> {
     let code = request
         .uri()
         .query()
@@ -803,12 +873,16 @@ fn login(request: &Request<Incoming>, actions: Option<&Actions>) -> Response<Bod
         );
     };
 
+    // The page is wherever the link was opened from, so the dashboard
+    // works under a proxy's path prefix, and the cookie, with no Path,
+    // is kept for that prefix alone.
+
     let mut response = plain(StatusCode::SEE_OTHER, "signed in\n");
     let headers = response.headers_mut();
-    headers.insert(http::header::LOCATION, "/".parse().expect("static"));
+    headers.insert(http::header::LOCATION, "./".parse().expect("static"));
 
     if let Ok(cookie) = format!(
-        "{}={id}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict",
+        "{}={id}; Max-Age=43200; HttpOnly; SameSite=Strict",
         actions::SESSION_COOKIE
     )
     .parse()
@@ -819,31 +893,29 @@ fn login(request: &Request<Incoming>, actions: Option<&Actions>) -> Response<Bod
     response
 }
 
-/// Carry out an action posted by a page of the dashboard's own origin,
-/// for a live session, with the session's token.
-async fn act(request: Request<Incoming>, actions: Option<&Actions>) -> Response<Body> {
-    let Some(actions) = actions else {
-        return plain(StatusCode::NOT_FOUND, "the dashboard's actions are off\n");
-    };
-
-    let Some(session) = signed_in(&request, actions) else {
+/// Carry out an action for a live session that may act: a form posted by
+/// a page of the dashboard's own origin with the session's token, or a
+/// script's request with its bearer token.
+async fn act(request: Request<Incoming>, actions: &Actions) -> Response<Body> {
+    let Some((session, bearer)) = signed_in(&request, actions) else {
         return plain(
             StatusCode::FORBIDDEN,
-            "not signed in; muructl dashboard login gives a link\n",
+            "not signed in; muructl dashboard login --actions gives a link\n",
         );
     };
 
-    let header = |name: http::header::HeaderName| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-    };
-    let origin = header(http::header::ORIGIN);
-    let host = header(http::header::HOST);
+    if !session.actions {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "this session may only look; muructl dashboard login --actions gives one that may act\n",
+        );
+    }
 
-    if origin.is_none() || origin != host.map(|host| format!("http://{host}")) {
+    // A browser sends the cookie whoever's page posts, so a form must come
+    // from the dashboard's own origin and carry the session's token; a
+    // bearer token is never sent by a browser on its own.
+
+    if !bearer && !same_origin(&request) {
         return plain(
             StatusCode::FORBIDDEN,
             "an action must come from the dashboard's own page\n",
@@ -859,7 +931,8 @@ async fn act(request: Request<Incoming>, actions: Option<&Actions>) -> Response<
     };
     let fields = actions::form_fields(&body);
 
-    if !actions::same_token(fields.get("csrf").map_or("", String::as_str), &session.csrf) {
+    if !bearer && !actions::same_token(fields.get("csrf").map_or("", String::as_str), &session.csrf)
+    {
         return plain(
             StatusCode::FORBIDDEN,
             "the form's token is not this session's\n",
@@ -873,13 +946,40 @@ async fn act(request: Request<Incoming>, actions: Option<&Actions>) -> Response<
 
     match (actions.sink)(action, session.label).await {
         Ok(_) => {
+            // Back to the page the form was on, which is one level up from
+            // the action's own path, under whatever prefix it is served.
+
             let mut response = plain(StatusCode::SEE_OTHER, "done\n");
             response
                 .headers_mut()
-                .insert(http::header::LOCATION, "/".parse().expect("static"));
+                .insert(http::header::LOCATION, "../".parse().expect("static"));
             response
         }
         Err(error) => plain_text(StatusCode::CONFLICT, format!("{error}\n")),
+    }
+}
+
+/// Whether a form was posted by a page of the dashboard's own origin. The
+/// browser's Sec-Fetch-Site says so whatever proxy is in front, since it
+/// compares the page with the URL the browser asked for; without it, the
+/// Origin must be the Host the request names.
+fn same_origin(request: &Request<Incoming>) -> bool {
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+
+    if let Some(site) = header("sec-fetch-site") {
+        return site == "same-origin";
+    }
+
+    match (header("origin"), header("host")) {
+        (Some(origin), Some(host)) => {
+            origin == format!("http://{host}") || origin == format!("https://{host}")
+        }
+        _ => false,
     }
 }
 

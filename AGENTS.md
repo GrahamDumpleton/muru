@@ -35,6 +35,13 @@ and are repeated here so that an agent needs nothing else to start work.
   other prose. This is about the raw file being readable. Be consistent
   within a list: if one item needs the spacing, space every item in it.
 
+- Text users see (CLI help, messages, warnings, errors, events, dashboard
+  pages) never names a section of the specification, an implementation
+  phase or an ADR, which are internal and go stale. Say what the thing is
+  instead. Code comments and docstrings may cite them.
+  `scripts/check-user-text.py` checks string literals, and a muructl unit
+  test checks the rendered help.
+
 ## Python code (the muru package, tests, fixtures, scripts)
 
 - Always use type hints: on all function and method parameters and return
