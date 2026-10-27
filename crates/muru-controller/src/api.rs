@@ -102,6 +102,12 @@ impl Admin for Service {
                 .metrics
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
+            websockets: info
+                .websockets
+                .lock()
+                .expect("websockets poisoned")
+                .values()
+                .sum::<u64>() as u32,
             dashboard: info
                 .dashboard
                 .map(|address| address.to_string())
@@ -497,6 +503,59 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable(STOPPING))?;
         let text = done_rx.await.map_err(|_| Status::unavailable(STOPPING))?;
         Ok(Response::new(pb::MetricsText { text }))
+    }
+
+    async fn list_web_sockets(
+        &self,
+        request: Request<pb::ListWebSocketsRequest>,
+    ) -> Result<Response<pb::WebSocketList>, Status> {
+        let request = request.into_inner();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::WebSockets {
+                app: request.app,
+                limit: request.limit,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let report = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        Ok(Response::new(pb::WebSocketList {
+            open: report.open,
+            endpoints: report
+                .endpoints
+                .into_iter()
+                .map(|endpoint| pb::WebSocketEndpoint {
+                    app: endpoint.app,
+                    pattern: endpoint.pattern,
+                    open: endpoint.open,
+                })
+                .collect(),
+            sockets: report
+                .sockets
+                .into_iter()
+                .map(|socket| pb::OpenWebSocket {
+                    request_id: socket.request_id,
+                    client: socket.client,
+                    app: socket.app,
+                    release: socket.release,
+                    host: socket.host,
+                    group: socket.group,
+                    mount: socket.mount,
+                    path: socket.path,
+                    worker: socket.worker,
+                    opened_unix_ms: socket.opened_unix_ms,
+                    received: socket.received,
+                    sent: socket.sent,
+                    received_bytes: socket.received_bytes,
+                    sent_bytes: socket.sent_bytes,
+                })
+                .collect(),
+        }))
     }
 
     async fn reload_config(
@@ -1707,6 +1766,29 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .and_then(|app| app.current)
         .as_deref()
         == Some(release.id.as_str());
+    let detected = handle
+        .info
+        .interfaces
+        .lock()
+        .expect("interfaces poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .cloned()
+        .unwrap_or_default();
+    let websockets = handle
+        .info
+        .websockets
+        .lock()
+        .expect("websockets poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .copied()
+        .unwrap_or(0) as u32;
+    let detected_for = |mount: &str| {
+        detected
+            .iter()
+            .find(|(name, _)| name == mount)
+            .map(|(_, interface)| interface.clone())
+            .unwrap_or_default()
+    };
 
     pb::Release {
         app: release.app,
@@ -1744,7 +1826,44 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .as_ref()
             .map(|http| http.command.clone())
             .unwrap_or_default(),
+        mounts: release
+            .spec
+            .mounts
+            .iter()
+            .map(|mount| pb::ReleaseMount {
+                name: mount.name.clone(),
+                path: mount.path.clone(),
+                entrypoint: mount.entrypoint.clone(),
+                interface: mount.interface.as_str().to_owned(),
+                internal: mount.internal,
+                threads: mount
+                    .threads
+                    .map_or(0, |threads| saturate(threads.reserved())),
+                max_threads: mount.threads.map_or(0, |threads| saturate(threads.max())),
+                detected_interface: detected_for(&mount.name),
+            })
+            .collect(),
+        groups: release
+            .spec
+            .groups
+            .iter()
+            .map(|group| pb::ReleaseGroup {
+                name: group.name.clone(),
+                paths: group.paths.clone(),
+                client_classes: group.client_class.clone(),
+                processes: group.processes,
+                threads: group.threads,
+                sync_threads: group.sync_threads,
+                concurrency: group.concurrency,
+            })
+            .collect(),
+        detected_interface: detected_for(""),
+        websockets,
     }
+}
+
+fn saturate(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 fn event_message(event: Event) -> pb::Event {

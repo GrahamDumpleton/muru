@@ -1,6 +1,6 @@
 // The dashboard's charts (design specification section 10.7): requests
-// and errors per second, and the median and 95th percentile of total
-// time, over the last hour at one second or the last day at one minute,
+// and errors per second, the median and 95th percentile of total time,
+// and requests in flight with WebSockets open, over the last hour at one second or the last day at one minute,
 // from /v1/history, kept live by the /v1/history/stream events.
 
 (function () {
@@ -8,7 +8,7 @@
 
   var ranges = { "1h": 3600, "24h": 1440 };
   var range = new URLSearchParams(window.location.search).get("range") === "24h" ? "24h" : "1h";
-  var series = { ts: [], rps: [], errors: [], p50: [], p95: [], inflight: [] };
+  var series = { ts: [], rps: [], errors: [], p50: [], p95: [], inflight: [], websockets: [] };
   var charts = [];
 
   function push(point) {
@@ -18,6 +18,7 @@
     series.p50.push(point[3]);
     series.p95.push(point[4]);
     series.inflight.push(point[5]);
+    series.websockets.push(point[7] || 0);
 
     while (series.ts.length > ranges[range]) {
       Object.keys(series).forEach(function (key) { series[key].shift(); });
@@ -100,6 +101,7 @@
         body.points.forEach(push);
         chart(document.getElementById("chart-rate"), "Requests and errors per second", ["rps", "errors"], ["requests/s", "errors/s"], "");
         chart(document.getElementById("chart-latency"), "Total time", ["p50", "p95"], ["p50", "p95"], " ms");
+        chart(document.getElementById("chart-open"), "In flight and WebSockets open", ["inflight", "websockets"], ["requests in flight", "WebSockets open"], "");
         window.addEventListener("resize", resize);
 
         if (range === "1h" && typeof EventSource !== "undefined") {

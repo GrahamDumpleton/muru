@@ -5,10 +5,11 @@
   <div class="tile"><div class="label">p95</div><div class="value">{{ data.summary.p95 }}</div></div>
   <div class="tile"><div class="label">Errors (5xx)</div><div class="value">{{ data.summary.errors }}</div></div>
   <div class="tile"><div class="label">In flight</div><div class="value">{{ data.summary.in_flight }}</div></div>
+  <div class="tile"><div class="label">WebSockets open</div><div class="value">{{ data.summary.websockets }}</div></div>
 </div>
 <h2 style="margin-top:1rem">Applications and releases</h2>
 <table>
-  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
+  <tr><th>Release</th><th>State</th><th>Serving</th><th class="num">Workers</th><th class="num">Slots busy</th><th class="num">WebSockets</th><th class="num">Slots</th><th class="num">Queued</th><th>Created</th><th>Note</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
   {% for app in data.apps %}
   {% for release in app.releases %}
   <tr>
@@ -17,6 +18,7 @@
     <td>{% if release.serving %}yes{% endif %}</td>
     <td class="num">{{ release.workers }}</td>
     <td class="num">{{ release.slots_busy }}</td>
+    <td class="num">{{ release.websockets }}</td>
     <td class="num">{{ release.slots_total }}</td>
     <td class="num">{{ release.waiting }}</td>
     <td>{{ release.created }}</td>
@@ -32,6 +34,7 @@
   {% endfor %}
   {% endfor %}
 </table>
+{% include "websockets.html" %}
 {% if !data.rollouts.is_empty() %}
 <h3>Rollouts</h3>
 <table>

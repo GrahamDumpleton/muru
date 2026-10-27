@@ -21,7 +21,7 @@ def test_single_process_run_reports_multiprocess_false() -> None:
     server = support.start("plain_wsgi:application", workers=None, threads=None)
 
     try:
-        assert "with 1 workers of 4 threads" in server.log()
+        assert "with 1 worker of 4 threads" in server.log()
         data = environ(server)
         assert data["wsgi.multiprocess"] is False
         assert data["wsgi.multithread"] is True

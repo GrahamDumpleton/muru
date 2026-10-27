@@ -20,6 +20,8 @@ const WINDOW: Duration = Duration::from_secs(60);
 const REQUEST_ROWS: usize = 50;
 /// Log lines shown.
 const LOG_LINES: usize = 200;
+/// Open WebSockets listed.
+const SOCKET_ROWS: usize = 200;
 
 /// What the dashboard reads from.
 pub struct Inputs {
@@ -122,6 +124,7 @@ fn collect(inputs: &Inputs) -> Data {
     let records = inputs.access_log.recent(RING_CAPACITY);
     let recent: Vec<&Record> = records
         .iter()
+        .filter(|record| record.websocket.is_none())
         .filter(|record| {
             now.duration_since(record.started)
                 .map_or(true, |age| age <= WINDOW)
@@ -150,12 +153,22 @@ fn collect(inputs: &Inputs) -> Data {
             in_flight: worker.in_flight,
         })
         .collect();
+    let websockets = muru_controller::dashboard::websockets_view(muru_edge::endpoints::report(
+        &inputs.access_log,
+        "",
+        SOCKET_ROWS,
+    ));
     let summary = Summary {
         rate: format!("{:.1}", minute.requests as f64 / minute.seconds as f64),
         p50: percentile(0.5),
         p95: percentile(0.95),
         errors: minute.errors,
-        in_flight: workers.iter().map(|worker| worker.in_flight).sum(),
+        in_flight: workers
+            .iter()
+            .map(|worker| worker.in_flight)
+            .sum::<usize>()
+            .saturating_sub(websockets.open),
+        websockets: websockets.open,
     };
     let requests = records
         .iter()
@@ -167,7 +180,10 @@ fn collect(inputs: &Inputs) -> Data {
                 time: format!("{hours:02}:{minutes:02}:{seconds:02}"),
                 status: record.status,
                 status_class: record.status / 100,
-                reason: record.reason.clone(),
+                reason: match &record.websocket {
+                    Some(end) => format!("websocket closed by {}, code {}", end.by, end.code),
+                    None => record.reason.clone(),
+                },
                 method: record.method.clone(),
                 target: record.target.clone(),
                 bytes: format_bytes(record.bytes),
@@ -191,6 +207,7 @@ fn collect(inputs: &Inputs) -> Data {
         summary,
         workers,
         requests,
+        websockets,
         logs: inputs.logs.recent(LOG_LINES),
     }
 }

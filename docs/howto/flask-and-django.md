@@ -28,9 +28,17 @@ The factory is called in each worker after the fork, so a database pool or
 cache client it creates belongs to that worker. Flask's own development
 server is not involved; `flask run` and `muructl run` are alternatives.
 
-Flask logs exceptions through its logger, which goes to standard error and
-so appears in the terminal tagged with the worker; the error page the
-client sees is Muru's, with the traceback in development mode.
+Flask catches an exception a view raises, logs it through its logger,
+which goes to standard error and so appears in the terminal tagged with
+the worker, and answers with its own plain 500 page. Muru sees an
+ordinary response, so the access log line has no `reason=`. To have
+Muru's [error page](error-pages.md) instead, with the traceback in
+development mode and `reason=app_error` in the access log, let the
+exception reach Muru:
+
+```python
+app.config["PROPAGATE_EXCEPTIONS"] = True
+```
 
 ## Django
 
@@ -48,6 +56,11 @@ application is first called, not at import time, so preloading is clean.
 If a settings module opens a database connection at import time, the
 [import check](../explanation/preload.md) says so and the workers import
 the application themselves instead.
+
+Django also answers an unhandled exception itself, with its debug page
+when `DEBUG = True` and its `handler500` view otherwise. Setting
+`DEBUG_PROPAGATE_EXCEPTIONS = True` lets the exception reach Muru, which
+answers with its own error page and records `reason=app_error`.
 
 Static files: Django does not serve them in production. Under the
 daemon, a [static route](static-files.md) serves `STATIC_ROOT` after

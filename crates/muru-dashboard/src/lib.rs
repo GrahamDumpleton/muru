@@ -70,6 +70,8 @@ pub struct Data {
     pub workers: Vec<Worker>,
     /// Recent requests, newest first.
     pub requests: Vec<RequestRow>,
+    /// The WebSockets open now.
+    pub websockets: WebSocketsView,
     /// Recent log lines, oldest first.
     pub logs: Vec<String>,
 }
@@ -85,8 +87,56 @@ pub struct Summary {
     pub p95: String,
     /// Responses with a 5xx status.
     pub errors: u64,
-    /// Requests being handled right now.
+    /// Requests being handled right now, WebSockets not counted.
     pub in_flight: usize,
+    /// WebSockets open right now.
+    pub websockets: usize,
+}
+
+/// The WebSockets open now: counted by endpoint, and the longest open.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct WebSocketsView {
+    /// How many are open.
+    pub open: usize,
+    /// Counted by endpoint, the most first.
+    pub endpoints: Vec<EndpointRow>,
+    /// The longest open, up to a limit.
+    pub sockets: Vec<SocketRow>,
+}
+
+/// Open WebSockets of one endpoint: a path pattern where identifiers
+/// are `{id}` and segments with many distinct values `*`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct EndpointRow {
+    /// The application.
+    pub app: String,
+    /// The path pattern.
+    pub pattern: String,
+    /// How many are open.
+    pub open: usize,
+}
+
+/// One open WebSocket, already formatted.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SocketRow {
+    /// app@release, or a dash.
+    pub release: String,
+    /// The path.
+    pub path: String,
+    /// The client address.
+    pub client: String,
+    /// When it opened, HH:MM:SS.
+    pub opened: String,
+    /// How long it has been open.
+    pub age: String,
+    /// Messages received from the client.
+    pub received: u64,
+    /// Messages sent to the client.
+    pub sent: u64,
+    /// The worker index, or a dash.
+    pub worker: String,
+    /// The request id of its handshake.
+    pub request_id: String,
 }
 
 /// One worker's row.
@@ -189,6 +239,8 @@ pub struct NodeData {
     pub rollouts: Vec<RolloutRow>,
     /// Recent requests, newest first.
     pub requests: Vec<NodeRequestRow>,
+    /// The WebSockets open now.
+    pub websockets: WebSocketsView,
     /// Recent events, newest first.
     pub events: Vec<EventRow>,
     /// The tail of each serving release's log.
@@ -272,8 +324,10 @@ pub struct ReleaseRow {
     pub message: String,
     /// Workers listening.
     pub workers: usize,
-    /// Slots handling a request.
+    /// Slots handling a request or holding a WebSocket.
     pub slots_busy: usize,
+    /// WebSockets open, each holding a slot.
+    pub websockets: usize,
     /// Slots in all.
     pub slots_total: usize,
     /// Requests waiting for a slot.
@@ -510,6 +564,7 @@ fn respond(
         "/fragment/overview" => page(OverviewFragment { data: &source() }.render()),
         "/fragment/requests" => page(RequestsFragment { data: &source() }.render()),
         "/fragment/logs" => page(LogsFragment { data: &source() }.render()),
+        "/v1/websockets" => json(&source().websockets),
         _ => plain(StatusCode::NOT_FOUND, "not found\n"),
     }
 }
@@ -778,6 +833,7 @@ async fn respond_node(
         "/v1/rollouts" => json(&data.rollouts),
         "/v1/events" => json(&data.events),
         "/v1/requests" => json(&data.requests),
+        "/v1/websockets" => json(&data.websockets),
         _ => match path
             .strip_prefix("/v1/apps/")
             .and_then(|rest| rest.strip_suffix("/releases"))

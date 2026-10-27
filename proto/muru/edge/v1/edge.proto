@@ -25,6 +25,8 @@ service EdgeControl {
   // Recent requests, the last minute's counters and the state of every
   // worker pool, for the dashboard (section 10.7).
   rpc GetRecent(RecentRequest) returns (RecentRequests);
+  // The WebSockets open now: counted by endpoint, and listed.
+  rpc GetWebSockets(WebSocketsRequest) returns (WebSockets);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
   // Section 7.4: the groups scaled to zero that requests are waiting
@@ -376,6 +378,7 @@ message AccessRecord {
   uint64 queue_us = 15;
   uint64 application_us = 16;
   uint64 total_us = 17;
+  string websocket_close = 18;          // on a WebSocket's closing record: by, code and outcome
 }
 
 // One worker pool's state.
@@ -387,4 +390,41 @@ message PoolState {
   uint32 slots = 5;
   uint32 busy = 6;
   uint32 waiting = 7;
+  uint32 websockets = 8;                // open WebSockets, each holding a slot
+}
+
+message WebSocketsRequest {
+  string app = 1;                       // only this application's; all when empty
+  uint32 limit = 2;                     // sockets listed, the longest open first; 0 for none
+}
+
+message WebSockets {
+  uint32 open = 1;                      // open WebSockets, of the application asked for
+  repeated WebSocketEndpoint endpoints = 2;
+  repeated OpenWebSocket sockets = 3;
+}
+
+// Open WebSockets counted by endpoint: a path pattern where segments
+// that are identifiers are {id} and many distinct values *.
+message WebSocketEndpoint {
+  string app = 1;
+  string pattern = 2;
+  uint32 open = 3;
+}
+
+message OpenWebSocket {
+  string request_id = 1;
+  string client = 2;
+  string app = 3;
+  string release = 4;
+  string host = 5;
+  string group = 6;
+  string mount = 7;
+  string path = 8;
+  int32 worker = 9;                     // -1 when not known
+  uint64 opened_unix_ms = 10;
+  uint64 received = 11;                 // messages from the client
+  uint64 sent = 12;                     // messages to the client
+  uint64 received_bytes = 13;
+  uint64 sent_bytes = 14;
 }

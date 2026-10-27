@@ -75,6 +75,20 @@ def test_websockets_reach_an_asgi_mount(development: support.Server) -> None:
         assert socket.recv() == "echo:hello"
 
 
+def test_the_start_up_output_names_each_mount(development: support.Server) -> None:
+    log = development.log()
+
+    # The host says what each entrypoint is served as, and the serving
+    # lines say where each mount is and that the workers have a loop.
+
+    assert "mounted:wsgi_app is served as WSGI" in log
+    assert "mount asgi: mounted:asgi_app is served as ASGI" in log
+    assert "mount reports: mounted:reports_app is served as WSGI" in log
+    assert "of 2 threads and an event loop of concurrency 1000" in log
+    assert "muru: mount asgi serves /asgi from mounted:asgi_app" in log
+    assert "muru: mount reports serves /reports from mounted:reports_app" in log
+
+
 def test_print_config_writes_the_mounts() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
@@ -107,6 +121,23 @@ def test_mounts_under_the_daemon_from_the_table_and_the_file(
     assert daemon.deploy("mounted", MOUNTED) == "muru: release mounted@r1 is ready and serving"
     assert report(daemon.request("/asgi/info"))["mount"] == "asgi"
     assert report(daemon.request("/reports/x"))["script_name"] == "/reports"
+
+    # release show lists the mounts with what the host detected each as,
+    # and the release's log has the host's own lines.
+
+    shown = [
+        " ".join(line.split())
+        for line in daemon.muructl("release", "show", "mounted@r1").stdout.splitlines()
+    ]
+    assert "state ready, serving" in shown
+    assert "entrypoint mounted:wsgi_app, WSGI (detected)" in shown
+    assert "mount asgi /asgi from mounted:asgi_app, ASGI (detected)" in shown
+    assert "mount reports /reports from mounted:reports_app, WSGI" in shown
+    assert any(
+        line.startswith("workers 1 process of 2 threads and an event loop") for line in shown
+    )
+    logs = daemon.muructl("logs", "mounted").stdout
+    assert "mount asgi: mounted:asgi_app is served as ASGI" in logs
 
     # A declared release's mounts replace the table's; the export writes
     # them whole and applies back unchanged.

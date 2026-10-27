@@ -34,6 +34,9 @@ def serve(
     soft_timeout_ms: int | None = None,
     timeout_error: type[BaseException] | None = None,
     grpc_methods: list[tuple[str, str, bool, bool]] = [],
+    loop_stall_timeout_ms: int | None = None,
+    websocket_drain_ms: int = 0,
+    drain_ms: int = 5000,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 

@@ -8,17 +8,23 @@
 //! memory for the dashboard and the CLI, and written to the terminal as
 //! compact lines, to a file as JSON lines, only for errors and slow
 //! requests, or not at all.
+//!
+//! A WebSocket's request ends when the worker accepts it: its line is
+//! written then, with the handshake's time. The open socket is then kept
+//! in a list of its own, counted in its own metrics, and written as a
+//! second line, with the same request id, when it closes.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, SocketKey};
 
 /// How many records the in-memory ring keeps.
 /// Records kept in memory for `recent()`, the dashboard and the CLI.
@@ -106,6 +112,188 @@ pub struct Record {
     pub redirects: Vec<String>,
     /// The client's class (section 4.14).
     pub client_class: String,
+    /// How a WebSocket ended, on the record written when it closes, whose
+    /// time is the close, whose total is how long it was open and whose
+    /// bytes are those sent to the client; none on any other record.
+    pub websocket: Option<WebSocketEnd>,
+}
+
+/// How a WebSocket ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketEnd {
+    /// Which side closed first: `client`, `application` or `edge`.
+    pub by: &'static str,
+    /// The close code.
+    pub code: u16,
+    /// The outcome, from a fixed set: normal, going_away, idle_timeout,
+    /// drained, abnormal, too_large, protocol_error, server_error or other.
+    pub close: &'static str,
+    /// Messages received from the client.
+    pub received: u64,
+    /// Messages sent to the client.
+    pub sent: u64,
+    /// Bytes received from the client.
+    pub received_bytes: u64,
+}
+
+/// The outcome of a WebSocket's close, for the metrics and the log, from
+/// the side that closed first and its code.
+pub fn close_outcome(by: &str, code: u16) -> &'static str {
+    match (by, code) {
+        (_, 1000 | 1005) => "normal",
+        ("edge", 1001) => "idle_timeout",
+        (_, 1001) => "going_away",
+        (_, 1006) => "abnormal",
+        (_, 1009) => "too_large",
+        (_, 1002 | 1007) => "protocol_error",
+        (_, 1011) => "server_error",
+        _ => "other",
+    }
+}
+
+/// A WebSocket open now, as the edge lists it.
+#[derive(Debug, Clone)]
+pub struct OpenWebSocket {
+    /// The request id of its handshake.
+    pub request_id: String,
+    /// The client address.
+    pub client: IpAddr,
+    /// The application.
+    pub app: String,
+    /// The release.
+    pub release: String,
+    /// The virtual host.
+    pub host: String,
+    /// The worker group.
+    pub group: String,
+    /// The mount.
+    pub mount: String,
+    /// The path, without the query string.
+    pub path: String,
+    /// The worker it is held on.
+    pub worker: Option<usize>,
+    /// When the worker accepted it.
+    pub opened: SystemTime,
+    /// How long it has been open.
+    pub age: Duration,
+    /// Messages received from the client.
+    pub received: u64,
+    /// Messages sent to the client.
+    pub sent: u64,
+    /// Bytes received from the client.
+    pub received_bytes: u64,
+    /// Bytes sent to the client.
+    pub sent_bytes: u64,
+}
+
+/// One open WebSocket's record and running counts.
+#[derive(Debug)]
+struct Socket {
+    record: Record,
+    opened: Instant,
+    opened_at: SystemTime,
+    received: AtomicU64,
+    sent: AtomicU64,
+    received_bytes: AtomicU64,
+    sent_bytes: AtomicU64,
+}
+
+impl Socket {
+    fn listed(&self) -> OpenWebSocket {
+        OpenWebSocket {
+            request_id: self.record.request_id.clone(),
+            client: self.record.client,
+            app: self.record.app.clone(),
+            release: self.record.release.clone(),
+            host: self.record.host.clone(),
+            group: self.record.group.clone(),
+            mount: self.record.mount.clone(),
+            path: self.record.path().to_owned(),
+            worker: self.record.worker,
+            opened: self.opened_at,
+            age: self.opened.elapsed(),
+            received: self.received.load(Ordering::Relaxed),
+            sent: self.sent.load(Ordering::Relaxed),
+            received_bytes: self.received_bytes.load(Ordering::Relaxed),
+            sent_bytes: self.sent_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn key(&self) -> SocketKey {
+        SocketKey {
+            app: self.record.app.clone(),
+            release: self.record.release.clone(),
+            group: self.record.group.clone(),
+            mount: self.record.mount.clone(),
+        }
+    }
+}
+
+/// An open WebSocket, listed and counted until it is closed or dropped;
+/// dropped without `close`, it is recorded as closed abnormally by the
+/// edge.
+pub struct WebSocket {
+    log: Arc<AccessLog>,
+    id: u64,
+    socket: Arc<Socket>,
+    end: Option<(&'static str, u16, &'static str)>,
+}
+
+impl WebSocket {
+    /// A message of `bytes` arrived from the client.
+    pub fn received(&self, bytes: u64) {
+        self.socket.received.fetch_add(1, Ordering::Relaxed);
+        self.socket
+            .received_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A message of `bytes` went to the client.
+    pub fn sent(&self, bytes: u64) {
+        self.socket.sent.fetch_add(1, Ordering::Relaxed);
+        self.socket.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The socket has closed, `by` the side that closed first with `code`.
+    pub fn close(self, by: &'static str, code: u16) {
+        self.close_as(by, code, close_outcome(by, code));
+    }
+
+    /// The socket has closed with an outcome its code does not tell, such
+    /// as `drained` for one its worker closed on its way to stopping.
+    pub fn close_as(mut self, by: &'static str, code: u16, close: &'static str) {
+        self.end = Some((by, code, close));
+    }
+}
+
+impl Drop for WebSocket {
+    fn drop(&mut self) {
+        let (by, code, close) = self.end.unwrap_or(("edge", 1006, "abnormal"));
+        let socket = &self.socket;
+        let lifetime = socket.opened.elapsed();
+        self.log
+            .websockets
+            .lock()
+            .expect("websockets poisoned")
+            .remove(&self.id);
+        self.log
+            .metrics
+            .close_websocket(&socket.key(), by, close, lifetime);
+
+        let mut record = socket.record.clone();
+        record.started = SystemTime::now();
+        record.total = lifetime;
+        record.bytes = socket.sent_bytes.load(Ordering::Relaxed);
+        record.websocket = Some(WebSocketEnd {
+            by,
+            code,
+            close,
+            received: socket.received.load(Ordering::Relaxed),
+            sent: socket.sent.load(Ordering::Relaxed),
+            received_bytes: socket.received_bytes.load(Ordering::Relaxed),
+        });
+        self.log.keep(record);
+    }
 }
 
 impl Record {
@@ -146,6 +334,9 @@ pub struct AccessLog {
     metrics: Metrics,
     started: u64,
     file: Option<Mutex<File>>,
+    /// The WebSockets open now, by a number of their own.
+    websockets: Mutex<BTreeMap<u64, Arc<Socket>>>,
+    next_websocket: AtomicU64,
 }
 
 /// A request counted as in flight until this is dropped.
@@ -183,6 +374,8 @@ impl AccessLog {
             metrics: Metrics::default(),
             started: unix_seconds(SystemTime::now()),
             file,
+            websockets: Mutex::new(BTreeMap::new()),
+            next_websocket: AtomicU64::new(0),
         })
     }
 
@@ -211,12 +404,18 @@ impl AccessLog {
 
     /// Keep a record and write it where the configuration says.
     pub fn record(&self, record: Record) {
+        self.metrics.observe(&record);
+        self.count(unix_seconds(SystemTime::now()), record.status);
+        self.keep(record);
+    }
+
+    /// Write a record where the configuration says and keep it in the
+    /// ring, without counting it as a request.
+    fn keep(&self, record: Record) {
         if self.shows(&record) {
             self.write(&record);
         }
 
-        self.metrics.observe(&record);
-        self.count(unix_seconds(SystemTime::now()), record.status);
         let mut ring = self.ring.lock().expect("access log ring poisoned");
 
         if ring.len() == RING_CAPACITY {
@@ -224,6 +423,66 @@ impl AccessLog {
         }
 
         ring.push_back(record);
+    }
+
+    /// A WebSocket's handshake, already recorded as its request, was
+    /// accepted: list and count the socket until the returned guard is
+    /// closed or dropped.
+    pub fn open_websocket(self: &Arc<Self>, record: Record) -> WebSocket {
+        let socket = Arc::new(Socket {
+            record,
+            opened: Instant::now(),
+            opened_at: SystemTime::now(),
+            received: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            received_bytes: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+        });
+        let id = self.next_websocket.fetch_add(1, Ordering::Relaxed);
+        self.metrics.open_websocket(&socket.key());
+        self.websockets
+            .lock()
+            .expect("websockets poisoned")
+            .insert(id, Arc::clone(&socket));
+        WebSocket {
+            log: Arc::clone(self),
+            id,
+            socket,
+            end: None,
+        }
+    }
+
+    /// The WebSockets open now, the longest open first.
+    pub fn websockets(&self) -> Vec<OpenWebSocket> {
+        self.websockets
+            .lock()
+            .expect("websockets poisoned")
+            .values()
+            .map(|socket| socket.listed())
+            .collect()
+    }
+
+    /// How many WebSockets are open, by application, release and group.
+    pub fn websocket_counts(&self) -> BTreeMap<(String, String, String), usize> {
+        let mut counts = BTreeMap::new();
+
+        for socket in self
+            .websockets
+            .lock()
+            .expect("websockets poisoned")
+            .values()
+        {
+            let record = &socket.record;
+            *counts
+                .entry((
+                    record.app.clone(),
+                    record.release.clone(),
+                    record.group.clone(),
+                ))
+                .or_default() += 1;
+        }
+
+        counts
     }
 
     fn count(&self, second: u64, status: u16) {
@@ -287,9 +546,17 @@ impl AccessLog {
     }
 
     fn shows(&self, record: &Record) -> bool {
-        match self.config.destination {
-            Destination::Off => return false,
-            Destination::Errors if record.status < 400 && record.total < self.config.slow => {
+        // A WebSocket's close is shown with the errors when it ended
+        // other than in order; its lifetime is not a slow request.
+
+        match (&self.config.destination, &record.websocket) {
+            (Destination::Off, _) => return false,
+            (Destination::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
+                return false;
+            }
+            (Destination::Errors, None)
+                if record.status < 400 && record.total < self.config.slow =>
+            {
                 return false;
             }
             _ => {}
@@ -348,17 +615,28 @@ const DEFAULT: &str = "default";
 fn text_line(record: &Record) -> String {
     let mut line = String::with_capacity(160);
     let (_, hours, minutes, seconds, millis) = civil(record.started);
+
+    let total = if record.websocket.is_some() {
+        format_lifetime(record.total)
+    } else {
+        format_duration(record.total)
+    };
     let _ = write!(
         line,
-        "{hours:02}:{minutes:02}:{seconds:02}.{millis:03} {} {} {} {} {}",
+        "{hours:02}:{minutes:02}:{seconds:02}.{millis:03} {} {} {} {} {total}",
         record.status,
         record.method,
         record.target,
         format_bytes(record.bytes),
-        format_duration(record.total)
     );
 
-    if record.worker.is_some() {
+    if let Some(end) = &record.websocket {
+        let _ = write!(
+            line,
+            " websocket=closed by={} code={} received={} sent={}",
+            end.by, end.code, end.received, end.sent
+        );
+    } else if record.worker.is_some() {
         let _ = write!(
             line,
             " queue={} app={}",
@@ -401,7 +679,7 @@ fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -429,6 +707,18 @@ fn json_line(record: &Record) -> String {
             .collect::<Vec<_>>()
             .join(","),
         json_string(&record.client_class),
+        record.websocket.as_ref().map_or_else(
+            || "null".to_owned(),
+            |end| format!(
+                "{{\"event\":\"closed\",\"by\":{},\"code\":{},\"close\":{},\"received\":{},\"sent\":{},\"received_bytes\":{}}}",
+                json_string(end.by),
+                end.code,
+                json_string(end.close),
+                end.received,
+                end.sent,
+                end.received_bytes
+            )
+        ),
     );
     line.push('\n');
     line
@@ -448,6 +738,20 @@ pub fn format_duration(duration: Duration) -> String {
         format!("{millis:.0}ms")
     } else {
         format!("{millis:.1}ms")
+    }
+}
+
+/// Format how long something lasted that may run to hours, such as a
+/// WebSocket: as `format_duration` under a minute, then 5m03s or 2h04m.
+pub fn format_lifetime(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+
+    if seconds < 60 {
+        format_duration(duration)
+    } else if seconds < 3600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 
@@ -568,6 +872,9 @@ mod tests {
         assert_eq!(format_duration(Duration::from_micros(870)), "0.9ms");
         assert_eq!(format_duration(Duration::from_millis(42)), "42ms");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1.50s");
+        assert_eq!(format_lifetime(Duration::from_millis(1500)), "1.50s");
+        assert_eq!(format_lifetime(Duration::from_secs(303)), "5m03s");
+        assert_eq!(format_lifetime(Duration::from_secs(7440)), "2h04m");
         assert_eq!(format_bytes(512), "512B");
         assert_eq!(format_bytes(20 * 1024), "20kB");
         assert_eq!(format_bytes(30 * 1024 * 1024), "30.0MB");
@@ -603,6 +910,7 @@ mod tests {
             total,
             redirects: Vec::new(),
             client_class: "default".to_owned(),
+            websocket: None,
         };
         assert!(!log.shows(&record(200, "/", Duration::from_millis(10))));
         assert!(log.shows(&record(500, "/", Duration::from_millis(10))));

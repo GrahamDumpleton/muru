@@ -32,12 +32,14 @@ pub struct Point {
     pub in_flight: u64,
     /// Workers listening at the end of the period.
     pub workers: u64,
+    /// WebSockets open at the end of the period.
+    pub websockets: u64,
 }
 
 impl Point {
     /// The point as the gateway writes it: a compact array of the
     /// second, requests per second, errors per second, p50, p95, in
-    /// flight and workers.
+    /// flight, workers and WebSockets open.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!([
             self.unix_s,
@@ -47,6 +49,7 @@ impl Point {
             round(self.p95_ms),
             self.in_flight,
             self.workers,
+            self.websockets,
         ])
     }
 }
@@ -69,6 +72,8 @@ pub struct Reading {
     pub in_flight: u64,
     /// Workers listening now.
     pub workers: u64,
+    /// WebSockets open now.
+    pub websockets: u64,
 }
 
 /// Turns successive readings into points.
@@ -106,6 +111,7 @@ impl Sampler {
             p95_ms: quantile(&deltas, 0.95) * 1000.0,
             in_flight: reading.in_flight,
             workers: reading.workers,
+            websockets: reading.websockets,
         })
     }
 }
@@ -246,6 +252,7 @@ fn fold(points: &[Point]) -> Option<Point> {
         p95_ms: points.iter().map(|p| p.p95_ms).fold(0.0, f64::max),
         in_flight: last.in_flight,
         workers: last.workers,
+        websockets: last.websockets,
     })
 }
 
@@ -261,6 +268,7 @@ mod tests {
             buckets: bounds.iter().copied().zip(counts.iter().copied()).collect(),
             in_flight: 1,
             workers: 2,
+            websockets: 3,
         }
     }
 
@@ -292,6 +300,7 @@ mod tests {
         assert!((point.p95_ms - 30.0).abs() < 0.01, "{}", point.p95_ms);
         assert_eq!(point.in_flight, 1);
         assert_eq!(point.workers, 2);
+        assert_eq!(point.websockets, 3);
     }
 
     #[test]

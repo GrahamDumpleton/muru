@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use muru_dashboard::{
-    Action, Actions, EventRow, EventsSource, History, NodeMetricsSource, NodeSource, Reading,
-    Sessions,
+    Action, Actions, EndpointRow, EventRow, EventsSource, History, NodeMetricsSource, NodeSource,
+    Reading, Sessions, SocketRow, WebSocketsView,
 };
+use muru_proto::edge::v1 as pb;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -109,9 +110,50 @@ fn action_sink(commands: mpsc::Sender<Command>, events: Events) -> muru_dashboar
         })
     })
 }
+/// The WebSockets an edge reported, as the dashboards show them.
+pub fn websockets_view(report: pb::WebSockets) -> WebSocketsView {
+    WebSocketsView {
+        open: report.open as usize,
+        endpoints: report
+            .endpoints
+            .into_iter()
+            .map(|endpoint| EndpointRow {
+                app: endpoint.app,
+                pattern: endpoint.pattern,
+                open: endpoint.open as usize,
+            })
+            .collect(),
+        sockets: report
+            .sockets
+            .into_iter()
+            .map(|socket| SocketRow {
+                release: if socket.app.is_empty() {
+                    "-".to_owned()
+                } else {
+                    format!("{}@{}", socket.app, socket.release)
+                },
+                path: socket.path,
+                client: socket.client,
+                opened: crate::daemon::clock_hms(socket.opened_unix_ms),
+                age: muru_dashboard::uptime(std::time::Duration::from_millis(
+                    crate::model::now_unix_ms().saturating_sub(socket.opened_unix_ms),
+                )),
+                received: socket.received,
+                sent: socket.sent,
+                worker: if socket.worker < 0 {
+                    "-".to_owned()
+                } else {
+                    socket.worker.to_string()
+                },
+                request_id: socket.request_id,
+            })
+            .collect(),
+    }
+}
+
 /// A reading of the request counters for the history, from the samples
 /// the edge reports: requests and 5xx responses completed, the total
-/// time histogram, requests in flight.
+/// time histogram, requests in flight and WebSockets open.
 pub fn reading(samples: &[muru_edge::metrics::Sample], workers: u64) -> Reading {
     let mut reading = Reading {
         workers,
@@ -136,7 +178,8 @@ pub fn reading(samples: &[muru_edge::metrics::Sample], workers: u64) -> Reading 
                     reading.errors_total += sample.value;
                 }
             }
-            "muru_requests_in_flight" => reading.in_flight += sample.value as u64,
+            "muru_requests_in_flight" => reading.in_flight += sample.value.max(0.0) as u64,
+            "muru_websocket_connections" => reading.websockets += sample.value.max(0.0) as u64,
             "muru_request_duration_seconds_bucket"
                 if label(sample, "phase").as_deref() == Some("total") =>
             {
