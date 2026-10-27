@@ -94,7 +94,7 @@
       }
     });
 
-    fetch("/v1/history?range=" + range, { cache: "no-store" })
+    fetch("v1/history?range=" + range, { cache: "no-store" })
       .then(function (response) { return response.json(); })
       .then(function (body) {
         body.points.forEach(push);
@@ -103,7 +103,7 @@
         window.addEventListener("resize", resize);
 
         if (range === "1h" && typeof EventSource !== "undefined") {
-          var stream = new EventSource("/v1/history/stream");
+          var stream = new EventSource("v1/history/stream");
           stream.addEventListener("point", function (event) {
             push(JSON.parse(event.data));
             redraw();

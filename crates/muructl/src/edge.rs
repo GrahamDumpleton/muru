@@ -57,7 +57,7 @@ pub struct EdgeRunArgs {
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = crate::parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
-    /// Open connections per listener (section 4.18).
+    /// Open connections per listener.
     #[arg(long, value_name = "N")]
     max_connections: Option<usize>,
 
@@ -78,7 +78,7 @@ pub struct EdgeRunArgs {
     #[arg(long = "worker-socket", value_name = "PATH")]
     worker_sockets: Vec<PathBuf>,
 
-    /// Where upload routes store files (section 4.11).
+    /// Where upload routes store files.
     #[arg(long, value_name = "PATH")]
     spool: Option<PathBuf>,
 
@@ -87,12 +87,12 @@ pub struct EdgeRunArgs {
     spool_quota: Option<u64>,
 
     /// The rate limits' buckets, shared with the node's other edge
-    /// processes (section 4.15); this process's own when absent.
+    /// processes; this process's own when absent.
     #[arg(long, value_name = "PATH")]
     rate_buckets: Option<PathBuf>,
 
     /// A Unix socket on which the listener is handed to whoever connects:
-    /// a daemon that restarted without it (section 2.3).
+    /// a daemon that restarted without it.
     #[arg(long, value_name = "PATH")]
     listener_socket: Option<PathBuf>,
 }

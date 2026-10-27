@@ -33,9 +33,7 @@ from typing import Any, NamedTuple, NoReturn, TypeVar
 try:
     import grpc
 except ImportError as error:  # pragma: no cover - depends on the interpreter
-    raise ImportError(
-        "gRPC mounts need grpcio, which this Python cannot import (section 6.13)"
-    ) from error
+    raise ImportError("gRPC mounts need grpcio, which this Python cannot import") from error
 
 __all__ = ["Dispatcher", "Server", "enable_reflection"]
 

@@ -1779,12 +1779,12 @@ pub struct DeployArgs {
     no_wait: bool,
 
     /// Start the release but leave traffic where it is, for a preview
-    /// with the Muru-Preview header or a rollout (section 9.2).
+    /// with the Muru-Preview header or a rollout.
     #[arg(long)]
     hold: bool,
 
-    /// Deploy although an overlay freezes the application's deploys
-    /// (section 9.6); recorded as an event.
+    /// Deploy although an overlay freezes the application's deploys;
+    /// recorded as an event.
     #[arg(long)]
     override_freeze: bool,
 
@@ -1826,14 +1826,14 @@ pub struct DeployArgs {
     env: Vec<(String, String)>,
 
     /// A secret for the workers as NAME=STORE:KEY, delivered as the
-    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE
-    /// (section 10.8). Repeatable.
+    /// variable, or NAME=STORE:KEY:file for a file named by NAME_FILE.
+    /// Repeatable.
     #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
     secrets: Vec<(String, String, String, bool)>,
 
-    /// Run an HTTP server of this profile instead of workers (section
-    /// 9.9): gunicorn, uvicorn, granian, mod_wsgi-express or generic,
-    /// with its command after `--`.
+    /// Run an HTTP server of this profile instead of workers: gunicorn,
+    /// uvicorn, granian, mod_wsgi-express or generic, with its command
+    /// after `--`.
     #[arg(long, value_name = "PROFILE")]
     server: Option<muru_config::ServerProfile>,
 
@@ -2298,7 +2298,7 @@ pub enum RolloutCommand {
         wait: bool,
 
         /// Go ahead although an overlay freezes the application's
-        /// deploys (section 9.6); recorded as an event.
+        /// deploys; recorded as an event.
         #[arg(long)]
         override_freeze: bool,
 
@@ -2313,7 +2313,7 @@ pub enum RolloutCommand {
         release: String,
 
         /// Go ahead although an overlay freezes the application's
-        /// deploys (section 9.6); recorded as an event.
+        /// deploys; recorded as an event.
         #[arg(long)]
         override_freeze: bool,
 
@@ -2359,7 +2359,7 @@ pub enum RolloutCommand {
         app: String,
 
         /// Go ahead although an overlay freezes the application's
-        /// deploys (section 9.6); recorded as an event.
+        /// deploys; recorded as an event.
         #[arg(long)]
         override_freeze: bool,
 
@@ -2404,7 +2404,7 @@ pub struct ScaleArgs {
     unpin: bool,
 
     /// Keep at least this many workers until --until or for --for, a
-    /// temporary schedule over the application (section 7.5).
+    /// temporary schedule over the application.
     #[arg(long = "min", value_name = "COUNT", conflicts_with_all = ["processes", "unpin"])]
     min_workers: Option<u32>,
 
@@ -3142,12 +3142,27 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The dashboard subcommands (section 10.7).
+/// The dashboard subcommands.
 #[derive(Subcommand)]
 pub enum DashboardCommand {
-    /// Print a single-use link that signs a browser in to the dashboard's
-    /// actions, which the [dashboard] table's `actions = true` enables.
+    /// Print a single-use link that signs a browser in to the dashboard.
     Login {
+        /// A session that may act from the dashboard as well as look, which
+        /// the [dashboard] table's `actions = true` allows.
+        #[arg(long)]
+        actions: bool,
+
+        /// Print a token for scripts to send as `Authorization: Bearer`,
+        /// good for twelve hours, instead of a link.
+        #[arg(long)]
+        token: bool,
+
+        /// The address the dashboard is reached at, when a proxy or tunnel
+        /// serves it somewhere other than its own address, such as
+        /// https://example.com/proxy/8090/.
+        #[arg(long, value_name = "URL", env = "MURU_DASHBOARD_URL")]
+        url: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
     },
@@ -3155,14 +3170,32 @@ pub enum DashboardCommand {
 
 /// Run a dashboard subcommand.
 pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
-    let DashboardCommand::Login { socket } = command;
+    let DashboardCommand::Login {
+        actions,
+        token,
+        url,
+        socket,
+    } = command;
     let mut client = client::connect(&socket.socket()).await?;
     let link = client
-        .dashboard_login(pb::DashboardLoginRequest {})
+        .dashboard_login(pb::DashboardLoginRequest { actions, token })
         .await
         .map_err(explain)?
         .into_inner();
-    println!("{}", link.url);
+
+    if token {
+        println!("{}", link.token);
+        eprintln!(
+            "muru: send it as Authorization: Bearer; it lasts twelve hours, or until the daemon restarts"
+        );
+        return Ok(());
+    }
+
+    match url {
+        Some(base) => println!("{}/login?code={}", base.trim_end_matches('/'), link.code),
+        None => println!("{}", link.url),
+    }
+
     eprintln!(
         "muru: open the link within {} to sign in; it works once",
         muru_config::format_duration(Duration::from_secs(link.expires_in_s))
@@ -3547,7 +3580,7 @@ pub struct ApplyArgs {
     #[arg(long)]
     prune: bool,
 
-    /// Deploy releases of applications an overlay freezes (section 9.6);
+    /// Deploy releases of applications an overlay freezes;
     /// recorded as an event.
     #[arg(long)]
     override_freeze: bool,

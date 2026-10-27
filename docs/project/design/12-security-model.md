@@ -21,7 +21,7 @@ The main assets are the applications' data and the node itself. The main threats
 | File access | Descriptor passing so the edge never needs application file access. Path hints restricted to sendfile_roots. Upload files unnamed until the application keeps them |
 | Resource exhaustion | Node budgets, cgroup or container limits, spool quotas, max_body_size, churn budgets, rate-limited recycling |
 | Secrets | Passed as environment variables or files with restrictive permissions, referenced rather than stored in exports, never in snapshots, events or logs |
-| Admin access | Socket permissions, mTLS or tokens for TCP, roles, idempotency, optimistic concurrency, audit log. The dashboard is read-only by default, CSRF-protected, not on public listeners |
+| Admin access | Socket permissions, mTLS or tokens for TCP, roles, idempotency, optimistic concurrency, audit log. The dashboard needs a session from the admin socket for every page, may act only for a session asked for with the actions, is CSRF-protected, not on public listeners |
 | Supply chain | Locked dependencies, cargo-deny and cargo-audit, pip-audit for development dependencies, trusted publishing to PyPI with attestations, signed container images (section 17) |
 | Upgrades | Protocol versioning with a compatibility window, reversible state schema changes, binary upgrades without dropping traffic |
 

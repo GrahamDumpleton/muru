@@ -9,6 +9,18 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a7 (2026-10-27)
+
+### Added
+
+- Added `muructl dashboard login --token`, a bearer token for scripts that read the dashboard's JSON gateway or act through it, and `--url` (or `MURU_DASHBOARD_URL`) to print the login link under the address a tunnel or proxy serves the dashboard at. The dashboards' pages now use relative addresses, so they work behind a proxy that serves them under a path, such as jupyter-server-proxy.
+
+### Changed
+
+- CLI help, messages and warnings no longer refer to the sections of the design specification or to implementation phases, and the `muructl run` warnings that said the daemon was still to come now point to `muructl daemon start`.
+- The daemon's dashboard and JSON gateway now need a signed-in session for every page, not only for the actions: `muructl dashboard login` gives a link for a session that may look, `--actions` one that may act, which `actions = true` in the `[dashboard]` table must still allow, and `/metrics` needs none. Scripts that read the gateway need a token from `muructl dashboard login --token`.
+
+
 ## 0.1.0a6 (2026-10-27)
 
 ### Added

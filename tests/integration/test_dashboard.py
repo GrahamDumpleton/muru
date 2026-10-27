@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import time
 from collections.abc import Iterator
 
@@ -129,5 +130,9 @@ def test_the_development_dashboard_serves_the_history(
 
     status, _headers, body = fetch(port, "/")
     assert status == 200
-    assert 'id="charts"' in body.decode() and "/static/charts.js" in body.decode()
+    assert 'id="charts"' in body.decode() and '"static/charts.js"' in body.decode()
+
+    # Addresses are relative, so the page works under a proxy's path prefix.
+
+    assert not re.findall(r'(?:href|src|hx-get|action|sse-connect)="/', body.decode())
     assert fetch(port, "/static/uplot.min.js")[0] == 200
