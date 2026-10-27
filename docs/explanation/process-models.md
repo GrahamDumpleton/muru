@@ -1,13 +1,12 @@
 # Process models, threads and the GIL
 
 ```{admonition} Status
-:class: warning
+:class: note
 
-This page describes the design Muru is being built to. Today WSGI
-applications run in forked workers on the fixed thread pool described here,
-with a fresh context per request. The ASGI bridge and the WebSocket
-extension for WSGI are not implemented yet. The
-[roadmap](../project/roadmap.md) says what comes when.
+Everything on this page is implemented except handing a request across
+between WSGI and ASGI after it has started, described under
+[mixing WSGI and ASGI](#mixing-wsgi-and-asgi-in-one-application); mounts,
+which choose the side by path, are implemented.
 ```
 
 Your application runs in worker processes. This page explains how those

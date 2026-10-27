@@ -123,8 +123,11 @@ seconds into mean rates and the worst percentiles.
 
 The pages are served with a strict content security policy, and the
 address is loopback, so reaching the dashboard from elsewhere means an
-SSH tunnel or a proxy of your own in front of it. The charts are drawn by uPlot and the live updates by the
-htmx Server-Sent Events extension, both vendored into the binary.
+SSH tunnel or a proxy of your own in front of it. A page from the same
+origin may show the dashboard in a frame, so behind jupyter-server-proxy
+it opens in a JupyterLab pane; pages from other sites may not frame it.
+The charts are drawn by uPlot and the live updates by the htmx
+Server-Sent Events extension, both vendored into the binary.
 
 ## Actions
 
