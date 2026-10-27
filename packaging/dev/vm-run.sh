@@ -4,7 +4,7 @@
 # muructl and the extension there, and runs the test suites or the benchmarks.
 #
 #   vm-run.sh SOURCE test [pytest args]
-#   vm-run.sh SOURCE bench [bench args]
+#   vm-run.sh SOURCE bench [--baseline REV] [bench args]
 #
 # Invoked by `just vm-test` and `just vm-bench`; SOURCE is the repository
 # path on the host, which Lima mounts at the same path.
@@ -64,11 +64,34 @@ case "$action" in
         uv run pytest -m requires_root tests/integration
         ;;
     bench)
+        # The extension is built optimised, as a wheel is. With
+        # --baseline REV, that revision is built the same way beside this
+        # one and measured as muru-baseline.
+
+        baseline=
+
+        if [ "${1:-}" = --baseline ]; then
+            baseline=$2
+            shift 2
+        fi
+
         cargo build --release -p muructl
         command -v oha >/dev/null || cargo install oha --locked
         uv sync --group bench --python 3.15
-        (cd packages/muru && uv run --project ../.. maturin develop)
+        (cd packages/muru && uv run --project ../.. maturin develop --release)
         uv pip install mod_wsgi
+
+        if [ -n "$baseline" ]; then
+            old=$HOME/muru-baseline
+            rm -rf "$old"
+            mkdir -p "$old"
+            git -c safe.directory='*' -C "$source" archive "$baseline" | tar -x -C "$old"
+            (cd "$old" && cargo build --release -p muructl)
+            (cd "$old" && uv venv --python 3.15 .venv && uv pip install --python .venv/bin/python maturin)
+            (cd "$old/packages/muru" && VIRTUAL_ENV=$old/.venv "$old/.venv/bin/maturin" develop --release)
+            set -- "$@" --baseline-muructl "$old/target/release/muructl" --baseline-python "$old/.venv/bin/python"
+        fi
+
         uv run --group bench python bench/run.py "$@"
         ;;
     *)
