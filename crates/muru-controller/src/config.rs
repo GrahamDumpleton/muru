@@ -8,13 +8,14 @@
 //! Listeners and limits belong to the daemon's own file and are reported,
 //! not applied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use muru_config::{
-    App as AppTable, Document, Group as GroupTable, Host as VirtualHost, Mount as MountTable,
-    Release as ReleaseTable, Route as RouteTable, ScalingMode, Upstream as UpstreamTable,
+    App as AppTable, ClientClass, Document, Group as GroupTable, Host as VirtualHost,
+    Mount as MountTable, Overlay, RateLimit, Release as ReleaseTable, Route as RouteTable,
+    ScalingMode, Upstream as UpstreamTable,
 };
 use muru_proto::admin::v1 as pb;
 
@@ -42,6 +43,14 @@ pub enum Action {
         group: Option<String>,
         /// The umask, in octal, or none for the daemon's.
         umask: Option<String>,
+    },
+    /// Set the priority by which the node's budget admits the
+    /// application's scale-ups (section 7.4).
+    SetAppPriority {
+        /// The application.
+        app: String,
+        /// The priority, 0 by default.
+        priority: i32,
     },
     /// Create a release with this spec and move traffic to it.
     Deploy {
@@ -89,7 +98,8 @@ pub enum Action {
     RemoveRoute {
         /// The host.
         host: String,
-        /// The path prefix.
+        /// The route's key: its path prefix, and the client classes it
+        /// is for.
         path: String,
     },
     /// Create or replace an HTTP upstream (section 4.13).
@@ -106,6 +116,48 @@ pub enum Action {
         /// The upstream's name.
         name: String,
     },
+    /// Create or replace an overlay (section 9.10).
+    PutOverlay {
+        /// The overlay's name.
+        name: String,
+        /// Its declaration.
+        overlay: Box<Overlay>,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop an overlay, ending it if it is active (prune).
+    RemoveOverlay {
+        /// The overlay's name.
+        name: String,
+    },
+    /// Create or replace a client class (section 4.14).
+    PutClientClass {
+        /// Its rule.
+        class: Box<ClientClass>,
+        /// Where its rule is tried among the applied ones.
+        position: i64,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a client class (prune).
+    RemoveClientClass {
+        /// The class's name.
+        name: String,
+    },
+    /// Create or replace a rate limit (section 4.15).
+    PutRateLimit {
+        /// The limit's name.
+        name: String,
+        /// Its table.
+        limit: Box<RateLimit>,
+        /// Whether it is new rather than changed.
+        new: bool,
+    },
+    /// Drop a rate limit (prune).
+    RemoveRateLimit {
+        /// The limit's name.
+        name: String,
+    },
 }
 
 impl Action {
@@ -114,6 +166,7 @@ impl Action {
         match self {
             Action::CreateApp { .. } => "create-app",
             Action::SetAppIdentity { .. } => "set-identity",
+            Action::SetAppPriority { .. } => "set-priority",
             Action::Deploy { .. } => "deploy",
             Action::RemoveRelease { .. } => "remove-release",
             Action::RemoveApp { .. } => "remove-app",
@@ -126,6 +179,15 @@ impl Action {
             Action::PutUpstream { new: true, .. } => "create-upstream",
             Action::PutUpstream { new: false, .. } => "update-upstream",
             Action::RemoveUpstream { .. } => "remove-upstream",
+            Action::PutOverlay { new: true, .. } => "create-overlay",
+            Action::PutOverlay { new: false, .. } => "update-overlay",
+            Action::RemoveOverlay { .. } => "remove-overlay",
+            Action::PutClientClass { new: true, .. } => "create-client-class",
+            Action::PutClientClass { new: false, .. } => "update-client-class",
+            Action::RemoveClientClass { .. } => "remove-client-class",
+            Action::PutRateLimit { new: true, .. } => "create-rate-limit",
+            Action::PutRateLimit { new: false, .. } => "update-rate-limit",
+            Action::RemoveRateLimit { .. } => "remove-rate-limit",
         }
     }
 
@@ -139,6 +201,12 @@ impl Action {
                 | Action::RemoveRoute { .. }
                 | Action::PutUpstream { .. }
                 | Action::RemoveUpstream { .. }
+                | Action::PutOverlay { .. }
+                | Action::RemoveOverlay { .. }
+                | Action::PutClientClass { .. }
+                | Action::RemoveClientClass { .. }
+                | Action::PutRateLimit { .. }
+                | Action::RemoveRateLimit { .. }
         )
     }
 }
@@ -159,15 +227,24 @@ impl Change {
         match &self.action {
             Action::CreateApp { app }
             | Action::RemoveApp { app }
-            | Action::SetAppIdentity { app, .. } => app.clone(),
+            | Action::SetAppIdentity { app, .. }
+            | Action::SetAppPriority { app, .. } => app.clone(),
             Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
                 format!("{app}@{id}")
             }
             Action::PutHost { name, .. } | Action::RemoveHost { name } => format!("host {name}"),
-            Action::PutRoute { route, .. } => format!("route {} {}", route.host, route.path),
+            Action::PutRoute { route, .. } => format!("route {} {}", route.host, route.key()),
             Action::RemoveRoute { host, path } => format!("route {host} {path}"),
             Action::PutUpstream { name, .. } | Action::RemoveUpstream { name } => {
                 format!("upstream {name}")
+            }
+            Action::PutOverlay { name, .. } | Action::RemoveOverlay { name } => {
+                format!("overlay {name}")
+            }
+            Action::PutClientClass { class, .. } => format!("client_class {}", class.name),
+            Action::RemoveClientClass { name } => format!("client_class {name}"),
+            Action::PutRateLimit { name, .. } | Action::RemoveRateLimit { name } => {
+                format!("rate_limit {name}")
             }
         }
     }
@@ -191,7 +268,7 @@ pub struct Plan {
 /// last declared release of an application is the one that serves; hosts
 /// and routes follow; with `prune`, removals of what the document does
 /// not contain come last.
-pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
+pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) -> Plan {
     let mut plan = Plan::default();
 
     // Listeners and limits are node settings, read from the daemon's own
@@ -239,6 +316,13 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
         );
     }
 
+    if document.overlay_webhook.is_some() {
+        plan.warnings.push(
+            "the [overlay_webhook] table belongs in the daemon configuration file and was not applied"
+                .to_owned(),
+        );
+    }
+
     if !document.error_pages.is_empty() || document.error_override.is_some() {
         plan.warnings.push(
             "the node-wide [error_pages] and [error_override] tables belong in the daemon \
@@ -247,13 +331,33 @@ pub fn plan(store: &Store, document: &Document, prune: bool) -> Plan {
         );
     }
 
+    // Sections 4.14 and 4.15: the document's classes and limits come
+    // first, so what follows may name them.
+
+    plan_clients(store, document, defined, prune, &mut plan);
+    let defined = &defined.with_applied(store, document, prune);
+
     for (name, app) in &document.app {
         plan_app(store, name, app, &mut plan);
+
+        // Section 4.14: a worker group's classes are the daemon's.
+
+        for (id, release) in &app.release {
+            for (group, table) in &release.groups {
+                for class in unknown_classes(table.matches.as_ref(), defined) {
+                    plan.errors.push(format!(
+                        "{name}@{id}: worker group {group}: no client class named {class}"
+                    ));
+                }
+            }
+        }
     }
 
-    plan_hosts(store, document, &mut plan);
+    plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
-    plan_routes(store, document, &mut plan);
+    plan_routes(store, document, defined, &mut plan);
+    plan_overlays(store, document, defined, prune, &mut plan);
+    plan_budget(document, defined, &mut plan);
 
     if prune {
         plan_removals(store, document, &mut plan);
@@ -329,6 +433,21 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         });
     }
 
+    let priority = app.priority.unwrap_or(0);
+
+    if stored
+        .as_ref()
+        .map_or(priority != 0, |stored| stored.priority != priority)
+    {
+        plan.changes.push(Change {
+            action: Action::SetAppPriority {
+                app: name.to_owned(),
+                priority,
+            },
+            detail: format!("priority {priority}"),
+        });
+    }
+
     // Releases are resolved as a deploy would resolve them, from the
     // table and the source's own [tool.muru], never from an earlier
     // release, so a file means the same thing wherever it is applied.
@@ -364,6 +483,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
             error_override: table.error_override.as_ref(),
             maintenance: table.maintenance.as_ref(),
+            declared: true,
         };
 
         let spec = match resolve_spec(&request_from(name, table, source), None, &tables) {
@@ -398,10 +518,263 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
     plan.changes.extend(deploys);
 }
 
+/// What the daemon's file sets that applied files are checked against:
+/// the rate limits (section 4.15) and client classes (section 4.14) they
+/// may name, the daemon's file's and, with `with_applied`, the applied
+/// files' too, and the node's budget with what its releases hold
+/// (section 7.4).
+#[derive(Debug, Clone, Default)]
+pub struct Defined {
+    /// The `[rate_limit.NAME]` tables.
+    pub rate_limits: Vec<String>,
+    /// The classes of the `[[client_class]]` rules.
+    pub client_classes: Vec<String>,
+    /// The node's budget and what its releases hold.
+    pub budget: crate::budget::View,
+}
+
+impl Defined {
+    /// These names with the classes and limits of applied files: those
+    /// `document` declares and, without `prune`, those recorded.
+    fn with_applied(&self, store: &Store, document: &Document, prune: bool) -> Defined {
+        let mut all = self.clone();
+        all.client_classes
+            .extend(document.client_class.iter().map(|class| class.name.clone()));
+        all.rate_limits.extend(document.rate_limit.keys().cloned());
+
+        if !prune {
+            all.client_classes.extend(
+                store
+                    .client_classes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, class)| class.name),
+            );
+            all.rate_limits.extend(
+                store
+                    .rate_limits()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
+        }
+
+        all
+    }
+}
+
+/// Sections 4.14 and 4.15: the changes the document's client classes and
+/// rate limits imply. A class's rule keeps its place among the applied
+/// ones, a new one going after them, and with `prune` they take the
+/// document's order; names the daemon's file defines are refused, as are
+/// list files that are not absolute paths.
+fn plan_clients(store: &Store, document: &Document, file: &Defined, prune: bool, plan: &mut Plan) {
+    let stored = store.client_classes().unwrap_or_default();
+    let mut next = stored
+        .iter()
+        .map(|(position, _)| position + 1)
+        .max()
+        .unwrap_or(0);
+    let mut seen = BTreeSet::new();
+
+    for (index, class) in document.client_class.iter().enumerate() {
+        let name = &class.name;
+
+        if !seen.insert(name.clone()) {
+            plan.errors
+                .push(format!("client_class {name} is declared twice"));
+            continue;
+        }
+
+        if file.client_classes.contains(name) {
+            plan.errors.push(format!(
+                "client_class {name}: the daemon configuration file defines it"
+            ));
+            continue;
+        }
+
+        let relative = [&class.user_agent_list, &class.address_list, &class.ja4_list]
+            .into_iter()
+            .flatten()
+            .find(|list| !Path::new(list).is_absolute());
+
+        if let Some(list) = relative {
+            plan.errors.push(format!(
+                "client_class {name}: the list {list} must be an absolute path"
+            ));
+            continue;
+        }
+
+        // The edge's own parsing, with the lists read, checks the rule.
+
+        let resolved = crate::clients::ClientPolicies::resolve(
+            std::slice::from_ref(class),
+            &BTreeMap::new(),
+            Path::new("/"),
+        );
+
+        if let Err(error) = resolved {
+            plan.errors.push(error);
+            continue;
+        }
+
+        let recorded = stored.iter().find(|(_, stored)| &stored.name == name);
+
+        let position = match recorded {
+            _ if prune => index as i64,
+            Some((position, _)) => *position,
+            None => {
+                next += 1;
+                next - 1
+            }
+        };
+
+        match recorded {
+            Some((at, stored)) if stored == class && *at == position => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutClientClass {
+                    class: Box::new(class.clone()),
+                    position,
+                    new: recorded.is_none(),
+                },
+                detail: describe_class(class),
+            }),
+        }
+    }
+
+    let stored_limits: BTreeMap<String, RateLimit> = store
+        .rate_limits()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    for (name, limit) in &document.rate_limit {
+        if file.rate_limits.contains(name) {
+            plan.errors.push(format!(
+                "rate_limit {name}: the daemon configuration file defines it"
+            ));
+            continue;
+        }
+
+        if let Err(error) = muru_config::check_rate_limit(name, limit) {
+            plan.errors.push(error);
+            continue;
+        }
+
+        match stored_limits.get(name) {
+            Some(recorded) if recorded == limit => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutRateLimit {
+                    name: name.clone(),
+                    limit: Box::new(limit.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: format!(
+                    "{}, {}",
+                    limit.rate,
+                    limit.action.as_deref().unwrap_or("reject")
+                ),
+            }),
+        }
+    }
+}
+
+/// What a class's rule matches on, as a phrase.
+fn describe_class(class: &ClientClass) -> String {
+    let inputs = [
+        ("user_agent", !class.user_agent.is_empty()),
+        ("user_agent_regex", !class.user_agent_regex.is_empty()),
+        ("user_agent_list", class.user_agent_list.is_some()),
+        ("addresses", !class.addresses.is_empty()),
+        ("address_list", class.address_list.is_some()),
+        ("ja4", !class.ja4.is_empty()),
+        ("ja4_list", class.ja4_list.is_some()),
+        ("headers", !class.headers.is_empty()),
+        ("cookies", !class.cookies.is_empty()),
+    ];
+    let named: Vec<&str> = inputs
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(input, _)| input)
+        .collect();
+    let verified = class.verify.as_ref().map_or("", |_| ", verified");
+
+    format!("matches {}{verified}", named.join(", "))
+}
+
+/// Section 4.14: the classes a `match` names that neither the daemon's
+/// file nor an applied file defines; `default` is always defined.
+fn unknown_classes(matches: Option<&muru_config::ClientMatch>, defined: &Defined) -> Vec<String> {
+    matches
+        .iter()
+        .flat_map(|matches| matches.client_class.iter())
+        .filter(|class| class.as_str() != "default" && !defined.client_classes.contains(class))
+        .cloned()
+        .collect()
+}
+
+/// Section 4.15: the rate limits `names` asks for that the daemon's file
+/// does not define.
+fn unknown_limits(names: &[String], defined: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| !defined.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// Section 7.4: whether the releases the plan deploys, and the floors its
+/// schedules and overlays raise, fit the node's budget as it stands;
+/// warnings, since the node may hold less or more when they apply.
+fn plan_budget(document: &Document, defined: &Defined, plan: &mut Plan) {
+    let view = &defined.budget;
+
+    if !view.budget.is_set() {
+        return;
+    }
+
+    for change in &plan.changes {
+        if let Action::Deploy { app, id, spec } = &change.action
+            && let Err(why) = view.release_fits(app, spec, view.retained)
+        {
+            plan.warnings
+                .push(format!("{app}@{id}: {why}, so its deploy would be refused"));
+        }
+    }
+
+    let (schedules, _) = schedule_overlays(document);
+    let overlays: Vec<(String, Overlay)> = document
+        .overlay
+        .clone()
+        .into_iter()
+        .chain(schedules)
+        .collect();
+
+    for entry in &overlays {
+        for ((app, group), capacity) in crate::overlays::capacities(std::iter::once(entry)) {
+            if capacity.floor == 0 {
+                continue;
+            }
+
+            if let Err(why) = view.floor_fits(&app, &group, capacity.floor, None) {
+                let what = if crate::overlays::is_schedule(&entry.0) {
+                    "schedule"
+                } else {
+                    "overlay"
+                };
+                plan.warnings.push(format!(
+                    "{what} {}: a floor of {} workers for {app} ({group} group) does not fit the node's budget as it stands: {why}",
+                    entry.0, capacity.floor
+                ));
+            }
+        }
+    }
+}
+
 /// The changes the document's hosts imply (section 4.3): names are
 /// checked, duplicates refused and certificates read, so a bad host
 /// never reaches the edge.
-fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: &mut Plan) {
     let stored: BTreeMap<String, VirtualHost> =
         store.hosts().unwrap_or_default().into_iter().collect();
     let mut seen_names: BTreeMap<String, String> = BTreeMap::new();
@@ -415,6 +788,12 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
         }
 
         let mut valid = true;
+
+        for missing in unknown_limits(&host.rate_limits, rate_limits) {
+            plan.errors
+                .push(format!("host {name}: no rate limit named {missing}"));
+            valid = false;
+        }
 
         for declared in &host.names {
             let normalised = muru_edge::routing::normalise(declared);
@@ -496,12 +875,12 @@ fn plan_hosts(store: &Store, document: &Document, plan: &mut Plan) {
 }
 
 /// The changes the document's routes imply (section 4.5).
-fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut Plan) {
     let stored: BTreeMap<(String, String), RouteTable> = store
         .routes()
         .unwrap_or_default()
         .into_iter()
-        .map(|route| ((route.host.clone(), route.path.clone()), route))
+        .map(|route| ((route.host.clone(), route.key()), route))
         .collect();
     let stored_hosts: Vec<String> = store
         .hosts()
@@ -524,11 +903,43 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
     let known_upstream = |name: &str| {
         document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
     };
-    let mut seen = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut classes_at: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+    let mut names: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+
+    // Section 9.10: a route's name is how overlays reach it, so it is
+    // unique among the declared routes and those already recorded.
+
+    for route in &stored_routes_named(&stored) {
+        names.insert(route.0, (route.1, route.2.clone()));
+    }
 
     for route in &document.route {
-        let key = (route.host.clone(), route.path.clone());
+        let key = (route.host.clone(), route.key());
         let mut valid = true;
+
+        if let Some(name) = &route.name {
+            if !valid_name(name) {
+                plan.errors.push(format!(
+                    "route {} {}: {name:?} is not a valid name",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+
+            match names.get(name.as_str()) {
+                Some((host, path)) if (*host, path) != (route.host.as_str(), &key.1) => {
+                    plan.errors.push(format!(
+                        "route {} {}: the name {name} is the route {host} {path}'s",
+                        route.host, route.path
+                    ));
+                    valid = false;
+                }
+                _ => {
+                    names.insert(name, (&route.host, key.1.clone()));
+                }
+            }
+        }
 
         if !route.path.starts_with('/') {
             plan.errors.push(format!(
@@ -687,6 +1098,84 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
             }
         }
 
+        // Section 4.15: the route's rate limits, method restrictions and
+        // mode.
+
+        if let Err(error) = muru_config::check_route_policies(route) {
+            plan.errors
+                .push(format!("route {} {}: {error}", route.host, route.path));
+            valid = false;
+        }
+
+        for missing in unknown_limits(&route.rate_limits, &defined.rate_limits) {
+            plan.errors.push(format!(
+                "route {} {}: no rate limit named {missing}",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        // Section 4.14: the classes a route and its policy are for are
+        // the daemon's, and two routes with one path are for different
+        // classes.
+
+        let pinned = route
+            .traffic
+            .iter()
+            .flat_map(|traffic| traffic.classes.keys().cloned())
+            .collect::<Vec<_>>();
+        let named = muru_config::ClientMatch {
+            client_class: pinned,
+        };
+
+        for class in unknown_classes(route.matches.as_ref(), defined)
+            .into_iter()
+            .chain(unknown_classes(Some(&named), defined))
+        {
+            plan.errors.push(format!(
+                "route {} {}: no client class named {class}",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        let at = classes_at
+            .entry((route.host.as_str(), route.path.as_str()))
+            .or_default();
+
+        if let Some(class) = route
+            .classes()
+            .iter()
+            .find(|class| at.contains(&class.as_str()))
+        {
+            plan.errors.push(format!(
+                "route {} {}: another route with the path is for client class {class}",
+                route.host, route.path
+            ));
+            valid = false;
+        }
+
+        at.extend(route.classes().iter().map(String::as_str));
+
+        // Sections 4.6 and 4.11: the body limit, and the upload keys, which
+        // need an application to hand the files to.
+
+        match muru_config::check_upload(route) {
+            Ok(Some(_)) if route.app.is_empty() => {
+                plan.errors.push(format!(
+                    "route {} {}: upload needs an application; static and upstream routes take none",
+                    route.host, route.path
+                ));
+                valid = false;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                plan.errors
+                    .push(format!("route {} {}: {error}", route.host, route.path));
+                valid = false;
+            }
+        }
+
         // Section 9.4: a traffic policy names releases of the route's
         // application that exist or are declared, with shares that fit.
 
@@ -706,14 +1195,14 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
                     valid = false;
                 }
                 Some(app) => {
-                    for id in traffic.split.keys() {
+                    for id in traffic.split.keys().chain(traffic.classes.values()) {
                         // Section 4.13: a share may go to an upstream.
 
                         if let Some(upstream) = id.strip_prefix(muru_edge::routing::UPSTREAM_PREFIX)
                         {
                             if !known_upstream(upstream) {
                                 plan.errors.push(format!(
-                                    "route {} {}: traffic.split names upstream {upstream}, which does not exist",
+                                    "route {} {}: traffic names upstream {upstream}, which does not exist",
                                     route.host, route.path
                                 ));
                                 valid = false;
@@ -729,7 +1218,7 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
 
                         if !declared && store.release(app, id).is_err() {
                             plan.errors.push(format!(
-                                "route {} {}: traffic.split names {app}@{id}, which does not exist",
+                                "route {} {}: traffic names {app}@{id}, which does not exist",
                                 route.host, route.path
                             ));
                             valid = false;
@@ -813,10 +1302,8 @@ fn plan_routes(store: &Store, document: &Document, plan: &mut Plan) {
         }
 
         if seen.contains(&key) {
-            plan.errors.push(format!(
-                "route {} {} is declared twice",
-                route.host, route.path
-            ));
+            plan.errors
+                .push(format!("route {} {} is declared twice", route.host, key.1));
             valid = false;
         }
 
@@ -880,6 +1367,298 @@ pub fn auth_handler(auth: &muru_config::Auth) -> String {
 }
 
 /// The changes the document's HTTP upstreams imply (section 4.13).
+/// The recorded routes with names, as (name, host, key).
+fn stored_routes_named(
+    stored: &BTreeMap<(String, String), RouteTable>,
+) -> Vec<(&str, &str, String)> {
+    stored
+        .values()
+        .filter_map(|route| {
+            route
+                .name
+                .as_deref()
+                .map(|name| (name, route.host.as_str(), route.key()))
+        })
+        .collect()
+}
+
+/// Section 9.10: the overlays a document declares, checked against the
+/// routes, applications, upstreams and rate limits they name, and
+/// against each other.
+fn plan_overlays(
+    store: &Store,
+    document: &Document,
+    defined: &Defined,
+    prune: bool,
+    plan: &mut Plan,
+) {
+    let stored: BTreeMap<String, Overlay> =
+        store.overlays().unwrap_or_default().into_iter().collect();
+    let stored_routes = store.routes().unwrap_or_default();
+    let mut route_names: BTreeMap<String, String> = document
+        .route
+        .iter()
+        .filter_map(|route| route.name.clone().map(|name| (name, route.app.clone())))
+        .collect();
+
+    if !prune {
+        for route in &stored_routes {
+            if let Some(name) = &route.name {
+                route_names
+                    .entry(name.clone())
+                    .or_insert_with(|| route.app.clone());
+            }
+        }
+    }
+
+    let stored_apps: Vec<String> = store
+        .apps()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|app| app.name)
+        .collect();
+    let known_app =
+        |app: &str| document.app.contains_key(app) || stored_apps.iter().any(|name| name == app);
+    let stored_upstreams: Vec<String> = store
+        .upstreams()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let known_upstream = |name: &str| {
+        document.upstream.contains_key(name) || stored_upstreams.iter().any(|u| u == name)
+    };
+
+    // Section 7.5: each application's schedules are overlays named
+    // APP.NAME, checked and recorded as the declared ones are.
+
+    let (schedules, schedule_errors) = schedule_overlays(document);
+    plan.errors.extend(schedule_errors);
+
+    for (name, overlay) in document.overlay.iter().chain(schedules.iter()) {
+        if !valid_name(name) && !schedules.contains_key(name) {
+            plan.errors
+                .push(format!("overlay {name:?} is not a valid name"));
+            continue;
+        }
+
+        let mut errors = Vec::new();
+
+        if let Err(error) = muru_config::check_overlay(name, overlay) {
+            errors.push(error);
+        }
+
+        for (route, change) in &overlay.routes {
+            if !route_names.contains_key(route) {
+                errors.push(format!("overlay {name}: no route is named {route}"));
+            }
+
+            // The route's own changes, then each route for a class.
+
+            let changes = std::iter::once((format!("routes.{route}"), change)).chain(
+                change
+                    .client_routes
+                    .iter()
+                    .flatten()
+                    .map(|(class, class_change)| {
+                        (
+                            format!("routes.{route}.client_routes.{class}"),
+                            class_change,
+                        )
+                    }),
+            );
+
+            for (field, change) in changes {
+                for limit in change.rate_limits.iter().flatten() {
+                    if !defined.rate_limits.contains(limit) {
+                        errors.push(format!(
+                            "overlay {name}: {field}: no rate limit named {limit}"
+                        ));
+                    }
+                }
+
+                let Some(target) = &change.target else {
+                    continue;
+                };
+
+                if let Some(app) = &target.app
+                    && !known_app(app)
+                {
+                    errors.push(format!(
+                        "overlay {name}: {field}: no application named {app}"
+                    ));
+                }
+
+                if let Some(upstream) = &target.upstream
+                    && !known_upstream(upstream)
+                {
+                    errors.push(format!(
+                        "overlay {name}: {field}: no upstream named {upstream}"
+                    ));
+                }
+
+                if let Some(directory) = &target.static_dir
+                    && !Path::new(directory).is_dir()
+                {
+                    errors.push(format!(
+                        "overlay {name}: {field}: {directory} is not a directory"
+                    ));
+                }
+            }
+
+            for class in change.client_routes.iter().flat_map(BTreeMap::keys) {
+                if class != "default" && !defined.client_classes.contains(class) {
+                    errors.push(format!(
+                        "overlay {name}: routes.{route}.client_routes: no client class named {class}"
+                    ));
+                }
+            }
+        }
+
+        for app in overlay.apps.keys() {
+            if !known_app(app) {
+                errors.push(format!("overlay {name}: no application named {app}"));
+            }
+        }
+
+        if let Some(ready) = overlay
+            .preconditions
+            .as_ref()
+            .and_then(|preconditions| preconditions.release_ready.as_deref())
+            && precondition_release(ready, overlay, &route_names).is_none()
+        {
+            errors.push(format!(
+                "overlay {name}: release_ready {ready:?} must be app@release, or a release when the overlay changes routes of one application"
+            ));
+        }
+
+        if let Some(release) = overlay
+            .warm_up
+            .as_ref()
+            .and_then(|warm_up| warm_up.start_release.as_deref())
+            && precondition_release(release, overlay, &route_names).is_none()
+        {
+            errors.push(format!(
+                "overlay {name}: warm_up.start_release {release:?} must be app@release, or a release when the overlay changes routes of one application"
+            ));
+        }
+
+        if !errors.is_empty() {
+            plan.errors.extend(errors);
+            continue;
+        }
+
+        match stored.get(name) {
+            Some(recorded) if recorded == overlay => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutOverlay {
+                    name: name.clone(),
+                    overlay: Box::new(overlay.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: describe_overlay(overlay),
+            }),
+        }
+    }
+
+    // Overlays that would set the same field need priorities, among the
+    // declared ones and those already recorded that stay.
+
+    let mut all = document.overlay.clone();
+    all.extend(schedules);
+
+    if !prune {
+        for (name, overlay) in stored {
+            all.entry(name).or_insert(overlay);
+        }
+    }
+
+    plan.errors.extend(crate::overlays::conflicts(&all));
+}
+
+/// Section 7.5: the overlays the applications' `[[app.NAME.schedule]]`
+/// entries stand for, by name, and what is wrong with the entries.
+fn schedule_overlays(document: &Document) -> (BTreeMap<String, Overlay>, Vec<String>) {
+    let mut overlays = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for (app, table) in &document.app {
+        for schedule in &table.schedule {
+            if !valid_name(&schedule.name) {
+                errors.push(format!(
+                    "app {app}: schedule {:?} is not a valid name",
+                    schedule.name
+                ));
+                continue;
+            }
+
+            let name = format!("{app}.{}", schedule.name);
+
+            if overlays.insert(name, schedule.overlay(app)).is_some() {
+                errors.push(format!(
+                    "app {app}: two schedules are named {}",
+                    schedule.name
+                ));
+            }
+        }
+    }
+
+    (overlays, errors)
+}
+
+/// The release an overlay's `release_ready` names, as (app, release):
+/// app@release, or a release of the one application its routes belong to.
+pub fn precondition_release(
+    ready: &str,
+    overlay: &Overlay,
+    route_apps: &BTreeMap<String, String>,
+) -> Option<(String, String)> {
+    if let Some((app, release)) = ready.split_once('@') {
+        return (!app.is_empty() && !release.is_empty())
+            .then(|| (app.to_owned(), release.to_owned()));
+    }
+
+    let apps: BTreeSet<&String> = overlay
+        .routes
+        .keys()
+        .filter_map(|route| route_apps.get(route))
+        .filter(|app| !app.is_empty())
+        .collect();
+
+    match apps.into_iter().collect::<Vec<_>>().as_slice() {
+        [app] => Some(((*app).clone(), ready.to_owned())),
+        _ => None,
+    }
+}
+
+/// An overlay for the report: what triggers it and what it changes.
+fn describe_overlay(overlay: &Overlay) -> String {
+    let mut parts = Vec::new();
+
+    parts.push(crate::overlays::describe_trigger(overlay));
+
+    if !overlay.routes.is_empty() {
+        parts.push(format!(
+            "routes {}",
+            overlay
+                .routes
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if !overlay.apps.is_empty() {
+        parts.push(format!(
+            "apps {}",
+            overlay.apps.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    parts.join("; ")
+}
+
 fn plan_upstreams(store: &Store, document: &Document, plan: &mut Plan) {
     let stored: BTreeMap<String, UpstreamTable> =
         store.upstreams().unwrap_or_default().into_iter().collect();
@@ -980,9 +1759,16 @@ pub fn describe_traffic(traffic: Option<&muru_config::Traffic>) -> String {
         .map(|(release, percent)| format!("{release} {percent}%"))
         .collect();
 
-    if parts.is_empty() {
+    if parts.is_empty() && traffic.classes.is_empty() {
         parts.push("no shares".to_owned());
     }
+
+    parts.extend(
+        traffic
+            .classes
+            .iter()
+            .map(|(class, release)| format!("{class} to {release}")),
+    );
 
     if traffic.sticky == Some(true) {
         parts.push("sticky".to_owned());
@@ -1002,13 +1788,13 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         let declared = document
             .route
             .iter()
-            .any(|candidate| candidate.host == route.host && candidate.path == route.path);
+            .any(|candidate| candidate.host == route.host && candidate.key() == route.key());
 
         if !declared {
             plan.changes.push(Change {
                 action: Action::RemoveRoute {
+                    path: route.key(),
                     host: route.host,
-                    path: route.path,
                 },
                 detail: "not declared".to_owned(),
             });
@@ -1024,10 +1810,46 @@ fn plan_removals(store: &Store, document: &Document, plan: &mut Plan) {
         }
     }
 
+    for (_, class) in store.client_classes().unwrap_or_default() {
+        if !document
+            .client_class
+            .iter()
+            .any(|declared| declared.name == class.name)
+        {
+            plan.changes.push(Change {
+                action: Action::RemoveClientClass { name: class.name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
+    for (name, _) in store.rate_limits().unwrap_or_default() {
+        if !document.rate_limit.contains_key(&name) {
+            plan.changes.push(Change {
+                action: Action::RemoveRateLimit { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
     for (name, _) in store.upstreams().unwrap_or_default() {
         if !document.upstream.contains_key(&name) {
             plan.changes.push(Change {
                 action: Action::RemoveUpstream { name },
+                detail: "not declared".to_owned(),
+            });
+        }
+    }
+
+    let (schedules, _) = schedule_overlays(document);
+
+    for (name, _) in store.overlays().unwrap_or_default() {
+        if !document.overlay.contains_key(&name)
+            && !schedules.contains_key(&name)
+            && !crate::overlays::is_temporary(&name)
+        {
+            plan.changes.push(Change {
+                action: Action::RemoveOverlay { name },
                 detail: "not declared".to_owned(),
             });
         }
@@ -1090,6 +1912,7 @@ pub fn export(
             user: app.user.clone(),
             group: app.group.clone(),
             umask: app.umask.clone(),
+            priority: (app.priority != 0).then_some(app.priority),
             ..AppTable::default()
         };
 
@@ -1150,7 +1973,189 @@ pub fn export(
         }
     }
 
+    // Applied client classes and rate limits (sections 4.14 and 4.15),
+    // in their order; with one application asked for, the limits its
+    // hosts and routes draw from and the classes they, its worker groups
+    // and those limits name.
+
+    let limits: Vec<(String, muru_config::RateLimit)> = store
+        .rate_limits()?
+        .into_iter()
+        .filter(|(name, _)| {
+            app.is_none()
+                || document
+                    .route
+                    .iter()
+                    .any(|route| route.rate_limits.contains(name))
+                || document
+                    .host
+                    .values()
+                    .any(|host| host.rate_limits.contains(name))
+        })
+        .collect();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+
+    for route in &document.route {
+        named.extend(route.classes().iter().map(String::as_str));
+        named.extend(
+            route
+                .traffic
+                .iter()
+                .flat_map(|traffic| traffic.classes.keys().map(String::as_str)),
+        );
+    }
+
+    for table in document.app.values() {
+        for release in table.release.values() {
+            for group in release.groups.values() {
+                named.extend(
+                    group
+                        .matches
+                        .iter()
+                        .flat_map(|matches| matches.client_class.iter().map(String::as_str)),
+                );
+            }
+        }
+    }
+
+    for (_, limit) in &limits {
+        named.extend(
+            limit
+                .matches
+                .iter()
+                .flat_map(|matches| matches.client_class.iter().map(String::as_str)),
+        );
+    }
+
+    let classes: Vec<muru_config::ClientClass> = store
+        .client_classes()?
+        .into_iter()
+        .map(|(_, class)| class)
+        .filter(|class| app.is_none() || named.contains(class.name.as_str()))
+        .collect();
+    document.client_class = classes;
+    document.rate_limit = limits.into_iter().collect();
+
+    // Overlays (section 9.10): schedules go back to their applications'
+    // tables, and with one application asked for, only the overlays that
+    // change it or its routes come along. Those muructl scale made are
+    // not configuration.
+
+    for (name, overlay) in store.overlays()? {
+        if crate::overlays::is_temporary(&name) {
+            continue;
+        }
+
+        if let Some((owner, schedule)) =
+            muru_config::CapacitySchedule::from_overlay(&name, &overlay)
+        {
+            if let Some(table) = document.app.get_mut(&owner) {
+                table.schedule.push(schedule);
+            }
+
+            continue;
+        }
+
+        let relevant = app.is_none_or(|app| {
+            overlay.apps.contains_key(app)
+                || overlay.routes.keys().any(|route| {
+                    document
+                        .route
+                        .iter()
+                        .any(|declared| declared.name.as_deref() == Some(route))
+                })
+        });
+
+        if relevant {
+            document.overlay.insert(name, overlay);
+        }
+    }
+
     Ok(document)
+}
+
+/// Section 10.4: write each rollout under way in an exported document as
+/// where it stands: its candidate declared beside the baseline, and each
+/// of the application's routes splitting traffic between them at the
+/// candidate's share in force, the baseline taking what the other shares
+/// leave, so the file gives the same split whichever release serves.
+pub fn resolve_rollouts(store: &Store, document: &mut Document) -> Result<(), StoreError> {
+    for rollout in store.rollouts(None)? {
+        let Some(table) = document.app.get_mut(&rollout.app) else {
+            continue;
+        };
+
+        if !rollout.state.is_active() {
+            continue;
+        }
+
+        for id in [&rollout.baseline, &rollout.candidate] {
+            if !table.release.contains_key(id) {
+                let release = store.release(&rollout.app, id)?;
+                table.release.insert(id.clone(), table_from(&release.spec));
+            }
+        }
+
+        for route in document
+            .route
+            .iter_mut()
+            .filter(|route| route.app == rollout.app)
+        {
+            let traffic = route.traffic.get_or_insert_with(Default::default);
+            traffic
+                .split
+                .insert(rollout.candidate.clone(), rollout.percent().min(100));
+
+            if !traffic.split.contains_key(&rollout.baseline) {
+                let named: u32 = traffic.split.values().sum();
+                traffic
+                    .split
+                    .insert(rollout.baseline.clone(), 100u32.saturating_sub(named));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Section 9.10: turn an exported document into the effective one, its
+/// routes as the active overlays leave them and without the overlays,
+/// and say what each sets that is in force, for `app` alone when given.
+pub fn make_effective(
+    store: &Store,
+    document: &mut Document,
+    app: Option<&str>,
+) -> Result<Vec<String>, StoreError> {
+    let overlays = store.overlays()?;
+    let states = store.overlay_states()?;
+    let active = crate::overlays::ordered(&overlays, &states);
+    let maintenance: BTreeSet<String> = store
+        .maintenance()?
+        .into_iter()
+        .map(|(app, _)| app)
+        .collect();
+    let routes = store.routes()?;
+    let attributions = crate::overlays::attribute(&routes, &maintenance, &active);
+    crate::overlays::apply_routes(&mut document.route, &active);
+    document.overlay.clear();
+
+    // With one application asked for, only what is about it or its
+    // routes.
+
+    let Some(app) = app else {
+        return Ok(attributions);
+    };
+
+    let subjects: Vec<String> = routes
+        .iter()
+        .filter(|route| route.app == app)
+        .filter_map(|route| route.name.as_ref().map(|name| format!("route {name}: ")))
+        .chain([format!("app {app}: ")])
+        .collect();
+    Ok(attributions
+        .into_iter()
+        .filter(|line| subjects.iter().any(|subject| line.starts_with(subject)))
+        .collect())
 }
 
 /// A host for the report: its names, and whether it has TLS.
@@ -1191,16 +2196,38 @@ pub struct Tables<'a> {
     pub error_override: Option<&'a muru_config::ErrorOverride>,
     /// Maintenance exemptions (section 4.12).
     pub maintenance: Option<&'a muru_config::Maintenance>,
+    /// Whether the request is a declared release's table rather than a
+    /// deploy's flags, which names its layer (section 3.3).
+    pub declared: bool,
+}
+
+/// Section 3.3: the layer a release setting came from, the first of
+/// the request, the source's [tool.muru] table and the previous release
+/// that gives it, else the default.
+fn layer(given: bool, table: bool, previous: bool, declared: bool) -> &'static str {
+    match (given, table, previous) {
+        (true, _, _) if declared => "the release table",
+        (true, _, _) => "deploy flags",
+        (_, true, _) => "[tool.muru]",
+        (_, _, true) => "the previous release",
+        _ => "default",
+    }
 }
 
 /// Resolve a deploy request into a release spec: the request's settings,
 /// then the source's [tool.muru] table, then the previous release when
-/// one is given (a deploy), then the defaults of section 13.1.
+/// one is given (a deploy) and it ran native workers, then the defaults
+/// of section 13.1.
 pub fn resolve_spec(
     request: &pb::DeployRequest,
     previous: Option<&ReleaseSpec>,
     tables: &Tables<'_>,
 ) -> Result<ReleaseSpec, String> {
+    // Section 9.9: a managed server's release has no workers, entrypoint
+    // or interpreter of its own, so the native release after it, the
+    // cutover, starts from the defaults.
+
+    let previous = previous.filter(|previous| previous.http.is_none());
     let Tables {
         groups,
         mounts,
@@ -1309,8 +2336,18 @@ pub fn resolve_spec(
             return Err(format!("{name:?} is not a valid worker group name"));
         }
 
-        if group.paths.is_empty() {
-            return Err(format!("worker group {name} has no paths"));
+        muru_config::check_client_match(group.matches.as_ref())
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+        let client_class = group
+            .matches
+            .as_ref()
+            .map(|matches| matches.client_class.clone())
+            .unwrap_or_default();
+
+        if group.paths.is_empty() && client_class.is_empty() {
+            return Err(format!(
+                "worker group {name} has no paths and no match.client_class"
+            ));
         }
 
         if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
@@ -1328,9 +2365,17 @@ pub fn resolve_spec(
             group.processes.map_or(processes, |value| value as u32),
             &format!("worker group {name}: scaling"),
         )?;
+
+        if group_scaling.host_idle_timeout_ms.is_some() {
+            return Err(format!(
+                "worker group {name}: host_idle_timeout belongs in the release's own scaling table"
+            ));
+        }
+
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
+            client_class,
             processes: group_processes,
             threads: group.threads.map_or(threads, |value| value as u32),
             sync_threads: group
@@ -1368,12 +2413,31 @@ pub fn resolve_spec(
         .or_else(|| table.sendfile_header.clone());
     muru_config::check_sendfile(&sendfile_roots, sendfile_header.as_deref())?;
 
+    // Section 6.13: the origins gRPC-Web answers with CORS, likewise.
+
+    let grpc_web_origins = if request.grpc_web_origins.is_empty() {
+        table.grpc_web_origins.clone()
+    } else {
+        request.grpc_web_origins.clone()
+    };
+    muru_config::check_origins(&grpc_web_origins)?;
+
     for (name, mount) in mounts.unwrap_or(&table.mounts) {
         if !crate::model::valid_name(name) {
             return Err(format!("{name:?} is not a valid mount name"));
         }
 
-        if !mount.path.starts_with('/') || mount.path == "/" {
+        // Section 6.13: a gRPC mount is reached by service name, not path.
+
+        let grpc = mount.interface == Some(muru_config::Interface::Grpc);
+
+        if grpc && !mount.path.is_empty() {
+            return Err(format!(
+                "mount {name}: a gRPC mount has no path; its calls are matched by service name"
+            ));
+        }
+
+        if !grpc && (!mount.path.starts_with('/') || mount.path == "/") {
             return Err(format!(
                 "mount {name}: {:?} is not a path below /",
                 mount.path
@@ -1388,7 +2452,7 @@ pub fn resolve_spec(
 
         let path = mount.path.trim_end_matches('/').to_owned();
 
-        if resolved_mounts.iter().any(|other| other.path == path) {
+        if !grpc && resolved_mounts.iter().any(|other| other.path == path) {
             return Err(format!("mount {name}: another mount has the path {path}"));
         }
 
@@ -1401,6 +2465,8 @@ pub fn resolve_spec(
             .clone()
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
@@ -1417,6 +2483,7 @@ pub fn resolve_spec(
             cgi_local_redirect: mount.cgi_local_redirect.unwrap_or(cgi_local_redirect),
             sendfile_roots: mount_roots,
             sendfile_header: mount_header,
+            threads: mount.threads,
         });
     }
 
@@ -1462,6 +2529,12 @@ pub fn resolve_spec(
             "shutdown_timeout",
         )?
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().shutdown_timeout_ms),
+        loop_stall_timeout_ms: duration_ms(
+            request.loop_stall_timeout_ms,
+            table_timeouts.loop_stall_timeout.as_ref(),
+            "loop_stall_timeout",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().loop_stall_timeout_ms),
     };
 
     if max_lifetime_ms == Some(0) {
@@ -1543,6 +2616,17 @@ pub fn resolve_spec(
     let (scaling, processes) =
         resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
 
+    if scaling.host_idle_timeout_ms.is_some()
+        && let Some(group) = resolved_groups
+            .iter()
+            .find(|group: &&GroupSpec| group.scaling.is_static() || group.scaling.min_workers > 0)
+    {
+        return Err(format!(
+            "scaling.host_idle_timeout needs every worker group to scale to zero, and worker group {} keeps workers",
+            group.name
+        ));
+    }
+
     let (error_pages, error_override, maintenance) = resolve_error_tables(
         tables,
         &table.error_pages,
@@ -1550,6 +2634,8 @@ pub fn resolve_spec(
         table.maintenance.as_ref(),
         &source,
     )?;
+
+    let layers = resolve_layers(request, &table, previous, tables.declared, &source);
 
     Ok(ReleaseSpec {
         source,
@@ -1575,6 +2661,8 @@ pub fn resolve_spec(
             .then(|| request.hooks.clone())
             .or(table.hooks),
         factory,
+        reflection: request.reflection.or(table.reflection).unwrap_or(false),
+        grpc_web_origins,
         groups: resolved_groups,
         mounts: resolved_mounts,
         accel_redirect,
@@ -1595,7 +2683,337 @@ pub fn resolve_spec(
         error_override,
         maintenance,
         http: None,
+        layers,
     })
+}
+
+/// Section 3.3: where each of a release's settings comes from, by the
+/// keys `release_settings` shows.
+fn resolve_layers(
+    request: &pb::DeployRequest,
+    table: &muru_config::ToolMuru,
+    previous: Option<&ReleaseSpec>,
+    declared: bool,
+    source: &Path,
+) -> crate::model::Layers {
+    let timeouts = table.timeouts.clone().unwrap_or_default();
+    let memory = table.memory.clone().unwrap_or_default();
+    let before = previous.is_some();
+    let venv = source.join(".venv").join("bin").join("python").is_file();
+
+    let python = if request.python.is_empty() && venv {
+        "the source's .venv"
+    } else {
+        layer(!request.python.is_empty(), false, before, declared)
+    };
+
+    let keys = [
+        (
+            "entrypoint",
+            layer(
+                !request.entrypoint.is_empty(),
+                table.entrypoint.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        ("python", python),
+        (
+            "interface",
+            layer(
+                !request.interface.is_empty(),
+                table.interface.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "preload",
+            layer(
+                !request.preload.is_empty(),
+                table.preload.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "processes",
+            layer(
+                request.processes.is_some(),
+                table.processes.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        (
+            "threads",
+            layer(
+                request.threads.is_some(),
+                table.threads.is_some(),
+                before,
+                declared,
+            ),
+        ),
+        (
+            "sync_threads",
+            layer(
+                request.sync_threads.is_some(),
+                table.sync_threads.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "concurrency",
+            layer(
+                request.concurrency.is_some(),
+                table.concurrency.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "max_requests",
+            layer(
+                request.max_requests.is_some(),
+                table.max_requests.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "max_lifetime",
+            layer(
+                request.max_lifetime_ms.is_some(),
+                table.max_lifetime.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.soft_timeout",
+            layer(
+                request.soft_timeout_ms.is_some(),
+                timeouts.soft_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.hard_timeout",
+            layer(
+                request.hard_timeout_ms.is_some(),
+                timeouts.hard_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.hard_drain_grace",
+            layer(
+                request.hard_drain_grace_ms.is_some(),
+                timeouts.hard_drain_grace.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.shutdown_timeout",
+            layer(
+                request.shutdown_timeout_ms.is_some(),
+                timeouts.shutdown_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "timeouts.loop_stall_timeout",
+            layer(
+                request.loop_stall_timeout_ms.is_some(),
+                timeouts.loop_stall_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.measure",
+            layer(
+                !request.memory_measure.is_empty(),
+                memory.measure.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.soft_limit",
+            layer(
+                request.memory_soft_limit.is_some(),
+                memory.soft_limit.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.soft_for",
+            layer(
+                request.memory_soft_for_ms.is_some(),
+                memory.soft_for.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.reclaim_first",
+            layer(
+                request.memory_reclaim_first.is_some(),
+                memory.reclaim_first.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.hard_limit",
+            layer(
+                request.memory_hard_limit.is_some(),
+                memory.hard_limit.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "memory.check_interval",
+            layer(
+                request.memory_check_interval_ms.is_some(),
+                memory.check_interval.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "accel_redirect",
+            layer(
+                request.accel_redirect.is_some(),
+                table.accel_redirect.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
+            "cgi_local_redirect",
+            layer(
+                request.cgi_local_redirect.is_some(),
+                table.cgi_local_redirect.is_some(),
+                false,
+                declared,
+            ),
+        ),
+    ];
+
+    crate::model::Layers(
+        keys.into_iter()
+            .map(|(key, layer)| (key.to_owned(), layer.to_owned()))
+            .collect(),
+    )
+}
+
+/// Section 3.3: a release's settings as `config show --effective`
+/// shows them beside their layers, by key.
+fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
+    let optional = |value: Option<u64>, format: fn(u64) -> String| {
+        value.map_or_else(|| "off".to_owned(), format)
+    };
+
+    vec![
+        ("entrypoint", spec.entrypoint.clone()),
+        ("python", spec.python.display().to_string()),
+        ("interface", spec.interface.to_string()),
+        ("preload", spec.preload.to_string()),
+        ("processes", spec.processes.to_string()),
+        ("threads", spec.threads.to_string()),
+        ("sync_threads", spec.sync_threads.to_string()),
+        ("concurrency", spec.concurrency.to_string()),
+        (
+            "max_requests",
+            optional(spec.max_requests, |value| value.to_string()),
+        ),
+        ("max_lifetime", optional(spec.max_lifetime_ms, format_ms)),
+        (
+            "timeouts.soft_timeout",
+            optional(spec.timeouts.soft_timeout_ms, format_ms),
+        ),
+        (
+            "timeouts.hard_timeout",
+            optional(spec.timeouts.hard_timeout_ms, format_ms),
+        ),
+        (
+            "timeouts.hard_drain_grace",
+            format_ms(spec.timeouts.hard_drain_grace_ms),
+        ),
+        (
+            "timeouts.shutdown_timeout",
+            format_ms(spec.timeouts.shutdown_timeout_ms),
+        ),
+        (
+            "timeouts.loop_stall_timeout",
+            format_ms(spec.timeouts.loop_stall_timeout_ms),
+        ),
+        ("memory.measure", spec.memory.measure.to_string()),
+        (
+            "memory.soft_limit",
+            optional(spec.memory.soft_limit, muru_config::format_size),
+        ),
+        ("memory.soft_for", format_ms(spec.memory.soft_for_ms)),
+        (
+            "memory.reclaim_first",
+            spec.memory.reclaim_first.to_string(),
+        ),
+        (
+            "memory.hard_limit",
+            optional(spec.memory.hard_limit, muru_config::format_size),
+        ),
+        (
+            "memory.check_interval",
+            format_ms(spec.memory.check_interval_ms),
+        ),
+        ("accel_redirect", spec.accel_redirect.to_string()),
+        ("cgi_local_redirect", spec.cgi_local_redirect.to_string()),
+    ]
+}
+
+/// Section 3.3: each setting of the releases an exported document
+/// declares, with the layer it came from, one line a setting, for
+/// `config show --effective`.
+pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
+    let mut lines = Vec::new();
+
+    for (app, table) in &document.app {
+        for id in table.release.keys() {
+            let release = store.release(app, id)?;
+
+            if release.spec.http.is_some() {
+                continue;
+            }
+
+            if release.spec.layers.is_empty() {
+                lines.push(format!(
+                    "{app}@{id}: made before Muru recorded where settings come from"
+                ));
+                continue;
+            }
+
+            for (key, value) in release_settings(&release.spec) {
+                let layer = release
+                    .spec
+                    .layers
+                    .0
+                    .get(key)
+                    .map_or("not recorded", String::as_str);
+                lines.push(format!("{app}@{id}: {key} = {value} ({layer})"));
+            }
+        }
+    }
+
+    Ok(lines)
 }
 
 /// Section 10.8: the environment, the table's entries with the
@@ -1703,7 +3121,8 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
     let timeouts_given = request.soft_timeout_ms.is_some()
         || request.hard_timeout_ms.is_some()
         || request.hard_drain_grace_ms.is_some()
-        || request.shutdown_timeout_ms.is_some();
+        || request.shutdown_timeout_ms.is_some()
+        || request.loop_stall_timeout_ms.is_some();
     let memory_given = !request.memory_measure.is_empty()
         || request.memory_soft_limit.is_some()
         || request.memory_soft_for_ms.is_some()
@@ -1723,6 +3142,8 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         source: Some(request.source.clone()),
         entrypoint: request.entrypoint.clone(),
         interface: parse_optional(&request.interface)?,
+        reflection: request.reflection,
+        grpc_web_origins: request.grpc_web_origins.clone(),
         factory: request.factory,
         factory_phase: parse_optional(&request.factory_phase)?,
         python: (!request.python.is_empty()).then(|| request.python.clone()),
@@ -1743,6 +3164,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             hard_timeout: request.hard_timeout_ms.map(format_ms),
             hard_drain_grace: request.hard_drain_grace_ms.map(format_ms),
             shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
+            loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
         }),
         memory: memory_given.then(muru_config::Memory::default),
         env: BTreeMap::new(),
@@ -1817,6 +3239,8 @@ fn resolve_http_spec(
         preload: muru_config::Preload::Auto,
         hooks: None,
         factory: None,
+        reflection: false,
+        grpc_web_origins: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
         accel_redirect: false,
@@ -1846,6 +3270,7 @@ fn resolve_http_spec(
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
         }),
+        layers: crate::model::Layers::default(),
     })
 }
 
@@ -1895,12 +3320,6 @@ fn resolve_scaling(
         return Err(format!("{what}: mode {} needs max_workers", mode.as_str()));
     };
     let min_workers = table.min_workers.unwrap_or(1);
-
-    if min_workers == 0 {
-        return Err(format!(
-            "{what}: min_workers must be at least 1; scale to zero is not supported yet"
-        ));
-    }
 
     if max_workers < min_workers {
         return Err(format!(
@@ -1994,7 +3413,18 @@ fn resolve_scaling(
         max_step_up: max_step_up as u32,
         churn_budget: churn_budget as u32,
         advisory: table.advisory.unwrap_or(false),
+        host_idle_timeout_ms: match &table.host_idle_timeout {
+            Some(text) => Some(duration("host_idle_timeout", Some(text), 0)?),
+            None => None,
+        },
     };
+
+    if spec.host_idle_timeout_ms.is_some() && spec.min_workers > 0 {
+        return Err(format!(
+            "{what}: host_idle_timeout needs min_workers = 0, so the group can scale to zero"
+        ));
+    }
+
     let initial = processes.max(spec.min_workers);
     Ok((spec, initial))
 }
@@ -2025,6 +3455,7 @@ fn scaling_table(spec: &ScalingSpec) -> Option<muru_config::Scaling> {
         max_step_up: Some(spec.max_step_up as usize),
         churn_budget: Some(spec.churn_budget as usize),
         advisory: spec.advisory.then_some(true),
+        host_idle_timeout: spec.host_idle_timeout_ms.and_then(duration),
     })
 }
 
@@ -2103,6 +3534,8 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
     pb::DeployRequest {
         app: app.to_owned(),
         source: source.to_owned(),
+        override_freeze: false,
+        retain_workers: None,
         kind: table
             .kind
             .map(|value| value.as_str().to_owned())
@@ -2145,6 +3578,8 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
             .unwrap_or_default(),
         hooks: table.hooks.clone().unwrap_or_default(),
         factory: table.factory,
+        reflection: table.reflection,
+        grpc_web_origins: table.grpc_web_origins.clone(),
         factory_phase: table
             .factory_phase
             .map(|value| value.as_str().to_owned())
@@ -2182,6 +3617,12 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .timeouts
                 .as_ref()
                 .and_then(|t| t.shutdown_timeout.as_ref()),
+        ),
+        loop_stall_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.loop_stall_timeout.as_ref()),
         ),
         memory_measure: table
             .memory
@@ -2278,6 +3719,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         source: Some(spec.source.display().to_string()),
         entrypoint: spec.entrypoint.clone(),
         interface: Some(spec.interface),
+        reflection: spec.reflection.then_some(true),
+        grpc_web_origins: spec.grpc_web_origins.clone(),
         factory: spec.factory.map(|_| true),
         factory_phase: spec.factory,
         python: Some(spec.python.display().to_string()),
@@ -2296,6 +3739,11 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                     group.name.clone(),
                     GroupTable {
                         paths: group.paths.clone(),
+                        matches: (!group.client_class.is_empty()).then(|| {
+                            muru_config::ClientMatch {
+                                client_class: group.client_class.clone(),
+                            }
+                        }),
                         processes: Some(group.processes as usize),
                         threads: Some(group.threads as usize),
                         sync_threads: Some(group.sync_threads as usize),
@@ -2326,6 +3774,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         sendfile_header: (mount.sendfile_header != spec.sendfile_header)
                             .then(|| mount.sendfile_header.clone())
                             .flatten(),
+                        threads: mount.threads,
                     },
                 )
             })
@@ -2354,6 +3803,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
                 shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.shutdown_timeout_ms,
+                ))),
+                loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.loop_stall_timeout_ms,
                 ))),
             }
         }),
@@ -2410,6 +3862,10 @@ fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
 pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
     if timeouts.soft_timeout_ms == Some(0) {
         return Err("soft_timeout must be longer than nothing".to_owned());
+    }
+
+    if timeouts.loop_stall_timeout_ms == 0 {
+        return Err("loop_stall_timeout must be longer than nothing".to_owned());
     }
 
     if let (Some(soft), Some(hard)) = (timeouts.soft_timeout_ms, timeouts.hard_timeout_ms)
@@ -2529,6 +3985,16 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         recorded.hooks.clone().unwrap_or_default(),
     );
     compare(
+        "reflection",
+        declared.reflection.to_string(),
+        recorded.reflection.to_string(),
+    );
+    compare(
+        "grpc_web_origins",
+        declared.grpc_web_origins.join(", "),
+        recorded.grpc_web_origins.join(", "),
+    );
+    compare(
         "factory",
         declared
             .factory
@@ -2604,6 +4070,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "shutdown_timeout",
         describe_ms(Some(declared.timeouts.shutdown_timeout_ms)),
         describe_ms(Some(recorded.timeouts.shutdown_timeout_ms)),
+    );
+    compare(
+        "loop_stall_timeout",
+        describe_ms(Some(declared.timeouts.loop_stall_timeout_ms)),
+        describe_ms(Some(recorded.timeouts.loop_stall_timeout_ms)),
     );
     compare(
         "memory",
@@ -2754,12 +4225,23 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
     groups
         .iter()
         .map(|group| {
+            let on = match (group.paths.is_empty(), group.client_class.is_empty()) {
+                (_, true) => group.paths.join(" "),
+                (true, false) => format!("every path for {}", group.client_class.join(" ")),
+                (false, false) => {
+                    format!(
+                        "{} for {}",
+                        group.paths.join(" "),
+                        group.client_class.join(" ")
+                    )
+                }
+            };
+
             format!(
-                "{} {}x{} on {}{}",
+                "{} {}x{} on {on}{}",
                 group.name,
                 group.processes,
                 group.threads,
-                group.paths.join(" "),
                 if group.scaling.is_static() {
                     String::new()
                 } else {
@@ -2803,6 +4285,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
             if !mount.sendfile_roots.is_empty() {
                 flags.push(format!("sendfile from {}", mount.sendfile_roots.join(", ")));
+            }
+
+            if let Some(threads) = mount.threads {
+                flags.push(format!("threads {}", threads.describe()));
             }
 
             let flags = if flags.is_empty() {
@@ -2873,10 +4359,62 @@ mod tests {
         let text = document.to_toml().unwrap();
         assert!(text.contains("[app.shop.release.r1]"), "{text}");
 
-        let plan = plan(&store, &Document::parse(&text).unwrap(), true);
+        let plan = plan(
+            &store,
+            &Document::parse(&text).unwrap(),
+            true,
+            &Defined::default(),
+        );
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.changes.is_empty(), "{:?}", plan.changes);
         assert_eq!(plan.unchanged, 1);
+    }
+
+    #[test]
+    fn a_release_records_the_layer_each_setting_came_from() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let document = export(&store, None, false).unwrap();
+        let lines = release_layers(&store, &document).unwrap();
+        let line = |key: &str| {
+            lines
+                .iter()
+                .find(|line| line.starts_with(&format!("shop@r1: {key} = ")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            line("entrypoint"),
+            "shop@r1: entrypoint = shop.wsgi:application (deploy flags)"
+        );
+        assert_eq!(line("threads"), "shop@r1: threads = 4 (default)");
+        assert_eq!(
+            line("timeouts.soft_timeout"),
+            "shop@r1: timeouts.soft_timeout = off (default)"
+        );
+
+        // A deploy takes what it does not give from the release before;
+        // a declared release names its table.
+
+        let previous = store.release("shop", "r1").unwrap().spec;
+        let request = pb::DeployRequest {
+            app: "shop".to_owned(),
+            source: source.display().to_string(),
+            threads: Some(2),
+            ..Default::default()
+        };
+        let next = resolve_spec(&request, Some(&previous), &Tables::default()).unwrap();
+        assert_eq!(next.layers.0["entrypoint"], "the previous release");
+        assert_eq!(next.layers.0["threads"], "deploy flags");
+        assert_eq!(next.layers.0["sync_threads"], "default");
+
+        let declared = Tables {
+            declared: true,
+            ..Tables::default()
+        };
+        let spec = resolve_spec(&request, Some(&previous), &declared).unwrap();
+        assert_eq!(spec.layers.0["threads"], "the release table");
+        assert_eq!(spec, next, "layers are not settings");
     }
 
     #[test]
@@ -2902,7 +4440,12 @@ mod tests {
             source.display()
         );
 
-        let plan = plan(&store, &Document::parse(&text).unwrap(), false);
+        let plan = plan(
+            &store,
+            &Document::parse(&text).unwrap(),
+            false,
+            &Defined::default(),
+        );
         assert_eq!(plan.errors.len(), 1, "{:?}", plan.errors);
         assert!(
             plan.errors[0].contains("shop@r1 already exists")
@@ -2926,10 +4469,149 @@ mod tests {
     }
 
     #[test]
+    fn applied_classes_keep_their_place_and_limits_may_be_named() {
+        let store = Store::in_memory().unwrap();
+        let file = Defined {
+            rate_limits: vec!["crawlers".to_owned()],
+            client_classes: vec!["partner".to_owned()],
+            ..Defined::default()
+        };
+        let class =
+            |name: &str| format!("[[client_class]]\nname = '{name}'\nuser_agent = ['{name}']\n");
+        let placed = |plan: &Plan| -> Vec<(String, i64)> {
+            plan.changes
+                .iter()
+                .filter_map(|change| match &change.action {
+                    Action::PutClientClass {
+                        class, position, ..
+                    } => Some((class.name.clone(), *position)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let record = |plan: &Plan| {
+            for change in &plan.changes {
+                if let Action::PutClientClass {
+                    class, position, ..
+                } = &change.action
+                {
+                    store.put_client_class(class, *position).unwrap();
+                }
+            }
+        };
+
+        // A host may draw from a limit the same document defines.
+
+        let text = format!(
+            "{}{}[rate_limit.slow]\nrate = '1/s'\n\
+             [host.shop]\nnames = ['shop.example.com']\nrate_limits = ['slow']\n",
+            class("late"),
+            class("early")
+        );
+        let first = plan(&store, &Document::parse(&text).unwrap(), false, &file);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(
+            placed(&first),
+            [("late".to_owned(), 0), ("early".to_owned(), 1)]
+        );
+        record(&first);
+
+        let again = format!("{}{}", class("late"), class("early"));
+        assert!(
+            plan(&store, &Document::parse(&again).unwrap(), false, &file)
+                .changes
+                .is_empty()
+        );
+
+        // A new class goes after those recorded; with prune the
+        // document's order is the order.
+
+        let added = plan(
+            &store,
+            &Document::parse(&class("extra")).unwrap(),
+            false,
+            &file,
+        );
+        assert_eq!(placed(&added), [("extra".to_owned(), 2)]);
+
+        let reordered = format!("{}{}", class("early"), class("late"));
+        let pruned = plan(&store, &Document::parse(&reordered).unwrap(), true, &file);
+        assert_eq!(
+            placed(&pruned),
+            [("early".to_owned(), 0), ("late".to_owned(), 1)]
+        );
+
+        let refused = format!(
+            "{}[[client_class]]\nname = 'listed'\nuser_agent_list = 'bots.txt'\n\
+             [rate_limit.crawlers]\nrate = '1/s'\n",
+            class("partner")
+        );
+        let errors = plan(&store, &Document::parse(&refused).unwrap(), false, &file)
+            .errors
+            .join("\n");
+
+        for expected in [
+            "client_class partner: the daemon configuration file defines it",
+            "client_class listed: the list bots.txt must be an absolute path",
+            "rate_limit crawlers: the daemon configuration file defines it",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
+    }
+
+    #[test]
+    fn routes_for_client_classes_share_a_path() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let defined = Defined {
+            client_classes: vec!["partner".to_owned(), "ai_crawler".to_owned()],
+            ..Defined::default()
+        };
+        let routes = |extra: &str| {
+            format!(
+                "[host.shop]\nnames = ['shop.example.com']\n\
+                 [[route]]\nhost = 'shop'\napp = 'shop'\n\
+                 [[route]]\nhost = 'shop'\napp = 'shop'\nmatch = {{ client_class = ['partner'] }}\n\
+                 traffic = {{ classes = {{ ai_crawler = 'r1' }} }}\n{extra}"
+            )
+        };
+
+        let plan = plan(
+            &store,
+            &Document::parse(&routes("")).unwrap(),
+            false,
+            &defined,
+        );
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        let subjects: Vec<String> = plan.changes.iter().map(Change::subject).collect();
+        assert!(
+            subjects.contains(&"route shop /".to_owned())
+                && subjects.contains(&"route shop / client_class=partner".to_owned()),
+            "{subjects:?}"
+        );
+
+        let text = routes(
+            "[[route]]\nhost = 'shop'\napp = 'shop'\nmatch = { client_class = ['partner', 'bots'] }\n\
+             traffic = { classes = { robots = 'r9' } }\n",
+        );
+        let refused = super::plan(&store, &Document::parse(&text).unwrap(), false, &defined);
+        let errors = refused.errors.join("\n");
+
+        for expected in [
+            "no client class named bots",
+            "no client class named robots",
+            "traffic names shop@r9, which does not exist",
+            "another route with the path is for client class partner",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
+    }
+
+    #[test]
     fn prune_removes_what_is_not_declared() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let plan = plan(&store, &Document::default(), true);
+        let plan = plan(&store, &Document::default(), true, &Defined::default());
         let names: Vec<(&str, String)> = plan
             .changes
             .iter()
@@ -2953,7 +4635,12 @@ mod tests {
                     [app.shop.release.r2]\nsource = '/nonexistent/dir'\n\
                     [[listener]]\naddress = '127.0.0.1:8080'\n";
 
-        let plan = plan(&store, &Document::parse(text).unwrap(), false);
+        let plan = plan(
+            &store,
+            &Document::parse(text).unwrap(),
+            false,
+            &Defined::default(),
+        );
         assert_eq!(plan.errors.len(), 3, "{:?}", plan.errors);
         assert!(plan.errors[0].contains("\"Shop\" is not a valid application name"));
         assert!(plan.errors[1].contains("shop@r1 has no source directory"));
@@ -3059,6 +4746,34 @@ mod tests {
                 1
             )
             .contains("queue_wait_p95")
+        );
+
+        // Section 7.4: a group may scale to zero, and only one that does
+        // may stop its host when idle.
+
+        let to_zero = muru_config::Scaling {
+            mode: Some(ScalingMode::Spare),
+            min_workers: Some(0),
+            max_workers: Some(4),
+            host_idle_timeout: Some("10m".to_owned()),
+            ..muru_config::Scaling::default()
+        };
+        let (spec, processes) = resolve_scaling(Some(&to_zero), 1, "scaling").unwrap();
+        assert_eq!((spec.min_workers, processes), (0, 1));
+        assert_eq!(spec.host_idle_timeout_ms, Some(600_000));
+        assert_eq!(
+            scaling_table(&spec).unwrap().host_idle_timeout.as_deref(),
+            Some("600s")
+        );
+        assert!(
+            refused(
+                muru_config::Scaling {
+                    min_workers: Some(1),
+                    ..to_zero
+                },
+                1
+            )
+            .contains("host_idle_timeout needs min_workers = 0")
         );
     }
 }

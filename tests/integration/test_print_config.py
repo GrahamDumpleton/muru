@@ -82,6 +82,7 @@ def test_recycling_and_host_timeouts_are_written() -> None:
         "hard_timeout": "45s",
         "hard_drain_grace": "10s",
         "shutdown_timeout": "5s",
+        "loop_stall_timeout": "10s",
     }
 
 

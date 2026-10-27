@@ -63,10 +63,11 @@ def test_requests_are_counted_and_served_to_a_scraper(scraped: tuple[Daemon, int
     assert "# TYPE muru_requests_total counter\n" in text
     assert (
         'muru_requests_total{app="shop",release="r1",group="default",mount="default",'
-        'status="2xx"} 2\n' in text
+        'status="2xx",client_class="default"} 2\n' in text
     ), text
     assert re.search(
-        r'muru_requests_total\{group="default",mount="default",status="5xx",reason="[a-z_]+"\} 1\n',
+        r'muru_requests_total\{group="default",mount="default",status="5xx",reason="[a-z_]+",'
+        r'client_class="default"\} 1\n',
         text,
     ), text
     assert "# TYPE muru_request_duration_seconds histogram\n" in text

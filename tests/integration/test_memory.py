@@ -49,6 +49,10 @@ def test_a_worker_over_the_hard_limit_is_replaced_at_once() -> None:
         wait_for(lambda: len(recycled(server.log())) >= 1)
         line = recycled(server.log())[0]
         assert "over the hard limit of 96MB" in line and "rss" in line
+
+        # Section 11.7: the event says what the worker held most of.
+
+        assert "; most objects: " in line, line
         wait_for(lambda: json.loads(server.get("/info").body)["pid"] != first)
         assert server.get("/").status == 200
     finally:

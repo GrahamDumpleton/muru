@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from support.server import Server, text
 
@@ -135,6 +137,11 @@ def test_wsgi_object_types(server: Server, key: str, expected: str) -> None:
 def test_muru_keys(server: Server) -> None:
     assert present(server, "muru.request_id")
     assert kind(server, "muru.request_id") == "builtins.str"
+
+    # When the edge gives up on the request, in seconds since the epoch.
+
+    assert kind(server, "muru.deadline") == "builtins.float"
+    assert time.time() < float(value(server, "muru.deadline")) < time.time() + 3600
 
 
 def test_all_http_keys_listed(server: Server) -> None:

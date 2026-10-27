@@ -52,6 +52,10 @@ service Admin {
   // edge, or serve it as usual again.
   rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
+  // Section 10.7: a single-use link that signs a browser in to the
+  // dashboard's actions, when the daemon's configuration enables them.
+  rpc DashboardLogin(DashboardLoginRequest) returns (DashboardLoginLink);
+
   // Events, from a sequence number.
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
@@ -94,6 +98,12 @@ service Admin {
   // DumpStacks and SetLogLevel of appendix B are the stacks and logging
   // operations of this one call.
   rpc Debug(DebugRequest) returns (DebugResponse);
+
+  // Section 9.10: overlays, their state, and activating, ending,
+  // previewing and promoting one.
+  rpc ListOverlays(ListOverlaysRequest) returns (ListOverlaysResponse);
+  rpc ControlOverlay(ControlOverlayRequest) returns (ControlOverlayResponse);
+  rpc PreviewOverlay(PreviewOverlayRequest) returns (PreviewOverlayResponse);
 }
 
 message GetStatusRequest {}
@@ -111,6 +121,7 @@ message Status {
   uint32 edge_pid = 10;             // the edge process serving the listeners
   string metrics = 11;              // the metrics listener's address, or empty
   string dashboard = 12;            // the dashboard's address, or empty
+  string budget = 13;               // what the releases hold of the node's budget (section 7.4), or empty without one
 }
 
 message ListAppsRequest {}
@@ -133,6 +144,7 @@ message App {
   string group = 7;
   string umask = 8;                 // octal
   bool maintenance = 9;             // the edge serves its maintenance page (section 4.12)
+  int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first (section 7.4)
 }
 
 // A deploy names the application (created on first use) and the source.
@@ -181,6 +193,11 @@ message DeployRequest {
   string stop_signal = 40;                  // the signal that stops an instance gracefully; the profile's when empty
   repeated string sendfile_roots = 41;      // section 4.9: directories an X-Muru-Sendfile path must lie in; the table's when empty
   optional string sendfile_header = 42;     // a second header honoured as X-Muru-Sendfile is; the table's when absent
+  bool override_freeze = 43;                // deploy although an overlay freezes the application's deploys (section 9.6)
+  optional bool reflection = 44;            // section 6.13: serve gRPC server reflection; the table's when absent
+  optional uint64 loop_stall_timeout_ms = 45; // section 7.6: how long an ASGI worker's loop may stall before it is replaced
+  optional uint32 retain_workers = 46;      // section 9.1: the workers each group of the superseded release keeps while warm; 1 when absent
+  repeated string grpc_web_origins = 47;    // section 6.13: origins whose pages may call it through gRPC-Web, or *; the table's when empty
 }
 
 // One environment variable: a value, or a secret reference.
@@ -231,6 +248,11 @@ message StartRolloutRequest {
   uint64 max_p95_ms = 5;            // a gate: the candidate's p95 over the step; none when 0
   uint64 min_requests = 6;          // requests before the gates judge, 100 when 0
   bool approve_each_step = 7;       // wait for ResumeRollout before each step after the first
+  bool override_freeze = 8;         // start although an overlay freezes the application's deploys (section 9.6)
+  uint64 max_p99_ms = 9;            // a gate: the candidate's p99 over the step; none when 0
+  uint64 max_worker_faults = 10;    // a gate: the candidate's worker crashes and timeout kills over the step
+  uint64 max_queue_wait_p95_ms = 11; // a gate: the candidate's p95 wait for a worker thread; none when 0
+  repeated string probes = 12;      // a gate: http or https URLs requested through the edge from each release by preview
 }
 
 message RolloutStep {
@@ -254,6 +276,10 @@ message Rollout {
   uint64 max_p95_ms = 13;
   uint64 min_requests = 14;
   bool approve_each_step = 15;
+  uint64 max_p99_ms = 16;
+  uint64 max_worker_faults = 17;
+  uint64 max_queue_wait_p95_ms = 18;
+  repeated string probes = 19;
 }
 
 message GetRolloutRequest {
@@ -271,12 +297,14 @@ message ListRolloutsResponse {
 
 message RolloutControlRequest {
   string app = 1;                   // the application's active rollout
+  bool override_freeze = 2;         // promote although an overlay freezes the application's deploys
 }
 
 // Blue/green (section 9.2): move all traffic to the release now.
 message PromoteReleaseRequest {
   string app = 1;
   string release = 2;
+  bool override_freeze = 3;         // promote although an overlay freezes the application's deploys (section 9.6)
 }
 
 // Section 7.4: pin a group's worker count, so the autoscaler stands
@@ -287,6 +315,16 @@ message SetScaleRequest {
   string group = 3;                 // default when empty
   optional uint32 processes = 4;    // the count to pin
   bool unpin = 5;                   // let the autoscaler decide again
+  optional uint32 min_workers = 6;  // section 7.5: a floor until until_unix_ms, as a temporary schedule
+  optional uint32 max_workers = 7;  // and a ceiling with it
+  uint64 until_unix_ms = 8;         // when the floor ends
+}
+
+message DashboardLoginRequest {}
+
+message DashboardLoginLink {
+  string url = 1;                   // open within expires_in_s, once
+  uint64 expires_in_s = 2;
 }
 
 message SetMaintenanceRequest {
@@ -334,6 +372,16 @@ message GroupScale {
   string policy = 18;               // the policy as one phrase
   uint64 scale_outs = 19;
   uint64 scale_ins = 20;
+  uint32 floor = 21;                // the fewest workers, with what schedules and overlays set (section 7.5)
+  uint32 ceiling = 22;              // the most workers, likewise
+  repeated string capacity_from = 23; // the overlays and schedules setting capacity now
+  bool scale_in_held = 24;          // a schedule holds scale-in
+  optional double worker_cpu = 25;  // section 7.3: CPU seconds per wall second, as a share of what a worker can use
+  optional double gil_wait_p95_ms = 26;
+  optional double loop_lag_p95_ms = 27;
+  string bottleneck = 28;           // cpu, gil, io, heavy, loop, memory, idle or none
+  string diagnosis = 29;            // the bottleneck in words
+  string advice = 30;               // the tuning it suggests for the next release, when any
 }
 
 // Section 9.1: pending, starting, warming, ready, draining, stopping,
@@ -419,6 +467,42 @@ message WorkerDebug {
   string result_json = 5;           // the operation's result, when ok
 }
 
+message ListOverlaysRequest {}
+
+message ListOverlaysResponse {
+  repeated OverlayInfo overlays = 1;
+}
+
+// An overlay as declared, with its state (section 9.10).
+message OverlayInfo {
+  string name = 1;
+  bool active = 2;
+  string state = 3;                 // schedule or manual while active; ended, skipped or promoted while held; empty when idle
+  uint64 since_unix_ms = 4;         // when the state began; 0 when idle
+  uint64 until_unix_ms = 5;         // when it ends or the hold lifts; 0 for none
+  string trigger = 6;               // its schedule, or "by hand"
+  repeated string changes = 7;      // what it changes, as route NAME and app NAME
+  uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
+}
+
+message ControlOverlayRequest {
+  string name = 1;
+  string action = 2;                // activate, end or promote
+  uint64 until_unix_ms = 3;         // for activate: when it ends; never when 0
+}
+
+message ControlOverlayResponse {
+  string message = 1;               // what happened
+}
+
+message PreviewOverlayRequest {
+  string name = 1;
+}
+
+message PreviewOverlayResponse {
+  repeated string changes = 1;      // what activating it now would change, one line per field
+}
+
 message UpgradeDaemonRequest {}
 
 message UpgradeDaemonResponse {
@@ -432,6 +516,7 @@ message ApplyConfigRequest {
   string document = 1;
   bool dry_run = 2;                 // report the plan and change nothing
   bool prune = 3;                   // also remove what the document does not contain
+  bool override_freeze = 4;         // deploy releases of applications an overlay freezes (section 9.6)
 }
 
 message DiffConfigRequest {
@@ -457,6 +542,8 @@ message ConfigChange {
 message ExportConfigRequest {
   string app = 1;                   // one application, else all
   bool all_releases = 2;            // every release, not only the one that serves
+  bool effective = 3;               // routes as the active overlays leave them (section 9.10)
+  bool resolve_rollouts = 4;        // each rollout under way as where it stands (section 10.4)
 }
 
 message ExportConfigResponse {
@@ -465,6 +552,8 @@ message ExportConfigResponse {
   string node = 3;                  // the host name
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
+  repeated string attributions = 6; // with effective: what each active overlay sets that is in force
+  repeated string layers = 7;       // with effective: each release setting and the layer it came from (section 3.3)
 }
 
 message ListHostsRequest {}
@@ -505,6 +594,10 @@ message Route {
   string auth = 11;                 // "APP PATH" when an authentication sub-request guards the route (section 4.16)
   string upstream = 12;             // the upstream that takes the requests (section 4.13), for an upstream route
   string fallback_upstream = 13;    // the upstream behind a static route, when there is one
+  string upload = 14;               // multipart or raw when the edge receives uploads (section 4.11), with ", precheck"
+  string max_body_size = 15;        // the route's own body limit, as configured (section 4.6)
+  repeated string client_classes = 16; // the client classes the route takes (section 4.14); every request when empty
+  map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
 }
 
 message ListUpstreamsRequest {}

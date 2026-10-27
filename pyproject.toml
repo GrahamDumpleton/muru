@@ -22,6 +22,7 @@ dev = [
     "zstandard>=0.25.0",
 ]
 fixtures = [
+    "debugpy>=1.8.17",
     "django>=5.2",
     "fastapi>=0.115",
     "flask>=3.1",
@@ -30,6 +31,13 @@ fixtures = [
     "starlette>=0.45",
     "uvicorn>=0.34",
     "websockets>=15",
+]
+# gRPC mounts (section 6.13). grpcio has no free-threaded wheels, so jobs
+# on a free-threaded Python leave this group out with UV_NO_GROUP=grpc.
+grpc = [
+    "grpcio>=1.84",
+    "grpcio-reflection>=1.84",
+    "grpcio-tools>=1.84",
 ]
 bench = [
     "granian>=2.0",
@@ -47,7 +55,7 @@ docs = [
 
 [tool.uv]
 package = false
-default-groups = ["dev", "docs", "fixtures"]
+default-groups = ["dev", "docs", "fixtures", "grpc"]
 
 [tool.ruff]
 line-length = 100
@@ -84,6 +92,12 @@ files = ["packages/muru/python/muru"]
 mypy_path = "packages/muru/python"
 python_version = "3.11"
 warn_unreachable = true
+
+# grpcio and grpcio-reflection have no type information.
+
+[[tool.mypy.overrides]]
+module = ["grpc", "grpc.*", "grpc_reflection.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

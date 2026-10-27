@@ -3,7 +3,8 @@
 //! byte of the frame that refers to it, so the receiver has it by the time
 //! it has decoded that frame. A side that may receive one reads the socket
 //! with recvmsg and a control buffer, since a plain read discards an
-//! attached descriptor.
+//! attached descriptor. A frame with more descriptors than one message
+//! carries has them spread over its first bytes, one message each.
 
 use std::collections::VecDeque;
 use std::io;
@@ -14,11 +15,11 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWriteExt, Interest, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-/// The most descriptors one message may carry.
-const MAX_DESCRIPTORS: usize = 8;
+/// The most descriptors one message carries.
+pub const MAX_DESCRIPTORS: usize = 64;
 
 /// Room for a control message carrying `MAX_DESCRIPTORS` descriptors.
-const CONTROL_LEN: usize = 128;
+const CONTROL_LEN: usize = 512;
 
 /// A control buffer aligned as the kernel requires.
 #[repr(C, align(8))]
@@ -156,43 +157,89 @@ pub async fn write_with_fd(
     bytes: &[u8],
     fd: BorrowedFd<'_>,
 ) -> io::Result<()> {
-    let stream = writer.as_ref();
-    let sent = stream
-        .async_io(Interest::WRITABLE, || {
-            send_message(stream.as_raw_fd(), bytes, fd)
-        })
-        .await?;
+    write_with_fds(writer, bytes, &[fd]).await
+}
 
-    if sent < bytes.len() {
-        writer.write_all(&bytes[sent..]).await?;
+/// Write `bytes`, a whole frame, with `fds` attached to its first bytes:
+/// up to `MAX_DESCRIPTORS` with each byte, the last group with the rest
+/// of the frame, so the receiver holds all of them, in order, once it has
+/// read the frame.
+pub async fn write_with_fds(
+    writer: &mut OwnedWriteHalf,
+    bytes: &[u8],
+    fds: &[BorrowedFd<'_>],
+) -> io::Result<()> {
+    let groups: Vec<&[BorrowedFd<'_>]> = fds.chunks(MAX_DESCRIPTORS).collect();
+
+    if groups.len() > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "more descriptors than the frame has bytes to carry them",
+        ));
+    }
+
+    let mut written = 0;
+
+    for (index, group) in groups.iter().enumerate() {
+        let end = if index + 1 == groups.len() {
+            bytes.len()
+        } else {
+            written + 1
+        };
+
+        // A message sent in part has carried its descriptors with its
+        // first byte; what is left of it goes as plain bytes.
+
+        let piece = &bytes[written..end];
+        let stream = writer.as_ref();
+        let sent = stream
+            .async_io(Interest::WRITABLE, || {
+                send_message(stream.as_raw_fd(), piece, group)
+            })
+            .await?;
+
+        if sent < piece.len() {
+            writer.write_all(&piece[sent..]).await?;
+        }
+
+        written = end;
+    }
+
+    if written < bytes.len() {
+        writer.write_all(&bytes[written..]).await?;
     }
 
     Ok(())
 }
 
-/// One sendmsg of `bytes` on `socket` with `fd` attached.
-fn send_message(socket: RawFd, bytes: &[u8], fd: BorrowedFd<'_>) -> io::Result<usize> {
+/// One sendmsg of `bytes` on `socket` with `fds` attached.
+fn send_message(socket: RawFd, bytes: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
     let mut control = Control([0u8; CONTROL_LEN]);
-    let raw = fd.as_raw_fd();
+    let raw: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
 
     // SAFETY: every pointer refers to a buffer that lives for the call,
-    // and the control buffer is aligned and sized for one descriptor.
+    // and the control buffer is aligned and sized for MAX_DESCRIPTORS,
+    // which bounds `fds`.
 
     unsafe {
         let mut message: libc::msghdr = std::mem::zeroed();
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = control_space(1) as _;
+        message.msg_controllen = control_space(raw.len()) as _;
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-        std::ptr::copy_nonoverlapping(&raw, libc::CMSG_DATA(header).cast::<RawFd>(), 1);
+        (*header).cmsg_len = libc::CMSG_LEN((raw.len() * std::mem::size_of::<RawFd>()) as u32) as _;
+        std::ptr::copy_nonoverlapping(
+            raw.as_ptr(),
+            libc::CMSG_DATA(header).cast::<RawFd>(),
+            raw.len(),
+        );
         let sent = libc::sendmsg(socket, &message, 0);
 
         if sent < 0 {
@@ -206,7 +253,7 @@ fn send_message(socket: RawFd, bytes: &[u8], fd: BorrowedFd<'_>) -> io::Result<u
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Seek as _, Write as _};
-    use std::os::fd::AsFd as _;
+    use std::os::fd::AsFd;
 
     use tokio::io::{AsyncReadExt as _, BufReader};
     use tokio::net::UnixStream;
@@ -238,6 +285,43 @@ mod tests {
         let mut content = String::new();
         copy.read_to_string(&mut content).unwrap();
         assert_eq!(content, "the file");
+        assert!(reader.get_mut().take_fd().is_none());
+    }
+
+    #[tokio::test]
+    async fn many_descriptors_arrive_in_order_with_their_frame() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (_, mut writer) = left.into_split();
+        let (read_half, _) = right.into_split();
+        let mut reader = BufReader::with_capacity(1024, FdReader::new(read_half));
+        let files: Vec<std::fs::File> = (0..150)
+            .map(|index| {
+                let mut file = tempfile::tempfile().unwrap();
+                write!(file, "file {index}").unwrap();
+                file
+            })
+            .collect();
+        let borrowed: Vec<BorrowedFd<'_>> = files.iter().map(AsFd::as_fd).collect();
+
+        write_with_fds(&mut writer, b"a frame of some length", &borrowed)
+            .await
+            .unwrap();
+        writer.write_all(b"after").await.unwrap();
+        drop(writer);
+
+        let mut text = String::new();
+        reader.read_to_string(&mut text).await.unwrap();
+        assert_eq!(text, "a frame of some lengthafter");
+
+        for index in 0..150 {
+            let received = reader.get_mut().take_fd().expect("a descriptor");
+            let mut copy = std::fs::File::from(received);
+            let mut content = String::new();
+            copy.rewind().unwrap();
+            copy.read_to_string(&mut content).unwrap();
+            assert_eq!(content, format!("file {index}"));
+        }
+
         assert!(reader.get_mut().take_fd().is_none());
     }
 

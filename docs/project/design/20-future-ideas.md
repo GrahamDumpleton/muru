@@ -71,3 +71,7 @@ An application hosted by Muru could manage the instance it runs in: deploy and d
 The same mechanism would serve the dashboard's mutating actions (section 10) and TCP access in phase 5, so it should be designed once, in an ADR, before either is built.
 
 **Dependencies and timing.** The workshop case also needs container releases and base images (section 8), memory limits through cgroups, and scale to zero or shutdown on idle, all phase 4 items; a front end that itself runs in a container reaches the admin socket only through a bind mount or the phase 5 TCP listener. The client and access model fit at the end of phase 3 or the start of phase 4 so they are ready when those arrive. Until then a separate process with permission on the admin socket can drive an instance with generated stubs or the JSON gateway, which needs no change.
+
+## 20.12 PROXY protocol
+
+Accepting the PROXY protocol on a listener, for a load balancer that passes TCP through without terminating HTTP and cannot preserve the client's source address (ADR 0029). The header is not authenticated, so the design would be strict: off by default and per listener, required from the listed sources and never parsed from any other, a connection from a listed source closed without a valid header, no optional mode, v2 parsed to a size cap within the header read timeout with its extensions ignored, and the address it gives standing for the client without making that client trusted for forwarded headers.

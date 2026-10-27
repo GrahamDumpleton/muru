@@ -30,7 +30,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
 | Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
-| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain | 9.2 |
+| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
 | Traffic | muructl host create, list, show, delete | Manage virtual hosts | 4.3 |
 | Traffic | muructl route set, list, show, delete | Manage routes and traffic splits | 4.5 |
@@ -39,6 +39,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Traffic | muructl drain RELEASE | Drain a release | 9.5 |
 | Traffic | muructl rollback APP | Restore the previous traffic policy | 9.6 |
 | Traffic | muructl maintenance on, off APP | Maintenance page at the edge | 4.12 |
+| Operations | muructl dashboard login | A single-use link signing a browser in to the dashboard's actions | 10.7 |
 | Capacity | muructl scale RELEASE or APP | Processes, threads, bounds, temporary floors with --until | 7.4, 7.5 |
 | Capacity | muructl scale status RELEASE | Signals, decisions, churn counters | 7.3 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 
 import pytest
 from support.server import Server
@@ -74,6 +75,7 @@ def test_client_server_and_state(server: Server) -> None:
     ]
     assert report["muru"]["request_id"]
     assert report["muru"]["max_body_size"] > 0
+    assert time.time() < report["muru"]["deadline"] < time.time() + 3600
 
 
 @pytest.mark.skipif(CURL is None, reason="curl is not installed")

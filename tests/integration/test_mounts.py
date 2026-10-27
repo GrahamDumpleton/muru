@@ -165,6 +165,16 @@ def test_invalid_mounts_are_refused(daemon: Daemon, tmp_path: Path) -> None:
             "[app.shop.release.r1.mounts.y]\npath = '/x/'\nentrypoint = 'a:c'\n",
             "another mount has the path /x",
         ),
+        (
+            "[app.shop.release.r1.mounts.x]\npath = '/x'\nentrypoint = 'a:b'\n"
+            "interface = 'asgi'\nthreads = 2\n",
+            "an ASGI mount runs on the event loop and has no threads",
+        ),
+        (
+            "[app.shop.release.r1.mounts.x]\npath = '/x'\nentrypoint = 'a:b'\n"
+            "threads = { reserved = 3, max = 2 }\n",
+            "max 2 must be at least 1 and no less than reserved 3",
+        ),
     ]:
         config.write_text(
             f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n{table}"

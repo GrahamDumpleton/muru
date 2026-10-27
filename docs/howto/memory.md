@@ -4,9 +4,9 @@
 :class: note
 
 Soft and hard memory limits per worker, measured as USS, PSS or RSS,
-with reclaiming before a recycle and a leak warning. Per-group limits,
-a node-wide budget, allocator settings and per-request memory deltas
-are still to come.
+with reclaiming before a recycle and a leak warning. The node-wide
+budget is in [scaling](scaling.md). Per-group limits, allocator settings
+and per-request memory deltas are still to come.
 ```
 
 A worker that grows too large is replaced through the same path as

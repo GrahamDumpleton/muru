@@ -22,6 +22,55 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::asgi::{Asgi, Channel};
 
+/// A request the soft timeout interrupted (section 7.6).
+pub struct Interrupted {
+    /// The request identifier.
+    pub request_id: String,
+    /// The method.
+    pub method: String,
+    /// The path and query.
+    pub path: String,
+    /// Where its thread was, innermost frame first, when it could be read
+    /// (section 11.7).
+    pub place: Option<String>,
+}
+
+/// The innermost frames of a thread as `file line N in function`,
+/// innermost first, read without opening source files.
+fn thread_place(py: Python<'_>, thread: u64) -> Option<String> {
+    let frame = py
+        .import("sys")
+        .ok()?
+        .call_method0("_current_frames")
+        .ok()?
+        .get_item(thread)
+        .ok()?;
+    let traceback = py.import("traceback").ok()?;
+    let walk = traceback.call_method1("walk_stack", (frame,)).ok()?;
+    let options = PyDict::new(py);
+    options.set_item("limit", 3).ok()?;
+    options.set_item("lookup_lines", false).ok()?;
+    let summary = traceback
+        .getattr("StackSummary")
+        .ok()?
+        .call_method("extract", (walk,), Some(&options))
+        .ok()?;
+    let mut places = Vec::new();
+
+    for entry in summary.try_iter().ok()? {
+        let entry = entry.ok()?;
+        let file: String = entry.getattr("filename").ok()?.extract().ok()?;
+        let line: Option<u64> = entry.getattr("lineno").ok()?.extract().ok()?;
+        let name: String = entry.getattr("name").ok()?.extract().ok()?;
+        let file = std::path::Path::new(&file)
+            .file_name()
+            .map_or(file.clone(), |name| name.to_string_lossy().into_owned());
+        places.push(format!("{file} line {} in {name}", line.unwrap_or(0)));
+    }
+
+    (!places.is_empty()).then(|| places.join(", called from "))
+}
+
 /// One request in flight, for the worker's soft timeout, the host's hard
 /// timeout and inspection (sections 7.6 and 11.7).
 pub struct RequestInfo {
@@ -35,6 +84,8 @@ pub struct RequestInfo {
     pub path: String,
     /// The Python thread serving it, once one has picked it up.
     pub thread: Option<u64>,
+    /// That thread's native identifier, for a reader from outside.
+    pub native: Option<u64>,
     /// The channel of an ASGI request, whose task the soft timeout cancels.
     pub channel: Option<Py<Channel>>,
     /// Wakes a bridge call the application thread is blocked in.
@@ -104,17 +155,94 @@ pub type Job = Box<dyn for<'py> FnOnce(Python<'py>) + Send + 'static>;
 /// does not know them.
 static THREAD_NAMES: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
 
-/// Record the calling thread's name under its Python identifier.
+/// The same names by the threads' native identifiers, which is how a
+/// reader from outside (PEP 768) knows threads on Linux (section 11.7).
+static NATIVE_THREAD_NAMES: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
+
+/// Record the calling thread's name under its Python identifier and its
+/// native one.
 pub fn name_this_thread(name: &str) {
     // SAFETY: PyThread_get_thread_ident reads the calling thread's
     // identifier and needs no interpreter state.
 
     let ident = unsafe { ffi::PyThread_get_thread_ident() } as u64;
-    THREAD_NAMES
-        .lock()
-        .expect("thread names poisoned")
-        .get_or_insert_with(HashMap::new)
-        .insert(ident, name.to_owned());
+
+    for (map, key) in [
+        (&THREAD_NAMES, ident),
+        (&NATIVE_THREAD_NAMES, native_thread_id()),
+    ] {
+        map.lock()
+            .expect("thread names poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(key, name.to_owned());
+    }
+}
+
+/// The calling thread's native identifier, as `threading.get_native_id()`
+/// gives it.
+pub fn native_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid has no preconditions.
+
+        (unsafe { libc::gettid() }) as u64
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut id: u64 = 0;
+
+        // SAFETY: a null thread asks about the calling thread, and the
+        // result is written to a u64 we own.
+
+        unsafe {
+            libc::pthread_threadid_np(0, &mut id);
+        }
+
+        id
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
+/// The runtime's thread names by Python identifier, without the
+/// interpreter.
+pub fn thread_name_list() -> Vec<(u64, String)> {
+    [&THREAD_NAMES, &NATIVE_THREAD_NAMES]
+        .into_iter()
+        .flat_map(|map| {
+            map.lock()
+                .expect("thread names poisoned")
+                .as_ref()
+                .map(|known| {
+                    known
+                        .iter()
+                        .map(|(ident, name)| (*ident, name.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// A request in flight, as the bookkeeping reports it without the
+/// interpreter (section 11.7).
+pub struct RequestSummary {
+    /// The edge's request id.
+    pub request_id: String,
+    /// The method.
+    pub method: String,
+    /// The path and query.
+    pub path: String,
+    /// How long it has run.
+    pub elapsed_ms: u64,
+    /// The Python thread serving it, once one has picked it up.
+    pub thread: Option<u64>,
+    /// That thread's native identifier.
+    pub native: Option<u64>,
 }
 
 /// The runtime's thread names by Python identifier, as a dict.
@@ -137,6 +265,12 @@ pub struct Mount {
     pub app: Py<PyAny>,
     /// The runner, when the mount is ASGI.
     pub runner: Option<Py<PyAny>>,
+    /// The mount's own threads, when it has them: those it reserves and
+    /// the most requests it runs at once.
+    pub threads: Option<(usize, usize)>,
+    /// The pool of its reserved threads, for a WSGI mount that reserves
+    /// any; its other requests run on the shared pool.
+    pub pool: Option<Arc<Pool>>,
 }
 
 impl Mount {
@@ -145,6 +279,8 @@ impl Mount {
         Self {
             app: self.app.clone_ref(py),
             runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
+            threads: self.threads,
+            pool: self.pool.clone(),
         }
     }
 }
@@ -177,6 +313,11 @@ pub struct Shared {
     pub pool: Pool,
     /// The soft timeout (section 7.6), when one is set.
     pub soft_timeout: Option<SoftTimeout>,
+    /// How long the event loop may go without beating before the host
+    /// is told it has stalled (section 7.6); none without a loop.
+    pub loop_stall: Option<std::time::Duration>,
+    /// The gRPC methods the mounts registered (section 6.13), for HELLO.
+    pub grpc_methods: Vec<muru_proto::worker::v1::GrpcMethod>,
     in_flight: AtomicU32,
     total: AtomicU64,
     next_id: AtomicU64,
@@ -204,8 +345,10 @@ impl Shared {
             threads,
             multiprocess,
             asgi,
-            pool: Pool::start(threads)?,
+            pool: Pool::start("muru-app", threads)?,
             soft_timeout,
+            loop_stall: None,
+            grpc_methods: Vec::new(),
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
@@ -222,12 +365,51 @@ impl Shared {
                 runner: self.asgi.as_ref().and_then(|asgi| {
                     Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
                 }),
+                threads: None,
+                pool: None,
             });
         }
 
         self.mounts
             .get(name)
             .map(|mount| Python::attach(|py| mount.clone_ref(py)))
+    }
+
+    /// wsgi.multithread for a request to the mount (section 6.5): whether
+    /// the pool serving it has more than one thread.
+    pub fn multithread(&self, mount: &str) -> bool {
+        match self.mounts.get(mount).and_then(|mount| mount.threads) {
+            Some((_, max)) => max > 1,
+            None => self.threads > 1,
+        }
+    }
+
+    /// The mounts' own threads, for HELLO (section 6.7).
+    pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
+        self.mounts
+            .iter()
+            .filter_map(|(name, mount)| {
+                mount
+                    .threads
+                    .map(|(reserved, max)| muru_proto::worker::v1::MountPool {
+                        mount: name.clone(),
+                        reserved: u32::try_from(reserved).unwrap_or(u32::MAX),
+                        max: u32::try_from(max).unwrap_or(u32::MAX),
+                    })
+            })
+            .collect()
+    }
+
+    /// Stop the shared pool and the mounts' own, letting their queued
+    /// requests finish. Called with the interpreter detached.
+    pub fn shutdown_pools(&self) {
+        self.pool.shutdown();
+
+        for mount in self.mounts.values() {
+            if let Some(pool) = &mount.pool {
+                pool.shutdown();
+            }
+        }
     }
 
     /// Count a request as started, returning its id for when it finishes
@@ -260,6 +442,7 @@ impl Shared {
                         )
                     },
                     thread: None,
+                    native: None,
                     channel: None,
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
@@ -294,18 +477,53 @@ impl Shared {
         }
     }
 
+    /// Exempt the request a thread serves from the timeouts, while a
+    /// debugger holds it (section 11.7). Returns whether the thread was
+    /// serving one.
+    pub fn exempt_thread(&self, thread: u64) -> bool {
+        let mut active = self.active.lock().expect("active requests poisoned");
+
+        let Some(info) = active.values_mut().find(|info| info.thread == Some(thread)) else {
+            return false;
+        };
+
+        info.exempt = true;
+        true
+    }
+
     /// Interrupt every request past the soft timeout that has not been
     /// interrupted yet (section 7.6): a WSGI request gets the timeout
     /// exception injected into its thread and its bridge waits woken, an
     /// ASGI request has its task cancelled. Returns what was interrupted,
-    /// as (request id, method, path) for the log.
-    pub fn interrupt_overdue(&self, py: Python<'_>) -> Vec<(String, String, String)> {
+    /// for the log and the event.
+    pub fn interrupt_overdue(&self, py: Python<'_>) -> Vec<Interrupted> {
         let Some(timeout) = self.soft_timeout.as_ref() else {
             return Vec::new();
         };
         let now = Instant::now();
         let mut interrupted = Vec::new();
         let mut channels = Vec::new();
+
+        // Section 11.7: where each overdue thread is, taken first, before
+        // the exception unwinds it, and without the lock, since reading a
+        // stack runs Python.
+
+        let overdue: Vec<(u64, u64)> = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .iter()
+            .filter(|(_, info)| {
+                !info.timed_out
+                    && !info.exempt
+                    && now.saturating_duration_since(info.started) >= timeout.after
+            })
+            .filter_map(|(id, info)| info.thread.map(|thread| (*id, thread)))
+            .collect();
+        let places: HashMap<u64, String> = overdue
+            .into_iter()
+            .filter_map(|(id, thread)| thread_place(py, thread).map(|place| (id, place)))
+            .collect();
 
         // The injection happens under the lock, so a request that ends
         // meanwhile clears it under the same lock (see request_finished).
@@ -314,7 +532,7 @@ impl Shared {
 
         let mut active = self.active.lock().expect("active requests poisoned");
 
-        for info in active.values_mut() {
+        for (id, info) in active.iter_mut() {
             if info.timed_out
                 || info.exempt
                 || now.saturating_duration_since(info.started) < timeout.after
@@ -323,11 +541,12 @@ impl Shared {
             }
 
             info.timed_out = true;
-            interrupted.push((
-                info.request_id.clone(),
-                info.method.clone(),
-                info.path.clone(),
-            ));
+            interrupted.push(Interrupted {
+                request_id: info.request_id.clone(),
+                method: info.method.clone(),
+                path: info.path.clone(),
+                place: places.get(id).cloned(),
+            });
 
             if let Some(channel) = &info.channel {
                 channels.push(channel.clone_ref(py));
@@ -377,6 +596,7 @@ impl Shared {
             .get_mut(&id)
         {
             info.thread = Some(thread as u64);
+            info.native = Some(native_thread_id());
         }
     }
 
@@ -406,6 +626,24 @@ impl Shared {
         }
 
         Ok(list)
+    }
+
+    /// The requests in flight, read without the interpreter.
+    pub fn active_summary(&self) -> Vec<RequestSummary> {
+        let now = Instant::now();
+        self.active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+            .map(|info| RequestSummary {
+                request_id: info.request_id.clone(),
+                method: info.method.clone(),
+                path: info.path.clone(),
+                elapsed_ms: now.saturating_duration_since(info.started).as_millis() as u64,
+                thread: info.thread,
+                native: info.native,
+            })
+            .collect()
     }
 
     /// Count a request as finished. For a WSGI request this runs on its
@@ -471,8 +709,8 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Start `threads` application threads.
-    pub fn start(threads: usize) -> std::io::Result<Self> {
+    /// Start `threads` application threads, named for the pool.
+    pub fn start(name: &str, threads: usize) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
 
@@ -481,8 +719,8 @@ impl Pool {
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
             let handle = std::thread::Builder::new()
-                .name(format!("muru-app-{index}"))
-                .spawn(move || thread_main(&receiver))?;
+                .name(format!("{name}-{index}"))
+                .spawn(move || thread_main(receiver))?;
             handles.push(handle);
         }
 
@@ -516,25 +754,57 @@ impl Pool {
     }
 }
 
-/// One application thread: attach once, then run jobs until the pool closes.
-fn thread_main(receiver: &Mutex<mpsc::Receiver<Job>>) {
+/// One application thread: attach once, then run jobs until the pool
+/// closes, inside `muru._pool.serve_jobs`, so the thread always has a
+/// Python frame that a reader from outside can start from (section 11.7).
+fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
     if let Some(name) = std::thread::current().name() {
         name_this_thread(name);
     }
 
     Python::attach(|py| {
-        loop {
-            // Wait for work with the interpreter detached. Only one idle
-            // thread holds the receiver at a time; the others wait for it.
+        let started = Arc::new(AtomicBool::new(false));
+        let inner = Arc::clone(&receiver);
+        let entered = Arc::clone(&started);
+        let framed = py.import("muru._pool").and_then(|module| {
+            let serve = pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _| {
+                entered.store(true, Ordering::SeqCst);
+                serve_jobs(args.py(), &inner);
+            })?;
+            module.call_method1("serve_jobs", (serve,))
+        });
 
-            let next = py.detach(|| receiver.lock().expect("pool receiver poisoned").recv());
+        // Without the module the thread serves all the same, only without
+        // the frame; once it has served, an error is only the way out.
 
-            match next {
-                Ok(job) => run_in_context(py, job),
-                Err(_) => break,
-            }
+        if let Err(error) = framed
+            && !started.load(Ordering::SeqCst)
+        {
+            tracing::warn!(%error, "application thread without its waiting frame");
+            serve_jobs(py, &receiver);
         }
     });
+}
+
+/// Run jobs until the pool closes.
+fn serve_jobs(py: Python<'_>, receiver: &Mutex<mpsc::Receiver<Job>>) {
+    loop {
+        // Wait for work with the interpreter detached. Only one idle
+        // thread holds the receiver at a time; the others wait for it.
+        // From the job arriving to holding the GIL again is the thread's
+        // GIL wait (section 7.3).
+
+        let (next, ready) = py.detach(|| {
+            let next = receiver.lock().expect("pool receiver poisoned").recv();
+            (next, std::time::Instant::now())
+        });
+        crate::signals::GIL_WAIT.record(ready.elapsed());
+
+        match next {
+            Ok(job) => run_in_context(py, job),
+            Err(_) => break,
+        }
+    }
 }
 
 /// Run a job inside a fresh copy of the thread's context variables.

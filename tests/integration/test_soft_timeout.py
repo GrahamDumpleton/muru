@@ -11,6 +11,7 @@ WebSockets are exempt from the soft and hard timeouts.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 
@@ -69,6 +70,16 @@ def test_a_wsgi_request_past_the_soft_timeout_is_interrupted() -> None:
         log = server.log_since_mark()
         assert "GET /busy?seconds=10" in log
         assert "muru.RequestTimeout" in log and "plain_wsgi.py" in log, log
+
+        # Section 11.7: the event carries where the request was, taken
+        # before it was interrupted.
+
+        assert server.wait_for_log("request.soft_timeout: worker 0")
+        assert re.search(
+            r"request\.soft_timeout: worker 0 \(pid \d+\): request \S+ GET /busy\?seconds=10 "
+            r"ran past the soft timeout of 1 s at \S+ line \d+ in \w+",
+            server.log_since_mark(),
+        ), server.log_since_mark()
 
         # The worker is the same one, and nothing is left over from the
         # interruption for the requests that follow on its threads.

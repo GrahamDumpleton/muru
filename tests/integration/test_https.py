@@ -10,6 +10,7 @@ developer's own mkcert authority is neither used nor touched.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import ssl
 import subprocess
@@ -73,9 +74,11 @@ def test_https_request_reaches_the_application_with_tls_details(
     assert tls["cipher"].startswith("TLS")
     assert tls["server_name"] == "localhost"
 
-    # http.client offers no application protocol, so none is negotiated.
+    # http.client offers no application protocol, so none is negotiated,
+    # and the fingerprint says so.
 
     assert tls["alpn"] == ""
+    assert re.match(r"^t1[23]d\d{4}00_[0-9a-f]{12}_[0-9a-f]{12}$", tls["ja4"]), tls["ja4"]
 
 
 def test_plain_http_is_still_served(server: support.Server) -> None:

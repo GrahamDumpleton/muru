@@ -234,6 +234,20 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     if environ["PATH_INFO"].endswith("/error"):
         raise RuntimeError("deliberate failure")
 
+    # /crash ends the worker at once, as a fault in a C extension would.
+
+    if environ["PATH_INFO"].endswith("/crash"):
+        os._exit(3)
+
+    # /fails-on/RELEASE answers 500 from that release alone: a health
+    # check only the candidate fails, for the rollout probe tests.
+
+    if "/fails-on/" in environ["PATH_INFO"]:
+        failing = environ["PATH_INFO"].rsplit("/", 1)[-1] == context().release
+        status = "500 Internal Server Error" if failing else "200 OK"
+        start_response(status, [("Content-Type", "text/plain"), ("Content-Length", "0")])
+        return [b""]
+
     # /status/CODE answers with that status, for the error override
     # tests: body=html, json or empty, override=off to keep the response,
     # www=1 for a WWW-Authenticate header and allow=METHODS for Allow.

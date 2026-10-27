@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +46,29 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// (section 19.2).
 pub const RETENTION: Duration = Duration::from_secs(30 * 60);
 
+/// The workers each group of a retained release keeps, its warm floor
+/// (section 9.1).
+pub const RETAIN_WORKERS: u32 = 1;
+
+/// Section 9.1: how long a superseded release stays warm, and the
+/// workers each of its groups keeps meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// How long; zero stops it once it has drained.
+    pub lasts: Duration,
+    /// The workers each group keeps.
+    pub workers: u32,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            lasts: RETENTION,
+            workers: RETAIN_WORKERS,
+        }
+    }
+}
+
 /// Section 9.4: how long sticky clients keep a release that is leaving
 /// traffic, unless the policy says otherwise.
 pub const STICKY_GRACE: Duration = Duration::from_secs(10 * 60);
@@ -67,6 +90,14 @@ pub struct Config {
     /// a daemon that runs as root starts the edge and the applications
     /// that name no user as (ADR 0026); `muru` when none is named.
     pub service_user: Option<String>,
+    /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
+    /// clients, with those clients.
+    pub h2c: Vec<pb::H2cPolicy>,
+    /// Whether `muructl debug exec` may run code in workers (section
+    /// 11.7).
+    pub debug_exec: bool,
+    /// The node's budget (section 7.4).
+    pub budget: crate::budget::Budget,
     /// Trusted proxies and the headers taken from them (section 4.7).
     pub proxy: Option<muru_config::Proxy>,
     /// How responses are compressed (section 4.17).
@@ -76,6 +107,10 @@ pub struct Config {
     pub error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
     /// The node-wide error override (section 4.12).
     pub error_override: Option<muru_config::ErrorOverride>,
+    /// The client classification rules (section 4.14).
+    pub client_classes: Vec<muru_config::ClientClass>,
+    /// The rate limits hosts and routes may name (section 4.15).
+    pub rate_limits: std::collections::BTreeMap<String, muru_config::RateLimit>,
     /// The secret stores (section 10.8).
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
@@ -86,6 +121,10 @@ pub struct Config {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
     pub dashboard: Option<SocketAddr>,
+    /// Whether the dashboard takes actions from signed-in sessions.
+    pub dashboard_actions: bool,
+    /// The overlays' signed webhook (section 9.10), or none.
+    pub overlay_webhook: Option<crate::triggers::Webhook>,
     /// The webhooks events are delivered to (section 11.5).
     pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
@@ -120,6 +159,10 @@ pub enum RolloutAction {
     Abort,
 }
 
+/// Section 9.3: each release's failed probes, by application and
+/// release, and how the latest failed.
+type ProbeFailures = Arc<std::sync::Mutex<HashMap<(String, String), (u64, String)>>>;
+
 /// Where a rollout's current step started from: the releases' counters
 /// at that moment, so the gates judge the step alone.
 #[derive(Debug, Clone)]
@@ -129,6 +172,10 @@ struct RolloutRun {
     candidate: Counters,
     baseline: Counters,
 }
+
+/// Section 7.3: the shortest time the workers' signals are measured
+/// over.
+const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
 
 /// A request for the reconciler, answered when it has been carried out.
 pub enum Command {
@@ -151,8 +198,9 @@ pub enum Command {
         spec: Box<ReleaseSpec>,
         /// The release id, or none to generate one.
         id: Option<String>,
-        /// How long the superseded release stays warm; zero stops it.
-        retain: Duration,
+        /// How long the superseded release stays warm, zero to stop it,
+        /// and the workers it keeps.
+        retain: Retention,
         /// Start the release but leave traffic where it is (section 9.2).
         hold: bool,
         /// Where the release record goes as soon as it exists.
@@ -313,6 +361,47 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Activate, end or promote an overlay (section 9.10).
+    Overlay {
+        /// The overlay.
+        name: String,
+        /// What to do.
+        action: OverlayAction,
+        /// Whether the signed webhook asks, rather than a person.
+        external: bool,
+        /// Answered with a sentence about what happened.
+        done: oneshot::Sender<Result<String, String>>,
+    },
+    /// Section 7.5: a temporary schedule raising a worker group's floor,
+    /// and its ceiling with it, until a time.
+    ScaleFloor {
+        /// The application.
+        app: String,
+        /// The worker group.
+        group: String,
+        /// The floor.
+        min_workers: u32,
+        /// The ceiling, when raised too.
+        max_workers: Option<u32>,
+        /// When it ends, Unix milliseconds.
+        until: u64,
+        /// Answered with a sentence about what happened.
+        done: oneshot::Sender<Result<String, String>>,
+    },
+}
+
+/// What a person asks of an overlay (section 9.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAction {
+    /// Apply it now, until a time or until ended.
+    Activate {
+        /// When it ends, Unix milliseconds; never without one.
+        until: Option<u64>,
+    },
+    /// Stop applying it; a schedule's window stays ended until it is over.
+    End,
+    /// Fold its changes into the base configuration and end it for good.
+    Promote,
 }
 
 /// What a previous daemon left behind about its edge, for re-adoption
@@ -351,6 +440,8 @@ struct HostRecord {
 struct GroupRecord {
     name: String,
     paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    client_classes: Vec<String>,
     sockets: Vec<PathBuf>,
 }
 
@@ -365,6 +456,14 @@ struct GroupScaling {
     /// The count last asked of the host, so a count the host has not
     /// reached yet is not asked for again every second.
     requested: Option<u32>,
+    /// The threads a worker can run Python on at once without a GIL,
+    /// for its CPU share (section 7.3).
+    threads: u32,
+    /// The soft memory limit and what it measures, when one is set.
+    memory_limit: Option<(muru_config::Measure, u64)>,
+    /// The last scale-out the node's budget held back: the count asked
+    /// for, the count given and the limit, so each is one event.
+    denied: Option<(u32, u32, crate::budget::Limit)>,
 }
 
 /// What the API needs to talk to a running daemon.
@@ -394,6 +493,12 @@ pub struct Info {
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
     pub dashboard: Option<SocketAddr>,
+    /// The dashboard's login codes and sessions, when it takes actions
+    /// (section 10.7).
+    pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
+    /// The rate limits (section 4.15) and client classes (section 4.14)
+    /// the daemon's file defines, which applied files may name.
+    pub defined: std::sync::RwLock<crate::config::Defined>,
 }
 
 /// What a ReopenLogs command reached.
@@ -405,11 +510,14 @@ pub struct Reopened {
     pub hosts: u32,
 }
 
-/// What runs a release: a host with Muru's workers, or the instances of
-/// a managed HTTP server (section 9.9).
+/// What runs a release: a host with Muru's workers, the instances of a
+/// managed HTTP server (section 9.9), or nothing for now: a release whose
+/// host stopped once every group had been at zero for its
+/// host_idle_timeout, started again by the next request (section 7.4).
 enum Backend {
     Host(HostProcess),
     Servers(Servers),
+    Dormant,
 }
 
 impl Backend {
@@ -417,7 +525,7 @@ impl Backend {
     fn host(&self) -> Option<&HostProcess> {
         match self {
             Self::Host(host) => Some(host),
-            Self::Servers(_) => None,
+            Self::Servers(_) | Self::Dormant => None,
         }
     }
 
@@ -425,7 +533,7 @@ impl Backend {
     fn servers(&self) -> Option<&Servers> {
         match self {
             Self::Servers(servers) => Some(servers),
-            Self::Host(_) => None,
+            Self::Host(_) | Self::Dormant => None,
         }
     }
 
@@ -434,14 +542,14 @@ impl Backend {
     fn try_exited(&mut self) -> std::io::Result<Option<String>> {
         match self {
             Self::Host(host) => host.try_exited(),
-            Self::Servers(_) => Ok(None),
+            Self::Servers(_) | Self::Dormant => Ok(None),
         }
     }
 
     /// The record a previous daemon reads to take the release over.
     fn record_path(&self, run_dir: &Path) -> PathBuf {
         match self {
-            Self::Host(_) => run_dir.join("host.toml"),
+            Self::Host(_) | Self::Dormant => run_dir.join("host.toml"),
             Self::Servers(_) => run_dir.join("servers.toml"),
         }
     }
@@ -452,6 +560,7 @@ impl Backend {
         match self {
             Self::Host(host) => host.stop().await,
             Self::Servers(servers) => servers.stop(grace).await,
+            Self::Dormant => {}
         }
     }
 
@@ -460,6 +569,7 @@ impl Backend {
         match self {
             Self::Host(host) => host.release(),
             Self::Servers(servers) => servers.release(),
+            Self::Dormant => {}
         }
     }
 
@@ -468,7 +578,7 @@ impl Backend {
     fn signal(&self, signal: i32) -> bool {
         match self {
             Self::Host(host) => host.signal(signal),
-            Self::Servers(_) => false,
+            Self::Servers(_) | Self::Dormant => false,
         }
     }
 
@@ -500,7 +610,7 @@ struct Running {
     /// Section 9.4: while set, the release is leaving traffic but stays
     /// reachable by sticky cookie until the instant, when it drains with
     /// the retention given.
-    sticky_until: Option<(Instant, Duration)>,
+    sticky_until: Option<(Instant, Retention)>,
     /// Deployed with hold (section 9.2): running and reachable by preview,
     /// taking no traffic until a rollout or a promotion, and left alone
     /// by the traffic reconciliation.
@@ -509,20 +619,107 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// Section 7.3: the report the workers' signals are measured from,
+    /// and when it arrived.
+    signals_from: Option<(Instant, Vec<crate::host::WorkerStatus>)>,
     /// Section 7.4: each worker group's autoscaler, the default first.
     scalers: Vec<GroupScaling>,
+    /// The host's own proportional set size, where it can be read, for
+    /// the node's memory budget.
+    host_pss: Option<u64>,
+    /// Section 7.4: since when every group has been at zero, for the
+    /// host_idle_timeout.
+    idle_since: Option<Instant>,
     /// When each worker socket entered routing, for the age of the
     /// youngest worker.
     ready_at: HashMap<PathBuf, Instant>,
 }
 
 impl Running {
+    /// Section 7.4: what one worker of a group costs, from its workers'
+    /// mean proportional set size and CPU, the soft memory limit standing
+    /// in before any has reported, then `fallback`.
+    fn worker_cost(&self, group: &GroupScaling, fallback: Option<u64>) -> crate::budget::Cost {
+        let sizes: Vec<u64> = self
+            .status
+            .iter()
+            .filter(|worker| worker.group == group.name)
+            .filter_map(|worker| worker.pss)
+            .collect();
+        let measured = (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64);
+
+        crate::budget::Cost {
+            memory: measured
+                .or(group.memory_limit.map(|(_, limit)| limit))
+                .or(fallback),
+            cpu: group.scaler.worker_signals().cores,
+        }
+    }
+
+    /// A group's workers, as the sockets the host announced; none for a
+    /// group it has not announced yet.
+    fn group_sockets(&self, group: &str) -> Option<&[PathBuf]> {
+        if group == muru_edge::routing::DEFAULT_GROUP {
+            return Some(&self.sockets);
+        }
+
+        self.groups
+            .iter()
+            .find(|record| record.name == group)
+            .map(|record| record.sockets.as_slice())
+    }
+
+    /// Section 7.4: the groups with no workers, whose requests wait at
+    /// the edge to be woken rather than being refused: a group scaled to
+    /// zero, or one whose workers are on their way.
+    fn waking_groups(&self) -> Vec<String> {
+        if self.backend.servers().is_some() {
+            return Vec::new();
+        }
+
+        std::iter::once((muru_edge::routing::DEFAULT_GROUP, &self.sockets))
+            .chain(
+                self.groups
+                    .iter()
+                    .map(|group| (group.name.as_str(), &group.sockets)),
+            )
+            .filter(|(_, sockets)| sockets.is_empty())
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+
+    /// Section 7.4: what the release holds against the node's budget:
+    /// each group at the larger of the workers it has and the count its
+    /// autoscaler is bringing it to, at what a worker costs, and the
+    /// host's own memory; a managed server's instances count as workers.
+    fn usage(&self, fallback: Option<u64>) -> crate::budget::Usage {
+        let mut usage = crate::budget::Usage::default();
+
+        if matches!(self.backend, Backend::Servers(_)) {
+            usage.workers = self.workers() as u32;
+            return usage;
+        }
+
+        for group in &self.scalers {
+            let mut count = self.group_sockets(&group.name).map_or(0, <[PathBuf]>::len) as u32;
+
+            if self.retained_until.is_none() {
+                count = count.max(group.scaler.desired());
+            }
+
+            usage.add(count, self.worker_cost(group, fallback));
+        }
+
+        usage.memory += self.host_pss.unwrap_or(0);
+        usage
+    }
+
     /// The processes serving: workers in every group, or a managed
     /// server's instances.
     fn workers(&self) -> usize {
         match &self.backend {
             Backend::Servers(servers) => servers.running(),
-            Backend::Host(_) => {
+            Backend::Host(_) | Backend::Dormant => {
                 self.sockets.len()
                     + self
                         .groups
@@ -550,9 +747,23 @@ struct Daemon {
     /// 4.12), for every snapshot.
     error_pages: Vec<pb::ErrorPage>,
     error_override: Option<pb::ErrorOverride>,
+    /// The daemon file's client classes and rate limits (sections 4.14
+    /// and 4.15).
+    client_rules: crate::clients::FileRules,
+    /// Those with the applied files', for every snapshot, with the list
+    /// files they were read from.
+    clients: crate::clients::ClientPolicies,
+    /// Which rate limits are refusing requests, for the events.
+    enforcement: crate::clients::Enforcement,
     /// The applications in maintenance mode (section 4.12), with when
     /// each was put there.
     maintenance: HashMap<String, u64>,
+    /// Section 9.10: the overlays in the warm-up lead before a window,
+    /// with the release each keeps running meanwhile.
+    warm_ups: BTreeMap<String, Option<(String, String)>>,
+    /// Section 9.10: when the clock's synchronisation was last checked,
+    /// and whether the daemon has warned that it is not synchronised.
+    clock: (Option<Instant>, bool),
     /// The secret stores releases may refer to (section 10.8).
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
@@ -560,6 +771,14 @@ struct Daemon {
     /// The service user (ADR 0026), when this daemon is root: whom the
     /// edge and the applications that name no user run as.
     service: Option<crate::host::Identity>,
+    /// Whether `muructl debug exec` may run code in workers.
+    debug_exec: bool,
+    /// The listeners' h2c policies, for every snapshot (section 6.13).
+    h2c: Vec<pb::H2cPolicy>,
+    /// Section 7.4: the node's budget, and the schedule windows already
+    /// checked against it, by overlay and start.
+    budget: crate::budget::Budget,
+    budget_checked: BTreeSet<(String, u64)>,
     /// The points the dashboard's charts draw, one a second.
     history: Arc<muru_dashboard::History>,
     /// Turns the edge's counters into those points.
@@ -568,6 +787,16 @@ struct Daemon {
     /// Section 9.3: the counters each running rollout's current step
     /// started from, by application.
     rollout_runs: HashMap<String, RolloutRun>,
+    /// Section 9.3: each release's worker crashes and timeout kills, from
+    /// the host's events, for the gates.
+    worker_faults: HashMap<(String, String), u64>,
+    /// Section 9.3: each release's failed probes and how the latest
+    /// failed, written by the probe tasks.
+    probe_failures: ProbeFailures,
+    /// When each application's rollout probes were last sent.
+    probed: HashMap<String, Instant>,
+    /// The client probes are sent with.
+    probe_client: crate::rollouts::ProbeClient,
     /// The release each application's traffic goes to, as the edge has
     /// been told; the store catches up once a switch has happened.
     serving: HashMap<String, String>,
@@ -605,9 +834,16 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let (error_pages, error_override) =
         error_tables_message(&config.error_pages, config.error_override.as_ref())
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let client_rules = crate::clients::FileRules {
+        classes: config.client_classes.clone(),
+        limits: config.rate_limits.clone(),
+        directory: config_directory(&config.locations.config.path),
+    };
 
     let metrics = config.metrics;
     let dashboard = config.dashboard;
+    let dashboard_sessions =
+        (dashboard.is_some() && config.dashboard_actions).then(muru_dashboard::Sessions::new);
     let sinks = std::mem::take(&mut config.sinks);
     let locations = config.locations;
 
@@ -632,6 +868,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     let store = Arc::new(Store::open(&locations.state_store())?);
+    let clients = client_rules
+        .policies(&store)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let events = Events::new(Arc::clone(&store));
 
     // Section 11.5: each sink delivers from its own cursor, so nothing
@@ -656,6 +895,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     let edge_log = locations.logs.path.join("edge.log");
 
+    // Section 4.11: the upload spool is the edge's own, in the state
+    // directory rather than the run directory, which may be memory.
+
+    let spool = locations.state.path.join("spool");
+    prepare_spool(&spool, service)
+        .with_context(|| format!("preparing the upload spool {}", spool.display()))?;
+
     let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
         Some(record) => EdgeProcess::adopt(
             record.pid,
@@ -671,6 +917,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             edge_log.clone(),
             config.access_log.clone(),
             config.limits.clone(),
+            spool.clone(),
             service,
         )
         .await
@@ -705,6 +952,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 log: edge_log,
                 access_log: config.access_log,
                 limits: config.limits,
+                spool,
                 identity: service,
             })
             .await?
@@ -725,6 +973,14 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
         dashboard,
+        dashboard_sessions: dashboard_sessions.clone(),
+        defined: std::sync::RwLock::new(crate::config::Defined {
+            budget: crate::budget::View {
+                budget: config.budget,
+                ..crate::budget::View::default()
+            },
+            ..client_rules.defined()
+        }),
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -764,6 +1020,29 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 handle.commands.clone(),
                 Arc::clone(&history),
                 events.clone(),
+                dashboard_sessions,
+            )))
+        }
+        None => None,
+    };
+
+    // The overlays' external trigger (section 9.10), on its own address.
+
+    let triggers = match config.overlay_webhook.take() {
+        Some(webhook) => {
+            let listener = tokio::net::TcpListener::bind(webhook.address)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot listen for the overlay webhook on {}",
+                        webhook.address
+                    )
+                })?;
+            Some(tokio::spawn(crate::triggers::serve(
+                listener,
+                webhook.secret,
+                Arc::clone(&handle.store),
+                handle.commands.clone(),
             )))
         }
         None => None,
@@ -812,14 +1091,27 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         compression,
         error_pages,
         error_override,
+        client_rules,
+        clients,
+        enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
+        warm_ups: BTreeMap::new(),
+        clock: (None, false),
         secrets: config.secrets.clone(),
         rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
         service,
+        debug_exec: config.debug_exec,
+        h2c: config.h2c.clone(),
+        budget: config.budget,
+        budget_checked: BTreeSet::new(),
         history,
         sampler: muru_dashboard::Sampler::default(),
         running: HashMap::new(),
         rollout_runs: HashMap::new(),
+        worker_faults: HashMap::new(),
+        probe_failures: Arc::default(),
+        probed: HashMap::new(),
+        probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
         default_app: None,
         owns_log,
@@ -830,6 +1122,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     daemon.restore().await;
     daemon.reconcile_traffic().await;
 
+    // The edge has the node's settings, a listener's h2c among them, from
+    // the start, whether or not any release runs yet.
+
+    if let Err(error) = daemon.push_snapshot().await {
+        tracing::warn!(%error, "pushing the first snapshot failed");
+    }
+
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
     // whole again.
@@ -837,6 +1136,12 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     if config.upgraded_from.is_some() {
         daemon.replace_edge().await;
     }
+
+    // Section 7.4: the edge says when a request waits for a group with
+    // no workers.
+
+    let (wake_sender, mut wakes) = mpsc::channel(64);
+    daemon.edge.watch_wakes(wake_sender);
 
     crate::notify::ready(&format!("serving on {serving_on}"));
 
@@ -897,6 +1202,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 Some(command) => daemon.carry_out(command).await,
                 None => break Ok(()),
             },
+            Some(wake) = wakes.recv() => {
+                daemon.wake(wake).await;
+            }
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
@@ -918,6 +1226,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.advance_rollouts(samples.as_deref()).await;
                 daemon.autoscale(samples.as_deref()).await;
+                daemon.refresh_client_lists().await;
+                daemon.reconcile_overlays().await;
+                daemon.check_clock();
+                daemon.watch_rate_limits(samples.as_deref());
             }
         }
     };
@@ -979,6 +1291,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     if let Some(pages) = pages {
         pages.abort();
+    }
+
+    if let Some(triggers) = triggers {
+        triggers.abort();
     }
 
     let _ = std::fs::remove_file(&socket);
@@ -1076,6 +1392,43 @@ fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::I
         "the edge and applications run as the service user"
     );
     Ok(Some(identity))
+}
+
+/// Section 4.11: a route's upload settings for the edge, with their
+/// defaults in place. Apply has checked the keys, so a route that fails
+/// them here takes no uploads.
+fn upload_message(route: &muru_config::Route) -> Option<pb::Upload> {
+    let settings = muru_config::check_upload(route).ok().flatten()?;
+
+    Some(pb::Upload {
+        mode: settings.mode,
+        max_file_size: settings.max_file_size.unwrap_or(0),
+        max_files: settings.max_files,
+        hash: settings.hash,
+        precheck: settings.precheck,
+        spool_quota: settings.spool_quota,
+    })
+}
+
+/// The directory a configuration file's relative paths start from.
+fn config_directory(path: &Path) -> PathBuf {
+    path.parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// The upload spool, open to the edge's user alone: the service user
+/// under a root daemon. The edge makes each application's directory in
+/// it.
+fn prepare_spool(directory: &Path, service: Option<crate::host::Identity>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(directory)?;
+
+    if let Some(service) = service {
+        std::os::unix::fs::chown(directory, Some(service.uid), Some(service.gid))?;
+    }
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Give a release's socket directory to the application's user with the
@@ -1380,8 +1733,8 @@ impl Daemon {
     /// log tail from its file.
     async fn dashboard_data(&mut self) -> muru_dashboard::NodeData {
         use muru_dashboard::{
-            AppRow, EventRow, HostRow, LogPanel, NodeData, NodeRequestRow, ReleaseRow, RouteRow,
-            Summary,
+            AppRow, EventRow, HostRow, LogPanel, NodeData, NodeRequestRow, ReleaseRow, RolloutRow,
+            RouteRow, ScalingRow, Summary,
         };
         use muru_edge::access::{format_bytes, format_duration};
 
@@ -1419,6 +1772,12 @@ impl Daemon {
         };
 
         let mut apps = Vec::new();
+        let maintenance: HashMap<String, u64> = self
+            .store
+            .maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         for app in self.store.apps().unwrap_or_default() {
             let mut releases = Vec::new();
@@ -1451,9 +1810,77 @@ impl Daemon {
                 name: app.name.clone(),
                 current: app.current.clone().unwrap_or_default(),
                 previous: app.previous.clone().unwrap_or_default(),
+                maintenance_since: maintenance
+                    .get(&app.name)
+                    .map(|since| clock_hms(*since))
+                    .unwrap_or_default(),
                 releases,
             });
         }
+
+        // Sections 7.3 and 7.4: each running release's groups as their
+        // autoscalers see them.
+
+        let mut scaling = Vec::new();
+        let mut running: Vec<&(String, String)> = self.running.keys().collect();
+        running.sort();
+
+        for (app, id) in running {
+            let measured = |value: Option<f64>, unit: &str| {
+                value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
+            };
+
+            for (group, status) in self.scale_status(app, id).unwrap_or_default() {
+                scaling.push(ScalingRow {
+                    release: format!("{app}@{id}"),
+                    group,
+                    workers: if status.desired == status.ready {
+                        status.ready.to_string()
+                    } else {
+                        format!("{} -> {}", status.ready, status.desired)
+                    },
+                    policy: status.spec.describe(),
+                    cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
+                    loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    diagnosis: status.diagnosis.summary.to_owned(),
+                    advice: status.diagnosis.advice.to_owned(),
+                    last_decision: status
+                        .last
+                        .map(|(age, what)| {
+                            format!(
+                                "{what} ({} ago)",
+                                muru_config::format_duration(Duration::from_secs(age.as_secs()))
+                            )
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+
+        // Section 9.3: the rollouts under way, then the latest that ended.
+
+        let mut rollouts = self.store.rollouts(None).unwrap_or_default();
+        rollouts.sort_by_key(|rollout| {
+            (
+                !rollout.state.is_active(),
+                std::cmp::Reverse(rollout.updated_unix_ms),
+            )
+        });
+        let rollouts = rollouts
+            .into_iter()
+            .take(10)
+            .map(|rollout| RolloutRow {
+                percent: rollout.percent(),
+                app: rollout.app,
+                id: rollout.id,
+                candidate: rollout.candidate,
+                baseline: rollout.baseline,
+                state: rollout.state.as_str().to_owned(),
+                message: rollout.message,
+                updated: clock_hms(rollout.updated_unix_ms),
+            })
+            .collect();
 
         let hosts = self
             .store
@@ -1566,6 +1993,8 @@ impl Daemon {
             apps,
             hosts,
             routes,
+            scaling,
+            rollouts,
             requests,
             events,
             logs,
@@ -1598,31 +2027,563 @@ impl Daemon {
             .map_err(|error| format!("[compression]: {error}"))?;
         let (error_pages, error_override) =
             error_tables_message(&document.error_pages, document.error_override.as_ref())?;
+        let client_rules = crate::clients::FileRules {
+            classes: document.client_class.clone(),
+            limits: document.rate_limit.clone(),
+            directory: config_directory(&path),
+        };
+        let clients = client_rules.policies(&self.store)?;
+        let budget = crate::budget::Budget::from_table(
+            document
+                .daemon
+                .as_ref()
+                .and_then(|table| table.budget.as_ref()),
+        )
+        .map_err(|error| format!("[daemon.budget]: {error}"))?;
         let changed = proxy != self.proxy
             || compression != self.compression
             || error_pages != self.error_pages
-            || error_override != self.error_override;
+            || error_override != self.error_override
+            || clients.classes_message != self.clients.classes_message
+            || clients.limits_message != self.clients.limits_message;
         self.proxy = proxy;
         self.compression = compression;
         self.error_pages = error_pages;
         self.error_override = error_override;
+        self.budget = budget;
+        let mut defined = client_rules.defined();
+        defined.budget = self.budget_view(self.budget_usage());
+        *self.info.defined.write().expect("defined names poisoned") = defined;
+        self.client_rules = client_rules;
+        self.clients = clients;
 
         if changed {
             self.push_snapshot().await?;
         }
 
         let message = format!(
-            "reloaded {}: the [proxy], [compression], [error_pages] and [error_override] tables {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}, and the budget is {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
             } else {
                 "are unchanged"
-            }
+            },
+            self.budget.describe(&self.budget_usage())
         );
         self.events
             .emit("config.reloaded", "daemon", "info", &message);
         Ok(message)
+    }
+
+    /// Section 9.10: the routes and the applications in maintenance mode
+    /// with the active overlays laid over them, lowest priority first.
+    fn effective(&self) -> (Vec<muru_config::Route>, BTreeSet<String>) {
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states = self.store.overlay_states().unwrap_or_default();
+        let active = crate::overlays::ordered(&overlays, &states);
+        let mut routes = self.store.routes().unwrap_or_default();
+        crate::overlays::apply_routes(&mut routes, &active);
+        let base: BTreeSet<String> = self.maintenance.keys().cloned().collect();
+        let maintained = crate::overlays::apply_maintenance(&base, &active);
+        (routes, maintained)
+    }
+
+    /// Section 9.10: whether an overlay's preconditions hold, or why not.
+    fn overlay_preconditions(&self, overlay: &muru_config::Overlay) -> Result<(), String> {
+        let Some(ready) = overlay
+            .preconditions
+            .as_ref()
+            .and_then(|preconditions| preconditions.release_ready.as_deref())
+        else {
+            return Ok(());
+        };
+
+        let route_apps: std::collections::BTreeMap<String, String> = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.name.map(|name| (name, route.app)))
+            .collect();
+        let (app, id) = crate::config::precondition_release(ready, overlay, &route_apps)
+            .ok_or_else(|| format!("release_ready {ready:?} names no release"))?;
+
+        // A retained release is warm and takes traffic at once, so it
+        // counts as ready.
+
+        match self.store.release(&app, &id) {
+            Ok(release)
+                if matches!(release.state, ReleaseState::Ready | ReleaseState::Retained) =>
+            {
+                Ok(())
+            }
+            Ok(release) => Err(format!("{app}@{id} is {}, not ready", release.state)),
+            Err(_) => Err(format!("{app}@{id} does not exist")),
+        }
+    }
+
+    /// Section 9.10: begin and end overlays by their schedules and by the
+    /// time they were activated for, start what their warm-ups name, and
+    /// give the edge the result.
+    async fn reconcile_overlays(&mut self) {
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states: HashMap<String, crate::model::OverlayState> = self
+            .store
+            .overlay_states()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|state| (state.name.clone(), state))
+            .collect();
+        let now = now_unix_ms();
+        let mut changed = false;
+
+        for (name, overlay) in &overlays {
+            let subject = format!("overlay {name}");
+
+            match crate::overlays::step(overlay, states.get(name), now) {
+                crate::overlays::Step::Stay => {}
+                crate::overlays::Step::Release => {
+                    let _ = self.store.set_overlay_state(name, None);
+                }
+                crate::overlays::Step::Extend { until } => {
+                    if let Some(state) = states.get(name) {
+                        let state = crate::model::OverlayState {
+                            until_unix_ms: until,
+                            ..state.clone()
+                        };
+                        let _ = self.store.set_overlay_state(name, Some(&state));
+                    }
+                }
+                crate::overlays::Step::End { reason } => {
+                    let _ = self.store.set_overlay_state(name, None);
+
+                    if crate::overlays::is_temporary(name) {
+                        let _ = self.store.delete_overlay(name);
+                    }
+
+                    let kind = if crate::overlays::is_schedule(name) {
+                        "schedule.expired"
+                    } else {
+                        "overlay.ended"
+                    };
+                    self.events
+                        .emit(kind, &subject, "notice", &format!("ended: {reason}"));
+                    changed = true;
+                }
+                crate::overlays::Step::Begin { until } => {
+                    let preconditions = self.overlay_preconditions(overlay);
+
+                    // An advisory overlay only says what it would do, once
+                    // a window; a skipped one is not retried every second.
+
+                    let (source, kind, level, detail) =
+                        match (overlay.advisory == Some(true), &preconditions) {
+                            (true, Ok(())) => (
+                                "advised",
+                                "overlay.would_activate",
+                                "notice",
+                                "would activate: its schedule's window began; it is advisory"
+                                    .to_owned(),
+                            ),
+                            (true, Err(why)) => (
+                                "advised",
+                                "overlay.would_activate",
+                                "notice",
+                                format!("would be skipped: {why}; it is advisory"),
+                            ),
+                            (false, Ok(())) if crate::overlays::is_schedule(name) => (
+                                "schedule",
+                                "schedule.activated",
+                                "notice",
+                                "activated: its window began".to_owned(),
+                            ),
+                            (false, Ok(())) => (
+                                "schedule",
+                                "overlay.activated",
+                                "notice",
+                                "activated: its schedule's window began".to_owned(),
+                            ),
+                            (false, Err(why)) => (
+                                "skipped",
+                                "overlay.skipped",
+                                "warning",
+                                format!("not activated: {why}"),
+                            ),
+                        };
+
+                    let active = source == "schedule";
+                    let latched = active && overlay.latch == Some(true);
+                    let state = crate::model::OverlayState {
+                        name: name.clone(),
+                        active,
+                        source: source.to_owned(),
+                        since_unix_ms: now,
+                        until_unix_ms: if latched { None } else { until },
+                    };
+                    let _ = self.store.set_overlay_state(name, Some(&state));
+                    self.events.emit(kind, &subject, level, &detail);
+                    changed |= active;
+                }
+            }
+        }
+
+        let warm_ups = self.warm_ups(&overlays, now);
+
+        if warm_ups != self.warm_ups {
+            for (name, release) in &warm_ups {
+                if self.warm_ups.contains_key(name) {
+                    continue;
+                }
+
+                let starts = overlays
+                    .iter()
+                    .find(|(declared, _)| declared == name)
+                    .and_then(|(_, overlay)| crate::overlays::window(overlay, now))
+                    .map_or(0, |(start, _)| start.saturating_sub(now));
+                let mut detail = format!(
+                    "warming up: its window begins in {}",
+                    crate::overlays::describe_wait(starts)
+                );
+
+                if let Some((app, id)) = release {
+                    detail.push_str(&format!("; starting {app}@{id}"));
+                }
+
+                self.events.emit(
+                    "overlay.warming",
+                    &format!("overlay {name}"),
+                    "info",
+                    &detail,
+                );
+            }
+
+            let releases_changed = warm_ups.values().collect::<BTreeSet<_>>()
+                != self.warm_ups.values().collect::<BTreeSet<_>>();
+            self.warm_ups = warm_ups;
+
+            if releases_changed && !changed {
+                self.reconcile_traffic().await;
+            }
+        }
+
+        if changed {
+            self.reconcile_traffic().await;
+
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for an overlay failed");
+            }
+        }
+    }
+
+    /// Section 9.10: warn, every ten minutes while schedules are declared,
+    /// when the system clock is not synchronised, as their windows follow
+    /// it, and say so once it is again.
+    fn check_clock(&mut self) {
+        let (checked, warned) = self.clock;
+
+        if checked.is_some_and(|at| at.elapsed() < CLOCK_CHECK) {
+            return;
+        }
+
+        let scheduled = self
+            .store
+            .overlays()
+            .unwrap_or_default()
+            .iter()
+            .any(|(_, overlay)| {
+                overlay
+                    .trigger
+                    .as_ref()
+                    .is_some_and(|trigger| trigger.schedule.is_some())
+            });
+        let event = clock_event(clock_synchronised(), warned, scheduled);
+        self.clock = (Some(Instant::now()), warned);
+
+        if let Some((kind, level, message)) = event {
+            self.clock.1 = kind == "clock.unsynchronised";
+            self.events.emit(kind, "daemon", level, message);
+        }
+    }
+
+    /// Section 9.10: the overlays in the lead before a window of their
+    /// schedule, with the release each warm-up starts.
+    fn warm_ups(
+        &self,
+        overlays: &[(String, muru_config::Overlay)],
+        now: u64,
+    ) -> BTreeMap<String, Option<(String, String)>> {
+        let route_apps: BTreeMap<String, String> = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.name.map(|name| (name, route.app)))
+            .collect();
+
+        overlays
+            .iter()
+            .filter(|(_, overlay)| crate::overlays::warming(overlay, now))
+            .map(|(name, overlay)| {
+                let release = overlay
+                    .warm_up
+                    .as_ref()
+                    .and_then(|warm_up| warm_up.start_release.as_deref())
+                    .and_then(|release| {
+                        crate::config::precondition_release(release, overlay, &route_apps)
+                    });
+                (name.clone(), release)
+            })
+            .collect()
+    }
+
+    /// Section 7.5: record and activate the temporary overlay `muructl
+    /// scale --min` stands for, replacing one already there for the group.
+    async fn scale_floor(
+        &mut self,
+        app: &str,
+        group: &str,
+        min_workers: u32,
+        max_workers: Option<u32>,
+        until: u64,
+    ) -> Result<String, String> {
+        self.store.app(app).map_err(|error| error.to_string())?;
+        let now = now_unix_ms();
+
+        if until <= now {
+            return Err("--until is not in the future".to_owned());
+        }
+
+        let change = muru_config::AppOverlay {
+            group: (group != muru_edge::routing::DEFAULT_GROUP).then(|| group.to_owned()),
+            min_workers: Some(min_workers),
+            max_workers,
+            ..muru_config::AppOverlay::default()
+        };
+        let overlay = muru_config::Overlay {
+            apps: BTreeMap::from([(app.to_owned(), change.clone())]),
+            ..muru_config::Overlay::default()
+        };
+        muru_config::check_overlay("scale", &overlay)?;
+        let name = crate::overlays::temporary_name(app, group);
+        self.store
+            .put_overlay(&name, &overlay)
+            .map_err(|error| error.to_string())?;
+        let state = crate::model::OverlayState {
+            name: name.clone(),
+            active: true,
+            source: "manual".to_owned(),
+            since_unix_ms: now,
+            until_unix_ms: Some(until),
+        };
+        self.store
+            .set_overlay_state(&name, Some(&state))
+            .map_err(|error| error.to_string())?;
+        let detail = format!(
+            "activated by muructl scale: {group} {} for {}",
+            crate::overlays::describe_capacity(&change),
+            crate::overlays::describe_wait(until - now)
+        );
+        self.events.emit(
+            "overlay.activated",
+            &format!("overlay {name}"),
+            "notice",
+            &detail,
+        );
+        Ok(detail)
+    }
+
+    /// Section 9.10: what a person, or with `external` the signed webhook,
+    /// asks of an overlay.
+    async fn control_overlay(
+        &mut self,
+        name: &str,
+        action: OverlayAction,
+        external: bool,
+    ) -> Result<String, String> {
+        let overlay = self
+            .store
+            .overlays()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(declared, _)| declared == name)
+            .map(|(_, overlay)| overlay)
+            .ok_or_else(|| format!("no overlay is named {name}"))?;
+        let state = self
+            .store
+            .overlay_states()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|state| state.name == name);
+        let active = state.as_ref().is_some_and(|state| state.active);
+        let subject = format!("overlay {name}");
+        let now = now_unix_ms();
+
+        let (source, by) = if external {
+            ("external", "by the webhook")
+        } else {
+            ("manual", "by hand")
+        };
+
+        let message = match action {
+            OverlayAction::Activate { until } => {
+                if active {
+                    return Err(format!("overlay {name} is already active"));
+                }
+
+                self.overlay_preconditions(&overlay)
+                    .map_err(|why| format!("overlay {name} was not activated: {why}"))?;
+                let state = crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: true,
+                    source: source.to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: until,
+                };
+                self.store
+                    .set_overlay_state(name, Some(&state))
+                    .map_err(|error| error.to_string())?;
+                let detail = format!("activated {by}");
+                self.events
+                    .emit("overlay.activated", &subject, "notice", &detail);
+                detail
+            }
+            OverlayAction::End => {
+                if !active {
+                    return Err(format!("overlay {name} is not active"));
+                }
+
+                // Ended inside its schedule's window, it stays ended until
+                // the window is over; otherwise it is simply inactive.
+
+                let window = crate::overlays::window(&overlay, now)
+                    .filter(|(start, end)| now >= *start && end.is_none_or(|end| now < end));
+                let held = window.map(|(_, end)| crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: false,
+                    source: "ended".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: end,
+                });
+                self.store
+                    .set_overlay_state(name, held.as_ref())
+                    .map_err(|error| error.to_string())?;
+
+                if crate::overlays::is_temporary(name) {
+                    self.store
+                        .delete_overlay(name)
+                        .map_err(|error| error.to_string())?;
+                }
+
+                let detail = format!("ended {by}");
+                self.events
+                    .emit("overlay.ended", &subject, "notice", &detail);
+                detail
+            }
+            OverlayAction::Promote => {
+                if !active {
+                    return Err(format!("overlay {name} is not active; activate it first"));
+                }
+
+                // Its changes become the base: the routes as the overlay
+                // leaves them, with those it adds for client classes, and
+                // its maintenance settings.
+
+                let pair = (name.to_owned(), overlay.clone());
+                let before = self.store.routes().unwrap_or_default();
+                let mut changed = before.clone();
+                crate::overlays::apply_routes(&mut changed, &[&pair]);
+
+                for route in changed.iter().filter(|route| !before.contains(route)) {
+                    self.store
+                        .put_route(route)
+                        .map_err(|error| error.to_string())?;
+                }
+
+                for (app, change) in &overlay.apps {
+                    if let Some(on) = change.maintenance {
+                        let since = on.then_some(now);
+                        self.store
+                            .set_maintenance(app, since)
+                            .map_err(|error| error.to_string())?;
+
+                        match since {
+                            Some(since) => {
+                                self.maintenance.entry(app.clone()).or_insert(since);
+                            }
+                            None => {
+                                self.maintenance.remove(app);
+                            }
+                        }
+                    }
+                }
+
+                let held = crate::model::OverlayState {
+                    name: name.to_owned(),
+                    active: false,
+                    source: "promoted".to_owned(),
+                    since_unix_ms: now,
+                    until_unix_ms: None,
+                };
+                self.store
+                    .set_overlay_state(name, Some(&held))
+                    .map_err(|error| error.to_string())?;
+                let detail = "promoted: its changes are now the base configuration".to_owned();
+                self.events
+                    .emit("overlay.promoted", &subject, "notice", &detail);
+                detail
+            }
+        };
+
+        self.reconcile_traffic().await;
+        self.push_snapshot().await?;
+        Ok(message)
+    }
+
+    /// Section 4.14: read the client classes' list files again when one
+    /// has changed, and give the edge the result.
+    async fn refresh_client_lists(&mut self) {
+        match self.clients.refresh() {
+            Ok(changed) if changed.is_empty() => {}
+            Ok(changed) => {
+                let names: Vec<String> = changed
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                self.events.emit(
+                    "client_class.list_reloaded",
+                    "daemon",
+                    "info",
+                    &format!("read {} again", names.join(", ")),
+                );
+
+                if let Err(error) = self.push_snapshot().await {
+                    tracing::error!(%error, "pushing the snapshot with the reloaded lists failed");
+                }
+            }
+            Err(error) => {
+                // The classes the edge has stay until the list reads.
+
+                tracing::warn!(%error, "a client class list could not be read; the edge keeps the last one read");
+            }
+        }
+    }
+
+    /// Section 4.15: a rate limit that begins refusing or holding
+    /// requests, after a quiet minute, is an event.
+    fn watch_rate_limits(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
+        let Some(samples) = samples else {
+            return;
+        };
+
+        for (limit, count) in self.enforcement.observe(samples, Instant::now()) {
+            self.events.emit(
+                "ratelimit.enforcing",
+                &format!("rate_limit {limit}"),
+                "warning",
+                &format!("began refusing or holding requests: {count:.0} so far"),
+            );
+        }
     }
 
     /// The node's metrics: the edge's samples with the daemon's own
@@ -1642,7 +2603,7 @@ impl Daemon {
                     muru_edge::routing::SERVER_GROUP.to_owned(),
                     servers.running(),
                 )],
-                Backend::Host(_) => vec![(
+                Backend::Host(_) | Backend::Dormant => vec![(
                     muru_edge::routing::DEFAULT_GROUP.to_owned(),
                     running.sockets.len(),
                 )],
@@ -1708,6 +2669,15 @@ impl Daemon {
                     ("group", worker.group.as_str()),
                     ("worker", index.as_str()),
                 ];
+
+                if let Some(cpu_ms) = worker.cpu_ms {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_cpu_seconds_total",
+                        &labels,
+                        cpu_ms as f64 / 1000.0,
+                    ));
+                }
+
                 samples.push(muru_edge::metrics::Sample::new(
                     "muru_worker_requests_total",
                     &labels,
@@ -1868,7 +2838,10 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        signals_from: None,
                         scalers,
+                        host_pss: None,
+                        idle_since: None,
                         ready_at,
                     },
                 );
@@ -1952,7 +2925,10 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        signals_from: None,
                         scalers: Vec::new(),
+                        host_pss: None,
+                        idle_since: None,
                         ready_at: HashMap::new(),
                     },
                 );
@@ -2036,6 +3012,16 @@ impl Daemon {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
             Command::Reconfigure { done } => {
+                // An apply may have changed the applied classes and
+                // limits.
+
+                match self.client_rules.policies(&self.store) {
+                    Ok(clients) => self.clients = clients,
+                    Err(error) => {
+                        tracing::warn!(%error, "the client classes stay as they were");
+                    }
+                }
+
                 self.reconcile_traffic().await;
                 let _ = done.send(self.push_snapshot().await);
             }
@@ -2067,6 +3053,68 @@ impl Daemon {
                 args,
                 done,
             } => {
+                // Section 11.7: exec runs code in a worker, and so does a
+                // debugger session, so both are off unless the daemon's
+                // file allows them, and the operations that reach into a
+                // worker are recorded.
+
+                if matches!(op.as_str(), "exec" | "attach" | "attach_io" | "detach")
+                    && !self.debug_exec
+                {
+                    let what = if op == "exec" {
+                        "debug exec"
+                    } else {
+                        "debugger attach"
+                    };
+                    let _ = done.send(Err(format!(
+                        "{what} is off: set debug_exec = true in the [daemon] table of the \
+                         daemon's configuration file"
+                    )));
+                    return;
+                }
+
+                if op == "attach" {
+                    let whom = worker.map_or_else(
+                        || "every worker".to_owned(),
+                        |index| format!("worker {index}"),
+                    );
+                    self.events.emit(
+                        "debug.attached",
+                        &format!("{app}@{id}"),
+                        "warning",
+                        &format!("a debugger session opened in {whom}"),
+                    );
+                }
+
+                if matches!(op.as_str(), "profile" | "trace" | "memory" | "exec") {
+                    let subject = format!("{app}@{id}");
+                    let whom = worker.map_or_else(
+                        || "every worker".to_owned(),
+                        |index| format!("worker {index}"),
+                    );
+
+                    let detail = if op == "exec" {
+                        let code: String = args
+                            .get("code")
+                            .and_then(|code| code.as_str())
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect();
+                        format!("ran code in {whom}: {code}")
+                    } else {
+                        let seconds = args
+                            .get("duration_s")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0);
+                        format!("{op} of {whom} for {seconds} s")
+                    };
+
+                    let level = if op == "exec" { "warning" } else { "info" };
+                    self.events
+                        .emit(&format!("debug.{op}"), &subject, level, &detail);
+                }
+
                 let control = self
                     .running
                     .get(&(app.clone(), id.clone()))
@@ -2085,6 +3133,27 @@ impl Daemon {
                     }
                 }
             }
+            Command::Overlay {
+                name,
+                action,
+                external,
+                done,
+            } => {
+                let _ = done.send(self.control_overlay(&name, action, external).await);
+            }
+            Command::ScaleFloor {
+                app,
+                group,
+                min_workers,
+                max_workers,
+                until,
+                done,
+            } => {
+                let outcome = self
+                    .scale_floor(&app, &group, min_workers, max_workers, until)
+                    .await;
+                let _ = done.send(outcome);
+            }
             Command::Shutdown { .. } | Command::Upgrade { .. } => {}
         }
     }
@@ -2096,10 +3165,15 @@ impl Daemon {
         app: &str,
         spec: ReleaseSpec,
         id: Option<String>,
-        retain: Duration,
+        retain: Retention,
         hold: bool,
         created: oneshot::Sender<Result<Release, String>>,
     ) -> Result<Release, String> {
+        if let Err(error) = self.make_room(app, &spec).await {
+            let _ = created.send(Err(error.clone()));
+            return Err(error);
+        }
+
         let record = self.create(app, spec, id);
 
         let release = match record {
@@ -2129,11 +3203,11 @@ impl Daemon {
                 running.held = true;
             }
 
-            self.set_state(&release, ReleaseState::Ready, "held: not serving");
-
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for a held release failed");
             }
+
+            self.mark_ready(app, &release.id, "held: not serving");
 
             return self
                 .store
@@ -2197,7 +3271,9 @@ impl Daemon {
     }
 
     /// Start a release's host and wait until every worker listens
-    /// (pending or stopped to starting, warming, ready; or failed).
+    /// (pending or stopped to starting and warming; or failed). The
+    /// caller marks the release ready once the edge has it, with
+    /// `mark_ready`, so a client told it is ready can reach it.
     async fn start(&mut self, app: &str, id: &str) -> Result<(), String> {
         let release = self
             .store
@@ -2206,10 +3282,10 @@ impl Daemon {
         let subject = format!("{app}@{id}");
 
         if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
-            // Retained and warm: back to ready without a restart.
+            // Retained and warm: no restart, and ready again once the
+            // caller has given it to the edge.
 
             running.retained_until = None;
-            self.set_state(&release, ReleaseState::Ready, "");
             return Ok(());
         }
 
@@ -2279,6 +3355,7 @@ impl Daemon {
             release: Some(id.to_owned()),
             interface: spec.interface,
             factory: spec.factory,
+            reflection: spec.reflection,
             processes: spec.processes as usize,
             threads: spec.threads as usize,
             sync_threads: spec.sync_threads as usize,
@@ -2296,6 +3373,7 @@ impl Daemon {
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
+            loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             memory: spec.memory.clone(),
             env,
             identity,
@@ -2318,6 +3396,7 @@ impl Daemon {
                     path: mount.path.clone(),
                     entrypoint: mount.entrypoint.clone(),
                     interface: mount.interface,
+                    threads: mount.threads,
                 })
                 .collect(),
         };
@@ -2348,15 +3427,17 @@ impl Daemon {
         let groups: Vec<GroupRecord> = host
             .group_sockets
             .iter()
-            .map(|(name, sockets)| GroupRecord {
-                name: name.clone(),
-                paths: spec
-                    .groups
-                    .iter()
-                    .find(|group| &group.name == name)
-                    .map(|group| group.paths.clone())
-                    .unwrap_or_default(),
-                sockets: sockets.clone(),
+            .map(|(name, sockets)| {
+                let group = spec.groups.iter().find(|group| &group.name == name);
+
+                GroupRecord {
+                    name: name.clone(),
+                    paths: group.map(|group| group.paths.clone()).unwrap_or_default(),
+                    client_classes: group
+                        .map(|group| group.client_class.clone())
+                        .unwrap_or_default(),
+                    sockets: sockets.clone(),
+                }
             })
             .collect();
         write_record(
@@ -2386,12 +3467,19 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                signals_from: None,
                 scalers,
+                host_pss: None,
+                idle_since: None,
                 ready_at,
             },
         );
         self.attach_control(app, id);
-        self.set_state(&release, ReleaseState::Ready, "");
+        self.set_state(
+            &release,
+            ReleaseState::Warming,
+            "workers ready, waiting for the edge",
+        );
         self.events.emit(
             "release.ready",
             &subject,
@@ -2572,11 +3660,18 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                signals_from: None,
                 scalers: Vec::new(),
+                host_pss: None,
+                idle_since: None,
                 ready_at: HashMap::new(),
             },
         );
-        self.set_state(release, ReleaseState::Ready, "");
+        self.set_state(
+            release,
+            ReleaseState::Warming,
+            "instances ready, waiting for the edge",
+        );
         self.events.emit(
             "release.ready",
             &subject,
@@ -2607,7 +3702,10 @@ impl Daemon {
             running.held = false;
         }
 
-        match self.push_snapshot().await {
+        let pushed = self.push_snapshot().await;
+        self.mark_ready(app, id, "");
+
+        match pushed {
             Ok(()) => {
                 self.events.emit(
                     "traffic.switched",
@@ -2634,7 +3732,11 @@ impl Daemon {
     /// workers are those of the application traffic was last switched to.
     fn build_snapshot(&mut self) -> pb::Snapshot {
         let mut apps = Vec::new();
-        let routes = self.store.routes().unwrap_or_default();
+
+        // Section 9.10: the routes and the applications in maintenance
+        // mode with the active overlays laid over them.
+
+        let (routes, maintained) = self.effective();
         let rollouts: Vec<Rollout> = self
             .store
             .rollouts(None)
@@ -2683,12 +3785,19 @@ impl Daemon {
                         .iter()
                         .map(|socket| socket.display().to_string())
                         .collect(),
+                    waking_groups: running.waking_groups(),
+                    grpc_web_origins: self
+                        .store
+                        .release(name, id)
+                        .map(|release| release.spec.grpc_web_origins)
+                        .unwrap_or_default(),
                     groups: running
                         .groups
                         .iter()
                         .map(|group| pb::Group {
                             name: group.name.clone(),
                             paths: group.paths.clone(),
+                            client_classes: group.client_classes.clone(),
                             sockets: group
                                 .sockets
                                 .iter()
@@ -2756,7 +3865,7 @@ impl Daemon {
                         .and_then(|release| release.spec.error_override)
                         .map(|table| error_override_message(&table)),
                     maintenance: Some(maintenance_message(
-                        self.maintenance.contains_key(name),
+                        maintained.contains(name),
                         self.store
                             .release(name, id)
                             .ok()
@@ -2828,6 +3937,7 @@ impl Daemon {
                 default: host.default,
                 error_pages: error_pages_message(&host.error_pages, None),
                 error_override: host.error_override.as_ref().map(error_override_message),
+                rate_limits: host.rate_limits,
             });
         }
 
@@ -2848,7 +3958,14 @@ impl Daemon {
         let routes = routes
             .into_iter()
             .map(|route| pb::Route {
+                upload: upload_message(&route),
+                max_body_size: route
+                    .max_body_size
+                    .as_deref()
+                    .and_then(|size| muru_config::parse_size(size).ok())
+                    .unwrap_or(0),
                 traffic: self.route_traffic(&route, &included, &rollouts),
+                client_classes: route.classes().to_vec(),
                 host: route.host,
                 path: route.path,
                 app: route.app,
@@ -2893,8 +4010,27 @@ impl Daemon {
                 error_pages: error_pages_message(&route.error_pages, None),
                 error_override: route.error_override.as_ref().map(error_override_message),
                 auth: route.auth.as_ref().map(auth_message),
+                rate_limits: route.rate_limits,
+                methods: route.methods.as_ref().map(|methods| pb::Methods {
+                    deny: methods.deny.clone(),
+                    not_allowed: methods.answer.as_deref() == Some("method_not_allowed"),
+                }),
+                mode: route.mode.unwrap_or_default(),
             })
             .collect();
+
+        // Section 9.3: with no host declared, the default application's
+        // rollout chooses among its releases as a route's would.
+
+        let default_traffic = if hosts.is_empty() && !default_app.is_empty() {
+            let route = muru_config::Route {
+                app: default_app.clone(),
+                ..muru_config::Route::default()
+            };
+            self.route_traffic(&route, &included, &rollouts)
+        } else {
+            None
+        };
 
         pb::Snapshot {
             version: 0,
@@ -2909,6 +4045,10 @@ impl Daemon {
             upstreams,
             default_app,
             default_release,
+            client_classes: self.clients.classes_message.clone(),
+            rate_limits: self.clients.limits_message.clone(),
+            default_traffic,
+            h2c: self.h2c.clone(),
         }
     }
 
@@ -2924,7 +4064,7 @@ impl Daemon {
     /// Section 9.5: with traffic already elsewhere, wait for the release's
     /// requests in flight to finish, then keep it warm for `retain` (section
     /// 9.1) or stop its host.
-    async fn drain(&mut self, app: &str, id: &str, retain: Duration) {
+    async fn drain(&mut self, app: &str, id: &str, retain: Retention) {
         let subject = format!("{app}@{id}");
         let Ok(release) = self.store.release(app, id) else {
             return;
@@ -2967,7 +4107,7 @@ impl Daemon {
 
     /// Drain a release that is out of the snapshot: wait for its requests
     /// in flight, then keep it warm for `retain` or stop it.
-    async fn drain_now(&mut self, app: &str, id: &str, retain: Duration) {
+    async fn drain_now(&mut self, app: &str, id: &str, retain: Retention) {
         let subject = format!("{app}@{id}");
         let Ok(release) = self.store.release(app, id) else {
             return;
@@ -2988,7 +4128,7 @@ impl Daemon {
 
         // One retained release per application: an older one makes way.
 
-        if !retain.is_zero() {
+        if !retain.lasts.is_zero() {
             let older: Vec<String> = self
                 .running
                 .iter()
@@ -3002,11 +4142,34 @@ impl Daemon {
                 self.stop_release(app, &other, "superseded again").await;
             }
 
+            // Section 9.1: once drained, each group keeps its warm floor;
+            // workers fork from the preloaded host when it serves again.
+
+            let mut floors = Vec::new();
+
             if let Some(running) = self.running.get_mut(&(app.to_owned(), id.to_owned())) {
-                running.retained_until = Some(Instant::now() + retain);
+                running.retained_until = Some(Instant::now() + retain.lasts);
+
+                for group in &mut running.scalers {
+                    let held = running
+                        .groups
+                        .iter()
+                        .find(|record| record.name == group.name)
+                        .map_or(running.sockets.len(), |record| record.sockets.len())
+                        as u32;
+
+                    if held > retain.workers && running.backend.host().is_some() {
+                        group.requested = Some(retain.workers);
+                        floors.push(group.name.clone());
+                    }
+                }
             }
 
-            let until = crate::model::now_unix_ms() + retain.as_millis() as u64;
+            for group in floors {
+                self.ask_scale(app, id, &group, retain.workers);
+            }
+
+            let until = crate::model::now_unix_ms() + retain.lasts.as_millis() as u64;
             self.set_state(
                 &release,
                 ReleaseState::Retained,
@@ -3016,7 +4179,12 @@ impl Daemon {
                 "release.retained",
                 &subject,
                 "info",
-                &format!("kept warm for {}", muru_config::format_duration(retain)),
+                &format!(
+                    "kept warm for {} with {} worker{} per group",
+                    muru_config::format_duration(retain.lasts),
+                    retain.workers,
+                    if retain.workers == 1 { "" } else { "s" }
+                ),
             );
             return;
         }
@@ -3099,6 +4267,10 @@ impl Daemon {
             return Err("a rollout needs at least one step".to_owned());
         }
 
+        for url in &gates.probes {
+            crate::rollouts::check_probe(url)?;
+        }
+
         for (index, step) in steps.iter().enumerate() {
             if step.percent == 0 || step.percent > 100 {
                 return Err(format!(
@@ -3112,6 +4284,7 @@ impl Daemon {
             }
         }
 
+        self.make_room_for(app, candidate).await?;
         self.start(app, candidate).await?;
 
         if let Some(running) = self
@@ -3153,9 +4326,82 @@ impl Daemon {
                 describe_steps(&rollout.steps)
             ),
         );
-        self.push_snapshot().await?;
+        let pushed = self.push_snapshot().await;
+        self.mark_ready(app, candidate, "");
+        pushed?;
         self.begin_rollout_run(&rollout).await;
         Ok(rollout)
+    }
+
+    /// Section 9.3: a release's counters for the gates, the edge's with
+    /// its workers' crashes and timeout kills and its failed probes.
+    fn counters(
+        &self,
+        samples: &[muru_edge::metrics::Sample],
+        app: &str,
+        release: &str,
+    ) -> Counters {
+        let key = (app.to_owned(), release.to_owned());
+        let mut counters = Counters::from_samples(samples, app, release);
+        counters.faults = self.worker_faults.get(&key).copied().unwrap_or(0) as f64;
+
+        if let Some((failures, error)) = self
+            .probe_failures
+            .lock()
+            .expect("probe failures poisoned")
+            .get(&key)
+        {
+            counters.probe_failures = *failures as f64;
+            counters.probe_error = Some(error.clone());
+        }
+
+        counters
+    }
+
+    /// Section 9.3: send a running rollout's probes to the candidate and
+    /// the baseline, each through the edge by preview, when the interval
+    /// has passed; a task sends them and records the round's failures
+    /// together, so a fault both releases share is never judged half
+    /// seen.
+    fn send_probes(&mut self, rollout: &Rollout) {
+        if rollout.gates.probes.is_empty()
+            || self
+                .probed
+                .get(&rollout.app)
+                .is_some_and(|sent| sent.elapsed() < crate::rollouts::PROBE_INTERVAL)
+        {
+            return;
+        }
+
+        self.probed.insert(rollout.app.clone(), Instant::now());
+        let client = self.probe_client.clone();
+        let failures = self.probe_failures.clone();
+        let urls = rollout.gates.probes.clone();
+        let app = rollout.app.clone();
+        let releases = [rollout.candidate.clone(), rollout.baseline.clone()];
+
+        tokio::spawn(async move {
+            let mut failed = Vec::new();
+
+            for release in releases {
+                for url in &urls {
+                    if let Err(error) = crate::rollouts::probe(&client, url, &release).await {
+                        tracing::debug!(%app, %release, %error, "a rollout probe failed");
+                        failed.push((release.clone(), error));
+                    }
+                }
+            }
+
+            let mut failures = failures.lock().expect("probe failures poisoned");
+
+            for (release, error) in failed {
+                let entry = failures
+                    .entry((app.clone(), release))
+                    .or_insert((0, String::new()));
+                entry.0 += 1;
+                entry.1 = error;
+            }
+        });
     }
 
     /// Section 9.3: mark where a rollout's current step starts from, once
@@ -3170,12 +4416,8 @@ impl Daemon {
                     RolloutRun {
                         rollout: rollout.id.clone(),
                         step: rollout.step,
-                        candidate: Counters::from_samples(
-                            &samples,
-                            &rollout.app,
-                            &rollout.candidate,
-                        ),
-                        baseline: Counters::from_samples(&samples, &rollout.app, &rollout.baseline),
+                        candidate: self.counters(&samples, &rollout.app, &rollout.candidate),
+                        baseline: self.counters(&samples, &rollout.app, &rollout.baseline),
                     },
                 );
             }
@@ -3286,6 +4528,7 @@ impl Daemon {
     ) -> Result<(), String> {
         let subject = format!("{}@{}", rollout.app, rollout.candidate);
         self.rollout_runs.remove(&rollout.app);
+        self.probed.remove(&rollout.app);
 
         let record = |rollout: &mut Rollout, store: &Store| -> Result<(), String> {
             rollout.state = state;
@@ -3326,7 +4569,7 @@ impl Daemon {
                 if !self.referenced_releases().contains(&candidate)
                     && self.serving.get(&rollout.app) != Some(&rollout.candidate)
                 {
-                    self.drain(&rollout.app, &rollout.candidate, RETENTION)
+                    self.drain(&rollout.app, &rollout.candidate, Retention::default())
                         .await;
                 }
             }
@@ -3346,6 +4589,7 @@ impl Daemon {
             return Err(format!("{app}@{id} already serves"));
         }
 
+        self.make_room_for(app, id).await?;
         self.start(app, id).await?;
         self.switch_to(app, id).await;
         self.store
@@ -3357,7 +4601,7 @@ impl Daemon {
                 .referenced_releases()
                 .contains(&(app.to_owned(), previous.clone()))
         {
-            self.drain(app, &previous, RETENTION).await;
+            self.drain(app, &previous, Retention::default()).await;
         }
 
         self.store
@@ -3383,8 +4627,27 @@ impl Daemon {
             .filter(|rollout| rollout.state == RolloutState::Running)
             .collect();
 
+        // Section 9.10: an overlay that pins or splits a route's traffic
+        // holds its application's rollout until it ends, as a deploy
+        // freeze does (section 9.6).
+
+        let pinned = {
+            let overlays = self.store.overlays().unwrap_or_default();
+            let states = self.store.overlay_states().unwrap_or_default();
+            let active = crate::overlays::ordered(&overlays, &states);
+            let mut pinned =
+                crate::overlays::pinned_apps(&self.store.routes().unwrap_or_default(), &active);
+            pinned.extend(crate::overlays::freezes(&active).into_keys());
+            pinned
+        };
+
         for mut rollout in running {
             let app = rollout.app.clone();
+
+            if pinned.contains(&app) {
+                continue;
+            }
+
             let subject = format!("{app}@{}", rollout.candidate);
             let now = now_unix_ms();
 
@@ -3394,8 +4657,8 @@ impl Daemon {
                     let run = RolloutRun {
                         rollout: rollout.id.clone(),
                         step: rollout.step,
-                        candidate: Counters::from_samples(samples, &app, &rollout.candidate),
-                        baseline: Counters::from_samples(samples, &app, &rollout.baseline),
+                        candidate: self.counters(samples, &app, &rollout.candidate),
+                        baseline: self.counters(samples, &app, &rollout.baseline),
                     };
                     rollout.step_started_unix_ms = now;
                     let _ = self.store.put_rollout(&rollout);
@@ -3404,10 +4667,13 @@ impl Daemon {
                 }
             };
 
-            let candidate =
-                Counters::from_samples(samples, &app, &rollout.candidate).since(&run.candidate);
-            let baseline =
-                Counters::from_samples(samples, &app, &rollout.baseline).since(&run.baseline);
+            self.send_probes(&rollout);
+            let candidate = self
+                .counters(samples, &app, &rollout.candidate)
+                .since(&run.candidate);
+            let baseline = self
+                .counters(samples, &app, &rollout.baseline)
+                .since(&run.baseline);
             let verdict = judge(&candidate, &baseline, &rollout.gates);
             let percent = rollout.percent();
 
@@ -3508,7 +4774,7 @@ impl Daemon {
     /// snapshot and drain.
     async fn expire_sticky(&mut self) {
         let now = Instant::now();
-        let expired: Vec<(String, String, Duration)> = self
+        let expired: Vec<(String, String, Retention)> = self
             .running
             .iter()
             .filter_map(|((app, id), running)| {
@@ -3534,7 +4800,16 @@ impl Daemon {
     /// release that only a policy kept in traffic drains once no policy
     /// names it. Called after the configuration changes and at start.
     async fn reconcile_traffic(&mut self) {
-        let referenced = self.referenced_releases();
+        let mut referenced = self.referenced_releases();
+        let warming: BTreeSet<(String, String)> = self
+            .warm_ups
+            .values()
+            .flatten()
+            .filter(|release| !referenced.contains(*release))
+            .cloned()
+            .collect();
+        referenced.extend(warming.iter().cloned());
+        let mut started = Vec::new();
 
         for (app, id) in &referenced {
             let key = (app.clone(), id.clone());
@@ -3552,13 +4827,36 @@ impl Daemon {
                 running.sticky_until = None;
             }
 
-            if let Err(error) = self.start(app, id).await {
-                self.events.emit(
-                    "traffic_policy.release_unavailable",
-                    &format!("{app}@{id}"),
-                    "warning",
-                    &format!("a traffic policy names the release but it cannot start: {error}"),
-                );
+            let started_now = match self.make_room_for(app, id).await {
+                Ok(()) => self.start(app, id).await,
+                Err(error) => Err(error),
+            };
+
+            match started_now {
+                Ok(()) => started.push(key),
+                Err(error) => {
+                    let why = if warming.contains(&key) {
+                        "an overlay's warm-up names the release"
+                    } else {
+                        "a traffic policy names the release"
+                    };
+                    self.events.emit(
+                        "traffic_policy.release_unavailable",
+                        &format!("{app}@{id}"),
+                        "warning",
+                        &format!("{why} but it cannot start: {error}"),
+                    );
+                }
+            }
+        }
+
+        if !started.is_empty() {
+            if let Err(error) = self.push_snapshot().await {
+                tracing::error!(%error, "pushing the snapshot for a policy's releases failed");
+            }
+
+            for (app, id) in &started {
+                self.mark_ready(app, id, "");
             }
         }
 
@@ -3576,14 +4874,15 @@ impl Daemon {
             .collect();
 
         for (app, id) in unreferenced {
-            self.drain(&app, &id, RETENTION).await;
+            self.drain(&app, &id, Retention::default()).await;
         }
     }
 
     /// Section 7.4: feed every running release's scalers what the edge
     /// reports and carry out their decisions, each one an event with its
-    /// reasons. A group whose count is not what its scaler wants, after a
-    /// restart or a restored pin, is asked for again.
+    /// reasons, scale-outs once the node's budget admits them. A group
+    /// whose count is not what its scaler wants, after a restart or a
+    /// restored pin, is asked for again.
     async fn autoscale(&mut self, samples: Option<&[muru_edge::metrics::Sample]>) {
         let Some(samples) = samples else {
             return;
@@ -3591,6 +4890,22 @@ impl Daemon {
         let now = Instant::now();
         let mut requests: Vec<(String, String, String, u32)> = Vec::new();
         let mut emitted: Vec<(&'static str, String, &'static str, String)> = Vec::new();
+        let mut capacities = self.capacities();
+
+        // Scale-outs are admitted against what the releases hold before
+        // any of them, the highest application priority first.
+
+        let fallback = self.node_mean_pss();
+        let used = self.budget_usage();
+        let priorities: HashMap<String, i32> = self
+            .store
+            .apps()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|app| (app.name, app.priority))
+            .collect();
+        let mut asks = Vec::new();
+        let mut reasons: HashMap<(String, String, String), (u32, String)> = HashMap::new();
 
         for ((app, id), running) in &mut self.running {
             // A retained release is at its warm floor (section 9.1), not
@@ -3602,18 +4917,11 @@ impl Daemon {
 
             let subject = format!("{app}@{id}");
 
-            for group in &mut running.scalers {
-                let sockets = if group.name == muru_edge::routing::DEFAULT_GROUP {
-                    &running.sockets
-                } else {
-                    match running
-                        .groups
-                        .iter()
-                        .find(|record| record.name == group.name)
-                    {
-                        Some(record) => &record.sockets,
-                        None => continue,
-                    }
+            for index in 0..running.scalers.len() {
+                let cost = running.worker_cost(&running.scalers[index], fallback);
+                let name = running.scalers[index].name.clone();
+                let Some(sockets) = running.group_sockets(&name) else {
+                    continue;
                 };
                 let ready = sockets.len() as u32;
                 let youngest = sockets
@@ -3621,12 +4929,19 @@ impl Daemon {
                     .filter_map(|socket| running.ready_at.get(socket))
                     .max()
                     .map(|at| now.saturating_duration_since(*at));
+                let group = &mut running.scalers[index];
                 let advisory = group.scaler.spec().advisory;
+                group.scaler.set_capacity(capacities.remove(&(
+                    app.clone(),
+                    id.clone(),
+                    group.name.clone(),
+                )));
 
                 if advisory {
                     group.scaler.sync(ready);
                 }
 
+                let before = group.scaler.desired();
                 let signals = Signals::from_samples(
                     samples,
                     app,
@@ -3638,20 +4953,34 @@ impl Daemon {
                 );
 
                 match group.scaler.observe(now, signals) {
-                    Some(Decision::ScaleOut { to, reason }) => {
-                        emitted.push((
-                            "scaling.decision",
-                            subject.clone(),
-                            "info",
-                            decision_message(&group.name, ready, to, &reason, advisory),
-                        ));
+                    Some(Decision::ScaleOut { to, reason }) if !advisory => {
+                        let reason = format!(
+                            "{reason}; {}",
+                            describe_diagnosis(&group.scaler.diagnosis())
+                        );
+                        let key = (app.clone(), id.clone(), name);
+                        reasons.insert(key.clone(), (ready, reason));
+                        asks.push(crate::budget::Ask {
+                            key,
+                            priority: priorities.get(app).copied().unwrap_or(0),
+                            from: before,
+                            to,
+                            cost,
+                        });
                     }
-                    Some(Decision::ScaleIn { to, reason }) => {
+                    Some(Decision::ScaleOut { to, reason } | Decision::ScaleIn { to, reason }) => {
+                        let diagnosis = group.scaler.diagnosis();
                         emitted.push((
                             "scaling.decision",
                             subject.clone(),
                             "info",
-                            decision_message(&group.name, ready, to, &reason, advisory),
+                            decision_message(
+                                &group.name,
+                                ready,
+                                to,
+                                &format!("{reason}; {}", describe_diagnosis(&diagnosis)),
+                                advisory,
+                            ),
                         ));
                     }
                     Some(Decision::Suspended { reason }) => {
@@ -3664,10 +4993,80 @@ impl Daemon {
                     }
                     None => {}
                 }
+            }
+        }
 
+        for admitted in crate::budget::admit(&self.budget, used, asks) {
+            let (app, id, name) = &admitted.ask.key;
+            let Some(group) = self
+                .running
+                .get_mut(&(app.clone(), id.clone()))
+                .and_then(|running| running.scalers.iter_mut().find(|group| &group.name == name))
+            else {
+                continue;
+            };
+
+            let subject = format!("{app}@{id}");
+            let (ready, reason) = reasons.remove(&admitted.ask.key).unwrap_or_default();
+            let from = admitted.ask.from;
+
+            match admitted.limit {
+                Some(limit) => {
+                    let held = format!(
+                        "the node's {limit} budget ({})",
+                        self.budget.describe(&used)
+                    );
+                    group.scaler.limit(from, admitted.to, now, &held);
+                    let denial = (admitted.ask.to, admitted.to, limit);
+
+                    if group.denied != Some(denial) {
+                        group.denied = Some(denial);
+                        emitted.push((
+                            "scaling.denied_by_budget",
+                            subject.clone(),
+                            "warning",
+                            format!(
+                                "{name}: {} of the {} more workers asked for fit {held}, at priority {}",
+                                admitted.to - from,
+                                admitted.ask.to - from,
+                                admitted.ask.priority
+                            ),
+                        ));
+                    }
+                }
+                None => group.denied = None,
+            }
+
+            if admitted.to > from {
+                emitted.push((
+                    "scaling.decision",
+                    subject,
+                    "info",
+                    decision_message(name, ready, admitted.to, &reason, false),
+                ));
+            }
+        }
+
+        for ((app, id), running) in &mut self.running {
+            if running.retained_until.is_some() || running.control.is_none() {
+                continue;
+            }
+
+            for index in 0..running.scalers.len() {
+                let Some(ready) = running
+                    .group_sockets(&running.scalers[index].name)
+                    .map(|sockets| sockets.len() as u32)
+                else {
+                    continue;
+                };
+
+                let group = &mut running.scalers[index];
                 let desired = group.scaler.desired();
 
-                if !advisory && desired != ready && group.requested != Some(desired) {
+                if !group.scaler.spec().advisory
+                    && desired != ready
+                    && group.requested != Some(desired)
+                {
                     group.requested = Some(desired);
                     requests.push((app.clone(), id.clone(), group.name.clone(), desired));
                 }
@@ -3680,6 +5079,585 @@ impl Daemon {
 
         for (app, id, group, processes) in requests {
             self.ask_scale(&app, &id, &group, processes);
+        }
+
+        // Section 9.1: over the memory budget, retained releases make way,
+        // the oldest first, one a tick: down to the host alone, then
+        // stopped.
+
+        if self
+            .budget
+            .memory
+            .is_some_and(|memory| used.memory > memory)
+        {
+            self.relieve_memory().await;
+        }
+
+        for (app, id, idle) in self.idle_hosts(now) {
+            self.sleep_release(&app, &id, idle).await;
+        }
+
+        let view = self.budget_view(used);
+        self.check_floors_ahead(&view);
+        self.info
+            .defined
+            .write()
+            .expect("defined names poisoned")
+            .budget = view;
+    }
+
+    /// Section 7.5: each window of a schedule or overlay that raises a
+    /// floor is checked against the node's budget once ahead of it, from
+    /// the start of its warm-up's lead or `BUDGET_LEAD` before it,
+    /// whichever is longer, with an event when it does not fit.
+    fn check_floors_ahead(&mut self, view: &crate::budget::View) {
+        if !self.budget.is_set() {
+            return;
+        }
+
+        let now = now_unix_ms();
+        let overlays = self.store.overlays().unwrap_or_default();
+
+        for entry in &overlays {
+            let (name, overlay) = entry;
+            let Some((start, _)) = crate::overlays::window(overlay, now) else {
+                continue;
+            };
+            let lead = overlay
+                .warm_up
+                .as_ref()
+                .and_then(|warm_up| muru_config::parse_duration(&warm_up.lead).ok())
+                .unwrap_or_default()
+                .max(BUDGET_LEAD);
+
+            if now >= start
+                || start > now + lead.as_millis() as u64
+                || !self.budget_checked.insert((name.clone(), start))
+            {
+                continue;
+            }
+
+            for ((app, group), capacity) in crate::overlays::capacities(std::iter::once(entry)) {
+                if capacity.floor == 0 {
+                    continue;
+                }
+
+                if let Err(why) = view.floor_fits(&app, &group, capacity.floor, None) {
+                    self.events.emit(
+                        "schedule.over_budget",
+                        &format!("overlay {name}"),
+                        "warning",
+                        &format!(
+                            "the window from {}: a floor of {} workers for {app} ({group} group) does not fit the node's budget as it stands: {why}",
+                            clock(start),
+                            capacity.floor
+                        ),
+                    );
+                }
+            }
+        }
+
+        self.budget_checked.retain(|(_, start)| *start > now);
+    }
+
+    /// Section 9.1: the node is over its memory budget. The retained
+    /// release created first that still has workers drops to its host
+    /// alone; when none has, the one created first stops.
+    async fn relieve_memory(&mut self) {
+        let mut retained: Vec<(u64, String, String)> = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.retained_until.is_some())
+            .map(|((app, id), _)| {
+                let created = self
+                    .store
+                    .release(app, id)
+                    .map_or(0, |release| release.created_unix_ms);
+                (created, app.clone(), id.clone())
+            })
+            .collect();
+        retained.sort();
+
+        for (_, app, id) in &retained {
+            let key = (app.clone(), id.clone());
+            let Some(running) = self.running.get_mut(&key) else {
+                continue;
+            };
+
+            if running.workers() == 0 || running.backend.host().is_none() {
+                continue;
+            }
+
+            let groups: Vec<String> = running
+                .scalers
+                .iter_mut()
+                .map(|group| {
+                    group.requested = Some(0);
+                    group.name.clone()
+                })
+                .collect();
+
+            for group in &groups {
+                self.ask_scale(app, id, group, 0);
+            }
+
+            self.events.emit(
+                "release.retained",
+                &format!("{app}@{id}"),
+                "warning",
+                "down to its host alone: the node is over its memory budget",
+            );
+            return;
+        }
+
+        if let Some((_, app, id)) = retained.first() {
+            self.stop_release(app, id, "the node is over its memory budget")
+                .await;
+        }
+    }
+
+    /// Section 7.4: the releases whose groups have all been at zero for
+    /// their host_idle_timeout, with how long that is; the time each
+    /// began is kept as it goes.
+    fn idle_hosts(&mut self, now: Instant) -> Vec<(String, String, Duration)> {
+        let mut idle = Vec::new();
+
+        for ((app, id), running) in &mut self.running {
+            let timeout = running
+                .scalers
+                .first()
+                .and_then(|group| group.scaler.spec().host_idle_timeout_ms)
+                .map(Duration::from_millis);
+
+            let at_zero = running.backend.host().is_some()
+                && running.control.is_some()
+                && running.retained_until.is_none()
+                && running.workers() == 0
+                && running
+                    .scalers
+                    .iter()
+                    .all(|group| group.scaler.desired() == 0);
+
+            let Some(timeout) = timeout.filter(|_| at_zero) else {
+                running.idle_since = None;
+                continue;
+            };
+
+            let since = *running.idle_since.get_or_insert(now);
+
+            if now.saturating_duration_since(since) >= timeout {
+                idle.push((app.clone(), id.clone(), timeout));
+            }
+        }
+
+        idle
+    }
+
+    /// Section 7.4: stop the host of a release whose groups have been at
+    /// zero for its host_idle_timeout. The release keeps its place in
+    /// the snapshot, so the next request waits at the edge and wakes it.
+    async fn sleep_release(&mut self, app: &str, id: &str, idle: Duration) {
+        let key = (app.to_owned(), id.to_owned());
+        let Some(mut running) = self.running.remove(&key) else {
+            return;
+        };
+
+        let backend = std::mem::replace(&mut running.backend, Backend::Dormant);
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let record = backend.record_path(&run_dir);
+        let grace = self
+            .store
+            .release(app, id)
+            .map_or(Duration::from_secs(5), |release| {
+                Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+            });
+
+        if tokio::time::timeout(DRAIN_TIMEOUT, backend.stop(grace))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                app,
+                id,
+                "the idle host did not stop within the drain timeout"
+            );
+        }
+
+        let _ = std::fs::remove_file(record);
+        running.control = None;
+        running.status.clear();
+        running.signals_from = None;
+        running.host_pss = None;
+        running.idle_since = None;
+        self.running.insert(key, running);
+
+        if let Ok(release) = self.store.release(app, id) {
+            self.set_state(
+                &release,
+                ReleaseState::Ready,
+                "idle: its host has stopped, and the next request starts it",
+            );
+        }
+
+        self.events.emit(
+            "release.idle",
+            &format!("{app}@{id}"),
+            "info",
+            &format!(
+                "every worker group has been at zero for {}: its host stopped, and the next request starts it again",
+                muru_config::format_duration(idle)
+            ),
+        );
+    }
+
+    /// Section 7.4: a request is waiting at the edge for a group with no
+    /// workers. A release whose host stopped while idle is started
+    /// again; a group scaled to zero gets a worker, once the node's
+    /// budget admits it.
+    async fn wake(&mut self, wake: muru_proto::edge::v1::Wake) {
+        let key = (wake.app.clone(), wake.release.clone());
+        let subject = format!("{}@{}", wake.app, wake.release);
+        let now = Instant::now();
+        let fallback = self.node_mean_pss();
+
+        let Some(running) = self.running.get_mut(&key) else {
+            return;
+        };
+
+        if matches!(running.backend, Backend::Dormant) {
+            self.running.remove(&key);
+            self.events.emit(
+                "release.woken",
+                &subject,
+                "info",
+                "a request is waiting: starting its host again",
+            );
+
+            match self.start(&wake.app, &wake.release).await {
+                Ok(()) => {
+                    if let Err(error) = self.push_snapshot().await {
+                        tracing::error!(%error, "pushing the snapshot for a woken release failed");
+                    }
+
+                    self.mark_ready(&wake.app, &wake.release, "woken by a request");
+                }
+                Err(error) => {
+                    self.events
+                        .emit("release.failed", &subject, "error", &error);
+                }
+            }
+
+            return;
+        }
+
+        if running.retained_until.is_some() || running.control.is_none() {
+            return;
+        }
+
+        let Some(index) = running
+            .scalers
+            .iter()
+            .position(|group| group.name == wake.group)
+        else {
+            return;
+        };
+
+        let cost = running.worker_cost(&running.scalers[index], fallback);
+        let group = &mut running.scalers[index];
+
+        let Some(Decision::ScaleOut { to, reason }) = group.scaler.wake(now) else {
+            return;
+        };
+
+        let priority = self
+            .store
+            .app(&wake.app)
+            .map_or(0, |record| record.priority);
+        let used = self.budget_usage();
+        let ask = crate::budget::Ask {
+            key: (),
+            priority,
+            from: 0,
+            to,
+            cost,
+        };
+        let admitted = crate::budget::admit(&self.budget, used, vec![ask]).remove(0);
+        let Some(group) = self
+            .running
+            .get_mut(&key)
+            .and_then(|running| running.scalers.get_mut(index))
+        else {
+            return;
+        };
+
+        if let Some(limit) = admitted.limit {
+            let held = format!(
+                "the node's {limit} budget ({})",
+                self.budget.describe(&used)
+            );
+            group.scaler.limit(0, admitted.to, now, &held);
+            self.events.emit(
+                "scaling.denied_by_budget",
+                &subject,
+                "warning",
+                &format!(
+                    "{}: a request is waiting for a group scaled to zero, and no worker fits {held}",
+                    wake.group
+                ),
+            );
+            return;
+        }
+
+        group.requested = Some(to);
+        self.events.emit(
+            "scaling.decision",
+            &subject,
+            "info",
+            &decision_message(&wake.group, 0, to, &reason, false),
+        );
+        self.ask_scale(&wake.app, &wake.release, &wake.group, to);
+    }
+
+    /// Section 7.4: the mean proportional set size of every worker that
+    /// reported one, standing in for a group's that is not known.
+    fn node_mean_pss(&self) -> Option<u64> {
+        let sizes: Vec<u64> = self
+            .running
+            .values()
+            .flat_map(|running| running.status.iter().filter_map(|worker| worker.pss))
+            .collect();
+        (!sizes.is_empty()).then(|| sizes.iter().sum::<u64>() / sizes.len() as u64)
+    }
+
+    /// Section 7.4: what the running releases hold against the node's
+    /// budget.
+    fn budget_usage(&self) -> crate::budget::Usage {
+        let fallback = self.node_mean_pss();
+        let mut used = crate::budget::Usage::default();
+
+        for running in self.running.values() {
+            used.add_usage(&running.usage(fallback));
+        }
+
+        used
+    }
+
+    /// Section 7.4: the node's budget and what its releases hold, for the
+    /// checks before a release starts and on schedules.
+    fn budget_view(&self, used: crate::budget::Usage) -> crate::budget::View {
+        let fallback = self.node_mean_pss();
+        let mut view = crate::budget::View {
+            budget: self.budget,
+            used,
+            fallback,
+            ..crate::budget::View::default()
+        };
+
+        for ((app, id), running) in &self.running {
+            if running.retained_until.is_some() {
+                view.retained += running.usage(fallback).memory;
+                continue;
+            }
+
+            if self.serving.get(app) != Some(id) {
+                continue;
+            }
+
+            if let Some(pss) = running.host_pss {
+                view.hosts.insert(app.clone(), pss);
+            }
+
+            for group in &running.scalers {
+                let held = running
+                    .group_sockets(&group.name)
+                    .map_or(0, <[PathBuf]>::len) as u32;
+                view.groups.insert(
+                    (app.clone(), group.name.clone()),
+                    (
+                        held.max(group.scaler.desired()),
+                        running.worker_cost(group, None),
+                    ),
+                );
+            }
+        }
+
+        view
+    }
+
+    /// Section 13.6: before a release starts, whether its memory fits the
+    /// node's budget, retained releases making way, the oldest first,
+    /// when that is enough; refused with a `scaling.denied_by_budget`
+    /// event when it is not.
+    async fn make_room(&mut self, app: &str, spec: &ReleaseSpec) -> Result<(), String> {
+        if self.budget.memory.is_none() {
+            return Ok(());
+        }
+
+        let view = self.budget_view(self.budget_usage());
+
+        if let Err(why) = view.release_fits(app, spec, view.retained) {
+            let message = if view.retained > 0 {
+                format!("{app}: {why}, even with the retained releases stopped")
+            } else {
+                format!("{app}: {why}")
+            };
+            self.events
+                .emit("scaling.denied_by_budget", app, "warning", &message);
+            return Err(format!("not started: {message}"));
+        }
+
+        while self
+            .budget_view(self.budget_usage())
+            .release_fits(app, spec, 0)
+            .is_err()
+        {
+            let Some((other_app, other_id)) = self.oldest_retained(None) else {
+                break;
+            };
+            self.stop_release(
+                &other_app,
+                &other_id,
+                &format!("making room in the node's memory budget for {app}"),
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// `make_room` for a recorded release that is not running.
+    async fn make_room_for(&mut self, app: &str, id: &str) -> Result<(), String> {
+        if self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return Ok(());
+        }
+
+        let release = self
+            .store
+            .release(app, id)
+            .map_err(|error| error.to_string())?;
+        self.make_room(app, &release.spec).await
+    }
+
+    /// Section 9.1: the retained release created first, other than one
+    /// of `except`'s application, which make way under memory pressure.
+    fn oldest_retained(&self, except: Option<&str>) -> Option<(String, String)> {
+        self.running
+            .iter()
+            .filter(|((app, _), running)| {
+                running.retained_until.is_some() && except != Some(app.as_str())
+            })
+            .map(|((app, id), _)| {
+                let created = self
+                    .store
+                    .release(app, id)
+                    .map_or(0, |release| release.created_unix_ms);
+                (created, app.clone(), id.clone())
+            })
+            .min()
+            .map(|(_, app, id)| (app, id))
+    }
+
+    /// Section 7.5: the capacity active overlays and schedules set, and
+    /// those warming up ahead of a window, for each running release's
+    /// groups. A release taking a share of its application's traffic, as
+    /// a canary does, takes that share of the floor.
+    fn capacities(&self) -> HashMap<(String, String, String), crate::scaling::Capacity> {
+        let overlays = self.store.overlays().unwrap_or_default();
+        let states = self.store.overlay_states().unwrap_or_default();
+        let mut applied = crate::overlays::ordered(&overlays, &states);
+        applied.extend(
+            overlays
+                .iter()
+                .filter(|(name, _)| self.warm_ups.contains_key(name)),
+        );
+        let by_app = crate::overlays::capacities(applied);
+        let mut found = HashMap::new();
+
+        if by_app.is_empty() {
+            return found;
+        }
+
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+
+        for (app, id) in self.running.keys() {
+            let share = self.traffic_share(app, id, &routes, &rollouts);
+
+            if share == 0 {
+                continue;
+            }
+
+            for ((capacity_app, group), capacity) in &by_app {
+                if capacity_app != app {
+                    continue;
+                }
+
+                let mut capacity = capacity.clone();
+                capacity.floor = (capacity.floor * share).div_ceil(100);
+                found.insert((app.clone(), id.clone(), group.clone()), capacity);
+            }
+        }
+
+        found
+    }
+
+    /// The percentage of its application's requests a release takes: its
+    /// rollout or policy share on the route that gives it the most, the
+    /// rest for the release that serves, and none for another.
+    fn traffic_share(
+        &self,
+        app: &str,
+        id: &str,
+        routes: &[muru_config::Route],
+        rollouts: &[Rollout],
+    ) -> u32 {
+        let serves = self.serving.get(app).is_some_and(|serving| serving == id);
+        let rollout = rollouts
+            .iter()
+            .find(|rollout| rollout.app == app && rollout.state.is_active());
+        let mut best = None;
+
+        for route in routes
+            .iter()
+            .filter(|route| route_apps(route).first() == Some(&app))
+        {
+            let mut shares: BTreeMap<&str, u32> = route
+                .traffic
+                .iter()
+                .flat_map(|traffic| traffic.split.iter())
+                .filter(|(release, _)| !release.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
+                .map(|(release, percent)| (release.as_str(), (*percent).min(100)))
+                .collect();
+
+            if let Some(rollout) = rollout {
+                shares.insert(rollout.candidate.as_str(), rollout.percent().min(100));
+            }
+
+            let named: u32 = shares.values().sum();
+
+            let share = match shares.get(id) {
+                Some(share) => *share,
+                None if serves => 100u32.saturating_sub(named),
+                None => 0,
+            };
+
+            best = Some(best.unwrap_or(0).max(share));
+        }
+
+        // Without a route, a rollout of the default application shares
+        // its requests all the same.
+
+        match (best, rollout) {
+            (Some(best), _) => best,
+            (None, Some(rollout)) if rollout.candidate == id => rollout.percent().min(100),
+            (None, Some(rollout)) if serves => 100u32.saturating_sub(rollout.percent().min(100)),
+            (None, _) => {
+                if serves {
+                    100
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -3763,10 +5741,10 @@ impl Daemon {
                 return Err("processes must be at least 1".to_owned());
             }
 
-            if !spec.is_static() && count > spec.max_workers {
+            if !spec.is_static() && count > scaling.scaler.ceiling() {
                 return Err(format!(
                     "{count} is over the group's max_workers of {}",
-                    spec.max_workers
+                    scaling.scaler.ceiling()
                 ));
             }
 
@@ -3834,10 +5812,25 @@ impl Daemon {
         let Some(running) = self.running.get(&(app.to_owned(), id.to_owned())) else {
             return Err(format!("release {app}@{id} is not running"));
         };
+
+        // A retained release is not the autoscaler's while it is warm
+        // (section 9.1): it holds the workers it has.
+
         Ok(running
             .scalers
             .iter()
-            .map(|scaling| (scaling.name.clone(), scaling.scaler.status(now)))
+            .map(|scaling| {
+                let mut status = scaling.scaler.status(now);
+
+                if running.retained_until.is_some() || running.control.is_none() {
+                    status.ready = running
+                        .group_sockets(&scaling.name)
+                        .map_or(0, <[PathBuf]>::len) as u32;
+                    status.desired = status.ready;
+                }
+
+                (scaling.name.clone(), status)
+            })
             .collect())
     }
 
@@ -3857,7 +5850,7 @@ impl Daemon {
     /// The releases the route policies name and the candidates of the
     /// rollouts under way, by application.
     fn referenced_releases(&self) -> BTreeSet<(String, String)> {
-        let mut referenced = referenced_in(&self.store.routes().unwrap_or_default());
+        let mut referenced = referenced_in(&self.effective().0);
         referenced.extend(
             self.store
                 .rollouts(None)
@@ -3947,8 +5940,22 @@ impl Daemon {
             })
         }));
 
+        // Section 4.14: a class goes to its release while the snapshot
+        // carries it, else as the policy's other requests do.
+
+        let classes = traffic
+            .classes
+            .iter()
+            .filter(|(_, id)| {
+                id.starts_with(muru_edge::routing::UPSTREAM_PREFIX)
+                    || included.contains(&(app.to_owned(), (*id).clone()))
+            })
+            .map(|(class, id)| (class.clone(), id.clone()))
+            .collect();
+
         Some(pb::Traffic {
             shares,
+            classes,
             hash_key: traffic.hash_key.clone().unwrap_or_default(),
             salt: traffic
                 .salt
@@ -4001,7 +6008,7 @@ impl Daemon {
                 .referenced_releases()
                 .contains(&(app.to_owned(), current.clone()))
         {
-            self.drain(app, &current, RETENTION).await;
+            self.drain(app, &current, Retention::default()).await;
         }
 
         self.store
@@ -4025,7 +6032,15 @@ impl Daemon {
                 .emit("traffic.switched", app, "notice", "no release serves");
         }
 
-        self.drain(app, id, Duration::ZERO).await;
+        self.drain(
+            app,
+            id,
+            Retention {
+                lasts: Duration::ZERO,
+                ..Retention::default()
+            },
+        )
+        .await;
 
         self.store
             .release(app, id)
@@ -4271,6 +6286,57 @@ impl Daemon {
             }
             HostMessage::Status { workers } => {
                 if let Some(running) = self.running.get_mut(&key) {
+                    // Section 7.3: the workers' own signals, from what
+                    // grew since a report at least a few seconds older,
+                    // since reports can arrive moments apart.
+
+                    let now = Instant::now();
+
+                    match &running.signals_from {
+                        None => running.signals_from = Some((now, workers.clone())),
+                        Some((at, _)) if now.saturating_duration_since(*at) < SIGNAL_WINDOW => {}
+                        Some((at, before)) => {
+                            let elapsed = now.saturating_duration_since(*at);
+
+                            for group in &mut running.scalers {
+                                let signals = crate::scaling::WorkerSignals::between(
+                                    before,
+                                    &workers,
+                                    &group.name,
+                                    elapsed,
+                                    group.threads,
+                                );
+                                let near = group.memory_limit.is_some_and(|(measure, limit)| {
+                                    workers
+                                        .iter()
+                                        .filter(|worker| worker.group == group.name)
+                                        .filter_map(|worker| match measure {
+                                            muru_config::Measure::Uss => worker.uss,
+                                            muru_config::Measure::Pss => worker.pss,
+                                            muru_config::Measure::Rss => worker.rss,
+                                        })
+                                        .any(|used| {
+                                            used.saturating_mul(10) >= limit.saturating_mul(9)
+                                        })
+                                });
+                                group.scaler.set_workers(signals, near);
+                            }
+
+                            running.signals_from = Some((now, workers.clone()));
+                        }
+                    }
+
+                    // Section 7.4: the host is measured when its workers
+                    // are, for the node's memory budget.
+
+                    if workers.iter().any(|worker| worker.pss.is_some()) {
+                        running.host_pss = running
+                            .backend
+                            .host()
+                            .and_then(HostProcess::pid)
+                            .and_then(crate::budget::process_pss);
+                    }
+
                     running.status = workers;
                 }
             }
@@ -4294,6 +6360,16 @@ impl Daemon {
                     "notice" => "notice",
                     _ => "info",
                 };
+
+                // Section 9.3: a crash or a timeout kill counts against
+                // the release in a rollout's gates.
+
+                if kind == "worker.timeout_killed" || (kind == "worker.exited" && level != "info") {
+                    *self
+                        .worker_faults
+                        .entry((app.to_owned(), id.to_owned()))
+                        .or_default() += 1;
+                }
 
                 self.events
                     .emit(&kind, &format!("{app}@{id}"), level, &message);
@@ -4513,6 +6589,27 @@ impl Daemon {
         Reopened { edge, hosts }
     }
 
+    /// Mark a running release ready, once the snapshot that gives it to
+    /// the edge has been pushed: the state means a request can reach it.
+    /// A release that has meanwhile begun to stop is left as it is.
+    fn mark_ready(&self, app: &str, id: &str, message: &str) {
+        if !self.running.contains_key(&(app.to_owned(), id.to_owned())) {
+            return;
+        }
+
+        if let Ok(release) = self.store.release(app, id)
+            && matches!(
+                release.state,
+                ReleaseState::Warming
+                    | ReleaseState::Ready
+                    | ReleaseState::Draining
+                    | ReleaseState::Retained
+            )
+        {
+            self.set_state(&release, ReleaseState::Ready, message);
+        }
+    }
+
     fn set_state(&self, release: &Release, state: ReleaseState, message: &str) {
         if let Err(error) = self
             .store
@@ -4595,7 +6692,12 @@ fn scalers_for(
     pins: &[(String, u32)],
     now: Instant,
 ) -> Vec<GroupScaling> {
-    let asgi = spec.interface == muru_config::Interface::Asgi;
+    // gRPC calls are held on the event loop too (section 6.13).
+
+    let asgi = matches!(
+        spec.interface,
+        muru_config::Interface::Asgi | muru_config::Interface::Grpc
+    );
     let slots = |threads: u32, concurrency: u32| {
         if asgi {
             concurrency as f64
@@ -4603,11 +6705,21 @@ fn scalers_for(
             threads as f64
         }
     };
+    let threads = |threads: u32, sync_threads: u32| {
+        if asgi { sync_threads + 1 } else { threads }
+    };
+    let memory_limit = spec
+        .memory
+        .soft_limit
+        .map(|limit| (spec.memory.measure, limit));
     let mut scalers = vec![GroupScaling {
         name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
         scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
         slots_per_worker: slots(spec.threads, spec.concurrency),
         requested: None,
+        threads: threads(spec.threads, spec.sync_threads),
+        memory_limit,
+        denied: None,
     }];
 
     for group in &spec.groups {
@@ -4620,6 +6732,9 @@ fn scalers_for(
             scaler: Scaler::new(group.scaling.clone(), current as u32),
             slots_per_worker: slots(group.threads, group.concurrency),
             requested: None,
+            threads: threads(group.threads, group.sync_threads),
+            memory_limit,
+            denied: None,
         });
     }
 
@@ -4632,7 +6747,78 @@ fn scalers_for(
     scalers
 }
 
+/// Section 7.5: how long before a window raising a floor, at least, it
+/// is checked against the node's budget.
+const BUDGET_LEAD: Duration = Duration::from_secs(15 * 60);
+
+/// How often the clock's synchronisation is checked.
+const CLOCK_CHECK: Duration = Duration::from_secs(600);
+
+/// Whether the system clock is synchronised, as the kernel's NTP state
+/// says, or none where that cannot be told.
+fn clock_synchronised() -> Option<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // SAFETY: timex is plain data for which all zeroes is a valid
+        // value, and with modes 0 the call only reads the clock's state
+        // into it.
+
+        let state = unsafe {
+            let mut timex: libc::timex = std::mem::zeroed();
+
+            #[cfg(target_os = "linux")]
+            let state = libc::adjtimex(&mut timex);
+
+            #[cfg(target_os = "macos")]
+            let state = libc::ntp_adjtime(&mut timex);
+
+            state
+        };
+
+        if state >= 0 {
+            return Some(state != libc::TIME_ERROR);
+        }
+    }
+
+    None
+}
+
+/// The event a clock check raises: a warning when the clock is not
+/// synchronised while schedules depend on it, once, and a notice when it
+/// is synchronised again after one.
+fn clock_event(
+    synchronised: Option<bool>,
+    warned: bool,
+    scheduled: bool,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match synchronised {
+        Some(false) if scheduled && !warned => Some((
+            "clock.unsynchronised",
+            "warning",
+            "the system clock is not synchronised; overlay schedules and scheduled capacity follow it",
+        )),
+        Some(true) if warned => Some((
+            "clock.synchronised",
+            "notice",
+            "the system clock is synchronised again",
+        )),
+        _ => None,
+    }
+}
+
 /// A scaling decision as its event says it.
+/// Section 7.3: a diagnosis as words for an event or a status line.
+fn describe_diagnosis(diagnosis: &crate::scaling::Diagnosis) -> String {
+    if diagnosis.advice.is_empty() {
+        format!("diagnosis: {}", diagnosis.summary)
+    } else {
+        format!(
+            "diagnosis: {}; for the next release, {}",
+            diagnosis.summary, diagnosis.advice
+        )
+    }
+}
+
 fn decision_message(group: &str, from: u32, to: u32, reason: &str, advisory: bool) -> String {
     let verb = if to > from { "scale out" } else { "scale in" };
 
@@ -4664,7 +6850,7 @@ fn route_apps(route: &muru_config::Route) -> Vec<&str> {
 }
 
 /// The releases the routes' traffic policies name, as (application,
-/// release) pairs (section 9.4).
+/// release) pairs (section 9.4), for a share or for a client class.
 fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
     routes
         .iter()
@@ -4674,6 +6860,7 @@ fn referenced_in(routes: &[muru_config::Route]) -> BTreeSet<(String, String)> {
                 traffic
                     .split
                     .keys()
+                    .chain(traffic.classes.values())
                     .filter(|id| !id.starts_with(muru_edge::routing::UPSTREAM_PREFIX))
                     .map(move |id| (app.to_owned(), id.clone()))
             })
@@ -4764,5 +6951,31 @@ fn step_message(steps: &[RolloutStep], step: usize) -> String {
             muru_config::format_duration(Duration::from_millis(current.hold_ms))
         ),
         None => format!("step {} of {}", step + 1, steps.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_clock_warning_is_raised_once_and_only_for_schedules() {
+        assert_eq!(
+            clock_event(Some(false), false, true).map(|(kind, ..)| kind),
+            Some("clock.unsynchronised")
+        );
+        assert_eq!(clock_event(Some(false), true, true), None);
+        assert_eq!(clock_event(Some(false), false, false), None);
+        assert_eq!(
+            clock_event(Some(true), true, true).map(|(kind, ..)| kind),
+            Some("clock.synchronised")
+        );
+        assert_eq!(clock_event(Some(true), false, true), None);
+        assert_eq!(clock_event(None, false, true), None);
+    }
+
+    #[test]
+    fn the_clock_state_can_be_read_here() {
+        assert!(clock_synchronised().is_some());
     }
 }

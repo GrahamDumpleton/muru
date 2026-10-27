@@ -49,6 +49,7 @@ import selectors
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -56,7 +57,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
 
-from muru import RequestTimeout, _asgi, _inspect, preload
+from muru import RequestTimeout, _asgi, _inspect, _outside, preload
 from muru import logging as muru_logging
 from muru._context import Context
 from muru._context import _set as set_context
@@ -121,7 +122,7 @@ def log(message: str) -> None:
         pass
 
 
-INTERFACES = ("auto", "wsgi", "asgi")
+INTERFACES = ("auto", "wsgi", "asgi", "grpc")
 FACTORY_PHASES = ("worker", "host")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -159,12 +160,17 @@ def detect_interface(app: Any) -> str:
 
 
 def resolve_interface(spec: str, app: Any, interface: str) -> str:
-    """Return the interface the application is served with: ``wsgi`` or ``asgi``.
+    """Return the interface the application is served with: ``wsgi``, ``asgi`` or ``grpc``.
 
-    ``auto`` detects it from the callable. A declared interface is trusted,
-    except that an application declared WSGI whose callable is a coroutine
-    function cannot be served that way and is refused.
+    ``auto`` detects WSGI or ASGI from the callable; ``grpc`` is never
+    detected, since its entrypoint is a registration function (section
+    6.13). A declared interface is trusted, except that an application
+    declared WSGI whose callable is a coroutine function cannot be served
+    that way and is refused.
     """
+
+    if interface == "grpc":
+        return interface
 
     detected = detect_interface(app)
     if interface == "auto":
@@ -189,7 +195,7 @@ def app_name(spec: str) -> str:
 def process_model(threads: int, interface: str = "wsgi") -> str:
     """Name the process model of section 6.4 for a release."""
 
-    if interface == "asgi":
+    if interface in ("asgi", "grpc"):
         return "async"
 
     gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
@@ -242,9 +248,19 @@ class Release:
         return self.hooks
 
     def accept(self, app: Any) -> None:
-        """Keep the application and settle the interface it is served with."""
+        """Keep the application and settle the interface it is served with.
+
+        A gRPC entrypoint is called now with the server it registers its
+        services on (section 6.13), which is what is served.
+        """
 
         self.resolved = resolve_interface(self.spec, app, self.interface)
+
+        if self.resolved == "grpc":
+            from muru import _grpc
+
+            app = _grpc.register(app)
+
         self.app = app
 
         # The context tells hooks and the application what they run under.
@@ -305,27 +321,49 @@ class Mount:
     """A named mount (section 6.7): a path served by another entrypoint.
 
     The mount's application is loaded and realised like the release's own,
-    without hooks of its own, and shares the worker's threads and loop.
+    without hooks of its own, and shares the worker's loop. It shares the
+    worker's threads too, unless it has threads of its own: the threads
+    it reserves and the most requests it runs at once.
     """
 
     name: str
     path: str
     release: Release
+    threads: tuple[int, int] | None = None
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
-        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE]."""
+        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]].
 
+        A gRPC mount's PATH is empty.
+        """
+
+        form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]"
         parts = text.split("=")
-        if len(parts) not in (3, 4) or not parts[0] or not parts[1].startswith("/"):
-            raise argparse.ArgumentTypeError(f"{text!r} is not NAME=PATH=ENTRYPOINT[=INTERFACE]")
+        interface = parts[3] if len(parts) >= 4 else "auto"
+        path_given = parts[1].startswith("/") if len(parts) > 1 else False
 
-        interface = parts[3] if len(parts) == 4 else "auto"
+        if len(parts) not in (3, 4, 5) or not parts[0] or path_given == (interface == "grpc"):
+            raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
         if interface not in INTERFACES:
             raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
 
+        own: tuple[int, int] | None = None
+
+        if len(parts) == 5:
+            try:
+                reserved, most = (int(part) for part in parts[4].split(","))
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+            if reserved < 0 or most < max(reserved, 1):
+                raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+
+            own = (reserved, most)
+
         release = Release(parts[2], None, context, threads=threads, interface=interface)
-        return cls(parts[0], parts[1], release)
+        return cls(parts[0], parts[1], release, own)
 
 
 @dataclass(frozen=True)
@@ -409,6 +447,16 @@ class WorkerState:
     over_soft_since: float | None = None
     reclaimed_at: float | None = None
 
+    # Section 7.3: the last scaling signals, relayed to the supervisor as
+    # the worker reported them.
+
+    signals: dict[str, Any] = field(default_factory=dict)
+
+    # Section 11.7: the debugger sessions open in the worker, which keep
+    # it out of routing and from being replaced.
+
+    debug_sessions: int = 0
+
 
 @dataclass
 class Pending:
@@ -420,6 +468,11 @@ class Pending:
     answers: dict[int, dict[str, Any]] = field(default_factory=dict)
     deadline: float = 0.0
 
+    # Section 11.7: a request the host makes for itself, whose answers go
+    # here rather than to the supervisor.
+
+    then: Callable[[Pending], None] | None = None
+
 
 @dataclass
 class Replacement:
@@ -430,6 +483,11 @@ class Replacement:
     reason: str
     kind: str  # worker.recycled or worker.timeout_killed
     new_pid: int | None = None
+
+    # Section 11.7: what the worker was doing when it was replaced (its
+    # stuck request's stack, or its commonest objects), for the event.
+
+    capture: str | None = None
     announced: int | None = None
     announced_at: float | None = None
     terminate_at: float | None = None
@@ -465,10 +523,13 @@ class Host:
         hard_timeout: float | None = None,
         hard_drain_grace: float = 10.0,
         shutdown_timeout: float = 5.0,
+        loop_stall_timeout: float = 10.0,
         memory: MemoryPolicy | None = None,
+        reflection: bool = False,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
+        self.reflection = reflection
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
@@ -482,6 +543,7 @@ class Host:
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
         self.shutdown_timeout = shutdown_timeout
+        self.loop_stall_timeout = loop_stall_timeout
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
@@ -532,6 +594,20 @@ class Host:
         self.control_sockets: dict[int, socket.socket] = {}
         self.control_buffers: dict[int, bytes] = {}
         self.pending: dict[int, Pending] = {}
+
+        # The host's own requests to workers count down from -1, apart
+        # from the supervisor's.
+
+        self.own_requests = 0
+
+        # Section 11.7: the reader of the workers' stacks from outside,
+        # and the pipe a profile sampled on a thread of its own wakes the
+        # loop with.
+
+        self.outside = _outside.Reader()
+        self.outside_errors: dict[int, str] = {}
+        self.traced: dict[int, list[WorkerState]] = {}
+        self.wake_write: int | None = None
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
@@ -808,10 +884,30 @@ class Host:
             # startup for each ASGI application before the worker is ready.
 
             realised = [
-                (mount.name, mount.release.realise(), mount.release) for mount in self.mounts
+                (mount.name, mount.release.realise(), mount.release, mount.threads)
+                for mount in self.mounts
             ]
-            any_asgi = release.resolved == "asgi" or any(
-                mounted.resolved == "asgi" for _, _, mounted in realised
+            any_asgi = release.resolved in ("asgi", "grpc") or any(
+                mounted.resolved in ("asgi", "grpc") for _, _, mounted, _ in realised
+            )
+
+            for name, _, mounted, own in realised:
+                if own is not None and mounted.resolved == "asgi":
+                    raise ValueError(
+                        f"mount {name}: an ASGI mount runs on the event loop and has no threads"
+                    )
+
+            # Section 6.5: the shared pool serves a WSGI default mount and
+            # every WSGI mount that has no threads of its own or borrows.
+
+            shared_threads = (
+                group.threads
+                if release.resolved not in ("asgi", "grpc")
+                or any(
+                    mounted.resolved not in ("asgi", "grpc") and (own is None or own[0] < own[1])
+                    for _, _, mounted, own in realised
+                )
+                else 1
             )
 
             if any_asgi:
@@ -823,17 +919,49 @@ class Host:
                 lifespan.startup()
 
             lifespans: list[_asgi.Lifespan] = []
-            served_mounts: list[tuple[str, Any, Any]] = []
+            served_mounts: list[tuple[str, Any, Any, tuple[int, int] | None]] = []
 
-            for name, mounted_app, mounted in realised:
-                if loop is not None and mounted.resolved == "asgi":
+            # Section 6.13: a gRPC application is served by a dispatcher on
+            # the loop, which runs synchronous handlers on threads of the
+            # mount's own, and its methods are declared to the edge.
+
+            grpc_servers: list[tuple[str, Any]] = []
+            grpc_runner: Any = None
+
+            if loop is not None and release.resolved == "grpc":
+                from muru import _grpc
+
+                grpc_servers.append(("", app))
+                app = _grpc.Dispatcher(app, group.threads)
+                grpc_runner = _asgi.runner(app, loop, {})
+
+            for name, mounted_app, mounted, own in realised:
+                if loop is not None and mounted.resolved == "grpc":
+                    from muru import _grpc
+
+                    grpc_servers.append((name, mounted_app))
+                    dispatcher = _grpc.Dispatcher(
+                        mounted_app, group.threads if own is None else own[0]
+                    )
+                    runner = _asgi.runner(dispatcher, loop, {})
+                    served_mounts.append((name, dispatcher, runner, own))
+                elif loop is not None and mounted.resolved == "asgi":
                     mounted_lifespan = _asgi.Lifespan(mounted_app, loop, mounted.spec)
                     mounted_lifespan.startup()
                     lifespans.append(mounted_lifespan)
                     runner = _asgi.runner(mounted_app, loop, mounted_lifespan.state)
-                    served_mounts.append((name, mounted_app, runner))
+                    served_mounts.append((name, mounted_app, runner, None))
                 else:
-                    served_mounts.append((name, mounted_app, None))
+                    served_mounts.append((name, mounted_app, None, own))
+
+            if grpc_servers and self.reflection:
+                from muru import _grpc
+
+                _grpc.enable_reflection([server for _, server in grpc_servers])
+
+            grpc_methods = [
+                method for name, server in grpc_servers for method in server.listing(name)
+            ]
 
             hooks.call("on_ready", context)
         except Exception as error:
@@ -867,6 +995,9 @@ class Host:
         if loop is not None and lifespan is not None:
             asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
 
+        if grpc_runner is not None:
+            asgi_arguments["runner"] = grpc_runner
+
         # Section 7.6: the soft timeout interrupts a request by raising
         # muru.RequestTimeout in its thread, or cancelling its task.
 
@@ -878,11 +1009,25 @@ class Host:
                 "timeout_error": RequestTimeout,
             }
 
+        # Section 7.6: the event loop beats twice a second, and a native
+        # watchdog tells the host when it has stopped beating for longer
+        # than the loop stall timeout.
+
+        if loop is not None:
+            timeout_arguments["loop_stall_timeout_ms"] = int(self.loop_stall_timeout * 1000)
+            _asgi.heartbeat(loop.loop)
+
+        # Section 11.7: breakpoint() waits for muructl debug attach.
+
+        from muru import _debug
+
+        _debug.install(index, report)
+
         try:
             _native.serve(
                 path or self.socket_path(index),
                 app,
-                group.threads if loop is None else 1,
+                shared_threads,
                 # Section 6.5: False only for a single-process development run.
                 multiprocess=self.worker_count > 1,
                 on_drain=lambda: hooks.call_logged("on_drain", context),
@@ -895,8 +1040,13 @@ class Host:
                 memory_interval_ms=int(self.memory.check_interval * 1000),
                 control=control,
                 on_control=lambda line, active, names: _inspect.handle(
-                    line, active, loop.loop if loop is not None else None, names
+                    line,
+                    active,
+                    loop.loop if loop is not None else None,
+                    names,
+                    slots=group.threads if loop is None else group.concurrency,
                 ),
+                grpc_methods=grpc_methods,
                 **asgi_arguments,
                 **timeout_arguments,
             )
@@ -914,6 +1064,7 @@ class Host:
         os.set_blocking(wake_write, False)
         signal.set_wakeup_fd(wake_write, warn_on_full_buffer=False)
         selector.register(wake_read, selectors.EVENT_READ)
+        self.wake_write = wake_write
 
         def request_stop(signum: int, _frame: Any) -> None:
             if not self.stopping:
@@ -1164,6 +1315,22 @@ class Host:
             )
             return
 
+        # Section 11.7: stacks, and a profile of everything a worker runs,
+        # are read from outside where the interpreter allows it, so they
+        # work on a worker whose threads hold the interpreter; elsewhere
+        # the worker is asked.
+
+        if op == "stacks" and self.stacks_from_outside(request_id, targets):
+            return
+
+        chosen = args.get("requests") or args.get("path")
+
+        if op == "profile" and not chosen and self.profile_from_outside(request_id, targets, args):
+            return
+
+        if op == "trace":
+            self.trace_started(request_id, targets)
+
         pending = Pending(request_id, op, targets)
         pending.deadline = time.monotonic() + float(args.get("timeout_s", CONTROL_TIMEOUT_SECONDS))
         self.pending[request_id] = pending
@@ -1188,7 +1355,8 @@ class Host:
         self.finish_if_answered(pending)
 
     # Section 7.4: the supervisor's scaling of one group, carried out by
-    # forking workers at new indices or draining the group's youngest.
+    # forking workers at new indices or draining the group's youngest; a
+    # group scaled to zero keeps the host, which forks again when asked.
 
     def scale_group(self, request_id: int, args: dict[str, Any]) -> None:
         """Bring a group to the worker count the supervisor asks for."""
@@ -1200,8 +1368,8 @@ class Host:
 
         if group is None:
             error = f"no worker group {name}"
-        elif wanted < 1:
-            error = "processes must be at least 1"
+        elif wanted < 0:
+            error = "processes must be at least 0"
 
         if error:
             self.send_to_supervisor(
@@ -1262,6 +1430,7 @@ class Host:
             for state in self.states.values()
             if state.ready
             and not state.replaced
+            and not state.debug_sessions
             and state.index not in self.replacing
             and self.placement[state.index][0] is group
         ]
@@ -1291,6 +1460,7 @@ class Host:
                 "socket": state.path,
                 "ready": state.ready,
                 "replaced": state.replaced,
+                "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
                 "in_flight": state.in_flight,
@@ -1387,6 +1557,21 @@ class Host:
             }
 
         self.pending.pop(pending.id, None)
+
+        if pending.op == "trace":
+            self.trace_ended(pending.id)
+
+        if pending.op == "attach":
+            for pid, answer in pending.answers.items():
+                state = self.states.get(pid)
+
+                if state is not None and answer.get("ok"):
+                    self.debugging(state, 1)
+
+        if pending.then is not None:
+            pending.then(pending)
+            return
+
         self.send_to_supervisor(
             {
                 "type": "response",
@@ -1394,6 +1579,81 @@ class Host:
                 "workers": sorted(pending.answers.values(), key=lambda answer: answer["index"]),
             }
         )
+
+    def trace_started(self, request_id: int, targets: dict[int, int]) -> None:
+        """Take traced workers out of routing while their trace lasts.
+
+        Section 11.7: tracing slows a worker, so the edge's requests go to
+        the others of its group meanwhile. A worker stays in routing when
+        it is the last of its group that is, and finishes the requests it
+        has either way.
+        """
+
+        taken = []
+
+        for pid in targets:
+            state = self.states.get(pid)
+
+            if state is None or self.routed.get(state.index) is None:
+                continue
+
+            group = self.placement[state.index][0]
+            others = [
+                other
+                for other in self.states.values()
+                if other.pid != pid
+                and self.placement[other.index][0] is group
+                and self.routed.get(other.index) is not None
+            ]
+
+            if not others:
+                continue
+
+            self.routed[state.index] = None
+            taken.append(state)
+            log(f"worker {state.index} (pid {state.pid}) leaves routing while it is traced")
+
+        if taken:
+            self.traced[request_id] = taken
+            self.announce()
+
+    def trace_ended(self, request_id: int) -> None:
+        """Put workers back in routing once their trace has answered."""
+
+        returned = False
+
+        for state in self.traced.pop(request_id, []):
+            if state.replaced or state.debug_sessions or state.pid not in self.states:
+                continue
+
+            self.routed[state.index] = state.path
+            returned = True
+            log(f"worker {state.index} (pid {state.pid}) serves again: its trace has ended")
+
+        if returned:
+            self.announce()
+
+    def debugging(self, state: WorkerState, change: int) -> None:
+        """Count a debugger session opening or ending in a worker.
+
+        Section 11.7: while any is open the worker is out of routing and
+        pinned, so no policy replaces it; it serves again after the last.
+        """
+
+        before = state.debug_sessions
+        state.debug_sessions = max(0, before + change)
+
+        if state.replaced or (before > 0) == (state.debug_sessions > 0):
+            return
+
+        if state.debug_sessions:
+            self.routed[state.index] = None
+            log(f"worker {state.index} (pid {state.pid}) leaves routing while it is debugged")
+        else:
+            self.routed[state.index] = state.path
+            log(f"worker {state.index} (pid {state.pid}) serves again: no debugger is attached")
+
+        self.announce()
 
     # Sections 7.6 and 7.7: reports, policies and replacements.
 
@@ -1427,6 +1687,28 @@ class Host:
             except ValueError:
                 continue
 
+            # Section 11.7: an event the worker raises, such as a request
+            # past the soft timeout with where it was.
+
+            if "event" in report:
+                self.emit(
+                    str(report["event"]),
+                    str(report.get("level", "warning")),
+                    f"worker {state.index} (pid {state.pid}): {report.get('message', '')}",
+                )
+
+                if report["event"] == "debug.detached":
+                    self.debugging(state, -1)
+                elif report["event"] == "worker.loop_stalled":
+                    self.replace(
+                        state,
+                        f"its event loop stalled past the loop stall timeout of "
+                        f"{self.loop_stall_timeout:g} s",
+                        "worker.timeout_killed",
+                    )
+
+                continue
+
             state.requests = int(report.get("requests", state.requests))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
@@ -1435,6 +1717,14 @@ class Host:
                 measured = True
                 state.memory = {
                     key: int(report[key]) for key in ("rss", "pss", "uss") if key in report
+                }
+
+            if "cpu_ms" in report:
+                measured = True
+                state.signals = {
+                    key: report[key]
+                    for key in ("cpu_ms", "gil_enabled", "gil_wait", "loop_lag")
+                    if key in report
                 }
 
         if not state.ready:
@@ -1535,6 +1825,7 @@ class Host:
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
                         **state.memory,
+                        **state.signals,
                     }
                     for state in sorted(self.states.values(), key=lambda state: state.index)
                     if not state.replaced
@@ -1600,16 +1891,22 @@ class Host:
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
 
+        # A profile sampled from outside is answered by its thread, so it is
+        # looked at here as well as when its time is up.
+
         for pending in list(self.pending.values()):
-            if now >= pending.deadline:
-                self.finish_if_answered(pending, expired=True)
+            self.finish_if_answered(pending, expired=now >= pending.deadline)
 
     def replace(self, state: WorkerState, reason: str, kind: str, hard: bool = False) -> None:
         """Start replacing a worker with a fresh one on a new socket.
 
         For a hard timeout the old worker leaves routing at once and its
-        stacks are recorded.
+        stacks are recorded. A worker being debugged is pinned: the policy
+        applies once the last session ends.
         """
+
+        if state.debug_sessions:
+            return
 
         if self.control_listener is None:
             if not getattr(self, "_warned_no_control", False):
@@ -1635,17 +1932,248 @@ class Host:
 
         if "limit" in reason:
             self.note_memory_recycle(index)
+            self.capture_objects(state, replacement)
 
         if hard:
             self.routed[index] = None
             self.announce()
 
             if kind == "worker.timeout_killed":
-                self.signal(state.pid, signal.SIGQUIT)
+                self.capture_stacks(state, replacement)
 
             replacement.terminate_at = time.monotonic() + self.hard_drain_grace
 
         replacement.new_pid = self.spawn(index, replacing=True)
+
+    def ask(
+        self,
+        state: WorkerState,
+        op: str,
+        args: dict[str, Any],
+        timeout: float,
+        then: Callable[[Pending], None],
+    ) -> None:
+        """Ask one worker something for the host itself; `then` gets the answer."""
+
+        self.ask_workers({state.pid: state.index}, op, args, timeout, then)
+
+    def ask_workers(
+        self,
+        targets: dict[int, int],
+        op: str,
+        args: dict[str, Any],
+        timeout: float,
+        then: Callable[[Pending], None],
+    ) -> None:
+        """Ask workers something for the host itself; `then` gets the answers."""
+
+        self.own_requests -= 1
+        pending = Pending(self.own_requests, op, dict(targets), then=then)
+        pending.deadline = time.monotonic() + timeout
+        self.pending[pending.id] = pending
+        line = json.dumps({"id": pending.id, "op": op, "args": args}).encode() + b"\n"
+
+        for pid in targets:
+            control = self.control_sockets.get(pid)
+
+            try:
+                if control is None:
+                    raise OSError("no control connection")
+
+                control.sendall(line)
+            except OSError as error:
+                pending.answers[pid] = {"ok": False, "error": str(error)}
+
+        self.finish_if_answered(pending)
+
+    def read_outside(self, pid: int) -> list[tuple[int, list[dict[str, Any]]]] | None:
+        """Read a worker's threads from outside, or return None.
+
+        The first time reading is found impossible is logged.
+        """
+
+        known = self.outside.unreadable
+
+        try:
+            return self.outside.stacks(pid)
+        except _outside.Unreadable as error:
+            self.outside_errors[pid] = str(error)
+
+            if known is None and self.outside.unreadable is not None:
+                log(f"workers are read from inside, since they cannot be from outside: {error}")
+
+            return None
+
+    def stacks_from_outside(self, request_id: int, targets: dict[int, int]) -> bool:
+        """Answer a stacks request from outside, or return False.
+
+        Each worker's frames are read now, and its bookkeeping, which the
+        runtime gives without the interpreter, names the threads and the
+        requests. False means reading from outside is not possible here.
+        """
+
+        read = {pid: self.read_outside(pid) for pid in targets}
+
+        if self.outside.unreadable is not None:
+            return False
+
+        def answered(pending: Pending) -> None:
+            workers = []
+
+            for pid, index in targets.items():
+                threads = read.get(pid)
+                answer = pending.answers.get(pid, {})
+                bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
+
+                if threads is None:
+                    error = self.outside_errors.pop(pid, "")
+                    workers.append(
+                        {
+                            "index": index,
+                            "pid": pid,
+                            "ok": False,
+                            "error": f"could not be read from outside: {error}",
+                        }
+                    )
+                    continue
+
+                workers.append(
+                    {
+                        "index": index,
+                        "pid": pid,
+                        "ok": True,
+                        "result": _outside.stacks_result(threads, bookkeeping),
+                    }
+                )
+
+            self.send_to_supervisor(
+                {
+                    "type": "response",
+                    "id": request_id,
+                    "workers": sorted(workers, key=lambda worker: worker["index"]),
+                }
+            )
+
+        self.ask_workers(targets, "bookkeeping", {}, 1.0, answered)
+        return True
+
+    def profile_from_outside(
+        self, request_id: int, targets: dict[int, int], args: dict[str, Any]
+    ) -> bool:
+        """Sample the workers from outside, or return False.
+
+        The sampling runs on a thread of the host's, which costs the
+        workers nothing. False means reading from outside is not possible
+        here.
+        """
+
+        if self.read_outside(next(iter(targets))) is None and self.outside.unreadable is not None:
+            return False
+
+        duration = float(args.get("duration_s", 10.0))
+        interval = float(args.get("interval_ms", 10.0)) / 1000
+        pending = Pending(request_id, "profile", dict(targets))
+        pending.deadline = time.monotonic() + duration + 10
+        self.pending[request_id] = pending
+
+        def sample(names: dict[int, dict[str, str]]) -> None:
+            results = self.outside.profile(list(targets), duration, interval, names)
+
+            for pid, answer in results.items():
+                pending.answers[pid] = {"index": targets[pid], "pid": pid, **answer}
+
+            if self.wake_write is not None:
+                try:
+                    os.write(self.wake_write, b"\0")
+                except OSError:
+                    pass
+
+        def named(bookkeeping: Pending) -> None:
+            names = {
+                pid: answer.get("result", {}).get("names", {})
+                for pid, answer in bookkeeping.answers.items()
+                if answer.get("ok")
+            }
+            threading.Thread(target=sample, args=(names,), name="muru-profile", daemon=True).start()
+
+        self.ask_workers(targets, "bookkeeping", {}, 1.0, named)
+        return True
+
+    def capture_stacks(self, state: WorkerState, replacement: Replacement) -> None:
+        """Take a worker's stacks before it is killed for the hard timeout.
+
+        Section 11.7: the stacks go to the log and where the oldest request
+        was goes to the event. They are read from outside where that is
+        possible; otherwise the worker is asked, and one that cannot answer
+        within a second gets SIGQUIT, and faulthandler writes its stacks to
+        the log instead.
+        """
+
+        outside = self.read_outside(state.pid)
+
+        if outside is not None:
+
+            def read(pending: Pending) -> None:
+                answer = pending.answers.get(state.pid, {})
+                bookkeeping = answer.get("result", {}) if answer.get("ok") else {}
+                result = _outside.stacks_result(outside, bookkeeping)
+                self.record_capture(state, replacement, result["threads"])
+
+            self.ask(state, "bookkeeping", {}, 1.0, read)
+            return
+
+        def answered(pending: Pending) -> None:
+            answer = pending.answers.get(state.pid, {})
+
+            if not answer.get("ok"):
+                replacement.capture = "its stacks were written to the log by faulthandler"
+                return
+
+            self.record_capture(state, replacement, answer.get("result", {}).get("threads", []))
+
+        self.ask(state, "stacks", {}, 1.0, answered)
+
+    def record_capture(
+        self, state: WorkerState, replacement: Replacement, threads: list[dict[str, Any]]
+    ) -> None:
+        """Log a worker's stacks and note where its oldest request was."""
+
+        for thread in threads:
+            frames = "".join(
+                f"\n    {frame['file']}:{frame['line']} in {frame['function']}"
+                for frame in thread.get("frames", [])
+            )
+            log(f"worker {state.index} (pid {state.pid}) {thread.get('name')}:{frames}")
+
+        stuck = max(
+            (thread for thread in threads if thread.get("request")),
+            key=lambda thread: thread["request"].get("elapsed_ms", 0),
+            default=None,
+        )
+
+        if stuck is not None and stuck.get("frames"):
+            innermost = stuck["frames"][-3:][::-1]
+            replacement.capture = "at " + ", called from ".join(
+                f"{os.path.basename(frame['file'])} line {frame['line']} in {frame['function']}"
+                for frame in innermost
+            )
+
+    def capture_objects(self, state: WorkerState, replacement: Replacement) -> None:
+        """Count a worker's commonest objects before it is recycled for memory.
+
+        Section 11.7: the counts go to the event, so the growth is attributed.
+        """
+
+        def answered(pending: Pending) -> None:
+            answer = pending.answers.get(state.pid, {})
+
+            if answer.get("ok"):
+                objects = answer.get("result", {}).get("objects", [])
+                replacement.capture = "most objects: " + ", ".join(
+                    f"{name} {count}" for name, count in objects
+                )
+
+        self.ask(state, "memory", {"top": 5}, 2.0, answered)
 
     def advance(self, replacement: Replacement, now: float) -> None:
         """Move a replacement along.
@@ -1785,11 +2313,12 @@ class Host:
             if replacement is not None and replacement.old_pid == pid:
                 del self.replacing[index]
                 level = "warning" if replacement.kind == "worker.timeout_killed" else "info"
+                capture = f"; {replacement.capture}" if replacement.capture else ""
                 self.emit(
                     replacement.kind,
                     level,
                     f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
-                    f"{replacement.reason}",
+                    f"{replacement.reason}{capture}",
                 )
                 continue
 
@@ -1970,6 +2499,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the interface the entrypoint speaks; auto detects it from the callable",
     )
     parser.add_argument(
+        "--reflection",
+        action="store_true",
+        help="serve gRPC server reflection for the registered services (section 6.13)",
+    )
+    parser.add_argument(
         "--factory",
         action="store_true",
         help="the entrypoint is a factory returning the application (section 6.8)",
@@ -2039,7 +2573,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--mount",
         action="append",
         default=[],
-        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE]",
+        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]",
         help="a named mount served by another entrypoint at a path (section 6.7)",
     )
     parser.add_argument(
@@ -2107,6 +2641,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=10.0,
         metavar="SECONDS",
         help="how long a replaced worker gets to finish its other requests",
+    )
+    parser.add_argument(
+        "--loop-stall-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="replace an ASGI worker whose event loop has not run for this long (section 7.6)",
     )
     parser.add_argument(
         "--shutdown-timeout",
@@ -2308,6 +2849,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
         shutdown_timeout=args.shutdown_timeout,
+        loop_stall_timeout=args.loop_stall_timeout,
         memory=MemoryPolicy(
             measure=args.memory_measure,
             soft_limit=args.memory_soft_limit,
@@ -2316,6 +2858,7 @@ def main(argv: list[str] | None = None) -> int:
             hard_limit=args.memory_hard_limit,
             check_interval=args.memory_check_interval,
         ),
+        reflection=args.reflection,
     )
 
     if args.single:

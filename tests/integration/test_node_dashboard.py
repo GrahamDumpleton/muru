@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
+import sys
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -138,9 +141,16 @@ def test_the_dashboard_is_loopback_only(tmp_path: Path) -> None:
         start_daemon(tmp_path, arguments=["--dashboard", "0.0.0.0:0"])
 
 
-def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0, count: int = 1) -> str:
+def read_sse(
+    port: int,
+    path: str,
+    wanted: str,
+    timeout: float = 15.0,
+    count: int = 1,
+    containing: tuple[str, ...] = (),
+) -> str:
     """Read a Server-Sent Events stream until `count` messages of `wanted` type
-    have arrived."""
+    have arrived, and one of `containing` with them when it names any."""
 
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
 
@@ -162,7 +172,10 @@ def read_sse(port: int, path: str, wanted: str, timeout: float = 15.0, count: in
 
             complete = collected.rsplit(b"\n\n", 1)[0] + b"\n\n" if b"\n\n" in collected else b""
 
-            if complete.count(f"event: {wanted}\n".encode()) >= count:
+            enough = complete.count(f"event: {wanted}\n".encode()) >= count
+            found = not containing or any(text.encode() in complete for text in containing)
+
+            if enough and found:
                 return collected.decode()
 
         raise AssertionError(f"no {wanted} event in {collected!r}")
@@ -225,7 +238,10 @@ def test_events_stream_as_rows_and_json(served: tuple[Daemon, int]) -> None:
     outcome: list[str] = []
 
     def listen() -> None:
-        outcome.append(read_sse(port, "/v1/events/stream", "json"))
+        # A worker's own events can come first, so read on to the drain's.
+
+        kinds = ('"kind":"release.', '"kind":"traffic.')
+        outcome.append(read_sse(port, "/v1/events/stream", "json", containing=kinds))
 
     listener = threading.Thread(target=listen)
     listener.start()
@@ -238,3 +254,130 @@ def test_events_stream_as_rows_and_json(served: tuple[Daemon, int]) -> None:
     assert '"kind":"release.' in text or '"kind":"traffic.' in text
     page = fetch(port, "/")[2].decode()
     assert 'sse-connect="/v1/events/stream"' in page and 'id="event-rows"' in page
+
+
+def test_scaling_rollouts_and_maintenance_are_shown(served: tuple[Daemon, int]) -> None:
+    daemon, port = served
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+    daemon.muructl(
+        "rollout", "canary", "shop@r2", "--steps", "20", "--hold", "60s", "--min-requests", "1000"
+    )
+    daemon.muructl("maintenance", "on", "shop")
+
+    rollouts = fetch_json(port, "/v1/rollouts")
+    assert rollouts[0]["candidate"] == "r2" and rollouts[0]["baseline"] == "r1"
+    assert rollouts[0]["state"] == "running" and rollouts[0]["percent"] == 20
+
+    scaling = fetch_json(port, "/v1/scaling")
+    rows = {(row["release"], row["group"]): row for row in scaling}
+    assert rows[("shop@r1", "default")]["workers"] == "2"
+    assert rows[("shop@r1", "default")]["policy"].startswith("static")
+    assert rows[("shop@r1", "default")]["diagnosis"]
+
+    apps = fetch_json(port, "/v1/apps")
+    assert apps[0]["maintenance_since"]
+
+    page = fetch(port, "/")[2].decode()
+    assert "maintenance since" in page
+    assert "<h3>Rollouts</h3>" in page and "<h3>Scaling</h3>" in page
+
+
+def post_form(
+    port: int, path: str, fields: dict[str, str], headers: dict[str, str]
+) -> tuple[int, bytes]:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+
+    try:
+        body = urllib.parse.urlencode(fields)
+        connection.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded", **headers},
+        )
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) -> None:
+    port = support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        arguments=["--dashboard", f"127.0.0.1:{port}"],
+        config_extra="[dashboard]\nactions = true\n",
+    )
+    origin = {"Origin": f"http://127.0.0.1:{port}"}
+
+    try:
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        assert "Maintenance on" not in fetch(port, "/")[2].decode()
+        refused = post_form(port, "/actions/maintenance", {"app": "shop", "state": "on"}, origin)
+        assert refused[0] == 403 and b"not signed in" in refused[1]
+
+        # A login link from the admin socket signs a browser in, once.
+
+        link = daemon.muructl("dashboard", "login").stdout.strip()
+        assert link.startswith(f"http://127.0.0.1:{port}/login?code=")
+        path = link.removeprefix(f"http://127.0.0.1:{port}")
+        status, headers, _ = fetch(port, path)
+        assert status == 303 and headers["location"] == "/"
+        cookie = headers["set-cookie"].split(";")[0]
+        assert "HttpOnly" in headers["set-cookie"] and "SameSite=Strict" in headers["set-cookie"]
+        assert fetch(port, path)[0] == 403
+
+        page = fetch_with(port, "/", {"Cookie": cookie})
+        assert "Maintenance on" in page
+        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)
+        assert token is not None
+        form = {"csrf": token.group(1), "app": "shop", "state": "on"}
+
+        # The session's token and the page's own origin are both needed.
+
+        signed = {"Cookie": cookie}
+        assert (
+            post_form(
+                port, "/actions/maintenance", {**form, "csrf": "0" * 64}, {**signed, **origin}
+            )[0]
+            == 403
+        )
+        assert (
+            post_form(port, "/actions/maintenance", form, {**signed, "Origin": "http://evil.test"})[
+                0
+            ]
+            == 403
+        )
+        assert post_form(port, "/actions/maintenance", form, signed)[0] == 403
+
+        status, _ = post_form(port, "/actions/maintenance", form, {**signed, **origin})
+        assert status == 303
+        assert daemon.request("/").status == 503
+        assert "Maintenance off" in fetch_with(port, "/", {"Cookie": cookie})
+        events = daemon.muructl("events").stdout
+        assert (
+            "dashboard.action" in events and "maintenance on for shop from the dashboard" in events
+        )
+
+        post_form(port, "/actions/maintenance", {**form, "state": "off"}, {**signed, **origin})
+        assert daemon.request("/").status == 200
+    finally:
+        daemon.stop()
+
+
+def fetch_with(port: int, path: str, headers: dict[str, str]) -> str:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+
+    try:
+        connection.request("GET", path, headers=headers)
+        return connection.getresponse().read().decode()
+    finally:
+        connection.close()
+
+
+def test_login_links_need_the_actions_turned_on(served: tuple[Daemon, int]) -> None:
+    daemon, port = served
+    refused = daemon.muructl("dashboard", "login", check=False)
+    assert refused.returncode != 0 and "actions are off" in refused.stderr
+    assert fetch(port, "/login?code=anything")[0] == 404

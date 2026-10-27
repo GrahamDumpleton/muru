@@ -9,12 +9,12 @@ criteria. The full table, with scope and exit criteria, is in
 | 0. Spike | Worker protocol drafts, the PyO3 extension started after fork, a minimal WSGI bridge and a benchmark harness. Decides the edge-to-worker link |
 | 1. Single application server | muructl run with HTTP/1.1 and HTTP/2, preload, hooks, process models, a complete WSGI bridge with free-threaded support, watch reload and a minimal dashboard. Serves one WSGI application in development |
 | 2. Daemon and live operations | ASGI, the daemon and state store, admin API and CLI, releases, blue/green, drain and rollback, virtual hosts and TLS, worker groups and mounts, metrics, logs and events, worker inspection, configuration apply and export, systemd integration |
-| 3. Traffic and scaling | Canaries with gates, bucketing and stickiness, the autoscaler, schedules, soft timeouts, internal redirects, uploads, HTTP upstreams, managed HTTP server releases, overlays, authentication sub-requests, gRPC mounts, client classes and rate limits, worker profiling and debugger attach |
-| 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, scale to zero, OTLP export, security review, performance tuning. 1.0 |
+| 3. Traffic and scaling | Canaries with gates, bucketing and stickiness, the autoscaler, schedules, soft timeouts, internal redirects, uploads, HTTP upstreams, managed HTTP server releases, overlays, authentication sub-requests, gRPC mounts, client classes and rate limits, node budgets and scale to zero, worker profiling and debugger attach |
+| 4. Hardening and extras | Condition-triggered overlays, uv provisioning, container releases and base images, multiple edge processes, ACME, HTTP/3, OTLP export, security review, performance tuning. 1.0 |
 | 5. Multi-node | Per-node daemons, central control, TCP with mTLS between components |
 
-Current position: phase 3 in progress, its first half released as
-0.1.0a5. Phase 0 landed the
+Current position: phase 3 complete, its first half released as 0.1.0a5
+and its second half as 0.1.0a6. Phase 0 landed the
 framed worker link chosen by [ADR 0021](adr/0021-framed-worker-link.md), a
 fixed pool of long-lived application threads and the benchmark harness.
 Phase 1, released as 0.1.0a2, is development mode for one WSGI application:
@@ -258,11 +258,13 @@ steps can wait for approval, and `rollout status`, `pause`, `resume`,
 `promote` and `abort` follow and control the rollout; `muructl rollout
 bluegreen` moves all traffic at once; every change is a `rollout.*`
 event, and a daemon restart continues a rollout with its current step
-starting afresh. Still to
-come in this part of the phase: A/B cohorts by header and cookie
-matches, per-route policies for one application, probe URL and worker
-crash gates, scheduled freezes, `config export --resolve-rollouts`, and
-rollouts for an application reached as the default with no route.
+starting afresh. Scheduled freezes came with capacity schedules, and the
+worker crash, p99, queue wait and probe URL gates,
+`config export --resolve-rollouts` and rollouts of an application
+reached as the default with no route followed. A/B
+cohorts by header or cookie are client classes given a release by a
+policy's `classes`, and per-route policies are each route's own split,
+both described in the traffic guide.
 
 The autoscaler (sections 7.2 to 7.4) followed: a `scaling` table on a
 release or a worker group gives the group a policy, spare mode keeping
@@ -281,10 +283,35 @@ spent; every decision is a `scaling.decision` event with its reasons,
 and `--unpin` hands it back, and `advisory = true` reports without
 acting. The decision engine is a module with an injectable clock, driven
 through step, ramp, sawtooth, bursty and budget scenarios in unit tests.
-Still to come: scheduled capacity, the node budget manager across
-applications, the worker CPU, GIL wait and loop lag signals with the
-diagnosis table, scale to zero, and the floor divided by traffic share
-during canaries.
+The workers' CPU, GIL wait and event loop lag followed, reported to the
+host with their memory and turned into rates by the daemon, with the
+diagnosis table naming each group's bottleneck in every decision and in
+`muructl scale status`. The node budget manager came next: the daemon
+file's `[daemon.budget]` table caps the workers, memory and CPU the
+releases hold between them, measured from what the workers and hosts
+report, and scale-outs are admitted against it, the highest application
+`priority` first and in part when only part fits, each shortfall a
+`scaling.denied_by_budget` event; a release is not started when its
+memory does not fit, after the retained releases have made way, and
+`muructl daemon status` shows what is held. Scale to zero, brought
+forward from phase 4, followed: a group with `min_workers = 0` drains its
+last worker once idle, the edge holds the next request and tells the
+daemon over a WatchWakes stream, and the group gets a worker at once;
+with `host_idle_timeout` the host stops too, and the next request starts
+it again. A superseded release keeps one worker per group while it is
+retained (`deploy --retain-workers`), dropping to its host alone and
+then stopping under memory pressure.
+
+Scheduled capacity (section 7.5) is in: `[[app.NAME.schedule]]` entries,
+one-off or recurring, raise a worker group's floor and ceiling for their
+windows and through their warm-up, in batches, with `scale_in = 'hold'`
+and the floor divided by traffic share during canaries; each is an
+overlay named `APP.NAME`, overlays set the same keys under `apps.NAME`,
+and `muructl scale --min N --until TIME` makes a temporary one. Deploy
+freezes (section 9.6) refuse deploys, deploying applies, rollouts and
+promotions of a frozen application unless `--override-freeze` is given,
+recorded as an event, and hold rollouts under way. Schedules are checked
+against the node's budget when applied and ahead of each window.
 
 The soft timeout (section 7.6) is in: `soft_timeout` in the `timeouts`
 table or `--timeout soft=` starts a watchdog thread in each worker that
@@ -296,10 +323,11 @@ application catches the exception and answers for itself, an injection
 the request outruns is withdrawn before its thread serves again, and
 streaming responses and WebSockets are exempt from the soft and the hard
 timeout once their head goes out. The hard timeout must exceed the soft
-one by 5 s, checked on `muructl run`, `deploy` and `apply`. Still to
-come: the loop stall timeout, the host's stack capture attached to the
-event when a request passes the soft timeout (section 11.7), and
-`muru.deadline` in the environ.
+one by 5 s, checked on `muructl run`, `deploy` and `apply`. Where a
+request was when it passed the soft timeout followed with worker
+inspection (section 11.7), then `muru.deadline` in the environ and the
+scope, and the loop stall timeout, which replaces an ASGI worker whose
+event loop has not run for 10 s.
 
 Internal redirects (section 4.10) are in: an application's response with
 `X-Muru-Redirect` (always), `X-Accel-Redirect` or a CGI local redirect
@@ -317,7 +345,7 @@ redirecting response's Content-Disposition, Cache-Control, Expires,
 Set-Cookie, Vary and non-empty Content-Type carry over; a chain stops
 after 5 hops with 500 redirect_loop under the client's deadline, with
 one access log line naming every hop; and a client's X-Muru-* request
-headers are stripped at the edge. Still to come: upload offloading.
+headers are stripped at the edge.
 
 File hints (sections 4.9, 5.7 and 6.5) are in, in both forms. By
 descriptor: a `wsgi.file_wrapper` object returned as the iterable with
@@ -334,6 +362,97 @@ sendfile_missing. Trusted upstreams and managed servers give path hints
 too, and `muructl deploy --sendfile-root` and `--sendfile-header`,
 `apply` and `config export` know the keys.
 
+Upload offloading (section 4.11) is in: a route with `upload =
+'multipart'` or `'raw'` makes the edge receive the body first and store
+each file in the spool as an unnamed file (a named one where the file
+system has no O_TMPFILE, macOS among them), hashing it as it arrives,
+and pass the files to the worker by descriptor on the REQUEST frame. A
+multipart form reaches the application with each file field replaced by
+`FIELD.name`, `content_type`, `size`, a digest field per algorithm and
+`ref`, a raw upload with an empty body, and `muru.uploads.files()` and
+`get()` give upload objects whose `open()`, `save()` (a link where it
+can, a copy otherwise) and `path` reach the files. `max_body_size` on a
+route, `max_file_size`, `max_files`, `hash` and a `spool_quota` per
+application and for the node answer 413 `upload_too_large`,
+`too_many_files` and 507 `upload_spool_full` at the edge, and `precheck
+= true` asks the application with the headers alone before the body is
+read. Recipes for Flask, Starlette and Django turn the files into each
+framework's own upload objects, and the test fixtures run all three.
+
+Client classes, rate limits, method restrictions and route site modes
+(sections 4.14 and 4.15) are in. `[[client_class]]` rules in the
+daemon's file classify each request by user agent (substrings, regular
+expressions or a list file), address (or a list file), headers and
+cookies, first match wins, with a claimed crawler confirmed by reverse
+and forward DNS in the background; list files are read again when they
+change, and the class reaches the access log, `muru_requests_total` and
+the application as `muru.client_class`. `[rate_limit.NAME]` token
+buckets keyed by address prefix, class, header or cookie, which hosts
+and routes name, reject with 429 and Retry-After (and the RateLimit
+fields where asked), delay, or only log, counted in
+`muru_rate_limited_total` with the `ratelimit.enforcing` event. A
+route's `methods` refuses methods with 503 read_only or 405, and its
+`mode` reaches the application as `muru.mode`. Routing on a class
+followed: a route's `match` makes it a route for some classes, sharing
+its path with the route for every class, a traffic policy's `classes`
+gives a class a release or upstream of its own, kept running for it,
+and a worker group's `match` takes a class's requests ahead of the other
+groups, and classes and limits may be declared in applied files too.
+An overlay's `apps.NAME.mode` sets the site mode, and `deny` the
+refused methods, on every route of an application. The JA4 fingerprint
+of a client's TLS ClientHello is an input to the class rules and reaches
+the application in `muru.tls`. Rate limit buckets are in shared memory,
+so they outlast an edge's replacement.
+
+Worker inspection's phase 3 commands (section 11.7) are in, through the
+in-process control thread of ADR 0025: `muructl debug profile` samples
+every thread running Python for a period and writes collapsed stacks for
+a flame graph, merged across the workers; `debug trace` counts calls and
+time with sys.monitoring on Python 3.12 and later, refusing a busy
+worker unless forced; `debug memory` reports sizes, gc state and the
+commonest objects, with tracemalloc over a period; and `debug exec` runs
+a snippet when the daemon's `[daemon] debug_exec` allows it, each of
+these an event. The automatic captures are in too: a request past the
+soft timeout is the event `request.soft_timeout` with where it was,
+taken before it was interrupted, a hard-timeout kill names where the
+oldest request was, and a memory recycle names the commonest objects.
+Debugger attach followed: `breakpoint()` in a worker waits for `muructl
+debug attach`, out of the timeouts, and `debug attach` carries a pdb
+session line by line through the daemon and the host, at the breakpoint
+or on a thread of its own, allowed where exec is, and the debugged
+worker is out of routing and pinned while the session lasts, and
+`--dap` carries the Debug Adapter Protocol to debugpy for an IDE.
+`debug profile --path` and `--requests` sample only the requests chosen,
+and `--format pstats` writes the samples as pstats. On Linux with
+Python 3.14 and later, stacks and profiles are read from outside the
+worker with PEP 768, so a worker holding the interpreter still shows
+them; macOS, which allows that only to root, asks the worker (ADR 0028).
+`debug memory --snapshot` and `--diff` compare two chosen moments, and a
+traced worker takes no new requests while its group has another.
+
+Overlays (section 9.10) are in, activated by hand or by a one-off or
+recurring (cron and duration) schedule in a named time zone: declared in applied files, they reach
+routes by a new route `name` and set a route's mode, method
+restrictions, traffic pin or split, target and rate limits, and an
+application's maintenance mode, laid over the base configuration
+without changing it, in priority order, with conflicting fields refused
+by apply. `preconditions.release_ready` keeps an overlay from moving
+traffic to a release that is not ready, a pin holds the application's
+rollout, and `muructl overlay list`, `activate` (with `--for` or
+`--until`), `end`, `preview` and `promote` manage them, each change an
+event; a restarted daemon carries on with the windows it was in.
+Advisory schedules only say they would activate, latched ones stay
+active until a person ends them, and a warm-up starts a release ahead
+of each window, and overlays set scheduled capacity and deploy freezes.
+The signed webhook of the `[overlay_webhook]` table activates and ends
+overlays with `trigger.external`, `muructl config show --effective`
+attributes what active overlays set, and the daemon warns when the clock
+schedules follow is not synchronised. An overlay's `error_pages` choose
+a route's pages while it is active, and its `client_routes` give client
+classes routes of their own, and `config show --effective` also says
+which layer each release setting came from. Condition triggers are
+phase 4.
+
 Custom error pages and maintenance mode (section 4.12) are in: pages by
 status or status:reason at the route, release, host and node levels, as
 a file read when the snapshot is compiled, a template the edge renders
@@ -346,8 +465,12 @@ and the `X-Muru-Error-Override: off` opt-out; `muructl maintenance on`
 and `off` over SetMaintenance, serving 503 maintenance at the edge with
 exemptions by path, address and bypass cookie, recorded in the store,
 announced as `maintenance.changed` and marked in `muructl app list`; and
-`muru.error_reason` for handlers. Still to come: the dashboard's
-maintenance control.
+`muru.error_reason` for handlers. The daemon's dashboard shows
+maintenance mode, the rollouts and each group as the autoscaler sees
+it, on its pages and as `/v1/rollouts` and `/v1/scaling`, and with
+`actions = true` in its table a browser signed in through a single-use
+link from `muructl dashboard login` turns maintenance mode on and off,
+each action CSRF-protected and recorded as an event.
 
 Authentication sub-requests (section 4.16) are in: a route's `auth`
 table names an application path the edge asks, with a bodiless GET
@@ -395,3 +518,24 @@ criterion asks for; `muructl deploy --server`, the release tables of
 `apply` and `config export`, `release list`, the release log and
 `muru_upstream_health` know them. Still to come: instance autoscaling
 and socket activation (section 20.1).
+
+gRPC mounts (section 6.13) are in: a mount or a release with
+`interface = 'grpc'` serves the services its registration function adds
+with grpcio-generated code, matched by content type and the method
+names its workers declare in HELLO, so gRPC and HTTP share listeners,
+hosts and routes; the edge unframes and decompresses request messages,
+passes them whole in MESSAGE frames of a `grpc` scope, frames the
+responses, carries the status in trailers, bounds each call by its
+grpc-timeout (and a unary call by the request deadline), and balances
+calls across the workers one by one; synchronous handlers run on
+threads and asynchronous ones on the event loop for all four kinds of
+call, with grpcio's servicer context; the edge answers the standard
+health service, `reflection = true` serves reflection through
+grpcio-reflection, and gRPC-Web, binary and text, is translated at the
+edge. grpcio has no free-threaded wheels, so gRPC mounts are unavailable
+on those builds. A listener's `h2c` limits cleartext HTTP/2 to the
+clients it names, and a release's `grpc_web_origins` has the edge answer
+gRPC-Web with CORS, preflights included. A WSGI mount takes threads of
+its own, a fixed pool or a reserved minimum that borrows the shared
+pool's threads up to a maximum, with the edge holding slots per pool, and
+a gRPC mount's `threads` sizes the pool of its handlers.

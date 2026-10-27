@@ -129,7 +129,8 @@ pub enum DaemonCommand {
     },
 
     /// Re-read the daemon's configuration file for what can change while
-    /// it runs: the [proxy] and [compression] tables.
+    /// it runs: the [proxy], [compression], [error_pages],
+    /// [error_override], [[client_class]] and [rate_limit] tables.
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
@@ -219,9 +220,16 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     };
 
     let limits = limits_from(&document)?;
+    let h2c = h2c_from(&document)?;
     let metrics = metrics_from(&document, args.metrics)?;
     let dashboard = dashboard_from(&document, args.dashboard)?;
     let sinks = sinks_from(&document)?;
+    let overlay_webhook = document
+        .overlay_webhook
+        .as_ref()
+        .map(muru_controller::triggers::Webhook::from_config)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("[overlay_webhook]: {error}"))?;
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -258,15 +266,35 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         listeners,
         limits,
         service_user,
+        h2c,
+        debug_exec: document
+            .daemon
+            .as_ref()
+            .and_then(|table| table.debug_exec)
+            .unwrap_or(false),
+        budget: muru_controller::budget::Budget::from_table(
+            document
+                .daemon
+                .as_ref()
+                .and_then(|table| table.budget.as_ref()),
+        )
+        .map_err(|error| anyhow::anyhow!("[daemon.budget]: {error}"))?,
         proxy: document.proxy.clone(),
         compression: document.compression.clone(),
         error_pages: document.error_pages.clone(),
         error_override: document.error_override.clone(),
+        client_classes: document.client_class.clone(),
+        rate_limits: document.rate_limit.clone(),
         secrets,
         rotation: muru_controller::rotation::Policy::from_table(document.logs.as_ref())?,
         access_log,
         metrics,
         dashboard,
+        dashboard_actions: document
+            .dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.actions),
+        overlay_webhook,
         sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
         upgrade_arguments: upgrade_arguments(),
@@ -553,6 +581,158 @@ pub enum DebugCommand {
     /// Each worker's interpreter, sys.path, loaded modules, threads,
     /// descriptors and environment (secrets redacted).
     Inspect(DebugArgs),
+
+    /// Sample every thread's stack for a period, merged across the
+    /// workers, as collapsed stacks for a flame graph or as pstats; with
+    /// --requests or --path, only the requests chosen.
+    Profile(ProfileArgs),
+
+    /// Count calls and time every Python function with sys.monitoring
+    /// for a period (Python 3.12 or later); refused on a busy worker
+    /// unless forced.
+    Trace(TraceArgs),
+
+    /// Each worker's memory, gc state and most common object types, and
+    /// with --trace the sites that allocated most over a period, or with
+    /// --diff since a snapshot kept with --snapshot.
+    Memory(MemoryArgs),
+
+    /// Run Python code in the workers and print its output and value;
+    /// allowed only when the daemon's [daemon] table sets debug_exec.
+    Exec(ExecArgs),
+
+    /// Open a pdb session in a worker: on the thread stopped at
+    /// breakpoint(), else on a thread of its own. Each line read is a pdb
+    /// command, and the end of input lets the code go on. Without
+    /// --worker, the first worker with a breakpoint waiting. Allowed only
+    /// when the daemon's [daemon] table sets debug_exec.
+    Attach(AttachArgs),
+}
+
+/// `muructl debug attach`.
+#[derive(Args)]
+pub struct AttachArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Carry the Debug Adapter Protocol for an IDE instead of a pdb
+    /// session, to debugpy in the worker, which the release's
+    /// environment must have.
+    #[arg(long)]
+    dap: bool,
+
+    /// Where the IDE connects with --dap.
+    #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:5678")]
+    listen: SocketAddr,
+}
+
+/// `muructl debug profile`.
+#[derive(Args)]
+pub struct ProfileArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// How long to sample.
+    #[arg(long = "for", value_name = "DURATION", default_value = "10s", value_parser = muru_config::parse_duration)]
+    duration: Duration,
+
+    /// How often to sample.
+    #[arg(long, value_name = "DURATION", default_value = "10ms", value_parser = muru_config::parse_duration)]
+    interval: Duration,
+
+    /// Sample only the threads serving requests whose path starts with
+    /// this.
+    #[arg(long, value_name = "PREFIX")]
+    path: Option<String>,
+
+    /// End once this many of the requests sampled have finished, within
+    /// --for.
+    #[arg(long, value_name = "N")]
+    requests: Option<u32>,
+
+    /// Collapsed stacks for a flame graph, or pstats, which needs
+    /// --output.
+    #[arg(long, value_enum, default_value_t = ProfileFormat::Collapsed)]
+    format: ProfileFormat,
+
+    /// Write the profile here rather than to standard output.
+    #[arg(long, short, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+/// How `muructl debug profile` writes the samples.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProfileFormat {
+    /// One line per stack, root first, and its count.
+    Collapsed,
+    /// Python's pstats, from the samples.
+    Pstats,
+}
+
+/// `muructl debug trace`.
+#[derive(Args)]
+pub struct TraceArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// How long to trace.
+    #[arg(long = "for", value_name = "DURATION", default_value = "10s", value_parser = muru_config::parse_duration)]
+    duration: Duration,
+
+    /// Trace a worker serving requests in more than half its slots.
+    #[arg(long)]
+    force: bool,
+
+    /// How many functions to show, by time.
+    #[arg(long, value_name = "N", default_value_t = 30)]
+    top: u32,
+}
+
+/// `muructl debug memory`.
+#[derive(Args)]
+pub struct MemoryArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// Trace allocations with tracemalloc for the period.
+    #[arg(long, conflicts_with_all = ["snapshot", "diff", "drop"])]
+    trace: bool,
+
+    /// Keep a tracemalloc snapshot in each worker, starting tracemalloc
+    /// if it is off, for a later --diff.
+    #[arg(long, conflicts_with_all = ["diff", "drop"])]
+    snapshot: bool,
+
+    /// Show the sites that allocated most since the kept snapshot.
+    #[arg(long, conflicts_with = "drop")]
+    diff: bool,
+
+    /// Drop the kept snapshot, stopping tracemalloc if --snapshot started it.
+    #[arg(long)]
+    drop: bool,
+
+    /// How long to trace allocations.
+    #[arg(long = "for", value_name = "DURATION", default_value = "30s", value_parser = muru_config::parse_duration)]
+    duration: Duration,
+
+    /// How many object types and allocation sites to show.
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    top: u32,
+}
+
+/// `muructl debug exec`.
+#[derive(Args)]
+pub struct ExecArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+
+    /// How long the code may run.
+    #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = muru_config::parse_duration)]
+    timeout: Duration,
+
+    /// The code, after --.
+    #[arg(last = true, required = true, value_name = "CODE")]
+    code: Vec<String>,
 }
 
 /// The logging subcommands (section 11.4).
@@ -587,35 +767,478 @@ pub enum LoggingCommand {
 
 /// Ask a release's workers something and print what came back.
 pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
-    let (op, args) = match &command {
-        DebugCommand::Status(args) => ("status", args),
-        DebugCommand::Stacks(args) => ("stacks", args),
-        DebugCommand::Tasks(args) => ("tasks", args),
-        DebugCommand::Inspect(args) => ("inspect", args),
+    if let DebugCommand::Attach(args) = &command {
+        return attach(args).await;
+    }
+
+    if let DebugCommand::Profile(profile) = &command
+        && profile.format == ProfileFormat::Pstats
+        && profile.output.is_none()
+    {
+        anyhow::bail!("--format pstats writes a binary file, so it needs --output");
+    }
+
+    // Section 11.7: an operation over a period gives the host that long
+    // and a little more before it gives up on a worker.
+
+    let period = |duration: Duration| duration.as_secs_f64() + 5.0;
+
+    let (op, args, request) = match &command {
+        DebugCommand::Status(args) => ("status", args, serde_json::json!({})),
+        DebugCommand::Stacks(args) => ("stacks", args, serde_json::json!({})),
+        DebugCommand::Tasks(args) => ("tasks", args, serde_json::json!({})),
+        DebugCommand::Inspect(args) => ("inspect", args, serde_json::json!({})),
+        DebugCommand::Profile(profile) => (
+            "profile",
+            &profile.common,
+            serde_json::json!({
+                "duration_s": profile.duration.as_secs_f64(),
+                "interval_ms": profile.interval.as_secs_f64() * 1000.0,
+                "requests": profile.requests.unwrap_or(0),
+                "path": profile.path.clone().unwrap_or_default(),
+                "timeout_s": period(profile.duration),
+            }),
+        ),
+        DebugCommand::Trace(trace) => (
+            "trace",
+            &trace.common,
+            serde_json::json!({
+                "duration_s": trace.duration.as_secs_f64(),
+                "force": trace.force,
+                "top": trace.top,
+                "timeout_s": period(trace.duration),
+            }),
+        ),
+        DebugCommand::Memory(memory) => (
+            "memory",
+            &memory.common,
+            serde_json::json!({
+                "trace": memory.trace,
+                "snapshot": if memory.snapshot {
+                    "take"
+                } else if memory.diff {
+                    "diff"
+                } else if memory.drop {
+                    "drop"
+                } else {
+                    ""
+                },
+                "duration_s": memory.duration.as_secs_f64(),
+                "top": memory.top,
+                "timeout_s": if memory.trace { period(memory.duration) } else { 30.0 },
+            }),
+        ),
+        DebugCommand::Exec(exec) => (
+            "exec",
+            &exec.common,
+            serde_json::json!({
+                "code": exec.code.join(" "),
+                "timeout_s": exec.timeout.as_secs_f64(),
+            }),
+        ),
+        DebugCommand::Attach(_) => unreachable!("attach is handled above"),
     };
 
-    let response = ask(
-        &args.socket,
-        &args.target,
-        op,
-        args.worker,
-        serde_json::json!({}),
-    )
-    .await?;
+    let response = ask(&args.socket, &args.target, op, args.worker, request).await?;
 
     if args.json {
         print_json(&response);
         return Ok(());
     }
 
-    match op {
-        "status" => print_status(&response),
-        "stacks" => print_stacks(&response),
-        "tasks" => print_tasks(&response),
-        _ => print_inspect(&response),
+    match &command {
+        DebugCommand::Status(_) => print_status(&response),
+        DebugCommand::Stacks(_) => print_stacks(&response),
+        DebugCommand::Tasks(_) => print_tasks(&response),
+        DebugCommand::Inspect(_) => print_inspect(&response),
+        DebugCommand::Profile(profile) => write_profile(&response, profile)?,
+        DebugCommand::Trace(_) => print_trace(&response),
+        DebugCommand::Memory(_) => print_memory(&response),
+        DebugCommand::Exec(_) => print_exec(&response),
+        DebugCommand::Attach(_) => {}
     }
 
     Ok(())
+}
+
+/// How often a session with nothing typed asks for pdb's output.
+const ATTACH_POLL: Duration = Duration::from_millis(300);
+
+/// `muructl debug attach` (section 11.7): a pdb session carried line by
+/// line, each line read going to the worker with a request whose answer
+/// brings what pdb wrote since, and the session polled while nothing is
+/// typed.
+async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let args = &attach_args.common;
+
+    let worker = match args.worker {
+        Some(worker) => worker,
+        None => {
+            let response = ask(
+                &args.socket,
+                &args.target,
+                "breakpoints",
+                None,
+                serde_json::json!({}),
+            )
+            .await?;
+            let waiting = response.workers.iter().find(|answer| {
+                parse_result(answer).is_some_and(|result| {
+                    result["waiting"]
+                        .as_array()
+                        .is_some_and(|waiting| !waiting.is_empty())
+                })
+            });
+
+            waiting
+                .or(response.workers.first())
+                .map_or(0, |answer| answer.index)
+        }
+    };
+
+    let exchange = |op: &'static str, request: serde_json::Value| async move {
+        let response = ask(&args.socket, &args.target, op, Some(worker), request).await?;
+        let answer = response
+            .workers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("worker {worker} did not answer"))?;
+
+        parse_result(answer).ok_or_else(|| anyhow::anyhow!("worker {worker}: {}", answer.error))
+    };
+
+    if attach_args.dap {
+        return relay_dap(attach_args.listen, worker, exchange).await;
+    }
+
+    let opened = exchange("attach", serde_json::json!({})).await?;
+    let session = opened["session"].as_u64().unwrap_or_default();
+    eprintln!(
+        "muru: attached to worker {worker} at {}; the end of input lets the code go on",
+        opened["where"].as_str().unwrap_or("?")
+    );
+    print!("{}", opened["output"].as_str().unwrap_or_default());
+    std::io::stdout().flush()?;
+
+    // Lines are read on a thread of their own, since reading blocks.
+
+    let (lines_tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let (op, request) = match tokio::time::timeout(ATTACH_POLL, lines.recv()).await {
+            Ok(Some(line)) => (
+                "attach_io",
+                serde_json::json!({"session": session, "input": line, "wait_s": 0.5}),
+            ),
+            Ok(None) => ("detach", serde_json::json!({"session": session})),
+            Err(_) => (
+                "attach_io",
+                serde_json::json!({"session": session, "input": "", "wait_s": 0.0}),
+            ),
+        };
+
+        let result = exchange(op, request).await?;
+        print!("{}", result["output"].as_str().unwrap_or_default());
+        std::io::stdout().flush()?;
+
+        if op == "detach" || result["ended"].as_bool().unwrap_or(true) {
+            eprintln!("muru: the session in worker {worker} has ended");
+            return Ok(());
+        }
+    }
+}
+
+/// `muructl debug attach --dap` (section 11.7): the Debug Adapter
+/// Protocol between an IDE connected to `listen` and debugpy's adapter in
+/// the worker, what the IDE sent going with each request and what the
+/// adapter sent coming back with its answer, base64, and the session
+/// polled while the IDE is quiet. The IDE closing its connection ends it.
+async fn relay_dap<F, R>(listen: SocketAddr, worker: u32, exchange: F) -> anyhow::Result<()>
+where
+    F: Fn(&'static str, serde_json::Value) -> R,
+    R: std::future::Future<Output = anyhow::Result<serde_json::Value>>,
+{
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("listening on {listen}"))?;
+    eprintln!(
+        "muru: waiting for an IDE to attach to {} with the Debug Adapter Protocol",
+        listener.local_addr()?
+    );
+    let (ide, _) = listener.accept().await?;
+    drop(listener);
+
+    let opened = exchange("attach", serde_json::json!({"dap": true})).await?;
+    let session = opened["session"].as_u64().unwrap_or_default();
+    eprintln!(
+        "muru: attached to worker {worker} at {}; the IDE disconnecting lets the code go on",
+        opened["where"].as_str().unwrap_or("?")
+    );
+
+    let (mut from_ide, mut to_ide) = ide.into_split();
+    let mut buffer = vec![0; 65536];
+
+    loop {
+        let (op, request) =
+            match tokio::time::timeout(ATTACH_POLL, from_ide.read(&mut buffer)).await {
+                Ok(Ok(0) | Err(_)) => ("detach", serde_json::json!({"session": session})),
+                Ok(Ok(read)) => (
+                    "attach_io",
+                    serde_json::json!({
+                        "session": session,
+                        "data": STANDARD.encode(&buffer[..read]),
+                        "wait_s": 0.5,
+                    }),
+                ),
+                Err(_) => (
+                    "attach_io",
+                    serde_json::json!({"session": session, "data": "", "wait_s": 0.0}),
+                ),
+            };
+
+        let result = exchange(op, request).await?;
+        let sent = STANDARD
+            .decode(result["data"].as_str().unwrap_or_default())
+            .context("the worker's answer")?;
+
+        // An IDE that has gone ends the session at the next turn.
+
+        if !sent.is_empty() && to_ide.write_all(&sent).await.is_err() {
+            exchange("detach", serde_json::json!({"session": session})).await?;
+            eprintln!("muru: the session in worker {worker} has ended");
+            return Ok(());
+        }
+
+        if op == "detach" || result["ended"].as_bool().unwrap_or(true) {
+            eprintln!("muru: the session in worker {worker} has ended");
+            return Ok(());
+        }
+    }
+}
+
+/// Merge the workers' collapsed stacks and write them, heaviest first, or
+/// as pstats, with the functions that took most samples on standard
+/// error.
+fn write_profile(response: &pb::DebugResponse, profile: &ProfileArgs) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let output = profile.output.as_deref();
+    let mut stacks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut leaves: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut rounds = 0;
+    let mut requests = 0;
+
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            eprintln!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        rounds += result["rounds"].as_u64().unwrap_or(0);
+        requests += result["requests"].as_u64().unwrap_or(0);
+
+        for (stack, count) in result["stacks"].as_object().into_iter().flatten() {
+            let count = count.as_u64().unwrap_or(0);
+            *stacks.entry(stack.clone()).or_default() += count;
+
+            if let Some(leaf) = stack.rsplit(';').next() {
+                *leaves.entry(leaf.to_owned()).or_default() += count;
+            }
+        }
+    }
+
+    let mut ordered: Vec<(&String, &u64)> = stacks.iter().collect();
+    ordered.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut text = String::new();
+
+    for (stack, count) in ordered {
+        text.push_str(&format!("{stack} {count}\n"));
+    }
+
+    let bytes = match profile.format {
+        ProfileFormat::Collapsed => text.into_bytes(),
+        ProfileFormat::Pstats => crate::pstats::encode(
+            stacks.iter().map(|(stack, count)| (stack.as_str(), *count)),
+            profile.interval.as_secs_f64(),
+        ),
+    };
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?
+        }
+        None => std::io::stdout().write_all(&bytes)?,
+    }
+
+    let total: u64 = leaves.values().sum();
+    let mut busiest: Vec<(String, u64)> = leaves.into_iter().collect();
+    busiest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    eprintln!(
+        "{total} samples of running Python code in {rounds} rounds across {} worker{}",
+        response.workers.len(),
+        if response.workers.len() == 1 { "" } else { "s" }
+    );
+
+    for (function, count) in busiest.iter().take(10) {
+        eprintln!(
+            "  {:>5.1}%  {function}",
+            *count as f64 * 100.0 / total.max(1) as f64
+        );
+    }
+
+    if profile.requests.is_some() || profile.path.is_some() {
+        eprintln!(
+            "{requests} request{} sampled to the end",
+            if requests == 1 { "" } else { "s" }
+        );
+    }
+
+    if let Some(path) = output {
+        let what = match profile.format {
+            ProfileFormat::Collapsed => "collapsed stacks",
+            ProfileFormat::Pstats => "pstats",
+        };
+
+        eprintln!("muru: {what} written to {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn print_trace(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}\n",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        println!("worker {} (pid {})", answer.index, answer.pid);
+        println!("  {:>10}  {:>8}  function", "total ms", "calls");
+
+        for function in result["functions"].as_array().into_iter().flatten() {
+            println!(
+                "  {:>10.3}  {:>8}  {}",
+                function["total_ms"].as_f64().unwrap_or(0.0),
+                function["calls"].as_u64().unwrap_or(0),
+                function["function"].as_str().unwrap_or("?")
+            );
+        }
+
+        println!();
+    }
+}
+
+fn print_memory(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}\n",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        println!("worker {} (pid {})", answer.index, answer.pid);
+
+        if let Some(memory) = result["memory"].as_object() {
+            let size = |name: &str| {
+                memory
+                    .get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .map(muru_config::format_size)
+                    .unwrap_or_else(|| "?".to_owned())
+            };
+            println!(
+                "  rss {}  pss {}  uss {}",
+                size("rss"),
+                size("pss"),
+                size("uss")
+            );
+        }
+
+        println!("  gc counts {}", result["gc"]["counts"]);
+        println!("  objects:");
+
+        for entry in result["objects"].as_array().into_iter().flatten() {
+            println!(
+                "    {:>9}  {}",
+                entry[1].as_u64().unwrap_or(0),
+                entry[0].as_str().unwrap_or("?")
+            );
+        }
+
+        match result["snapshot"].as_str() {
+            Some("taken") => println!(
+                "  snapshot kept; tracemalloc holds {} (peak {})",
+                muru_config::format_size(result["traced"].as_u64().unwrap_or(0)),
+                muru_config::format_size(result["peak"].as_u64().unwrap_or(0))
+            ),
+            Some("dropped") => println!("  snapshot dropped"),
+            Some("none") => println!("  no snapshot was kept"),
+            _ => {}
+        }
+
+        if let Some(allocations) = result["allocations"].as_array() {
+            if result["snapshot"] == "compared" {
+                println!("  allocated since the snapshot:");
+            } else {
+                println!("  allocated over the period:");
+            }
+
+            for site in allocations {
+                println!(
+                    "    {:>+12}  {:>+8}  {}",
+                    site["size_diff"].as_i64().unwrap_or(0),
+                    site["count_diff"].as_i64().unwrap_or(0),
+                    site["site"].as_str().unwrap_or("?")
+                );
+            }
+        }
+
+        println!();
+    }
+}
+
+fn print_exec(response: &pb::DebugResponse) {
+    for answer in &response.workers {
+        let Some(result) = parse_result(answer) else {
+            println!(
+                "worker {} (pid {}): {}",
+                answer.index, answer.pid, answer.error
+            );
+            continue;
+        };
+
+        println!("worker {} (pid {}):", answer.index, answer.pid);
+        print!("{}", result["output"].as_str().unwrap_or_default());
+
+        if let Some(value) = result["value"].as_str() {
+            println!("{value}");
+        }
+    }
 }
 
 /// Change logger levels in a release's workers.
@@ -796,6 +1419,8 @@ fn print_status(response: &pb::DebugResponse) {
 
         let state = if result["replaced"].as_bool() == Some(true) {
             "replaced"
+        } else if result["debugging"].as_bool() == Some(true) {
+            "debugging"
         } else if result["ready"].as_bool() == Some(true) {
             "ready"
         } else {
@@ -1082,6 +1707,11 @@ pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
     println!("apps     {} ({} releases)", status.apps, status.releases);
+
+    if !status.budget.is_empty() {
+        println!("budget   {}", status.budget);
+    }
+
     Ok(())
 }
 
@@ -1153,10 +1783,20 @@ pub struct DeployArgs {
     #[arg(long)]
     hold: bool,
 
+    /// Deploy although an overlay freezes the application's deploys
+    /// (section 9.6); recorded as an event.
+    #[arg(long)]
+    override_freeze: bool,
+
     /// How long the release this one replaces stays warm for an instant
     /// rollback (default 30m; 0 stops it as soon as it has drained).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     retain: Option<Duration>,
+
+    /// The workers each group of the release this one replaces keeps
+    /// while it stays warm (default 1; 0 keeps the host alone).
+    #[arg(long, value_name = "N")]
+    retain_workers: Option<u32>,
 
     /// Replace a worker after this many requests, with jitter.
     #[arg(long, value_name = "N")]
@@ -1168,8 +1808,9 @@ pub struct DeployArgs {
 
     /// A host timeout as NAME=DURATION: soft (interrupt a request that
     /// runs this long; off), hard (replace a worker whose request runs
-    /// this long; off), hard_drain_grace (10s) or shutdown (5s).
-    /// Repeatable.
+    /// this long; off), hard_drain_grace (10s), shutdown (5s) or
+    /// loop_stall (replace an ASGI worker whose event loop stalls this
+    /// long; 10s). Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -1439,9 +2080,10 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         .ok_or_else(|| format!("{text:?} is not NAME=DURATION, for example hard=60s"))?;
     let name = name.trim();
 
-    if !["soft", "hard", "hard_drain_grace", "shutdown"].contains(&name) {
+    if !["soft", "hard", "hard_drain_grace", "shutdown", "loop_stall"].contains(&name) {
         return Err(format!(
-            "{name:?} is not a host timeout name: soft, hard, hard_drain_grace or shutdown"
+            "{name:?} is not a host timeout name: soft, hard, hard_drain_grace, shutdown or \
+             loop_stall"
         ));
     }
 
@@ -1519,7 +2161,11 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
+        override_freeze: args.override_freeze,
+        reflection: None,
+        grpc_web_origins: Vec::new(),
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
+        retain_workers: args.retain_workers,
         max_requests: args.max_requests,
         max_lifetime_ms: args
             .max_lifetime
@@ -1532,6 +2178,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
+        loop_stall_timeout_ms: timeout_ms(&args.timeouts, "loop_stall"),
         memory_measure: memory_setting(&args.memory, "measure").unwrap_or_default(),
         memory_soft_limit: memory_setting(&args.memory, "soft_limit")
             .and_then(|text| muru_config::parse_size(&text).ok()),
@@ -1617,6 +2264,26 @@ pub enum RolloutCommand {
         #[arg(long = "max-p95", value_name = "DURATION", value_parser = muru_config::parse_duration)]
         max_p95: Option<Duration>,
 
+        /// The 99th percentile request time the candidate may not exceed.
+        #[arg(long = "max-p99", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        max_p99: Option<Duration>,
+
+        /// Worker crashes and timeout kills the candidate may have in a
+        /// step; one more rolls back at once.
+        #[arg(long = "max-worker-faults", value_name = "COUNT", default_value = "0")]
+        max_worker_faults: u64,
+
+        /// The 95th percentile wait for a worker thread the candidate
+        /// may not exceed.
+        #[arg(long = "max-queue-wait", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        max_queue_wait: Option<Duration>,
+
+        /// A URL requested through the edge from the candidate and the
+        /// baseline every few seconds, by preview; one failing on the
+        /// candidate alone rolls back. Repeatable.
+        #[arg(long = "probe", value_name = "URL")]
+        probes: Vec<String>,
+
         /// Requests the candidate must serve in a step before the gates
         /// judge it.
         #[arg(long = "min-requests", value_name = "COUNT", default_value = "100")]
@@ -1630,6 +2297,11 @@ pub enum RolloutCommand {
         #[arg(long)]
         wait: bool,
 
+        /// Go ahead although an overlay freezes the application's
+        /// deploys (section 9.6); recorded as an event.
+        #[arg(long)]
+        override_freeze: bool,
+
         #[command(flatten)]
         socket: SocketArgs,
     },
@@ -1639,6 +2311,11 @@ pub enum RolloutCommand {
     Bluegreen {
         /// The release, as app@release.
         release: String,
+
+        /// Go ahead although an overlay freezes the application's
+        /// deploys (section 9.6); recorded as an event.
+        #[arg(long)]
+        override_freeze: bool,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -1681,6 +2358,11 @@ pub enum RolloutCommand {
         /// The application.
         app: String,
 
+        /// Go ahead although an overlay freezes the application's
+        /// deploys (section 9.6); recorded as an event.
+        #[arg(long)]
+        override_freeze: bool,
+
         #[command(flatten)]
         socket: SocketArgs,
     },
@@ -1720,6 +2402,32 @@ pub struct ScaleArgs {
     /// Let the autoscaler decide the group's count again.
     #[arg(long)]
     unpin: bool,
+
+    /// Keep at least this many workers until --until or for --for, a
+    /// temporary schedule over the application (section 7.5).
+    #[arg(long = "min", value_name = "COUNT", conflicts_with_all = ["processes", "unpin"])]
+    min_workers: Option<u32>,
+
+    /// With --min, allow up to this many workers meanwhile.
+    #[arg(long = "max", value_name = "COUNT", requires = "min_workers")]
+    max_workers: Option<u32>,
+
+    /// When the floor ends, such as 2026-11-30T23:59 or an RFC 3339 time.
+    #[arg(
+        long,
+        value_name = "TIME",
+        requires = "min_workers",
+        conflicts_with = "duration"
+    )]
+    until: Option<String>,
+
+    /// How long the floor lasts, such as 4h.
+    #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, requires = "min_workers")]
+    duration: Option<Duration>,
+
+    /// The time zone --until is in; the local zone without it.
+    #[arg(long, value_name = "ZONE", requires = "until")]
+    timezone: Option<String>,
 
     #[command(flatten)]
     socket: SocketArgs,
@@ -1761,11 +2469,22 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     let target = args.target.unwrap_or_default();
     let (app, release) = split_target(&target)?;
 
-    if args.processes.is_none() && !args.unpin {
+    if args.processes.is_none() && !args.unpin && args.min_workers.is_none() {
         anyhow::bail!(
-            "give --processes COUNT to pin the group, or --unpin; `scale status` shows the state"
+            "give --processes COUNT to pin the group, --unpin, or --min COUNT with --until or --for; `scale status` shows the state"
         );
     }
+
+    let until_unix_ms = match (&args.until, args.duration) {
+        (Some(text), _) => muru_config::parse_moment(text, args.timezone.as_deref())
+            .map_err(|error| anyhow::anyhow!("--until: {error}"))?
+            .max(0) as u64,
+        (None, Some(duration)) => now_unix_ms() + duration.as_millis() as u64,
+        (None, None) if args.min_workers.is_some() => {
+            anyhow::bail!("--min needs --until TIME or --for DURATION")
+        }
+        (None, None) => 0,
+    };
 
     let mut client = client::connect(&args.socket.socket()).await?;
     let status = client
@@ -1775,10 +2494,22 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             group: args.group.clone(),
             processes: args.processes,
             unpin: args.unpin,
+            min_workers: args.min_workers,
+            max_workers: args.max_workers,
+            until_unix_ms,
         })
         .await
         .map_err(explain)?
         .into_inner();
+
+    if let Some(floor) = args.min_workers {
+        println!(
+            "muru: {app} {} kept at {floor} workers or more until {}",
+            args.group,
+            format_time(until_unix_ms)
+        );
+        return Ok(());
+    }
 
     match args.processes {
         Some(count) => println!(
@@ -1845,6 +2576,43 @@ fn print_scale_status(status: &pb::ScaleStatus) {
             group.policy
         );
 
+        if !group.capacity_from.is_empty() {
+            println!(
+                "  scheduled: {}-{} workers{} from {}",
+                group.floor,
+                group.ceiling,
+                if group.scale_in_held {
+                    ", no scale-in"
+                } else {
+                    ""
+                },
+                group.capacity_from.join(", ")
+            );
+        }
+
+        // Section 7.3: the workers' own signals, and what they say.
+
+        let measured = |value: Option<f64>, unit: &str| {
+            value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
+        };
+        println!(
+            "  workers: cpu {}, gil wait p95 {}, loop lag p95 {}",
+            measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+            measured(group.gil_wait_p95_ms, " ms"),
+            measured(group.loop_lag_p95_ms, " ms")
+        );
+
+        if !group.diagnosis.is_empty() {
+            if group.advice.is_empty() {
+                println!("  diagnosis: {}", group.diagnosis);
+            } else {
+                println!(
+                    "  diagnosis: {}; for the next release, {}",
+                    group.diagnosis, group.advice
+                );
+            }
+        }
+
         if !group.last_decision.is_empty() {
             println!(
                 "  last: {} ({} ago)",
@@ -1866,9 +2634,14 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             hold,
             max_error_rate,
             max_p95,
+            max_p99,
+            max_worker_faults,
+            max_queue_wait,
+            probes,
             min_requests,
             approve_each_step,
             wait,
+            override_freeze,
             socket,
         } => {
             let (app, id) = split_release(&release)?;
@@ -1886,8 +2659,13 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                         .collect(),
                     max_error_rate: max_error_rate / 100.0,
                     max_p95_ms: max_p95.map_or(0, |p95| p95.as_millis() as u64),
+                    max_p99_ms: max_p99.map_or(0, |p99| p99.as_millis() as u64),
+                    max_worker_faults,
+                    max_queue_wait_p95_ms: max_queue_wait.map_or(0, |wait| wait.as_millis() as u64),
+                    probes,
                     min_requests,
                     approve_each_step,
+                    override_freeze,
                 })
                 .await
                 .map_err(explain)?
@@ -1907,13 +2685,18 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
 
             Ok(())
         }
-        RolloutCommand::Bluegreen { release, socket } => {
+        RolloutCommand::Bluegreen {
+            release,
+            override_freeze,
+            socket,
+        } => {
             let (app, id) = split_release(&release)?;
             let mut client = client::connect(&socket.socket()).await?;
             let release = client
                 .promote_release(pb::PromoteReleaseRequest {
                     app: app.to_owned(),
                     release: id.to_owned(),
+                    override_freeze,
                 })
                 .await
                 .map_err(explain)?
@@ -1976,7 +2759,10 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
         RolloutCommand::Pause { app, socket } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .pause_rollout(pb::RolloutControlRequest { app })
+                .pause_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze: false,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -1989,7 +2775,10 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
         RolloutCommand::Resume { app, socket } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .resume_rollout(pb::RolloutControlRequest { app })
+                .resume_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze: false,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -1999,10 +2788,17 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        RolloutCommand::Promote { app, socket } => {
+        RolloutCommand::Promote {
+            app,
+            override_freeze,
+            socket,
+        } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .promote_rollout(pb::RolloutControlRequest { app })
+                .promote_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -2015,7 +2811,10 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
         RolloutCommand::Abort { app, socket } => {
             let mut client = client::connect(&socket.socket()).await?;
             let rollout = client
-                .abort_rollout(pb::RolloutControlRequest { app })
+                .abort_rollout(pb::RolloutControlRequest {
+                    app,
+                    override_freeze: false,
+                })
                 .await
                 .map_err(explain)?
                 .into_inner();
@@ -2097,7 +2896,7 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             format!("{}:{}", app.user, app.group)
         };
         println!(
-            "{:<20} {:<12} {:<12} {user}{}{}",
+            "{:<20} {:<12} {:<12} {user}{}{}{}",
             app.name,
             or_dash(&app.current_release),
             or_dash(&app.previous_release),
@@ -2106,11 +2905,188 @@ pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
             } else {
                 format!(" umask {}", app.umask)
             },
+            if app.priority == 0 {
+                String::new()
+            } else {
+                format!(" [priority {}]", app.priority)
+            },
             if app.maintenance {
                 " [maintenance]"
             } else {
                 ""
             }
+        );
+    }
+
+    Ok(())
+}
+
+/// The `muructl overlay` subcommands (section 9.10).
+#[derive(Subcommand)]
+pub enum OverlayCommand {
+    /// Every overlay, whether it is active and what it changes.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Apply an overlay now, until ended, or for a time.
+    Activate {
+        /// The overlay.
+        name: String,
+
+        /// End it on its own after this long, for example 2h.
+        #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration, conflicts_with = "until")]
+        duration: Option<Duration>,
+
+        /// End it on its own at this time, such as 2026-11-02T09:00 or an
+        /// RFC 3339 time.
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+
+        /// The time zone --until is in; the local zone without it.
+        #[arg(long, value_name = "ZONE", requires = "until")]
+        timezone: Option<String>,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Stop applying an overlay; one its schedule activated stays ended
+    /// until the schedule's window is over.
+    End {
+        /// The overlay.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// What activating an overlay now would change.
+    Preview {
+        /// The overlay.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Fold an active overlay's changes into the base configuration and
+    /// end it for good.
+    Promote {
+        /// The overlay.
+        name: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// List, activate, end, preview or promote overlays.
+pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
+    let (name, action, until, socket) = match command {
+        OverlayCommand::List { socket } => return list_overlays(&socket).await,
+        OverlayCommand::Preview { name, socket } => {
+            let mut client = client::connect(&socket.socket()).await?;
+            let preview = client
+                .preview_overlay(pb::PreviewOverlayRequest { name: name.clone() })
+                .await
+                .map_err(explain)?
+                .into_inner();
+
+            if preview.changes.is_empty() {
+                println!("muru: activating overlay {name} would change nothing now");
+            }
+
+            for change in preview.changes {
+                println!("{change}");
+            }
+
+            return Ok(());
+        }
+        OverlayCommand::Activate {
+            name,
+            duration,
+            until,
+            timezone,
+            socket,
+        } => {
+            let until = match (duration, until) {
+                (Some(duration), _) => Some(now_unix_ms() + duration.as_millis() as u64),
+                (None, Some(text)) => Some(
+                    muru_config::parse_moment(&text, timezone.as_deref())
+                        .map_err(anyhow::Error::msg)?
+                        .max(0) as u64,
+                ),
+                (None, None) => None,
+            };
+
+            (name, "activate", until, socket)
+        }
+        OverlayCommand::End { name, socket } => (name, "end", None, socket),
+        OverlayCommand::Promote { name, socket } => (name, "promote", None, socket),
+    };
+
+    let mut client = client::connect(&socket.socket()).await?;
+    let response = client
+        .control_overlay(pb::ControlOverlayRequest {
+            name: name.clone(),
+            action: action.to_owned(),
+            until_unix_ms: until.unwrap_or(0),
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    println!(
+        "muru: overlay {name} {}{}",
+        response.message,
+        until
+            .map(|until| format!(", until {}", format_time(until)))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+async fn list_overlays(socket: &SocketArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let overlays = client
+        .list_overlays(pb::ListOverlaysRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner()
+        .overlays;
+
+    if overlays.is_empty() {
+        println!("muru: no overlays are declared");
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<10} {:<34} CHANGES",
+        "OVERLAY", "STATE", "TRIGGER"
+    );
+
+    for overlay in overlays {
+        let mut state = if overlay.state.is_empty() {
+            "idle".to_owned()
+        } else if overlay.active {
+            format!("active ({})", overlay.state)
+        } else {
+            overlay.state.clone()
+        };
+
+        if overlay.until_unix_ms > 0 {
+            state.push_str(&format!(" until {}", format_time(overlay.until_unix_ms)));
+        } else if overlay.starts_unix_ms > 0 {
+            state.push_str(&format!(" from {}", format_time(overlay.starts_unix_ms)));
+        }
+
+        println!(
+            "{:<24} {:<10} {:<34} {}",
+            overlay.name,
+            state,
+            overlay.trigger,
+            overlay.changes.join(", ")
         );
     }
 
@@ -2163,6 +3139,34 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
         println!("muru: {} serves as usual again", status.app);
     }
 
+    Ok(())
+}
+
+/// The dashboard subcommands (section 10.7).
+#[derive(Subcommand)]
+pub enum DashboardCommand {
+    /// Print a single-use link that signs a browser in to the dashboard's
+    /// actions, which the [dashboard] table's `actions = true` enables.
+    Login {
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+}
+
+/// Run a dashboard subcommand.
+pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
+    let DashboardCommand::Login { socket } = command;
+    let mut client = client::connect(&socket.socket()).await?;
+    let link = client
+        .dashboard_login(pb::DashboardLoginRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner();
+    println!("{}", link.url);
+    eprintln!(
+        "muru: open the link within {} to sign in; it works once",
+        muru_config::format_duration(Duration::from_secs(link.expires_in_s))
+    );
     Ok(())
 }
 
@@ -2313,14 +3317,26 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
             format!("static {}, else {}", route.static_dir, route.fallback_app)
         };
 
-        // Section 9.4: the policy, when the route has one.
+        // Section 9.4: the policy, when the route has one, with the
+        // releases it gives client classes (section 4.14).
 
-        if !route.traffic.is_empty() || route.sticky || !route.hash_key.is_empty() {
+        if !route.traffic.is_empty()
+            || route.sticky
+            || !route.hash_key.is_empty()
+            || !route.traffic_classes.is_empty()
+        {
             let mut parts: Vec<String> = route
                 .traffic
                 .iter()
                 .map(|share| format!("{} {}%", share.release, share.percent))
                 .collect();
+            let mut classes: Vec<_> = route.traffic_classes.iter().collect();
+            classes.sort();
+            parts.extend(
+                classes
+                    .into_iter()
+                    .map(|(class, release)| format!("{class} to {release}")),
+            );
 
             if route.sticky {
                 parts.push("sticky".to_owned());
@@ -2351,6 +3367,22 @@ pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
 
         if !route.auth.is_empty() {
             target.push_str(&format!(" [auth by {}]", route.auth));
+        }
+
+        // Sections 4.6 and 4.11: the route's body limit and uploads.
+
+        if !route.max_body_size.is_empty() {
+            target.push_str(&format!(" [max body {}]", route.max_body_size));
+        }
+
+        if !route.upload.is_empty() {
+            target.push_str(&format!(" [uploads {}]", route.upload));
+        }
+
+        // Section 4.14: the client classes the route is for.
+
+        if !route.client_classes.is_empty() {
+            target.push_str(&format!(" [for {}]", route.client_classes.join(", ")));
         }
 
         println!("{:<16} {:<24} {target}", route.host, route.path);
@@ -2515,6 +3547,11 @@ pub struct ApplyArgs {
     #[arg(long)]
     prune: bool,
 
+    /// Deploy releases of applications an overlay freezes (section 9.6);
+    /// recorded as an event.
+    #[arg(long)]
+    override_freeze: bool,
+
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -2534,6 +3571,7 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
             document: document.to_toml().context("writing the configuration")?,
             dry_run: args.dry_run,
             prune: args.prune,
+            override_freeze: args.override_freeze,
         })
         .await
         .map_err(explain)?
@@ -2560,9 +3598,29 @@ pub enum ConfigCommand {
         #[arg(long)]
         all_releases: bool,
 
+        /// Write each rollout under way as where it stands: its candidate
+        /// declared, and the application's routes splitting traffic at
+        /// its current share.
+        #[arg(long)]
+        resolve_rollouts: bool,
+
         /// Write JSON rather than TOML.
         #[arg(long)]
         json: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
+    /// Show desired state; with --effective, as the active overlays leave
+    /// it, with what each sets that is in force.
+    Show {
+        /// One application rather than all.
+        app: Option<String>,
+
+        /// Apply the active overlays and attribute what they set.
+        #[arg(long)]
+        effective: bool,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -2587,6 +3645,7 @@ pub enum ConfigCommand {
 pub async fn config_export(
     app: Option<String>,
     all_releases: bool,
+    resolve_rollouts: bool,
     json: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
@@ -2595,6 +3654,8 @@ pub async fn config_export(
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
             all_releases,
+            effective: false,
+            resolve_rollouts,
         })
         .await
         .map_err(explain)?
@@ -2615,6 +3676,64 @@ pub async fn config_export(
         format_time(export.time_unix_ms),
         export.state_version
     );
+    print!("{}", export.document);
+    Ok(())
+}
+
+/// Show desired state, or with `effective` the state the active overlays
+/// make of it, headed by what each sets that is in force.
+pub async fn config_show(
+    app: Option<String>,
+    effective: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.socket()).await?;
+    let export = client
+        .export_config(pb::ExportConfigRequest {
+            app: app.unwrap_or_default(),
+            all_releases: false,
+            effective,
+            resolve_rollouts: false,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if !effective {
+        print!("{}", export.document);
+        return Ok(());
+    }
+
+    println!(
+        "# Muru effective state: muructl {} on {}, {}, state version {}.",
+        export.version,
+        export.node,
+        format_time(export.time_unix_ms),
+        export.state_version
+    );
+
+    if export.attributions.is_empty() {
+        println!("# No active overlay changes this configuration.\n");
+    } else {
+        println!("# The active overlays set, and the routes below include:");
+
+        for line in &export.attributions {
+            println!("#   {line}");
+        }
+
+        println!();
+    }
+
+    if !export.layers.is_empty() {
+        println!("# The releases' settings, and the layer each came from:");
+
+        for line in &export.layers {
+            println!("#   {line}");
+        }
+
+        println!();
+    }
+
     print!("{}", export.document);
     Ok(())
 }
@@ -2801,6 +3920,13 @@ fn report_json(report: &pb::ConfigReport) -> serde_json::Value {
         "unchanged": report.unchanged,
         "applied": report.applied,
     })
+}
+
+/// The time now, as Unix milliseconds.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }
 
 /// Unix milliseconds as an RFC 3339 instant in UTC.
@@ -3163,6 +4289,33 @@ fn listeners_from(document: &muru_config::Document) -> anyhow::Result<Vec<(Socke
     Ok(listeners)
 }
 
+/// Section 6.13: the listeners that limit cleartext HTTP/2, checked.
+fn h2c_from(
+    document: &muru_config::Document,
+) -> anyhow::Result<Vec<muru_proto::edge::v1::H2cPolicy>> {
+    let mut policies = Vec::new();
+
+    for listener in &document.listener {
+        let Some(allowed) = &listener.h2c else {
+            continue;
+        };
+
+        anyhow::ensure!(
+            !listener.tls,
+            "listener {}: h2c is for a listener without TLS, where HTTP/2 is cleartext",
+            listener.address
+        );
+        muru_edge::proxy::Networks::parse(allowed)
+            .map_err(|error| anyhow::anyhow!("listener {}: h2c: {error}", listener.address))?;
+        policies.push(muru_proto::edge::v1::H2cPolicy {
+            listener: listener.address.clone(),
+            allowed: allowed.clone(),
+        });
+    }
+
+    Ok(policies)
+}
+
 /// The edge limits from the [limits] table, with the defaults for the rest.
 fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Limits> {
     let mut limits = muru_edge::Limits::default();
@@ -3194,6 +4347,10 @@ fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Li
 
     if let Some(count) = table.max_requests_per_connection {
         limits.max_requests_per_connection = count;
+    }
+
+    if let Some(size) = &table.spool_quota {
+        limits.spool_quota = muru_config::parse_size(size).map_err(anyhow::Error::msg)?;
     }
 
     if let Some(count) = table

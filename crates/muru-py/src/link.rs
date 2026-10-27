@@ -13,10 +13,10 @@
 //! the request.
 
 use std::io;
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -26,8 +26,10 @@ use prost::Message;
 use pyo3::prelude::*;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
+
+use muru_proto::descriptors::FdReader;
 
 use crate::asgi;
 use crate::pool::Shared;
@@ -51,7 +53,7 @@ const COALESCE_MAX_DELAY: Duration = Duration::from_millis(10);
 /// Payloads up to this size are copied into one buffer with their header.
 const SMALL_PAYLOAD: usize = 16 * 1024;
 
-type Reader = BufReader<OwnedReadHalf>;
+type Reader = BufReader<FdReader>;
 type Writer = OwnedWriteHalf;
 
 /// Python callables run at points in the worker's life (section 6.3).
@@ -160,7 +162,17 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
             let stop = Arc::clone(&watchdog_stop);
             std::thread::Builder::new()
                 .name("muru-watchdog".to_owned())
-                .spawn(move || watchdog_loop(&watchdog_shared, timeout, &stop))?;
+                .spawn(move || watchdog_loop(&watchdog_shared, timeout, &stop, report))?;
+        }
+
+        // Section 7.6: the loop stall watchdog needs no interpreter, so it
+        // notices a loop held by code that never lets go.
+
+        if let Some(timeout) = accepting.loop_stall {
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-loop-watch".to_owned())
+                .spawn(move || loop_watch(timeout, &stop, report))?;
         }
 
         loop {
@@ -189,7 +201,7 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     // everything stops.
 
     Lifecycle::call(lifecycle.on_drain.as_ref());
-    shared.pool.shutdown();
+    shared.shutdown_pools();
 
     // The pool joins its threads; the loop's requests are waited for here.
 
@@ -211,8 +223,9 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Interrupt requests past the soft timeout until told to stop (section
-/// 7.6), logging each one.
-fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool) {
+/// 7.6), logging each one with where it was and telling the host, which
+/// makes it an event (section 11.7).
+fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(WATCHDOG_INTERVAL);
 
@@ -222,13 +235,111 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool) {
 
         let interrupted = Python::attach(|py| shared.interrupt_overdue(py));
 
-        for (request_id, method, path) in interrupted {
-            eprintln!(
-                "muru: request {request_id} {method} {path} ran past the soft timeout of {}, \
-                 interrupting it",
+        for request in interrupted {
+            let place = request
+                .place
+                .as_deref()
+                .map(|place| format!(" at {place}"))
+                .unwrap_or_default();
+            let message = format!(
+                "request {} {} {} ran past the soft timeout of {}{place}",
+                request.request_id,
+                request.method,
+                request.path,
                 wsgi::describe_seconds(timeout)
             );
+            eprintln!("muru: {message}, interrupting it");
+
+            if let Some(fd) = report {
+                report_event(fd, "request.soft_timeout", "warning", &message);
+            }
         }
+    }
+}
+
+/// When the event loop last beat, in milliseconds since the first look
+/// at the clock, or 0 before it first did.
+static LOOP_BEAT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How often the loop stall watchdog looks at the heartbeat.
+const LOOP_WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+fn clock_ms() -> u64 {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    let started = STARTED.get_or_init(Instant::now);
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How often the event loop beats.
+const LOOP_BEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Record that the event loop has run (section 7.6), and how much later
+/// than due it ran (section 7.3).
+pub fn loop_beat() {
+    let now = clock_ms().max(1);
+    let last = LOOP_BEAT_MS.swap(now, Ordering::Relaxed);
+
+    if last > 0 {
+        let interval = Duration::from_millis(now.saturating_sub(last));
+        crate::signals::LOOP_LAG.record(interval.saturating_sub(LOOP_BEAT_INTERVAL));
+    }
+}
+
+/// Tell the host, once a stall, when the event loop has gone longer than
+/// `timeout` without beating, so that it replaces the worker as for the
+/// hard timeout (section 7.6).
+fn loop_watch(timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
+    let mut reported = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(LOOP_WATCH_INTERVAL);
+        let beat = LOOP_BEAT_MS.load(Ordering::Relaxed);
+
+        if beat == 0 {
+            continue;
+        }
+
+        let silent = Duration::from_millis(clock_ms().saturating_sub(beat));
+
+        if silent <= timeout {
+            reported = false;
+            continue;
+        }
+
+        if reported {
+            continue;
+        }
+
+        reported = true;
+        let message = format!(
+            "the event loop has not run for {:.1} s, past the loop stall timeout of {}",
+            silent.as_secs_f64(),
+            wsgi::describe_seconds(timeout)
+        );
+        eprintln!("muru: {message}");
+
+        if let Some(fd) = report {
+            report_event(fd, "worker.loop_stalled", "error", &message);
+        }
+    }
+}
+
+/// Write an event for the host to raise on the report descriptor, as one
+/// line beside the status lines.
+fn report_event(fd: i32, kind: &str, level: &str, message: &str) {
+    let line = format!(
+        "{{\"event\":{},\"level\":{},\"message\":{}}}\n",
+        serde_json_string(kind),
+        serde_json_string(level),
+        serde_json_string(message)
+    );
+
+    // SAFETY: write from a buffer this frame owns, on the descriptor the
+    // host handed over for reports; a line under PIPE_BUF is written
+    // whole or not at all, and a failed write loses only this event.
+
+    unsafe {
+        libc::write(fd, line.as_ptr().cast(), line.len());
     }
 }
 
@@ -336,6 +447,21 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // Section 11.7: the bookkeeping is answered here, without the
+        // interpreter, so a worker whose threads hold it still says which
+        // request each thread serves while its stacks are read from
+        // outside.
+
+        if let Some(id) = bookkeeping_request(&line) {
+            let text = bookkeeping_answer(id, &shared);
+
+            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+                break;
+            }
+
+            continue;
+        }
+
         let answer = Python::attach(|py| {
             let active = shared.active_requests(py)?;
             let names = crate::pool::thread_names(py)?;
@@ -355,6 +481,54 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             break;
         }
     }
+}
+
+/// The id of a request line asking for the bookkeeping, as the host
+/// writes it: `{"id": N, "op": "bookkeeping", ...}`.
+fn bookkeeping_request(line: &str) -> Option<i64> {
+    if !line.contains("\"op\": \"bookkeeping\"") {
+        return None;
+    }
+
+    let rest = line.split_once("\"id\": ")?.1;
+    let end = rest
+        .find(|c: char| c != '-' && !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// The requests in flight, with the thread serving each, and the
+/// runtime's thread names, as an answer line.
+fn bookkeeping_answer(id: i64, shared: &Shared) -> String {
+    let requests: Vec<String> = shared
+        .active_summary()
+        .into_iter()
+        .map(|request| {
+            format!(
+                "{{\"request_id\":{},\"method\":{},\"path\":{},\"elapsed_ms\":{},\"thread\":{},\"native\":{}}}",
+                serde_json_string(&request.request_id),
+                serde_json_string(&request.method),
+                serde_json_string(&request.path),
+                request.elapsed_ms,
+                request
+                    .thread
+                    .map_or_else(|| "null".to_owned(), |thread| thread.to_string()),
+                request
+                    .native
+                    .map_or_else(|| "null".to_owned(), |native| native.to_string())
+            )
+        })
+        .collect();
+    let names: Vec<String> = crate::pool::thread_name_list()
+        .into_iter()
+        .map(|(ident, name)| format!("\"{ident}\":{}", serde_json_string(&name)))
+        .collect();
+
+    format!(
+        "{{\"id\":{id},\"ok\":true,\"result\":{{\"active\":[{}],\"names\":{{{}}}}}}}",
+        requests.join(","),
+        names.join(",")
+    )
 }
 
 /// A string as a JSON literal, escaped by hand so the runtime needs no
@@ -414,6 +588,8 @@ async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
                     memory.rss, memory.pss, memory.uss
                 ));
             }
+
+            line.push_str(&crate::signals::report_fields());
         }
 
         line.push_str("}\n");
@@ -464,7 +640,7 @@ impl Signals {
 
 async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
     let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::with_capacity(32 * 1024, read_half);
+    let mut reader = BufReader::with_capacity(32 * 1024, FdReader::new(read_half));
     let mut writer = write_half;
 
     match frame::read(&mut reader).await {
@@ -505,6 +681,8 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         websockets: shared.asgi.is_some(),
         files: true,
         max_message_size: MAX_MESSAGE_SIZE,
+        grpc_methods: shared.grpc_methods.clone(),
+        mount_pools: shared.mount_pools(),
     };
 
     if frame::write(&mut writer, kind::HELLO, 0, hello.encode_to_vec().into())
@@ -535,7 +713,28 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
             return;
         };
 
-        match handle_request(&mut reader, &mut writer, head, request_end, &shared).await {
+        // Section 5.7: the request's stored uploads arrived with its first
+        // bytes, one descriptor for each reference, in order.
+
+        let mut uploads = Vec::with_capacity(head.uploads.len());
+
+        for _ in 0..head.uploads.len() {
+            match reader.get_mut().take_fd() {
+                Some(fd) => uploads.push(fd),
+                None => return,
+            }
+        }
+
+        match handle_request(
+            &mut reader,
+            &mut writer,
+            head,
+            uploads,
+            request_end,
+            &shared,
+        )
+        .await
+        {
             Ok(next) => early = next,
             Err(_) => return,
         }
@@ -588,10 +787,13 @@ fn same_major(version: &str) -> bool {
     version.split('.').next() == pb::PROTOCOL_VERSION.split('.').next()
 }
 
+/// Serve one request. `uploads` are its stored files' descriptors, held
+/// until the request ends (section 4.11).
 async fn handle_request(
     reader: &mut Reader,
     writer: &mut Writer,
     head: pb::RequestHead,
+    uploads: Vec<OwnedFd>,
     request_end: bool,
     shared: &Arc<Shared>,
 ) -> io::Result<Option<frame::Frame>> {
@@ -606,8 +808,26 @@ async fn handle_request(
     };
 
     if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner) {
-        return handle_asgi_request(reader, writer, head, request_end, shared, asgi, runner).await;
+        return handle_asgi_request(
+            reader,
+            writer,
+            head,
+            uploads,
+            request_end,
+            shared,
+            asgi,
+            runner,
+        )
+        .await;
     }
+
+    // Section 6.7: a mount with threads of its own runs on them, unless
+    // the edge gave the request a shared thread the mount borrows.
+
+    let pool: &crate::pool::Pool = match &mount.pool {
+        Some(own) if !head.borrowed => own,
+        _ => &shared.pool,
+    };
 
     let app = mount.app;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -617,19 +837,22 @@ async fn handle_request(
     let (request_id, interrupt) = shared.request_started(&head);
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
-    let queued = shared.pool.spawn(Box::new(move |py| {
+    let queued = pool.spawn(Box::new(move |py| {
         worker_shared.request_on_this_thread(request_id);
+        let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
         wsgi::run(
             py,
             &worker_shared,
             request_id,
             &app,
             head,
+            &fds,
             body_rx,
             out_tx,
             worker_cancelled,
             interrupt,
         );
+        drop(uploads);
         worker_shared.request_finished(request_id);
     }));
 
@@ -722,10 +945,12 @@ async fn handle_request(
 /// `http.request` messages for the application's `receive()`, ABORT or the
 /// end of the response becomes `http.disconnect`, and the output goes
 /// through the same coalescing writer as a WSGI response.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 async fn handle_asgi_request(
     reader: &mut Reader,
     writer: &mut Writer,
     head: pb::RequestHead,
+    uploads: Vec<OwnedFd>,
     request_end: bool,
     shared: &Arc<Shared>,
     asgi: &asgi::Asgi,
@@ -735,11 +960,14 @@ async fn handle_asgi_request(
     let done = tokio::sync::Notify::new();
 
     // The task starts on the loop now; the channel is how the two sides
-    // of this function reach it.
+    // of this function reach it. The uploads stay open until this
+    // function returns, when the request has ended.
 
     let (request_id, _interrupt) = shared.request_started(&head);
+    let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
+    let _uploads = uploads;
 
-    let channel = match asgi::start(shared, asgi, &runner, &head, out_tx, request_id) {
+    let channel = match asgi::start(shared, asgi, &runner, &head, &fds, out_tx, request_id) {
         Ok(channel) => channel,
         Err(error) => {
             shared.request_finished(request_id);
@@ -753,6 +981,13 @@ async fn handle_asgi_request(
 
     if head.scope == pb::Scope::Websocket as i32 {
         return handle_websocket(reader, writer, out_rx, shared, channel, &done, request_id).await;
+    }
+
+    if head.scope == pb::Scope::Grpc as i32 {
+        return handle_grpc(
+            reader, writer, out_rx, shared, channel, &done, request_id, &head,
+        )
+        .await;
     }
 
     let read_side = async {
@@ -924,6 +1159,166 @@ async fn handle_websocket(
     let early = read_result?;
     write_result?;
     Ok(early)
+}
+
+/// Run one gRPC call (section 6.13): MESSAGE frames from the edge become
+/// `grpc.message` events, its END `grpc.end`, and ABORT or the end of the
+/// call `grpc.disconnect`, while the application's metadata, messages and
+/// trailers go out as RESPONSE, MESSAGE and END. A streaming call runs as
+/// long as it needs to, outside the soft timeout.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the call
+async fn handle_grpc(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    out_rx: mpsc::Receiver<Outgoing>,
+    shared: &Arc<Shared>,
+    channel: &asgi::Channel,
+    done: &tokio::sync::Notify,
+    request_id: u64,
+    head: &pb::RequestHead,
+) -> io::Result<Option<frame::Frame>> {
+    let path = String::from_utf8_lossy(&head.raw_path);
+    let streaming = shared
+        .grpc_methods
+        .iter()
+        .find(|method| {
+            method.path == path
+                || (method.path.ends_with('/') && path.starts_with(method.path.as_str()))
+        })
+        .is_none_or(|method| method.client_streaming || method.server_streaming);
+
+    if streaming {
+        shared.request_exempt(request_id);
+    }
+
+    let read_side = async {
+        loop {
+            let Some(next) = frame::read(reader).await? else {
+                channel.disconnect();
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the edge closed the connection during a gRPC call",
+                ));
+            };
+
+            match next.kind {
+                kind::MESSAGE => channel.deliver_message(next.payload, false).await,
+                kind::END => {
+                    channel.deliver_end().await;
+                    break;
+                }
+                kind::ABORT => {
+                    channel.disconnect();
+                    break;
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected frame type {other} in a gRPC call"),
+                    ));
+                }
+            }
+        }
+
+        // Section 5.5: the client going away is grpc.disconnect.
+
+        loop {
+            match watch_request(reader, done).await? {
+                Interrupt::Done => return Ok(None),
+                Interrupt::Request(next) => return Ok(Some(next)),
+                Interrupt::Abort => channel.disconnect(),
+                Interrupt::Closed => {
+                    channel.disconnect();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the edge closed the connection during a gRPC call",
+                    ));
+                }
+            }
+        }
+    };
+    let write_side = async {
+        let result = write_grpc_response(out_rx, writer).await;
+        channel.complete();
+        done.notify_one();
+        result
+    };
+
+    let (read_result, write_result) = tokio::join!(read_side, write_side);
+    channel.disconnect();
+    shared.request_finished(request_id);
+
+    let early = read_result?;
+    write_result?;
+    Ok(early)
+}
+
+/// Turn a gRPC call's output into frames as it comes, each message on its
+/// own: the head, the messages, and an END with the trailers or the
+/// application's failure.
+async fn write_grpc_response(
+    mut rx: mpsc::Receiver<Outgoing>,
+    writer: &mut Writer,
+) -> io::Result<()> {
+    loop {
+        match rx.recv().await {
+            Some(Outgoing::Head { headers, .. }) => {
+                let head = pb::ResponseHead {
+                    status: 200,
+                    headers: headers
+                        .into_iter()
+                        .map(|(name, value)| pb::Header {
+                            name: Bytes::from(name),
+                            value: Bytes::from(value),
+                        })
+                        .collect(),
+                    flush: pb::FlushPolicy::Immediate as i32,
+                    ..Default::default()
+                };
+                frame::write(writer, kind::RESPONSE, 0, head.encode_to_vec().into()).await?;
+            }
+            Some(Outgoing::Message { data, .. }) => {
+                frame::write(writer, kind::MESSAGE, 0, data).await?;
+            }
+            Some(Outgoing::Trailers(trailers)) => {
+                let end = pb::End {
+                    trailers: trailers
+                        .into_iter()
+                        .map(|(name, value)| pb::Header {
+                            name: Bytes::from(name),
+                            value: Bytes::from(value),
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
+            }
+            Some(Outgoing::Abort {
+                error,
+                reason,
+                detail,
+            }) => {
+                // The edge turns the failure into the call's status.
+
+                let end = pb::End {
+                    error,
+                    reason,
+                    detail,
+                    ..Default::default()
+                };
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
+            }
+            Some(Outgoing::Finished) | None => {
+                let end = pb::End {
+                    error: "the application returned without finishing the call".to_owned(),
+                    reason: "app_error".to_owned(),
+                    ..Default::default()
+                };
+                return frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await;
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// Turn the application's output into frames, coalescing small chunks.
@@ -1178,6 +1573,9 @@ async fn write_response(mut rx: mpsc::Receiver<Outgoing>, writer: &mut Writer) -
                     let flags = if text { flag::TEXT } else { 0 };
                     frame::write(writer, kind::MESSAGE, flags, data).await?;
                 }
+            }
+            Some(Some(Outgoing::Trailers(_))) => {
+                // Only a gRPC call sends trailers, through its own writer.
             }
             Some(Some(Outgoing::Close { code, reason })) => {
                 if upgraded {

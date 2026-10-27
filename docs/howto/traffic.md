@@ -101,6 +101,52 @@ same way, which is useful while a split sends most clients elsewhere.
 The preview header is not an `X-Muru-` header, so it is not among the
 headers the edge removes from requests.
 
+## Cohorts
+
+A cohort is a set of clients that gets a release of its own whatever
+the split says: testers with a cookie, say, or users a proxy marks with
+a header. Define the cohort as a [client class](client-classes.md),
+which matches headers and cookies by regular expression, and give the
+class a release in the policy's `classes`:
+
+```toml
+[[client_class]]
+name = 'beta'
+cookies = { plan = '^beta$' }
+
+[[route]]
+host = 'shop'
+app = 'shop'
+traffic = { classes = { beta = 'r2' } }
+```
+
+A request with `plan=beta` goes to `r2`, ahead of a sticky cookie and
+the split, and everyone else is routed as before. For an experiment
+that gives a share of all clients a release, use `split` with a `salt`
+of its own, so the experiment's clients are not the same ones another
+route's split picks.
+
+## Routes on different releases
+
+Each route has a policy of its own, so routes of one application can be
+on different releases. A route whose split gives one release all of its
+requests stays on that release while the others follow the serving one:
+
+```toml
+[[route]]
+host = 'shop'
+app = 'shop'
+
+[[route]]
+host = 'shop'
+path = '/legacy'
+app = 'shop'
+traffic = { split = { r1 = 100 } }
+```
+
+Deploys move `/` to each new release, and `/legacy` stays on `r1`,
+which is kept running for it.
+
 ## Seeing the policy
 
 `muructl route list` shows each route's shares, stickiness and key:

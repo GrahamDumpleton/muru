@@ -88,6 +88,24 @@ pub struct WorkerStatus {
     pub pss: Option<u64>,
     /// Unique set size in bytes, when measured.
     pub uss: Option<u64>,
+    /// CPU time used since it started, in milliseconds, when measured
+    /// (section 7.3).
+    pub cpu_ms: Option<u64>,
+    /// Whether its interpreter runs with a GIL.
+    pub gil_enabled: bool,
+    /// Its GIL waits, cumulative at or below each of the worker
+    /// protocol's signal bounds, then the count of all.
+    pub gil_wait: Vec<u64>,
+    /// Its event loop's lateness, likewise.
+    pub loop_lag: Vec<u64>,
+}
+
+/// A histogram's counts from a status line, or none.
+fn counts(value: &serde_json::Value) -> Vec<u64> {
+    value
+        .as_array()
+        .map(|items| items.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default()
 }
 
 impl HostMessage {
@@ -172,6 +190,10 @@ impl HostMessage {
                                 rss: worker["rss"].as_u64(),
                                 pss: worker["pss"].as_u64(),
                                 uss: worker["uss"].as_u64(),
+                                cpu_ms: worker["cpu_ms"].as_u64(),
+                                gil_enabled: worker["gil_enabled"].as_bool().unwrap_or(true),
+                                gil_wait: counts(&worker["gil_wait"]),
+                                loop_lag: counts(&worker["loop_lag"]),
                             })
                             .collect()
                     })
@@ -278,6 +300,8 @@ pub struct HostSpec {
     pub interface: muru_config::Interface,
     /// Whether the entrypoint is a factory, and when it is called.
     pub factory: Option<muru_config::FactoryPhase>,
+    /// Whether gRPC server reflection is served (section 6.13).
+    pub reflection: bool,
     /// Worker processes to fork.
     pub processes: usize,
     /// Application threads per worker.
@@ -320,6 +344,9 @@ pub struct HostSpec {
     pub hard_drain_grace: Duration,
     /// How long a worker told to stop gets before it is killed.
     pub shutdown_timeout: Duration,
+    /// How long an ASGI worker's event loop may stall before the worker
+    /// is replaced (section 7.6).
+    pub loop_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
     /// Environment variables for the host and its workers (section
@@ -403,6 +430,8 @@ pub struct HostMount {
     pub entrypoint: String,
     /// The interface the entrypoint speaks.
     pub interface: muru_config::Interface,
+    /// Threads of the mount's own (section 6.7).
+    pub threads: Option<muru_config::MountThreads>,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -516,18 +545,28 @@ impl HostProcess {
             command.arg("--single");
         }
 
+        if spec.reflection {
+            command.arg("--reflection");
+        }
+
         if let Some(log) = &spec.detach_to {
             command.arg("--detach").arg("--log-file").arg(log);
         }
 
         for mount in &spec.mounts {
-            command.arg("--mount").arg(format!(
+            let mut text = format!(
                 "{}={}={}={}",
                 mount.name,
                 mount.path,
                 mount.entrypoint,
                 mount.interface.as_str()
-            ));
+            );
+
+            if let Some(threads) = mount.threads {
+                text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
+            }
+
+            command.arg("--mount").arg(text);
         }
 
         for group in &spec.groups {
@@ -578,7 +617,9 @@ impl HostProcess {
             .arg("--hard-drain-grace")
             .arg(spec.hard_drain_grace.as_secs_f64().to_string())
             .arg("--shutdown-timeout")
-            .arg(spec.shutdown_timeout.as_secs_f64().to_string());
+            .arg(spec.shutdown_timeout.as_secs_f64().to_string())
+            .arg("--loop-stall-timeout")
+            .arg(spec.loop_stall_timeout.as_secs_f64().to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());

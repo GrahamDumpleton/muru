@@ -8,6 +8,7 @@
 //! races against the request's interrupt, so the soft timeout (section
 //! 7.6) wakes a thread blocked in the bridge at once.
 
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +73,9 @@ pub enum Outgoing {
         /// Text rather than binary.
         text: bool,
     },
+    /// The trailers that end a gRPC call (section 6.13), its status
+    /// among them.
+    Trailers(Vec<(Vec<u8>, Vec<u8>)>),
     /// The application closes the WebSocket (section 5.6).
     Close {
         /// The close code.
@@ -763,6 +767,7 @@ fn build_environ<'py>(
     py: Python<'py>,
     shared: &Shared,
     head: &pb::RequestHead,
+    uploads: &[RawFd],
     input: Bound<'py, Input>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let environ = PyDict::new(py);
@@ -846,12 +851,16 @@ fn build_environ<'py>(
         details.set_item(intern!(py, "cipher"), &tls.cipher)?;
         details.set_item(intern!(py, "server_name"), &tls.server_name)?;
         details.set_item(intern!(py, "alpn"), &tls.alpn)?;
+        details.set_item(intern!(py, "ja4"), &tls.ja4)?;
         environ.set_item(intern!(py, "muru.tls"), details)?;
     }
 
     environ.set_item(intern!(py, "wsgi.input"), input)?;
     environ.set_item(intern!(py, "wsgi.errors"), shared.errors.bind(py))?;
-    environ.set_item(intern!(py, "wsgi.multithread"), shared.threads > 1)?;
+    environ.set_item(
+        intern!(py, "wsgi.multithread"),
+        shared.multithread(&head.mount),
+    )?;
     environ.set_item(intern!(py, "wsgi.multiprocess"), shared.multiprocess)?;
     environ.set_item(intern!(py, "wsgi.run_once"), false)?;
     environ.set_item(intern!(py, "wsgi.input_terminated"), true)?;
@@ -863,6 +872,41 @@ fn build_environ<'py>(
 
     if head.max_body_size != 0 {
         environ.set_item(intern!(py, "muru.max_body_size"), head.max_body_size)?;
+    }
+
+    // Section 4.11: the files the edge stored, read through
+    // muru.uploads.files(), and the precheck that comes before them.
+
+    if !head.uploads.is_empty() {
+        environ.set_item(
+            intern!(py, "muru.uploads"),
+            crate::uploads::describe(py, &head.uploads, uploads)?,
+        )?;
+    }
+
+    if head.precheck {
+        environ.set_item(intern!(py, "muru.precheck"), true)?;
+    }
+
+    // Section 7.6: when the edge gives up on the request, in seconds
+    // since the epoch.
+
+    if head.deadline_unix_ms != 0 {
+        environ.set_item(
+            intern!(py, "muru.deadline"),
+            head.deadline_unix_ms as f64 / 1000.0,
+        )?;
+    }
+
+    // Sections 4.14 and 4.15: the client's class, and the route's site
+    // mode when it has one.
+
+    if !head.client_class.is_empty() {
+        environ.set_item(intern!(py, "muru.client_class"), &head.client_class)?;
+    }
+
+    if !head.mode.is_empty() {
+        environ.set_item(intern!(py, "muru.mode"), &head.mode)?;
     }
 
     // Section 4.10: a request that arrived by internal redirect carries
@@ -921,6 +965,7 @@ pub fn run(
     request: u64,
     app: &Py<PyAny>,
     head: pb::RequestHead,
+    uploads: &[RawFd],
     body_rx: mpsc::Receiver<Bytes>,
     tx: mpsc::Sender<Outgoing>,
     cancelled: Arc<AtomicBool>,
@@ -943,6 +988,7 @@ pub fn run(
         shared,
         app,
         &head,
+        uploads,
         body_rx,
         announce,
         &start_response,
@@ -1009,6 +1055,7 @@ fn run_app<'py>(
     shared: &Shared,
     app: &Py<PyAny>,
     head: &pb::RequestHead,
+    uploads: &[RawFd],
     body_rx: mpsc::Receiver<Bytes>,
     announce: Option<mpsc::Sender<Outgoing>>,
     start_response: &Bound<'py, StartResponse>,
@@ -1016,7 +1063,7 @@ fn run_app<'py>(
     interrupt: Arc<Interrupt>,
 ) -> PyResult<()> {
     let input = Bound::new(py, Input::new(body_rx, announce, interrupt))?;
-    let environ = build_environ(py, shared, head, input)?;
+    let environ = build_environ(py, shared, head, uploads, input)?;
     let result = app.bind(py).call1((environ, start_response))?;
 
     // Section 6.5: a file the edge can send itself goes by descriptor;

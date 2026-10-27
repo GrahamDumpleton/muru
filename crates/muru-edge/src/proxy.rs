@@ -114,6 +114,27 @@ pub(crate) fn parse_network(text: &str) -> Result<Network, String> {
     Ok(Network::Range(address, prefix))
 }
 
+/// A list of networks, as `[proxy]` trusted takes them, for other
+/// settings that name clients: a listener's h2c (section 6.13).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Networks(Vec<Network>);
+
+impl Networks {
+    /// Parse the entries: addresses, ranges, loopback, private or unix.
+    pub fn parse(entries: &[String]) -> Result<Self, String> {
+        entries
+            .iter()
+            .map(|entry| parse_network(entry))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    /// Whether a peer lies in one of them.
+    pub fn contains(&self, peer: &SocketAddr) -> bool {
+        self.0.iter().any(|network| network.contains(peer.ip()))
+    }
+}
+
 /// The compiled `[proxy]` table.
 #[derive(Debug, Clone, Default)]
 pub struct Trust {

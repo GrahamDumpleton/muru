@@ -35,7 +35,8 @@ pub mod kind {
     /// (empty payload), worker to edge.
     pub const CONTINUE: u8 = 7;
     /// One whole WebSocket message, raw bytes, in either direction; the
-    /// TEXT flag says which kind (section 5.6).
+    /// TEXT flag says which kind (section 5.6). On a gRPC call it is one
+    /// whole gRPC message (section 6.13).
     pub const MESSAGE: u8 = 8;
     /// Closes a WebSocket with a code and reason (protobuf `Close`), in
     /// either direction; each side sends exactly one (section 5.6).

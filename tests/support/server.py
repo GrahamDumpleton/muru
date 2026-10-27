@@ -20,6 +20,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "apps"
 
+LOG_TAIL_LINES = 80  # how much of the log a timed-out `wait_for_log` prints
+
 
 def muructl_path() -> Path | None:
     """Return the muructl binary to test, or None when it is not built."""
@@ -191,7 +193,11 @@ class Server:
             return handle.read().decode(errors="replace")
 
     def wait_for_log(self, text: str, timeout: float = 5.0) -> bool:
-        """Wait until the log written since `mark_log` contains text."""
+        """Wait until the log written since `mark_log` contains text.
+
+        On a timeout the log since the mark is printed, which pytest shows
+        with a failing test, so a wait that never ends can be diagnosed.
+        """
 
         deadline = time.monotonic() + timeout
 
@@ -200,6 +206,9 @@ class Server:
                 return True
             time.sleep(0.02)
 
+        lines = self.log_since_mark().splitlines()
+        print(f"{text!r} not in the log within {timeout} s; the last lines since the mark:")
+        print("\n".join(lines[-LOG_TAIL_LINES:]))
         return False
 
     def worker_pids(self) -> dict[int, int]:

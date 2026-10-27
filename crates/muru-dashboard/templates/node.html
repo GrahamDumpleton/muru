@@ -27,6 +27,8 @@ pre { margin: 0; font-size: 0.8rem; line-height: 1.4; white-space: pre-wrap; wor
 .status-2 { color: #0f6b3a; } .status-3 { color: #946200; } .status-4, .status-5 { color: #b42318; }
 .state-ready { color: #0f6b3a; } .state-failed, .state-stopped { color: #b42318; } .state-draining, .state-retained, .state-starting, .state-warming { color: #946200; }
 .level-warning { color: #946200; } .level-error { color: #b42318; }
+.rollout-running, .rollout-paused, .rollout-awaiting_approval { color: #946200; } .rollout-promoted { color: #0f6b3a; } .rollout-rolled_back { color: #b42318; }
+td small { color: #627d98; white-space: normal; }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem; }
 .chart { min-height: 12rem; }
 .ranges { float: right; font-size: 0.8rem; }

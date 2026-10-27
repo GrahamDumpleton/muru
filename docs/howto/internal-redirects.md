@@ -6,8 +6,8 @@
 Internal redirects from an application to a static route or another
 application path, internal routes and mounts, and the `X-Muru-Redirect`,
 `X-Accel-Redirect` and CGI local redirect forms; `X-Muru-Redirect` from
-a trusted [HTTP upstream](upstreams.md) too. Upload offloading, the
-reverse direction, is still to come. A decision the edge needs before it
+a trusted [HTTP upstream](upstreams.md) too. The reverse direction is
+[upload offloading](uploads.md). A decision the edge needs before it
 serves a route, such as for a WebSocket upgrade, is an [authentication
 sub-request](auth-subrequests.md).
 ```

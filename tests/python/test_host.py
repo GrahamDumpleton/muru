@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -81,3 +82,19 @@ def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> No
         "sockets": ["/a"],
         "groups": [{"name": "api", "sockets": ["/api-0"]}],
     }
+
+
+def test_a_mount_takes_threads_of_its_own() -> None:
+    context = host.Context(app="shop")
+    mount = host.Mount.parse("reports=/reports=shop:reports=wsgi=2,6", context, 4)
+    assert (mount.name, mount.path, mount.threads) == ("reports", "/reports", (2, 6))
+    assert host.Mount.parse("reports=/reports=shop:reports", context, 4).threads is None
+
+    for text in (
+        "reports=/reports=shop:reports=wsgi=2",
+        "reports=/reports=shop:reports=wsgi=3,2",
+        "reports=/reports=shop:reports=wsgi=0,0",
+        "reports=/reports=shop:reports=wsgi=-1,2",
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.Mount.parse(text, context, 4)

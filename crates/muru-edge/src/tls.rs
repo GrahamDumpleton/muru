@@ -222,6 +222,7 @@ pub(crate) fn info(connection: &rustls::ServerConnection) -> pb::TlsInfo {
             .alpn_protocol()
             .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
             .unwrap_or_default(),
+        ja4: String::new(),
     }
 }
 

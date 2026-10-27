@@ -85,7 +85,9 @@ whose host has no route for its path gets 404 with the reason `no_route`.
 The application's serving release takes the request, unless the route
 has a `traffic` table sharing its requests between releases (see
 [traffic between releases](traffic.md)); while the application has no
-release serving, the answer is 503 `no_workers`.
+release serving, the answer is 503 `no_workers`. A route may carry a
+`name`, unique among routes and made of lower case letters, digits and
+hyphens, by which [overlays](overlays.md) change it.
 
 The application sees the name the request matched with as `SERVER_NAME`
 (ASGI: the `server` tuple), or the host's `canonical` name when

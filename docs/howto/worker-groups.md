@@ -50,9 +50,14 @@ covers `/reports` and `/reports/daily`, not `/reportsx`); a trailing `*`
 means the same thing and is accepted for readability. The most specific
 match across all groups wins, and everything unclaimed goes to the default
 group. A group's `processes`, `threads`, `sync_threads` and `concurrency`
-default to the release's own values. A group needs at least one path and
-one process, cannot be named `default`, and takes a name of lowercase
-letters, digits and hyphens.
+default to the release's own values. A group needs at least one path, or
+a `match`, and one process, cannot be named `default`, and takes a name of
+lowercase letters, digits and hyphens.
+
+Under the daemon, `match = { client_class = [...] }` makes a group take
+the requests of those [client classes](client-classes.md#routing-by-class)
+for its paths, or for every path when it has none, ahead of the groups
+for every class.
 
 ## In the workers
 

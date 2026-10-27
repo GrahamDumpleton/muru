@@ -26,6 +26,27 @@ message Hello {
   bool websockets = 5;              // accepts websocket scopes
   bool files = 6;                   // accepts FILE frames
   uint32 max_message_size = 7;      // largest WebSocket message, bytes
+  repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
+  repeated MountPool mount_pools = 9; // mounts with threads of their own (section 6.7)
+}
+
+// A mount's own threads (section 6.7): reserved threads only it uses, and
+// the most requests it runs at once. Requests beyond the reserved threads,
+// up to the maximum, borrow threads of the shared pool.
+message MountPool {
+  string mount = 1;
+  uint32 reserved = 2;
+  uint32 max = 3;
+}
+
+// A gRPC method a worker serves (section 6.13). A path ending in / is a
+// whole service whose methods were not listed, taken as streaming both
+// ways.
+message GrpcMethod {
+  string path = 1;                  // /package.Service/Method, or /package.Service/
+  string mount = 2;                 // the mount that registered it, empty for the default
+  bool client_streaming = 3;
+  bool server_streaming = 4;
 }
 
 // Payload of a REQUEST frame.
@@ -54,15 +75,22 @@ message RequestHead {
   repeated UploadRef uploads = 22;  // descriptors passed with the request head
   bool precheck = 23;
   string http_version = 24;         // for example HTTP/1.1, for SERVER_PROTOCOL
-  Scope scope = 25;                 // http unless the request is a WebSocket upgrade
+  Scope scope = 25;                 // http unless the request is a WebSocket upgrade or a gRPC call
   bool expect_continue = 26;        // the client waits for 100 Continue before sending the body (section 5.5)
   string server_name = 27;          // the virtual host name matched, or its canonical name (section 4.3); SERVER_NAME when set
+  string client_class = 28;         // section 4.14: the class the edge assigned, default when no rule matched
+  string mode = 29;                 // section 4.15: the route's site mode, as muru.mode; none when empty
+  bool borrowed = 30;               // section 6.7: the edge gave the request a shared thread its mount borrows
 }
 
-// What a REQUEST frame opens (section 5.6).
+// What a REQUEST frame opens (sections 5.6 and 6.13). A gRPC call's
+// request and response bodies are MESSAGE frames, one whole message each,
+// already unframed and decompressed by the edge; the response's END
+// carries the status in its trailers.
 enum Scope {
   SCOPE_HTTP = 0;
   SCOPE_WEBSOCKET = 1;
+  SCOPE_GRPC = 2;
 }
 
 message Header {
@@ -81,6 +109,7 @@ message TlsInfo {
   string cipher = 2;                // negotiated cipher suite, for example TLS13_AES_256_GCM_SHA384
   string server_name = 3;           // the name the client asked for (SNI), if any
   string alpn = 4;                  // negotiated application protocol, for example h2
+  string ja4 = 5;                   // the ClientHello's JA4 fingerprint (section 4.14), if it was read
 }
 
 // How a request arrived by internal redirect (section 4.10): what the
@@ -99,8 +128,17 @@ message InternalContext {
   string original_host = 10;        // the host it asked for, as muru.original_host
 }
 
+// Section 4.11: a file the edge received and stored for the request,
+// whose descriptor is attached to the REQUEST frame; the descriptors are
+// matched to these by order.
 message UploadRef {
-  string ref = 1;
+  string ref = 1;                   // unique within the request, as the form's FIELD.ref
+  string field = 2;                 // the form field; empty for a raw upload
+  string filename = 3;              // the client's file name; may be empty
+  string content_type = 4;          // as the client declared it; may be empty
+  uint64 size = 5;                  // bytes received
+  map<string, string> digests = 6;  // hex digests by algorithm, such as sha256
+  string path = 7;                  // the spool file's name where it has one (not on Linux); empty otherwise
 }
 
 // Payload of a FILE frame (section 5.7): the response body, or the next

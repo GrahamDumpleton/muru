@@ -11,8 +11,10 @@
 //! every second for the charts; this crate knows nothing about how the
 //! figures are collected.
 
+pub mod actions;
 pub mod history;
 
+pub use actions::{Action, ActionSink, Sessions};
 pub use history::{History, Point, Reading, Sampler};
 
 use std::convert::Infallible;
@@ -143,6 +145,16 @@ pub type NodeSource = Arc<dyn Fn() -> BoxFuture<Option<NodeData>> + Send + Sync>
 /// or none when the daemon is stopping.
 pub type NodeMetricsSource = Arc<dyn Fn() -> BoxFuture<Option<String>> + Send + Sync>;
 
+/// The dashboard's actions when the daemon enables them (section 10.7):
+/// the sessions signed in, and what carries an action out.
+#[derive(Clone)]
+pub struct Actions {
+    /// Login codes and sessions, shared with the admin API.
+    pub sessions: Arc<Sessions>,
+    /// Carries an action out.
+    pub sink: ActionSink,
+}
+
 /// Everything the daemon's dashboard shows.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct NodeData {
@@ -168,6 +180,12 @@ pub struct NodeData {
     pub hosts: Vec<HostRow>,
     /// Routes.
     pub routes: Vec<RouteRow>,
+    /// Each running release's worker groups as the autoscaler sees them
+    /// (sections 7.3 and 7.4).
+    pub scaling: Vec<ScalingRow>,
+    /// Rollouts, those under way first, then the latest ended ones
+    /// (section 9.3).
+    pub rollouts: Vec<RolloutRow>,
     /// Recent requests, newest first.
     pub requests: Vec<NodeRequestRow>,
     /// Recent events, newest first.
@@ -185,8 +203,59 @@ pub struct AppRow {
     pub current: String,
     /// The release a rollback restores, or empty.
     pub previous: String,
+    /// When maintenance mode began, as a clock time, or empty when it is
+    /// off (section 4.12).
+    pub maintenance_since: String,
     /// Its releases, newest first.
     pub releases: Vec<ReleaseRow>,
+}
+
+/// One worker group of a running release, as the autoscaler sees it.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScalingRow {
+    /// app@release.
+    pub release: String,
+    /// The group.
+    pub group: String,
+    /// Workers ready, and the count being reached while they differ.
+    pub workers: String,
+    /// The policy as one phrase.
+    pub policy: String,
+    /// CPU per wall second as a share of what a worker can use,
+    /// formatted, or a dash.
+    pub cpu: String,
+    /// The 95th percentile GIL wait, formatted, or a dash.
+    pub gil_wait: String,
+    /// The 95th percentile event loop lag, formatted, or a dash.
+    pub loop_lag: String,
+    /// The bottleneck in words.
+    pub diagnosis: String,
+    /// The tuning it suggests, or empty.
+    pub advice: String,
+    /// The last decision and how long ago, or empty.
+    pub last_decision: String,
+}
+
+/// One rollout.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RolloutRow {
+    /// The application.
+    pub app: String,
+    /// The rollout's id.
+    pub id: String,
+    /// The release gaining traffic.
+    pub candidate: String,
+    /// The release that served when it began.
+    pub baseline: String,
+    /// Its state: running, paused, awaiting_approval, promoted or
+    /// rolled_back.
+    pub state: String,
+    /// The candidate's share in force, in percent.
+    pub percent: u32,
+    /// What it is doing, or why it ended.
+    pub message: String,
+    /// When it last changed, as a clock time.
+    pub updated: String,
 }
 
 /// One release.
@@ -346,12 +415,15 @@ struct LogsFragment<'a> {
 #[template(path = "node.html")]
 struct NodePage<'a> {
     data: &'a NodeData,
+    /// The signed-in session's form token, when actions are on.
+    csrf: Option<&'a str>,
 }
 
 #[derive(Template)]
 #[template(path = "node_overview.html")]
 struct NodeOverviewFragment<'a> {
     data: &'a NodeData,
+    csrf: Option<&'a str>,
 }
 
 #[derive(Template)]
@@ -510,7 +582,7 @@ fn page(rendered: Result<String, askama::Error>) -> Response<Body> {
 
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'"
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'"
             .parse()
             .expect("static"),
     );
@@ -522,7 +594,11 @@ fn whole(bytes: Bytes) -> Body {
 }
 
 fn plain(status: StatusCode, text: &'static str) -> Response<Body> {
-    let mut response = Response::new(whole(Bytes::from_static(text.as_bytes())));
+    plain_text(status, text.to_owned())
+}
+
+fn plain_text(status: StatusCode, text: String) -> Response<Body> {
+    let mut response = Response::new(whole(Bytes::from(text)));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -540,6 +616,7 @@ pub async fn serve_node(
     metrics: NodeMetricsSource,
     history: Arc<History>,
     events: EventsSource,
+    actions: Option<Actions>,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -547,15 +624,17 @@ pub async fn serve_node(
         let metrics = Arc::clone(&metrics);
         let history = Arc::clone(&history);
         let events = Arc::clone(&events);
+        let actions = actions.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
                 let metrics = Arc::clone(&metrics);
                 let history = Arc::clone(&history);
                 let events = Arc::clone(&events);
+                let actions = actions.clone();
                 async move {
                     Ok::<_, Infallible>(
-                        respond_node(&request, &source, &metrics, &history, &events).await,
+                        respond_node(request, &source, &metrics, &history, &events, actions).await,
                     )
                 }
             });
@@ -571,15 +650,32 @@ pub async fn serve_node(
 }
 
 async fn respond_node(
-    request: &Request<Incoming>,
+    request: Request<Incoming>,
     source: &NodeSource,
     metrics: &NodeMetricsSource,
     history: &Arc<History>,
     events: &EventsSource,
+    actions: Option<Actions>,
 ) -> Response<Body> {
+    // Section 10.7: signing in and the actions, when they are on.
+
+    if request.method() == Method::POST && request.uri().path() == "/actions/maintenance" {
+        return act(request, actions.as_ref()).await;
+    }
+
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
     }
+
+    if request.uri().path() == "/login" {
+        return login(&request, actions.as_ref());
+    }
+
+    let request = &request;
+    let csrf = actions
+        .as_ref()
+        .and_then(|actions| signed_in(request, actions))
+        .map(|session| session.csrf);
 
     if let Some(response) = shared_paths(request, history) {
         return response;
@@ -626,8 +722,20 @@ async fn respond_node(
     };
 
     match path {
-        "/" => page(NodePage { data: &data }.render()),
-        "/fragment/node/overview" => page(NodeOverviewFragment { data: &data }.render()),
+        "/" => page(
+            NodePage {
+                data: &data,
+                csrf: csrf.as_deref(),
+            }
+            .render(),
+        ),
+        "/fragment/node/overview" => page(
+            NodeOverviewFragment {
+                data: &data,
+                csrf: csrf.as_deref(),
+            }
+            .render(),
+        ),
         "/fragment/node/requests" => page(NodeRequestsFragment { data: &data }.render()),
         "/fragment/node/events" => page(NodeEventsFragment { data: &data }.render()),
         "/fragment/node/logs" => page(NodeLogsFragment { data: &data }.render()),
@@ -644,6 +752,8 @@ async fn respond_node(
         "/v1/apps" => json(&data.apps),
         "/v1/hosts" => json(&data.hosts),
         "/v1/routes" => json(&data.routes),
+        "/v1/scaling" => json(&data.scaling),
+        "/v1/rollouts" => json(&data.rollouts),
         "/v1/events" => json(&data.events),
         "/v1/requests" => json(&data.requests),
         _ => match path
@@ -656,6 +766,120 @@ async fn respond_node(
             },
             None => plain(StatusCode::NOT_FOUND, "not found\n"),
         },
+    }
+}
+
+/// The session a request's cookie names, if it is live.
+fn signed_in(request: &Request<Incoming>, actions: &Actions) -> Option<actions::Session> {
+    request
+        .headers()
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(name, _)| *name == actions::SESSION_COOKIE)
+        .and_then(|(_, id)| actions.sessions.session(id.trim()))
+}
+
+/// Redeem a login link: a session cookie and back to the page.
+fn login(request: &Request<Incoming>, actions: Option<&Actions>) -> Response<Body> {
+    let Some(actions) = actions else {
+        return plain(StatusCode::NOT_FOUND, "the dashboard's actions are off\n");
+    };
+
+    let code = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("code="))
+        .unwrap_or_default();
+
+    let Some((id, _)) = actions.sessions.redeem(code) else {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "this login link is unknown, used or expired; muructl dashboard login gives another\n",
+        );
+    };
+
+    let mut response = plain(StatusCode::SEE_OTHER, "signed in\n");
+    let headers = response.headers_mut();
+    headers.insert(http::header::LOCATION, "/".parse().expect("static"));
+
+    if let Ok(cookie) = format!(
+        "{}={id}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict",
+        actions::SESSION_COOKIE
+    )
+    .parse()
+    {
+        headers.insert(http::header::SET_COOKIE, cookie);
+    }
+
+    response
+}
+
+/// Carry out an action posted by a page of the dashboard's own origin,
+/// for a live session, with the session's token.
+async fn act(request: Request<Incoming>, actions: Option<&Actions>) -> Response<Body> {
+    let Some(actions) = actions else {
+        return plain(StatusCode::NOT_FOUND, "the dashboard's actions are off\n");
+    };
+
+    let Some(session) = signed_in(&request, actions) else {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "not signed in; muructl dashboard login gives a link\n",
+        );
+    };
+
+    let header = |name: http::header::HeaderName| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let origin = header(http::header::ORIGIN);
+    let host = header(http::header::HOST);
+
+    if origin.is_none() || origin != host.map(|host| format!("http://{host}")) {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "an action must come from the dashboard's own page\n",
+        );
+    }
+
+    let body = match http_body_util::Limited::new(request.into_body(), 4096)
+        .collect()
+        .await
+    {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "the form is too large\n"),
+    };
+    let fields = actions::form_fields(&body);
+
+    if !actions::same_token(fields.get("csrf").map_or("", String::as_str), &session.csrf) {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "the form's token is not this session's\n",
+        );
+    }
+
+    let action = Action::Maintenance {
+        app: fields.get("app").cloned().unwrap_or_default(),
+        on: fields.get("state").map(String::as_str) == Some("on"),
+    };
+
+    match (actions.sink)(action, session.label).await {
+        Ok(_) => {
+            let mut response = plain(StatusCode::SEE_OTHER, "done\n");
+            response
+                .headers_mut()
+                .insert(http::header::LOCATION, "/".parse().expect("static"));
+            response
+        }
+        Err(error) => plain_text(StatusCode::CONFLICT, format!("{error}\n")),
     }
 }
 

@@ -4,9 +4,10 @@
 :class: note
 
 Named mounts at path prefixes, any mix of WSGI and ASGI in the same
-workers, in development mode and under the daemon, and internal mounts.
-Per-mount thread pools and connection limits, gRPC mounts and the groups
-`mounts` subset are still to come.
+workers, in development mode and under the daemon, internal mounts, and
+threads of a mount's own. [gRPC mounts](grpc.md) have a page of their
+own. Per-mount connection limits and the groups `mounts` subset are
+still to come.
 ```
 
 A release can serve several entrypoints from the same worker processes,
@@ -66,9 +67,42 @@ A worker with any ASGI mount runs one event loop, and every ASGI
 application on it, the default mount's or a named one's, has its own
 lifespan: each is started before the worker is ready and shut down when
 it stops, with its own `state` copied into its requests. WSGI mounts share
-the worker's thread pool. A worker whose default mount is WSGI is sized by
-its threads at the edge, one whose default is ASGI by its concurrency;
-per-mount pools are still to come.
+the worker's thread pool unless they have threads of their own. A worker
+whose default mount is WSGI is sized by its threads at the edge, one whose
+default is ASGI by its concurrency.
+
+## Threads of a mount's own
+
+A WSGI mount's `threads` gives it threads that only it uses, so the rest
+of the application cannot take them all. A number is a pool of its own:
+
+```toml
+[mounts.reports]
+path = "/reports"
+entrypoint = "chat.reports:application"
+threads = 4
+```
+
+and a table reserves some threads and lets the mount borrow the worker's
+shared threads beyond them, up to a maximum of requests at once:
+
+```toml
+[mounts.reports]
+path = "/reports"
+entrypoint = "chat.reports:application"
+threads = { reserved = 2, max = 6 }
+```
+
+Here two of the mount's requests always have a thread, and up to four
+more run on the shared threads when those are free. `reserved = 0` caps
+the mount's share of the shared threads without reserving any. Requests
+beyond what a mount can run wait at the edge, as they do for the shared
+threads, until the queue timeout. `wsgi.multithread` is True when the
+mount can run more than one request at once.
+
+On a [gRPC mount](grpc.md), `threads` is a number: the threads its
+synchronous handlers run on. An ASGI mount runs on the event loop and
+takes no `threads`.
 
 Mounts share one interpreter: two applications that rely on process-wide
 globals need separate releases.
