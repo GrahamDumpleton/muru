@@ -521,6 +521,11 @@ def test_a_session_that_may_act_promotes_rolls_back_scales_restarts_and_drains(
         assert 'action="actions/rollback"' not in page
         assert page.count('action="actions/scale"') == 2 and "<button>Unpin</button>" not in page
 
+        # The section is swapped in afresh every two seconds, so what is
+        # typed into a form is kept across the swap.
+
+        assert 'id="pin-shop-r1-default" hx-preserve="true"' in page
+
         status, headers = post("promote", {"app": "shop", "release": "r2"})
         assert status == 303 and headers["location"] == "../"
         assert current() == "r2"
@@ -582,6 +587,7 @@ def test_a_session_that_may_act_promotes_rolls_back_scales_restarts_and_drains(
             'action="actions/restart"' in page
             and 'name="back" value="workers?release=shop@r1"' in page
         )
+        assert f'id="force-{chosen}" hx-preserve="true"' in page
         page = fetch_with(port, f"/worker?release=shop@r1&worker={chosen}", acting)
         assert f'name="back" value="worker?release=shop@r1&#38;worker={chosen}"' in page
         status, headers = post(
