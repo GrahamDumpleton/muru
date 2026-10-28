@@ -874,6 +874,9 @@ async fn serve<I>(
                         secure,
                         ids: &shared.request_ids,
                         client_class: &client_class,
+                        host: host.as_deref(),
+                        virtual_host: None,
+                        method: parts.method.as_str(),
                     },
                     origin.as_ref(),
                 );
@@ -1011,6 +1014,9 @@ async fn serve<I>(
                                 secure,
                                 ids: &shared.request_ids,
                                 client_class: &client_class,
+                                host: host.as_deref(),
+                                virtual_host: None,
+                                method: parts.method.as_str(),
                             },
                         },
                     )

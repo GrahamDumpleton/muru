@@ -117,6 +117,7 @@ class Daemon:
         cafile: Path | None = None,
         server_hostname: str | None = None,
         headers: dict[str, str] | None = None,
+        method: str = "GET",
     ) -> support.Response:
         """One request, with a Host header and, given a CA file, over TLS.
 
@@ -137,7 +138,7 @@ class Daemon:
             )
 
         try:
-            connection.request("GET", path, headers=headers)
+            connection.request(method, path, headers=headers)
             raw = connection.getresponse()
             return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
         finally:

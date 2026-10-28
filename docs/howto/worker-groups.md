@@ -6,8 +6,9 @@
 Named groups with their own process and thread counts, selected by path
 prefix, in development mode and under the daemon, each with its own
 scaling policy (see [scaling](scaling.md)), timeouts and memory policy,
-and optional groups the release is ready without. Match lists with host
-and method conditions and the `mounts` subset are still to come.
+optional groups the release is ready without, and match lists that ask a
+client class, host or method of a request beside its path. The `mounts`
+subset is still to come.
 ```
 
 A release can split its paths across named worker groups, all forked from
@@ -54,10 +55,44 @@ default to the release's own values. A group needs at least one path, or
 a `match`, and one process, cannot be named `default`, and takes a name of
 lowercase letters, digits and hyphens.
 
-Under the daemon, `match = { client_class = [...] }` makes a group take
-the requests of those [client classes](client-classes.md#routing-by-class)
-for its paths, or for every path when it has none, ahead of the groups
-for every class.
+## Match lists
+
+A group's `match` table asks more of a request than its path: the
+[client classes](client-classes.md#routing-by-class) it takes, the hosts
+it serves, or the methods it handles. A request matches the group when
+its path is under one of the group's paths, or any path for a group
+with none, and every list the group gives names the request's class,
+host or method:
+
+```toml
+[groups.uploads]
+paths = ["/files/*"]
+match = { method = ["POST", "PUT"] }
+processes = 2
+
+[groups.partner]
+paths = ["/reports/*"]
+match = { host = ["partner.example.com"] }
+threads = 4
+
+[groups.crawlers]
+match = { client_class = ["ai_crawler"] }
+processes = 1
+```
+
+`host` names a [virtual host](virtual-hosts.md) by its configured name or
+by one of the names it answers to, written exactly, and under `muructl
+run` the name the request carries; `method` is compared in upper case;
+`client_class` names classes the daemon defines. A header condition is
+written once as a client class and the group names the class.
+
+A group asking more of a request comes before one asking less: a group
+with two lists is tried before a group with one, and a group with a list
+before a group with none, so a class's group still comes ahead of the
+groups for every class. Among groups asking as much, the longer path
+prefix wins. Two groups that ask the same of the same path are refused,
+since nothing could order them; two that ask different methods of the
+same path are the usual way to split reads from writes.
 
 `muructl run` prints a line for each group when it starts, after the
 serving line, which describes the default group:

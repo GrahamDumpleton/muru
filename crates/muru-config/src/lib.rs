@@ -525,11 +525,13 @@ pub struct Group {
     /// match across all groups wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
-    /// The client classes (section 4.14) the group takes: their requests
-    /// for its paths, or for every path without `paths`, ahead of the
-    /// groups that name no class.
+    /// What the group asks of a request beside its path (ADR 0033): the
+    /// client classes (section 4.14), hosts and methods it takes, each
+    /// list any of its entries; a group asking more comes before one
+    /// asking less, and a group with lists and no `paths` takes every
+    /// path.
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<ClientMatch>,
+    pub matches: Option<GroupMatch>,
     /// Whether the release is ready without the group's workers (ADR
     /// 0033): its requests wait until one listens (default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -558,6 +560,24 @@ pub struct Group {
     /// release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+}
+
+/// Check a worker group's `match` table (ADR 0033): it must ask
+/// something, and its classes are named as a class is.
+pub fn check_group_match(matches: Option<&GroupMatch>) -> Result<(), String> {
+    let Some(matches) = matches else {
+        return Ok(());
+    };
+
+    if matches.client_class.is_empty() && matches.host.is_empty() && matches.method.is_empty() {
+        return Err("match names no client_class, host or method".to_owned());
+    }
+
+    for class in &matches.client_class {
+        check_policy_name("match.client_class", class)?;
+    }
+
+    Ok(())
 }
 
 /// Check a worker group's `timeouts` table (section 7.1): the stop
@@ -2350,13 +2370,30 @@ pub struct RateLimit {
     pub headers: Option<bool>,
 }
 
-/// The requests a rate limit, route or worker group applies to.
+/// The requests a rate limit or route applies to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientMatch {
     /// Client classes (section 4.14).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<String>,
+}
+
+/// The requests a worker group takes for its paths (ADR 0033): every
+/// list given must name the request's class, host or method.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMatch {
+    /// Client classes (section 4.14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<String>,
+    /// Hosts: a virtual host's name or a name it answers to, or under
+    /// `muructl run` the name the request carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host: Vec<String>,
+    /// Methods, compared in upper case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method: Vec<String>,
 }
 
 /// One key part or several.

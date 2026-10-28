@@ -159,6 +159,13 @@ pub struct GroupSpec {
     /// that name none; their requests for every path without `paths`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<String>,
+    /// The hosts it takes, lower case; every host when empty (ADR 0033).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host: Vec<String>,
+    /// The methods it takes, upper case; every method when empty (ADR
+    /// 0033).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method: Vec<String>,
     /// Whether the release is ready without the group's workers (ADR
     /// 0033).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

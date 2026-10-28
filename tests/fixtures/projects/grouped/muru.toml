@@ -21,3 +21,13 @@ memory = { check_interval = "1s" }
 paths = ["/batch/*"]
 optional = true
 processes = 1
+
+[groups.uploads]
+paths = ["/files/*"]
+match = { method = ["POST", "PUT"] }
+processes = 1
+
+[groups.partner]
+paths = ["/reports/*"]
+match = { host = ["partner.test"] }
+processes = 1

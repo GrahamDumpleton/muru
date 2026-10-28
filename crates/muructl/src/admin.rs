@@ -3871,6 +3871,8 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             ));
         }
 
+        serves.push_str(&group_asks(&group.hosts, &group.methods));
+
         lines.push((
             format!("group {}", group.name),
             format!(
@@ -3952,6 +3954,30 @@ struct Uses {
 
 /// A group's processes and what each takes at once: threads for WSGI,
 /// the event loop's concurrency and sync threads for ASGI.
+/// What a group asks of a request beside its path and class (ADR
+/// 0033): the hosts and methods it takes, as a suffix for its line.
+pub fn group_asks(hosts: &[String], methods: &[String]) -> String {
+    let mut asks = String::new();
+
+    if !hosts.is_empty() {
+        asks.push_str(&format!(
+            " on host{} {}",
+            if hosts.len() == 1 { "" } else { "s" },
+            hosts.join(", ")
+        ));
+    }
+
+    if !methods.is_empty() {
+        asks.push_str(&format!(
+            " with method{} {}",
+            if methods.len() == 1 { "" } else { "s" },
+            methods.join(", ")
+        ));
+    }
+
+    asks
+}
+
 fn group_size(
     uses: Uses,
     processes: u32,

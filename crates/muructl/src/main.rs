@@ -1566,6 +1566,28 @@ fn group_sockets_from(
                 .and_then(|group| group.matches.as_ref())
                 .map(|matches| matches.client_class.clone())
                 .unwrap_or_default(),
+            hosts: groups
+                .get(name)
+                .and_then(|group| group.matches.as_ref())
+                .map(|matches| {
+                    matches
+                        .host
+                        .iter()
+                        .map(|host| muru_edge::routing::normalise(host))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            methods: groups
+                .get(name)
+                .and_then(|group| group.matches.as_ref())
+                .map(|matches| {
+                    matches
+                        .method
+                        .iter()
+                        .map(|method| method.trim().to_ascii_uppercase())
+                        .collect()
+                })
+                .unwrap_or_default(),
             sockets: sockets.clone(),
         })
         .collect()
@@ -1623,12 +1645,29 @@ fn group_serves(group: &muru_config::Group) -> String {
         .as_ref()
         .map(|matches| matches.client_class.join(", "))
         .filter(|classes| !classes.is_empty());
+    let asks = group.matches.as_ref().map_or_else(String::new, |matches| {
+        admin::group_asks(
+            &matches
+                .host
+                .iter()
+                .map(|host| muru_edge::routing::normalise(host))
+                .collect::<Vec<_>>(),
+            &matches
+                .method
+                .iter()
+                .map(|method| method.trim().to_ascii_uppercase())
+                .collect::<Vec<_>>(),
+        )
+    });
 
-    match (group.paths.join(", "), classes) {
+    let serves = match (group.paths.join(", "), classes) {
+        (paths, None) if paths.is_empty() => "every path".to_owned(),
         (paths, None) => paths,
         (paths, Some(classes)) if paths.is_empty() => format!("client classes {classes}"),
         (paths, Some(classes)) => format!("{paths} and client classes {classes}"),
-    }
+    };
+
+    format!("{serves}{asks}")
 }
 
 /// What a named mount serves, from where, and on which threads.

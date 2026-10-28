@@ -295,6 +295,8 @@ message Group {
   repeated string paths = 2;            // prefixes, with an optional trailing *
   repeated string sockets = 3;
   repeated string client_classes = 4;   // section 4.14: the classes the group takes, ahead of groups naming none
+  repeated string hosts = 5;            // ADR 0033: the hosts it takes, lower case; every host when empty
+  repeated string methods = 6;          // ADR 0033: the methods it takes, upper case; every method when empty
 }
 
 message Applied {

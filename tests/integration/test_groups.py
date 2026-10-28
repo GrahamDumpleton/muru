@@ -7,7 +7,8 @@ each worker knows its group through the context and MURU_GROUP. Groups
 come from the project's table in development mode and from the applied
 file or the table under the daemon, and a restarted daemon takes every
 group's workers back. A release is ready without an optional group's
-workers, which join as each listens (ADR 0033).
+workers, which join as each listens, and a group's match lists ask a
+host or method of a request beside its path (ADR 0033).
 """
 
 from __future__ import annotations
@@ -58,6 +59,17 @@ def test_paths_reach_their_groups_in_development(development: support.Server) ->
     assert served_by(development.get("/api"))["group"] == "default"
     assert served_by(development.get("/batch/nightly"))["group"] == "batch", "optional group"
 
+    # ADR 0033: a group asking a method or a host of a request takes it
+    # ahead of the group for the path alone; under muructl run the host
+    # is the name the request carries.
+
+    assert served_by(development.request("POST", "/files/up"))["group"] == "uploads"
+    assert served_by(development.request("PUT", "/files/up"))["group"] == "uploads"
+    assert served_by(development.get("/files/up"))["group"] == "default"
+    partner = development.get("/reports/daily", headers={"Host": "partner.test"})
+    assert served_by(partner)["group"] == "partner"
+    assert served_by(development.get("/reports/daily"))["group"] == "reports"
+
     # The reports group has two workers of its own, numbered within it.
 
     workers = {served_by(development.get("/reports/x"))["worker"] for _ in range(30)}
@@ -72,6 +84,8 @@ def test_the_start_up_output_names_each_group(development: support.Server) -> No
     assert "muru: group reports serves /reports/* with 2 workers of 1 thread" in log
     assert "muru: group status serves /api/status with 1 worker of 8 threads" in log
     assert "muru: group batch serves /batch/* with 1 worker of 2 threads, optional" in log
+    assert "muru: group uploads serves /files/* with methods POST, PUT with 1 worker" in log
+    assert "muru: group partner serves /reports/* on host partner.test with 1 worker" in log
 
 
 def test_print_config_writes_the_groups() -> None:
@@ -95,6 +109,11 @@ def test_print_config_writes_the_groups() -> None:
         "memory": {"check_interval": "1s"},
     }
     assert release["groups"]["batch"] == {"paths": ["/batch/*"], "optional": True, "processes": 1}
+    assert release["groups"]["uploads"] == {
+        "paths": ["/files/*"],
+        "match": {"method": ["POST", "PUT"]},
+        "processes": 1,
+    }
 
 
 def test_a_group_has_timeouts_of_its_own(development: support.Server) -> None:
@@ -127,13 +146,20 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
     assert served_by(daemon.request("/reports/x"))["group"] == "reports"
     assert served_by(daemon.request("/"))["group"] == "default"
     assert served_by(daemon.request("/batch/nightly"))["group"] == "batch"
-    assert "6 workers ready" in daemon.muructl("events").stdout
+    assert served_by(daemon.request("/files/up", method="POST"))["group"] == "uploads"
+    assert served_by(daemon.request("/files/up"))["group"] == "default"
+    assert served_by(daemon.request("/reports/x", host="partner.test"))["group"] == "partner"
+    assert "8 workers ready" in daemon.muructl("events").stdout
     assert daemon.request("/slow/x?ms=1500").status == 504
     shown = daemon.muructl("release", "show", "grouped@r1").stdout
     assert (
         "workers 1 process of 2 threads group batch /batch/*: 1 process of 2 threads, optional "
+        "group partner /reports/* on host partner.test: 1 process of 2 threads "
         "group reports /reports/*: 2 processes of 1 thread"
     ) in " ".join(shown.split())
+    assert "group uploads /files/* with methods POST, PUT: 1 process of 2 threads" in " ".join(
+        shown.split()
+    )
 
     # A declared release's groups replace the table's, and resolve their
     # sizes from the release where silent; the export writes them whole.
@@ -208,7 +234,7 @@ def test_an_optional_group_that_cannot_start_leaves_the_release_ready(daemon: Da
     assert json.loads(held.body)["reason"] == "queue_full"
 
     events = daemon.muructl("events").stdout
-    assert "5 workers ready in" in events and "without the optional group batch" in events, events
+    assert "7 workers ready in" in events and "without the optional group batch" in events, events
     assert "of the optional group batch failed 3 times at start" in events, events
     assert "it is given up" in events, events
 
@@ -230,6 +256,19 @@ def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:
     for table, expected in [
         ("[app.shop.release.r1.groups.default]\npaths = ['/x']\n", "is not a valid worker group"),
         ("[app.shop.release.r1.groups.hot]\n", "has no paths"),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmatch = { host = ['*.x'] }\n",
+            'match.host "*.x" is not a host name',
+        ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmatch = { method = ['P 1'] }\n",
+            'match.method "P 1" is not a method',
+        ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmatch = { method = ['get'] }\n"
+            "[app.shop.release.r1.groups.cold]\npaths = ['/x/']\nmatch = { method = ['GET'] }\n",
+            "worker groups cold and hot ask the same of /x",
+        ),
         ("[app.shop.release.r1.groups.hot]\npaths = ['x']\n", "does not start with /"),
         ("[app.shop.release.r1.groups.hot]\npaths = ['/x']\nprocesses = 0\n", "has no processes"),
         (

@@ -461,6 +461,10 @@ struct GroupRecord {
     paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     client_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    methods: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     optional: bool,
     sockets: Vec<PathBuf>,
@@ -3548,6 +3552,8 @@ impl Daemon {
                     client_classes: group
                         .map(|group| group.client_class.clone())
                         .unwrap_or_default(),
+                    hosts: group.map(|group| group.host.clone()).unwrap_or_default(),
+                    methods: group.map(|group| group.method.clone()).unwrap_or_default(),
                     optional: group.is_some_and(|group| group.optional),
                     sockets: sockets.clone(),
                 }
@@ -3916,6 +3922,8 @@ impl Daemon {
                             name: group.name.clone(),
                             paths: group.paths.clone(),
                             client_classes: group.client_classes.clone(),
+                            hosts: group.hosts.clone(),
+                            methods: group.methods.clone(),
                             sockets: group
                                 .sockets
                                 .iter()
