@@ -3449,6 +3449,8 @@ impl Daemon {
                     threads: group.threads as usize,
                     sync_threads: group.sync_threads as usize,
                     concurrency: group.concurrency as usize,
+                    timeouts: group.timeouts.resolve(&spec.timeouts),
+                    memory: group.memory.clone().unwrap_or_else(|| spec.memory.clone()),
                 })
                 .collect(),
             mounts: spec
@@ -3460,6 +3462,8 @@ impl Daemon {
                     entrypoint: mount.entrypoint.clone(),
                     interface: mount.interface,
                     threads: mount.threads,
+                    concurrency: mount.concurrency.map(|value| value as usize),
+                    max_connections: mount.max_connections.map(|value| value as usize),
                 })
                 .collect(),
         };

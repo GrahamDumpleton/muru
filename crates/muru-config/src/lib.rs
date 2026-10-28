@@ -390,6 +390,44 @@ pub struct Mount {
     /// the worker's pool when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<MountThreads>,
+    /// Requests an ASGI mount runs at once on each worker, slots of its
+    /// own at the edge; it shares the worker's slots when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    /// Open WebSockets an ASGI mount holds at once on each worker, apart
+    /// from the requests it runs; unbounded but by its slots when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
+}
+
+/// Section 6.7: check an ASGI mount's own limits. Both belong to a mount
+/// declared ASGI, since they size its place on the event loop, and each
+/// is at least one.
+pub fn check_mount_limits(
+    concurrency: Option<usize>,
+    max_connections: Option<usize>,
+    interface: Option<Interface>,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("concurrency", concurrency),
+        ("max_connections", max_connections),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+
+        if interface != Some(Interface::Asgi) {
+            return Err(format!(
+                "{name}: only a mount declared interface = 'asgi' takes it"
+            ));
+        }
+
+        if value == 0 {
+            return Err(format!("{name}: must be at least 1"));
+        }
+    }
+
+    Ok(())
 }
 
 /// A mount's own threads (section 6.7): a fixed pool, `threads = 4`, or a
@@ -507,6 +545,33 @@ pub struct Group {
     /// How the group is scaled (sections 7.2 and 7.4); static when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<Scaling>,
+    /// The group's own timeouts (section 7.6), each the release's when
+    /// absent; `shutdown_timeout` and `websocket_drain_grace` belong to
+    /// the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<Timeouts>,
+    /// The group's own memory policy (section 7.7), each key the
+    /// release's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+}
+
+/// Check a worker group's `timeouts` table (section 7.1): the stop
+/// budget is the release's, so a group may not set its parts.
+pub fn check_group_timeouts(timeouts: Option<&Timeouts>) -> Result<(), String> {
+    let Some(timeouts) = timeouts else {
+        return Ok(());
+    };
+
+    if timeouts.shutdown_timeout.is_some() {
+        return Err("timeouts.shutdown_timeout applies to the whole release".to_owned());
+    }
+
+    if timeouts.websocket_drain_grace.is_some() {
+        return Err("timeouts.websocket_drain_grace applies to the whole release".to_owned());
+    }
+
+    Ok(())
 }
 
 /// A release definition, the `[app.NAME.release.ID]` table (appendix C):

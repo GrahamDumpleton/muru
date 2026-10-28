@@ -10,3 +10,8 @@ threads = 1
 [groups.status]
 paths = ["/api/status"]
 threads = 8
+
+[groups.slow]
+paths = ["/slow/*"]
+timeouts = { soft_timeout = "1s" }
+memory = { check_interval = "1s" }

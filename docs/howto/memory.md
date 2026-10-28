@@ -5,8 +5,10 @@
 
 Soft and hard memory limits per worker, measured as USS, PSS or RSS,
 with reclaiming before a recycle and a leak warning. The node-wide
-budget is in [scaling](scaling.md). Per-group limits, allocator settings
-and per-request memory deltas are still to come.
+budget is in [scaling](scaling.md), and a [worker
+group](worker-groups.md#timeouts-and-memory-per-group) can have limits
+of its own. Allocator settings and per-request memory deltas are still
+to come.
 ```
 
 A worker that grows too large is replaced through the same path as

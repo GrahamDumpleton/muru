@@ -90,12 +90,15 @@ struct WorkerSlots {
     idle: Mutex<Vec<Conn>>,
 }
 
-/// A mount's own threads on one worker (section 6.7): its reserved slots,
-/// and for one that borrows, its allowance of the shared pool's.
+/// A mount's own slots on one worker (section 6.7): its reserved slots,
+/// and for one that borrows, its allowance of the shared pool's; for an
+/// ASGI mount, its concurrency, or none when it shares the worker's
+/// slots, and the open WebSockets it may hold apart from them.
 struct MountSlots {
     reserved: usize,
-    own: Arc<Semaphore>,
+    own: Option<Arc<Semaphore>>,
     allowance: Option<Arc<Semaphore>>,
+    connections: Option<Arc<Semaphore>>,
 }
 
 impl WorkerSlots {
@@ -107,10 +110,12 @@ impl WorkerSlots {
             .map(|pool| {
                 let reserved = usize::try_from(pool.reserved).unwrap_or(usize::MAX);
                 let max = usize::try_from(pool.max).unwrap_or(usize::MAX);
+                let connections = usize::try_from(pool.connections).unwrap_or(usize::MAX);
                 let slots = MountSlots {
                     reserved,
-                    own: Arc::new(Semaphore::new(reserved)),
+                    own: (max > 0).then(|| Arc::new(Semaphore::new(reserved))),
                     allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
+                    connections: (connections > 0).then(|| Arc::new(Semaphore::new(connections))),
                 };
                 (pool.mount.clone(), slots)
             })
@@ -143,21 +148,25 @@ impl WorkerSlots {
             + self
                 .mounts
                 .values()
-                .map(|mount| mount.reserved - mount.own.available_permits())
+                .map(|mount| {
+                    mount.own.as_ref().map_or(0, |own| {
+                        mount.reserved.saturating_sub(own.available_permits())
+                    })
+                })
                 .sum::<usize>()
     }
 
     /// Slots free for a request to the mount: its own and what it may
-    /// borrow, or the shared pool's for a mount without threads.
+    /// borrow, or the shared pool's for a mount without slots of its own.
     fn free(&self, mount: &str) -> usize {
         let shared = self.semaphore.available_permits();
 
-        let Some(slots) = self.mounts.get(mount) else {
+        let Some(own) = self.mounts.get(mount).and_then(|slots| slots.own.as_ref()) else {
             return shared;
         };
 
-        slots.own.available_permits()
-            + slots
+        own.available_permits()
+            + self.mounts[mount]
                 .allowance
                 .as_ref()
                 .map_or(0, |allowance| allowance.available_permits().min(shared))
@@ -165,60 +174,91 @@ impl WorkerSlots {
 
     /// Take a slot for a request to the mount, waiting for one: one of
     /// its own first, else a shared one within its allowance, else the
-    /// shared pool's for a mount without threads. Says whether the slot
-    /// was borrowed.
-    async fn take(&self, mount: &str) -> io::Result<(Slot, bool)> {
+    /// shared pool's for a mount without slots of its own. A WebSocket
+    /// upgrade to a mount that bounds its open sockets first takes a
+    /// place among them, which it keeps once accepted. Says whether the
+    /// slot was borrowed.
+    async fn take(&self, mount: &str, upgrade: bool) -> io::Result<(Slot, bool)> {
         let closed = |_| io::Error::other("pool closed");
+        let slots = self.mounts.get(mount);
 
-        let Some(slots) = self.mounts.get(mount) else {
+        let connection = match slots.and_then(|slots| slots.connections.as_ref()) {
+            Some(connections) if upgrade => Some(
+                Arc::clone(connections)
+                    .acquire_owned()
+                    .await
+                    .map_err(closed)?,
+            ),
+            _ => None,
+        };
+
+        let Some(own) = slots.and_then(|slots| slots.own.as_ref()) else {
             let permit = Arc::clone(&self.semaphore)
                 .acquire_owned()
                 .await
                 .map_err(closed)?;
-            return Ok((Slot::new(permit, None), false));
+            return Ok((Slot::new(permit, None, connection), false));
         };
 
-        if let Ok(permit) = Arc::clone(&slots.own).try_acquire_owned() {
-            return Ok((Slot::new(permit, None), false));
+        if let Ok(permit) = Arc::clone(own).try_acquire_owned() {
+            return Ok((Slot::new(permit, None, connection), false));
         }
 
-        let Some(allowance) = &slots.allowance else {
-            let permit = Arc::clone(&slots.own)
-                .acquire_owned()
-                .await
-                .map_err(closed)?;
-            return Ok((Slot::new(permit, None), false));
+        let Some(allowance) = self.mounts[mount].allowance.as_ref() else {
+            let permit = Arc::clone(own).acquire_owned().await.map_err(closed)?;
+            return Ok((Slot::new(permit, None, connection), false));
         };
 
         let borrowed = async {
             let allowed = Arc::clone(allowance).acquire_owned().await?;
             let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
-            Ok::<_, tokio::sync::AcquireError>(Slot::new(permit, Some(allowed)))
+            Ok::<_, tokio::sync::AcquireError>((permit, allowed))
         };
 
         tokio::select! {
             biased;
-            permit = Arc::clone(&slots.own).acquire_owned() => {
-                Ok((Slot::new(permit.map_err(closed)?, None), false))
+            permit = Arc::clone(own).acquire_owned() => {
+                Ok((Slot::new(permit.map_err(closed)?, None, connection), false))
             }
-            slot = borrowed => Ok((slot.map_err(closed)?, true)),
+            slot = borrowed => {
+                let (permit, allowed) = slot.map_err(closed)?;
+                Ok((Slot::new(permit, Some(allowed), connection), true))
+            }
         }
     }
 }
 
 /// A request's hold on a worker (section 6.7): a slot of the shared pool
-/// or of its mount's own, and for a borrowed shared slot, the place in
-/// the mount's allowance it takes. Dropped, both are given back.
+/// or of its mount's own, for a borrowed shared slot the place in the
+/// mount's allowance it takes, and for a WebSocket upgrade to a mount
+/// that bounds its open sockets, its place among them. Dropped, all are
+/// given back.
 pub(crate) struct Slot {
-    _permit: OwnedSemaphorePermit,
-    _allowance: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
+    allowance: Option<OwnedSemaphorePermit>,
+    connection: Option<OwnedSemaphorePermit>,
 }
 
 impl Slot {
-    fn new(permit: OwnedSemaphorePermit, allowance: Option<OwnedSemaphorePermit>) -> Self {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        allowance: Option<OwnedSemaphorePermit>,
+        connection: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         Self {
-            _permit: permit,
-            _allowance: allowance,
+            permit: Some(permit),
+            allowance,
+            connection,
+        }
+    }
+
+    /// The WebSocket was accepted: a socket counted among the mount's
+    /// open connections gives its request slot back for the life of the
+    /// socket; one on a mount without that bound keeps the slot.
+    fn accepted(&mut self) {
+        if self.connection.is_some() {
+            self.permit = None;
+            self.allowance = None;
         }
     }
 }
@@ -400,16 +440,18 @@ impl LinkPool {
     /// Take a connection from the worker with the most free slots for the
     /// mount, waiting for one if every worker is busy.
     pub(crate) async fn acquire(&self, mount: &str) -> io::Result<Lease> {
-        self.acquire_avoiding(mount, None).await
+        self.acquire_avoiding(mount, None, false).await
     }
 
     /// As `acquire`, but not from `avoid` while there is another worker:
     /// the one that closed its connection before reading the request
-    /// (section 4.8).
+    /// (section 4.8); `upgrade` says the request is a WebSocket
+    /// handshake, which a mount may bound (section 6.7).
     pub(crate) async fn acquire_avoiding(
         &self,
         mount: &str,
         avoid: Option<usize>,
+        upgrade: bool,
     ) -> io::Result<Lease> {
         if self.workers.is_empty() {
             let Some(key) = &self.wake else {
@@ -423,7 +465,7 @@ impl LinkPool {
             let waiting = Waiting(&self.waiting);
             let pool = crate::wake::wakes().wait(key).await?;
             drop(waiting);
-            let mut lease = Box::pin(pool.acquire(mount)).await?;
+            let mut lease = Box::pin(pool.acquire_avoiding(mount, None, upgrade)).await?;
             lease.woken.get_or_insert(pool);
             return Ok(lease);
         }
@@ -457,7 +499,7 @@ impl LinkPool {
             let worker = &self.workers[best];
             self.waiting.fetch_add(1, Ordering::Relaxed);
             let waiting = Waiting(&self.waiting);
-            let (permit, borrowed) = worker.take(mount).await?;
+            let (permit, borrowed) = worker.take(mount, upgrade).await?;
             drop(waiting);
             let idle = worker.idle.lock().expect("pool poisoned").pop();
 
@@ -622,6 +664,17 @@ impl Return {
         let mut state = self.state.lock().expect("return state poisoned");
         state.reader = reader;
         self.report(&mut state);
+    }
+
+    /// Section 6.7: the worker accepted the WebSocket, so its hold on the
+    /// worker becomes a place among the mount's open sockets where the
+    /// mount bounds them.
+    pub(crate) fn websocket_accepted(&self) {
+        let mut state = self.state.lock().expect("return state poisoned");
+
+        if let Some(slot) = state.permit.as_mut() {
+            slot.accepted();
+        }
     }
 
     /// Take the writer back for a WebSocket relay, which holds both halves
@@ -1358,8 +1411,11 @@ async fn handle_inner(
     let (back, mut reader, mut writer, end, upgrading) = loop {
         let queued = Instant::now();
 
-        let acquired =
-            tokio::time::timeout(queue_timeout, pool.acquire_avoiding(&head.mount, avoid)).await;
+        let acquired = tokio::time::timeout(
+            queue_timeout,
+            pool.acquire_avoiding(&head.mount, avoid, upgrade.is_some()),
+        )
+        .await;
 
         let lease = match acquired {
             Ok(Ok(lease)) => lease,
@@ -1659,6 +1715,7 @@ async fn handle_inner(
             back.give_reader(None);
             return failing.worker_crashed("The worker connection was lost.");
         };
+        back.websocket_accepted();
         let response = crate::websocket::accepted_response(&upgrade, head.headers);
         tokio::spawn(crate::websocket::relay(crate::websocket::Relay {
             upgrade,

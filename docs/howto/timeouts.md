@@ -138,6 +138,11 @@ loop_stall_timeout = "10s"
 gil_stall_timeout = "30s"
 ```
 
+A [worker group](worker-groups.md#timeouts-and-memory-per-group) can
+set the soft, hard, hard drain grace, loop stall and GIL stall timeouts
+for itself, so that a group of slow paths has long ones while the rest
+of the application keeps short ones.
+
 Set the hard timeout above the edge's `deadline`, so that a slow request
 is answered 504 by the edge first and only a request that never returns
 costs a worker, and at least 5 seconds above the soft timeout, which

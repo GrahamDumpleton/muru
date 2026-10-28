@@ -24,6 +24,7 @@ def serve(
             Callable[..., Any],
             Callable[[Any, Channel], None] | None,
             tuple[int, int] | None,
+            tuple[int, int] | None,
         ]
     ] = [],
     report: int | None = None,

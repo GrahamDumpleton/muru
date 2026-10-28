@@ -4,10 +4,10 @@
 :class: note
 
 Named mounts at path prefixes, any mix of WSGI and ASGI in the same
-workers, in development mode and under the daemon, internal mounts, and
-threads of a mount's own. [gRPC mounts](grpc.md) have a page of their
-own. Per-mount connection limits and the groups `mounts` subset are
-still to come.
+workers, in development mode and under the daemon, internal mounts,
+threads of a WSGI mount's own and the concurrency and connection limits
+of an ASGI mount's own. [gRPC mounts](grpc.md) have a page of their own.
+The groups `mounts` subset is still to come.
 ```
 
 A release can serve several entrypoints from the same worker processes,
@@ -117,6 +117,36 @@ mount can run more than one request at once.
 On a [gRPC mount](grpc.md), `threads` is a number: the threads its
 synchronous handlers run on. An ASGI mount runs on the event loop and
 takes no `threads`.
+
+## Limits of an ASGI mount's own
+
+An ASGI mount runs on the worker's event loop and, without limits of its
+own, shares the worker's slots: beside a WSGI application its requests
+and open WebSockets take the WSGI threads' places at the edge, so a few
+hundred open sockets can hold every thread. Two settings give the mount
+a place of its own on each worker:
+
+```toml
+[mounts.ws]
+path = "/ws"
+entrypoint = "chat.asgi:websocket_app"
+interface = "asgi"
+concurrency = 500
+max_connections = 2000
+```
+
+`concurrency` is the requests the mount runs at once, slots the edge
+holds for it apart from the worker's others, and `max_connections` the
+open WebSockets it holds at once. A WebSocket handshake takes one of
+each; once the application accepts the socket it gives its request slot
+back and keeps its place among the connections for the life of the
+socket, so the mount's requests are not held up by its sockets. Requests
+and handshakes beyond either limit wait at the edge until the queue
+timeout. Either may be set alone: with `concurrency` alone, open
+sockets hold request slots as they do without limits, and with
+`max_connections` alone, requests share the worker's slots. Both need
+the mount declared `interface = "asgi"`, and both are per worker, like
+`threads`.
 
 Mounts share one interpreter: two applications that rely on process-wide
 globals need separate releases.

@@ -128,6 +128,13 @@ pub struct MountSpec {
     /// A 200 with a local Location and no body is an internal redirect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cgi_local_redirect: bool,
+    /// An ASGI mount's requests at once on each worker, slots of its own
+    /// at the edge (section 6.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    /// An ASGI mount's open WebSockets at once on each worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
     /// Directories the mount's X-Muru-Sendfile paths must lie in
     /// (section 4.9).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -163,6 +170,82 @@ pub struct GroupSpec {
     /// How the group is scaled (sections 7.2 and 7.4).
     #[serde(default)]
     pub scaling: ScalingSpec,
+    /// The group's own timeouts, each the release's when absent (section
+    /// 7.1).
+    #[serde(default, skip_serializing_if = "GroupTimeouts::is_empty")]
+    pub timeouts: GroupTimeouts,
+    /// The group's own memory policy, resolved over the release's; the
+    /// release's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPolicy>,
+}
+
+/// A worker group's own timeouts (section 7.1): the ones a group may
+/// set, each the release's when absent. The stop budget is the release's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupTimeouts {
+    /// How long a request may run before it is interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_timeout_ms: Option<u64>,
+    /// How long a request may run before its worker is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout_ms: Option<u64>,
+    /// How long a replaced worker gets to finish its other requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_drain_grace_ms: Option<u64>,
+    /// How long the event loop may go without running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_stall_timeout_ms: Option<u64>,
+    /// How long no thread may run Python, or no report arrive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gil_stall_timeout_ms: Option<u64>,
+}
+
+impl GroupTimeouts {
+    /// Whether the group sets nothing of its own.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The timeouts in force for the group: its own over the release's.
+    pub fn resolve(&self, release: &WorkerTimeouts) -> WorkerTimeouts {
+        WorkerTimeouts {
+            soft_timeout_ms: self.soft_timeout_ms.or(release.soft_timeout_ms),
+            hard_timeout_ms: self.hard_timeout_ms.or(release.hard_timeout_ms),
+            hard_drain_grace_ms: self
+                .hard_drain_grace_ms
+                .unwrap_or(release.hard_drain_grace_ms),
+            shutdown_timeout_ms: release.shutdown_timeout_ms,
+            websocket_drain_grace_ms: release.websocket_drain_grace_ms,
+            loop_stall_timeout_ms: self
+                .loop_stall_timeout_ms
+                .unwrap_or(release.loop_stall_timeout_ms),
+            gil_stall_timeout_ms: self
+                .gil_stall_timeout_ms
+                .unwrap_or(release.gil_stall_timeout_ms),
+        }
+    }
+
+    /// The group's own timeouts as a `timeouts` table, for an export.
+    pub fn table(&self) -> Option<muru_config::Timeouts> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let format = |ms: Option<u64>| {
+            ms.map(|ms| muru_config::format_duration(std::time::Duration::from_millis(ms)))
+        };
+
+        Some(muru_config::Timeouts {
+            soft_timeout: format(self.soft_timeout_ms),
+            hard_timeout: format(self.hard_timeout_ms),
+            hard_drain_grace: format(self.hard_drain_grace_ms),
+            shutdown_timeout: None,
+            websocket_drain_grace: None,
+            loop_stall_timeout: format(self.loop_stall_timeout_ms),
+            gil_stall_timeout: format(self.gil_stall_timeout_ms),
+        })
+    }
 }
 
 /// What a release runs: its source and the settings fixed at creation
@@ -570,6 +653,63 @@ impl WorkerTimeouts {
             self.websocket_drain_grace_ms
                 .saturating_add(self.shutdown_timeout_ms),
         )
+    }
+}
+
+impl MemoryPolicy {
+    /// The policy a `memory` table makes of this one: each key the
+    /// table sets replaces the value here (section 7.1, a group's policy
+    /// over the release's).
+    pub fn with_table(&self, table: &muru_config::Memory) -> Result<Self, String> {
+        let size = |text: Option<&String>, name: &str| -> Result<Option<u64>, String> {
+            text.map(|text| {
+                muru_config::parse_size(text).map_err(|error| format!("memory.{name}: {error}"))
+            })
+            .transpose()
+        };
+        let duration = |text: Option<&String>, name: &str| -> Result<Option<u64>, String> {
+            text.map(|text| {
+                muru_config::parse_duration(text)
+                    .map(|duration| duration.as_millis() as u64)
+                    .map_err(|error| format!("memory.{name}: {error}"))
+            })
+            .transpose()
+        };
+        let policy = Self {
+            measure: table.measure.unwrap_or(self.measure),
+            soft_limit: size(table.soft_limit.as_ref(), "soft_limit")?.or(self.soft_limit),
+            soft_for_ms: duration(table.soft_for.as_ref(), "soft_for")?.unwrap_or(self.soft_for_ms),
+            reclaim_first: table.reclaim_first.unwrap_or(self.reclaim_first),
+            hard_limit: size(table.hard_limit.as_ref(), "hard_limit")?.or(self.hard_limit),
+            check_interval_ms: duration(table.check_interval.as_ref(), "check_interval")?
+                .unwrap_or(self.check_interval_ms),
+        };
+
+        if let (Some(soft), Some(hard)) = (policy.soft_limit, policy.hard_limit)
+            && hard < soft
+        {
+            return Err("memory.hard_limit must not be below memory.soft_limit".to_owned());
+        }
+
+        if policy.check_interval_ms == 0 {
+            return Err("memory.check_interval must be longer than nothing".to_owned());
+        }
+
+        Ok(policy)
+    }
+
+    /// The policy as a `memory` table, every key spelled out.
+    pub fn table(&self) -> muru_config::Memory {
+        let duration = |ms: u64| muru_config::format_duration(std::time::Duration::from_millis(ms));
+
+        muru_config::Memory {
+            measure: Some(self.measure),
+            soft_limit: self.soft_limit.map(muru_config::format_size),
+            soft_for: Some(duration(self.soft_for_ms)),
+            reclaim_first: Some(self.reclaim_first),
+            hard_limit: self.hard_limit.map(muru_config::format_size),
+            check_interval: Some(duration(self.check_interval_ms)),
+        }
     }
 }
 

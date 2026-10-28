@@ -38,6 +38,7 @@ scaling = { mode = 'target', min_workers = 0, max_workers = 8 }
 - Groups can ship in [tool.muru.groups] and be resized by operators. MURU_GROUP and the hook context identify the group after fork.
 - A release is ready when every required group has its minimum ready workers. Groups can be optional.
 - Groups share the interpreter and import-time configuration. Differences must be applied after fork.
+- **Details fixed by the implementation.** A group's `timeouts` table may set `soft_timeout`, `hard_timeout`, `hard_drain_grace`, `loop_stall_timeout` and `gil_stall_timeout`, each the release's when absent, and may not set `shutdown_timeout` or `websocket_drain_grace`, which bound the stop budget of every worker and so belong to the release; the hard timeout must exceed the soft by 5 s within the group as within the release. Its `memory` table sets any of the keys of section 7.7 over the release's policy. The host receives every group's resolved values and applies them per worker by its group, and `config export` writes a group's timeouts as set and its memory policy whole. `max_requests` and `max_lifetime` stay per release.
 
 ### Release variants
 
