@@ -26,8 +26,16 @@ fn version() -> &'static str {
 }
 
 /// A mount as `serve` takes it: the path prefix, the application, its
-/// runner, and its own threads as (reserved, max) when it has any.
-type MountArgument = (String, Py<PyAny>, Option<Py<PyAny>>, Option<(usize, usize)>);
+/// runner, its own threads as (reserved, max) when it has any, and for an
+/// ASGI mount its limits as (concurrency, connections), 0 for one it
+/// does not set.
+type MountArgument = (
+    String,
+    Py<PyAny>,
+    Option<Py<PyAny>>,
+    Option<(usize, usize)>,
+    Option<(usize, usize)>,
+);
 
 /// Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 ///
@@ -138,7 +146,7 @@ fn serve(
 
     let mut named = std::collections::HashMap::new();
 
-    for (name, app, runner, threads) in mounts {
+    for (name, app, runner, threads, limits) in mounts {
         if runner.is_some() && asgi.is_none() {
             return Err(PyTypeError::new_err(format!(
                 "mount {name:?} is ASGI, so an event_loop is needed"
@@ -165,6 +173,8 @@ fn serve(
                 app,
                 runner,
                 threads,
+                limits: limits
+                    .filter(|&(concurrency, connections)| concurrency > 0 || connections > 0),
                 pool,
             },
         );

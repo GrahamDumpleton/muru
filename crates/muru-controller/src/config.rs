@@ -2372,6 +2372,24 @@ pub fn resolve_spec(
             ));
         }
 
+        // Section 7.1: the group's own timeouts, checked against the
+        // release's once those are resolved below, and its memory policy,
+        // resolved over the release's there too.
+
+        muru_config::check_group_timeouts(group.timeouts.as_ref())
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+        let own = group.timeouts.clone().unwrap_or_default();
+        let parse = |text: Option<&String>, key: &str| {
+            parse_ms(text, key).map_err(|error| format!("worker group {name}: timeouts.{error}"))
+        };
+        let group_timeouts = crate::model::GroupTimeouts {
+            soft_timeout_ms: parse(own.soft_timeout.as_ref(), "soft_timeout")?,
+            hard_timeout_ms: parse(own.hard_timeout.as_ref(), "hard_timeout")?,
+            hard_drain_grace_ms: parse(own.hard_drain_grace.as_ref(), "hard_drain_grace")?,
+            loop_stall_timeout_ms: parse(own.loop_stall_timeout.as_ref(), "loop_stall_timeout")?,
+            gil_stall_timeout_ms: parse(own.gil_stall_timeout.as_ref(), "gil_stall_timeout")?,
+        };
+
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
@@ -2383,6 +2401,8 @@ pub fn resolve_spec(
                 .map_or(sync_threads, |value| value as u32),
             concurrency: group.concurrency.map_or(concurrency, |value| value as u32),
             scaling: group_scaling,
+            timeouts: group_timeouts,
+            memory: None,
         });
     }
 
@@ -2466,6 +2486,8 @@ pub fn resolve_spec(
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
             .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
 
@@ -2484,6 +2506,8 @@ pub fn resolve_spec(
             sendfile_roots: mount_roots,
             sendfile_header: mount_header,
             threads: mount.threads,
+            concurrency: mount.concurrency.map(|value| value as u32),
+            max_connections: mount.max_connections.map(|value| value as u32),
         });
     }
 
@@ -2612,6 +2636,26 @@ pub fn resolve_spec(
 
     if memory.check_interval_ms == 0 {
         return Err("memory.check_interval must be longer than nothing".to_owned());
+    }
+
+    // Section 7.1: each group's timeouts hold the same rules over the
+    // release's, and its memory table is resolved over the release's.
+
+    for group in &mut resolved_groups {
+        check_timeouts(&group.timeouts.resolve(&timeouts))
+            .map_err(|error| format!("worker group {}: {error}", group.name))?;
+
+        if let Some(table) = groups
+            .unwrap_or(&table.groups)
+            .get(&group.name)
+            .and_then(|declared| declared.memory.as_ref())
+        {
+            group.memory = Some(
+                memory
+                    .with_table(table)
+                    .map_err(|error| format!("worker group {}: {error}", group.name))?,
+            );
+        }
     }
 
     let env = resolve_env_specs(&table.env, &request.env)?;
@@ -3803,6 +3847,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         sync_threads: Some(group.sync_threads as usize),
                         concurrency: Some(group.concurrency as usize),
                         scaling: scaling_table(&group.scaling),
+                        timeouts: group.timeouts.table(),
+                        memory: group.memory.as_ref().map(crate::model::MemoryPolicy::table),
                     },
                 )
             })
@@ -3829,6 +3875,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                             .then(|| mount.sendfile_header.clone())
                             .flatten(),
                         threads: mount.threads,
+                        concurrency: mount.concurrency.map(|value| value as usize),
+                        max_connections: mount.max_connections.map(|value| value as usize),
                     },
                 )
             })
@@ -3919,7 +3967,7 @@ fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
 /// Section 7.6: a soft timeout is a duration, and the hard timeout, the
 /// backstop for a request the soft timeout could not interrupt, must
 /// exceed it by at least 5 s.
-pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
+pub fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
     if timeouts.soft_timeout_ms == Some(0) {
         return Err("soft_timeout must be longer than nothing".to_owned());
     }
@@ -4282,6 +4330,17 @@ fn describe_memory(memory: &crate::model::MemoryPolicy) -> String {
     )
 }
 
+/// A duration from a configuration table in milliseconds, none when the
+/// key is absent.
+fn parse_ms(text: Option<&String>, name: &str) -> Result<Option<u64>, String> {
+    text.map(|text| {
+        muru_config::parse_duration(text)
+            .map(|duration| duration.as_millis() as u64)
+            .map_err(|error| format!("{name}: {error}"))
+    })
+    .transpose()
+}
+
 /// A duration in milliseconds as the configuration writes it, or off.
 fn describe_ms(ms: Option<u64>) -> String {
     match ms {
@@ -4311,8 +4370,19 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
                 }
             };
 
+            let own = [
+                ("soft_timeout", group.timeouts.soft_timeout_ms),
+                ("hard_timeout", group.timeouts.hard_timeout_ms),
+                ("hard_drain_grace", group.timeouts.hard_drain_grace_ms),
+                ("loop_stall_timeout", group.timeouts.loop_stall_timeout_ms),
+                ("gil_stall_timeout", group.timeouts.gil_stall_timeout_ms),
+            ]
+            .into_iter()
+            .filter_map(|(name, ms)| ms.map(|ms| format!("{name} {}", describe_ms(Some(ms)))))
+            .collect::<Vec<_>>();
+
             format!(
-                "{} {}x{} on {on}{}",
+                "{} {}x{} on {on}{}{}{}",
                 group.name,
                 group.processes,
                 group.threads,
@@ -4320,7 +4390,17 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
                     String::new()
                 } else {
                     format!(" scaling {}", group.scaling.describe())
-                }
+                },
+                if own.is_empty() {
+                    String::new()
+                } else {
+                    format!(" timeouts {}", own.join(", "))
+                },
+                group
+                    .memory
+                    .as_ref()
+                    .map(|memory| format!(" memory {}", describe_memory(memory)))
+                    .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()

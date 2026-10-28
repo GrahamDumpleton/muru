@@ -463,6 +463,10 @@ pub struct HostMount {
     pub interface: muru_config::Interface,
     /// Threads of the mount's own (section 6.7).
     pub threads: Option<muru_config::MountThreads>,
+    /// An ASGI mount's requests at once on each worker (section 6.7).
+    pub concurrency: Option<usize>,
+    /// An ASGI mount's open WebSockets at once on each worker.
+    pub max_connections: Option<usize>,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -478,6 +482,10 @@ pub struct HostGroup {
     pub sync_threads: usize,
     /// Requests an ASGI worker's event loop takes at once.
     pub concurrency: usize,
+    /// The group's timeouts, resolved over the release's (section 7.1).
+    pub timeouts: crate::model::WorkerTimeouts,
+    /// The group's memory policy, resolved over the release's.
+    pub memory: crate::model::MemoryPolicy,
 }
 
 /// A running host and the sockets its workers listen on.
@@ -601,6 +609,12 @@ impl HostProcess {
 
             if let Some(threads) = mount.threads {
                 text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
+            } else if mount.concurrency.is_some() || mount.max_connections.is_some() {
+                text.push_str(&format!(
+                    "={},{}",
+                    mount.concurrency.unwrap_or(0),
+                    mount.max_connections.unwrap_or(0)
+                ));
             }
 
             command.arg("--mount").arg(text);
@@ -610,6 +624,38 @@ impl HostProcess {
             command.arg("--group").arg(format!(
                 "{}={},{},{},{}",
                 group.name, group.processes, group.threads, group.sync_threads, group.concurrency
+            ));
+
+            // Section 7.1: the group's own timeouts and memory policy,
+            // every value spelled out, the release's where it set none.
+
+            let seconds = |ms: Option<u64>| {
+                ms.map_or_else(|| "off".to_owned(), |ms| (ms as f64 / 1000.0).to_string())
+            };
+            let timeouts = &group.timeouts;
+            command.arg("--group-timeouts").arg(format!(
+                "{}={},{},{},{},{}",
+                group.name,
+                seconds(timeouts.soft_timeout_ms),
+                seconds(timeouts.hard_timeout_ms),
+                seconds(Some(timeouts.hard_drain_grace_ms)),
+                seconds(Some(timeouts.loop_stall_timeout_ms)),
+                seconds(Some(timeouts.gil_stall_timeout_ms)),
+            ));
+            let memory = &group.memory;
+            command.arg("--group-memory").arg(format!(
+                "{}={},{},{},{},{},{}",
+                group.name,
+                memory.measure.as_str(),
+                memory
+                    .soft_limit
+                    .map_or_else(|| "off".to_owned(), |bytes| bytes.to_string()),
+                seconds(Some(memory.soft_for_ms)),
+                memory.reclaim_first,
+                memory
+                    .hard_limit
+                    .map_or_else(|| "off".to_owned(), |bytes| bytes.to_string()),
+                seconds(Some(memory.check_interval_ms)),
             ));
         }
 

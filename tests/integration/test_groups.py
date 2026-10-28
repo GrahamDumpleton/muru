@@ -86,6 +86,22 @@ def test_print_config_writes_the_groups() -> None:
     release = tomllib.loads(completed.stdout)["app"]["grouped"]["release"]["r1"]
     assert release["groups"]["reports"] == {"paths": ["/reports/*"], "processes": 2, "threads": 1}
     assert release["groups"]["status"] == {"paths": ["/api/status"], "threads": 8}
+    assert release["groups"]["slow"] == {
+        "paths": ["/slow/*"],
+        "timeouts": {"soft_timeout": "1s"},
+        "memory": {"check_interval": "1s"},
+    }
+
+
+def test_a_group_has_timeouts_of_its_own(development: support.Server) -> None:
+    # Section 7.1: the slow group's soft timeout interrupts its request;
+    # the default group, with none, serves a request as long.
+
+    slow = development.get("/slow/report?ms=1500", headers={"Accept": "application/json"})
+    assert slow.status == 504, slow.body
+    assert json.loads(slow.body)["reason"] == "soft_timeout"
+    assert served_by(development.get("/?ms=1500"))["group"] == "default"
+    assert served_by(development.get("/slow/report?ms=100"))["group"] == "slow"
 
 
 @pytest.fixture
@@ -106,7 +122,8 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
     assert daemon.deploy("grouped", GROUPED) == "muru: release grouped@r1 is ready and serving"
     assert served_by(daemon.request("/reports/x"))["group"] == "reports"
     assert served_by(daemon.request("/"))["group"] == "default"
-    assert "4 workers ready" in daemon.muructl("events").stdout
+    assert "5 workers ready" in daemon.muructl("events").stdout
+    assert daemon.request("/slow/x?ms=1500").status == 504
     shown = daemon.muructl("release", "show", "grouped@r1").stdout
     assert "workers 1 process of 2 threads group reports" in " ".join(shown.split())
     assert "group reports /reports/*: 2 processes of 1 thread" in " ".join(shown.split())
@@ -124,6 +141,8 @@ threads = 5
 [app.shop.release.r1.groups.hot]
 paths = ["/hot/*", "/also-hot"]
 processes = 1
+timeouts = {{ hard_timeout = "300s" }}
+memory = {{ hard_limit = "1GB" }}
 """
     )
     applied = daemon.muructl("apply", "-f", str(config))
@@ -144,6 +163,14 @@ processes = 1
             "threads": 5,
             "sync_threads": 8,
             "concurrency": 1000,
+            "timeouts": {"hard_timeout": "300s"},
+            "memory": {
+                "measure": "uss",
+                "soft_for": "120s",
+                "reclaim_first": True,
+                "hard_limit": "1GB",
+                "check_interval": "5s",
+            },
         }
     }
     assert "no changes" in daemon.muructl("apply", "-f", str(config)).stdout
@@ -153,7 +180,10 @@ processes = 1
     config.write_text(config.read_text().replace("processes = 1", "processes = 2"))
     refused = daemon.muructl("apply", "-f", str(config), check=False)
     assert refused.returncode == 1
-    assert "groups hot 2x5 on /hot/* /also-hot, recorded hot 1x5" in refused.stdout
+    assert (
+        "groups hot 2x5 on /hot/* /also-hot timeouts hard_timeout 300s memory uss soft off "
+        "for 120s (reclaim first true), hard 1GB, every 5s, recorded hot 1x5"
+    ) in refused.stdout, refused.stdout
 
 
 def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:
@@ -164,6 +194,16 @@ def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:
         ("[app.shop.release.r1.groups.hot]\n", "has no paths"),
         ("[app.shop.release.r1.groups.hot]\npaths = ['x']\n", "does not start with /"),
         ("[app.shop.release.r1.groups.hot]\npaths = ['/x']\nprocesses = 0\n", "has no processes"),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\n"
+            "timeouts = { shutdown_timeout = '1s' }\n",
+            "worker group hot: timeouts.shutdown_timeout applies to the whole release",
+        ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\n"
+            "timeouts = { soft_timeout = '10s', hard_timeout = '12s' }\n",
+            "worker group hot: hard_timeout must exceed soft_timeout by at least 5s",
+        ),
     ]:
         config.write_text(
             f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n{table}"

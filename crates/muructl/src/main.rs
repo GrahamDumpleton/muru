@@ -1107,6 +1107,64 @@ pub(crate) fn worker_timeouts(
     })
 }
 
+/// Section 7.1: a worker group's timeouts, its own table over the
+/// release's, with the release's stop budget.
+fn group_timeouts(
+    name: &str,
+    table: Option<&muru_config::Timeouts>,
+    release: &HostTimeouts,
+) -> anyhow::Result<muru_controller::model::WorkerTimeouts> {
+    muru_config::check_group_timeouts(table)
+        .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+    let parse = |text: &Option<String>, key: &str| -> anyhow::Result<Option<u64>> {
+        text.as_ref()
+            .map(|text| {
+                muru_config::parse_duration(text)
+                    .map(|duration| duration.as_millis() as u64)
+                    .map_err(|error| {
+                        anyhow::anyhow!("[tool.muru.groups.{name}.timeouts] {key}: {error}")
+                    })
+            })
+            .transpose()
+    };
+    let own = table.cloned().unwrap_or_default();
+    let own = muru_controller::model::GroupTimeouts {
+        soft_timeout_ms: parse(&own.soft_timeout, "soft_timeout")?,
+        hard_timeout_ms: parse(&own.hard_timeout, "hard_timeout")?,
+        hard_drain_grace_ms: parse(&own.hard_drain_grace, "hard_drain_grace")?,
+        loop_stall_timeout_ms: parse(&own.loop_stall_timeout, "loop_stall_timeout")?,
+        gil_stall_timeout_ms: parse(&own.gil_stall_timeout, "gil_stall_timeout")?,
+    };
+    let ms = |duration: Duration| duration.as_millis() as u64;
+    let resolved = own.resolve(&muru_controller::model::WorkerTimeouts {
+        soft_timeout_ms: release.soft.map(ms),
+        hard_timeout_ms: release.hard.map(ms),
+        hard_drain_grace_ms: ms(release.hard_drain_grace),
+        shutdown_timeout_ms: ms(release.shutdown),
+        websocket_drain_grace_ms: ms(release.websocket_drain_grace),
+        loop_stall_timeout_ms: ms(release.loop_stall),
+        gil_stall_timeout_ms: ms(release.gil_stall),
+    });
+    muru_controller::config::check_timeouts(&resolved)
+        .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+    Ok(resolved)
+}
+
+/// Section 7.1: a worker group's memory policy, its own table over the
+/// release's policy.
+fn group_memory(
+    name: &str,
+    table: Option<&muru_config::Memory>,
+    release: &muru_controller::model::MemoryPolicy,
+) -> anyhow::Result<muru_controller::model::MemoryPolicy> {
+    match table {
+        Some(table) => release
+            .with_table(table)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}")),
+        None => Ok(release.clone()),
+    }
+}
+
 /// Largest request body in development (section 13.1, ADR 0008).
 const DEVELOPMENT_MAX_BODY_SIZE: u64 = 100 * 1024 * 1024;
 
@@ -1288,6 +1346,8 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
 
     for (name, mount) in &table.mounts {
+        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
     }
@@ -1763,6 +1823,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
@@ -1785,14 +1846,18 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         groups: resolved
             .groups
             .iter()
-            .map(|(name, group)| muru_controller::host::HostGroup {
-                name: name.clone(),
-                processes: group.processes.unwrap_or(resolved.processes),
-                threads: group.threads.unwrap_or(resolved.threads),
-                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
-                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+            .map(|(name, group)| {
+                Ok(muru_controller::host::HostGroup {
+                    name: name.clone(),
+                    processes: group.processes.unwrap_or(resolved.processes),
+                    threads: group.threads.unwrap_or(resolved.threads),
+                    sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
+                    concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+                    timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
+                    memory: group_memory(name, group.memory.as_ref(), &memory)?,
+                })
             })
-            .collect(),
+            .collect::<anyhow::Result<Vec<_>>>()?,
         mounts: resolved
             .mounts
             .iter()
@@ -1802,6 +1867,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 entrypoint: mount.entrypoint.clone(),
                 interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
                 threads: mount.threads,
+                concurrency: mount.concurrency,
+                max_connections: mount.max_connections,
             })
             .collect(),
         logging: resolved
@@ -1818,7 +1885,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         websocket_drain_grace: timeouts.websocket_drain_grace,
         loop_stall_timeout: timeouts.loop_stall,
         gil_stall_timeout: timeouts.gil_stall,
-        memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
+        memory: memory.clone(),
         env: resolved
             .env
             .iter()
