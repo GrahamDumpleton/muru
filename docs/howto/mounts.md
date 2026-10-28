@@ -6,8 +6,8 @@
 Named mounts at path prefixes, any mix of WSGI and ASGI in the same
 workers, in development mode and under the daemon, internal mounts,
 threads of a WSGI mount's own and the concurrency and connection limits
-of an ASGI mount's own. [gRPC mounts](grpc.md) have a page of their own.
-The groups `mounts` subset is still to come.
+of an ASGI mount's own, and the mounts a [worker group](worker-groups.md)
+serves. [gRPC mounts](grpc.md) have a page of their own.
 ```
 
 A release can serve several entrypoints from the same worker processes,

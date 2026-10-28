@@ -4,8 +4,9 @@
 :class: note
 
 Workers are replaced after a number of requests or a lifetime, on the
-hard timeout and over the memory limits. Per-group settings and the
-surge limit are still to come.
+hard timeout and over the memory limits, with the memory policy and
+timeouts settable per [worker group](worker-groups.md). Request and
+lifetime limits per group and the surge limit are still to come.
 ```
 
 A worker process that has served long enough is replaced by a fresh one,
