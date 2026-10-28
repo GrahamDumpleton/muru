@@ -9,6 +9,7 @@ test short; the decisions are the same.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,12 @@ def test_the_scaling_tutorial(tmp_path: Path) -> None:
             check=True,
         ).stdout
         assert load.splitlines()[-1].endswith("requests served, 0 failed"), load
-        assert "default: scale out from 1 to 5 workers" in daemon.muructl("events").stdout
+
+        # On a slow machine the clients can arrive over more than one
+        # decision, so the group may grow in steps; it ends at five.
+
+        events = daemon.muructl("events").stdout
+        assert re.search(r"default: scale out from \d+ to 5 workers", events), events
         status = daemon.muructl("scale", "status", "busy").stdout
         assert "diagnosis: I/O bound with exhausted slots" in status
 
