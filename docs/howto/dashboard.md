@@ -8,8 +8,9 @@ address with charts over the last hour or day. The daemon's needs a
 signed-in session, serves the same figures as JSON, with rollouts,
 scaling and maintenance, streams its history and events with
 Server-Sent Events, and can turn maintenance mode on and off for a
-session that may act. Worker inspection views and the other actions are
-still to come.
+session that may act, and shows each running release's workers with
+their status, stacks, tasks and memory. The other actions are still to
+come.
 ```
 
 ## In development mode
@@ -90,6 +91,32 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
 - recent requests across every release, the last fifty events (new ones
   arriving as they happen), and the tail of each serving release's log.
 
+### Looking into the workers
+
+Each running release on the page links to its workers, where the
+dashboard shows what [`muructl debug`](debugging.md) shows:
+
+- the release's workers as `debug status` lists them: pid, group,
+  uptime, requests served and in flight, the age of the oldest request,
+  memory, and whether each is ready, starting, being replaced or being
+  debugged, refreshed every two seconds;
+- their stacks as `debug stacks` shows them: the Python stack of every
+  thread with the request each is serving, threads showing the same
+  stack across workers shown once, taken when the page opens and again
+  on request.
+
+Each worker links to a page of its own with its status, its stacks, its
+asyncio tasks as `debug tasks` shows them, and, when asked for, its
+memory as `debug memory` shows it: resident, proportional and unique
+size, the garbage collector's counts, and the object types it holds most
+of. Counting the objects holds the interpreter while it runs, so the
+page takes it only on request, and it is recorded as a `debug.memory`
+event as the command is.
+
+A page is at `workers?release=APP@RELEASE` and `worker?release=APP@RELEASE&worker=N`
+under the dashboard's address; a release that is not running says so
+in place of its workers.
+
 ### JSON for scripts
 
 The same figures are served as JSON, each path answering with what the
@@ -114,6 +141,7 @@ A token lasts twelve hours, or until the daemon restarts.
 | `/v1/requests` | recent requests, newest first |
 | `/v1/websockets` | the WebSockets open: `open`, `endpoints` counted by path pattern, and `sockets`, the longest open first |
 | `/v1/events` | recent events, newest first |
+| `/v1/debug/OP?release=APP@RELEASE` | a release's workers' answers to `status`, `stacks`, `tasks` or `memory`, as `muructl debug OP --json` prints them, one worker with `&worker=N`; 409 when the release is not running |
 | `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers, WebSockets open]`, one a second for the last hour, or one a minute for the last day with `range=24h` |
 | `/v1/history/stream` | each new point as a Server-Sent Event of type `point` |
 | `/v1/events/stream` | each new event as it happens, as a rendered table row (type `event`) and as JSON (type `json`) |

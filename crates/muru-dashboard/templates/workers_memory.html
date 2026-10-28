@@ -1,0 +1,20 @@
+{% if !error.is_empty() %}<p class="level-error">{{ error }}</p>{% endif %}
+{% for view in memory %}
+{% if !view.error.is_empty() %}
+<p class="level-error">worker {{ view.index }} (pid {{ view.pid }}): {{ view.error }}</p>
+{% else %}
+<h3>worker {{ view.index }} (pid {{ view.pid }})</h3>
+<div class="tiles">
+  <div class="tile"><div class="label">RSS</div><div class="value">{{ view.rss }}</div></div>
+  <div class="tile"><div class="label">PSS</div><div class="value">{{ view.pss }}</div></div>
+  <div class="tile"><div class="label">USS</div><div class="value">{{ view.uss }}</div></div>
+  <div class="tile"><div class="label">GC counts</div><div class="value">{{ view.gc_counts }}</div></div>
+</div>
+<table>
+  <tr><th>Type</th><th class="num">Objects</th></tr>
+  {% for object in view.objects %}
+  <tr><td>{{ object.name }}</td><td class="num">{{ object.count }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endfor %}

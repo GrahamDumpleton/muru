@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use muru_dashboard::{
-    Action, Actions, EndpointRow, EventRow, EventsSource, History, NodeMetricsSource, NodeSource,
-    Reading, Sessions, SocketRow, WebSocketsView,
+    Action, Actions, DebugAnswer, DebugAsk, DebugSource, EndpointRow, EventRow, EventsSource,
+    History, NodeMetricsSource, NodeSource, Reading, Sessions, SocketRow, WebSocketsView,
+    WorkerAnswer,
 };
 use muru_proto::edge::v1 as pb;
 use tokio::net::TcpListener;
@@ -30,6 +31,7 @@ pub async fn serve(
         sessions,
         sink: action_sink(commands.clone(), events.clone()),
     };
+    let debug = debug_source(commands.clone());
     let data_commands = commands.clone();
     let source: NodeSource = Arc::new(move || {
         let commands = data_commands.clone();
@@ -78,7 +80,67 @@ pub async fn serve(
         }
     });
     let live: EventsSource = Arc::new(move || rows.subscribe());
-    muru_dashboard::serve_node(listener, source, metrics, history, live, actions).await
+    muru_dashboard::serve_node(listener, source, metrics, history, live, actions, debug).await
+}
+
+/// Section 11.7: ask a release's workers what the inspection pages show,
+/// as the admin API's Debug does, with the arguments `muructl debug`
+/// sends for the operation and the same wait for the host.
+fn debug_source(commands: mpsc::Sender<Command>) -> DebugSource {
+    Arc::new(move |ask: DebugAsk| {
+        let commands = commands.clone();
+        Box::pin(async move {
+            let args = if ask.op == "memory" {
+                serde_json::json!({
+                    "trace": false,
+                    "snapshot": "",
+                    "duration_s": 0.0,
+                    "top": 20,
+                    "timeout_s": 30.0,
+                })
+            } else {
+                serde_json::json!({})
+            };
+            let wait = args
+                .get("timeout_s")
+                .and_then(serde_json::Value::as_f64)
+                .map_or(std::time::Duration::from_secs(20), |seconds| {
+                    std::time::Duration::from_secs_f64(seconds) + std::time::Duration::from_secs(15)
+                });
+            let (done_tx, done_rx) = oneshot::channel();
+            commands
+                .send(Command::Debug {
+                    app: ask.app,
+                    id: ask.release.clone(),
+                    op: ask.op,
+                    worker: ask.worker,
+                    args,
+                    done: done_tx,
+                })
+                .await
+                .map_err(|_| "the daemon is stopping".to_owned())?;
+            let replies = tokio::time::timeout(wait, done_rx)
+                .await
+                .map_err(|_| format!("the host did not answer in {} seconds", wait.as_secs()))?
+                .map_err(|_| "the daemon is stopping".to_owned())??;
+            Ok(DebugAnswer {
+                release: ask.release,
+                workers: replies
+                    .into_iter()
+                    .map(|reply| WorkerAnswer {
+                        index: reply.index,
+                        pid: reply.pid,
+                        ok: reply.ok,
+                        error: (!reply.error.is_empty()).then_some(reply.error),
+                        result: reply
+                            .ok
+                            .then(|| serde_json::from_str(&reply.result_json).ok())
+                            .flatten(),
+                    })
+                    .collect(),
+            })
+        })
+    })
 }
 
 /// Section 10.7: carry out a dashboard action as the admin API would,
