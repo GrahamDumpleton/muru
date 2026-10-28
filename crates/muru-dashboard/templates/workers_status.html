@@ -1,0 +1,33 @@
+<h2>Workers</h2>
+{% if !error.is_empty() %}<p class="level-error">{{ error }}</p>{% endif %}
+<table>
+  <tr><th>Worker</th><th class="num">PID</th><th>Group</th><th class="num">Up</th><th class="num">Requests</th><th class="num">In flight</th><th class="num">Oldest</th><th class="num">RSS</th><th class="num">USS</th><th>State</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
+  {% for row in status %}
+  <tr>
+    <td><a href="worker?release={{ release }}&worker={{ row.index }}">{{ row.index }}</a></td>
+    <td class="num">{{ row.pid }}</td>
+    {% if row.error.is_empty() %}
+    <td>{{ row.group }}</td>
+    <td class="num">{{ row.uptime }}</td>
+    <td class="num">{{ row.requests }}</td>
+    <td class="num">{{ row.in_flight }}</td>
+    <td class="num">{{ row.oldest }}</td>
+    <td class="num">{{ row.rss }}</td>
+    <td class="num">{{ row.uss }}</td>
+    <td class="state-{{ row.state }}">{{ row.state }}</td>
+    {% else %}
+    <td colspan="8" class="level-error">{{ row.error }}</td>
+    {% endif %}
+    {% if let Some(token) = csrf %}
+    <td class="actions">{% if row.state == "ready" %}<form method="post" action="actions/restart">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="app" value="{{ release.split('@').next().unwrap_or_default() }}">
+      <input type="hidden" name="release" value="{{ release.split('@').nth(1).unwrap_or_default() }}">
+      <input type="hidden" name="worker" value="{{ row.index }}">
+      <input type="hidden" name="back" value="{{ back }}">
+      <label><input type="checkbox" name="force" value="on" id="force-{{ row.index }}" hx-preserve="true"> force</label> <button>Restart</button>
+    </form>{% endif %}</td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+</table>

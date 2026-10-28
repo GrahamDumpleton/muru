@@ -24,6 +24,9 @@ muructl debug tasks api
 muructl debug inspect shop --json
 ```
 
+The daemon's [dashboard](dashboard.md#looking-into-the-workers) shows
+the status, stacks, tasks and memory of a release's workers too.
+
 ## Status
 
 What the host knows about each worker from its reports: pid, group,
@@ -257,9 +260,13 @@ lost the evidence:
 
 - `request.soft_timeout`: a request past the [soft timeout](timeouts.md),
   with where its thread was, taken before the timeout interrupted it.
-- `worker.timeout_killed`: a worker replaced for the hard timeout, with
-  where its oldest request was. Its threads' stacks go to the log, through
-  faulthandler when the worker cannot answer.
+- `worker.timeout_killed`: a worker replaced for the hard timeout, after
+  `worker.loop_stalled` or `worker.gil_stalled`, or because its reports
+  stopped, with where its oldest request was. Its threads' stacks go to
+  the log, through faulthandler when the worker cannot answer.
+- `worker.restarted` with `--force`: a worker [killed on
+  request](recycling.md#restarting-a-worker-by-hand), its stacks taken
+  the same way first.
 - `worker.recycled` for memory: a worker replaced over a [memory
   limit](memory.md), with the object types it held most of.
 

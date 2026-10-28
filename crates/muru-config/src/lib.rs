@@ -390,6 +390,44 @@ pub struct Mount {
     /// the worker's pool when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<MountThreads>,
+    /// Requests an ASGI mount runs at once on each worker, slots of its
+    /// own at the edge; it shares the worker's slots when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    /// Open WebSockets an ASGI mount holds at once on each worker, apart
+    /// from the requests it runs; unbounded but by its slots when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
+}
+
+/// Section 6.7: check an ASGI mount's own limits. Both belong to a mount
+/// declared ASGI, since they size its place on the event loop, and each
+/// is at least one.
+pub fn check_mount_limits(
+    concurrency: Option<usize>,
+    max_connections: Option<usize>,
+    interface: Option<Interface>,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("concurrency", concurrency),
+        ("max_connections", max_connections),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+
+        if interface != Some(Interface::Asgi) {
+            return Err(format!(
+                "{name}: only a mount declared interface = 'asgi' takes it"
+            ));
+        }
+
+        if value == 0 {
+            return Err(format!("{name}: must be at least 1"));
+        }
+    }
+
+    Ok(())
 }
 
 /// A mount's own threads (section 6.7): a fixed pool, `threads = 4`, or a
@@ -487,11 +525,22 @@ pub struct Group {
     /// match across all groups wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
-    /// The client classes (section 4.14) the group takes: their requests
-    /// for its paths, or for every path without `paths`, ahead of the
-    /// groups that name no class.
+    /// The named mounts (section 6.7) the group's workers serve, beside
+    /// the default mount, which every worker serves; every mount when
+    /// absent (ADR 0033). The group's paths must lie within them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
+    /// What the group asks of a request beside its path (ADR 0033): the
+    /// client classes (section 4.14), hosts and methods it takes, each
+    /// list any of its entries; a group asking more comes before one
+    /// asking less, and a group with lists and no `paths` takes every
+    /// path.
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<ClientMatch>,
+    pub matches: Option<GroupMatch>,
+    /// Whether the release is ready without the group's workers (ADR
+    /// 0033): its requests wait until one listens (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
     /// Worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processes: Option<usize>,
@@ -507,6 +556,51 @@ pub struct Group {
     /// How the group is scaled (sections 7.2 and 7.4); static when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<Scaling>,
+    /// The group's own timeouts (section 7.6), each the release's when
+    /// absent; `shutdown_timeout` and `websocket_drain_grace` belong to
+    /// the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<Timeouts>,
+    /// The group's own memory policy (section 7.7), each key the
+    /// release's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
+}
+
+/// Check a worker group's `match` table (ADR 0033): it must ask
+/// something, and its classes are named as a class is.
+pub fn check_group_match(matches: Option<&GroupMatch>) -> Result<(), String> {
+    let Some(matches) = matches else {
+        return Ok(());
+    };
+
+    if matches.client_class.is_empty() && matches.host.is_empty() && matches.method.is_empty() {
+        return Err("match names no client_class, host or method".to_owned());
+    }
+
+    for class in &matches.client_class {
+        check_policy_name("match.client_class", class)?;
+    }
+
+    Ok(())
+}
+
+/// Check a worker group's `timeouts` table (section 7.1): the stop
+/// budget is the release's, so a group may not set its parts.
+pub fn check_group_timeouts(timeouts: Option<&Timeouts>) -> Result<(), String> {
+    let Some(timeouts) = timeouts else {
+        return Ok(());
+    };
+
+    if timeouts.shutdown_timeout.is_some() {
+        return Err("timeouts.shutdown_timeout applies to the whole release".to_owned());
+    }
+
+    if timeouts.websocket_drain_grace.is_some() {
+        return Err("timeouts.websocket_drain_grace applies to the whole release".to_owned());
+    }
+
+    Ok(())
 }
 
 /// A release definition, the `[app.NAME.release.ID]` table (appendix C):
@@ -931,6 +1025,11 @@ pub struct Timeouts {
     /// 10s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_stall_timeout: Option<String>,
+    /// How long a worker may go with no thread running Python, or with
+    /// no report to its host, before it is replaced as for the hard
+    /// timeout (default 30s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gil_stall_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -2276,13 +2375,30 @@ pub struct RateLimit {
     pub headers: Option<bool>,
 }
 
-/// The requests a rate limit, route or worker group applies to.
+/// The requests a rate limit or route applies to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientMatch {
     /// Client classes (section 4.14).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<String>,
+}
+
+/// The requests a worker group takes for its paths (ADR 0033): every
+/// list given must name the request's class, host or method.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMatch {
+    /// Client classes (section 4.14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_class: Vec<String>,
+    /// Hosts: a virtual host's name or a name it answers to, or under
+    /// `muructl run` the name the request carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host: Vec<String>,
+    /// Methods, compared in upper case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method: Vec<String>,
 }
 
 /// One key part or several.
@@ -3095,6 +3211,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                     || timeouts.hard_drain_grace.is_some()
                     || timeouts.websocket_drain_grace.is_some()
                     || timeouts.loop_stall_timeout.is_some()
+                    || timeouts.gil_stall_timeout.is_some()
             }),
         ),
     ];

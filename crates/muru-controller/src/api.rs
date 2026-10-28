@@ -1855,6 +1855,10 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 threads: group.threads,
                 sync_threads: group.sync_threads,
                 concurrency: group.concurrency,
+                optional: group.optional,
+                hosts: group.host.clone(),
+                methods: group.method.clone(),
+                mounts: group.mounts.clone(),
             })
             .collect(),
         detected_interface: detected_for(""),

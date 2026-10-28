@@ -1,0 +1,18 @@
+{% if !error.is_empty() %}<p class="level-error">{{ error }}</p>{% endif %}
+{% for view in tasks %}
+{% if !view.error.is_empty() %}
+<p class="level-error">worker {{ view.index }} (pid {{ view.pid }}): {{ view.error }}</p>
+{% else if let Some(lag) = view.lag %}
+<h3>worker {{ view.index }} (pid {{ view.pid }}): loop lag {{ lag }}</h3>
+{% if view.tasks.is_empty() %}<p class="note">no tasks</p>{% else %}
+<table>
+  <tr><th>Task</th><th>Coroutine</th><th>Waiting on</th><th>At</th></tr>
+  {% for task in view.tasks %}
+  <tr><td>{{ task.name }}</td><td>{{ task.coro }}</td><td>{{ task.waiting_on }}</td><td>{{ task.at }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% else %}
+<h3>worker {{ view.index }} (pid {{ view.pid }}): {{ view.note }}</h3>
+{% endif %}
+{% endfor %}

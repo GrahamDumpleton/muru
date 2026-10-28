@@ -117,6 +117,10 @@ enum Command {
     /// Pin a worker group's count, or show the autoscaler's state.
     Scale(admin::ScaleArgs),
 
+    /// Replace a worker of a release with a fresh one, gracefully or at
+    /// once with --force; or every worker in turn with --all.
+    Restart(admin::RestartArgs),
+
     /// Overlays: list them, activate or end one by hand, preview what
     /// one changes, or make one's changes permanent.
     Overlay {
@@ -421,10 +425,11 @@ struct RunArgs {
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
     /// (off), hard (off), hard_drain_grace (10s), shutdown (5s),
-    /// websocket_drain_grace (0s) or loop_stall (10s) in the host, which
-    /// interrupts a request that runs past the soft timeout and replaces
-    /// a worker whose request runs past the hard timeout, or whose event
-    /// loop stalls past loop_stall. Repeatable.
+    /// websocket_drain_grace (0s), loop_stall (10s) or gil_stall (30s)
+    /// in the host, which interrupts a request that runs past the soft
+    /// timeout and replaces a worker whose request runs past the hard
+    /// timeout, whose event loop stalls past loop_stall, or in which no
+    /// thread has run Python for gil_stall. Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -758,6 +763,7 @@ fn main() -> anyhow::Result<()> {
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
+        Command::Restart(args) => runtime.block_on(admin::restart(args)),
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
@@ -843,13 +849,14 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "shutdown",
         "websocket_drain_grace",
         "loop_stall",
+        "gil_stall",
     ]
     .contains(&name)
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
              response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
-             shutdown, websocket_drain_grace or loop_stall"
+             shutdown, websocket_drain_grace, loop_stall or gil_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -993,6 +1000,8 @@ pub(crate) struct HostTimeouts {
     pub websocket_drain_grace: Duration,
     /// How long an ASGI worker's event loop may stall.
     pub loop_stall: Duration,
+    /// How long a worker may run no Python, or send no report.
+    pub gil_stall: Duration,
 }
 
 impl HostTimeouts {
@@ -1005,6 +1014,7 @@ impl HostTimeouts {
             shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
             websocket_drain_grace: Some(muru_config::format_duration(self.websocket_drain_grace)),
             loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
+            gil_stall_timeout: Some(muru_config::format_duration(self.gil_stall)),
         }
     }
 }
@@ -1044,6 +1054,11 @@ pub(crate) fn worker_timeouts(
             parse(&table.loop_stall_timeout, "loop_stall_timeout")
         })?
         .unwrap_or(Duration::from_secs(10));
+    let mut gil_stall = table
+        .map_or(Ok(None), |table| {
+            parse(&table.gil_stall_timeout, "gil_stall_timeout")
+        })?
+        .unwrap_or(Duration::from_secs(30));
 
     for (name, duration) in timeouts {
         match name.as_str() {
@@ -1053,6 +1068,7 @@ pub(crate) fn worker_timeouts(
             "shutdown" => shutdown = *duration,
             "websocket_drain_grace" => websocket_drain_grace = *duration,
             "loop_stall" => loop_stall = *duration,
+            "gil_stall" => gil_stall = *duration,
             _ => {}
         }
     }
@@ -1067,6 +1083,10 @@ pub(crate) fn worker_timeouts(
     anyhow::ensure!(
         loop_stall > Duration::ZERO,
         "loop_stall_timeout must be longer than nothing"
+    );
+    anyhow::ensure!(
+        gil_stall > Duration::ZERO,
+        "gil_stall_timeout must be longer than nothing"
     );
 
     if let (Some(soft), Some(hard)) = (soft, hard) {
@@ -1083,7 +1103,66 @@ pub(crate) fn worker_timeouts(
         shutdown,
         websocket_drain_grace,
         loop_stall,
+        gil_stall,
     })
+}
+
+/// Section 7.1: a worker group's timeouts, its own table over the
+/// release's, with the release's stop budget.
+fn group_timeouts(
+    name: &str,
+    table: Option<&muru_config::Timeouts>,
+    release: &HostTimeouts,
+) -> anyhow::Result<muru_controller::model::WorkerTimeouts> {
+    muru_config::check_group_timeouts(table)
+        .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+    let parse = |text: &Option<String>, key: &str| -> anyhow::Result<Option<u64>> {
+        text.as_ref()
+            .map(|text| {
+                muru_config::parse_duration(text)
+                    .map(|duration| duration.as_millis() as u64)
+                    .map_err(|error| {
+                        anyhow::anyhow!("[tool.muru.groups.{name}.timeouts] {key}: {error}")
+                    })
+            })
+            .transpose()
+    };
+    let own = table.cloned().unwrap_or_default();
+    let own = muru_controller::model::GroupTimeouts {
+        soft_timeout_ms: parse(&own.soft_timeout, "soft_timeout")?,
+        hard_timeout_ms: parse(&own.hard_timeout, "hard_timeout")?,
+        hard_drain_grace_ms: parse(&own.hard_drain_grace, "hard_drain_grace")?,
+        loop_stall_timeout_ms: parse(&own.loop_stall_timeout, "loop_stall_timeout")?,
+        gil_stall_timeout_ms: parse(&own.gil_stall_timeout, "gil_stall_timeout")?,
+    };
+    let ms = |duration: Duration| duration.as_millis() as u64;
+    let resolved = own.resolve(&muru_controller::model::WorkerTimeouts {
+        soft_timeout_ms: release.soft.map(ms),
+        hard_timeout_ms: release.hard.map(ms),
+        hard_drain_grace_ms: ms(release.hard_drain_grace),
+        shutdown_timeout_ms: ms(release.shutdown),
+        websocket_drain_grace_ms: ms(release.websocket_drain_grace),
+        loop_stall_timeout_ms: ms(release.loop_stall),
+        gil_stall_timeout_ms: ms(release.gil_stall),
+    });
+    muru_controller::config::check_timeouts(&resolved)
+        .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+    Ok(resolved)
+}
+
+/// Section 7.1: a worker group's memory policy, its own table over the
+/// release's policy.
+fn group_memory(
+    name: &str,
+    table: Option<&muru_config::Memory>,
+    release: &muru_controller::model::MemoryPolicy,
+) -> anyhow::Result<muru_controller::model::MemoryPolicy> {
+    match table {
+        Some(table) => release
+            .with_table(table)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}")),
+        None => Ok(release.clone()),
+    }
 }
 
 /// Largest request body in development (section 13.1, ADR 0008).
@@ -1267,6 +1346,8 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
 
     for (name, mount) in &table.mounts {
+        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
     }
@@ -1485,6 +1566,28 @@ fn group_sockets_from(
                 .and_then(|group| group.matches.as_ref())
                 .map(|matches| matches.client_class.clone())
                 .unwrap_or_default(),
+            hosts: groups
+                .get(name)
+                .and_then(|group| group.matches.as_ref())
+                .map(|matches| {
+                    matches
+                        .host
+                        .iter()
+                        .map(|host| muru_edge::routing::normalise(host))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            methods: groups
+                .get(name)
+                .and_then(|group| group.matches.as_ref())
+                .map(|matches| {
+                    matches
+                        .method
+                        .iter()
+                        .map(|method| method.trim().to_ascii_uppercase())
+                        .collect()
+                })
+                .unwrap_or_default(),
             sockets: sockets.clone(),
         })
         .collect()
@@ -1542,12 +1645,29 @@ fn group_serves(group: &muru_config::Group) -> String {
         .as_ref()
         .map(|matches| matches.client_class.join(", "))
         .filter(|classes| !classes.is_empty());
+    let asks = group.matches.as_ref().map_or_else(String::new, |matches| {
+        admin::group_asks(
+            &matches
+                .host
+                .iter()
+                .map(|host| muru_edge::routing::normalise(host))
+                .collect::<Vec<_>>(),
+            &matches
+                .method
+                .iter()
+                .map(|method| method.trim().to_ascii_uppercase())
+                .collect::<Vec<_>>(),
+        )
+    });
 
-    match (group.paths.join(", "), classes) {
+    let serves = match (group.paths.join(", "), classes) {
+        (paths, None) if paths.is_empty() => "every path".to_owned(),
         (paths, None) => paths,
         (paths, Some(classes)) if paths.is_empty() => format!("client classes {classes}"),
         (paths, Some(classes)) => format!("{paths} and client classes {classes}"),
-    }
+    };
+
+    format!("{serves}{asks}{}", admin::group_mounts(&group.mounts))
 }
 
 /// What a named mount serves, from where, and on which threads.
@@ -1742,6 +1862,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
+    let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
@@ -1764,14 +1885,20 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         groups: resolved
             .groups
             .iter()
-            .map(|(name, group)| muru_controller::host::HostGroup {
-                name: name.clone(),
-                processes: group.processes.unwrap_or(resolved.processes),
-                threads: group.threads.unwrap_or(resolved.threads),
-                sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
-                concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+            .map(|(name, group)| {
+                Ok(muru_controller::host::HostGroup {
+                    name: name.clone(),
+                    processes: group.processes.unwrap_or(resolved.processes),
+                    threads: group.threads.unwrap_or(resolved.threads),
+                    sync_threads: group.sync_threads.unwrap_or(resolved.sync_threads),
+                    concurrency: group.concurrency.unwrap_or(resolved.concurrency),
+                    timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
+                    memory: group_memory(name, group.memory.as_ref(), &memory)?,
+                    optional: group.optional.unwrap_or(false),
+                    mounts: group.mounts.clone(),
+                })
             })
-            .collect(),
+            .collect::<anyhow::Result<Vec<_>>>()?,
         mounts: resolved
             .mounts
             .iter()
@@ -1781,6 +1908,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 entrypoint: mount.entrypoint.clone(),
                 interface: mount.interface.unwrap_or(muru_config::Interface::Auto),
                 threads: mount.threads,
+                concurrency: mount.concurrency,
+                max_connections: mount.max_connections,
             })
             .collect(),
         logging: resolved
@@ -1796,7 +1925,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         shutdown_timeout: timeouts.shutdown,
         websocket_drain_grace: timeouts.websocket_drain_grace,
         loop_stall_timeout: timeouts.loop_stall,
-        memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
+        gil_stall_timeout: timeouts.gil_stall,
+        memory: memory.clone(),
         env: resolved
             .env
             .iter()
@@ -1931,12 +2061,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     for (name, group) in &resolved.groups {
         println!(
-            "muru: group {name} serves {} with {}",
+            "muru: group {name} serves {} with {}{}",
             group_serves(group),
             workers(
                 group.processes.unwrap_or(resolved.processes),
                 &capacity_of(name, group.threads.unwrap_or(resolved.threads))
-            )
+            ),
+            if group.optional == Some(true) {
+                ", optional"
+            } else {
+                ""
+            }
         );
     }
 
@@ -2030,6 +2165,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let pools = edge.pools();
+    let drainer = edge.drainer();
     let mut serving = tokio::spawn(edge.run());
     let mut release = 1;
 
@@ -2161,6 +2297,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     };
 
+    // Section 13.4: the edge stops accepting and lets the requests in
+    // flight finish before the host is told to stop, so no request is
+    // written to a worker that is going.
+
+    drainer.drain(stop_budget).await;
     current.stop(stop_budget).await;
     let _ = std::fs::remove_dir_all(&run_dir);
     outcome

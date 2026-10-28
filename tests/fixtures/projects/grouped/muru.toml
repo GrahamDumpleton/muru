@@ -1,4 +1,5 @@
 entrypoint = "grouped:application"
+hooks = "grouped_hooks"
 processes = 1
 threads = 2
 
@@ -10,3 +11,23 @@ threads = 1
 [groups.status]
 paths = ["/api/status"]
 threads = 8
+
+[groups.slow]
+paths = ["/slow/*"]
+timeouts = { soft_timeout = "1s" }
+memory = { check_interval = "1s" }
+
+[groups.batch]
+paths = ["/batch/*"]
+optional = true
+processes = 1
+
+[groups.uploads]
+paths = ["/files/*"]
+match = { method = ["POST", "PUT"] }
+processes = 1
+
+[groups.partner]
+paths = ["/reports/*"]
+match = { host = ["partner.test"] }
+processes = 1

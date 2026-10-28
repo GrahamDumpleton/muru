@@ -27,16 +27,21 @@ message Hello {
   bool files = 6;                   // accepts FILE frames
   uint32 max_message_size = 7;      // largest WebSocket message, bytes
   repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
-  repeated MountPool mount_pools = 9; // mounts with threads of their own (section 6.7)
+  repeated MountPool mount_pools = 9; // mounts with slots or connections of their own (section 6.7)
 }
 
-// A mount's own threads (section 6.7): reserved threads only it uses, and
-// the most requests it runs at once. Requests beyond the reserved threads,
-// up to the maximum, borrow threads of the shared pool.
+// A mount's own slots (section 6.7). For a WSGI mount, reserved threads
+// only it uses and the most requests it runs at once; requests beyond the
+// reserved threads, up to the maximum, borrow threads of the shared pool.
+// For an ASGI mount, reserved and max are both its concurrency, or 0 for
+// one that shares the worker's slots, and connections bounds the open
+// WebSockets it holds apart from the requests it runs, 0 for no bound of
+// its own.
 message MountPool {
   string mount = 1;
   uint32 reserved = 2;
   uint32 max = 3;
+  uint32 connections = 4;
 }
 
 // A gRPC method a worker serves (section 6.13). A path ending in / is a

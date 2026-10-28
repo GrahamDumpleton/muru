@@ -344,7 +344,12 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
 
         for (id, release) in &app.release {
             for (group, table) in &release.groups {
-                for class in unknown_classes(table.matches.as_ref(), defined) {
+                let classes = table
+                    .matches
+                    .as_ref()
+                    .map_or(&[][..], |matches| &matches.client_class[..]);
+
+                for class in unknown_among(classes, defined) {
                     plan.errors.push(format!(
                         "{name}@{id}: worker group {group}: no client class named {class}"
                     ));
@@ -705,9 +710,16 @@ fn describe_class(class: &ClientClass) -> String {
 /// Section 4.14: the classes a `match` names that neither the daemon's
 /// file nor an applied file defines; `default` is always defined.
 fn unknown_classes(matches: Option<&muru_config::ClientMatch>, defined: &Defined) -> Vec<String> {
-    matches
+    unknown_among(
+        matches.map_or(&[][..], |matches| &matches.client_class[..]),
+        defined,
+    )
+}
+
+/// The classes among `classes` that nothing defines.
+fn unknown_among(classes: &[String], defined: &Defined) -> Vec<String> {
+    classes
         .iter()
-        .flat_map(|matches| matches.client_class.iter())
         .filter(|class| class.as_str() != "default" && !defined.client_classes.contains(class))
         .cloned()
         .collect()
@@ -2201,6 +2213,19 @@ pub struct Tables<'a> {
     pub declared: bool,
 }
 
+/// A group's paths as the edge matches them: prefixes without their
+/// `*`, and `/` alone for a group that claims every path.
+fn group_prefixes(paths: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return vec!["/".to_owned()];
+    }
+
+    paths
+        .iter()
+        .map(|path| muru_edge::routing::group_prefix(path))
+        .collect()
+}
+
 /// Section 3.3: the layer a release setting came from, the first of
 /// the request, the source's [tool.muru] table and the previous release
 /// that gives it, else the default.
@@ -2336,18 +2361,44 @@ pub fn resolve_spec(
             return Err(format!("{name:?} is not a valid worker group name"));
         }
 
-        muru_config::check_client_match(group.matches.as_ref())
+        muru_config::check_group_match(group.matches.as_ref())
             .map_err(|error| format!("worker group {name}: {error}"))?;
-        let client_class = group
-            .matches
-            .as_ref()
-            .map(|matches| matches.client_class.clone())
-            .unwrap_or_default();
+        let matches = group.matches.clone().unwrap_or_default();
+        let client_class = matches.client_class;
 
-        if group.paths.is_empty() && client_class.is_empty() {
-            return Err(format!(
-                "worker group {name} has no paths and no match.client_class"
-            ));
+        // ADR 0033: hosts are compared as the host tables hold them, with
+        // no wildcard, and methods in upper case.
+
+        let mut host = Vec::new();
+
+        for given in &matches.host {
+            let normalised = muru_edge::routing::normalise(given);
+
+            if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
+                return Err(format!(
+                    "worker group {name}: match.host {given:?} is not a host name"
+                ));
+            }
+
+            host.push(normalised);
+        }
+
+        let mut method = Vec::new();
+
+        for given in &matches.method {
+            let token = given.trim().to_ascii_uppercase();
+
+            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return Err(format!(
+                    "worker group {name}: match.method {given:?} is not a method"
+                ));
+            }
+
+            method.push(token);
+        }
+
+        if group.paths.is_empty() && group.matches.is_none() {
+            return Err(format!("worker group {name} has no paths and no match"));
         }
 
         if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
@@ -2372,10 +2423,32 @@ pub fn resolve_spec(
             ));
         }
 
+        // Section 7.1: the group's own timeouts, checked against the
+        // release's once those are resolved below, and its memory policy,
+        // resolved over the release's there too.
+
+        muru_config::check_group_timeouts(group.timeouts.as_ref())
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+        let own = group.timeouts.clone().unwrap_or_default();
+        let parse = |text: Option<&String>, key: &str| {
+            parse_ms(text, key).map_err(|error| format!("worker group {name}: timeouts.{error}"))
+        };
+        let group_timeouts = crate::model::GroupTimeouts {
+            soft_timeout_ms: parse(own.soft_timeout.as_ref(), "soft_timeout")?,
+            hard_timeout_ms: parse(own.hard_timeout.as_ref(), "hard_timeout")?,
+            hard_drain_grace_ms: parse(own.hard_drain_grace.as_ref(), "hard_drain_grace")?,
+            loop_stall_timeout_ms: parse(own.loop_stall_timeout.as_ref(), "loop_stall_timeout")?,
+            gil_stall_timeout_ms: parse(own.gil_stall_timeout.as_ref(), "gil_stall_timeout")?,
+        };
+
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
+            mounts: group.mounts.clone(),
             client_class,
+            host,
+            method,
+            optional: group.optional.unwrap_or(false),
             processes: group_processes,
             threads: group.threads.map_or(threads, |value| value as u32),
             sync_threads: group
@@ -2383,7 +2456,36 @@ pub fn resolve_spec(
                 .map_or(sync_threads, |value| value as u32),
             concurrency: group.concurrency.map_or(concurrency, |value| value as u32),
             scaling: group_scaling,
+            timeouts: group_timeouts,
+            memory: None,
         });
+    }
+
+    // ADR 0033: two groups asking the same of the same path cannot be
+    // ordered, so they are refused; groups asking different things of a
+    // path are ranked by how much they ask.
+
+    for (index, group) in resolved_groups.iter().enumerate() {
+        for other in &resolved_groups[index + 1..] {
+            let overlap = |mine: &[String], theirs: &[String]| {
+                (mine.is_empty() && theirs.is_empty())
+                    || mine.iter().any(|value| theirs.contains(value))
+            };
+            let shared = group_prefixes(&group.paths)
+                .into_iter()
+                .find(|prefix| group_prefixes(&other.paths).contains(prefix));
+
+            if let Some(path) = shared
+                && overlap(&group.client_class, &other.client_class)
+                && overlap(&group.host, &other.host)
+                && overlap(&group.method, &other.method)
+            {
+                return Err(format!(
+                    "worker groups {} and {} ask the same of {path}",
+                    group.name, other.name
+                ));
+            }
+        }
     }
 
     // Section 6.7: mounts from the declaration, else the source's own
@@ -2466,6 +2568,8 @@ pub fn resolve_spec(
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
             .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
 
@@ -2484,7 +2588,47 @@ pub fn resolve_spec(
             sendfile_roots: mount_roots,
             sendfile_header: mount_header,
             threads: mount.threads,
+            concurrency: mount.concurrency.map(|value| value as u32),
+            max_connections: mount.max_connections.map(|value| value as u32),
         });
+    }
+
+    // ADR 0033: a group's workers serve the mounts it lists and the
+    // default mount; its paths must lie within them, so a request it
+    // claims never reaches a worker without the request's mount.
+
+    for group in &resolved_groups {
+        if group.mounts.is_empty() {
+            continue;
+        }
+
+        for name in &group.mounts {
+            if !resolved_mounts.iter().any(|mount| &mount.name == name) {
+                return Err(format!(
+                    "worker group {}: no mount named {name}",
+                    group.name
+                ));
+            }
+        }
+
+        for mount in &resolved_mounts {
+            if group.mounts.contains(&mount.name) || mount.path.is_empty() {
+                continue;
+            }
+
+            for prefix in group_prefixes(&group.paths) {
+                let under = |path: &str, prefix: &str| {
+                    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
+                };
+
+                if under(&mount.path, &prefix) || under(&prefix, &mount.path) {
+                    return Err(format!(
+                        "worker group {}: its path {prefix} reaches mount {} at {}, which it does not serve",
+                        group.name, mount.name, mount.path
+                    ));
+                }
+            }
+        }
     }
 
     // Section 7.6 and 7.7: the host's own timeouts and recycling, from
@@ -2541,6 +2685,12 @@ pub fn resolve_spec(
             "loop_stall_timeout",
         )?
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().loop_stall_timeout_ms),
+        gil_stall_timeout_ms: duration_ms(
+            request.gil_stall_timeout_ms,
+            table_timeouts.gil_stall_timeout.as_ref(),
+            "gil_stall_timeout",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().gil_stall_timeout_ms),
     };
 
     if max_lifetime_ms == Some(0) {
@@ -2606,6 +2756,26 @@ pub fn resolve_spec(
 
     if memory.check_interval_ms == 0 {
         return Err("memory.check_interval must be longer than nothing".to_owned());
+    }
+
+    // Section 7.1: each group's timeouts hold the same rules over the
+    // release's, and its memory table is resolved over the release's.
+
+    for group in &mut resolved_groups {
+        check_timeouts(&group.timeouts.resolve(&timeouts))
+            .map_err(|error| format!("worker group {}: {error}", group.name))?;
+
+        if let Some(table) = groups
+            .unwrap_or(&table.groups)
+            .get(&group.name)
+            .and_then(|declared| declared.memory.as_ref())
+        {
+            group.memory = Some(
+                memory
+                    .with_table(table)
+                    .map_err(|error| format!("worker group {}: {error}", group.name))?,
+            );
+        }
     }
 
     let env = resolve_env_specs(&table.env, &request.env)?;
@@ -2851,6 +3021,15 @@ fn resolve_layers(
             ),
         ),
         (
+            "timeouts.gil_stall_timeout",
+            layer(
+                request.gil_stall_timeout_ms.is_some(),
+                timeouts.gil_stall_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
             "memory.measure",
             layer(
                 !request.memory_measure.is_empty(),
@@ -2975,6 +3154,10 @@ fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
         (
             "timeouts.loop_stall_timeout",
             format_ms(spec.timeouts.loop_stall_timeout_ms),
+        ),
+        (
+            "timeouts.gil_stall_timeout",
+            format_ms(spec.timeouts.gil_stall_timeout_ms),
         ),
         ("memory.measure", spec.memory.measure.to_string()),
         (
@@ -3142,7 +3325,8 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         || request.hard_drain_grace_ms.is_some()
         || request.shutdown_timeout_ms.is_some()
         || request.websocket_drain_grace_ms.is_some()
-        || request.loop_stall_timeout_ms.is_some();
+        || request.loop_stall_timeout_ms.is_some()
+        || request.gil_stall_timeout_ms.is_some();
     let memory_given = !request.memory_measure.is_empty()
         || request.memory_soft_limit.is_some()
         || request.memory_soft_for_ms.is_some()
@@ -3186,6 +3370,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
             websocket_drain_grace: request.websocket_drain_grace_ms.map(format_ms),
             loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
+            gil_stall_timeout: request.gil_stall_timeout_ms.map(format_ms),
         }),
         memory: memory_given.then(muru_config::Memory::default),
         env: BTreeMap::new(),
@@ -3651,6 +3836,12 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|t| t.loop_stall_timeout.as_ref()),
         ),
+        gil_stall_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.gil_stall_timeout.as_ref()),
+        ),
         memory_measure: table
             .memory
             .as_ref()
@@ -3766,16 +3957,23 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                     group.name.clone(),
                     GroupTable {
                         paths: group.paths.clone(),
-                        matches: (!group.client_class.is_empty()).then(|| {
-                            muru_config::ClientMatch {
-                                client_class: group.client_class.clone(),
-                            }
+                        mounts: group.mounts.clone(),
+                        matches: (!group.client_class.is_empty()
+                            || !group.host.is_empty()
+                            || !group.method.is_empty())
+                        .then(|| muru_config::GroupMatch {
+                            client_class: group.client_class.clone(),
+                            host: group.host.clone(),
+                            method: group.method.clone(),
                         }),
+                        optional: group.optional.then_some(true),
                         processes: Some(group.processes as usize),
                         threads: Some(group.threads as usize),
                         sync_threads: Some(group.sync_threads as usize),
                         concurrency: Some(group.concurrency as usize),
                         scaling: scaling_table(&group.scaling),
+                        timeouts: group.timeouts.table(),
+                        memory: group.memory.as_ref().map(crate::model::MemoryPolicy::table),
                     },
                 )
             })
@@ -3802,6 +4000,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                             .then(|| mount.sendfile_header.clone())
                             .flatten(),
                         threads: mount.threads,
+                        concurrency: mount.concurrency.map(|value| value as usize),
+                        max_connections: mount.max_connections.map(|value| value as usize),
                     },
                 )
             })
@@ -3836,6 +4036,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 ))),
                 loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.loop_stall_timeout_ms,
+                ))),
+                gil_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.gil_stall_timeout_ms,
                 ))),
             }
         }),
@@ -3889,13 +4092,17 @@ fn env_table_from(env: &[EnvSpec]) -> BTreeMap<String, muru_config::EnvValue> {
 /// Section 7.6: a soft timeout is a duration, and the hard timeout, the
 /// backstop for a request the soft timeout could not interrupt, must
 /// exceed it by at least 5 s.
-pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
+pub fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<(), String> {
     if timeouts.soft_timeout_ms == Some(0) {
         return Err("soft_timeout must be longer than nothing".to_owned());
     }
 
     if timeouts.loop_stall_timeout_ms == 0 {
         return Err("loop_stall_timeout must be longer than nothing".to_owned());
+    }
+
+    if timeouts.gil_stall_timeout_ms == 0 {
+        return Err("gil_stall_timeout must be longer than nothing".to_owned());
     }
 
     if let (Some(soft), Some(hard)) = (timeouts.soft_timeout_ms, timeouts.hard_timeout_ms)
@@ -4112,6 +4319,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_ms(Some(recorded.timeouts.loop_stall_timeout_ms)),
     );
     compare(
+        "gil_stall_timeout",
+        describe_ms(Some(declared.timeouts.gil_stall_timeout_ms)),
+        describe_ms(Some(recorded.timeouts.gil_stall_timeout_ms)),
+    );
+    compare(
         "memory",
         describe_memory(&declared.memory),
         describe_memory(&recorded.memory),
@@ -4243,6 +4455,17 @@ fn describe_memory(memory: &crate::model::MemoryPolicy) -> String {
     )
 }
 
+/// A duration from a configuration table in milliseconds, none when the
+/// key is absent.
+fn parse_ms(text: Option<&String>, name: &str) -> Result<Option<u64>, String> {
+    text.map(|text| {
+        muru_config::parse_duration(text)
+            .map(|duration| duration.as_millis() as u64)
+            .map_err(|error| format!("{name}: {error}"))
+    })
+    .transpose()
+}
+
 /// A duration in milliseconds as the configuration writes it, or off.
 fn describe_ms(ms: Option<u64>) -> String {
     match ms {
@@ -4260,7 +4483,8 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
     groups
         .iter()
         .map(|group| {
-            let on = match (group.paths.is_empty(), group.client_class.is_empty()) {
+            let mut on = match (group.paths.is_empty(), group.client_class.is_empty()) {
+                (true, true) => "every path".to_owned(),
                 (_, true) => group.paths.join(" "),
                 (true, false) => format!("every path for {}", group.client_class.join(" ")),
                 (false, false) => {
@@ -4272,16 +4496,50 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
                 }
             };
 
+            if !group.host.is_empty() {
+                on.push_str(&format!(" host {}", group.host.join(" ")));
+            }
+
+            if !group.method.is_empty() {
+                on.push_str(&format!(" method {}", group.method.join(" ")));
+            }
+
+            if !group.mounts.is_empty() {
+                on.push_str(&format!(" mounts {}", group.mounts.join(" ")));
+            }
+
+            let own = [
+                ("soft_timeout", group.timeouts.soft_timeout_ms),
+                ("hard_timeout", group.timeouts.hard_timeout_ms),
+                ("hard_drain_grace", group.timeouts.hard_drain_grace_ms),
+                ("loop_stall_timeout", group.timeouts.loop_stall_timeout_ms),
+                ("gil_stall_timeout", group.timeouts.gil_stall_timeout_ms),
+            ]
+            .into_iter()
+            .filter_map(|(name, ms)| ms.map(|ms| format!("{name} {}", describe_ms(Some(ms)))))
+            .collect::<Vec<_>>();
+
             format!(
-                "{} {}x{} on {on}{}",
+                "{} {}x{} on {on}{}{}{}{}",
                 group.name,
                 group.processes,
                 group.threads,
+                if group.optional { " optional" } else { "" },
                 if group.scaling.is_static() {
                     String::new()
                 } else {
                     format!(" scaling {}", group.scaling.describe())
-                }
+                },
+                if own.is_empty() {
+                    String::new()
+                } else {
+                    format!(" timeouts {}", own.join(", "))
+                },
+                group
+                    .memory
+                    .as_ref()
+                    .map(|memory| format!(" memory {}", describe_memory(memory)))
+                    .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()

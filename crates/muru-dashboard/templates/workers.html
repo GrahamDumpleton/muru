@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muru: {{ release }} workers</title>
+{% include "style.html" %}
+</head>
+<body>
+<header>
+  <h1>Muru</h1>
+  <span>{{ release }}</span>
+  <span>workers</span>
+</header>
+<main>
+  <nav><a href="./">daemon</a><a href="workers?release={{ release }}">{{ release }}</a></nav>
+  <section id="status" hx-get="fragment/workers/status?release={{ release }}" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "workers_status.html" %}
+  </section>
+  <section id="stacks">
+    <h2>Stacks <button hx-get="fragment/workers/stacks?release={{ release }}" hx-target="#stacks-body" hx-swap="innerHTML">Take again</button></h2>
+    <p class="note">The Python stack of every thread in every worker, with the request each is serving; threads showing the same stack across workers are shown once.</p>
+    <div id="stacks-body" hx-get="fragment/workers/stacks?release={{ release }}" hx-trigger="load" hx-swap="innerHTML">Reading the stacks…</div>
+  </section>
+</main>
+<script src="static/htmx.min.js"></script>
+</body>
+</html>

@@ -239,6 +239,7 @@ message DeployRequest {
   optional uint32 retain_workers = 46;      // section 9.1: the workers each group of the superseded release keeps while warm; 1 when absent
   repeated string grpc_web_origins = 47;    // section 6.13: origins whose pages may call it through gRPC-Web, or *; the table's when empty
   optional uint64 websocket_drain_grace_ms = 48; // how long a worker told to stop keeps its WebSockets before closing them with 1001
+  optional uint64 gil_stall_timeout_ms = 49; // section 7.6: how long a worker may run no Python, or send no report, before it is replaced
 }
 
 // One environment variable: a value, or a secret reference.
@@ -483,6 +484,10 @@ message ReleaseGroup {
   uint32 threads = 5;
   uint32 sync_threads = 6;
   uint32 concurrency = 7;
+  bool optional = 8;
+  repeated string hosts = 9;            // ADR 0033: the hosts the group takes, every host when empty
+  repeated string methods = 10;         // ADR 0033: the methods, upper case, every method when empty
+  repeated string mounts = 11;          // ADR 0033: the named mounts its workers serve, every mount when empty
 }
 
 message Worker {
@@ -523,7 +528,7 @@ message ShutdownResponse {}
 message DebugRequest {
   string app = 1;
   string release = 2;               // the application's current release when empty
-  string op = 3;                    // status, stacks, tasks, inspect or logging
+  string op = 3;                    // status, stacks, tasks, inspect, logging, restart or the other debug operations
   optional uint32 worker = 4;       // one worker, else every worker
   string args_json = 5;             // the operation's arguments as a JSON object
 }

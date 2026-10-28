@@ -272,6 +272,7 @@ def start(
     env: dict[str, str] | None = None,
     https: bool = False,
     host: str = "127.0.0.1",
+    new_session: bool = False,
 ) -> Server:
     """Start muructl for `module:callable`, skipping the test when it cannot run.
 
@@ -282,8 +283,10 @@ def start(
     and passed as --https-port (the caller adds --https, --https-only or
     --tls-cert). `host` is the address to bind, which is loopback unless a
     test needs the server reachable from a container (with --allow-public
-    in `args`). When muructl exits before its workers are ready, the
-    RuntimeError raised carries its output.
+    in `args`). With `new_session`, muructl leads a session of its own, so
+    a test can signal its process group as a terminal's Ctrl-C would. When
+    muructl exits before its workers are ready, the RuntimeError raised
+    carries its output.
     """
 
     muructl = muructl_path()
@@ -321,6 +324,7 @@ def start(
             stdout=handle,
             stderr=subprocess.STDOUT,
             env={**os.environ, **(env or {})},
+            start_new_session=new_session,
         )
 
     server = Server(port, process, log, workers or 0, threads or 0, https_port)

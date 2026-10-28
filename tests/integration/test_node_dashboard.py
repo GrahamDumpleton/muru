@@ -158,6 +158,81 @@ def test_the_gateway_serves_the_same_figures_as_json(served: tuple[Daemon, int])
     assert 'muru_requests_total{app="shop"' in body.decode()
 
 
+def test_worker_pages_show_status_stacks_tasks_and_memory(served: tuple[Daemon, int]) -> None:
+    daemon, port = served
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    assert daemon.request("/catalogue").status == 200
+
+    # The daemon page links each running release to its workers, whose
+    # page shows what debug status shows and links each worker to its own.
+
+    page = fetch(port, "/")[2].decode()
+    assert '<a href="workers?release=shop@r1">shop@r1</a>' in page
+    status, headers, body = fetch(port, "/workers?release=shop@r1")
+    assert status == 200 and headers["content-type"].startswith("text/html")
+    page = body.decode()
+    assert "<title>Muru: shop@r1 workers</title>" in page
+    assert '<a href="worker?release=shop@r1&worker=0">0</a>' in page
+    assert '<a href="worker?release=shop@r1&worker=1">1</a>' in page
+    assert page.count('class="state-ready">ready') == 2
+    assert 'hx-get="fragment/workers/stacks?release=shop@r1"' in page
+
+    # The stacks are merged across workers as muructl debug stacks merges
+    # them; the status fragment polls.
+
+    stacks = fetch(port, "/fragment/workers/stacks?release=shop@r1")[2].decode()
+    assert "<h3>MainThread in 2 workers (0, 1)</h3>" in stacks
+    assert "muru-control" not in stacks
+    fragment = fetch(port, "/fragment/workers/status?release=shop@r1")[2].decode()
+    assert fragment.count("<tr>") == 3
+
+    # One worker's page: its status, stacks, tasks, and memory when asked
+    # for, which is recorded as muructl debug memory is.
+
+    page = fetch(port, "/worker?release=shop@r1&worker=1")[2].decode()
+    assert "<title>Muru: shop@r1 worker 1</title>" in page
+    assert page.count('class="state-ready">ready') == 1
+    assert 'hx-get="fragment/workers/memory?release=shop@r1&worker=1"' in page
+    stacks = fetch(port, "/fragment/workers/stacks?release=shop@r1&worker=1")[2].decode()
+    assert "<h3>MainThread in worker 1</h3>" in stacks and "worker 0" not in stacks
+    tasks = fetch(port, "/fragment/workers/tasks?release=shop@r1&worker=1")[2].decode()
+    assert "worker 1 (pid" in tasks and "no event loop" in tasks
+    memory = fetch(port, "/fragment/workers/memory?release=shop@r1&worker=1")[2].decode()
+    assert "worker 1 (pid" in memory and "GC counts" in memory and "<td>dict</td>" in memory
+    assert "debug.memory" in daemon.muructl("events").stdout
+
+    # An ASGI worker's tasks.
+
+    assert daemon.deploy(
+        "asgi", support.FIXTURES, "--entrypoint", "plain_asgi:application", "--processes", "1"
+    ) == ("muru: release asgi@r1 is ready and serving")
+    tasks = fetch(port, "/fragment/workers/tasks?release=asgi@r1")[2].decode()
+    assert "loop lag" in tasks
+
+    # The same answers as JSON, shaped as muructl debug --json prints them.
+
+    answer = fetch_json(port, "/v1/debug/status?release=shop@r1")
+    assert answer["release"] == "r1"
+    assert [worker["index"] for worker in answer["workers"]] == [0, 1]
+    assert all(worker["ok"] and worker["result"]["ready"] for worker in answer["workers"])
+    answer = fetch_json(port, "/v1/debug/stacks?release=shop@r1&worker=0")
+    assert len(answer["workers"]) == 1
+    assert any(t["name"] == "MainThread" for t in answer["workers"][0]["result"]["threads"])
+    tasks = fetch_json(port, "/v1/debug/tasks?release=asgi@r1")
+    assert tasks["workers"][0]["result"]["lag_ms"] is not None
+
+    # What cannot be asked.
+
+    status, _, body = fetch(port, "/v1/debug/status?release=shop@r9")
+    assert status == 409 and b"not running" in body
+    assert fetch(port, "/v1/debug/inspect?release=shop@r1")[0] == 404
+    assert fetch(port, "/workers")[0] == 400
+    assert fetch(port, "/worker?release=shop@r1")[0] == 400
+    assert fetch(port, "/worker?release=shop@r1&worker=x")[0] == 400
+    page = fetch(port, "/workers?release=shop@r9")[2].decode()
+    assert "not running" in page
+
+
 def test_the_dashboard_is_loopback_only(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="loopback"):
         start_daemon(tmp_path, arguments=["--dashboard", "0.0.0.0:0"])
@@ -413,6 +488,153 @@ def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) 
         daemon.stop()
 
 
+def test_a_session_that_may_act_promotes_rolls_back_scales_restarts_and_drains(
+    tmp_path: Path,
+) -> None:
+    port = support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        arguments=["--dashboard", f"127.0.0.1:{port}"],
+        config_extra="[dashboard]\nactions = true\n",
+    )
+
+    try:
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
+        acting = {"Authorization": f"Bearer {bearer}"}
+        TOKENS[port] = bearer
+
+        def post(name: str, fields: dict[str, str]) -> tuple[int, dict[str, str]]:
+            return post_form_headers(port, f"/actions/{name}", fields, acting)
+
+        def current() -> str:
+            return str(fetch_json(port, "/v1/apps")[0]["current"])
+
+        # The page offers what each release allows: the held release can be
+        # promoted or drained, the serving one drained, and nothing rolled
+        # back until there is a previous release.
+
+        page = fetch_with(port, "/", acting)
+        assert page.count('action="actions/promote"') == 1
+        assert page.count('action="actions/drain"') == 2
+        assert 'action="actions/rollback"' not in page
+        assert page.count('action="actions/scale"') == 2 and "<button>Unpin</button>" not in page
+
+        # The section is swapped in afresh every two seconds, so what is
+        # typed into a form is kept across the swap.
+
+        assert 'id="pin-shop-r1-default" hx-preserve="true"' in page
+
+        status, headers = post("promote", {"app": "shop", "release": "r2"})
+        assert status == 303 and headers["location"] == "../"
+        assert current() == "r2"
+        assert "Roll back to r1" in fetch_with(port, "/", acting)
+        assert post("promote", {"app": "shop", "release": "r2"})[0] == 409
+
+        status, _ = post("rollback", {"app": "shop"})
+        assert status == 303
+        assert current() == "r1"
+
+        # A pin shows in the scaling table with a button to lift it.
+
+        status, _ = post(
+            "scale", {"app": "shop", "release": "r1", "group": "default", "processes": "3"}
+        )
+        assert status == 303
+        scaling = {
+            row["group"]: row
+            for row in fetch_json(port, "/v1/scaling")
+            if row["release"] == "shop@r1"
+        }
+        assert scaling["default"]["pinned"] is True
+        assert "<button>Unpin</button>" in fetch_with(port, "/", acting)
+        status, _ = post(
+            "scale", {"app": "shop", "release": "r1", "group": "default", "unpin": "on"}
+        )
+        assert status == 303
+        scaling = {
+            row["group"]: row
+            for row in fetch_json(port, "/v1/scaling")
+            if row["release"] == "shop@r1"
+        }
+        assert scaling["default"]["pinned"] is False
+
+        # Restarting a worker from its page comes back to that page.
+
+        def pids() -> dict[int, int]:
+            answer = fetch_json(port, "/v1/debug/status?release=shop@r1")
+            return {
+                int(worker["index"]): int(worker["pid"])
+                for worker in answer["workers"]
+                if worker["ok"] and worker["result"]["ready"] and not worker["result"]["replaced"]
+            }
+
+        # The lifted pin takes the third worker away first.
+
+        wait_for(
+            lambda: (
+                len(fetch_json(port, "/v1/debug/status?release=shop@r1")["workers"]) == 2
+                and len(pids()) == 2
+            ),
+            timeout=30,
+        )
+        before = pids()
+        assert len(before) == 2, before
+        chosen, other = sorted(before)
+        page = fetch_with(port, "/workers?release=shop@r1", acting)
+        assert (
+            'action="actions/restart"' in page
+            and 'name="back" value="workers?release=shop@r1"' in page
+        )
+        assert f'id="force-{chosen}" hx-preserve="true"' in page
+        page = fetch_with(port, f"/worker?release=shop@r1&worker={chosen}", acting)
+        assert f'name="back" value="worker?release=shop@r1&#38;worker={chosen}"' in page
+        status, headers = post(
+            "restart",
+            {
+                "app": "shop",
+                "release": "r1",
+                "worker": str(chosen),
+                "back": "workers?release=shop@r1",
+            },
+        )
+        assert status == 303 and headers["location"] == "../workers?release=shop@r1"
+        wait_for(lambda: pids().get(chosen) not in (None, before[chosen]), timeout=30)
+        assert pids()[other] == before[other]
+        status, _ = post("restart", {"app": "shop", "release": "r1", "worker": "9"})
+        assert status == 409
+
+        status, _ = post("drain", {"app": "shop", "release": "r2"})
+        assert status == 303
+        releases = {
+            release["id"]: release for release in fetch_json(port, "/v1/apps/shop/releases")
+        }
+        assert releases["r2"]["state"] == "stopped" and current() == "r1"
+
+        # What is not an action, or not a whole one.
+
+        status, _ = post("deploy", {"app": "shop"})
+        assert status == 400
+        status, _ = post("drain", {"app": "shop"})
+        assert status == 400
+
+        events = daemon.muructl("events").stdout
+
+        for what in (
+            "promoted shop@r2 from the dashboard",
+            "rolled shop back to r1 from the dashboard",
+            "pinned default to 3 workers from the dashboard",
+            "unpinned default from the dashboard",
+            f"restarted worker {chosen} from the dashboard",
+            "drained shop@r2 from the dashboard",
+        ):
+            assert what in events, what
+    finally:
+        TOKENS.pop(port, None)
+        daemon.stop()
+
+
 def post_form_headers(
     port: int, path: str, fields: dict[str, str], headers: dict[str, str]
 ) -> tuple[int, dict[str, str]]:
@@ -457,6 +679,9 @@ def test_everything_but_the_metrics_and_assets_needs_a_session(
         "/v1/history",
         "/v1/history/stream",
         "/v1/events/stream",
+        "/workers?release=shop@r1",
+        "/fragment/workers/stacks?release=shop@r1",
+        "/v1/debug/status?release=shop@r1",
     ):
         status, _, body = fetch(port, path, signed=False)
         assert status == 401 and b"not signed in" in body, path

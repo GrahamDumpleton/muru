@@ -268,6 +268,10 @@ pub struct Mount {
     /// The mount's own threads, when it has them: those it reserves and
     /// the most requests it runs at once.
     pub threads: Option<(usize, usize)>,
+    /// An ASGI mount's own limits, when it has any: the requests it runs
+    /// at once and the open WebSockets it holds, 0 for one it does not
+    /// set (section 6.7). The edge holds the slots.
+    pub limits: Option<(usize, usize)>,
     /// The pool of its reserved threads, for a WSGI mount that reserves
     /// any; its other requests run on the shared pool.
     pub pool: Option<Arc<Pool>>,
@@ -280,6 +284,7 @@ impl Mount {
             app: self.app.clone_ref(py),
             runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
             threads: self.threads,
+            limits: self.limits,
             pool: self.pool.clone(),
         }
     }
@@ -316,6 +321,10 @@ pub struct Shared {
     /// How long the event loop may go without beating before the host
     /// is told it has stalled (section 7.6); none without a loop.
     pub loop_stall: Option<std::time::Duration>,
+    /// How long no thread may manage to attach to the interpreter before
+    /// the host is told it has stalled (section 7.6); none turns the
+    /// check off.
+    pub gil_stall: Option<std::time::Duration>,
     /// The gRPC methods the mounts registered (section 6.13), for HELLO.
     pub grpc_methods: Vec<muru_proto::worker::v1::GrpcMethod>,
     in_flight: AtomicU32,
@@ -351,6 +360,7 @@ impl Shared {
             pool: Pool::start("muru-app", threads)?,
             soft_timeout,
             loop_stall: None,
+            gil_stall: None,
             grpc_methods: Vec::new(),
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
@@ -381,6 +391,7 @@ impl Shared {
                     Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
                 }),
                 threads: None,
+                limits: None,
                 pool: None,
             });
         }
@@ -399,18 +410,28 @@ impl Shared {
         }
     }
 
-    /// The mounts' own threads, for HELLO (section 6.7).
+    /// The mounts' own threads and limits, for HELLO (section 6.7).
     pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
+        let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+
         self.mounts
             .iter()
-            .filter_map(|(name, mount)| {
-                mount
-                    .threads
-                    .map(|(reserved, max)| muru_proto::worker::v1::MountPool {
+            .filter_map(|(name, mount)| match (mount.threads, mount.limits) {
+                (Some((reserved, max)), _) => Some(muru_proto::worker::v1::MountPool {
+                    mount: name.clone(),
+                    reserved: clamp(reserved),
+                    max: clamp(max),
+                    connections: 0,
+                }),
+                (None, Some((concurrency, connections))) => {
+                    Some(muru_proto::worker::v1::MountPool {
                         mount: name.clone(),
-                        reserved: u32::try_from(reserved).unwrap_or(u32::MAX),
-                        max: u32::try_from(max).unwrap_or(u32::MAX),
+                        reserved: clamp(concurrency),
+                        max: clamp(concurrency),
+                        connections: clamp(connections),
                     })
+                }
+                (None, None) => None,
             })
             .collect()
     }

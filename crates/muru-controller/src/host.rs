@@ -375,6 +375,9 @@ pub struct HostSpec {
     /// How long an ASGI worker's event loop may stall before the worker
     /// is replaced (section 7.6).
     pub loop_stall_timeout: Duration,
+    /// How long a worker may run no Python, or send no report, before it
+    /// is replaced (section 7.6).
+    pub gil_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
     /// Environment variables for the host and its workers (section
@@ -460,6 +463,10 @@ pub struct HostMount {
     pub interface: muru_config::Interface,
     /// Threads of the mount's own (section 6.7).
     pub threads: Option<muru_config::MountThreads>,
+    /// An ASGI mount's requests at once on each worker (section 6.7).
+    pub concurrency: Option<usize>,
+    /// An ASGI mount's open WebSockets at once on each worker.
+    pub max_connections: Option<usize>,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -475,6 +482,16 @@ pub struct HostGroup {
     pub sync_threads: usize,
     /// Requests an ASGI worker's event loop takes at once.
     pub concurrency: usize,
+    /// The group's timeouts, resolved over the release's (section 7.1).
+    pub timeouts: crate::model::WorkerTimeouts,
+    /// The group's memory policy, resolved over the release's.
+    pub memory: crate::model::MemoryPolicy,
+    /// Whether the release is ready without the group's workers (ADR
+    /// 0033).
+    pub optional: bool,
+    /// The named mounts its workers serve beside the default mount;
+    /// every mount when empty (ADR 0033).
+    pub mounts: Vec<String>,
 }
 
 /// A running host and the sockets its workers listen on.
@@ -486,6 +503,8 @@ pub struct HostProcess {
     pub sockets: Vec<PathBuf>,
     /// The sockets of each named group, in the order of the spec.
     pub group_sockets: Vec<(String, Vec<PathBuf>)>,
+    /// The groups the release is ready without (ADR 0033).
+    optional: Vec<String>,
     run_dir: PathBuf,
     /// The release number within this run, from 1.
     pub release: u32,
@@ -555,6 +574,12 @@ impl HostProcess {
             }
             None => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+                // Section 13.1: a Ctrl-C in the terminal reaches muructl
+                // alone, which stops the edge before it tells the host,
+                // so the host and its workers are in a group of their own.
+
+                command.process_group(0);
             }
         }
 
@@ -592,6 +617,12 @@ impl HostProcess {
 
             if let Some(threads) = mount.threads {
                 text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
+            } else if mount.concurrency.is_some() || mount.max_connections.is_some() {
+                text.push_str(&format!(
+                    "={},{}",
+                    mount.concurrency.unwrap_or(0),
+                    mount.max_connections.unwrap_or(0)
+                ));
             }
 
             command.arg("--mount").arg(text);
@@ -601,6 +632,50 @@ impl HostProcess {
             command.arg("--group").arg(format!(
                 "{}={},{},{},{}",
                 group.name, group.processes, group.threads, group.sync_threads, group.concurrency
+            ));
+
+            if group.optional {
+                command.arg("--optional-group").arg(&group.name);
+            }
+
+            if !group.mounts.is_empty() {
+                command.arg("--group-mounts").arg(format!(
+                    "{}={}",
+                    group.name,
+                    group.mounts.join(",")
+                ));
+            }
+
+            // Section 7.1: the group's own timeouts and memory policy,
+            // every value spelled out, the release's where it set none.
+
+            let seconds = |ms: Option<u64>| {
+                ms.map_or_else(|| "off".to_owned(), |ms| (ms as f64 / 1000.0).to_string())
+            };
+            let timeouts = &group.timeouts;
+            command.arg("--group-timeouts").arg(format!(
+                "{}={},{},{},{},{}",
+                group.name,
+                seconds(timeouts.soft_timeout_ms),
+                seconds(timeouts.hard_timeout_ms),
+                seconds(Some(timeouts.hard_drain_grace_ms)),
+                seconds(Some(timeouts.loop_stall_timeout_ms)),
+                seconds(Some(timeouts.gil_stall_timeout_ms)),
+            ));
+            let memory = &group.memory;
+            command.arg("--group-memory").arg(format!(
+                "{}={},{},{},{},{},{}",
+                group.name,
+                memory.measure.as_str(),
+                memory
+                    .soft_limit
+                    .map_or_else(|| "off".to_owned(), |bytes| bytes.to_string()),
+                seconds(Some(memory.soft_for_ms)),
+                memory.reclaim_first,
+                memory
+                    .hard_limit
+                    .map_or_else(|| "off".to_owned(), |bytes| bytes.to_string()),
+                seconds(Some(memory.check_interval_ms)),
             ));
         }
 
@@ -649,7 +724,9 @@ impl HostProcess {
             .arg("--websocket-drain-grace")
             .arg(spec.websocket_drain_grace.as_secs_f64().to_string())
             .arg("--loop-stall-timeout")
-            .arg(spec.loop_stall_timeout.as_secs_f64().to_string());
+            .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
+            .arg("--gil-stall-timeout")
+            .arg(spec.gil_stall_timeout.as_secs_f64().to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());
@@ -750,6 +827,12 @@ impl HostProcess {
             stdin,
             sockets,
             group_sockets,
+            optional: spec
+                .groups
+                .iter()
+                .filter(|group| group.optional)
+                .map(|group| group.name.clone())
+                .collect(),
             run_dir,
             release,
         })
@@ -762,23 +845,66 @@ impl HostProcess {
         pid: u32,
         sockets: Vec<PathBuf>,
         group_sockets: Vec<(String, Vec<PathBuf>)>,
+        optional: Vec<String>,
         run_dir: PathBuf,
         release: u32,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(alive(pid), "process {pid} is gone");
-        anyhow::ensure!(
-            sockets.iter().all(|socket| listening(socket)),
-            "the workers of process {pid} are not listening"
-        );
-
-        Ok(Self {
+        let host = Self {
             process: Process::Adopted(pid),
             stdin: None,
             sockets,
             group_sockets,
+            optional,
             run_dir,
             release,
-        })
+        };
+        anyhow::ensure!(
+            host.required_sockets()
+                .iter()
+                .all(|socket| listening(socket)),
+            "the workers of process {pid} are not listening"
+        );
+
+        Ok(host)
+    }
+
+    /// The sockets the release is not ready without: every group's but
+    /// the optional groups' (ADR 0033).
+    fn required_sockets(&self) -> Vec<PathBuf> {
+        let optional: Vec<&PathBuf> = self
+            .group_sockets
+            .iter()
+            .filter(|(name, _)| self.optional.contains(name))
+            .flat_map(|(_, sockets)| sockets)
+            .collect();
+
+        self.sockets
+            .iter()
+            .filter(|socket| !optional.contains(socket))
+            .cloned()
+            .collect()
+    }
+
+    /// Keep of an optional group's planned sockets the ones a worker
+    /// listens on: the others join as the host announces them.
+    fn settle_optional(&mut self) {
+        // The default group's sockets are counted from the named groups'
+        // total, so they are taken before any group is pruned.
+
+        let default = self.default_sockets();
+
+        for (name, sockets) in &mut self.group_sockets {
+            if self.optional.contains(name) {
+                sockets.retain(|socket| listening(socket));
+            }
+        }
+
+        let named = self
+            .group_sockets
+            .iter()
+            .flat_map(|(_, sockets)| sockets.iter().cloned());
+        self.sockets = default.into_iter().chain(named).collect();
     }
 
     /// The default group's sockets: those of no named group.
@@ -822,12 +948,17 @@ impl HostProcess {
         self.run_dir.join("control.sock")
     }
 
-    /// Wait until every worker listens, or the host exits or the time is up.
+    /// Wait until every worker the release needs listens, or the host
+    /// exits or the time is up. An optional group's workers are not
+    /// waited for: the ones listening by then are kept, and the rest
+    /// join as the host announces them (ADR 0033).
     pub async fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let started = Instant::now();
+        let required = self.required_sockets();
 
         loop {
-            if self.sockets.iter().all(|socket| listening(socket)) {
+            if required.iter().all(|socket| listening(socket)) {
+                self.settle_optional();
                 return Ok(());
             }
 

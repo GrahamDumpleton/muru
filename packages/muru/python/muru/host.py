@@ -75,6 +75,11 @@ RESTART_DELAY_SECONDS = 0.5
 ACK_TIMEOUT_SECONDS = 5.0
 ROUTE_SETTLE_SECONDS = 1.0
 
+# How long after a forced restart takes a worker out of routing it is
+# killed: time enough for its stacks to be taken.
+
+FORCE_KILL_SECONDS = 1.0
+
 # How often the supervision loop runs when timeouts or recycling are on.
 
 TICK_SECONDS = 0.5
@@ -328,19 +333,24 @@ class Mount:
     The mount's application is loaded and realised like the release's own,
     without hooks of its own, and shares the worker's loop. It shares the
     worker's threads too, unless it has threads of its own: the threads
-    it reserves and the most requests it runs at once.
+    it reserves and the most requests it runs at once. An ASGI mount may
+    have limits of its own instead: the requests it runs at once and the
+    open WebSockets it holds, 0 for one it does not set, which the edge
+    holds the slots for.
     """
 
     name: str
     path: str
     release: Release
     threads: tuple[int, int] | None = None
+    limits: tuple[int, int] | None = None
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
         """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]].
 
-        A gRPC mount's PATH is empty.
+        A gRPC mount's PATH is empty, and for an ASGI mount the last part
+        is CONCURRENCY,CONNECTIONS instead.
         """
 
         form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]"
@@ -355,28 +365,36 @@ class Mount:
             raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
 
         own: tuple[int, int] | None = None
+        limits: tuple[int, int] | None = None
 
         if len(parts) == 5:
             try:
-                reserved, most = (int(part) for part in parts[4].split(","))
+                first, second = (int(part) for part in parts[4].split(","))
             except ValueError:
                 raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
 
-            if reserved < 0 or most < max(reserved, 1):
-                raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+            if interface == "asgi":
+                if first < 0 or second < 0:
+                    raise argparse.ArgumentTypeError(f"{text!r} has limits below nothing")
 
-            own = (reserved, most)
+                limits = (first, second)
+            else:
+                if first < 0 or second < max(first, 1):
+                    raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+
+                own = (first, second)
 
         release = Release(parts[2], None, context, threads=threads, interface=interface)
-        return cls(parts[0], parts[1], release, own)
+        return cls(parts[0], parts[1], release, own, limits)
 
 
 @dataclass(frozen=True)
 class Group:
-    """A worker group (section 7.1): its name and sizes.
+    """A worker group (section 7.1): its name, sizes and policies.
 
     The default group, named "default", carries the release's own
-    settings; named groups follow it in the order given.
+    settings; named groups follow it in the order given. A timeout or
+    memory policy left None is the release's, filled in by the host.
     """
 
     name: str
@@ -384,6 +402,23 @@ class Group:
     threads: int
     sync_threads: int
     concurrency: int
+    soft_timeout: float | None = None
+    hard_timeout: float | None = None
+    hard_drain_grace: float | None = None
+    loop_stall_timeout: float | None = None
+    gil_stall_timeout: float | None = None
+    memory: MemoryPolicy | None = None
+
+    # ADR 0033: the release is ready without an optional group's workers,
+    # which enter routing as each listens, and a worker of one that
+    # cannot start is given up rather than stopping the host.
+
+    optional: bool = False
+
+    # ADR 0033: the named mounts the group's workers serve beside the
+    # default mount; every mount when empty.
+
+    mounts: tuple[str, ...] = ()
 
     @classmethod
     def parse(cls, text: str) -> Group:
@@ -402,6 +437,71 @@ class Group:
             raise argparse.ArgumentTypeError(f"{text!r} is not a valid worker group")
 
         return cls(name, processes, threads, sync_threads, concurrency)
+
+
+def parse_group_mounts(text: str) -> tuple[str, tuple[str, ...]]:
+    """Parse NAME=MOUNT,... into the group's name and the mounts it serves."""
+
+    name, _, names = text.partition("=")
+    mounts = tuple(part for part in names.split(",") if part)
+
+    if not name or not mounts:
+        raise argparse.ArgumentTypeError(f"{text!r} is not NAME=MOUNT,...")
+
+    return name, mounts
+
+
+def parse_group_timeouts(text: str) -> tuple[str, dict[str, float | None]]:
+    """Parse NAME=SOFT,HARD,HARD_DRAIN_GRACE,LOOP_STALL,GIL_STALL, seconds or off."""
+
+    form = "NAME=SOFT,HARD,HARD_DRAIN_GRACE,LOOP_STALL,GIL_STALL"
+    name, _, values = text.partition("=")
+    names = (
+        "soft_timeout",
+        "hard_timeout",
+        "hard_drain_grace",
+        "loop_stall_timeout",
+        "gil_stall_timeout",
+    )
+    parts = values.split(",")
+
+    if not name or len(parts) != len(names):
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    try:
+        parsed = {
+            key: None if part == "off" else float(part)
+            for key, part in zip(names, parts, strict=True)
+        }
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+    return name, parsed
+
+
+def parse_group_memory(text: str) -> tuple[str, MemoryPolicy]:
+    """Parse NAME=MEASURE,SOFT_LIMIT,SOFT_FOR,RECLAIM_FIRST,HARD_LIMIT,CHECK_INTERVAL."""
+
+    form = "NAME=MEASURE,SOFT_LIMIT,SOFT_FOR,RECLAIM_FIRST,HARD_LIMIT,CHECK_INTERVAL"
+    name, _, values = text.partition("=")
+    parts = values.split(",")
+
+    if not name or len(parts) != 6:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    try:
+        policy = MemoryPolicy(
+            measure=parts[0],
+            soft_limit=None if parts[1] == "off" else int(parts[1]),
+            soft_for=float(parts[2]),
+            reclaim_first=parts[3] == "true",
+            hard_limit=None if parts[4] == "off" else int(parts[4]),
+            check_interval=float(parts[5]),
+        )
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+    return name, policy
 
 
 @dataclass
@@ -436,6 +536,11 @@ class WorkerState:
     in_flight: int = 0
     oldest_ms: int = 0
     ready: bool = False
+
+    # Section 7.6: when the worker last reported, so one that has gone
+    # silent altogether is noticed.
+
+    last_report_at: float = 0.0
 
     # The request count and the time at which this worker is recycled,
     # jittered so workers do not all go at once, and whether it is the
@@ -530,6 +635,7 @@ class Host:
         shutdown_timeout: float = 5.0,
         websocket_drain_grace: float = 0.0,
         loop_stall_timeout: float = 10.0,
+        gil_stall_timeout: float = 30.0,
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
     ) -> None:
@@ -551,6 +657,7 @@ class Host:
         self.shutdown_timeout = shutdown_timeout
         self.websocket_drain_grace = websocket_drain_grace
         self.loop_stall_timeout = loop_stall_timeout
+        self.gil_stall_timeout = gil_stall_timeout
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
@@ -561,6 +668,7 @@ class Host:
 
         self.groups = [Group("default", workers, threads, sync_threads, concurrency)]
         self.groups.extend(groups or [])
+        self.groups = [self.settled(group) for group in self.groups]
         self.placement: list[tuple[Group, int]] = [
             (group, index) for group in self.groups for index in range(group.processes)
         ]
@@ -648,6 +756,34 @@ class Host:
             self.control_listener.listen(2)
             self.control_listener.setblocking(False)
 
+    def settled(self, group: Group) -> Group:
+        """Section 7.1: the group with the release's values where it set none."""
+
+        return replace(
+            group,
+            soft_timeout=self.soft_timeout if group.soft_timeout is None else group.soft_timeout,
+            hard_timeout=self.hard_timeout if group.hard_timeout is None else group.hard_timeout,
+            hard_drain_grace=(
+                self.hard_drain_grace if group.hard_drain_grace is None else group.hard_drain_grace
+            ),
+            loop_stall_timeout=(
+                self.loop_stall_timeout
+                if group.loop_stall_timeout is None
+                else group.loop_stall_timeout
+            ),
+            gil_stall_timeout=(
+                self.gil_stall_timeout
+                if group.gil_stall_timeout is None
+                else group.gil_stall_timeout
+            ),
+            memory=self.memory if group.memory is None else group.memory,
+        )
+
+    def group_of(self, index: int) -> Group:
+        """Return the group a worker index belongs to."""
+
+        return self.placement[index][0]
+
     @property
     def policies(self) -> bool:
         """Whether any timeout or recycling policy is on."""
@@ -655,8 +791,10 @@ class Host:
         return (
             self.max_requests is not None
             or self.max_lifetime is not None
-            or self.hard_timeout is not None
-            or self.memory.active
+            or any(
+                group.hard_timeout is not None or (group.memory is not None and group.memory.active)
+                for group in self.groups
+            )
         )
 
     def socket_path(self, index: int) -> str:
@@ -775,6 +913,7 @@ class Host:
 
         now = time.monotonic()
         state = WorkerState(index, pid, self.generation.get(index, 0), path, now, report_read)
+        state.last_report_at = now
 
         if self.max_requests is not None:
             state.recycle_after_requests = self.max_requests + random.randint(
@@ -866,6 +1005,12 @@ class Host:
         known = release.resolved is not None
         known_mounts = {mount.name for mount in self.mounts if mount.release.resolved is not None}
 
+        # ADR 0033: a group that lists mounts serves those and the default
+        # mount; the host imported every mount, so the others cost this
+        # worker nothing after the fork.
+
+        mounts = [mount for mount in self.mounts if not group.mounts or mount.name in group.mounts]
+
         try:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
@@ -874,7 +1019,7 @@ class Host:
 
                 started = time.monotonic()
                 hooks = release.load()
-                for mount in self.mounts:
+                for mount in mounts:
                     mount.release.load()
                 log(f"worker {index} imported {release.spec} in {elapsed_ms(started)} ms")
                 hooks.call("on_load", context)
@@ -899,8 +1044,9 @@ class Host:
 
             realised = [
                 (mount.name, mount.release.realise(), mount.release, mount.threads)
-                for mount in self.mounts
+                for mount in mounts
             ]
+            limits = {mount.name: mount.limits for mount in mounts}
 
             for name, _, mounted, _ in realised:
                 if name not in known_mounts and mounted.resolved is not None:
@@ -941,7 +1087,9 @@ class Host:
                 lifespan.startup()
 
             lifespans: list[_asgi.Lifespan] = []
-            served_mounts: list[tuple[str, Any, Any, tuple[int, int] | None]] = []
+            served_mounts: list[
+                tuple[str, Any, Any, tuple[int, int] | None, tuple[int, int] | None]
+            ] = []
 
             # Section 6.13: a gRPC application is served by a dispatcher on
             # the loop, which runs synchronous handlers on threads of the
@@ -966,15 +1114,15 @@ class Host:
                         mounted_app, group.threads if own is None else own[0]
                     )
                     runner = _asgi.runner(dispatcher, loop, {})
-                    served_mounts.append((name, dispatcher, runner, own))
+                    served_mounts.append((name, dispatcher, runner, own, None))
                 elif loop is not None and mounted.resolved == "asgi":
                     mounted_lifespan = _asgi.Lifespan(mounted_app, loop, mounted.spec)
                     mounted_lifespan.startup()
                     lifespans.append(mounted_lifespan)
                     runner = _asgi.runner(mounted_app, loop, mounted_lifespan.state)
-                    served_mounts.append((name, mounted_app, runner, None))
+                    served_mounts.append((name, mounted_app, runner, None, limits[name]))
                 else:
-                    served_mounts.append((name, mounted_app, None, own))
+                    served_mounts.append((name, mounted_app, None, own, None))
 
             if grpc_servers and self.reflection:
                 from muru import _grpc
@@ -1032,8 +1180,8 @@ class Host:
             "drain_ms": int(self.shutdown_timeout * 1000),
         }
 
-        if self.soft_timeout is not None:
-            timeout_arguments["soft_timeout_ms"] = int(self.soft_timeout * 1000)
+        if group.soft_timeout is not None:
+            timeout_arguments["soft_timeout_ms"] = int(group.soft_timeout * 1000)
             timeout_arguments["timeout_error"] = RequestTimeout
 
         # Section 7.6: the event loop beats twice a second, and a native
@@ -1041,8 +1189,18 @@ class Host:
         # than the loop stall timeout.
 
         if loop is not None:
-            timeout_arguments["loop_stall_timeout_ms"] = int(self.loop_stall_timeout * 1000)
+            timeout_arguments["loop_stall_timeout_ms"] = int(
+                (group.loop_stall_timeout or self.loop_stall_timeout) * 1000
+            )
             _asgi.heartbeat(loop.loop)
+
+        # Section 7.6: a thread attaches to the interpreter every half
+        # second, and a native watchdog tells the host when none has for
+        # longer than the GIL stall timeout.
+
+        timeout_arguments["gil_stall_timeout_ms"] = int(
+            (group.gil_stall_timeout or self.gil_stall_timeout) * 1000
+        )
 
         # Section 11.7: breakpoint() waits for muructl debug attach.
 
@@ -1064,7 +1222,7 @@ class Host:
                 mounts=served_mounts,
                 report=report,
                 on_reclaim=reclaim,
-                memory_interval_ms=int(self.memory.check_interval * 1000),
+                memory_interval_ms=int((group.memory or self.memory).check_interval * 1000),
                 control=control,
                 on_control=lambda line, active, names: _inspect.handle(
                     line,
@@ -1094,9 +1252,15 @@ class Host:
         self.wake_write = wake_write
 
         def request_stop(signum: int, _frame: Any) -> None:
-            if not self.stopping:
-                log(f"received {signal.Signals(signum).name}, stopping")
+            # Ctrl-C sends SIGINT and muructl SIGTERM close together, and
+            # the second handler may run while the first is still logging,
+            # so the flag is set before the line is written.
+
+            first = not self.stopping
             self.stopping = True
+
+            if first:
+                log(f"received {signal.Signals(signum).name}, stopping")
 
         def request_reopen(_signum: int, _frame: Any) -> None:
             self.reopen_requested = True
@@ -1126,15 +1290,23 @@ class Host:
         if self.control_listener is not None:
             selector.register(self.control_listener, selectors.EVENT_READ)
 
+        # An optional group's workers are routed to once they listen, as
+        # a scale-out's are, so the edge holds the group's requests until
+        # one does rather than sending them to a socket nobody serves.
+
         for index in range(self.worker_count):
-            self.spawn(index)
+            if self.group_of(index).optional:
+                self.starting.add(index)
+                self.spawn(index, replacing=True)
+            else:
+                self.spawn(index)
 
         self.announce()
 
         while True:
             if self.restart_after:
                 timeout: float | None = 0.1
-            elif self.policies or self.replacing or self.pending:
+            elif self.policies or self.replacing or self.pending or self.states:
                 timeout = TICK_SECONDS
             else:
                 timeout = None
@@ -1338,6 +1510,10 @@ class Host:
             self.scale_group(request_id, args)
             return
 
+        if op == "restart":
+            self.restart_worker(request_id, wanted, args)
+            return
+
         if op == "status":
             self.send_to_supervisor(
                 {
@@ -1430,6 +1606,82 @@ class Host:
             self.retire_worker(group)
 
         self.send_to_supervisor({"type": "response", "id": request_id, "workers": []})
+
+    # Section 7.6: a worker replaced because the operator asked, through
+    # the path the policies use; with force, killed at once.
+
+    def restart_worker(self, request_id: int, wanted: Any, args: dict[str, Any]) -> None:
+        """Replace one worker on request, gracefully or at once with force."""
+
+        force = bool(args.get("force"))
+        state = next(
+            (
+                candidate
+                for candidate in self.states.values()
+                if candidate.index == wanted and not candidate.replaced
+            ),
+            None,
+        )
+        error = ""
+
+        if wanted is None:
+            error = "a worker index is needed"
+        elif state is None:
+            error = f"no worker {wanted}"
+        elif not state.ready:
+            error = f"worker {wanted} is still starting"
+        elif wanted in self.replacing:
+            error = f"worker {wanted} is already being replaced"
+        elif state.debug_sessions and not force:
+            error = f"worker {wanted} is being debugged; --force ends the session"
+        elif self.start_failures.get(wanted, 0) >= MAX_START_FAILURES:
+            error = (
+                f"a replacement for worker {wanted} failed to start {MAX_START_FAILURES} "
+                "times and is not tried again"
+            )
+        elif self.control_listener is None:
+            error = "workers cannot be replaced without a control socket"
+
+        if error or state is None:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": error}
+            )
+            return
+
+        if force:
+            state.debug_sessions = 0
+            self.replace(state, "restarted on request, killed at once", "worker.restarted", True)
+        else:
+            self.replace(state, "restarted on request", "worker.restarted")
+
+        replacement = self.replacing[state.index]
+
+        # A forced restart takes the stacks the way a hard timeout does,
+        # then kills the worker without asking it to stop.
+
+        if force:
+            self.capture_stacks(state, replacement)
+            replacement.terminated = True
+            replacement.kill_at = time.monotonic() + FORCE_KILL_SECONDS
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [
+                    {
+                        "index": state.index,
+                        "pid": state.pid,
+                        "ok": True,
+                        "result": {
+                            "old_pid": state.pid,
+                            "new_pid": replacement.new_pid,
+                            "forced": force,
+                        },
+                    }
+                ],
+            }
+        )
 
     def active_indices(self, group: Group) -> list[int]:
         """Return the group's indices with a worker that serves or is starting, in order."""
@@ -1746,12 +1998,20 @@ class Host:
                     self.replace(
                         state,
                         f"its event loop stalled past the loop stall timeout of "
-                        f"{self.loop_stall_timeout:g} s",
+                        f"{self.group_of(state.index).loop_stall_timeout:g} s",
+                        "worker.timeout_killed",
+                    )
+                elif report["event"] == "worker.gil_stalled":
+                    self.replace(
+                        state,
+                        f"no thread of it ran Python for the GIL stall timeout of "
+                        f"{self.group_of(state.index).gil_stall_timeout:g} s",
                         "worker.timeout_killed",
                     )
 
                 continue
 
+            state.last_report_at = time.monotonic()
             state.requests = int(report.get("requests", state.requests))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
@@ -1783,21 +2043,23 @@ class Host:
     def check_memory(self, state: WorkerState) -> None:
         """Section 7.7: hold a worker to the memory limits."""
 
-        if state.replaced or state.index in self.replacing or not self.memory.active:
+        policy = self.group_of(state.index).memory or self.memory
+
+        if state.replaced or state.index in self.replacing or not policy.active:
             return
 
-        value = state.memory.get(self.memory.measure)
+        value = state.memory.get(policy.measure)
         if value is None:
             return
 
         now = time.monotonic()
-        hard = self.memory.hard_limit
-        soft = self.memory.soft_limit
+        hard = policy.hard_limit
+        soft = policy.soft_limit
 
         if hard is not None and value > hard:
             self.replace(
                 state,
-                f"{self.memory.measure} {format_size(value)} is over the hard limit of "
+                f"{policy.measure} {format_size(value)} is over the hard limit of "
                 f"{format_size(hard)}",
                 "worker.recycled",
                 hard=True,
@@ -1813,20 +2075,20 @@ class Host:
             state.over_soft_since = now
             return
 
-        if now - state.over_soft_since < self.memory.soft_for:
+        if now - state.over_soft_since < policy.soft_for:
             return
 
         # Over the soft limit for long enough: reclaim first, then recycle
         # when the next measurement is still over.
 
-        if self.memory.reclaim_first and state.reclaimed_at is None:
+        if policy.reclaim_first and state.reclaimed_at is None:
             state.reclaimed_at = now
             self.signal(state.pid, signal.SIGUSR2)
             return
 
         self.replace(
             state,
-            f"{self.memory.measure} {format_size(value)} stayed over the soft limit of "
+            f"{policy.measure} {format_size(value)} stayed over the soft limit of "
             f"{format_size(soft)} for {now - state.over_soft_since:.0f} s"
             + (" after reclaiming" if state.reclaimed_at is not None else ""),
             "worker.recycled",
@@ -1917,11 +2179,25 @@ class Host:
             if state.replaced or state.index in self.replacing or not state.ready:
                 continue
 
-            if self.hard_timeout is not None and state.oldest_ms > self.hard_timeout * 1000:
+            group = self.group_of(state.index)
+            hard_timeout = group.hard_timeout
+            gil_stall_timeout = group.gil_stall_timeout or self.gil_stall_timeout
+
+            if hard_timeout is not None and state.oldest_ms > hard_timeout * 1000:
                 self.replace(
                     state,
                     f"a request has run for {state.oldest_ms / 1000:.1f} s, past the hard "
-                    f"timeout of {self.hard_timeout:g} s",
+                    f"timeout of {hard_timeout:g} s",
+                    "worker.timeout_killed",
+                )
+            elif now - state.last_report_at > gil_stall_timeout:
+                # Section 7.6: a worker whose reports have stopped, which
+                # its native threads send, is stopped or frozen whole.
+
+                self.replace(
+                    state,
+                    f"sent no report for {now - state.last_report_at:.0f} s, longer than "
+                    f"the GIL stall timeout of {gil_stall_timeout:g} s",
                     "worker.timeout_killed",
                 )
             elif state.recycle_at is not None and now >= state.recycle_at:
@@ -1984,7 +2260,10 @@ class Host:
             if kind == "worker.timeout_killed":
                 self.capture_stacks(state, replacement)
 
-            replacement.terminate_at = time.monotonic() + self.hard_drain_grace
+            grace = self.group_of(index).hard_drain_grace
+            replacement.terminate_at = time.monotonic() + (
+                self.hard_drain_grace if grace is None else grace
+            )
 
         replacement.new_pid = self.spawn(index, replacing=True)
 
@@ -2391,6 +2670,27 @@ class Host:
                 self.start_failures[index] = self.start_failures.get(index, 0) + 1
 
                 if self.start_failures[index] >= MAX_START_FAILURES:
+                    group = self.group_of(index)
+
+                    # ADR 0033: the release is ready without an optional
+                    # group, so its worker is given up and the index left
+                    # for a scale-out to try again, while the others serve.
+
+                    if group.optional:
+                        self.start_failures[index] = 0
+                        self.starting.discard(index)
+                        self.routed[index] = None
+                        self.retired.add(index)
+                        self.emit(
+                            "worker.exited",
+                            "error",
+                            f"worker {index} (pid {pid}) of the optional group {group.name} "
+                            f"failed {MAX_START_FAILURES} times at start, last with "
+                            f"{describe(status)}; it is given up",
+                        )
+                        self.announce()
+                        continue
+
                     log(
                         f"worker {index} failed {MAX_START_FAILURES} times at start, "
                         f"last with {describe(status)}; stopping"
@@ -2625,11 +2925,43 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="a named worker group beside the default one",
     )
     parser.add_argument(
+        "--optional-group",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="a group the release is ready without; its workers join as each listens",
+    )
+    parser.add_argument(
+        "--group-mounts",
+        action="append",
+        default=[],
+        type=parse_group_mounts,
+        metavar="NAME=MOUNT,...",
+        help="the named mounts a group's workers serve beside the default; every mount without",
+    )
+    parser.add_argument(
+        "--group-timeouts",
+        action="append",
+        default=[],
+        type=parse_group_timeouts,
+        metavar="NAME=SOFT,HARD,HARD_DRAIN_GRACE,LOOP_STALL,GIL_STALL",
+        help="a named group's timeouts in seconds, or off; the release's without",
+    )
+    parser.add_argument(
+        "--group-memory",
+        action="append",
+        default=[],
+        type=parse_group_memory,
+        metavar="NAME=MEASURE,SOFT_LIMIT,SOFT_FOR,RECLAIM_FIRST,HARD_LIMIT,CHECK_INTERVAL",
+        help="a named group's memory policy, limits in bytes or off; the release's without",
+    )
+    parser.add_argument(
         "--mount",
         action="append",
         default=[],
         metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]",
-        help="a named mount served by another entrypoint at a path",
+        help="a named mount served by another entrypoint at a path; for an ASGI mount "
+        "the last part is CONCURRENCY,CONNECTIONS",
     )
     parser.add_argument(
         "--log-level",
@@ -2703,6 +3035,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=10.0,
         metavar="SECONDS",
         help="replace an ASGI worker whose event loop has not run for this long",
+    )
+    parser.add_argument(
+        "--gil-stall-timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="replace a worker in which no thread has run Python for this long, or that "
+        "has not reported for this long",
     )
     parser.add_argument(
         "--shutdown-timeout",
@@ -2908,7 +3248,16 @@ def main(argv: list[str] | None = None) -> int:
         sync_threads=args.sync_threads,
         concurrency=args.concurrency,
         detach=args.detach,
-        groups=args.group,
+        groups=[
+            replace(
+                group,
+                **dict(args.group_timeouts).get(group.name, {}),
+                memory=dict(args.group_memory).get(group.name),
+                optional=group.name in args.optional_group,
+                mounts=dict(args.group_mounts).get(group.name, ()),
+            )
+            for group in args.group
+        ],
         mounts=mounts,
         log_file=args.log_file,
         control=args.control,
@@ -2920,6 +3269,7 @@ def main(argv: list[str] | None = None) -> int:
         shutdown_timeout=args.shutdown_timeout,
         websocket_drain_grace=args.websocket_drain_grace,
         loop_stall_timeout=args.loop_stall_timeout,
+        gil_stall_timeout=args.gil_stall_timeout,
         memory=MemoryPolicy(
             measure=args.memory_measure,
             soft_limit=args.memory_soft_limit,

@@ -8,8 +8,9 @@ address with charts over the last hour or day. The daemon's needs a
 signed-in session, serves the same figures as JSON, with rollouts,
 scaling and maintenance, streams its history and events with
 Server-Sent Events, and can turn maintenance mode on and off for a
-session that may act. Worker inspection views and the other actions are
-still to come.
+session that may act, which can also promote, roll back and drain
+releases, pin a group's workers and restart a worker, and shows each
+running release's workers with their status, stacks, tasks and memory.
 ```
 
 ## In development mode
@@ -90,6 +91,32 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
 - recent requests across every release, the last fifty events (new ones
   arriving as they happen), and the tail of each serving release's log.
 
+### Looking into the workers
+
+Each running release on the page links to its workers, where the
+dashboard shows what [`muructl debug`](debugging.md) shows:
+
+- the release's workers as `debug status` lists them: pid, group,
+  uptime, requests served and in flight, the age of the oldest request,
+  memory, and whether each is ready, starting, being replaced or being
+  debugged, refreshed every two seconds;
+- their stacks as `debug stacks` shows them: the Python stack of every
+  thread with the request each is serving, threads showing the same
+  stack across workers shown once, taken when the page opens and again
+  on request.
+
+Each worker links to a page of its own with its status, its stacks, its
+asyncio tasks as `debug tasks` shows them, and, when asked for, its
+memory as `debug memory` shows it: resident, proportional and unique
+size, the garbage collector's counts, and the object types it holds most
+of. Counting the objects holds the interpreter while it runs, so the
+page takes it only on request, and it is recorded as a `debug.memory`
+event as the command is.
+
+A page is at `workers?release=APP@RELEASE` and `worker?release=APP@RELEASE&worker=N`
+under the dashboard's address; a release that is not running says so
+in place of its workers.
+
 ### JSON for scripts
 
 The same figures are served as JSON, each path answering with what the
@@ -114,6 +141,7 @@ A token lasts twelve hours, or until the daemon restarts.
 | `/v1/requests` | recent requests, newest first |
 | `/v1/websockets` | the WebSockets open: `open`, `endpoints` counted by path pattern, and `sockets`, the longest open first |
 | `/v1/events` | recent events, newest first |
+| `/v1/debug/OP?release=APP@RELEASE` | a release's workers' answers to `status`, `stacks`, `tasks` or `memory`, as `muructl debug OP --json` prints them, one worker with `&worker=N`; 409 when the release is not running |
 | `/v1/history?range=1h` | the charts' points: `[second, requests/s, errors/s, p50 ms, p95 ms, in flight, workers, WebSockets open]`, one a second for the last hour, or one a minute for the last day with `range=24h` |
 | `/v1/history/stream` | each new point as a Server-Sent Event of type `point` |
 | `/v1/events/stream` | each new event as it happens, as a rendered table row (type `event`) and as JSON (type `json`) |
@@ -149,15 +177,42 @@ actions = true
 $ muructl dashboard login --actions
 ```
 
-A session that may act shows a button beside each application's
-serving release that turns [maintenance mode](error-pages.md#maintenance-mode)
-on or off. Deploys, rollbacks, drains and scaling stay with `muructl`.
+A session that may act shows buttons beside each release and worker
+group, and each worker, for what `muructl` would do:
+
+- beside the serving release, turning [maintenance
+  mode](error-pages.md#maintenance-mode) on or off, and rolling back to
+  the previous release when there is one;
+- beside a ready release that is not serving, promoting it, as after a
+  held deploy or a rollout;
+- beside any running release, draining it, which takes it out of
+  traffic when it serves and stops it;
+- beside each worker group in the scaling table, pinning its workers to
+  a count, and unpinning a pinned group so the autoscaler decides again;
+- beside each ready worker on the [workers
+  pages](#looking-into-the-workers), restarting it, with `force` to kill
+  it at once as `muructl restart --force` does.
+
+Deploys and rollouts stay with `muructl`, and a release an overlay
+freezes is not promoted from the page.
 
 Each action is a form posted from the dashboard's own page, carrying a
 token of the session's own, so another site cannot act through a
 signed-in browser. A script with a token from `--actions --token` posts
-the same form fields, `app` and `state` (`on` or `off`), to
-`/actions/maintenance`. Every action is recorded as a `dashboard.action`
-event naming the start of the session's id, beside the event the action
-itself raises, such as `maintenance.changed`, and every link or token
-issued is a `dashboard.login_issued` event.
+the same form fields to the action's path:
+
+| Path | Fields |
+| --- | --- |
+| `/actions/maintenance` | `app`, `state` (`on` or `off`) |
+| `/actions/promote` | `app`, `release` |
+| `/actions/rollback` | `app` |
+| `/actions/drain` | `app`, `release` |
+| `/actions/scale` | `app`, `release`, `group`, and `processes` to pin or `unpin=on` |
+| `/actions/restart` | `app`, `release`, `worker`, and `force=on` to kill it at once |
+
+The answer is 303 back to the page, 400 for a form that is not an
+action, or 409 with the reason the daemon refused it, as `muructl`
+would print. Every action is recorded as a `dashboard.action` event
+naming the start of the session's id, beside the events the action
+itself raises, such as `maintenance.changed` or `worker.restarted`, and
+every link or token issued is a `dashboard.login_issued` event.

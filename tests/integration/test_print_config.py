@@ -84,6 +84,7 @@ def test_recycling_and_host_timeouts_are_written() -> None:
         "shutdown_timeout": "5s",
         "websocket_drain_grace": "0ms",
         "loop_stall_timeout": "10s",
+        "gil_stall_timeout": "30s",
     }
 
 

@@ -1,0 +1,9 @@
+entrypoint = "limited:wsgi_app"
+threads = 2
+
+[mounts.ws]
+path = "/ws"
+entrypoint = "limited:asgi_app"
+interface = "asgi"
+concurrency = 2
+max_connections = 2

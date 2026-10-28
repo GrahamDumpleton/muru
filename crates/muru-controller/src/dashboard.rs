@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use muru_dashboard::{
-    Action, Actions, EndpointRow, EventRow, EventsSource, History, NodeMetricsSource, NodeSource,
-    Reading, Sessions, SocketRow, WebSocketsView,
+    Action, Actions, DebugAnswer, DebugAsk, DebugSource, EndpointRow, EventRow, EventsSource,
+    History, NodeMetricsSource, NodeSource, Reading, Sessions, SocketRow, WebSocketsView,
+    WorkerAnswer,
 };
 use muru_proto::edge::v1 as pb;
 use tokio::net::TcpListener;
@@ -16,20 +17,24 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::daemon::Command;
 use crate::events::Events;
+use crate::store::Store;
 
 /// Serve the dashboard on the listener until accepting fails, for the
-/// sessions given, which also take the actions when they may.
+/// sessions given, which also take the actions when they may; `store`
+/// is read for what an action must check first.
 pub async fn serve(
     listener: TcpListener,
     commands: mpsc::Sender<Command>,
     history: Arc<History>,
     events: Events,
     sessions: Arc<Sessions>,
+    store: Arc<Store>,
 ) -> anyhow::Result<()> {
     let actions = Actions {
         sessions,
-        sink: action_sink(commands.clone(), events.clone()),
+        sink: action_sink(commands.clone(), events.clone(), store),
     };
+    let debug = debug_source(commands.clone());
     let data_commands = commands.clone();
     let source: NodeSource = Arc::new(move || {
         let commands = data_commands.clone();
@@ -78,38 +83,244 @@ pub async fn serve(
         }
     });
     let live: EventsSource = Arc::new(move || rows.subscribe());
-    muru_dashboard::serve_node(listener, source, metrics, history, live, actions).await
+    muru_dashboard::serve_node(listener, source, metrics, history, live, actions, debug).await
 }
 
-/// Section 10.7: carry out a dashboard action as the admin API would,
-/// recording who asked as a `dashboard.action` event.
-fn action_sink(commands: mpsc::Sender<Command>, events: Events) -> muru_dashboard::ActionSink {
-    Arc::new(move |action, session| {
+/// Section 11.7: ask a release's workers what the inspection pages show,
+/// as the admin API's Debug does, with the arguments `muructl debug`
+/// sends for the operation and the same wait for the host.
+fn debug_source(commands: mpsc::Sender<Command>) -> DebugSource {
+    Arc::new(move |ask: DebugAsk| {
         let commands = commands.clone();
-        let events = events.clone();
         Box::pin(async move {
-            let Action::Maintenance { app, on } = action;
+            let args = if ask.op == "memory" {
+                serde_json::json!({
+                    "trace": false,
+                    "snapshot": "",
+                    "duration_s": 0.0,
+                    "top": 20,
+                    "timeout_s": 30.0,
+                })
+            } else {
+                serde_json::json!({})
+            };
+            let wait = args
+                .get("timeout_s")
+                .and_then(serde_json::Value::as_f64)
+                .map_or(std::time::Duration::from_secs(20), |seconds| {
+                    std::time::Duration::from_secs_f64(seconds) + std::time::Duration::from_secs(15)
+                });
             let (done_tx, done_rx) = oneshot::channel();
             commands
-                .send(Command::SetMaintenance {
-                    app: app.clone(),
-                    on,
+                .send(Command::Debug {
+                    app: ask.app,
+                    id: ask.release.clone(),
+                    op: ask.op,
+                    worker: ask.worker,
+                    args,
                     done: done_tx,
                 })
                 .await
                 .map_err(|_| "the daemon is stopping".to_owned())?;
-            done_rx
+            let replies = tokio::time::timeout(wait, done_rx)
                 .await
+                .map_err(|_| format!("the host did not answer in {} seconds", wait.as_secs()))?
                 .map_err(|_| "the daemon is stopping".to_owned())??;
-            let what = format!(
-                "maintenance {} for {app} from the dashboard, session {session}",
-                if on { "on" } else { "off" }
-            );
-            events.emit("dashboard.action", &app, "notice", &what);
+            Ok(DebugAnswer {
+                release: ask.release,
+                workers: replies
+                    .into_iter()
+                    .map(|reply| WorkerAnswer {
+                        index: reply.index,
+                        pid: reply.pid,
+                        ok: reply.ok,
+                        error: (!reply.error.is_empty()).then_some(reply.error),
+                        result: reply
+                            .ok
+                            .then(|| serde_json::from_str(&reply.result_json).ok())
+                            .flatten(),
+                    })
+                    .collect(),
+            })
+        })
+    })
+}
+
+/// Section 10.7: carry out a dashboard action as the admin API would,
+/// recording who asked as a `dashboard.action` event.
+fn action_sink(
+    commands: mpsc::Sender<Command>,
+    events: Events,
+    store: Arc<Store>,
+) -> muru_dashboard::ActionSink {
+    Arc::new(move |action, session| {
+        let commands = commands.clone();
+        let events = events.clone();
+        let store = Arc::clone(&store);
+        Box::pin(async move {
+            let what = carry_out(&commands, &store, action).await?;
+            let (subject, what) = what;
+            let what = format!("{what} from the dashboard, session {session}");
+            events.emit("dashboard.action", &subject, "notice", &what);
             Ok(what)
         })
     })
 }
+
+/// Carry an action out through the reconciler, and say what was done
+/// and to what.
+async fn carry_out(
+    commands: &mpsc::Sender<Command>,
+    store: &Store,
+    action: Action,
+) -> Result<(String, String), String> {
+    const STOPPING: &str = "the daemon is stopping";
+
+    // A sent command answered by the reconciler, or why it could not be.
+
+    macro_rules! ask {
+        ($command:expr, $done_rx:expr) => {{
+            commands
+                .send($command)
+                .await
+                .map_err(|_| STOPPING.to_owned())?;
+            $done_rx.await.map_err(|_| STOPPING.to_owned())??
+        }};
+    }
+
+    Ok(match action {
+        Action::Maintenance { app, on } => {
+            let (done, done_rx) = oneshot::channel();
+            ask!(
+                Command::SetMaintenance {
+                    app: app.clone(),
+                    on,
+                    done,
+                },
+                done_rx
+            );
+            let what = format!("maintenance {} for {app}", if on { "on" } else { "off" });
+            (app, what)
+        }
+        Action::Promote { app, release } => {
+            // Section 9.6: a frozen application's deploys are refused, as
+            // the admin API refuses them, with no override from a page.
+
+            let overlays = store.overlays().map_err(|error| error.to_string())?;
+            let states = store.overlay_states().map_err(|error| error.to_string())?;
+            let frozen = crate::overlays::freezes(&crate::overlays::ordered(&overlays, &states));
+
+            if let Some(by) = frozen.get(&app) {
+                return Err(format!(
+                    "deploys of {app} are frozen by overlay {}; muructl promote --override-freeze promotes anyway",
+                    by.join(", ")
+                ));
+            }
+
+            let (done, done_rx) = oneshot::channel();
+            ask!(
+                Command::PromoteRelease {
+                    app: app.clone(),
+                    id: release.clone(),
+                    done,
+                },
+                done_rx
+            );
+            (
+                format!("{app}@{release}"),
+                format!("promoted {app}@{release}"),
+            )
+        }
+        Action::Rollback { app } => {
+            let (done, done_rx) = oneshot::channel();
+            let release = ask!(
+                Command::Rollback {
+                    app: app.clone(),
+                    done,
+                },
+                done_rx
+            );
+            let what = format!("rolled {app} back to {}", release.id);
+            (app, what)
+        }
+        Action::Drain { app, release } => {
+            let (done, done_rx) = oneshot::channel();
+            ask!(
+                Command::Drain {
+                    app: app.clone(),
+                    id: release.clone(),
+                    done,
+                },
+                done_rx
+            );
+            (
+                format!("{app}@{release}"),
+                format!("drained {app}@{release}"),
+            )
+        }
+        Action::Scale {
+            app,
+            release,
+            group,
+            processes,
+        } => {
+            let (done, done_rx) = oneshot::channel();
+            ask!(
+                Command::SetScale {
+                    app: app.clone(),
+                    id: release.clone(),
+                    group: group.clone(),
+                    processes,
+                    unpin: processes.is_none(),
+                    done,
+                },
+                done_rx
+            );
+
+            let what = match processes {
+                Some(count) => format!("pinned {group} to {count} workers"),
+                None => format!("unpinned {group}"),
+            };
+
+            (format!("{app}@{release}"), what)
+        }
+        Action::Restart {
+            app,
+            release,
+            worker,
+            force,
+        } => {
+            let (done, done_rx) = oneshot::channel();
+            let replies = ask!(
+                Command::Debug {
+                    app: app.clone(),
+                    id: release.clone(),
+                    op: "restart".to_owned(),
+                    worker: Some(worker),
+                    args: serde_json::json!({ "force": force }),
+                    done,
+                },
+                done_rx
+            );
+
+            // The host answers with the worker, or with why it could not
+            // be replaced.
+
+            match replies.first() {
+                Some(reply) if reply.ok => {}
+                Some(reply) => return Err(reply.error.clone()),
+                None => return Err(format!("{app}@{release} has no worker {worker}")),
+            }
+
+            let how = if force { ", killed at once" } else { "" };
+            (
+                format!("{app}@{release}"),
+                format!("restarted worker {worker}{how}"),
+            )
+        }
+    })
+}
+
 /// The WebSockets an edge reported, as the dashboards show them.
 pub fn websockets_view(report: pb::WebSockets) -> WebSocketsView {
     WebSocketsView {

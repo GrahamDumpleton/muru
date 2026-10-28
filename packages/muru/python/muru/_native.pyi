@@ -24,6 +24,7 @@ def serve(
             Callable[..., Any],
             Callable[[Any, Channel], None] | None,
             tuple[int, int] | None,
+            tuple[int, int] | None,
         ]
     ] = [],
     report: int | None = None,
@@ -37,6 +38,7 @@ def serve(
     loop_stall_timeout_ms: int | None = None,
     websocket_drain_ms: int = 0,
     drain_ms: int = 5000,
+    gil_stall_timeout_ms: int | None = None,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 

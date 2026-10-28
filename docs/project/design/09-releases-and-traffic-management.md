@@ -265,7 +265,7 @@ liveness = { path = '/healthz', interval = '30s', failures = 3 }
 
 **Liveness without false kills**
 
-- An HTTP probe that waits in a full thread pool can fail only because the worker is busy. The primary liveness signal is therefore native: the Rust layer's heartbeat to the host, and evidence that requests are completing. Requests that hang are handled by timeouts (section 7.6).
+- An HTTP probe that waits in a full thread pool can fail only because the worker is busy. The primary liveness signal is therefore native, and it says two things (section 7.6, ADR 0031): that the worker's native side still reports to the host every second, which a stopped or frozen process does not, and that a thread can still attach to the interpreter, which a held GIL prevents. Either going quiet for `gil_stall_timeout` replaces the worker as the hard timeout does. Requests that hang are handled by timeouts (section 7.6).
 - HTTP liveness probes are opt-in, for application-level failures such as a broken connection pool. They require several consecutive failures, are skipped while the worker's queue is saturated, and lead to a graceful replacement, never an immediate kill.
 
 **How probes are handled**

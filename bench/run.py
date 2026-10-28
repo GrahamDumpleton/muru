@@ -1,4 +1,4 @@
-"""Run the phase 0 benchmarks: the same WSGI applications under several servers.
+"""Run the benchmarks: the same WSGI applications under several servers.
 
 Each server is started in turn, warmed up, measured with oha, and stopped.
 Results go to bench/results/<timestamp>.json and a summary table is printed
@@ -7,6 +7,12 @@ with each server's throughput relative to the best for that scenario.
     just bench                              # everything that is installed
     just bench --servers muru,gunicorn-gthread --scenarios hello
     just bench --duration 20s --connections 128 --workers 4 --threads 4
+
+Muru is run three ways: `muru` with the access log off, as the other servers
+are run; `muru-logged` with the access log written to the terminal, as
+`muructl run` does by default; and `muru-baseline`, an earlier build given
+with --baseline-muructl and --baseline-python, to see what has been added to
+the cost of a request since then.
 
 Servers whose command is not installed are skipped with a note. mod_wsgi-express
 needs Apache httpd and the mod_wsgi package; see bench/README.md.
@@ -44,6 +50,56 @@ def muructl_path() -> Path:
     return Path(os.environ.get("MURUCTL", ROOT / "target" / "release" / "muructl"))
 
 
+# An earlier muructl, and an interpreter with that build's runtime library,
+# for the muru-baseline server.
+
+BASELINE: dict[str, Path] = {}
+
+
+def run_flags(muructl: Path) -> str:
+    """The help text of `muructl run`, to tell which flags a build takes."""
+
+    completed = subprocess.run(
+        [str(muructl), "run", "--help"], capture_output=True, text=True, check=False
+    )
+    return completed.stdout
+
+
+def muru_command(
+    muructl: Path,
+    python: str,
+    app: str,
+    address: str,
+    workers: int,
+    threads: int,
+    access_log: bool,
+) -> list[str]:
+    """The command line for one Muru build, with the flags that build takes:
+    phase 0 named the processes --workers and had no access log."""
+
+    flags = run_flags(muructl)
+    command = [
+        str(muructl),
+        "run",
+        app,
+        "--bind",
+        address,
+        "--processes" if "--processes" in flags else "--workers",
+        str(workers),
+        "--threads",
+        str(threads),
+        "--python",
+        python,
+        "--chdir",
+        str(APPS),
+    ]
+
+    if not access_log and "--access-log" in flags:
+        command += ["--access-log", "off"]
+
+    return command
+
+
 @dataclass
 class Server:
     """How to start one server for an application module."""
@@ -60,22 +116,27 @@ class Server:
         address = f"127.0.0.1:{port}"
         python = sys.executable
 
-        if self.name == "muru":
-            return [
-                str(muructl_path()),
-                "run",
-                app,
-                "--bind",
-                address,
-                "--workers",
-                str(workers),
-                "--threads",
-                str(threads),
-                "--python",
+        if self.name in ("muru", "muru-logged"):
+            return muru_command(
+                muructl_path(),
                 python,
-                "--chdir",
-                str(APPS),
-            ]
+                app,
+                address,
+                workers,
+                threads,
+                access_log=self.name == "muru-logged",
+            )
+
+        if self.name == "muru-baseline":
+            return muru_command(
+                BASELINE["muructl"],
+                str(BASELINE["python"]),
+                app,
+                address,
+                workers,
+                threads,
+                access_log=False,
+            )
 
         if self.name == "gunicorn-sync":
             return [
@@ -190,6 +251,8 @@ class Server:
 
 SERVERS = [
     Server("muru", "muructl"),
+    Server("muru-logged", "muructl"),
+    Server("muru-baseline", "baseline"),
     Server("gunicorn-sync", "python:gunicorn"),
     Server("gunicorn-gthread", "python:gunicorn"),
     Server("uvicorn", "python:uvicorn"),
@@ -203,6 +266,9 @@ SERVERS = [
 def is_available(server: Server) -> bool:
     if server.available == "muructl":
         return muructl_path().is_file()
+
+    if server.available == "baseline":
+        return bool(BASELINE) and all(path.is_file() for path in BASELINE.values())
 
     if server.available.startswith("python:"):
         module = server.available.split(":", 1)[1]
@@ -268,6 +334,15 @@ def oha(url: str, duration: str, connections: int) -> dict[str, Any]:
     return report
 
 
+def tail(path: Path, lines: int = 20) -> str:
+    """The last lines a server wrote, for when it failed."""
+
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
 def summarise(report: dict[str, Any]) -> dict[str, Any]:
     summary = report.get("summary", {})
     percentiles = report.get("latencyPercentiles", {})
@@ -306,8 +381,19 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="seconds to wait between servers, for TIME_WAIT sockets to drain (macOS needs ~15)",
     )
+    parser.add_argument(
+        "--baseline-muructl", type=Path, help="an earlier muructl, run as muru-baseline"
+    )
+    parser.add_argument(
+        "--baseline-python",
+        type=Path,
+        help="an interpreter with the earlier build's runtime library installed",
+    )
     parser.add_argument("--list", action="store_true", help="show available servers and exit")
     args = parser.parse_args(argv)
+
+    if args.baseline_muructl and args.baseline_python:
+        BASELINE.update(muructl=args.baseline_muructl, python=args.baseline_python)
 
     if args.list:
         for server in SERVERS:
@@ -330,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         "connections": args.connections,
         "duration": args.duration,
         "repeat": args.repeat,
+        "baseline": {name: str(path) for name, path in BASELINE.items()},
         "runs": [],
     }
     scratch = Path(tempfile.mkdtemp(prefix="muru-bench-"))
@@ -345,7 +432,10 @@ def main(argv: list[str] | None = None) -> int:
             port = free_port()
             command = server.command(module, port, args.workers, args.threads, scratch)
             print(f"=== {scenario} on {server.name}", file=sys.stderr)
-            process = subprocess.Popen(command, cwd=APPS, stdout=subprocess.DEVNULL)
+            output = scratch / f"{scenario}-{server.name}.log"
+
+            with output.open("wb") as log:
+                process = subprocess.Popen(command, cwd=APPS, stdout=log, stderr=log)
 
             try:
                 wait_for_port(port, process)
@@ -356,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
                 report = reports[len(reports) // 2]
             except Exception as error:
                 print(f"failed {server.name}: {error}", file=sys.stderr)
+                print(tail(output), file=sys.stderr)
                 results["runs"].append(
                     {"scenario": scenario, "server": server.name, "error": str(error)}
                 )

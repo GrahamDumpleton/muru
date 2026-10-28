@@ -52,6 +52,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | kind, profile, command, cwd, bind, instances, readiness (path, timeout), stop_signal | release | workers, none, none, source, unix, 1, none and 60s, the profile's | 9.9 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |
 | match.client_class | group, route | none (every class) | 4.14 |
+| match.host, match.method | group | none (every host, every method) | 7.1 |
 | path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none (required except for a gRPC mount, which takes none), false, false, false, 1000, 1000 | 6.7, 4.10, 6.13 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
@@ -63,7 +64,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
-| timeouts (queue_timeout, request_deadline, soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, idle_timeout) | group, route | 5s, 300s, off, off, 10s, 5s, 10s, 60s | 7.6 |
+| timeouts (queue_timeout, request_deadline, soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | group, route | 5s, 300s, off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
 | max_body_size, buffer_body, chunked_body, buffer_response | route and wider | 10MB, off, buffer, on | 4.6 |
 | max_header_bytes, max_headers, header_read_timeout | listener, host | 64KiB, 100, 30s | 4.6 |
@@ -104,8 +105,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, upgrade_not_allowed |
 | 429 | rate_limited |
 | 500 | app_error, redirect_loop, sendfile_refused |
-| 502 | worker_crashed, upstream_failed |
-| 503 | queue_full, no_workers, cold_start_timeout, release_failed, draining, maintenance, read_only, auth_unavailable, edge_overloaded |
+| 502 | worker_crashed, worker_unavailable, upstream_failed |
+| 503 | queue_full, no_workers, cold_start_timeout, release_failed, draining, maintenance, read_only, auth_unavailable, edge_overloaded, mount_not_loaded |
 | 504 | deadline, soft_timeout, hard_timeout |
 | 507 | upload_spool_full |
 | 403, 405 | blocked (client class or rule), method_not_allowed |
@@ -118,7 +119,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- |
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
 | Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
-| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, worker.loop_stalled, server.started, server.exited, server.failed |
+| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable |

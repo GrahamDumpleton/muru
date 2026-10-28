@@ -41,7 +41,13 @@ def test_deploy_serves_and_records_the_release(daemon: Daemon) -> None:
     assert response.status == 200
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "ready", "serving": "yes"}]
     assert "shop" in daemon.muructl("app", "list").stdout
-    assert daemon.events()[-3:] == ["release.created", "release.ready", "traffic.switched"]
+
+    # A worker's own events come from its host, which the daemon hears
+    # only once it has attached to it, so one may arrive after the
+    # release's; the release's events are in order among themselves.
+
+    releases = [kind for kind in daemon.events() if not kind.startswith("worker.")]
+    assert releases[-3:] == ["release.created", "release.ready", "traffic.switched"]
 
 
 def test_second_deploy_moves_traffic_without_failed_requests(daemon: Daemon) -> None:
