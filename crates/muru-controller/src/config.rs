@@ -2394,6 +2394,7 @@ pub fn resolve_spec(
             name: name.clone(),
             paths: group.paths.clone(),
             client_class,
+            optional: group.optional.unwrap_or(false),
             processes: group_processes,
             threads: group.threads.map_or(threads, |value| value as u32),
             sync_threads: group
@@ -3842,6 +3843,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                                 client_class: group.client_class.clone(),
                             }
                         }),
+                        optional: group.optional.then_some(true),
                         processes: Some(group.processes as usize),
                         threads: Some(group.threads as usize),
                         sync_threads: Some(group.sync_threads as usize),
@@ -4382,10 +4384,11 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
             .collect::<Vec<_>>();
 
             format!(
-                "{} {}x{} on {on}{}{}{}",
+                "{} {}x{} on {on}{}{}{}{}",
                 group.name,
                 group.processes,
                 group.threads,
+                if group.optional { " optional" } else { "" },
                 if group.scaling.is_static() {
                     String::new()
                 } else {

@@ -484,6 +484,7 @@ message ReleaseGroup {
   uint32 threads = 5;
   uint32 sync_threads = 6;
   uint32 concurrency = 7;
+  bool optional = 8;
 }
 
 message Worker {

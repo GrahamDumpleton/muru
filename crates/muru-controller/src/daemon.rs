@@ -461,6 +461,8 @@ struct GroupRecord {
     paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     client_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    optional: bool,
     sockets: Vec<PathBuf>,
 }
 
@@ -1884,12 +1886,26 @@ impl Daemon {
                 value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
             };
 
+            let optional: Vec<String> = self
+                .running
+                .get(&(app.clone(), id.clone()))
+                .map(|running| {
+                    running
+                        .groups
+                        .iter()
+                        .filter(|group| group.optional)
+                        .map(|group| group.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             for (group, status) in self.scale_status(app, id).unwrap_or_default() {
                 scaling.push(ScalingRow {
                     release: format!("{app}@{id}"),
                     app: app.clone(),
                     id: id.clone(),
                     pinned: status.pinned.is_some(),
+                    optional: optional.contains(&group),
                     group,
                     workers: if status.desired == status.ready {
                         status.ready.to_string()
@@ -2861,10 +2877,17 @@ impl Daemon {
             .iter()
             .map(|group| (group.name.clone(), group.sockets.clone()))
             .collect();
+        let optional = record
+            .groups
+            .iter()
+            .filter(|group| group.optional)
+            .map(|group| group.name.clone())
+            .collect();
         let adopted = HostProcess::adopt(
             record.pid,
             record.sockets.clone(),
             group_sockets,
+            optional,
             run_dir.join("r1"),
             1,
         );
@@ -3455,6 +3478,7 @@ impl Daemon {
                     concurrency: group.concurrency as usize,
                     timeouts: group.timeouts.resolve(&spec.timeouts),
                     memory: group.memory.clone().unwrap_or_else(|| spec.memory.clone()),
+                    optional: group.optional,
                 })
                 .collect(),
             mounts: spec
@@ -3495,6 +3519,23 @@ impl Daemon {
         }
 
         let sockets = host.default_sockets();
+        let host_sockets = host.sockets.len();
+
+        // ADR 0033: an optional group whose workers are not all listening
+        // yet is named in the event; they join as the host announces them.
+
+        let awaited: Vec<String> = spec
+            .groups
+            .iter()
+            .filter(|group| group.optional)
+            .filter(|group| {
+                host.group_sockets
+                    .iter()
+                    .find(|(name, _)| name == &group.name)
+                    .is_some_and(|(_, sockets)| sockets.len() < group.processes as usize)
+            })
+            .map(|group| format!("group {}", group.name))
+            .collect();
         let groups: Vec<GroupRecord> = host
             .group_sockets
             .iter()
@@ -3507,6 +3548,7 @@ impl Daemon {
                     client_classes: group
                         .map(|group| group.client_class.clone())
                         .unwrap_or_default(),
+                    optional: group.is_some_and(|group| group.optional),
                     sockets: sockets.clone(),
                 }
             })
@@ -3556,9 +3598,14 @@ impl Daemon {
             &subject,
             "info",
             &format!(
-                "{} workers ready in {:.1} s",
-                spec.processes + spec.groups.iter().map(|group| group.processes).sum::<u32>(),
-                started.elapsed().as_secs_f64()
+                "{} workers ready in {:.1} s{}",
+                host_sockets,
+                started.elapsed().as_secs_f64(),
+                if awaited.is_empty() {
+                    String::new()
+                } else {
+                    format!(", without the optional {}", awaited.join(", "))
+                }
             ),
         );
         Ok(())

@@ -3874,14 +3874,15 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         lines.push((
             format!("group {}", group.name),
             format!(
-                "{serves}: {}",
+                "{serves}: {}{}",
                 group_size(
                     uses,
                     group.processes,
                     group.threads,
                     group.concurrency,
                     group.sync_threads
-                )
+                ),
+                if group.optional { ", optional" } else { "" }
             ),
         ));
     }

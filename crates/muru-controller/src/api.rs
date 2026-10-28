@@ -1855,6 +1855,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 threads: group.threads,
                 sync_threads: group.sync_threads,
                 concurrency: group.concurrency,
+                optional: group.optional,
             })
             .collect(),
         detected_interface: detected_for(""),

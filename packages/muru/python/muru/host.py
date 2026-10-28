@@ -409,6 +409,12 @@ class Group:
     gil_stall_timeout: float | None = None
     memory: MemoryPolicy | None = None
 
+    # ADR 0033: the release is ready without an optional group's workers,
+    # which enter routing as each listens, and a worker of one that
+    # cannot start is given up rather than stopping the host.
+
+    optional: bool = False
+
     @classmethod
     def parse(cls, text: str) -> Group:
         """Parse NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY."""
@@ -1261,8 +1267,16 @@ class Host:
         if self.control_listener is not None:
             selector.register(self.control_listener, selectors.EVENT_READ)
 
+        # An optional group's workers are routed to once they listen, as
+        # a scale-out's are, so the edge holds the group's requests until
+        # one does rather than sending them to a socket nobody serves.
+
         for index in range(self.worker_count):
-            self.spawn(index)
+            if self.group_of(index).optional:
+                self.starting.add(index)
+                self.spawn(index, replacing=True)
+            else:
+                self.spawn(index)
 
         self.announce()
 
@@ -2633,6 +2647,27 @@ class Host:
                 self.start_failures[index] = self.start_failures.get(index, 0) + 1
 
                 if self.start_failures[index] >= MAX_START_FAILURES:
+                    group = self.group_of(index)
+
+                    # ADR 0033: the release is ready without an optional
+                    # group, so its worker is given up and the index left
+                    # for a scale-out to try again, while the others serve.
+
+                    if group.optional:
+                        self.start_failures[index] = 0
+                        self.starting.discard(index)
+                        self.routed[index] = None
+                        self.retired.add(index)
+                        self.emit(
+                            "worker.exited",
+                            "error",
+                            f"worker {index} (pid {pid}) of the optional group {group.name} "
+                            f"failed {MAX_START_FAILURES} times at start, last with "
+                            f"{describe(status)}; it is given up",
+                        )
+                        self.announce()
+                        continue
+
                     log(
                         f"worker {index} failed {MAX_START_FAILURES} times at start, "
                         f"last with {describe(status)}; stopping"
@@ -2865,6 +2900,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=Group.parse,
         metavar="NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY",
         help="a named worker group beside the default one",
+    )
+    parser.add_argument(
+        "--optional-group",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="a group the release is ready without; its workers join as each listens",
     )
     parser.add_argument(
         "--group-timeouts",
@@ -3180,6 +3222,7 @@ def main(argv: list[str] | None = None) -> int:
                 group,
                 **dict(args.group_timeouts).get(group.name, {}),
                 memory=dict(args.group_memory).get(group.name),
+                optional=group.name in args.optional_group,
             )
             for group in args.group
         ],
