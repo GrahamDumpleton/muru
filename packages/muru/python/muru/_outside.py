@@ -15,11 +15,17 @@ the names of its own threads and the request each thread serves.
 
 from __future__ import annotations
 
+import ast
+import functools
 import linecache
 import os
 import time
 from collections import Counter
 from typing import Any
+
+# The nodes that have a code object of their own, and so a frame.
+
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp)
 
 
 class Unreadable(Exception):
@@ -74,6 +80,68 @@ def _threads(trace: Any) -> list[tuple[int, list[dict[str, Any]]]]:
             )
 
     return found
+
+
+@functools.lru_cache(maxsize=256)
+def _scopes(file: str, mtime: float) -> list[tuple[int, int, str, int]] | None:
+    """Return each scope in a file: its lines, its name and where it starts.
+
+    Where a scope starts is its code object's first line, which for a
+    decorated function or class is its first decorator's. None means the
+    file cannot be read or parsed.
+    """
+
+    try:
+        with open(file, "rb") as source:
+            tree = ast.parse(source.read(), file)
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+    found = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, _SCOPES):
+            continue
+
+        if isinstance(node, ast.Lambda):
+            name = "<lambda>"
+        elif isinstance(node, ast.GeneratorExp):
+            name = "<genexpr>"
+        else:
+            name = node.name
+
+        decorators = getattr(node, "decorator_list", [])
+        start = min([node.lineno, *(decorator.lineno for decorator in decorators)])
+        found.append((node.lineno, node.end_lineno or node.lineno, name, start))
+
+    return found
+
+
+def first_line(file: str, line: int, function: str) -> int:
+    """Return where the function a frame is running starts.
+
+    A frame read from outside gives its file, the line it is running and
+    its function's name; the in-process profile labels a function by
+    where it starts, so the innermost scope of that name holding the line
+    is found in the file's source. The running line is returned when it
+    cannot be.
+    """
+
+    if function == "<module>":
+        return 1
+
+    try:
+        scopes = _scopes(file, os.stat(file).st_mtime)
+    except OSError:
+        return line
+
+    name = function.rsplit(".", 1)[-1]
+    holding = [scope for scope in scopes or [] if scope[0] <= line <= scope[1] and scope[2] == name]
+
+    if not holding:
+        return line
+
+    return max(holding, key=lambda scope: scope[0])[3]
 
 
 def parked(frames: list[dict[str, Any]]) -> bool:
@@ -183,7 +251,7 @@ class Reader:
 
         They are reported as the in-process profile reports them:
         collapsed stacks under each thread's name, a frame labelled
-        `function (file:line)` by the line it was running.
+        `function (file:line)` by the line its function starts on.
         """
 
         unwinders: dict[int, Any] = {}
@@ -231,7 +299,8 @@ class Reader:
                         continue
 
                     labels = [
-                        f"{frame['function']} ({os.path.basename(frame['file'])}:{frame['line']})"
+                        f"{frame['function']} ({os.path.basename(frame['file'])}:"
+                        f"{first_line(frame['file'], frame['line'], frame['function'])})"
                         for frame in frames
                     ]
                     thread = known.get(str(ident), f"thread-{ident}")
