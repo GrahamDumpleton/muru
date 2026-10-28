@@ -489,6 +489,9 @@ pub struct HostGroup {
     /// Whether the release is ready without the group's workers (ADR
     /// 0033).
     pub optional: bool,
+    /// The named mounts its workers serve beside the default mount;
+    /// every mount when empty (ADR 0033).
+    pub mounts: Vec<String>,
 }
 
 /// A running host and the sockets its workers listen on.
@@ -633,6 +636,14 @@ impl HostProcess {
 
             if group.optional {
                 command.arg("--optional-group").arg(&group.name);
+            }
+
+            if !group.mounts.is_empty() {
+                command.arg("--group-mounts").arg(format!(
+                    "{}={}",
+                    group.name,
+                    group.mounts.join(",")
+                ));
             }
 
             // Section 7.1: the group's own timeouts and memory policy,

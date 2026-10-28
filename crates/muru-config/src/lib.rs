@@ -525,6 +525,11 @@ pub struct Group {
     /// match across all groups wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// The named mounts (section 6.7) the group's workers serve, beside
+    /// the default mount, which every worker serves; every mount when
+    /// absent (ADR 0033). The group's paths must lie within them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
     /// What the group asks of a request beside its path (ADR 0033): the
     /// client classes (section 4.14), hosts and methods it takes, each
     /// list any of its entries; a group asking more comes before one

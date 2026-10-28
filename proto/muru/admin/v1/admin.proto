@@ -487,6 +487,7 @@ message ReleaseGroup {
   bool optional = 8;
   repeated string hosts = 9;            // ADR 0033: the hosts the group takes, every host when empty
   repeated string methods = 10;         // ADR 0033: the methods, upper case, every method when empty
+  repeated string mounts = 11;          // ADR 0033: the named mounts its workers serve, every mount when empty
 }
 
 message Worker {

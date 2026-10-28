@@ -6,9 +6,9 @@
 Named groups with their own process and thread counts, selected by path
 prefix, in development mode and under the daemon, each with its own
 scaling policy (see [scaling](scaling.md)), timeouts and memory policy,
-optional groups the release is ready without, and match lists that ask a
-client class, host or method of a request beside its path. The `mounts`
-subset is still to come.
+optional groups the release is ready without, match lists that ask a
+client class, host or method of a request beside its path, and a
+`mounts` subset a group's workers serve.
 ```
 
 A release can split its paths across named worker groups, all forked from
@@ -157,6 +157,35 @@ it again. `muructl run` and `muructl release show` mark such a group
 `optional`, as does the dashboard's scaling table, and the `release.ready`
 event names an optional group whose workers were not all listening when
 the release became ready.
+
+## Mounts a group serves
+
+Every worker serves every [mount](mounts.md) of the release. A group can
+list the named mounts its workers serve instead, so the workers of a
+group for one mount's paths do not start the lifespans or hold the
+slots of the others:
+
+```toml
+[groups.reports]
+paths = ["/reports/*"]
+mounts = ["reports"]
+processes = 2
+```
+
+The default mount, which is the release's entrypoint and carries its
+hooks, is always served. The host still imports every mount before the
+fork, so a broken entrypoint fails the release early as before and the
+preload stays shared; a worker of the group realises, starts the
+lifespan of, and declares to the edge only its own mounts. With
+per-worker imports, a worker imports only its own.
+
+A group's paths must lie within the mounts it serves: the release is
+refused when a mount the group leaves out has its path under one of the
+group's paths, or a group's path under the mount's, since a request for
+that path could reach a worker without its mount. A group that claims
+every path therefore serves every mount. A worker asked for a mount it
+does not serve, which that check rules out, answers 503
+`mount_not_loaded`.
 
 ## In the workers
 

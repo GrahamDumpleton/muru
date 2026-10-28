@@ -2444,6 +2444,7 @@ pub fn resolve_spec(
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
+            mounts: group.mounts.clone(),
             client_class,
             host,
             method,
@@ -2590,6 +2591,44 @@ pub fn resolve_spec(
             concurrency: mount.concurrency.map(|value| value as u32),
             max_connections: mount.max_connections.map(|value| value as u32),
         });
+    }
+
+    // ADR 0033: a group's workers serve the mounts it lists and the
+    // default mount; its paths must lie within them, so a request it
+    // claims never reaches a worker without the request's mount.
+
+    for group in &resolved_groups {
+        if group.mounts.is_empty() {
+            continue;
+        }
+
+        for name in &group.mounts {
+            if !resolved_mounts.iter().any(|mount| &mount.name == name) {
+                return Err(format!(
+                    "worker group {}: no mount named {name}",
+                    group.name
+                ));
+            }
+        }
+
+        for mount in &resolved_mounts {
+            if group.mounts.contains(&mount.name) || mount.path.is_empty() {
+                continue;
+            }
+
+            for prefix in group_prefixes(&group.paths) {
+                let under = |path: &str, prefix: &str| {
+                    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
+                };
+
+                if under(&mount.path, &prefix) || under(&prefix, &mount.path) {
+                    return Err(format!(
+                        "worker group {}: its path {prefix} reaches mount {} at {}, which it does not serve",
+                        group.name, mount.name, mount.path
+                    ));
+                }
+            }
+        }
     }
 
     // Section 7.6 and 7.7: the host's own timeouts and recycling, from
@@ -3918,6 +3957,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                     group.name.clone(),
                     GroupTable {
                         paths: group.paths.clone(),
+                        mounts: group.mounts.clone(),
                         matches: (!group.client_class.is_empty()
                             || !group.host.is_empty()
                             || !group.method.is_empty())
@@ -4462,6 +4502,10 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
 
             if !group.method.is_empty() {
                 on.push_str(&format!(" method {}", group.method.join(" ")));
+            }
+
+            if !group.mounts.is_empty() {
+                on.push_str(&format!(" mounts {}", group.mounts.join(" ")));
             }
 
             let own = [

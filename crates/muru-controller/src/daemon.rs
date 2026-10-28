@@ -3483,6 +3483,7 @@ impl Daemon {
                     timeouts: group.timeouts.resolve(&spec.timeouts),
                     memory: group.memory.clone().unwrap_or_else(|| spec.memory.clone()),
                     optional: group.optional,
+                    mounts: group.mounts.clone(),
                 })
                 .collect(),
             mounts: spec
