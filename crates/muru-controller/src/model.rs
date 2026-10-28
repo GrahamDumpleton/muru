@@ -542,6 +542,10 @@ pub struct WorkerTimeouts {
     /// before the worker is replaced.
     #[serde(default = "default_loop_stall_timeout_ms")]
     pub loop_stall_timeout_ms: u64,
+    /// How long a worker may go with no thread running Python, or with
+    /// no report to its host, before it is replaced.
+    #[serde(default = "default_gil_stall_timeout_ms")]
+    pub gil_stall_timeout_ms: u64,
 }
 
 impl Default for WorkerTimeouts {
@@ -553,6 +557,7 @@ impl Default for WorkerTimeouts {
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
             websocket_drain_grace_ms: 0,
             loop_stall_timeout_ms: default_loop_stall_timeout_ms(),
+            gil_stall_timeout_ms: default_gil_stall_timeout_ms(),
         }
     }
 }
@@ -578,6 +583,10 @@ fn default_shutdown_timeout_ms() -> u64 {
 
 fn default_loop_stall_timeout_ms() -> u64 {
     10_000
+}
+
+fn default_gil_stall_timeout_ms() -> u64 {
+    30_000
 }
 
 /// Section 9.3: where a rollout is.

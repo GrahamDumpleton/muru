@@ -75,6 +75,11 @@ RESTART_DELAY_SECONDS = 0.5
 ACK_TIMEOUT_SECONDS = 5.0
 ROUTE_SETTLE_SECONDS = 1.0
 
+# How long after a forced restart takes a worker out of routing it is
+# killed: time enough for its stacks to be taken.
+
+FORCE_KILL_SECONDS = 1.0
+
 # How often the supervision loop runs when timeouts or recycling are on.
 
 TICK_SECONDS = 0.5
@@ -437,6 +442,11 @@ class WorkerState:
     oldest_ms: int = 0
     ready: bool = False
 
+    # Section 7.6: when the worker last reported, so one that has gone
+    # silent altogether is noticed.
+
+    last_report_at: float = 0.0
+
     # The request count and the time at which this worker is recycled,
     # jittered so workers do not all go at once, and whether it is the
     # old one of a replacement.
@@ -530,6 +540,7 @@ class Host:
         shutdown_timeout: float = 5.0,
         websocket_drain_grace: float = 0.0,
         loop_stall_timeout: float = 10.0,
+        gil_stall_timeout: float = 30.0,
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
     ) -> None:
@@ -551,6 +562,7 @@ class Host:
         self.shutdown_timeout = shutdown_timeout
         self.websocket_drain_grace = websocket_drain_grace
         self.loop_stall_timeout = loop_stall_timeout
+        self.gil_stall_timeout = gil_stall_timeout
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
@@ -775,6 +787,7 @@ class Host:
 
         now = time.monotonic()
         state = WorkerState(index, pid, self.generation.get(index, 0), path, now, report_read)
+        state.last_report_at = now
 
         if self.max_requests is not None:
             state.recycle_after_requests = self.max_requests + random.randint(
@@ -1044,6 +1057,12 @@ class Host:
             timeout_arguments["loop_stall_timeout_ms"] = int(self.loop_stall_timeout * 1000)
             _asgi.heartbeat(loop.loop)
 
+        # Section 7.6: a thread attaches to the interpreter every half
+        # second, and a native watchdog tells the host when none has for
+        # longer than the GIL stall timeout.
+
+        timeout_arguments["gil_stall_timeout_ms"] = int(self.gil_stall_timeout * 1000)
+
         # Section 11.7: breakpoint() waits for muructl debug attach.
 
         from muru import _debug
@@ -1094,9 +1113,15 @@ class Host:
         self.wake_write = wake_write
 
         def request_stop(signum: int, _frame: Any) -> None:
-            if not self.stopping:
-                log(f"received {signal.Signals(signum).name}, stopping")
+            # Ctrl-C sends SIGINT and muructl SIGTERM close together, and
+            # the second handler may run while the first is still logging,
+            # so the flag is set before the line is written.
+
+            first = not self.stopping
             self.stopping = True
+
+            if first:
+                log(f"received {signal.Signals(signum).name}, stopping")
 
         def request_reopen(_signum: int, _frame: Any) -> None:
             self.reopen_requested = True
@@ -1134,7 +1159,7 @@ class Host:
         while True:
             if self.restart_after:
                 timeout: float | None = 0.1
-            elif self.policies or self.replacing or self.pending:
+            elif self.policies or self.replacing or self.pending or self.states:
                 timeout = TICK_SECONDS
             else:
                 timeout = None
@@ -1338,6 +1363,10 @@ class Host:
             self.scale_group(request_id, args)
             return
 
+        if op == "restart":
+            self.restart_worker(request_id, wanted, args)
+            return
+
         if op == "status":
             self.send_to_supervisor(
                 {
@@ -1430,6 +1459,82 @@ class Host:
             self.retire_worker(group)
 
         self.send_to_supervisor({"type": "response", "id": request_id, "workers": []})
+
+    # Section 7.6: a worker replaced because the operator asked, through
+    # the path the policies use; with force, killed at once.
+
+    def restart_worker(self, request_id: int, wanted: Any, args: dict[str, Any]) -> None:
+        """Replace one worker on request, gracefully or at once with force."""
+
+        force = bool(args.get("force"))
+        state = next(
+            (
+                candidate
+                for candidate in self.states.values()
+                if candidate.index == wanted and not candidate.replaced
+            ),
+            None,
+        )
+        error = ""
+
+        if wanted is None:
+            error = "a worker index is needed"
+        elif state is None:
+            error = f"no worker {wanted}"
+        elif not state.ready:
+            error = f"worker {wanted} is still starting"
+        elif wanted in self.replacing:
+            error = f"worker {wanted} is already being replaced"
+        elif state.debug_sessions and not force:
+            error = f"worker {wanted} is being debugged; --force ends the session"
+        elif self.start_failures.get(wanted, 0) >= MAX_START_FAILURES:
+            error = (
+                f"a replacement for worker {wanted} failed to start {MAX_START_FAILURES} "
+                "times and is not tried again"
+            )
+        elif self.control_listener is None:
+            error = "workers cannot be replaced without a control socket"
+
+        if error or state is None:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": error}
+            )
+            return
+
+        if force:
+            state.debug_sessions = 0
+            self.replace(state, "restarted on request, killed at once", "worker.restarted", True)
+        else:
+            self.replace(state, "restarted on request", "worker.restarted")
+
+        replacement = self.replacing[state.index]
+
+        # A forced restart takes the stacks the way a hard timeout does,
+        # then kills the worker without asking it to stop.
+
+        if force:
+            self.capture_stacks(state, replacement)
+            replacement.terminated = True
+            replacement.kill_at = time.monotonic() + FORCE_KILL_SECONDS
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [
+                    {
+                        "index": state.index,
+                        "pid": state.pid,
+                        "ok": True,
+                        "result": {
+                            "old_pid": state.pid,
+                            "new_pid": replacement.new_pid,
+                            "forced": force,
+                        },
+                    }
+                ],
+            }
+        )
 
     def active_indices(self, group: Group) -> list[int]:
         """Return the group's indices with a worker that serves or is starting, in order."""
@@ -1749,9 +1854,17 @@ class Host:
                         f"{self.loop_stall_timeout:g} s",
                         "worker.timeout_killed",
                     )
+                elif report["event"] == "worker.gil_stalled":
+                    self.replace(
+                        state,
+                        f"no thread of it ran Python for the GIL stall timeout of "
+                        f"{self.gil_stall_timeout:g} s",
+                        "worker.timeout_killed",
+                    )
 
                 continue
 
+            state.last_report_at = time.monotonic()
             state.requests = int(report.get("requests", state.requests))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
@@ -1922,6 +2035,16 @@ class Host:
                     state,
                     f"a request has run for {state.oldest_ms / 1000:.1f} s, past the hard "
                     f"timeout of {self.hard_timeout:g} s",
+                    "worker.timeout_killed",
+                )
+            elif now - state.last_report_at > self.gil_stall_timeout:
+                # Section 7.6: a worker whose reports have stopped, which
+                # its native threads send, is stopped or frozen whole.
+
+                self.replace(
+                    state,
+                    f"sent no report for {now - state.last_report_at:.0f} s, longer than "
+                    f"the GIL stall timeout of {self.gil_stall_timeout:g} s",
                     "worker.timeout_killed",
                 )
             elif state.recycle_at is not None and now >= state.recycle_at:
@@ -2705,6 +2828,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="replace an ASGI worker whose event loop has not run for this long",
     )
     parser.add_argument(
+        "--gil-stall-timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="replace a worker in which no thread has run Python for this long, or that "
+        "has not reported for this long",
+    )
+    parser.add_argument(
         "--shutdown-timeout",
         type=float,
         default=5.0,
@@ -2920,6 +3051,7 @@ def main(argv: list[str] | None = None) -> int:
         shutdown_timeout=args.shutdown_timeout,
         websocket_drain_grace=args.websocket_drain_grace,
         loop_stall_timeout=args.loop_stall_timeout,
+        gil_stall_timeout=args.gil_stall_timeout,
         memory=MemoryPolicy(
             measure=args.memory_measure,
             soft_limit=args.memory_soft_limit,

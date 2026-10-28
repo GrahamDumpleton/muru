@@ -316,6 +316,10 @@ pub struct Shared {
     /// How long the event loop may go without beating before the host
     /// is told it has stalled (section 7.6); none without a loop.
     pub loop_stall: Option<std::time::Duration>,
+    /// How long no thread may manage to attach to the interpreter before
+    /// the host is told it has stalled (section 7.6); none turns the
+    /// check off.
+    pub gil_stall: Option<std::time::Duration>,
     /// The gRPC methods the mounts registered (section 6.13), for HELLO.
     pub grpc_methods: Vec<muru_proto::worker::v1::GrpcMethod>,
     in_flight: AtomicU32,
@@ -351,6 +355,7 @@ impl Shared {
             pool: Pool::start("muru-app", threads)?,
             soft_timeout,
             loop_stall: None,
+            gil_stall: None,
             grpc_methods: Vec::new(),
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),

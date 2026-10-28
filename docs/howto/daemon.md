@@ -49,6 +49,7 @@ muructl release show shop@r3
 muructl release wait shop@r3
 muructl rollback shop
 muructl drain shop@r2
+muructl restart shop --worker 1
 muructl events --follow
 ```
 
@@ -65,7 +66,9 @@ stopped starts it again first and moves traffic when it is ready; the
 release it replaces is retained in turn. `drain` takes a release out of
 traffic and stops it; draining the serving release leaves the application
 answering 503 until the next deploy. `deploy --no-wait` returns once the
-release is recorded, and `release wait` waits for a state.
+release is recorded, and `release wait` waits for a state. `restart`
+replaces one worker of a release, or each in turn, as the [recycling
+guide](recycling.md#restarting-a-worker-by-hand) describes.
 
 `release show` prints one release: its state, source, interpreter,
 entrypoint and sizes, and its worker groups and mounts:

@@ -931,6 +931,11 @@ pub struct Timeouts {
     /// 10s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_stall_timeout: Option<String>,
+    /// How long a worker may go with no thread running Python, or with
+    /// no report to its host, before it is replaced as for the hard
+    /// timeout (default 30s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gil_stall_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -3095,6 +3100,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                     || timeouts.hard_drain_grace.is_some()
                     || timeouts.websocket_drain_grace.is_some()
                     || timeouts.loop_stall_timeout.is_some()
+                    || timeouts.gil_stall_timeout.is_some()
             }),
         ),
     ];

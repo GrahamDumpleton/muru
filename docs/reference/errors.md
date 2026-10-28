@@ -31,6 +31,7 @@ precisely than the status, appears in the access log line as
 | 500 | `redirect_loop` | The application redirected internally more than 5 times for one request |
 | 502 | `upstream_failed` | No address of the [HTTP upstream](../howto/upstreams.md) could be reached, or the one that took the request did not answer it, or a WebSocket upgrade was asked of an HTTP/2 upstream |
 | 502 | `worker_crashed` | The worker's connection ended before a response head, or it sent something invalid |
+| 502 | `worker_unavailable` | The worker chosen closed its connection before reading the request, as a worker that is stopping does, and so did the worker the request was sent to next; a request one worker never read goes to another before this is answered |
 | 503 | `auth_unavailable` | The route's [authentication handler](../howto/auth-subrequests.md) could not decide: it failed, answered something other than 2xx, 3xx, 401 or 403, redirected internally, or did not answer within its timeout |
 | 503 | `maintenance` | The application is in maintenance mode (`muructl maintenance on`) and nothing exempted the request; `Retry-After` is the release's `retry_after`, 60 s by default (see the [error pages guide](../howto/error-pages.md)) |
 | 503 | `read_only` | The route refuses the method while its site is read-only (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |

@@ -177,6 +177,24 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
                 .spawn(move || loop_watch(timeout, &stop, report))?;
         }
 
+        // Section 7.6: the interpreter's heartbeat. A thread attaches to
+        // the interpreter every half second, which a thread holding the
+        // GIL in a call that never returns stops, and a watchdog that
+        // needs no interpreter notices when it has not for the GIL stall
+        // timeout.
+
+        if let Some(timeout) = accepting.gil_stall {
+            GIL_BEAT_MS.store(clock_ms().max(1), Ordering::Relaxed);
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-gil-beat".to_owned())
+                .spawn(move || gil_beat(&stop))?;
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-gil-watch".to_owned())
+                .spawn(move || gil_watch(timeout, &stop, report))?;
+        }
+
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -328,6 +346,70 @@ fn loop_watch(timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
 
         if let Some(fd) = report {
             report_event(fd, "worker.loop_stalled", "error", &message);
+        }
+    }
+}
+
+/// When a thread last attached to the interpreter (section 7.6), in
+/// milliseconds of `clock_ms`, or 0 before the heartbeat started.
+static GIL_BEAT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How often the heartbeat thread attaches to the interpreter.
+const GIL_BEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Attach to the interpreter every half second and record the time
+/// (section 7.6). A thread that holds the GIL without returning to the
+/// interpreter, in a C call or a deadlock, keeps this thread from
+/// attaching, and the record goes stale for the watchdog to see. On a
+/// free-threaded build attaching never waits for other threads, so the
+/// record stays fresh there.
+fn gil_beat(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(GIL_BEAT_INTERVAL);
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        Python::attach(|_py| GIL_BEAT_MS.store(clock_ms().max(1), Ordering::Relaxed));
+    }
+}
+
+/// Tell the host, once a stall, when no thread has attached to the
+/// interpreter for longer than `timeout`, so that it replaces the worker
+/// as for the hard timeout (section 7.6).
+fn gil_watch(timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
+    let mut reported = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(LOOP_WATCH_INTERVAL);
+        let beat = GIL_BEAT_MS.load(Ordering::Relaxed);
+
+        if beat == 0 {
+            continue;
+        }
+
+        let silent = Duration::from_millis(clock_ms().saturating_sub(beat));
+
+        if silent <= timeout {
+            reported = false;
+            continue;
+        }
+
+        if reported {
+            continue;
+        }
+
+        reported = true;
+        let message = format!(
+            "no thread has run Python for {:.1} s, past the GIL stall timeout of {}",
+            silent.as_secs_f64(),
+            wsgi::describe_seconds(timeout)
+        );
+        eprintln!("muru: {message}");
+
+        if let Some(fd) = report {
+            report_event(fd, "worker.gil_stalled", "error", &message);
         }
     }
 }

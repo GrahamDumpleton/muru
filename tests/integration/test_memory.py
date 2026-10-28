@@ -16,11 +16,18 @@ from support.daemon import SHOP, start_daemon
 MB = 1024 * 1024
 
 
-def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
+def wait_for(
+    predicate: Callable[[], bool], timeout: float = 30.0, server: support.Server | None = None
+) -> None:
+    """Wait for the predicate; a timeout shows the server's log, so that a
+    recycle that stalled can be placed."""
+
     deadline = time.monotonic() + timeout
 
     while not predicate():
-        assert time.monotonic() < deadline, "timed out"
+        assert time.monotonic() < deadline, (
+            f"timed out\n{server.log()[-4000:]}" if server is not None else "timed out"
+        )
         time.sleep(0.1)
 
 
@@ -46,14 +53,14 @@ def test_a_worker_over_the_hard_limit_is_replaced_at_once() -> None:
     try:
         first = json.loads(server.get("/info").body)["pid"]
         assert int(server.get("/grow?mb=160").body) >= 160 * MB
-        wait_for(lambda: len(recycled(server.log())) >= 1)
+        wait_for(lambda: len(recycled(server.log())) >= 1, server=server)
         line = recycled(server.log())[0]
         assert "over the hard limit of 96MB" in line and "rss" in line
 
         # Section 11.7: the event says what the worker held most of.
 
         assert "; most objects: " in line, line
-        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != first)
+        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != first, server=server)
         assert server.get("/").status == 200
     finally:
         server.stop()
@@ -79,11 +86,11 @@ def test_a_worker_over_the_soft_limit_reclaims_and_then_recycles() -> None:
     try:
         first = json.loads(server.get("/info").body)["pid"]
         assert server.get("/grow?mb=160").status == 200
-        wait_for(lambda: "reclaimed memory: collected" in server.log())
-        wait_for(lambda: len(recycled(server.log())) >= 1)
+        wait_for(lambda: "reclaimed memory: collected" in server.log(), server=server)
+        wait_for(lambda: len(recycled(server.log())) >= 1, server=server)
         line = recycled(server.log())[0]
         assert "stayed over the soft limit of 96MB" in line and "after reclaiming" in line
-        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != first)
+        wait_for(lambda: json.loads(server.get("/info").body)["pid"] != first, server=server)
     finally:
         server.stop()
 

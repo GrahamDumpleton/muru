@@ -3436,6 +3436,7 @@ impl Daemon {
             shutdown_timeout: Duration::from_millis(spec.timeouts.shutdown_timeout_ms),
             websocket_drain_grace: Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
+            gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
             env,
             identity,

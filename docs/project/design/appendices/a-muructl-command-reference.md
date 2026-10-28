@@ -42,6 +42,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Operations | muructl dashboard login | A single-use link signing a browser in to the dashboard's actions | 10.7 |
 | Capacity | muructl scale RELEASE or APP | Processes, threads, bounds, temporary floors with --until | 7.4, 7.5 |
 | Capacity | muructl scale status RELEASE | Signals, decisions, churn counters | 7.3 |
+| Capacity | muructl restart RELEASE or APP --worker N | Replace one worker with a fresh one, or every worker in turn with --all; --pid names it by process id, --force kills it at once, --no-wait returns before the replacement serves | 7.6 |
 | Capacity | muructl schedule add, list, remove | Scheduled capacity | 7.5 |
 | Capacity | muructl edge pools, set | Edge pools and process counts | 4.2 |
 | Observability | muructl watch | Live view of applications, releases and workers | 10.7 |
