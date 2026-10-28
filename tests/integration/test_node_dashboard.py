@@ -488,6 +488,147 @@ def test_a_signed_in_session_turns_maintenance_on_from_the_page(tmp_path: Path) 
         daemon.stop()
 
 
+def test_a_session_that_may_act_promotes_rolls_back_scales_restarts_and_drains(
+    tmp_path: Path,
+) -> None:
+    port = support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        arguments=["--dashboard", f"127.0.0.1:{port}"],
+        config_extra="[dashboard]\nactions = true\n",
+    )
+
+    try:
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
+        acting = {"Authorization": f"Bearer {bearer}"}
+        TOKENS[port] = bearer
+
+        def post(name: str, fields: dict[str, str]) -> tuple[int, dict[str, str]]:
+            return post_form_headers(port, f"/actions/{name}", fields, acting)
+
+        def current() -> str:
+            return str(fetch_json(port, "/v1/apps")[0]["current"])
+
+        # The page offers what each release allows: the held release can be
+        # promoted or drained, the serving one drained, and nothing rolled
+        # back until there is a previous release.
+
+        page = fetch_with(port, "/", acting)
+        assert page.count('action="actions/promote"') == 1
+        assert page.count('action="actions/drain"') == 2
+        assert 'action="actions/rollback"' not in page
+        assert page.count('action="actions/scale"') == 2 and "<button>Unpin</button>" not in page
+
+        status, headers = post("promote", {"app": "shop", "release": "r2"})
+        assert status == 303 and headers["location"] == "../"
+        assert current() == "r2"
+        assert "Roll back to r1" in fetch_with(port, "/", acting)
+        assert post("promote", {"app": "shop", "release": "r2"})[0] == 409
+
+        status, _ = post("rollback", {"app": "shop"})
+        assert status == 303
+        assert current() == "r1"
+
+        # A pin shows in the scaling table with a button to lift it.
+
+        status, _ = post(
+            "scale", {"app": "shop", "release": "r1", "group": "default", "processes": "3"}
+        )
+        assert status == 303
+        scaling = {
+            row["group"]: row
+            for row in fetch_json(port, "/v1/scaling")
+            if row["release"] == "shop@r1"
+        }
+        assert scaling["default"]["pinned"] is True
+        assert "<button>Unpin</button>" in fetch_with(port, "/", acting)
+        status, _ = post(
+            "scale", {"app": "shop", "release": "r1", "group": "default", "unpin": "on"}
+        )
+        assert status == 303
+        scaling = {
+            row["group"]: row
+            for row in fetch_json(port, "/v1/scaling")
+            if row["release"] == "shop@r1"
+        }
+        assert scaling["default"]["pinned"] is False
+
+        # Restarting a worker from its page comes back to that page.
+
+        def pids() -> dict[int, int]:
+            answer = fetch_json(port, "/v1/debug/status?release=shop@r1")
+            return {
+                int(worker["index"]): int(worker["pid"])
+                for worker in answer["workers"]
+                if worker["ok"] and worker["result"]["ready"] and not worker["result"]["replaced"]
+            }
+
+        # The lifted pin takes the third worker away first.
+
+        wait_for(
+            lambda: (
+                len(fetch_json(port, "/v1/debug/status?release=shop@r1")["workers"]) == 2
+                and len(pids()) == 2
+            ),
+            timeout=30,
+        )
+        before = pids()
+        assert len(before) == 2, before
+        chosen, other = sorted(before)
+        page = fetch_with(port, "/workers?release=shop@r1", acting)
+        assert (
+            'action="actions/restart"' in page
+            and 'name="back" value="workers?release=shop@r1"' in page
+        )
+        page = fetch_with(port, f"/worker?release=shop@r1&worker={chosen}", acting)
+        assert f'name="back" value="worker?release=shop@r1&#38;worker={chosen}"' in page
+        status, headers = post(
+            "restart",
+            {
+                "app": "shop",
+                "release": "r1",
+                "worker": str(chosen),
+                "back": "workers?release=shop@r1",
+            },
+        )
+        assert status == 303 and headers["location"] == "../workers?release=shop@r1"
+        wait_for(lambda: pids().get(chosen) not in (None, before[chosen]), timeout=30)
+        assert pids()[other] == before[other]
+        status, _ = post("restart", {"app": "shop", "release": "r1", "worker": "9"})
+        assert status == 409
+
+        status, _ = post("drain", {"app": "shop", "release": "r2"})
+        assert status == 303
+        releases = {
+            release["id"]: release for release in fetch_json(port, "/v1/apps/shop/releases")
+        }
+        assert releases["r2"]["state"] == "stopped" and current() == "r1"
+
+        # What is not an action, or not a whole one.
+
+        status, _ = post("deploy", {"app": "shop"})
+        assert status == 400
+        status, _ = post("drain", {"app": "shop"})
+        assert status == 400
+
+        events = daemon.muructl("events").stdout
+
+        for what in (
+            "promoted shop@r2 from the dashboard",
+            "rolled shop back to r1 from the dashboard",
+            "pinned default to 3 workers from the dashboard",
+            "unpinned default from the dashboard",
+            f"restarted worker {chosen} from the dashboard",
+            "drained shop@r2 from the dashboard",
+        ):
+            assert what in events, what
+    finally:
+        TOKENS.pop(port, None)
+        daemon.stop()
+
+
 def post_form_headers(
     port: int, path: str, fields: dict[str, str], headers: dict[str, str]
 ) -> tuple[int, dict[str, str]]:

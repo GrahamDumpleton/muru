@@ -31,6 +31,105 @@ pub enum Action {
         /// On or off.
         on: bool,
     },
+    /// Move an application's traffic to a release now (section 9.2).
+    Promote {
+        /// The application.
+        app: String,
+        /// The release.
+        release: String,
+    },
+    /// Restore traffic to an application's previous release.
+    Rollback {
+        /// The application.
+        app: String,
+    },
+    /// Take a release out of traffic and stop it.
+    Drain {
+        /// The application.
+        app: String,
+        /// The release.
+        release: String,
+    },
+    /// Pin a worker group's count, or let the autoscaler decide again
+    /// (section 7.4).
+    Scale {
+        /// The application.
+        app: String,
+        /// The release.
+        release: String,
+        /// The worker group.
+        group: String,
+        /// The count to pin, or none to unpin.
+        processes: Option<u32>,
+    },
+    /// Replace one worker with a fresh one (section 7.6), at once with
+    /// `force`.
+    Restart {
+        /// The application.
+        app: String,
+        /// The release.
+        release: String,
+        /// The worker's index.
+        worker: u32,
+        /// Kill it rather than let it finish.
+        force: bool,
+    },
+}
+
+impl Action {
+    /// The action a form names, from its path's last segment and its
+    /// fields, or why the form is not one.
+    pub fn from_form(name: &str, fields: &HashMap<String, String>) -> Result<Self, String> {
+        let field = |key: &str| fields.get(key).cloned().unwrap_or_default();
+        let named = |key: &str| -> Result<String, String> {
+            let value = field(key);
+
+            if value.is_empty() {
+                return Err(format!("the form needs a {key}"));
+            }
+
+            Ok(value)
+        };
+
+        Ok(match name {
+            "maintenance" => Self::Maintenance {
+                app: named("app")?,
+                on: field("state") == "on",
+            },
+            "promote" => Self::Promote {
+                app: named("app")?,
+                release: named("release")?,
+            },
+            "rollback" => Self::Rollback { app: named("app")? },
+            "drain" => Self::Drain {
+                app: named("app")?,
+                release: named("release")?,
+            },
+            "scale" => Self::Scale {
+                app: named("app")?,
+                release: named("release")?,
+                group: named("group")?,
+                processes: if field("unpin") == "on" {
+                    None
+                } else {
+                    Some(
+                        named("processes")?
+                            .parse()
+                            .map_err(|_| "processes must be a whole number".to_owned())?,
+                    )
+                },
+            },
+            "restart" => Self::Restart {
+                app: named("app")?,
+                release: named("release")?,
+                worker: named("worker")?
+                    .parse()
+                    .map_err(|_| "worker must be an index".to_owned())?,
+                force: field("force") == "on",
+            },
+            _ => return Err(format!("there is no action {name}")),
+        })
+    }
 }
 
 /// Carries out an action for a session, named by a short label for the
@@ -212,6 +311,63 @@ mod tests {
                 .session(&sessions.issue_token(true))
                 .unwrap()
                 .actions
+        );
+    }
+
+    #[test]
+    fn forms_name_their_actions() {
+        let fields = |text: &[u8]| form_fields(text);
+        assert_eq!(
+            Action::from_form("promote", &fields(b"app=shop&release=r2")),
+            Ok(Action::Promote {
+                app: "shop".to_owned(),
+                release: "r2".to_owned()
+            })
+        );
+        assert_eq!(
+            Action::from_form(
+                "scale",
+                &fields(b"app=shop&release=r1&group=default&processes=3")
+            ),
+            Ok(Action::Scale {
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                group: "default".to_owned(),
+                processes: Some(3),
+            })
+        );
+        assert_eq!(
+            Action::from_form(
+                "scale",
+                &fields(b"app=shop&release=r1&group=default&unpin=on")
+            ),
+            Ok(Action::Scale {
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                group: "default".to_owned(),
+                processes: None,
+            })
+        );
+        assert_eq!(
+            Action::from_form("restart", &fields(b"app=shop&release=r1&worker=1&force=on")),
+            Ok(Action::Restart {
+                app: "shop".to_owned(),
+                release: "r1".to_owned(),
+                worker: 1,
+                force: true,
+            })
+        );
+        assert_eq!(
+            Action::from_form("restart", &fields(b"app=shop&release=r1&worker=x")),
+            Err("worker must be an index".to_owned())
+        );
+        assert_eq!(
+            Action::from_form("drain", &fields(b"app=shop")),
+            Err("the form needs a release".to_owned())
+        );
+        assert_eq!(
+            Action::from_form("deploy", &fields(b"app=shop")),
+            Err("there is no action deploy".to_owned())
         );
     }
 
