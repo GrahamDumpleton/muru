@@ -486,6 +486,9 @@ pub struct HostGroup {
     pub timeouts: crate::model::WorkerTimeouts,
     /// The group's memory policy, resolved over the release's.
     pub memory: crate::model::MemoryPolicy,
+    /// Whether the release is ready without the group's workers (ADR
+    /// 0033).
+    pub optional: bool,
 }
 
 /// A running host and the sockets its workers listen on.
@@ -497,6 +500,8 @@ pub struct HostProcess {
     pub sockets: Vec<PathBuf>,
     /// The sockets of each named group, in the order of the spec.
     pub group_sockets: Vec<(String, Vec<PathBuf>)>,
+    /// The groups the release is ready without (ADR 0033).
+    optional: Vec<String>,
     run_dir: PathBuf,
     /// The release number within this run, from 1.
     pub release: u32,
@@ -625,6 +630,10 @@ impl HostProcess {
                 "{}={},{},{},{}",
                 group.name, group.processes, group.threads, group.sync_threads, group.concurrency
             ));
+
+            if group.optional {
+                command.arg("--optional-group").arg(&group.name);
+            }
 
             // Section 7.1: the group's own timeouts and memory policy,
             // every value spelled out, the release's where it set none.
@@ -807,6 +816,12 @@ impl HostProcess {
             stdin,
             sockets,
             group_sockets,
+            optional: spec
+                .groups
+                .iter()
+                .filter(|group| group.optional)
+                .map(|group| group.name.clone())
+                .collect(),
             run_dir,
             release,
         })
@@ -819,23 +834,66 @@ impl HostProcess {
         pid: u32,
         sockets: Vec<PathBuf>,
         group_sockets: Vec<(String, Vec<PathBuf>)>,
+        optional: Vec<String>,
         run_dir: PathBuf,
         release: u32,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(alive(pid), "process {pid} is gone");
-        anyhow::ensure!(
-            sockets.iter().all(|socket| listening(socket)),
-            "the workers of process {pid} are not listening"
-        );
-
-        Ok(Self {
+        let host = Self {
             process: Process::Adopted(pid),
             stdin: None,
             sockets,
             group_sockets,
+            optional,
             run_dir,
             release,
-        })
+        };
+        anyhow::ensure!(
+            host.required_sockets()
+                .iter()
+                .all(|socket| listening(socket)),
+            "the workers of process {pid} are not listening"
+        );
+
+        Ok(host)
+    }
+
+    /// The sockets the release is not ready without: every group's but
+    /// the optional groups' (ADR 0033).
+    fn required_sockets(&self) -> Vec<PathBuf> {
+        let optional: Vec<&PathBuf> = self
+            .group_sockets
+            .iter()
+            .filter(|(name, _)| self.optional.contains(name))
+            .flat_map(|(_, sockets)| sockets)
+            .collect();
+
+        self.sockets
+            .iter()
+            .filter(|socket| !optional.contains(socket))
+            .cloned()
+            .collect()
+    }
+
+    /// Keep of an optional group's planned sockets the ones a worker
+    /// listens on: the others join as the host announces them.
+    fn settle_optional(&mut self) {
+        // The default group's sockets are counted from the named groups'
+        // total, so they are taken before any group is pruned.
+
+        let default = self.default_sockets();
+
+        for (name, sockets) in &mut self.group_sockets {
+            if self.optional.contains(name) {
+                sockets.retain(|socket| listening(socket));
+            }
+        }
+
+        let named = self
+            .group_sockets
+            .iter()
+            .flat_map(|(_, sockets)| sockets.iter().cloned());
+        self.sockets = default.into_iter().chain(named).collect();
     }
 
     /// The default group's sockets: those of no named group.
@@ -879,12 +937,17 @@ impl HostProcess {
         self.run_dir.join("control.sock")
     }
 
-    /// Wait until every worker listens, or the host exits or the time is up.
+    /// Wait until every worker the release needs listens, or the host
+    /// exits or the time is up. An optional group's workers are not
+    /// waited for: the ones listening by then are kept, and the rest
+    /// join as the host announces them (ADR 0033).
     pub async fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let started = Instant::now();
+        let required = self.required_sockets();
 
         loop {
-            if self.sockets.iter().all(|socket| listening(socket)) {
+            if required.iter().all(|socket| listening(socket)) {
+                self.settle_optional();
                 return Ok(());
             }
 

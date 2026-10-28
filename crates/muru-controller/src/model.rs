@@ -159,6 +159,10 @@ pub struct GroupSpec {
     /// that name none; their requests for every path without `paths`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_class: Vec<String>,
+    /// Whether the release is ready without the group's workers (ADR
+    /// 0033).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
     /// Worker processes.
     pub processes: u32,
     /// Application threads per worker.

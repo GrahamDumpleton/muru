@@ -5,9 +5,9 @@
 
 Named groups with their own process and thread counts, selected by path
 prefix, in development mode and under the daemon, each with its own
-scaling policy (see [scaling](scaling.md)), timeouts and memory policy.
-Match lists with host and method conditions, optional groups and the
-`mounts` subset are still to come.
+scaling policy (see [scaling](scaling.md)), timeouts and memory policy,
+and optional groups the release is ready without. Match lists with host
+and method conditions and the `mounts` subset are still to come.
 ```
 
 A release can split its paths across named worker groups, all forked from
@@ -93,6 +93,36 @@ timeout by at least five seconds, as the release's must. `muructl config
 export` writes a group's memory policy with every key spelled out and
 its timeouts as it set them.
 
+## Optional groups
+
+A release is normally ready only when every worker of every group
+listens. A group marked `optional = true` is one the release is ready
+without:
+
+```toml
+[groups.batch]
+paths = ["/batch/*"]
+optional = true
+processes = 1
+```
+
+The release is ready once the default group and every required group
+listen, and the optional group's workers join as each one does. Until the
+group has a worker, a request for its paths waits at the edge, as it
+does for a group scaled to zero, and is answered 503 at the queue
+timeout; it is not sent to the default group, since the paths were given
+to the group for its own sizing or isolation, and serving them from
+elsewhere would hide that the group is down.
+
+A worker of a required group that fails three times at start stops the
+release. A worker of an optional group that does so is given up instead,
+with a `worker.exited` event that names the group, and the release keeps
+serving on the others; `muructl scale` with a count for the group forks
+it again. `muructl run` and `muructl release show` mark such a group
+`optional`, as does the dashboard's scaling table, and the `release.ready`
+event names an optional group whose workers were not all listening when
+the release became ready.
+
 ## In the workers
 
 Each worker knows its group: `muru.context().group` is the group's name,
@@ -106,8 +136,8 @@ before the fork; differences must be applied after it.
 
 `muructl deploy` takes the groups from the source's table; `muructl apply`
 takes them from the release's `groups` tables when present. A release is
-ready when every worker of every group listens, and `muructl events`
-counts them all. Groups are part of the release, so a declared release
+ready when every worker of every required group listens, and `muructl
+events` counts the workers listening. Groups are part of the release, so a declared release
 whose groups differ from what is recorded is refused like any other
 changed setting; `muructl config export` writes each group with every size
 spelled out, and a restarted daemon takes every group's workers back.

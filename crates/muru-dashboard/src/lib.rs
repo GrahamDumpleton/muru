@@ -278,6 +278,8 @@ pub struct ScalingRow {
     pub group: String,
     /// Whether an operator has pinned its count.
     pub pinned: bool,
+    /// Whether the release is ready without the group (ADR 0033).
+    pub optional: bool,
     /// Workers ready, and the count being reached while they differ.
     pub workers: String,
     /// The policy as one phrase.

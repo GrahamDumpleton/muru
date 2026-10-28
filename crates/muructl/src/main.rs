@@ -1855,6 +1855,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     concurrency: group.concurrency.unwrap_or(resolved.concurrency),
                     timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
                     memory: group_memory(name, group.memory.as_ref(), &memory)?,
+                    optional: group.optional.unwrap_or(false),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
@@ -2020,12 +2021,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     for (name, group) in &resolved.groups {
         println!(
-            "muru: group {name} serves {} with {}",
+            "muru: group {name} serves {} with {}{}",
             group_serves(group),
             workers(
                 group.processes.unwrap_or(resolved.processes),
                 &capacity_of(name, group.threads.unwrap_or(resolved.threads))
-            )
+            ),
+            if group.optional == Some(true) {
+                ", optional"
+            } else {
+                ""
+            }
         );
     }
 

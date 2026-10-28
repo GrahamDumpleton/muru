@@ -6,7 +6,8 @@ specific group path wins and everything else goes to the default group;
 each worker knows its group through the context and MURU_GROUP. Groups
 come from the project's table in development mode and from the applied
 file or the table under the daemon, and a restarted daemon takes every
-group's workers back.
+group's workers back. A release is ready without an optional group's
+workers, which join as each listens (ADR 0033).
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ def test_paths_reach_their_groups_in_development(development: support.Server) ->
     assert status["group"] == "status"
     assert served_by(development.get("/api/status/extra"))["group"] == "status"
     assert served_by(development.get("/api"))["group"] == "default"
+    assert served_by(development.get("/batch/nightly"))["group"] == "batch", "optional group"
 
     # The reports group has two workers of its own, numbered within it.
 
@@ -69,6 +71,7 @@ def test_the_start_up_output_names_each_group(development: support.Server) -> No
     assert "with 1 worker of 2 threads" in log
     assert "muru: group reports serves /reports/* with 2 workers of 1 thread" in log
     assert "muru: group status serves /api/status with 1 worker of 8 threads" in log
+    assert "muru: group batch serves /batch/* with 1 worker of 2 threads, optional" in log
 
 
 def test_print_config_writes_the_groups() -> None:
@@ -91,6 +94,7 @@ def test_print_config_writes_the_groups() -> None:
         "timeouts": {"soft_timeout": "1s"},
         "memory": {"check_interval": "1s"},
     }
+    assert release["groups"]["batch"] == {"paths": ["/batch/*"], "optional": True, "processes": 1}
 
 
 def test_a_group_has_timeouts_of_its_own(development: support.Server) -> None:
@@ -122,11 +126,14 @@ def test_groups_under_the_daemon_from_the_table_and_the_file(
     assert daemon.deploy("grouped", GROUPED) == "muru: release grouped@r1 is ready and serving"
     assert served_by(daemon.request("/reports/x"))["group"] == "reports"
     assert served_by(daemon.request("/"))["group"] == "default"
-    assert "5 workers ready" in daemon.muructl("events").stdout
+    assert served_by(daemon.request("/batch/nightly"))["group"] == "batch"
+    assert "6 workers ready" in daemon.muructl("events").stdout
     assert daemon.request("/slow/x?ms=1500").status == 504
     shown = daemon.muructl("release", "show", "grouped@r1").stdout
-    assert "workers 1 process of 2 threads group reports" in " ".join(shown.split())
-    assert "group reports /reports/*: 2 processes of 1 thread" in " ".join(shown.split())
+    assert (
+        "workers 1 process of 2 threads group batch /batch/*: 1 process of 2 threads, optional "
+        "group reports /reports/*: 2 processes of 1 thread"
+    ) in " ".join(shown.split())
 
     # A declared release's groups replace the table's, and resolve their
     # sizes from the release where silent; the export writes them whole.
@@ -184,6 +191,37 @@ memory = {{ hard_limit = "1GB" }}
         "groups hot 2x5 on /hot/* /also-hot timeouts hard_timeout 300s memory uss soft off "
         "for 120s (reclaim first true), hard 1GB, every 5s, recorded hot 1x5"
     ) in refused.stdout, refused.stdout
+
+
+def test_an_optional_group_that_cannot_start_leaves_the_release_ready(daemon: Daemon) -> None:
+    # ADR 0033: the batch group's worker fails in post_fork, three times,
+    # and is given up; the release is ready on the other groups' workers
+    # and the batch paths wait for a worker until the queue timeout.
+
+    deployed = daemon.deploy("grouped", GROUPED, "--env", "MURU_FAIL_GROUP=batch")
+    assert deployed == "muru: release grouped@r1 is ready and serving"
+    assert served_by(daemon.request("/reports/x"))["group"] == "reports"
+    assert served_by(daemon.request("/"))["group"] == "default"
+
+    held = daemon.request("/batch/nightly", headers={"Accept": "application/json"})
+    assert held.status == 503, held.body
+    assert json.loads(held.body)["reason"] == "queue_full"
+
+    events = daemon.muructl("events").stdout
+    assert "5 workers ready in" in events and "without the optional group batch" in events, events
+    assert "of the optional group batch failed 3 times at start" in events, events
+    assert "it is given up" in events, events
+
+    shown = " ".join(daemon.muructl("release", "show", "grouped@r1").stdout.split())
+    assert "group batch /batch/*: 1 process of 2 threads, optional" in shown
+
+    # The exported table carries the flag, and a declared release that
+    # drops it is a changed release.
+
+    import tomllib
+
+    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "grouped").stdout)
+    assert exported["app"]["grouped"]["release"]["r1"]["groups"]["batch"]["optional"] is True
 
 
 def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:

@@ -530,6 +530,10 @@ pub struct Group {
     /// groups that name no class.
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub matches: Option<ClientMatch>,
+    /// Whether the release is ready without the group's workers (ADR
+    /// 0033): its requests wait until one listens (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
     /// Worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processes: Option<usize>,
