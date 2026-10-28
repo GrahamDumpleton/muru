@@ -1443,87 +1443,57 @@ fn print_status(response: &pb::DebugResponse) {
 
 fn print_stacks(response: &pb::DebugResponse) {
     // Threads with the same frames across workers are shown once with
-    // the workers they came from.
-
-    let mut merged: Vec<(String, Vec<String>, Vec<u32>, serde_json::Value)> = Vec::new();
+    // the workers they came from, merged as the dashboard merges them.
 
     for answer in &response.workers {
-        let Some(result) = parse_result(answer) else {
+        if !answer.ok {
             println!(
                 "worker {} (pid {}): {}\n",
                 answer.index, answer.pid, answer.error
             );
-            continue;
-        };
-
-        for thread in result["threads"].as_array().into_iter().flatten() {
-            let name = thread["name"].as_str().unwrap_or("?").to_owned();
-            let frames: Vec<String> = thread["frames"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|frame| {
-                    format!(
-                        "  File \"{}\", line {}, in {}\n    {}",
-                        frame["file"].as_str().unwrap_or("?"),
-                        frame["line"].as_u64().unwrap_or(0),
-                        frame["function"].as_str().unwrap_or("?"),
-                        frame["text"].as_str().unwrap_or("").trim()
-                    )
-                })
-                .collect();
-            let request = thread["request"].clone();
-            let same = merged
-                .iter_mut()
-                .find(|(other, other_frames, _, other_request)| {
-                    *other == name
-                        && *other_frames == frames
-                        && other_request.is_null()
-                        && request.is_null()
-                });
-
-            match same {
-                Some(entry) => entry.2.push(answer.index),
-                None => merged.push((name, frames, vec![answer.index], request)),
-            }
         }
     }
 
-    for (name, frames, workers, request) in merged {
-        let where_ = if workers.len() == 1 {
-            format!("worker {}", workers[0])
-        } else {
-            format!(
-                "{} workers ({})",
-                workers.len(),
-                workers
-                    .iter()
-                    .map(|index| index.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        println!("{name} in {where_}:");
+    for stack in muru_dashboard::inspect::merge_stacks(&debug_answer(response)) {
+        println!("{} in {}:", stack.name, stack.where_);
 
-        if !request.is_null() {
+        if let Some(serving) = &stack.request {
             println!(
-                "  serving {} {} for {:.1} s (request {})",
-                request["method"].as_str().unwrap_or("?"),
-                request["path"].as_str().unwrap_or("?"),
-                request["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0,
-                request["request_id"].as_str().unwrap_or("?")
+                "  serving {} {} for {} (request {})",
+                serving.method, serving.path, serving.elapsed, serving.request_id
             );
         }
 
-        if frames.is_empty() {
+        if stack.frames.is_empty() {
             println!("  (no Python frames)");
         }
 
-        for frame in frames {
-            println!("{frame}");
+        for frame in &stack.frames {
+            println!(
+                "  File \"{}\", line {}, in {}\n    {}",
+                frame.file, frame.line, frame.function, frame.text
+            );
         }
 
         println!();
+    }
+}
+
+/// The workers' answers as the dashboard's views read them.
+fn debug_answer(response: &pb::DebugResponse) -> muru_dashboard::DebugAnswer {
+    muru_dashboard::DebugAnswer {
+        release: response.release.clone(),
+        workers: response
+            .workers
+            .iter()
+            .map(|answer| muru_dashboard::WorkerAnswer {
+                index: answer.index,
+                pid: answer.pid,
+                ok: answer.ok,
+                error: (!answer.error.is_empty()).then(|| answer.error.clone()),
+                result: parse_result(answer),
+            })
+            .collect(),
     }
 }
 

@@ -13,9 +13,11 @@
 
 pub mod actions;
 pub mod history;
+pub mod inspect;
 
 pub use actions::{Action, ActionSink, Sessions};
 pub use history::{History, Point, Reading, Sampler};
+pub use inspect::{DebugAnswer, DebugAsk, DebugSource, WorkerAnswer};
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -505,6 +507,55 @@ struct NodeEventRow<'a> {
     event: &'a EventRow,
 }
 
+#[derive(Template)]
+#[template(path = "workers.html")]
+struct WorkersPage<'a> {
+    /// app@release.
+    release: &'a str,
+    status: &'a [inspect::StatusRow],
+    /// Why the workers could not be asked, or empty.
+    error: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "worker.html")]
+struct WorkerPage<'a> {
+    release: &'a str,
+    worker: u32,
+    status: &'a [inspect::StatusRow],
+    error: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "workers_status.html")]
+struct WorkersStatusFragment<'a> {
+    release: &'a str,
+    status: &'a [inspect::StatusRow],
+    error: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "workers_stacks.html")]
+struct WorkersStacksFragment<'a> {
+    stacks: &'a [inspect::StackView],
+    failures: &'a [inspect::WorkerFailure],
+    error: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "workers_tasks.html")]
+struct WorkersTasksFragment<'a> {
+    tasks: &'a [inspect::TasksView],
+    error: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "workers_memory.html")]
+struct WorkersMemoryFragment<'a> {
+    memory: &'a [inspect::MemoryView],
+    error: &'a str,
+}
+
 /// Serve the dashboard on a bound listener until the task is dropped.
 /// `history` holds the points the charts draw.
 pub async fn serve(
@@ -677,8 +728,9 @@ fn plain_text(status: StatusCode, text: String) -> Response<Body> {
 }
 
 /// Serve the daemon's dashboard and gateway on a bound listener until
-/// the task is dropped. `history` holds the points the charts draw and
-/// `events` gives the events as they happen, for the events stream.
+/// the task is dropped. `history` holds the points the charts draw,
+/// `events` gives the events as they happen, for the events stream, and
+/// `debug` asks a release's workers what the inspection pages show.
 pub async fn serve_node(
     listener: TcpListener,
     source: NodeSource,
@@ -686,6 +738,7 @@ pub async fn serve_node(
     history: Arc<History>,
     events: EventsSource,
     actions: Actions,
+    debug: DebugSource,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -694,6 +747,7 @@ pub async fn serve_node(
         let history = Arc::clone(&history);
         let events = Arc::clone(&events);
         let actions = actions.clone();
+        let debug = Arc::clone(&debug);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
@@ -701,9 +755,13 @@ pub async fn serve_node(
                 let history = Arc::clone(&history);
                 let events = Arc::clone(&events);
                 let actions = actions.clone();
+                let debug = Arc::clone(&debug);
                 async move {
                     Ok::<_, Infallible>(
-                        respond_node(request, &source, &metrics, &history, &events, actions).await,
+                        respond_node(
+                            request, &source, &metrics, &history, &events, actions, &debug,
+                        )
+                        .await,
                     )
                 }
             });
@@ -725,6 +783,7 @@ async fn respond_node(
     history: &Arc<History>,
     events: &EventsSource,
     actions: Actions,
+    debug: &DebugSource,
 ) -> Response<Body> {
     // Section 10.7: signing in, and the actions for a session that may
     // act.
@@ -794,6 +853,10 @@ async fn respond_node(
         }));
     }
 
+    if let Some(response) = inspect_paths(request, debug).await {
+        return response;
+    }
+
     let Some(data) = source().await else {
         return plain(StatusCode::SERVICE_UNAVAILABLE, "the daemon is stopping\n");
     };
@@ -845,6 +908,133 @@ async fn respond_node(
             None => plain(StatusCode::NOT_FOUND, "not found\n"),
         },
     }
+}
+
+/// Sections 10.7 and 11.7: the worker inspection pages, their fragments
+/// and the same answers as JSON, each asking a release's workers the
+/// operation it shows, as `muructl debug` does. A page or fragment
+/// renders a refusal in its place; the JSON answers 409 with it.
+async fn inspect_paths(request: &Request<Incoming>, debug: &DebugSource) -> Option<Response<Body>> {
+    use inspect::{failures, memory_views, merge_stacks, status_rows, tasks_views};
+
+    let path = request.uri().path();
+
+    let (kind, op) = if path == "/workers" || path == "/worker" {
+        (path, "status")
+    } else if let Some(op) = path.strip_prefix("/fragment/workers/") {
+        ("fragment", op)
+    } else {
+        ("json", path.strip_prefix("/v1/debug/")?)
+    };
+
+    if !matches!(op, "status" | "stacks" | "tasks" | "memory") {
+        return Some(plain(StatusCode::NOT_FOUND, "not found\n"));
+    }
+
+    // The release as app@release, and one worker for the worker page,
+    // or when asked for.
+
+    let query = actions::form_fields(request.uri().query().unwrap_or_default().as_bytes());
+    let release = query.get("release").cloned().unwrap_or_default();
+
+    let Some((app, id)) = release
+        .split_once('@')
+        .filter(|(app, id)| !app.is_empty() && !id.is_empty())
+    else {
+        return Some(plain(
+            StatusCode::BAD_REQUEST,
+            "release=APP@RELEASE names the release\n",
+        ));
+    };
+
+    let worker = match query.get("worker") {
+        Some(text) => match text.parse::<u32>() {
+            Ok(index) => Some(index),
+            Err(_) => {
+                return Some(plain(
+                    StatusCode::BAD_REQUEST,
+                    "worker=N names a worker by its index\n",
+                ));
+            }
+        },
+        None if kind == "/worker" => {
+            return Some(plain(
+                StatusCode::BAD_REQUEST,
+                "worker=N names a worker by its index\n",
+            ));
+        }
+        None => None,
+    };
+
+    let asked = debug(DebugAsk {
+        app: app.to_owned(),
+        release: id.to_owned(),
+        op: op.to_owned(),
+        worker,
+    })
+    .await;
+
+    if kind == "json" {
+        return Some(match asked {
+            Ok(answer) => json(&answer),
+            Err(error) => plain_text(StatusCode::CONFLICT, format!("{error}\n")),
+        });
+    }
+
+    let (answer, error) = match asked {
+        Ok(answer) => (answer, String::new()),
+        Err(error) => (DebugAnswer::default(), error),
+    };
+
+    Some(match (kind, op) {
+        ("/workers", _) => page(
+            WorkersPage {
+                release: &release,
+                status: &status_rows(&answer),
+                error: &error,
+            }
+            .render(),
+        ),
+        ("/worker", _) => page(
+            WorkerPage {
+                release: &release,
+                worker: worker.unwrap_or_default(),
+                status: &status_rows(&answer),
+                error: &error,
+            }
+            .render(),
+        ),
+        (_, "status") => page(
+            WorkersStatusFragment {
+                release: &release,
+                status: &status_rows(&answer),
+                error: &error,
+            }
+            .render(),
+        ),
+        (_, "stacks") => page(
+            WorkersStacksFragment {
+                stacks: &merge_stacks(&answer),
+                failures: &failures(&answer),
+                error: &error,
+            }
+            .render(),
+        ),
+        (_, "tasks") => page(
+            WorkersTasksFragment {
+                tasks: &tasks_views(&answer),
+                error: &error,
+            }
+            .render(),
+        ),
+        _ => page(
+            WorkersMemoryFragment {
+                memory: &memory_views(&answer),
+                error: &error,
+            }
+            .render(),
+        ),
+    })
 }
 
 /// The live session a request names, by a bearer token or its cookie,

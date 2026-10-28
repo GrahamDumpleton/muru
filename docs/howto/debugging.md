@@ -24,6 +24,9 @@ muructl debug tasks api
 muructl debug inspect shop --json
 ```
 
+The daemon's [dashboard](dashboard.md#looking-into-the-workers) shows
+the status, stacks, tasks and memory of a release's workers too.
+
 ## Status
 
 What the host knows about each worker from its reports: pid, group,

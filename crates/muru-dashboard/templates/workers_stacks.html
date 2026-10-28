@@ -1,0 +1,9 @@
+{% if !error.is_empty() %}<p class="level-error">{{ error }}</p>{% endif %}
+{% for failure in failures %}<p class="level-error">worker {{ failure.index }} (pid {{ failure.pid }}): {{ failure.error }}</p>{% endfor %}
+{% for stack in stacks %}
+<h3>{{ stack.name }} in {{ stack.where_ }}</h3>
+{% if let Some(serving) = stack.request %}<p class="note">serving {{ serving.method }} {{ serving.path }} for {{ serving.elapsed }} (request {{ serving.request_id }})</p>{% endif %}
+<pre class="stack">{% if stack.frames.is_empty() %}(no Python frames){% endif %}{% for frame in stack.frames %}File "{{ frame.file }}", line {{ frame.line }}, in {{ frame.function }}
+    {{ frame.text }}
+{% endfor %}</pre>
+{% endfor %}
