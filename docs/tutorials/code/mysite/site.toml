@@ -1,0 +1,13 @@
+[host.site]
+names = ["127.0.0.1", "localhost"]
+default = true
+
+[[route]]
+host = "site"
+app = "mysite"
+
+[[route]]
+host = "site"
+path = "/static/"
+static = "/home/you/mysite/static"
+cache = { max_age = "1h" }

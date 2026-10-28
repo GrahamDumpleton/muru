@@ -180,5 +180,7 @@ on loopback only and is read-only.
   check that runs before workers are forked, and the message you will see
   when an import opens a connection too early.
 - Development mode serves loopback only and is not for production, which
-  is the daemon's job: the [daemon](../howto/daemon.md) guide starts one
-  and deploys an application to it.
+  is the daemon's job: [deploy with the daemon and roll
+  back](deploy-and-roll-back.md) starts one and deploys an application to
+  it, and [run an ASGI app with WebSockets](asgi-websockets.md) does for
+  ASGI what this tutorial did for WSGI.

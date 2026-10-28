@@ -1,0 +1,1 @@
+Added eight tutorials: an ASGI application with WebSockets, deploying with the daemon and rolling back, a first canary, moving from gunicorn to Muru, a first Django site, scaling under load, finding a slow request, and two sites on one node. The Flask and Django guide now says how to serve Django's static files under `muructl run`, which `DEBUG` alone does not do.

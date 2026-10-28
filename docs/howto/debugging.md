@@ -91,7 +91,9 @@ flamegraph.pl shop.folded > shop.svg
 ```
 
 Each line is a stack, root first and under the thread's name, then how
-many samples found it. The functions that took most samples are printed
+many samples found it. A function is named with the file and the line it
+starts on, so its samples are counted together whichever of its lines
+was running. The functions that took most samples are printed
 on standard error with their share. Threads waiting outside Python, such
 as idle threads of the pool, are not sampled, so the profile is of the
 work being done. Sampling costs the worker little, so it is safe on a

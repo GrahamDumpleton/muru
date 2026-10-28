@@ -1,0 +1,27 @@
+[host.shop]
+names = ["shop.localhost"]
+tls = { certificate = "certs/sites.pem", key = "certs/sites-key.pem" }
+https_redirect = true
+
+[host.blog]
+names = ["blog.localhost"]
+tls = { certificate = "certs/sites.pem", key = "certs/sites-key.pem" }
+
+[host.notes]
+names = ["notes.localhost"]
+tls = { certificate = "certs/sites.pem", key = "certs/sites-key.pem" }
+
+[upstream.notes]
+addresses = ["127.0.0.1:9001"]
+
+[[route]]
+host = "shop"
+app = "shop"
+
+[[route]]
+host = "blog"
+static = "/home/you/node/blog"
+
+[[route]]
+host = "notes"
+upstream = "notes"

@@ -1,0 +1,21 @@
+[project]
+name = "busy"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.muru]
+entrypoint = "app:application"
+processes = 1
+threads = 2
+
+[tool.muru.scaling]
+mode = "spare"
+min_workers = 1
+max_workers = 8
+min_spare = 1
+max_spare = 3
+scale_in_window = "20s"
+hold_after_growth = "20s"
+reap_interval = "5s"
+min_lifetime = "10s"
+idle_reap_after = "30s"
