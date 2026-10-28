@@ -344,7 +344,12 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
 
         for (id, release) in &app.release {
             for (group, table) in &release.groups {
-                for class in unknown_classes(table.matches.as_ref(), defined) {
+                let classes = table
+                    .matches
+                    .as_ref()
+                    .map_or(&[][..], |matches| &matches.client_class[..]);
+
+                for class in unknown_among(classes, defined) {
                     plan.errors.push(format!(
                         "{name}@{id}: worker group {group}: no client class named {class}"
                     ));
@@ -705,9 +710,16 @@ fn describe_class(class: &ClientClass) -> String {
 /// Section 4.14: the classes a `match` names that neither the daemon's
 /// file nor an applied file defines; `default` is always defined.
 fn unknown_classes(matches: Option<&muru_config::ClientMatch>, defined: &Defined) -> Vec<String> {
-    matches
+    unknown_among(
+        matches.map_or(&[][..], |matches| &matches.client_class[..]),
+        defined,
+    )
+}
+
+/// The classes among `classes` that nothing defines.
+fn unknown_among(classes: &[String], defined: &Defined) -> Vec<String> {
+    classes
         .iter()
-        .flat_map(|matches| matches.client_class.iter())
         .filter(|class| class.as_str() != "default" && !defined.client_classes.contains(class))
         .cloned()
         .collect()
@@ -2201,6 +2213,19 @@ pub struct Tables<'a> {
     pub declared: bool,
 }
 
+/// A group's paths as the edge matches them: prefixes without their
+/// `*`, and `/` alone for a group that claims every path.
+fn group_prefixes(paths: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return vec!["/".to_owned()];
+    }
+
+    paths
+        .iter()
+        .map(|path| muru_edge::routing::group_prefix(path))
+        .collect()
+}
+
 /// Section 3.3: the layer a release setting came from, the first of
 /// the request, the source's [tool.muru] table and the previous release
 /// that gives it, else the default.
@@ -2336,18 +2361,44 @@ pub fn resolve_spec(
             return Err(format!("{name:?} is not a valid worker group name"));
         }
 
-        muru_config::check_client_match(group.matches.as_ref())
+        muru_config::check_group_match(group.matches.as_ref())
             .map_err(|error| format!("worker group {name}: {error}"))?;
-        let client_class = group
-            .matches
-            .as_ref()
-            .map(|matches| matches.client_class.clone())
-            .unwrap_or_default();
+        let matches = group.matches.clone().unwrap_or_default();
+        let client_class = matches.client_class;
 
-        if group.paths.is_empty() && client_class.is_empty() {
-            return Err(format!(
-                "worker group {name} has no paths and no match.client_class"
-            ));
+        // ADR 0033: hosts are compared as the host tables hold them, with
+        // no wildcard, and methods in upper case.
+
+        let mut host = Vec::new();
+
+        for given in &matches.host {
+            let normalised = muru_edge::routing::normalise(given);
+
+            if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
+                return Err(format!(
+                    "worker group {name}: match.host {given:?} is not a host name"
+                ));
+            }
+
+            host.push(normalised);
+        }
+
+        let mut method = Vec::new();
+
+        for given in &matches.method {
+            let token = given.trim().to_ascii_uppercase();
+
+            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return Err(format!(
+                    "worker group {name}: match.method {given:?} is not a method"
+                ));
+            }
+
+            method.push(token);
+        }
+
+        if group.paths.is_empty() && group.matches.is_none() {
+            return Err(format!("worker group {name} has no paths and no match"));
         }
 
         if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
@@ -2394,6 +2445,8 @@ pub fn resolve_spec(
             name: name.clone(),
             paths: group.paths.clone(),
             client_class,
+            host,
+            method,
             optional: group.optional.unwrap_or(false),
             processes: group_processes,
             threads: group.threads.map_or(threads, |value| value as u32),
@@ -2405,6 +2458,33 @@ pub fn resolve_spec(
             timeouts: group_timeouts,
             memory: None,
         });
+    }
+
+    // ADR 0033: two groups asking the same of the same path cannot be
+    // ordered, so they are refused; groups asking different things of a
+    // path are ranked by how much they ask.
+
+    for (index, group) in resolved_groups.iter().enumerate() {
+        for other in &resolved_groups[index + 1..] {
+            let overlap = |mine: &[String], theirs: &[String]| {
+                (mine.is_empty() && theirs.is_empty())
+                    || mine.iter().any(|value| theirs.contains(value))
+            };
+            let shared = group_prefixes(&group.paths)
+                .into_iter()
+                .find(|prefix| group_prefixes(&other.paths).contains(prefix));
+
+            if let Some(path) = shared
+                && overlap(&group.client_class, &other.client_class)
+                && overlap(&group.host, &other.host)
+                && overlap(&group.method, &other.method)
+            {
+                return Err(format!(
+                    "worker groups {} and {} ask the same of {path}",
+                    group.name, other.name
+                ));
+            }
+        }
     }
 
     // Section 6.7: mounts from the declaration, else the source's own
@@ -3838,10 +3918,13 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                     group.name.clone(),
                     GroupTable {
                         paths: group.paths.clone(),
-                        matches: (!group.client_class.is_empty()).then(|| {
-                            muru_config::ClientMatch {
-                                client_class: group.client_class.clone(),
-                            }
+                        matches: (!group.client_class.is_empty()
+                            || !group.host.is_empty()
+                            || !group.method.is_empty())
+                        .then(|| muru_config::GroupMatch {
+                            client_class: group.client_class.clone(),
+                            host: group.host.clone(),
+                            method: group.method.clone(),
                         }),
                         optional: group.optional.then_some(true),
                         processes: Some(group.processes as usize),
@@ -4360,7 +4443,8 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
     groups
         .iter()
         .map(|group| {
-            let on = match (group.paths.is_empty(), group.client_class.is_empty()) {
+            let mut on = match (group.paths.is_empty(), group.client_class.is_empty()) {
+                (true, true) => "every path".to_owned(),
                 (_, true) => group.paths.join(" "),
                 (true, false) => format!("every path for {}", group.client_class.join(" ")),
                 (false, false) => {
@@ -4371,6 +4455,14 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
                     )
                 }
             };
+
+            if !group.host.is_empty() {
+                on.push_str(&format!(" host {}", group.host.join(" ")));
+            }
+
+            if !group.method.is_empty() {
+                on.push_str(&format!(" method {}", group.method.join(" ")));
+            }
 
             let own = [
                 ("soft_timeout", group.timeouts.soft_timeout_ms),

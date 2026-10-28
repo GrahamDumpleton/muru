@@ -221,6 +221,11 @@ pub struct GroupSockets {
     /// The client classes it takes (section 4.14), ahead of the groups
     /// that name none; every path of theirs without `paths`.
     pub client_classes: Vec<String>,
+    /// The hosts it takes, lower case; every host when empty (ADR 0033).
+    pub hosts: Vec<String>,
+    /// The methods it takes, upper case; every method when empty (ADR
+    /// 0033).
+    pub methods: Vec<String>,
     /// Its workers.
     pub sockets: Vec<std::path::PathBuf>,
 }
@@ -278,6 +283,7 @@ pub struct Selection {
 /// What a request brings to the release choice (section 9.4): its
 /// headers, for the preview, sticky and id cookies and a header key, and
 /// the client's address.
+#[derive(Clone, Copy)]
 pub struct Client<'a> {
     /// The request headers.
     pub headers: &'a HeaderMap,
@@ -291,6 +297,14 @@ pub struct Client<'a> {
     /// The client's class (section 4.14), which routes, policies and
     /// worker groups may be for.
     pub client_class: &'a str,
+    /// The host name the request carries, which a worker group may be
+    /// for (ADR 0033).
+    pub host: Option<&'a str>,
+    /// The configured name of the virtual host the request reached,
+    /// which the routing fills in once it has chosen one; none before.
+    pub virtual_host: Option<&'a str>,
+    /// The request's method, which a worker group may be for.
+    pub method: &'a str,
 }
 
 /// An application's releases that may take requests: the serving one,
@@ -482,9 +496,9 @@ impl Chosen<'_> {
         }
     }
 
-    fn select(self, path: &str, class: &str, origin: Option<&Origin>) -> Option<Selection> {
+    fn select(self, path: &str, client: &Client<'_>, origin: Option<&Origin>) -> Option<Selection> {
         match self {
-            Self::Pools(pools) => pools.select(path, class, origin),
+            Self::Pools(pools) => pools.select(path, client, origin),
             Self::Upstream(upstream) => Some(upstream_selection(&upstream)),
         }
     }
@@ -639,10 +653,44 @@ struct GroupPath {
     prefix: String,
     /// The client classes the group is for; every class when empty.
     classes: Vec<String>,
+    /// The hosts the group is for; every host when empty.
+    hosts: Vec<String>,
+    /// The methods the group is for; every method when empty.
+    methods: Vec<String>,
     /// The group's name.
     name: String,
     /// Its workers.
     pool: Arc<LinkPool>,
+}
+
+impl GroupPath {
+    /// How many lists the group asks with, for its rank (ADR 0033).
+    fn lists(&self) -> usize {
+        [
+            !self.classes.is_empty(),
+            !self.hosts.is_empty(),
+            !self.methods.is_empty(),
+        ]
+        .into_iter()
+        .filter(|given| *given)
+        .count()
+    }
+
+    /// Whether a request of the client's class, carrying `carried` as
+    /// its host to the client's virtual host, with its method, satisfies
+    /// every list the group gives.
+    fn takes(&self, client: &Client<'_>, carried: Option<&str>) -> bool {
+        (self.classes.is_empty() || self.classes.iter().any(|name| name == client.client_class))
+            && (self.hosts.is_empty()
+                || self.hosts.iter().any(|host| {
+                    Some(host.as_str()) == carried || Some(host.as_str()) == client.virtual_host
+                }))
+            && (self.methods.is_empty()
+                || self
+                    .methods
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(client.method)))
+    }
 }
 
 /// The group name a managed HTTP release's requests are logged under
@@ -668,12 +716,15 @@ impl AppPools {
         for group in groups {
             let pool = Arc::new(LinkPool::connect(&group.sockets).await?);
 
-            // Section 4.14: a group for client classes with no paths of
-            // its own takes those classes' requests for every path.
+            // Section 4.14 and ADR 0033: a group with match lists and no
+            // paths of its own takes the requests they name for every path.
 
             let root = ["/".to_owned()];
+            let asks = !group.client_classes.is_empty()
+                || !group.hosts.is_empty()
+                || !group.methods.is_empty();
 
-            let paths = if group.paths.is_empty() && !group.client_classes.is_empty() {
+            let paths = if group.paths.is_empty() && asks {
                 &root[..]
             } else {
                 &group.paths[..]
@@ -683,15 +734,21 @@ impl AppPools {
                 connected.push(GroupPath {
                     prefix: group_prefix(path),
                     classes: group.client_classes.clone(),
+                    hosts: group.hosts.clone(),
+                    methods: group.methods.clone(),
                     name: group.name.clone(),
                     pool: Arc::clone(&pool),
                 });
             }
         }
 
+        // ADR 0033: a group asking more of a request comes before one
+        // asking less, and among groups asking as much the longer prefix
+        // wins.
+
         connected.sort_by_key(|group| {
             (
-                group.classes.is_empty(),
+                std::cmp::Reverse(group.lists()),
                 std::cmp::Reverse(group.prefix.len()),
             )
         });
@@ -785,14 +842,20 @@ impl AppPools {
         self
     }
 
-    /// Where a path goes: the most specific path of a group for the
-    /// client's class (section 4.14), else of a group for every class,
-    /// else the default group, and the longest mount prefix, else the
-    /// default mount (section 6.7). An internal mount (section 4.10) is reached
-    /// only by a redirect from the release's own application, or from
-    /// one it accepts: a client's request for it, or an unaccepted
-    /// redirect, gets nothing.
-    pub fn select(&self, path: &str, class: &str, origin: Option<&Origin>) -> Option<Selection> {
+    /// Where a path goes: the group asking the most of the request that
+    /// it satisfies, by class, host and method (section 4.14 and ADR
+    /// 0033), with the most specific path among those, else the default
+    /// group, and the longest mount prefix, else the default mount
+    /// (section 6.7). An internal mount (section 4.10) is reached only
+    /// by a redirect from the release's own application, or from one it
+    /// accepts: a client's request for it, or an unaccepted redirect,
+    /// gets nothing.
+    pub fn select(
+        &self,
+        path: &str,
+        client: &Client<'_>,
+        origin: Option<&Origin>,
+    ) -> Option<Selection> {
         if let Some(server) = &self.server {
             return Some(Selection {
                 pool: Arc::new(LinkPool::empty()),
@@ -809,12 +872,12 @@ impl AppPools {
             });
         }
 
+        let carried = client.host.map(normalise);
         let (group, pool) = self
             .groups
             .iter()
             .find(|group| {
-                prefix_matches(&group.prefix, path)
-                    && (group.classes.is_empty() || group.classes.iter().any(|name| name == class))
+                prefix_matches(&group.prefix, path) && group.takes(client, carried.as_deref())
             })
             .map(|group| (group.name.clone(), Arc::clone(&group.pool)))
             .unwrap_or_else(|| (DEFAULT_GROUP.to_owned(), Arc::clone(&self.default)));
@@ -921,7 +984,7 @@ pub const DEFAULT_GROUP: &str = "default";
 
 /// A group path as a route-style prefix: a trailing `*` means anything
 /// below, which is what a prefix already means.
-fn group_prefix(path: &str) -> String {
+pub fn group_prefix(path: &str) -> String {
     let trimmed = path.trim_end_matches('*');
 
     let trimmed = if trimmed.len() > 1 {
@@ -1551,7 +1614,7 @@ impl Routing {
                 Some((app, policy)) => {
                     self.selection_for(app, Some(policy), path, client, &mut cookies, origin)
                 }
-                None => self.default.select(path, client.client_class, origin),
+                None => self.default.select(path, client, origin),
             };
 
             return match selection {
@@ -1581,6 +1644,14 @@ impl Routing {
             return Decision::Misdirected;
         };
         let host = &self.hosts[index];
+
+        // ADR 0033: a worker group may be for the host by its configured
+        // name as well as by the name the request carries.
+
+        let client = &Client {
+            virtual_host: Some(&host.name),
+            ..*client
+        };
 
         if host.https_redirect && !tls && origin.is_none() {
             return Decision::Redirect;
@@ -1697,9 +1768,7 @@ impl Routing {
         };
 
         if self.hosts.is_empty() {
-            return self
-                .default
-                .select(path, client.client_class, Some(&origin));
+            return self.default.select(path, client, Some(&origin));
         }
 
         let mut cookies = Vec::new();
@@ -1735,12 +1804,9 @@ impl Routing {
                     .and_then(|origin| releases.releases.get(&origin.release));
 
                 match pinned {
-                    Some(pools) => pools.select(path, client.client_class, origin),
-                    None => choose(releases, policy, client, cookies, &self.upstreams).select(
-                        path,
-                        client.client_class,
-                        origin,
-                    ),
+                    Some(pools) => pools.select(path, client, origin),
+                    None => choose(releases, policy, client, cookies, &self.upstreams)
+                        .select(path, client, origin),
                 }
             }
             None => Some(Selection {
@@ -1809,6 +1875,8 @@ fn groups_of(app: &pb::AppWorkers) -> Vec<GroupSockets> {
             name: group.name.clone(),
             paths: group.paths.clone(),
             client_classes: group.client_classes.clone(),
+            hosts: group.hosts.clone(),
+            methods: group.methods.clone(),
             sockets: paths(&group.sockets),
         })
         .collect()
@@ -1960,6 +2028,9 @@ mod tests {
             secure: false,
             ids,
             client_class: "default",
+            host: None,
+            virtual_host: None,
+            method: "GET",
         }
     }
 
@@ -2352,6 +2423,86 @@ mod tests {
             }
             _ => panic!("{path} as {class} is not served"),
         }
+    }
+
+    /// The group a request of the method, carrying the host, lands in.
+    fn grouped(routing: &Routing, path: &str, host: &str, method: &str) -> String {
+        let headers = HeaderMap::new();
+        let ids = crate::errors::RequestIds::new();
+        let client = Client {
+            host: Some(host),
+            method,
+            ..client(&headers, &ids)
+        };
+
+        match routing.select(Some(host), path, "127.0.0.1:1", true, &client, None) {
+            Decision::Serve { selection, .. } => selection.group,
+            _ => panic!("{method} {path} on {host} is not served"),
+        }
+    }
+
+    #[test]
+    fn hosts_and_methods_pick_groups() {
+        // ADR 0033: a group asking more of a request comes first, a host
+        // is matched by the virtual host's name or the name carried, and
+        // a method in upper case.
+
+        let mut snapshot = split_snapshot(true, "");
+        let groups = vec![
+            pb::Group {
+                name: "files".to_owned(),
+                paths: vec!["/files".to_owned()],
+                ..Default::default()
+            },
+            pb::Group {
+                name: "uploads".to_owned(),
+                paths: vec!["/files".to_owned()],
+                methods: vec!["POST".to_owned(), "PUT".to_owned()],
+                ..Default::default()
+            },
+            pb::Group {
+                name: "both".to_owned(),
+                paths: vec!["/files/big".to_owned()],
+                hosts: vec!["shop".to_owned()],
+                methods: vec!["POST".to_owned()],
+                ..Default::default()
+            },
+            pb::Group {
+                name: "byname".to_owned(),
+                paths: vec!["/reports".to_owned()],
+                hosts: vec!["shop".to_owned()],
+                ..Default::default()
+            },
+            pb::Group {
+                name: "carried".to_owned(),
+                paths: vec!["/carried".to_owned()],
+                hosts: vec!["shop.example.com".to_owned()],
+                ..Default::default()
+            },
+        ];
+
+        // The split sends a request to either release, so both carry
+        // the groups.
+
+        for app in &mut snapshot.apps {
+            app.groups = groups.clone();
+        }
+
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot))
+            .unwrap();
+        let at = |path: &str, host: &str, method: &str| grouped(&routing, path, host, method);
+
+        assert_eq!(at("/files/x", "shop.example.com", "GET"), "files");
+        assert_eq!(at("/files/x", "shop.example.com", "POST"), "uploads");
+        assert_eq!(at("/files/x", "shop.example.com", "put"), "uploads");
+        assert_eq!(at("/files/big/x", "shop.example.com", "POST"), "both");
+        assert_eq!(at("/files/big/x", "shop.example.com", "GET"), "files");
+        assert_eq!(at("/reports/x", "shop.example.com", "GET"), "byname");
+        assert_eq!(at("/carried/x", "shop.example.com", "GET"), "carried");
+        assert_eq!(at("/carried/x", "Shop.Example.com:443", "GET"), "carried");
+        assert_eq!(at("/", "shop.example.com", "GET"), "default");
     }
 
     #[test]

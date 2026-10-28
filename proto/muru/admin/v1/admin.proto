@@ -485,6 +485,8 @@ message ReleaseGroup {
   uint32 sync_threads = 6;
   uint32 concurrency = 7;
   bool optional = 8;
+  repeated string hosts = 9;            // ADR 0033: the hosts the group takes, every host when empty
+  repeated string methods = 10;         // ADR 0033: the methods, upper case, every method when empty
 }
 
 message Worker {

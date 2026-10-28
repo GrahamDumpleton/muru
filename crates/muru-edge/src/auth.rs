@@ -279,10 +279,21 @@ pub async fn check(auth: &Auth, check: Check<'_>) -> Outcome {
         };
     }
 
+    // ADR 0033: the sub-request's own method, HEAD or GET, is what a
+    // worker group of the authentication application may be for.
+
+    let method = if check.parts.method == Method::HEAD {
+        "HEAD"
+    } else {
+        "GET"
+    };
+    let client = crate::routing::Client {
+        method,
+        ..*check.client
+    };
+
     let selection = if auth.upstream.is_empty() {
-        check
-            .routing
-            .select_app(&auth.app, &auth.path, check.client)
+        check.routing.select_app(&auth.app, &auth.path, &client)
     } else {
         check.routing.select_upstream(&auth.upstream)
     };
