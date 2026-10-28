@@ -75,7 +75,7 @@
       <input type="hidden" name="app" value="{{ row.app }}">
       <input type="hidden" name="release" value="{{ row.id }}">
       <input type="hidden" name="group" value="{{ row.group }}">
-      <input type="number" name="processes" min="1" size="3" aria-label="workers to pin"> <button>Pin</button>
+      <input type="number" name="processes" min="1" size="3" aria-label="workers to pin" id="pin-{{ row.app }}-{{ row.id }}-{{ row.group }}" hx-preserve="true"> <button>Pin</button>
     </form>{% if row.pinned %}<form method="post" action="actions/scale">
       <input type="hidden" name="csrf" value="{{ token }}">
       <input type="hidden" name="app" value="{{ row.app }}">

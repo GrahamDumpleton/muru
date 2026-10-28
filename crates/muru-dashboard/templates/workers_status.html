@@ -25,7 +25,7 @@
       <input type="hidden" name="release" value="{{ release.split('@').nth(1).unwrap_or_default() }}">
       <input type="hidden" name="worker" value="{{ row.index }}">
       <input type="hidden" name="back" value="{{ back }}">
-      <label><input type="checkbox" name="force" value="on"> force</label> <button>Restart</button>
+      <label><input type="checkbox" name="force" value="on" id="force-{{ row.index }}" hx-preserve="true"> force</label> <button>Restart</button>
     </form>{% endif %}</td>
     {% endif %}
   </tr>
