@@ -110,3 +110,21 @@ def test_a_mount_takes_threads_of_its_own() -> None:
     ):
         with pytest.raises(argparse.ArgumentTypeError):
             host.Mount.parse(text, context, 4)
+
+
+def test_a_restart_is_refused_for_a_worker_the_host_cannot_replace(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    answers: list[dict[str, object]] = []
+    instance.send_to_supervisor = answers.append  # type: ignore[method-assign]
+
+    instance.take_request({"id": 1, "op": "restart", "args": {}})
+    assert answers[-1] == {
+        "type": "response",
+        "id": 1,
+        "workers": [],
+        "error": "a worker index is needed",
+    }
+
+    instance.take_request({"id": 2, "op": "restart", "worker": 3, "args": {"force": True}})
+    assert answers[-1]["error"] == "no worker 3"

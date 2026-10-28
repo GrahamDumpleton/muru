@@ -104,6 +104,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Time a request spent waiting for a worker (queue), in the application, and in total.",
     },
     Family {
+        name: "muru_request_retries_total",
+        kind: Kind::Counter,
+        help: "Requests sent again to another worker after the first closed its connection before reading them.",
+    },
+    Family {
         name: "muru_requests_in_flight",
         kind: Kind::Gauge,
         help: "Requests the edge has taken and not yet answered; a WebSocket counts until its handshake is answered.",
@@ -400,6 +405,8 @@ struct Durations {
 struct Inner {
     requests: BTreeMap<RequestKey, u64>,
     durations: BTreeMap<DurationKey, Durations>,
+    /// Requests sent to a second worker (section 4.8), by group.
+    retries: BTreeMap<DurationKey, u64>,
     in_flight: BTreeMap<ReleaseKey, i64>,
     /// WebSockets open, by where they were routed.
     websockets: BTreeMap<SocketKey, i64>,
@@ -453,14 +460,17 @@ impl Metrics {
             client_class: record.client_class.clone(),
         };
         *inner.requests.entry(key).or_default() += 1;
-        let durations = inner
-            .durations
-            .entry(DurationKey {
-                app: record.app.clone(),
-                release: record.release.clone(),
-                group: record.group.clone(),
-            })
-            .or_default();
+        let by_group = DurationKey {
+            app: record.app.clone(),
+            release: record.release.clone(),
+            group: record.group.clone(),
+        };
+
+        if record.retried {
+            *inner.retries.entry(by_group.clone()).or_default() += 1;
+        }
+
+        let durations = inner.durations.entry(by_group).or_default();
         durations.total.observe(record.total);
 
         if record.worker.is_some() {
@@ -548,6 +558,14 @@ impl Metrics {
                 labels.push(("phase".to_owned(), phase.to_owned()));
                 histogram.samples("muru_request_duration_seconds", &labels, &mut samples);
             }
+        }
+
+        for (key, count) in &inner.retries {
+            samples.push(Sample {
+                name: "muru_request_retries_total".to_owned(),
+                labels: key.labels(),
+                value: *count as f64,
+            });
         }
 
         for (key, count) in &inner.in_flight {
@@ -827,6 +845,7 @@ mod tests {
             reason: reason.to_owned(),
             bytes: 10,
             worker,
+            retried: false,
             queue: Duration::from_millis(1),
             application: Duration::from_millis(total_ms / 2),
             total: Duration::from_millis(total_ms),

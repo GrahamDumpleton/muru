@@ -101,6 +101,9 @@ pub struct Record {
     pub bytes: u64,
     /// The index of the worker that served the request, if one did.
     pub worker: Option<usize>,
+    /// Section 4.8: the request was sent again to another worker after
+    /// the first closed its connection before reading it.
+    pub retried: bool,
     /// Time spent waiting for a worker connection.
     pub queue: Duration,
     /// Time from dispatch until the response head arrived.
@@ -669,6 +672,10 @@ fn text_line(record: &Record) -> String {
         let _ = write!(line, " worker={worker}");
     }
 
+    if record.retried {
+        line.push_str(" retried=1");
+    }
+
     let _ = writeln!(line, " id={}", record.request_id);
     line
 }
@@ -679,7 +686,7 @@ fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -696,6 +703,7 @@ fn json_line(record: &Record) -> String {
         record
             .worker
             .map_or_else(|| "null".to_owned(), |worker| worker.to_string()),
+        record.retried,
         millis_f64(record.queue),
         millis_f64(record.application),
         millis_f64(record.total),
@@ -905,6 +913,7 @@ mod tests {
             reason: String::new(),
             bytes: 0,
             worker: Some(0),
+            retried: false,
             queue: Duration::ZERO,
             application: Duration::ZERO,
             total,

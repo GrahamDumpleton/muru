@@ -5,8 +5,9 @@
 
 The edge's timeouts, the soft timeout, which interrupts a request that
 runs too long, the hard timeout, which replaces a worker whose request
-never returns, and the loop stall timeout, which replaces an ASGI worker
-whose event loop is held.
+never returns, the loop stall timeout, which replaces an ASGI worker
+whose event loop is held, and the GIL stall timeout, which replaces a
+worker in which Python has stopped running at all.
 ```
 
 Every timeout has a name, a default, and a response the client sees when
@@ -134,6 +135,7 @@ hard_drain_grace = "10s"
 websocket_drain_grace = "0s"
 shutdown_timeout = "5s"
 loop_stall_timeout = "10s"
+gil_stall_timeout = "30s"
 ```
 
 Set the hard timeout above the edge's `deadline`, so that a slow request
@@ -183,6 +185,42 @@ muructl run app:application --timeout loop_stall=5s
 
 A worker being debugged is pinned, so a `breakpoint()` in a coroutine,
 which holds the loop while it waits, does not cost the worker.
+
+## The GIL stall timeout
+
+A worker can stop running Python altogether while every request to it
+waits: a C extension call that never returns while it holds the GIL, a
+deadlock between threads, or a process stopped by a signal. No request
+need be in flight, so the hard timeout does not see it, and a WSGI
+worker has no event loop to go quiet. Every worker therefore runs a
+thread outside Python that takes the interpreter lock every half second
+and lets it go again, which is what a worker running Python in slices
+allows at once and a wedged one never does. A watchdog outside Python
+notices when that thread has not managed it for the GIL stall timeout,
+and the worker is replaced as for the hard timeout, its stacks written
+to the log by `faulthandler`, with a `worker.gil_stalled` event before
+the `worker.timeout_killed` one.
+
+The host also times each worker's reports, which the worker sends from
+outside Python once a second, and replaces a worker that has sent none
+for the same period: one stopped by a signal, or frozen whole.
+
+| Name | Default | Measured | When it fires |
+| --- | --- | --- | --- |
+| `gil_stall` | 30s | since a thread last took the interpreter lock, or the worker last reported | the worker is replaced |
+
+```
+muructl run app:application --timeout gil_stall=10s
+```
+
+On a free-threaded build there is no lock to hold, so the heartbeat
+there stops only with the process, and the timeout fires for a worker
+that is stopped or frozen. A worker being debugged with `muructl debug
+attach` is pinned; one stopped under a native debugger for longer than
+the timeout is replaced, so raise the timeout for such a session.
+
+To replace a worker the watchdogs do not catch, such as one with a
+broken connection pool, see [restarting a worker](recycling.md#restarting-a-worker-by-hand).
 
 The body size limit is a limit rather than a timeout, but lives beside
 them: `--max-body-size 100MB` (the development default; 10 MB with

@@ -59,8 +59,53 @@ ready and its stacks are written to the log first, and so does a worker
 over its [memory limits](memory.md).
 
 Events record each replacement: `worker.started` and `worker.ready` for
-the new worker, then `worker.recycled` (or `worker.timeout_killed`) with
-the reason once the old one has gone, under the release's subject; a
-worker that exits on its own is `worker.exited`. The daemon restarts a
-release whose host dies, and a host that cannot start a replacement
-three times running keeps the old worker and stops trying.
+the new worker, then `worker.recycled` (or `worker.timeout_killed`, or
+`worker.restarted`) with the reason once the old one has gone, under the
+release's subject; a worker that exits on its own is `worker.exited`.
+The daemon restarts a release whose host dies, and a host that cannot
+start a replacement three times running keeps the old worker and stops
+trying.
+
+## Restarting a worker by hand
+
+`muructl restart` replaces one worker of a release the way a recycle
+does, for a fault the policies do not see: a broken connection pool,
+bad state left in the process, or a request that hangs with the hard
+timeout off. The worker is named by the index `muructl debug status`
+and the access log's `worker=` field show, or by its process id:
+
+```
+muructl restart shop --worker 1
+muructl restart shop@r3 --pid 48213
+muructl restart shop --all
+muructl restart shop --all --group reports
+```
+
+The replacement is forked on a new socket, the edge routes to it, and
+only then is the old worker told to stop, so no request is lost; the
+command waits until the new worker serves and the old one has gone, and
+prints both pids (`--no-wait` returns as soon as the restart is under
+way). `--all` restarts every worker in turn, one at a time, so capacity
+holds. A worker that is frozen is recovered the same way, since the host
+acts on its own records and signals and never needs the worker to
+answer; it takes about ten seconds with the default timeouts.
+
+`--force` is for a worker that must go now: it leaves routing at once,
+its threads' stacks are written to the log as they are for the hard
+timeout, and it is killed a second later without being asked to stop.
+The requests it was serving fail with 502, and a debugger session in it
+ends. Without `--force`, a worker being debugged is left alone and the
+command says so.
+
+```
+muructl restart shop --worker 1 --force
+```
+
+A restart resets the worker's state but loads no new code: workers fork
+from the host's already loaded interpreter, so the application is as it
+was when the release started. New code is a new release (`muructl
+deploy`), and in development `muructl run` restarts on its own with
+`--reload`. The event is `worker.restarted`, with the reason and, for
+`--force`, where the stacks were; manual restarts do not count against
+the churn budget. The command needs the daemon: a development run has
+no admin socket, and Ctrl-C and running again does the same job.

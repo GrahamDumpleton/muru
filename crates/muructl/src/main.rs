@@ -117,6 +117,10 @@ enum Command {
     /// Pin a worker group's count, or show the autoscaler's state.
     Scale(admin::ScaleArgs),
 
+    /// Replace a worker of a release with a fresh one, gracefully or at
+    /// once with --force; or every worker in turn with --all.
+    Restart(admin::RestartArgs),
+
     /// Overlays: list them, activate or end one by hand, preview what
     /// one changes, or make one's changes permanent.
     Overlay {
@@ -421,10 +425,11 @@ struct RunArgs {
     /// header_read (30s), body_idle (60s), response_idle (60s),
     /// keep_alive (20s) or keep_alive_proxy (75s) at the edge; soft
     /// (off), hard (off), hard_drain_grace (10s), shutdown (5s),
-    /// websocket_drain_grace (0s) or loop_stall (10s) in the host, which
-    /// interrupts a request that runs past the soft timeout and replaces
-    /// a worker whose request runs past the hard timeout, or whose event
-    /// loop stalls past loop_stall. Repeatable.
+    /// websocket_drain_grace (0s), loop_stall (10s) or gil_stall (30s)
+    /// in the host, which interrupts a request that runs past the soft
+    /// timeout and replaces a worker whose request runs past the hard
+    /// timeout, whose event loop stalls past loop_stall, or in which no
+    /// thread has run Python for gil_stall. Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -758,6 +763,7 @@ fn main() -> anyhow::Result<()> {
         Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
+        Command::Restart(args) => runtime.block_on(admin::restart(args)),
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
@@ -843,13 +849,14 @@ pub(crate) fn parse_timeout(text: &str) -> Result<(String, Duration), String> {
         "shutdown",
         "websocket_drain_grace",
         "loop_stall",
+        "gil_stall",
     ]
     .contains(&name)
     {
         return Err(format!(
             "{name:?} is not a timeout name: queue, deadline, header_read, body_idle, \
              response_idle, keep_alive, keep_alive_proxy, soft, hard, hard_drain_grace, \
-             shutdown, websocket_drain_grace or loop_stall"
+             shutdown, websocket_drain_grace, loop_stall or gil_stall"
         ));
     }
     Ok((name.to_owned(), muru_config::parse_duration(duration)?))
@@ -993,6 +1000,8 @@ pub(crate) struct HostTimeouts {
     pub websocket_drain_grace: Duration,
     /// How long an ASGI worker's event loop may stall.
     pub loop_stall: Duration,
+    /// How long a worker may run no Python, or send no report.
+    pub gil_stall: Duration,
 }
 
 impl HostTimeouts {
@@ -1005,6 +1014,7 @@ impl HostTimeouts {
             shutdown_timeout: Some(muru_config::format_duration(self.shutdown)),
             websocket_drain_grace: Some(muru_config::format_duration(self.websocket_drain_grace)),
             loop_stall_timeout: Some(muru_config::format_duration(self.loop_stall)),
+            gil_stall_timeout: Some(muru_config::format_duration(self.gil_stall)),
         }
     }
 }
@@ -1044,6 +1054,11 @@ pub(crate) fn worker_timeouts(
             parse(&table.loop_stall_timeout, "loop_stall_timeout")
         })?
         .unwrap_or(Duration::from_secs(10));
+    let mut gil_stall = table
+        .map_or(Ok(None), |table| {
+            parse(&table.gil_stall_timeout, "gil_stall_timeout")
+        })?
+        .unwrap_or(Duration::from_secs(30));
 
     for (name, duration) in timeouts {
         match name.as_str() {
@@ -1053,6 +1068,7 @@ pub(crate) fn worker_timeouts(
             "shutdown" => shutdown = *duration,
             "websocket_drain_grace" => websocket_drain_grace = *duration,
             "loop_stall" => loop_stall = *duration,
+            "gil_stall" => gil_stall = *duration,
             _ => {}
         }
     }
@@ -1067,6 +1083,10 @@ pub(crate) fn worker_timeouts(
     anyhow::ensure!(
         loop_stall > Duration::ZERO,
         "loop_stall_timeout must be longer than nothing"
+    );
+    anyhow::ensure!(
+        gil_stall > Duration::ZERO,
+        "gil_stall_timeout must be longer than nothing"
     );
 
     if let (Some(soft), Some(hard)) = (soft, hard) {
@@ -1083,6 +1103,7 @@ pub(crate) fn worker_timeouts(
         shutdown,
         websocket_drain_grace,
         loop_stall,
+        gil_stall,
     })
 }
 
@@ -1796,6 +1817,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         shutdown_timeout: timeouts.shutdown,
         websocket_drain_grace: timeouts.websocket_drain_grace,
         loop_stall_timeout: timeouts.loop_stall,
+        gil_stall_timeout: timeouts.gil_stall,
         memory: memory_policy(&args.memory, resolved.memory.as_ref())?,
         env: resolved
             .env
@@ -2030,6 +2052,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let pools = edge.pools();
+    let drainer = edge.drainer();
     let mut serving = tokio::spawn(edge.run());
     let mut release = 1;
 
@@ -2161,6 +2184,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     };
 
+    // Section 13.4: the edge stops accepting and lets the requests in
+    // flight finish before the host is told to stop, so no request is
+    // written to a worker that is going.
+
+    drainer.drain(stop_budget).await;
     current.stop(stop_budget).await;
     let _ = std::fs::remove_dir_all(&run_dir);
     outcome

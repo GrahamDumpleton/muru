@@ -1898,8 +1898,9 @@ pub struct DeployArgs {
     /// runs this long; off), hard (replace a worker whose request runs
     /// this long; off), hard_drain_grace (10s), shutdown (5s),
     /// websocket_drain_grace (how long a stopping worker keeps its open
-    /// WebSockets; 0s) or loop_stall (replace an ASGI worker whose event
-    /// loop stalls this long; 10s). Repeatable.
+    /// WebSockets; 0s), loop_stall (replace an ASGI worker whose event
+    /// loop stalls this long; 10s) or gil_stall (replace a worker in
+    /// which no thread has run Python for this long; 30s). Repeatable.
     #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = parse_host_timeout)]
     timeouts: Vec<(String, Duration)>,
 
@@ -2176,12 +2177,13 @@ fn parse_host_timeout(text: &str) -> Result<(String, Duration), String> {
         "shutdown",
         "websocket_drain_grace",
         "loop_stall",
+        "gil_stall",
     ]
     .contains(&name)
     {
         return Err(format!(
             "{name:?} is not a host timeout name: soft, hard, hard_drain_grace, shutdown, \
-             websocket_drain_grace or loop_stall"
+             websocket_drain_grace, loop_stall or gil_stall"
         ));
     }
 
@@ -2278,6 +2280,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
         websocket_drain_grace_ms: timeout_ms(&args.timeouts, "websocket_drain_grace"),
         loop_stall_timeout_ms: timeout_ms(&args.timeouts, "loop_stall"),
+        gil_stall_timeout_ms: timeout_ms(&args.timeouts, "gil_stall"),
         memory_measure: memory_setting(&args.memory, "measure").unwrap_or_default(),
         memory_soft_limit: memory_setting(&args.memory, "soft_limit")
             .and_then(|text| muru_config::parse_size(&text).ok()),
@@ -2546,6 +2549,186 @@ pub enum ScaleCommand {
         #[command(flatten)]
         socket: SocketArgs,
     },
+}
+
+/// What `restart` takes: one worker of a release, by index or pid, or
+/// every worker in turn, gracefully or at once.
+#[derive(Args)]
+pub struct RestartArgs {
+    /// The release as app@release, or an application for its current
+    /// release.
+    #[arg(value_name = "APP[@RELEASE]")]
+    target: String,
+
+    /// The worker to restart, by the index `debug status` and the access
+    /// log show.
+    #[arg(long, value_name = "N", conflicts_with_all = ["pid", "all"])]
+    worker: Option<u32>,
+
+    /// The worker to restart, by process id.
+    #[arg(long, value_name = "PID", conflicts_with = "all")]
+    pid: Option<u32>,
+
+    /// Every worker of the release, one at a time so capacity holds.
+    #[arg(long, required_unless_present_any = ["worker", "pid"])]
+    all: bool,
+
+    /// With --all, the workers of one group only.
+    #[arg(long, value_name = "NAME", requires = "all")]
+    group: Option<String>,
+
+    /// Take the worker out of routing and kill it at once, its stacks
+    /// written to the log; the requests it is serving fail, and a
+    /// debugger session in it ends.
+    #[arg(long)]
+    force: bool,
+
+    /// Return once the restart is under way, without waiting for the
+    /// replacement to serve and the old worker to stop.
+    #[arg(long)]
+    no_wait: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// How long `restart` waits for a replacement to serve and the old
+/// worker to go: a start, the routing change and the stop budget, with
+/// room for a slow start.
+const RESTART_WAIT: Duration = Duration::from_secs(120);
+
+/// How often `restart` looks at the host's status while it waits.
+const RESTART_POLL: Duration = Duration::from_millis(250);
+
+/// Replace one worker of a release, or each in turn, with a fresh one.
+pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
+    let status = ask(
+        &args.socket,
+        &args.target,
+        "status",
+        None,
+        serde_json::json!({}),
+    )
+    .await?;
+    let serving: Vec<(u32, u32, String)> = status
+        .workers
+        .iter()
+        .filter_map(|answer| {
+            let result = parse_result(answer)?;
+            let serving = result["ready"].as_bool() == Some(true)
+                && result["replaced"].as_bool() != Some(true);
+            serving.then(|| {
+                (
+                    answer.index,
+                    answer.pid,
+                    result["group"].as_str().unwrap_or("default").to_owned(),
+                )
+            })
+        })
+        .collect();
+    let app = args.target.split('@').next().unwrap_or(&args.target);
+    let release = format!("{app}@{}", status.release);
+
+    let chosen: Vec<(u32, u32)> = if args.all {
+        serving
+            .iter()
+            .filter(|(_, _, group)| args.group.as_ref().is_none_or(|wanted| wanted == group))
+            .map(|(index, pid, _)| (*index, *pid))
+            .collect()
+    } else if let Some(pid) = args.pid {
+        serving
+            .iter()
+            .find(|(_, candidate, _)| *candidate == pid)
+            .map(|(index, pid, _)| vec![(*index, *pid)])
+            .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker with pid {pid}"))?
+    } else {
+        let wanted = args.worker.expect("clap requires --worker, --pid or --all");
+        serving
+            .iter()
+            .find(|(index, _, _)| *index == wanted)
+            .map(|(index, pid, _)| vec![(*index, *pid)])
+            .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker with index {wanted}"))?
+    };
+
+    if chosen.is_empty() {
+        let group = args
+            .group
+            .as_ref()
+            .map(|group| format!(" in group {group}"))
+            .unwrap_or_default();
+        anyhow::bail!("{release} has no serving worker{group}");
+    }
+
+    for (index, pid) in chosen {
+        let response = ask(
+            &args.socket,
+            &args.target,
+            "restart",
+            Some(index),
+            serde_json::json!({ "force": args.force }),
+        )
+        .await?;
+        let answer = &response.workers[0];
+
+        if !answer.ok {
+            anyhow::bail!("worker {index} (pid {pid}): {}", answer.error);
+        }
+
+        let new_pid = parse_result(answer)
+            .and_then(|result| result["new_pid"].as_u64())
+            .unwrap_or_default();
+        let how = if args.force { ", killed at once" } else { "" };
+        println!("muru: worker {index} (pid {pid}) is being replaced by pid {new_pid}{how}");
+
+        if args.no_wait {
+            continue;
+        }
+
+        let served_by = wait_restarted(&args, index, pid).await?;
+        println!("muru: worker {index} is served by pid {served_by}; pid {pid} has stopped");
+    }
+
+    Ok(())
+}
+
+/// Wait until the worker at `index` is one other than `old_pid`, ready,
+/// with the old one gone, and return the pid that serves.
+async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow::Result<u32> {
+    let deadline = Instant::now() + RESTART_WAIT;
+
+    loop {
+        tokio::time::sleep(RESTART_POLL).await;
+        let status = ask(
+            &args.socket,
+            &args.target,
+            "status",
+            Some(index),
+            serde_json::json!({}),
+        )
+        .await;
+
+        // The host's status names every worker at the index, the old one
+        // and its replacement while both exist.
+
+        if let Ok(status) = status {
+            let old_gone = status.workers.iter().all(|answer| answer.pid != old_pid);
+            let ready = status.workers.iter().find(|answer| {
+                answer.pid != old_pid
+                    && parse_result(answer)
+                        .is_some_and(|result| result["ready"].as_bool() == Some(true))
+            });
+
+            if let (true, Some(answer)) = (old_gone, ready) {
+                return Ok(answer.pid);
+            }
+        }
+
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "worker {index} was not replaced within {} seconds; muructl debug status shows where it is",
+            RESTART_WAIT.as_secs()
+        );
+    }
 }
 
 /// Pin or release a group's count, or show the autoscaler's state.

@@ -67,12 +67,15 @@ type MountArgument = (String, Py<PyAny>, Option<Py<PyAny>>, Option<(usize, usize
 /// task; both are needed for the timeout to be on. `grpc_methods` are
 /// the gRPC methods the gRPC mounts registered (section 6.13), as (path,
 /// mount, client streaming, server streaming) tuples; a gRPC mount's
-/// runner is the dispatcher of its calls.
+/// runner is the dispatcher of its calls. `loop_stall_timeout_ms` and
+/// `gil_stall_timeout_ms` are the stall timeouts (section 7.6): the host
+/// is told when the event loop has not run, or no thread has managed to
+/// attach to the interpreter, for that long.
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, gil_stall_timeout_ms=None))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -98,6 +101,7 @@ fn serve(
     loop_stall_timeout_ms: Option<u64>,
     websocket_drain_ms: u64,
     drain_ms: u64,
+    gil_stall_timeout_ms: Option<u64>,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -178,6 +182,9 @@ fn serve(
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     shared.loop_stall = loop_stall_timeout_ms
         .filter(|&ms| ms > 0 && shared.asgi.is_some())
+        .map(std::time::Duration::from_millis);
+    shared.gil_stall = gil_stall_timeout_ms
+        .filter(|&ms| ms > 0)
         .map(std::time::Duration::from_millis);
     shared.grpc_methods = grpc_methods
         .into_iter()

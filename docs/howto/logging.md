@@ -130,7 +130,8 @@ A JSON line has these fields:
  "client": "127.0.0.1", "app": "shop", "release": "r1", "host": "shop.example.com",
  "group": "default", "mount": "default", "method": "GET", "target": "/hello",
  "version": "HTTP/1.1", "status": 200, "reason": "", "bytes": 18, "worker": 0,
- "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3, "redirects": [],
+ "retried": false, "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3,
+ "redirects": [],
  "client_class": "default"}
 ```
 
@@ -143,7 +144,10 @@ group](worker-groups.md) and [mount](mounts.md), and `snapshot` is the
 version of the routing the edge used (0 in development mode).
 `redirects` lists the targets of [internal redirects](internal-redirects.md)
 the request went through, and `client_class` is its [client
-class](client-classes.md). `websocket` is null except on a WebSocket's
+class](client-classes.md). `retried` is true (`retried=1` on the compact
+line) when the first worker chosen closed its connection before reading
+the request, as a worker that is stopping does, and the request was sent
+to another. `websocket` is null except on a WebSocket's
 closing line, where it holds `event` (`closed`), `by`, `code`, `close`
 (the outcome the [metrics](metrics.md) name), `received`, `sent` and
 `received_bytes`; that line's `total_ms` is how long the socket was open

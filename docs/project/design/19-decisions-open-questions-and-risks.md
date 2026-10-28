@@ -40,6 +40,8 @@ specification is maintained.
 | Runtime wheels | Version-specific wheels for every supported CPython, regular and free-threaded. No abi3 |
 | gRPC mounts and authentication sub-requests | In initial scope, phase 3 (sections 6.13 and 4.16) |
 | TLS cryptography | rustls, tokio-rustls and rcgen on the ring provider in every crate; aws-lc-rs banned by cargo-deny so cmake never becomes a prerequisite (ADR 0024) |
+| Retries | A request is sent again only when no worker has read it: a worker that cannot be connected to or closes its connection before the head is written is skipped for another. Nothing is sent again after a worker has read the head, whatever the method (ADR 0032) |
+| Worker liveness | Native, in every worker: a thread attaches to the interpreter every 500 ms and the worker reports to its host every second; either quiet for gil_stall_timeout (30 s) replaces the worker as the hard timeout does. HTTP liveness probes stay opt-in for application failures (ADR 0031) |
 
 ## 19.2 Open questions
 

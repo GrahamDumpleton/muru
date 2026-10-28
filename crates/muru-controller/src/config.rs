@@ -2541,6 +2541,12 @@ pub fn resolve_spec(
             "loop_stall_timeout",
         )?
         .unwrap_or_else(|| crate::model::WorkerTimeouts::default().loop_stall_timeout_ms),
+        gil_stall_timeout_ms: duration_ms(
+            request.gil_stall_timeout_ms,
+            table_timeouts.gil_stall_timeout.as_ref(),
+            "gil_stall_timeout",
+        )?
+        .unwrap_or_else(|| crate::model::WorkerTimeouts::default().gil_stall_timeout_ms),
     };
 
     if max_lifetime_ms == Some(0) {
@@ -2851,6 +2857,15 @@ fn resolve_layers(
             ),
         ),
         (
+            "timeouts.gil_stall_timeout",
+            layer(
+                request.gil_stall_timeout_ms.is_some(),
+                timeouts.gil_stall_timeout.is_some(),
+                false,
+                declared,
+            ),
+        ),
+        (
             "memory.measure",
             layer(
                 !request.memory_measure.is_empty(),
@@ -2975,6 +2990,10 @@ fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
         (
             "timeouts.loop_stall_timeout",
             format_ms(spec.timeouts.loop_stall_timeout_ms),
+        ),
+        (
+            "timeouts.gil_stall_timeout",
+            format_ms(spec.timeouts.gil_stall_timeout_ms),
         ),
         ("memory.measure", spec.memory.measure.to_string()),
         (
@@ -3142,7 +3161,8 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         || request.hard_drain_grace_ms.is_some()
         || request.shutdown_timeout_ms.is_some()
         || request.websocket_drain_grace_ms.is_some()
-        || request.loop_stall_timeout_ms.is_some();
+        || request.loop_stall_timeout_ms.is_some()
+        || request.gil_stall_timeout_ms.is_some();
     let memory_given = !request.memory_measure.is_empty()
         || request.memory_soft_limit.is_some()
         || request.memory_soft_for_ms.is_some()
@@ -3186,6 +3206,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             shutdown_timeout: request.shutdown_timeout_ms.map(format_ms),
             websocket_drain_grace: request.websocket_drain_grace_ms.map(format_ms),
             loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
+            gil_stall_timeout: request.gil_stall_timeout_ms.map(format_ms),
         }),
         memory: memory_given.then(muru_config::Memory::default),
         env: BTreeMap::new(),
@@ -3651,6 +3672,12 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .as_ref()
                 .and_then(|t| t.loop_stall_timeout.as_ref()),
         ),
+        gil_stall_timeout_ms: duration_field(
+            table
+                .timeouts
+                .as_ref()
+                .and_then(|t| t.gil_stall_timeout.as_ref()),
+        ),
         memory_measure: table
             .memory
             .as_ref()
@@ -3837,6 +3864,9 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
                     spec.timeouts.loop_stall_timeout_ms,
                 ))),
+                gil_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                    spec.timeouts.gil_stall_timeout_ms,
+                ))),
             }
         }),
         env: env_table_from(&spec.env),
@@ -3896,6 +3926,10 @@ pub(crate) fn check_timeouts(timeouts: &crate::model::WorkerTimeouts) -> Result<
 
     if timeouts.loop_stall_timeout_ms == 0 {
         return Err("loop_stall_timeout must be longer than nothing".to_owned());
+    }
+
+    if timeouts.gil_stall_timeout_ms == 0 {
+        return Err("gil_stall_timeout must be longer than nothing".to_owned());
     }
 
     if let (Some(soft), Some(hard)) = (timeouts.soft_timeout_ms, timeouts.hard_timeout_ms)
@@ -4110,6 +4144,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "loop_stall_timeout",
         describe_ms(Some(declared.timeouts.loop_stall_timeout_ms)),
         describe_ms(Some(recorded.timeouts.loop_stall_timeout_ms)),
+    );
+    compare(
+        "gil_stall_timeout",
+        describe_ms(Some(declared.timeouts.gil_stall_timeout_ms)),
+        describe_ms(Some(recorded.timeouts.gil_stall_timeout_ms)),
     );
     compare(
         "memory",

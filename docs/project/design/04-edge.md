@@ -147,7 +147,9 @@ forwarded_headers = 'keep'                # keep normalised, or consume
 
 ## 4.8 Retries
 
-The edge retries only when it is provably safe: a connection failure before any request byte was sent, or an idempotent method on a worker that died before sending a response head and whose body was fully buffered or empty. Retries go to a different worker and are counted in metrics.
+The edge sends a request again only when no worker can have seen it: a worker that cannot be connected to, or one that closes its connection before the request head is written to it, as a worker that is stopping does, has read nothing of the request, so the request goes to another worker of the pool, once. A request whose head a worker has read is never sent again, whatever its method (ADR 0032): a request that crashed one worker would crash the next, and the method says nothing about what the handler does. Retries are counted in metrics and marked in the access log, and the first worker's failure is logged.
+
+- **Details fixed by the implementation.** A pool skips a worker it cannot connect to while another is left, and a request whose head write fails is sent once more to another worker of the pool (to the same one over a new connection when the pool has one worker); the pool chooses as it always does among the rest. A second failure is 502 `worker_unavailable`. `muru_request_retries_total` counts the requests sent again, by application, release and group, and the access log's `retried` field marks them. The stored uploads of a request (section 4.11) go with the head again.
 
 ## 4.9 Static files and file hints
 
@@ -324,7 +326,7 @@ Adapters should check muru.context() and fall back to the framework's normal par
 
 ## 4.12 Error pages and maintenance
 
-- Every response Muru generates has a status and a reason, for example 503 with queue_full, no_workers, cold_start_timeout, release_failed, draining or maintenance; 502 with worker_crashed or upstream_failed; 504 with deadline, soft_timeout or hard_timeout. The full list is in Appendix C.
+- Every response Muru generates has a status and a reason, for example 503 with queue_full, no_workers, cold_start_timeout, release_failed, draining or maintenance; 502 with worker_crashed, worker_unavailable or upstream_failed; 504 with deadline, soft_timeout or hard_timeout. The full list is in Appendix C.
 - Built-in pages are content-negotiated: HTML, application/problem+json (RFC 9457) or plain text, with the request id and Retry-After. Development mode shows tracebacks for application errors.
 - Custom pages by status or status:reason, configured globally, per host, application or route: static file, edge-rendered template ({status}, {reason}, {request_id}, {retry_after}, {host}, {path}), or an internal application path receiving REDIRECT_* variables and muru.error_reason.
 - Safeguards: an application handler is skipped when it would run on the failing capacity pool, has a 2 s timeout, never recurses, keeps the original status and Retry-After, WWW-Authenticate and Allow headers, and pages default to Cache-Control: no-store.

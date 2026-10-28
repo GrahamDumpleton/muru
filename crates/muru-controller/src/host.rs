@@ -375,6 +375,9 @@ pub struct HostSpec {
     /// How long an ASGI worker's event loop may stall before the worker
     /// is replaced (section 7.6).
     pub loop_stall_timeout: Duration,
+    /// How long a worker may run no Python, or send no report, before it
+    /// is replaced (section 7.6).
+    pub gil_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
     /// Environment variables for the host and its workers (section
@@ -555,6 +558,12 @@ impl HostProcess {
             }
             None => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+                // Section 13.1: a Ctrl-C in the terminal reaches muructl
+                // alone, which stops the edge before it tells the host,
+                // so the host and its workers are in a group of their own.
+
+                command.process_group(0);
             }
         }
 
@@ -649,7 +658,9 @@ impl HostProcess {
             .arg("--websocket-drain-grace")
             .arg(spec.websocket_drain_grace.as_secs_f64().to_string())
             .arg("--loop-stall-timeout")
-            .arg(spec.loop_stall_timeout.as_secs_f64().to_string());
+            .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
+            .arg("--gil-stall-timeout")
+            .arg(spec.gil_stall_timeout.as_secs_f64().to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());
