@@ -3872,6 +3872,7 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         }
 
         serves.push_str(&group_asks(&group.hosts, &group.methods));
+        serves.push_str(&group_mounts(&group.mounts));
 
         lines.push((
             format!("group {}", group.name),
@@ -3976,6 +3977,20 @@ pub fn group_asks(hosts: &[String], methods: &[String]) -> String {
     }
 
     asks
+}
+
+/// The named mounts a group's workers serve beside the default mount
+/// (ADR 0033), as a suffix for its line; empty for every mount.
+pub fn group_mounts(mounts: &[String]) -> String {
+    if mounts.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        " serving mount{} {}",
+        if mounts.len() == 1 { "" } else { "s" },
+        mounts.join(", ")
+    )
 }
 
 fn group_size(

@@ -2078,6 +2078,11 @@ impl Failing<'_> {
             "soft_timeout" => {
                 Problem::new(StatusCode::GATEWAY_TIMEOUT, "soft_timeout", description)
             }
+            "mount_not_loaded" => Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mount_not_loaded",
+                description,
+            ),
             _ => Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description),
         };
 

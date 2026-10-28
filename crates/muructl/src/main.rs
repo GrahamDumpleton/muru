@@ -1667,7 +1667,7 @@ fn group_serves(group: &muru_config::Group) -> String {
         (paths, Some(classes)) => format!("{paths} and client classes {classes}"),
     };
 
-    format!("{serves}{asks}")
+    format!("{serves}{asks}{}", admin::group_mounts(&group.mounts))
 }
 
 /// What a named mount serves, from where, and on which threads.
@@ -1895,6 +1895,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
                     memory: group_memory(name, group.memory.as_ref(), &memory)?,
                     optional: group.optional.unwrap_or(false),
+                    mounts: group.mounts.clone(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?,

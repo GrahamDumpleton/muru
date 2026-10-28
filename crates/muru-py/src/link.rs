@@ -890,11 +890,18 @@ async fn handle_request(
     // Section 6.7: the head names the mount; an ASGI mount's request
     // goes to the loop, a WSGI mount's to the thread pool.
 
+    // ADR 0033: a worker of a group that serves a subset of the mounts
+    // says so, and the edge's reason names the fault, rather than
+    // dropping the connection as a crash would.
+
     let Some(mount) = shared.mount(&head.mount) else {
-        return Err(io::Error::other(format!(
-            "the edge asked for a mount this worker does not have: {:?}",
-            head.mount
-        )));
+        let end = pb::End {
+            error: format!("this worker does not serve the mount {:?}", head.mount),
+            reason: "mount_not_loaded".to_owned(),
+            ..Default::default()
+        };
+        frame::write(writer, kind::END, 0, end.encode_to_vec().into()).await?;
+        return Ok(None);
     };
 
     if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner) {

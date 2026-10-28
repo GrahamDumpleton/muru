@@ -155,6 +155,10 @@ pub struct GroupSpec {
     pub name: String,
     /// Path prefixes it serves, with an optional trailing `*`.
     pub paths: Vec<String>,
+    /// The named mounts its workers serve beside the default mount;
+    /// every mount when empty (ADR 0033).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
     /// The client classes it takes (section 4.14), ahead of the groups
     /// that name none; their requests for every path without `paths`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

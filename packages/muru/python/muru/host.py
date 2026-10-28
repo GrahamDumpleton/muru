@@ -415,6 +415,11 @@ class Group:
 
     optional: bool = False
 
+    # ADR 0033: the named mounts the group's workers serve beside the
+    # default mount; every mount when empty.
+
+    mounts: tuple[str, ...] = ()
+
     @classmethod
     def parse(cls, text: str) -> Group:
         """Parse NAME=PROCESSES,THREADS,SYNC_THREADS,CONCURRENCY."""
@@ -432,6 +437,18 @@ class Group:
             raise argparse.ArgumentTypeError(f"{text!r} is not a valid worker group")
 
         return cls(name, processes, threads, sync_threads, concurrency)
+
+
+def parse_group_mounts(text: str) -> tuple[str, tuple[str, ...]]:
+    """Parse NAME=MOUNT,... into the group's name and the mounts it serves."""
+
+    name, _, names = text.partition("=")
+    mounts = tuple(part for part in names.split(",") if part)
+
+    if not name or not mounts:
+        raise argparse.ArgumentTypeError(f"{text!r} is not NAME=MOUNT,...")
+
+    return name, mounts
 
 
 def parse_group_timeouts(text: str) -> tuple[str, dict[str, float | None]]:
@@ -988,6 +1005,12 @@ class Host:
         known = release.resolved is not None
         known_mounts = {mount.name for mount in self.mounts if mount.release.resolved is not None}
 
+        # ADR 0033: a group that lists mounts serves those and the default
+        # mount; the host imported every mount, so the others cost this
+        # worker nothing after the fork.
+
+        mounts = [mount for mount in self.mounts if not group.mounts or mount.name in group.mounts]
+
         try:
             if release.preloaded:
                 hooks = release.hooks or Hooks()
@@ -996,7 +1019,7 @@ class Host:
 
                 started = time.monotonic()
                 hooks = release.load()
-                for mount in self.mounts:
+                for mount in mounts:
                     mount.release.load()
                 log(f"worker {index} imported {release.spec} in {elapsed_ms(started)} ms")
                 hooks.call("on_load", context)
@@ -1021,9 +1044,9 @@ class Host:
 
             realised = [
                 (mount.name, mount.release.realise(), mount.release, mount.threads)
-                for mount in self.mounts
+                for mount in mounts
             ]
-            limits = {mount.name: mount.limits for mount in self.mounts}
+            limits = {mount.name: mount.limits for mount in mounts}
 
             for name, _, mounted, _ in realised:
                 if name not in known_mounts and mounted.resolved is not None:
@@ -2909,6 +2932,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="a group the release is ready without; its workers join as each listens",
     )
     parser.add_argument(
+        "--group-mounts",
+        action="append",
+        default=[],
+        type=parse_group_mounts,
+        metavar="NAME=MOUNT,...",
+        help="the named mounts a group's workers serve beside the default; every mount without",
+    )
+    parser.add_argument(
         "--group-timeouts",
         action="append",
         default=[],
@@ -3223,6 +3254,7 @@ def main(argv: list[str] | None = None) -> int:
                 **dict(args.group_timeouts).get(group.name, {}),
                 memory=dict(args.group_memory).get(group.name),
                 optional=group.name in args.optional_group,
+                mounts=dict(args.group_mounts).get(group.name, ()),
             )
             for group in args.group
         ],

@@ -9,3 +9,8 @@ entrypoint = "mounted:asgi_app"
 path = "/reports"
 entrypoint = "mounted:reports_app"
 interface = "wsgi"
+
+[groups.reports]
+paths = ["/reports/*"]
+mounts = ["reports"]
+processes = 1

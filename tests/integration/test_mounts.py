@@ -7,7 +7,8 @@ the rest is PATH_INFO (path including root_path for ASGI), an ASGI mount
 beside a WSGI default gets the worker's event loop and its own lifespan,
 and WebSockets reach an ASGI mount. Mounts come from the project's table
 in development mode and from the table or the applied file under the
-daemon.
+daemon. A worker group that lists mounts serves those and the default
+mount, and its paths must lie within them (ADR 0033).
 """
 
 from __future__ import annotations
@@ -65,6 +66,14 @@ def test_paths_reach_their_mounts_with_the_right_prefixes(development: support.S
     assert asgi["started_in"] == asgi["pid"]
     assert root["pid"] == asgi["pid"], "one worker serves every mount"
     assert root["context_interface"] == "wsgi", "the context names the default mount's interface"
+
+    # ADR 0033: the reports group's worker serves the reports mount and
+    # the default mount, and nothing else.
+
+    assert reports["pid"] != root["pid"], "the reports group has a worker of its own"
+    log = development.log()
+    assert "worker 1 serves mount reports" in log or "mount reports: mounted:reports_app" in log
+    assert "muru: group reports serves /reports/* serving mount reports with 1 worker" in log
 
 
 def test_websockets_reach_an_asgi_mount(development: support.Server) -> None:
@@ -134,6 +143,11 @@ def test_mounts_under_the_daemon_from_the_table_and_the_file(
     assert "mount asgi /asgi from mounted:asgi_app, ASGI (detected)" in shown
     assert "mount reports /reports from mounted:reports_app, WSGI" in shown
     assert any(
+        line.startswith("group reports /reports/* serving mount reports: 1 process of 2 threads")
+        for line in shown
+    ), shown
+    assert report(daemon.request("/reports/x"))["pid"] != report(daemon.request("/"))["pid"]
+    assert any(
         line.startswith("workers 1 process of 2 threads and an event loop") for line in shown
     )
     logs = daemon.muructl("logs", "mounted").stdout
@@ -172,6 +186,58 @@ interface = "asgi"
     refused = daemon.muructl("apply", "-f", str(config), check=False)
     assert refused.returncode == 1
     assert "mounts asgi plain_asgi:application at /async, recorded asgi" in refused.stdout
+
+
+def test_a_group_must_serve_the_mounts_its_paths_reach(daemon: Daemon, tmp_path: Path) -> None:
+    # ADR 0033: a group that lists mounts may not claim a path that
+    # reaches a mount it leaves out, and must name mounts that exist.
+
+    config = tmp_path / "echo.toml"
+    head = f"""[app.echo.release.r1]
+source = '{APPS}'
+entrypoint = 'plain_wsgi:application'
+python = '{sys.executable}'
+
+[app.echo.release.r1.mounts.asgi]
+path = "/asgi"
+entrypoint = "plain_asgi:application"
+interface = "asgi"
+
+[app.echo.release.r1.mounts.other]
+path = "/other"
+entrypoint = "plain_wsgi:application"
+"""
+
+    for table, expected in [
+        (
+            "[app.echo.release.r1.groups.hot]\npaths = ['/asgi/*']\nmounts = ['other']\n",
+            "worker group hot: its path /asgi reaches mount asgi at /asgi, which it does not serve",
+        ),
+        (
+            "[app.echo.release.r1.groups.hot]\npaths = ['/']\nmounts = ['other']\n",
+            "worker group hot: its path / reaches mount asgi at /asgi, which it does not serve",
+        ),
+        (
+            "[app.echo.release.r1.groups.hot]\npaths = ['/x']\nmounts = ['nope']\n",
+            "worker group hot: no mount named nope",
+        ),
+    ]:
+        config.write_text(head + table)
+        refused = daemon.muructl("apply", "-f", str(config), check=False)
+        assert refused.returncode == 1, refused.stdout
+        assert expected in refused.stdout, refused.stdout
+
+    # A group whose paths lie within its mounts is accepted, and the
+    # export writes the subset.
+
+    config.write_text(
+        head + "[app.echo.release.r1.groups.hot]\npaths = ['/other/*']\nmounts = ['other']\n"
+    )
+    applied = daemon.muructl("apply", "-f", str(config))
+    assert "ready and serving" in applied.stdout, applied.stdout
+    assert daemon.request("/other/info").status == 200
+    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "echo").stdout)
+    assert exported["app"]["echo"]["release"]["r1"]["groups"]["hot"]["mounts"] == ["other"]
 
 
 def test_invalid_mounts_are_refused(daemon: Daemon, tmp_path: Path) -> None:

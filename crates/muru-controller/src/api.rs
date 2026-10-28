@@ -1858,6 +1858,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 optional: group.optional,
                 hosts: group.host.clone(),
                 methods: group.method.clone(),
+                mounts: group.mounts.clone(),
             })
             .collect(),
         detected_interface: detected_for(""),
