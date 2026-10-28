@@ -9,6 +9,73 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a10 (2026-10-28)
+
+### Added
+
+- Added `concurrency` and `max_connections` on an ASGI mount: the requests
+  it runs at once on each worker, as slots of its own at the edge, and the
+  open WebSockets it holds apart from them, so sockets on a `/ws` mount no
+  longer take the WSGI application's threads.
+- Added `host` and `method` lists to a worker group's `match` table: a
+  group takes a request when its path is under one of the group's paths
+  and every list given names the request's client class, host or method.
+  A group asking more of a request comes before one asking less, and two
+  groups asking the same of the same path are refused.
+- Added `muructl restart APP[@RELEASE] --worker N`, which replaces one worker
+  with a fresh one the way a recycle does, with `--pid` to name it by process
+  id, `--all` for every worker in turn, `--force` to take it out of routing
+  and kill it at once with its stacks in the log, and `--no-wait`. The event
+  is `worker.restarted`. A restart resets the worker's state but loads no new
+  code; new code is a new release.
+- Added a worker group's `mounts` list, the named mounts its workers serve
+  beside the default mount: the host still imports every mount, a worker of
+  the group realises and declares only its own, and a group's paths must lie
+  within the mounts it serves.
+- Added optional worker groups: a group with `optional = true` is one the
+  release is ready without. Its workers join as each listens, its requests
+  wait for one until the queue timeout rather than going to the default
+  group, and a worker of it that cannot start is given up instead of
+  stopping the release.
+- Added per-group timeouts and memory policy: a worker group's `timeouts`
+  table may set the soft, hard, hard drain grace, loop stall and GIL stall
+  timeouts, and its `memory` table any memory limit, each key the release's
+  when absent. `shutdown_timeout` and `websocket_drain_grace` stay with the
+  release.
+- Added the GIL stall timeout: every worker, WSGI or ASGI, now has a native
+  thread that attaches to the interpreter every half second, and a worker in
+  which no thread has run Python for `gil_stall_timeout` (30 s by default,
+  `--timeout gil_stall=`) is replaced as for the hard timeout, with a
+  `worker.gil_stalled` event and its stacks in the log. The host also
+  replaces a worker whose reports have stopped for that long, such as one
+  stopped by a signal.
+- Added the dashboard actions beside maintenance mode: a session that may
+  act can promote a ready release, roll an application back, drain a
+  release, pin a worker group's count or unpin it, and restart a worker,
+  each a form on the page or a POST to `/actions/NAME` for a script, and
+  each recorded as a `dashboard.action` event.
+- Added the edge's retry of a request no worker has read: when the worker
+  chosen cannot be connected to, or closes its connection before the
+  request head reaches it, as a worker that is stopping does, the request
+  goes to another worker. Retries are counted in `muru_request_retries_total`
+  and marked `retried` in the access log; a second failure is 502
+  `worker_unavailable`. A request a worker has read is never sent again.
+- Added worker inspection to the daemon's dashboard: each running release
+  links to a page of its workers, with their status refreshed every two
+  seconds and their stacks merged across workers, and each worker to a page
+  of its own with its status, stacks, asyncio tasks and, on request, its
+  memory, as `muructl debug` shows them; the same answers are served as JSON
+  at `/v1/debug/OP?release=APP@RELEASE`.
+
+### Fixed
+
+- Fixed Ctrl-C on `muructl run` answering requests in the stopping window
+  with 502 `worker_crashed`, and the host logging its stop twice: the edge
+  now stops accepting and finishes the requests it holds before the host is
+  told to stop, and only `muructl` tells it, since the host and its workers
+  no longer share the terminal's process group.
+
+
 ## 0.1.0a9 (2026-10-27)
 
 ### Added
