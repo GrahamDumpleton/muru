@@ -1,0 +1,1 @@
+A profile of a worker read from outside, on Linux, no longer stops sampling that worker after one failed read, which could leave it with no samples while requests were starting and ending; a failed read is skipped and the worker sampled again, and a stacks read is tried again.

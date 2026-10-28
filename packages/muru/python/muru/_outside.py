@@ -150,16 +150,29 @@ class Reader:
         if self.unreadable is not None:
             raise Unreadable(self.unreadable)
 
-        try:
-            trace = _unwinder(pid).get_stack_trace()
-        except Unreadable as error:
-            self.unreadable = str(error)
-            raise
-        except PermissionError as error:
-            self.unreadable = str(error)
-            raise Unreadable(str(error)) from None
-        except (OSError, RuntimeError) as error:
-            raise Unreadable(str(error)) from None
+        unwinder = None
+
+        # As in a profile, a read that meets a frame being pushed or
+        # popped fails, so it is tried again a few times.
+
+        for attempt in range(3):
+            try:
+                if unwinder is None:
+                    unwinder = _unwinder(pid)
+
+                trace = unwinder.get_stack_trace()
+                break
+            except Unreadable as error:
+                self.unreadable = str(error)
+                raise
+            except PermissionError as error:
+                self.unreadable = str(error)
+                raise Unreadable(str(error)) from None
+            except (OSError, RuntimeError) as error:
+                if attempt == 2 or isinstance(error, ProcessLookupError):
+                    raise Unreadable(str(error)) from None
+
+                time.sleep(0.01)
 
         return [(ident, frames) for ident, frames in _threads(trace) if not parked(frames)]
 
@@ -188,12 +201,25 @@ class Reader:
 
         while unwinders and time.monotonic() < deadline:
             for pid, unwinder in list(unwinders.items()):
+                # A read can fail when it meets a frame the worker is
+                # pushing or popping, so a failed round is skipped and the
+                # worker is sampled again; the error is reported only for
+                # a worker no round could read.
+
                 try:
                     trace = unwinder.get_stack_trace()
                 except (OSError, RuntimeError) as error:
-                    failed[pid] = str(error)
-                    del unwinders[pid]
+                    if not rounds[pid]:
+                        failed[pid] = str(error)
+
+                    # A worker that has exited is not read again.
+
+                    if isinstance(error, ProcessLookupError):
+                        del unwinders[pid]
+
                     continue
+
+                failed.pop(pid, None)
 
                 known = names.get(pid, {})
 

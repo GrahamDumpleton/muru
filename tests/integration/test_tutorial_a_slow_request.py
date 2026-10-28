@@ -9,6 +9,7 @@ The profile runs for 3 s rather than the page's 10 s.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -34,7 +35,12 @@ def test_the_slow_request_tutorial(tmp_path: Path) -> None:
         assert stopped.status == 504
         assert json.loads(stopped.body)["reason"] == "soft_timeout"
         events = daemon.muructl("events").stdout
-        assert "ran past the soft timeout of 3 s at report.py line 14 in summarise" in events
+
+        # The interruption lands on the loop's line or its body's.
+
+        assert re.search(
+            r"ran past the soft timeout of 3 s at report\.py line 1[34] in summarise", events
+        )
         assert "muru.RequestTimeout" in daemon.muructl("logs", "reports").stdout
 
         # A request in progress, in the stacks.
