@@ -62,11 +62,20 @@ when `DEBUG = True` and its `handler500` view otherwise. Setting
 `DEBUG_PROPAGATE_EXCEPTIONS = True` lets the exception reach Muru, which
 answers with its own error page and records `reason=app_error`.
 
-Static files: Django does not serve them in production. Under the
-daemon, a [static route](static-files.md) serves `STATIC_ROOT` after
-`collectstatic`. In development, `DEBUG = True` with
-`django.contrib.staticfiles` serves them from the application as usual,
-or use WhiteNoise.
+Static files: Django serves them only under `runserver`, so under Muru a
+request for one reaches the application and finds no URL. In
+development, add Django's static file patterns to the URLs, which serve
+them while `DEBUG = True` and add nothing otherwise:
+
+```python
+from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+
+urlpatterns += staticfiles_urlpatterns()
+```
+
+Under the daemon, a [static route](static-files.md) serves `STATIC_ROOT`
+after `collectstatic`, or use WhiteNoise. The
+[Django tutorial](../tutorials/first-django-site.md) does both.
 
 ## Both
 

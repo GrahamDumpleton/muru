@@ -1,0 +1,10 @@
+[project]
+name = "reports"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.muru]
+entrypoint = "report:application"
+
+[tool.muru.timeouts]
+soft_timeout = "3s"
