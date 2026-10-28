@@ -270,8 +270,14 @@ pub struct AppRow {
 pub struct ScalingRow {
     /// app@release.
     pub release: String,
+    /// The application.
+    pub app: String,
+    /// The release's id.
+    pub id: String,
     /// The group.
     pub group: String,
+    /// Whether an operator has pinned its count.
+    pub pinned: bool,
     /// Workers ready, and the count being reached while they differ.
     pub workers: String,
     /// The policy as one phrase.
@@ -512,6 +518,10 @@ struct NodeEventRow<'a> {
 struct WorkersPage<'a> {
     /// app@release.
     release: &'a str,
+    /// The signed-in session's form token, when actions are on.
+    csrf: Option<&'a str>,
+    /// The page a restart comes back to, relative to the dashboard.
+    back: &'a str,
     status: &'a [inspect::StatusRow],
     /// Why the workers could not be asked, or empty.
     error: &'a str,
@@ -521,6 +531,10 @@ struct WorkersPage<'a> {
 #[template(path = "worker.html")]
 struct WorkerPage<'a> {
     release: &'a str,
+    /// The signed-in session's form token, when actions are on.
+    csrf: Option<&'a str>,
+    /// The page a restart comes back to, relative to the dashboard.
+    back: &'a str,
     worker: u32,
     status: &'a [inspect::StatusRow],
     error: &'a str,
@@ -530,6 +544,10 @@ struct WorkerPage<'a> {
 #[template(path = "workers_status.html")]
 struct WorkersStatusFragment<'a> {
     release: &'a str,
+    /// The signed-in session's form token, when actions are on.
+    csrf: Option<&'a str>,
+    /// The page a restart comes back to, relative to the dashboard.
+    back: &'a str,
     status: &'a [inspect::StatusRow],
     error: &'a str,
 }
@@ -788,8 +806,11 @@ async fn respond_node(
     // Section 10.7: signing in, and the actions for a session that may
     // act.
 
-    if request.method() == Method::POST && request.uri().path() == "/actions/maintenance" {
-        return act(request, &actions).await;
+    if request.method() == Method::POST
+        && let Some(name) = request.uri().path().strip_prefix("/actions/")
+    {
+        let name = name.to_owned();
+        return act(request, &name, &actions).await;
     }
 
     if request.method() != Method::GET && request.method() != Method::HEAD {
@@ -853,7 +874,7 @@ async fn respond_node(
         }));
     }
 
-    if let Some(response) = inspect_paths(request, debug).await {
+    if let Some(response) = inspect_paths(request, debug, csrf.as_deref()).await {
         return response;
     }
 
@@ -914,7 +935,11 @@ async fn respond_node(
 /// and the same answers as JSON, each asking a release's workers the
 /// operation it shows, as `muructl debug` does. A page or fragment
 /// renders a refusal in its place; the JSON answers 409 with it.
-async fn inspect_paths(request: &Request<Incoming>, debug: &DebugSource) -> Option<Response<Body>> {
+async fn inspect_paths(
+    request: &Request<Incoming>,
+    debug: &DebugSource,
+    csrf: Option<&str>,
+) -> Option<Response<Body>> {
     use inspect::{failures, memory_views, merge_stacks, status_rows, tasks_views};
 
     let path = request.uri().path();
@@ -986,10 +1011,17 @@ async fn inspect_paths(request: &Request<Incoming>, debug: &DebugSource) -> Opti
         Err(error) => (DebugAnswer::default(), error),
     };
 
+    let back = match worker {
+        Some(index) => format!("worker?release={release}&worker={index}"),
+        None => format!("workers?release={release}"),
+    };
+
     Some(match (kind, op) {
         ("/workers", _) => page(
             WorkersPage {
                 release: &release,
+                csrf,
+                back: &back,
                 status: &status_rows(&answer),
                 error: &error,
             }
@@ -998,6 +1030,8 @@ async fn inspect_paths(request: &Request<Incoming>, debug: &DebugSource) -> Opti
         ("/worker", _) => page(
             WorkerPage {
                 release: &release,
+                csrf,
+                back: &back,
                 worker: worker.unwrap_or_default(),
                 status: &status_rows(&answer),
                 error: &error,
@@ -1007,6 +1041,8 @@ async fn inspect_paths(request: &Request<Incoming>, debug: &DebugSource) -> Opti
         (_, "status") => page(
             WorkersStatusFragment {
                 release: &release,
+                csrf,
+                back: &back,
                 status: &status_rows(&answer),
                 error: &error,
             }
@@ -1143,8 +1179,9 @@ fn login(request: &Request<Incoming>, actions: &Actions) -> Response<Body> {
 
 /// Carry out an action for a live session that may act: a form posted by
 /// a page of the dashboard's own origin with the session's token, or a
-/// script's request with its bearer token.
-async fn act(request: Request<Incoming>, actions: &Actions) -> Response<Body> {
+/// script's request with its bearer token. `name` is the action's, from
+/// the path.
+async fn act(request: Request<Incoming>, name: &str, actions: &Actions) -> Response<Body> {
     let Some((session, bearer)) = signed_in(&request, actions) else {
         return plain(
             StatusCode::FORBIDDEN,
@@ -1187,20 +1224,30 @@ async fn act(request: Request<Incoming>, actions: &Actions) -> Response<Body> {
         );
     }
 
-    let action = Action::Maintenance {
-        app: fields.get("app").cloned().unwrap_or_default(),
-        on: fields.get("state").map(String::as_str) == Some("on"),
+    let action = match Action::from_form(name, &fields) {
+        Ok(action) => action,
+        Err(error) => return plain_text(StatusCode::BAD_REQUEST, format!("{error}\n")),
     };
 
     match (actions.sink)(action, session.label).await {
         Ok(_) => {
             // Back to the page the form was on, which is one level up from
-            // the action's own path, under whatever prefix it is served.
+            // the action's own path, under whatever prefix it is served: a
+            // worker page names itself in `back`, a relative path of the
+            // dashboard's own.
 
+            let back = fields
+                .get("back")
+                .filter(|back| back.starts_with("workers?") || back.starts_with("worker?"))
+                .map_or_else(|| "../".to_owned(), |back| format!("../{back}"));
             let mut response = plain(StatusCode::SEE_OTHER, "done\n");
-            response
-                .headers_mut()
-                .insert(http::header::LOCATION, "../".parse().expect("static"));
+
+            if let Ok(location) = back.parse() {
+                response
+                    .headers_mut()
+                    .insert(http::header::LOCATION, location);
+            }
+
             response
         }
         Err(error) => plain_text(StatusCode::CONFLICT, format!("{error}\n")),

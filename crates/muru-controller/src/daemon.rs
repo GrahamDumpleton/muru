@@ -1056,6 +1056,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 Arc::clone(&history),
                 events.clone(),
                 dashboard_sessions.unwrap_or_else(muru_dashboard::Sessions::new),
+                Arc::clone(&handle.store),
             )))
         }
         None => None,
@@ -1886,6 +1887,9 @@ impl Daemon {
             for (group, status) in self.scale_status(app, id).unwrap_or_default() {
                 scaling.push(ScalingRow {
                     release: format!("{app}@{id}"),
+                    app: app.clone(),
+                    id: id.clone(),
+                    pinned: status.pinned.is_some(),
                     group,
                     workers: if status.desired == status.ready {
                         status.ready.to_string()

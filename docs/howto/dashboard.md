@@ -8,9 +8,9 @@ address with charts over the last hour or day. The daemon's needs a
 signed-in session, serves the same figures as JSON, with rollouts,
 scaling and maintenance, streams its history and events with
 Server-Sent Events, and can turn maintenance mode on and off for a
-session that may act, and shows each running release's workers with
-their status, stacks, tasks and memory. The other actions are still to
-come.
+session that may act, which can also promote, roll back and drain
+releases, pin a group's workers and restart a worker, and shows each
+running release's workers with their status, stacks, tasks and memory.
 ```
 
 ## In development mode
@@ -177,15 +177,42 @@ actions = true
 $ muructl dashboard login --actions
 ```
 
-A session that may act shows a button beside each application's
-serving release that turns [maintenance mode](error-pages.md#maintenance-mode)
-on or off. Deploys, rollbacks, drains and scaling stay with `muructl`.
+A session that may act shows buttons beside each release and worker
+group, and each worker, for what `muructl` would do:
+
+- beside the serving release, turning [maintenance
+  mode](error-pages.md#maintenance-mode) on or off, and rolling back to
+  the previous release when there is one;
+- beside a ready release that is not serving, promoting it, as after a
+  held deploy or a rollout;
+- beside any running release, draining it, which takes it out of
+  traffic when it serves and stops it;
+- beside each worker group in the scaling table, pinning its workers to
+  a count, and unpinning a pinned group so the autoscaler decides again;
+- beside each ready worker on the [workers
+  pages](#looking-into-the-workers), restarting it, with `force` to kill
+  it at once as `muructl restart --force` does.
+
+Deploys and rollouts stay with `muructl`, and a release an overlay
+freezes is not promoted from the page.
 
 Each action is a form posted from the dashboard's own page, carrying a
 token of the session's own, so another site cannot act through a
 signed-in browser. A script with a token from `--actions --token` posts
-the same form fields, `app` and `state` (`on` or `off`), to
-`/actions/maintenance`. Every action is recorded as a `dashboard.action`
-event naming the start of the session's id, beside the event the action
-itself raises, such as `maintenance.changed`, and every link or token
-issued is a `dashboard.login_issued` event.
+the same form fields to the action's path:
+
+| Path | Fields |
+| --- | --- |
+| `/actions/maintenance` | `app`, `state` (`on` or `off`) |
+| `/actions/promote` | `app`, `release` |
+| `/actions/rollback` | `app` |
+| `/actions/drain` | `app`, `release` |
+| `/actions/scale` | `app`, `release`, `group`, and `processes` to pin or `unpin=on` |
+| `/actions/restart` | `app`, `release`, `worker`, and `force=on` to kill it at once |
+
+The answer is 303 back to the page, 400 for a form that is not an
+action, or 409 with the reason the daemon refused it, as `muructl`
+would print. Every action is recorded as a `dashboard.action` event
+naming the start of the session's id, beside the events the action
+itself raises, such as `maintenance.changed` or `worker.restarted`, and
+every link or token issued is a `dashboard.login_issued` event.
