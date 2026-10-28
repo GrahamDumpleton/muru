@@ -7,8 +7,9 @@ The daemon serves request counters and histograms, slot and queue gauges,
 the workers ready, each worker's requests and memory and each
 listener's connections in the Prometheus text format, on a metrics
 listener and through `muructl metrics`, and a development run serves the
-request and connection figures from its dashboard. Worker CPU, scaling
-and TLS metrics, and OTLP export are still to come.
+request and connection figures from its dashboard, with each worker's
+CPU time and the autoscaler's decisions and reaps beside them. TLS
+metrics and OTLP export are still to come.
 ```
 
 Muru counts what the edge does with each request and what the daemon
