@@ -127,6 +127,11 @@ def log(message: str) -> None:
 
 
 INTERFACES = ("auto", "wsgi", "asgi", "grpc")
+
+# The longest a Unix socket path may be, its NUL included: sun_path is 104
+# bytes on macOS and 108 on Linux.
+
+SOCKET_PATH_LIMIT = 104 if sys.platform == "darwin" else 108
 FACTORY_PHASES = ("worker", "host")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -3371,6 +3376,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.preload_gc_collect:
             gc.collect()
+
+    # A socket past the platform's path limit never binds, so the longest
+    # a default worker's socket can be is checked once here; a named
+    # group's sockets carry its name as well.
+
+    longest = os.path.join(args.socket_dir, "worker-99-g99.sock")
+
+    if len(longest.encode()) >= SOCKET_PATH_LIMIT:
+        log(
+            f"the worker socket path {longest} would be {len(longest.encode())} bytes, past "
+            f"the {SOCKET_PATH_LIMIT}-byte limit of this platform; give the daemon or "
+            "muructl run a shorter run directory"
+        )
+        return 1
 
     os.makedirs(args.socket_dir, exist_ok=True)
     host = Host(

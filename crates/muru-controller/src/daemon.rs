@@ -857,6 +857,11 @@ struct Daemon {
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
 pub async fn run(mut config: Config) -> anyhow::Result<()> {
+    config
+        .locations
+        .check_run_dir()
+        .map_err(|error| anyhow::anyhow!(error))?;
+
     // A [proxy] table the edge would refuse is refused here, before
     // anything is bound.
 
