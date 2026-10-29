@@ -109,8 +109,9 @@ needs no cooperation from the stuck thread), a fresh worker is forked on
 a new socket and the edge routes to it as soon as it listens. The stuck
 worker gets `hard_drain_grace` to finish its other requests, is then told
 to stop, and is killed `shutdown_timeout` later if it has not. The stuck
-request's client is answered by the edge when its connection to the
-worker closes, and a `worker.timeout_killed` event records what happened.
+request cannot finish, so its client is answered at once, `504` with the
+reason `hard_timeout`, rather than when the worker is finally killed, and
+a `worker.timeout_killed` event records what happened.
 
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |
@@ -178,7 +179,10 @@ database call in an `async def`, holds every request in the worker. The
 loop beats twice a second, and a watchdog outside Python notices when it
 has not beaten for the loop stall timeout. The worker is then replaced
 as for the hard timeout, stacks and all, with a `worker.loop_stalled`
-event before the `worker.timeout_killed` one.
+event before the `worker.timeout_killed` one, and every request it held
+is answered at once, `502` with the reason `worker_stalled`, since none
+of them can finish. The GIL stall timeout below answers them the same
+way.
 
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |
@@ -207,8 +211,9 @@ to the log by `faulthandler`, with a `worker.gil_stalled` event before
 the `worker.timeout_killed` one.
 
 The host also times each worker's reports, which the worker sends from
-outside Python once a second, and replaces a worker that has sent none
-for the same period: one stopped by a signal, or frozen whole.
+outside Python once a second, and replaces a worker whose next report
+is the same period late: one stopped by a signal, or frozen whole. Its
+requests are answered `502 worker_stalled` as well.
 
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |

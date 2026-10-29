@@ -17,10 +17,11 @@ MB = 1024 * 1024
 
 
 def wait_for(
-    predicate: Callable[[], bool], timeout: float = 30.0, server: support.Server | None = None
+    predicate: Callable[[], bool], timeout: float = 60.0, server: support.Server | None = None
 ) -> None:
     """Wait for the predicate; a timeout shows the server's log, so that a
-    recycle that stalled can be placed."""
+    recycle that stalled can be placed. A loaded CI runner has taken just
+    over thirty seconds to recycle, so the wait is twice that."""
 
     deadline = time.monotonic() + timeout
 

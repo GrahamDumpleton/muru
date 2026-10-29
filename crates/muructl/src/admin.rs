@@ -307,6 +307,9 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
 /// writing to the daemon log, waited for until its socket answers.
 pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve();
+    locations
+        .check_run_dir()
+        .map_err(|error| anyhow::anyhow!(error))?;
     let socket = locations.admin_socket();
     if let Ok(mut client) = client::connect(&socket).await
         && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await

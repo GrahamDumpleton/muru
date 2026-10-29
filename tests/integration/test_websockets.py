@@ -319,13 +319,20 @@ websocket_drain_grace = '{grace}s'
     try:
         assert "ready and serving" in daemon.muructl("apply", "-f", str(config)).stdout
 
-        with connect(f"ws://127.0.0.1:{daemon.port}/ws/echo", open_timeout=10) as socket_:
+        # One socket has exchanged a message, the other has sent nothing
+        # since it connected; the drain closes both the same way.
+
+        with (
+            connect(f"ws://127.0.0.1:{daemon.port}/ws/echo", open_timeout=10) as socket_,
+            connect(f"ws://127.0.0.1:{daemon.port}/ws/echo", open_timeout=10) as idle,
+        ):
             socket_.send("hello")
             assert socket_.recv() == "hello"
+            time.sleep(0.5)
             started = time.monotonic()
 
-            # The worker keeps the socket for its grace, then closes it
-            # with 1001 itself, and the drain is over once it has.
+            # The worker keeps the sockets for their grace, then closes
+            # them with 1001 itself, and the drain is over once it has.
 
             assert "is stopped" in daemon.muructl("drain", "chat@r1").stdout
             drained = time.monotonic() - started
@@ -334,10 +341,15 @@ websocket_drain_grace = '{grace}s'
             with pytest.raises(ConnectionClosed) as closed:
                 socket_.recv()
 
-        assert closed.value.rcvd is not None
-        assert closed.value.rcvd.code == 1001
+            with pytest.raises(ConnectionClosed) as idle_closed:
+                idle.recv()
+
+        for ended in (closed, idle_closed):
+            assert ended.value.rcvd is not None
+            assert ended.value.rcvd.code == 1001
+
         assert "websocket disconnected with 1001" in daemon.muructl("logs", "chat@r1").stdout
         assert "websocket=closed by=edge code=1001" in daemon.muructl("logs", "--access").stdout
-        assert 'by="edge",close="drained"} 1' in daemon.muructl("metrics").stdout
+        assert 'by="edge",close="drained"} 2' in daemon.muructl("metrics").stdout
     finally:
         daemon.stop()

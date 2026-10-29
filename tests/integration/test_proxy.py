@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -218,6 +219,8 @@ app = "shop"
 
 
 def test_a_bad_proxy_table_refuses_to_start(tmp_path: Path) -> None:
+    # The run directory is short, so the proxy table is what refuses.
+
     import subprocess
 
     muructl = support.muructl_path()
@@ -234,7 +237,7 @@ def test_a_bad_proxy_table_refuses_to_start(tmp_path: Path) -> None:
             "--state-dir",
             str(tmp_path / "state"),
             "--run-dir",
-            str(tmp_path / "run"),
+            tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"),
             "--log-dir",
             str(tmp_path / "logs"),
             "--listen",

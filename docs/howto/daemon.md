@@ -206,9 +206,12 @@ locations for the platform, or the system locations with `--system`:
 override each, as do `MURU_STATE_DIR`, `MURU_RUN_DIR`, `MURU_LOG_DIR`,
 `MURU_CACHE_DIR` and `MURU_CONFIG`, and the directories systemd provides
 through `StateDirectory=` and its siblings are used when set. `muructl
-daemon run` prints every location and which rule chose it. The socket
-path is limited to about a hundred bytes, so a deep `--run-dir` is
-refused with a message saying so.
+daemon run` prints every location and which rule chose it. The run
+directory must be an absolute path, and a Unix socket path is limited to
+104 bytes on macOS and 108 on Linux, so a run directory too deep to leave
+room for the workers' sockets, which sit about 35 bytes plus the
+application's name below it, is refused at start with a message saying
+so.
 
 The configuration file is optional. Its `[[listener]]` entries name the
 addresses to serve, each with `tls = true` when the edge terminates TLS

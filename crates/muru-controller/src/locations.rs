@@ -59,7 +59,54 @@ pub struct Locations {
     pub cache: Location,
 }
 
+/// The longest a Unix socket path may be on this platform, its NUL
+/// included: sun_path is 104 bytes on macOS and 108 on Linux.
+pub const SOCKET_PATH_LIMIT: usize = if cfg!(target_os = "macos") { 104 } else { 108 };
+
+/// What a worker's socket path takes below the run directory besides the
+/// application's name: `/apps/APP/RID/RID/worker-N-gG.sock` with a release
+/// id of four characters and two digits each for the worker and its
+/// generation.
+const SOCKET_PATH_OVERHEAD: usize =
+    "/apps/".len() + "/r999".len() * 2 + "/worker-99-g99.sock".len();
+
+/// The room an application's name must have in the socket path for the
+/// run directory to be accepted at all.
+const SHORTEST_NAME_ROOM: usize = 8;
+
 impl Locations {
+    /// Check the run directory before anything binds a socket under it.
+    /// It must be absolute, since the workers and the edge bind their
+    /// sockets by the paths they are given wherever they run, and short
+    /// enough to leave a worker's socket path within the platform's
+    /// limit, which it otherwise exceeds only once a release starts.
+    pub fn check_run_dir(&self) -> Result<(), String> {
+        let run = &self.run.path;
+
+        if run.is_relative() {
+            return Err(format!(
+                "the run directory {} is a relative path; --run-dir or MURU_RUN_DIR must be \
+                 absolute",
+                run.display()
+            ));
+        }
+
+        let length = run.as_os_str().len();
+        let room = SOCKET_PATH_LIMIT.saturating_sub(length + SOCKET_PATH_OVERHEAD + 1);
+
+        if room < SHORTEST_NAME_ROOM {
+            return Err(format!(
+                "the run directory {} is {length} bytes long, which leaves {room} bytes for an \
+                 application's name in its workers' socket paths, limited to \
+                 {SOCKET_PATH_LIMIT} bytes on this platform; give --run-dir or MURU_RUN_DIR a \
+                 shorter path",
+                run.display()
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Resolve every location for the given options and environment.
     pub fn resolve(options: &Options) -> Self {
         let mode = if options.system || is_root() {

@@ -105,7 +105,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | 408, 411, 413, 421, 426 | client_timeout, length_required, body_too_large, upload_too_large, too_many_files, misdirected, upgrade_not_allowed |
 | 429 | rate_limited |
 | 500 | app_error, redirect_loop, sendfile_refused |
-| 502 | worker_crashed, worker_unavailable, upstream_failed |
+| 502 | worker_crashed, worker_stalled, worker_unavailable, upstream_failed |
 | 503 | queue_full, no_workers, cold_start_timeout, release_failed, draining, maintenance, read_only, auth_unavailable, edge_overloaded, mount_not_loaded |
 | 504 | deadline, soft_timeout, hard_timeout |
 | 507 | upload_spool_full |

@@ -1021,6 +1021,10 @@ pub struct Routing {
     /// With no host declared, the default application and the policy
     /// that chooses among its releases, when it has one (section 9.3).
     default_policy: Option<(String, Policy)>,
+    /// The application the default workers belong to, when a snapshot
+    /// names it, so a preview can reach its other releases (a held one,
+    /// section 9.2) without a host declared.
+    default_app: Option<String>,
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
@@ -1117,6 +1121,7 @@ impl Routing {
             upstreams: HashMap::new(),
             classifier: crate::classify::Classifier::default(),
             default_policy: None,
+            default_app: None,
             h2c: HashMap::new(),
         }
     }
@@ -1203,6 +1208,17 @@ impl Routing {
         // The default workers are one application's, found by its sockets
         // so its groups come along and its pools are shared; without one,
         // a plain pool.
+
+        let default_name = if snapshot.default_app.is_empty() {
+            snapshot
+                .apps
+                .iter()
+                .find(|app| app.sockets == snapshot.worker_sockets)
+                .map(|app| app.app.clone())
+        } else {
+            Some(snapshot.default_app.clone())
+        }
+        .filter(|name| apps.contains_key(name));
 
         let default_app = if snapshot.default_app.is_empty() {
             snapshot
@@ -1305,6 +1321,7 @@ impl Routing {
             upstreams: upstreams.clone(),
             classifier,
             default_policy,
+            default_app: default_name,
             h2c,
         };
 
@@ -1613,15 +1630,19 @@ impl Routing {
     ) -> Decision {
         if self.hosts.is_empty() {
             // A rollout of the default application chooses among its
-            // releases as a route's policy does.
+            // releases as a route's policy does, and without one a
+            // preview still reaches a held release of it.
 
             let mut cookies = Vec::new();
 
-            let selection = match &self.default_policy {
-                Some((app, policy)) => {
+            let selection = match (&self.default_policy, &self.default_app) {
+                (Some((app, policy)), _) => {
                     self.selection_for(app, Some(policy), path, client, &mut cookies, origin)
                 }
-                None => self.default.select(path, client, origin),
+                (None, Some(app)) => {
+                    self.selection_for(app, None, path, client, &mut cookies, origin)
+                }
+                (None, None) => self.default.select(path, client, origin),
             };
 
             return match selection {
