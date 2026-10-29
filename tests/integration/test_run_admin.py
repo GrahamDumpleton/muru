@@ -10,7 +10,9 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -244,3 +246,68 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert "is not serving" in refused.value.read().decode()
     finally:
         server.stop()
+
+
+PAUSED = """
+import os
+
+
+def application(environ, start_response):
+    value = 20
+
+    if environ["PATH_INFO"] == "/pause":
+        breakpoint(timeout=float(environ.get("QUERY_STRING") or 30))
+
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [f"value={value}".encode()]
+"""
+
+
+def test_a_breakpoint_is_debugged_under_a_run(runtime: Path, tmp_path: Path) -> None:
+    # Section 11.7 under section 13.1: breakpoint() names the command
+    # that attaches, and it works as it is, with no debug_exec to set.
+
+    project = tmp_path / "paused"
+    project.mkdir()
+    (project / "paused.py").write_text(PAUSED)
+    server = support.start(
+        "paused:application",
+        workers=1,
+        threads=2,
+        chdir=project,
+        env={"MURU_RUN_DIR": str(runtime)},
+    )
+
+    try:
+        assert server.wait_for_log("admin socket"), server.log()
+        server.mark_log()
+        thread, answers = in_background(lambda: server.get("/pause"))
+        assert server.wait_for_log("waits 30 s for muructl debug attach paused --worker 0")
+
+        session = muructl(
+            runtime,
+            "debug",
+            "attach",
+            "paused",
+            "--worker",
+            "0",
+            cwd=project,
+            stdin="p value\nvalue = 99\ncontinue\n",
+        )
+        assert "muru: attached to worker 0" in session.stderr
+        assert "paused.py" in session.stderr
+        assert "(Pdb) 20" in session.stdout.replace("\n", " ")
+        thread.join(30)
+        assert answers[0].body == b"value=99"
+        assert server.wait_for_log("muru: debug.attached: a debugger session opened in worker 0")
+    finally:
+        server.stop()
+
+
+def in_background(
+    call: Callable[[], support.Response],
+) -> tuple[threading.Thread, list[support.Response]]:
+    answers: list[support.Response] = []
+    thread = threading.Thread(target=lambda: answers.append(call()))
+    thread.start()
+    return thread, answers

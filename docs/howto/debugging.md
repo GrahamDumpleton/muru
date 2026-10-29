@@ -173,7 +173,9 @@ raised:
 muructl debug exec shop --worker 0 -- 'import myapp.cache; len(myapp.cache.entries)'
 ```
 
-It is off unless the daemon's configuration file allows it:
+It is off unless the daemon's configuration file allows it, and on
+under `muructl run`, where the person at the terminal started the
+workers:
 
 ```toml
 [daemon]
@@ -202,7 +204,10 @@ def checkout(request):
 ```
 
 `muructl debug attach` opens a pdb session at the waiting breakpoint,
-taking the worker that waits unless `--worker` names one:
+taking the worker that waits unless `--worker` names one. The event's
+line names the command to run, with the application as the daemon or
+the run calls it, and under `muructl run` it works as it is, with no
+`debug_exec` to set:
 
 ```
 $ muructl debug attach shop

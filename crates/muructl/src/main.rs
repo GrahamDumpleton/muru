@@ -1897,10 +1897,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+
+    // The application's name, as the edge labels it and muru.context()
+    // reports it, so a command the log names works as it is.
+
+    let label = app_name(&resolved.entrypoint).replace('_', "-");
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
-        name: None,
+        name: Some(label.clone()),
         release: None,
         interface: resolved.interface,
         factory: resolved.factory,
@@ -2031,8 +2036,6 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .attach(control);
 
     let (http_address, https_address) = addresses(&args);
-
-    let label = app_name(&resolved.entrypoint).replace('_', "-");
 
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,

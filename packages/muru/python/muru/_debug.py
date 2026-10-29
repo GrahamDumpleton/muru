@@ -317,11 +317,17 @@ def breakpoint_hook(*args: Any, timeout: float = BREAKPOINT_TIMEOUT, **kwargs: A
 
     _native.suspend_timeouts()
     index = _worker["index"]
+
+    # The line names the command that works as it is: the application
+    # as the daemon or the run names it, and this worker.
+
+    from muru import context
+
     event(
         "debug.breakpoint",
         "warning",
         f"breakpoint() at {waiting.where} waits {timeout:g} s for muructl debug attach "
-        f"--worker {index}",
+        f"{context().app} --worker {index}",
     )
 
     # Waiting in a coroutine holds the event loop, so the wait beats for
