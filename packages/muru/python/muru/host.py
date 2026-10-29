@@ -169,6 +169,108 @@ def interface_name(interface: str) -> str:
     return "gRPC" if interface == "grpc" else interface.upper()
 
 
+# What a call passes: environ and start_response, or scope, receive and send.
+
+ARGUMENTS = {"wsgi": 2, "asgi": 3}
+
+
+def positional_shape(app: Any) -> tuple[int, int, str | None] | None:
+    """Return the positional arguments ``app`` needs and takes, and a required keyword-only name.
+
+    The signature is the callable's own: a class is read through its
+    constructor, since calling it is what serves a request, and an object
+    through its ``__call__``. ``*args`` takes any number. None when Python
+    cannot tell, as for some callables written in C, which are then taken
+    as they are.
+    """
+
+    try:
+        signature = inspect.signature(app)
+    except (TypeError, ValueError):
+        return None
+
+    required = accepted = 0
+    keyword = None
+
+    for parameter in signature.parameters.values():
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
+            accepted += 1
+
+            if parameter.default is parameter.empty:
+                required += 1
+        elif parameter.kind is parameter.VAR_POSITIONAL:
+            accepted = sys.maxsize
+        elif parameter.kind is parameter.KEYWORD_ONLY and parameter.default is parameter.empty:
+            keyword = keyword or parameter.name
+
+    return required, accepted, keyword
+
+
+def check_arguments(spec: str, app: Any, interface: str, declared: bool) -> None:
+    """Refuse ``app`` when it cannot be called as a ``interface`` application is.
+
+    A WSGI application is called with two positional arguments and an
+    ASGI application with three. A callable with no required positional
+    parameters is most likely an application factory named without the
+    factory setting, which would otherwise fail on every request; one
+    that fits the other interface is refused rather than guessed at.
+    """
+
+    shape = positional_shape(app)
+
+    if shape is None:
+        return
+
+    required, accepted, keyword = shape
+    wanted = ARGUMENTS[interface]
+    name = interface_name(interface)
+
+    if keyword is None and required <= wanted <= accepted:
+        return
+
+    if keyword is not None:
+        raise RuntimeError(
+            f"{spec} has a required keyword-only parameter {keyword!r}, which a {name} "
+            "application is never passed"
+        )
+
+    if required == 0 and accepted < wanted:
+        raise RuntimeError(
+            f"{spec} takes no required arguments, so it cannot be a {name} application; if it "
+            "is an application factory, set factory = true in [tool.muru], or give --factory "
+            "when the entrypoint is named on the command line"
+        )
+
+    other = "asgi" if interface == "wsgi" else "wsgi"
+    other_name = interface_name(other)
+    takes = f"takes {ARGUMENTS[other]} arguments, as an {other_name} application does"
+
+    if required <= ARGUMENTS[other] <= accepted:
+        if declared:
+            raise RuntimeError(f"{spec} is declared {name} but {takes}; declare it as {other}")
+
+        if interface == "asgi":
+            raise RuntimeError(
+                f"{spec} is a coroutine function, so it cannot be served as WSGI, but {takes}"
+            )
+
+        raise RuntimeError(
+            f"{spec} {takes}, but is not a coroutine function, so it was detected as WSGI; "
+            "declare interface = 'asgi' if it is one"
+        )
+
+    if accepted == sys.maxsize:
+        count = f"at least {required}"
+    elif required == accepted:
+        count = str(required)
+    else:
+        count = f"{required} to {accepted}"
+
+    raise RuntimeError(
+        f"{spec} takes {count} positional arguments, where a {name} application is passed {wanted}"
+    )
+
+
 def resolve_interface(spec: str, app: Any, interface: str) -> str:
     """Return the interface the application is served with: ``wsgi``, ``asgi`` or ``grpc``.
 
@@ -176,15 +278,15 @@ def resolve_interface(spec: str, app: Any, interface: str) -> str:
     detected, since its entrypoint is a registration function (section
     6.13). A declared interface is trusted, except that an application
     declared WSGI whose callable is a coroutine function cannot be served
-    that way and is refused.
+    that way and is refused. Either way the callable must take the
+    arguments the interface passes, which catches a factory named without
+    the factory setting at load rather than on every request.
     """
 
     if interface == "grpc":
         return interface
 
     detected = detect_interface(app)
-    if interface == "auto":
-        return detected
 
     if interface == "wsgi" and detected == "asgi":
         raise RuntimeError(
@@ -192,7 +294,9 @@ def resolve_interface(spec: str, app: Any, interface: str) -> str:
             "leave the interface to be detected"
         )
 
-    return interface
+    resolved = detected if interface == "auto" else interface
+    check_arguments(spec, app, resolved, declared=interface != "auto")
+    return resolved
 
 
 def app_name(spec: str) -> str:
