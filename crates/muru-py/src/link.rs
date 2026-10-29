@@ -149,10 +149,16 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         let mut lifeline = Lifeline::new(lifeline)?;
 
         // The first report says the worker is listening; the rest keep
-        // the host informed of what it is doing.
+        // the host informed of what it is doing. On a thread of its own,
+        // so the host's view (and its hard timeout, section 7.6) never
+        // waits on the link's runtime.
 
         if let Some(fd) = report {
-            tokio::spawn(report_loop(fd, Arc::clone(&accepting), memory_interval));
+            let report_shared = Arc::clone(&accepting);
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-report".to_owned())
+                .spawn(move || report_thread(fd, &report_shared, memory_interval, &stop))?;
         }
 
         // Section 7.6: the watchdog interrupts requests past the soft
@@ -647,7 +653,7 @@ fn serde_json_string(text: &str) -> String {
 /// in flight, the age of the oldest, and requests served, and every
 /// `memory_interval` the worker's memory too. A write that cannot
 /// complete at once (the host is behind) is skipped.
-async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
+fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &AtomicBool) {
     // SAFETY: fcntl on a descriptor inherited for this purpose, setting
     // a flag; the descriptor stays open for the life of the worker.
 
@@ -692,7 +698,11 @@ async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
             libc::write(fd, line.as_ptr().cast(), line.len());
         }
 
-        tokio::time::sleep(REPORT_INTERVAL).await;
+        std::thread::sleep(REPORT_INTERVAL);
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
@@ -1051,7 +1061,7 @@ async fn handle_asgi_request(
     request_end: bool,
     shared: &Arc<Shared>,
     asgi: &asgi::Asgi,
-    runner: Py<PyAny>,
+    runner: Arc<Py<PyAny>>,
 ) -> io::Result<Option<frame::Frame>> {
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();

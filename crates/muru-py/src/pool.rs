@@ -260,11 +260,13 @@ pub fn thread_names(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 
 /// One mount of a release (section 6.7): its application and, for an
 /// ASGI mount, the runner scheduled on the loop for each request.
+#[derive(Clone)]
 pub struct Mount {
-    /// The application callable.
-    pub app: Py<PyAny>,
+    /// The application callable, shared so a request's lookup needs no
+    /// interpreter.
+    pub app: Arc<Py<PyAny>>,
     /// The runner, when the mount is ASGI.
-    pub runner: Option<Py<PyAny>>,
+    pub runner: Option<Arc<Py<PyAny>>>,
     /// The mount's own threads, when it has them: those it reserves and
     /// the most requests it runs at once.
     pub threads: Option<(usize, usize)>,
@@ -275,19 +277,6 @@ pub struct Mount {
     /// The pool of its reserved threads, for a WSGI mount that reserves
     /// any; its other requests run on the shared pool.
     pub pool: Option<Arc<Pool>>,
-}
-
-impl Mount {
-    /// A new reference to the same mount.
-    pub fn clone_ref(&self, py: Python<'_>) -> Self {
-        Self {
-            app: self.app.clone_ref(py),
-            runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
-            threads: self.threads,
-            limits: self.limits,
-            pool: self.pool.clone(),
-        }
-    }
 }
 
 /// The soft timeout (section 7.6): how long a request may run before it
@@ -302,8 +291,9 @@ pub struct SoftTimeout {
 
 /// State shared by every request handled by this worker.
 pub struct Shared {
-    /// The default mount's application callable, at /.
-    pub app: Py<PyAny>,
+    /// The default mount's application callable, at /, shared so a
+    /// request's lookup needs no interpreter.
+    pub app: Arc<Py<PyAny>>,
     /// The named mounts (section 6.7), by name.
     pub mounts: HashMap<String, Mount>,
     /// The `wsgi.errors` stream (sys.stderr at start-up).
@@ -351,7 +341,7 @@ impl Shared {
     ) -> std::io::Result<Self> {
         let threads = threads.max(1);
         Ok(Self {
-            app,
+            app: Arc::new(app),
             mounts,
             errors,
             threads,
@@ -382,23 +372,22 @@ impl Shared {
     }
 
     /// The application a request head names: the default mount for an
-    /// empty name, else the mount of that name.
+    /// empty name, else the mount of that name. This runs on a link
+    /// thread, so it must not attach to the interpreter: a request stuck
+    /// in C code holding the GIL would block the thread, and with it the
+    /// runtime's timers and every other connection (section 7.6).
     pub fn mount(&self, name: &str) -> Option<Mount> {
         if name.is_empty() {
             return Some(Mount {
-                app: Python::attach(|py| self.app.clone_ref(py)),
-                runner: self.asgi.as_ref().and_then(|asgi| {
-                    Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
-                }),
+                app: Arc::clone(&self.app),
+                runner: self.asgi.as_ref().and_then(|asgi| asgi.runner.clone()),
                 threads: None,
                 limits: None,
                 pool: None,
             });
         }
 
-        self.mounts
-            .get(name)
-            .map(|mount| Python::attach(|py| mount.clone_ref(py)))
+        self.mounts.get(name).cloned()
     }
 
     /// wsgi.multithread for a request to the mount (section 6.5): whether
