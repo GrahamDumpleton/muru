@@ -1538,6 +1538,13 @@ impl Routing {
         self
     }
 
+    /// The same tables trusting these proxies, for a development run,
+    /// which has no snapshot to carry them.
+    pub fn with_trust(mut self, trust: Trust) -> Self {
+        self.trust = trust;
+        self
+    }
+
     /// Whether any virtual host is declared.
     pub fn has_hosts(&self) -> bool {
         !self.hosts.is_empty()

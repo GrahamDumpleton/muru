@@ -25,8 +25,13 @@ muructl run app:create_app --factory
 ```
 
 The factory is called in each worker after the fork, so a database pool or
-cache client it creates belongs to that worker. Flask's own development
-server is not involved; `flask run` and `muructl run` are alternatives.
+cache client it creates belongs to that worker. Without `--factory`, the
+factory itself would be served and fail on every request, so Muru refuses
+to start, since a callable taking no required arguments cannot be an
+application. The `factory` key of the `[tool.muru]` table applies to the
+table's own entrypoint only; an entrypoint named on the command line needs
+`--factory`. Flask's own development server is not involved; `flask run`
+and `muructl run` are alternatives.
 
 Flask catches an exception a view raises, logs it through its logger,
 which goes to standard error and so appears in the terminal tagged with

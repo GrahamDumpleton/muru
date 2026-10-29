@@ -102,20 +102,18 @@ uv run python -m http.server 9001 --bind 127.0.0.1 --directory notes
 
 ## Hosts and routes
 
-Now tell the daemon which name goes where. Save this as `sites.toml`,
-with the full path of your `blog` directory (`pwd` in `node` prints the
-rest of it):
+Now tell the daemon which name goes where. Save this as `sites.toml`
+in `node`:
 
 ```{literalinclude} code/node/sites.toml
 :language: toml
-:emphasize-lines: 23
 ```
 
-Each `[host]` is a site: the names it answers to and its certificate,
-taken from the file's directory when the path is relative. Each
-`[[route]]` sends a host's requests somewhere: to an application, to a
-directory the edge serves itself, or to an `[upstream]`, an HTTP server
-Muru does not manage. Apply it:
+Each `[host]` is a site: the names it answers to and its certificate.
+Each `[[route]]` sends a host's requests somewhere: to an application, to
+a directory the edge serves itself, or to an `[upstream]`, an HTTP server
+Muru does not manage. Relative paths, the certificate's and the `blog`
+directory's, are taken from the file's directory. Apply it:
 
 ```
 muructl apply -f sites.toml

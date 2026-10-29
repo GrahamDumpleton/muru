@@ -52,8 +52,7 @@ def make_project(base: Path) -> Path:
     (project / "pyproject.toml").write_text('[tool.muru]\nentrypoint = "mysite.wsgi:application"\n')
     shutil.copy(CODE / "urls.py", project / "mysite" / "urls.py")
     shutil.copy(CODE / "production.py", project / "mysite" / "production.py")
-    site = (CODE / "site.toml").read_text().replace("/home/you/mysite", str(project))
-    (project / "site.toml").write_text(site)
+    shutil.copy(CODE / "site.toml", project / "site.toml")
     manage(project, "migrate")
     manage(
         project,

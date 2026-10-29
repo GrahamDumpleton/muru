@@ -142,6 +142,10 @@ pub struct Trust {
     headers: Vec<String>,
     recursive: bool,
     consume: bool,
+    /// The peers' headers are applied, but they are not proxies for the
+    /// connection share and timeouts: a development run's loopback peers
+    /// are browsers and test clients as often as a proxy.
+    headers_only: bool,
 }
 
 /// What the forwarding headers of a trusted peer said.
@@ -160,6 +164,25 @@ pub struct Resolved {
 }
 
 impl Trust {
+    /// What a development run trusts: loopback peers, for every forwarding
+    /// header but X-Real-IP, so a proxy on the same machine that mounts
+    /// the application under a path (jupyter-server-proxy, code-server)
+    /// gets its prefix applied with no setup. Their headers alone: a
+    /// loopback peer is as often a browser as a proxy, so it keeps a
+    /// client's connection share and timeouts.
+    pub fn loopback() -> Self {
+        Self {
+            networks: vec![Network::Loopback],
+            headers: FORWARDING_HEADERS[..6]
+                .iter()
+                .map(|header| (*header).to_owned())
+                .collect(),
+            recursive: true,
+            consume: false,
+            headers_only: true,
+        }
+    }
+
     /// Compile the snapshot's proxy settings.
     pub fn from_snapshot(proxy: &pb::Proxy) -> Result<Self, String> {
         let mut networks = Vec::new();
@@ -185,11 +208,18 @@ impl Trust {
             headers,
             recursive: proxy.recursive,
             consume: proxy.consume,
+            headers_only: false,
         })
     }
 
-    /// Whether a peer may speak for the client.
+    /// Whether a peer is a trusted proxy, for the connection share and
+    /// timeouts a proxy gets (section 4.18).
     pub fn trusts(&self, peer: &SocketAddr) -> bool {
+        !self.headers_only && self.speaks_for_client(peer)
+    }
+
+    /// Whether a peer's forwarding headers are applied.
+    fn speaks_for_client(&self, peer: &SocketAddr) -> bool {
         self.networks
             .iter()
             .any(|network| network.contains(peer.ip()))
@@ -200,7 +230,7 @@ impl Trust {
     /// trusted one the configured types are read, then the headers are
     /// kept or consumed as configured.
     pub fn resolve(&self, peer: &SocketAddr, headers: &mut HeaderMap) -> Resolved {
-        if !self.trusts(peer) {
+        if !self.speaks_for_client(peer) {
             remove_all(headers);
             return Resolved::default();
         }

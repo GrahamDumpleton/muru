@@ -1745,12 +1745,21 @@ fn describe_upstream(upstream: &UpstreamTable) -> String {
 }
 
 /// Section 4.12: a host's or route's error pages and override, whose
-/// files must be absolute paths.
+/// files must be absolute paths to files that exist, so a missing page is
+/// refused here rather than by the edge when the snapshot reaches it.
 fn check_error_tables(
     pages: &BTreeMap<String, muru_config::ErrorPage>,
     override_: Option<&muru_config::ErrorOverride>,
 ) -> Result<(), String> {
     muru_config::check_error_pages(pages, false)?;
+
+    for (key, page) in pages {
+        if let Some(file) = &page.file
+            && !Path::new(file).is_file()
+        {
+            return Err(format!("error_pages: {key}: {file} is not a file"));
+        }
+    }
 
     if let Some(table) = override_ {
         muru_config::check_error_override(table)?;

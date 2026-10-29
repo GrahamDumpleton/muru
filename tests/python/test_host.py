@@ -128,3 +128,47 @@ def test_a_restart_is_refused_for_a_worker_the_host_cannot_replace(tmp_path: Pat
 
     instance.take_request({"id": 2, "op": "restart", "worker": 3, "args": {"force": True}})
     assert answers[-1]["error"] == "no worker 3"
+
+
+def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyPatch) -> None:
+    def wsgi(environ: object, start_response: object) -> None: ...
+    def factory() -> None: ...
+    def factory_with_defaults(config: object = None) -> None: ...
+    def three(scope: object, receive: object, send: object) -> None: ...
+    def any_args(*args: object, **kwargs: object) -> None: ...
+    def keyword(environ: object, start_response: object, *, extra: object) -> None: ...
+
+    async def asgi(scope: object, receive: object, send: object) -> None: ...
+
+    async def two_async(scope: object, receive: object) -> None: ...
+
+    assert host.resolve_interface("m:wsgi", wsgi, "auto") == "wsgi"
+    assert host.resolve_interface("m:asgi", asgi, "auto") == "asgi"
+    assert host.resolve_interface("m:any", any_args, "auto") == "wsgi"
+    assert host.resolve_interface("m:three", three, "asgi") == "asgi"
+
+    with pytest.raises(RuntimeError, match="set factory = true"):
+        host.resolve_interface("m:factory", factory, "auto")
+
+    with pytest.raises(RuntimeError, match="set factory = true"):
+        host.resolve_interface("m:factory", factory_with_defaults, "auto")
+
+    with pytest.raises(RuntimeError, match="as an ASGI application does, but is not a coroutine"):
+        host.resolve_interface("m:three", three, "auto")
+
+    with pytest.raises(RuntimeError, match="declared ASGI but takes 2 arguments"):
+        host.resolve_interface("m:wsgi", wsgi, "asgi")
+
+    with pytest.raises(RuntimeError, match="declared WSGI but takes 3 arguments"):
+        host.resolve_interface("m:three", three, "wsgi")
+
+    with pytest.raises(RuntimeError, match="coroutine function, so it cannot be served as WSGI"):
+        host.resolve_interface("m:two", two_async, "auto")
+
+    with pytest.raises(RuntimeError, match="keyword-only parameter 'extra'"):
+        host.resolve_interface("m:keyword", keyword, "auto")
+
+    # What Python cannot read the signature of is taken as it is.
+
+    monkeypatch.setattr(host.inspect, "signature", lambda app: (_ for _ in ()).throw(ValueError()))
+    assert host.resolve_interface("m:factory", factory, "auto") == "wsgi"

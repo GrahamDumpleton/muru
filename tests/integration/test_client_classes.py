@@ -342,17 +342,21 @@ rate_limits = ['applied_limit']
     exported = site.daemon.muructl("config", "export").stdout
     assert 'name = "applied"' in exported and "[rate_limit.applied_limit]" in exported
 
-    # A name the daemon's file defines, and a list that is not an
-    # absolute path, are refused.
+    # A name the daemon's file defines is refused.
 
-    tables.write_text(
-        "[[client_class]]\nname = 'partner'\nuser_agent = ['x']\n\n"
-        "[[client_class]]\nname = 'relative'\nuser_agent_list = 'lists/ai.txt'\n"
-    )
+    tables.write_text("[[client_class]]\nname = 'partner'\nuser_agent = ['x']\n")
     refused = site.daemon.muructl("apply", "-f", str(tables), check=False)
     assert refused.returncode != 0
     assert "client_class partner: the daemon configuration file defines it" in refused.stdout
-    assert "must be an absolute path" in refused.stdout
+
+    # A relative list is taken from the applied file's directory.
+
+    tables.write_text(
+        "[[client_class]]\nname = 'relative'\nuser_agent_list = 'lists/applied.txt'\n"
+    )
+    applied = site.daemon.muructl("apply", "-f", str(tables))
+    assert "create-client-class" in applied.stdout, applied.stdout
+    assert str(listed) in site.daemon.muructl("config", "export").stdout
 
     # Pruned, they are gone.
 

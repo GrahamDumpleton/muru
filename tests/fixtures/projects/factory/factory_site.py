@@ -56,3 +56,38 @@ class AsgiCallable:
         """Answer like asgi_app."""
 
         await asgi_app(scope, receive, send)
+
+
+def wsgi_app(environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:
+    """A plain WSGI application, for the argument checks."""
+
+    start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "5")])
+    return [b"wsgi\n"]
+
+
+def create_app_with_config(config: dict[str, Any] | None = None) -> Any:
+    """A factory whose only parameter has a default, so it takes no required arguments."""
+
+    return create_app()
+
+
+def three_args(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    """A plain function taking an ASGI application's three arguments."""
+
+
+def star_args(*args: Any, **kwargs: Any) -> Iterable[bytes]:
+    """A WSGI application behind a decorator-like signature, which is taken as it is."""
+
+    return wsgi_app(*args, **kwargs)
+
+
+class KeywordOnly:
+    """An object whose __call__ needs a keyword argument no interface passes."""
+
+    def __call__(
+        self, environ: dict[str, Any], start_response: Callable[..., Any], *, extra: str
+    ) -> Iterable[bytes]:
+        return wsgi_app(environ, start_response)
+
+
+keyword_only = KeywordOnly()

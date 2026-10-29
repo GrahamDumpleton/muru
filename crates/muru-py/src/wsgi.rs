@@ -10,6 +10,7 @@
 
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,6 +26,17 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
 use crate::pool::{Interrupt, Shared};
+
+/// SERVER_SOFTWARE: Muru's name and version, the version in the form
+/// PyPI gives it (0.1.0a10 for Cargo's 0.1.0-alpha.10), so it matches
+/// `muru.__version__`.
+static SERVER_SOFTWARE: LazyLock<String> = LazyLock::new(|| {
+    let version = env!("CARGO_PKG_VERSION")
+        .replace("-alpha.", "a")
+        .replace("-beta.", "b")
+        .replace("-rc.", "rc");
+    format!("muru/{version}")
+});
 
 /// One item of application output on its way to the coalescing task.
 pub enum Outgoing {
@@ -789,6 +801,7 @@ fn build_environ<'py>(
         head.http_version.as_str()
     };
     environ.set_item(intern!(py, "SERVER_PROTOCOL"), protocol)?;
+    environ.set_item(intern!(py, "SERVER_SOFTWARE"), SERVER_SOFTWARE.as_str())?;
 
     // Section 4.3: SERVER_NAME is the virtual host matched, else the
     // listener's address.

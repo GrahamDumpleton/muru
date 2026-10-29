@@ -92,6 +92,9 @@ pub struct Config {
     pub limits: Limits,
     /// How responses are compressed (section 4.17).
     pub compression: compression::Compression,
+    /// Which peers are trusted to speak for the client, until a snapshot
+    /// says otherwise (section 4.7).
+    pub trust: proxy::Trust,
     /// The HTTPS listener, when TLS is on.
     pub https: Option<Https>,
     /// Where upload routes store files (section 4.11); a route that
@@ -197,6 +200,8 @@ pub struct Pools {
     current: RwLock<Arc<routing::Routing>>,
     /// The compression policy a development run keeps across replacements.
     compression: compression::Compression,
+    /// The trusted proxies a development run keeps across replacements.
+    trust: proxy::Trust,
 }
 
 impl Pools {
@@ -208,7 +213,11 @@ impl Pools {
     /// Send new requests to another application's workers, with no
     /// hosts. Requests in flight finish on the pool they started with.
     pub fn replace(&self, pools: routing::AppPools) {
-        self.apply(routing::Routing::single(pools).with_compression(self.compression.clone()));
+        self.apply(
+            routing::Routing::single(pools)
+                .with_compression(self.compression.clone())
+                .with_trust(self.trust.clone()),
+        );
     }
 
     /// Switch to the tables of a new snapshot, handing the pools of woken
@@ -393,9 +402,11 @@ impl Edge {
                     .with_sendfile(Arc::clone(&config.sendfile))
                     .with_grpc_web(&config.grpc_web_origins),
                 )
-                .with_compression(config.compression.clone()),
+                .with_compression(config.compression.clone())
+                .with_trust(config.trust.clone()),
             )),
             compression: config.compression.clone(),
+            trust: config.trust.clone(),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
 

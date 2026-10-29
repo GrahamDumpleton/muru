@@ -4324,6 +4324,102 @@ pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyho
 /// Read one file, or every .toml file of a directory in name order, into
 /// one document, with relative source paths taken from each file's
 /// directory.
+/// Make every path in an applied document absolute against `base`, the
+/// directory of the file it came from: a release's source, interpreter
+/// and file hint roots, a host's certificate and key, a route's or an
+/// overlay's static directory, the error page files of hosts and routes,
+/// an upstream's trusted certificates and a client class's lists. A
+/// release's error page files are the exception: they are relative to
+/// its source, where the daemon checks them. (The node-wide tables
+/// belong to the daemon's own file, which the apply leaves alone.)
+fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
+    let absolute = |path: &str| {
+        if Path::new(path).is_relative() {
+            base.join(path).display().to_string()
+        } else {
+            path.to_owned()
+        }
+    };
+    let resolve = |path: &mut Option<String>| {
+        if let Some(value) = path {
+            *value = absolute(value);
+        }
+    };
+    let resolve_pages = |pages: &mut std::collections::BTreeMap<String, muru_config::ErrorPage>| {
+        for page in pages.values_mut() {
+            resolve(&mut page.file);
+        }
+    };
+
+    for app in document.app.values_mut() {
+        for release in app.release.values_mut() {
+            resolve(&mut release.source);
+
+            if let Some(python) = &release.python {
+                release.python = Some(absolute_interpreter(Path::new(python), Some(base)));
+            }
+
+            for root in &mut release.sendfile_roots {
+                *root = absolute(root);
+            }
+        }
+    }
+
+    for host in document.host.values_mut() {
+        if let Some(tls) = &mut host.tls {
+            tls.certificate = absolute(&tls.certificate);
+            tls.key = absolute(&tls.key);
+        }
+
+        resolve_pages(&mut host.error_pages);
+    }
+
+    for route in &mut document.route {
+        resolve(&mut route.static_dir);
+        resolve_pages(&mut route.error_pages);
+    }
+
+    for overlay in document.overlay.values_mut() {
+        for route in overlay.routes.values_mut() {
+            resolve_route_overlay(route, &absolute);
+        }
+    }
+
+    for upstream in document.upstream.values_mut() {
+        if let Some(tls) = &mut upstream.tls {
+            resolve(&mut tls.ca);
+        }
+    }
+
+    for class in &mut document.client_class {
+        resolve(&mut class.user_agent_list);
+        resolve(&mut class.address_list);
+    }
+}
+
+/// The paths of one route overlay and of the client routes under it.
+fn resolve_route_overlay(route: &mut muru_config::RouteOverlay, absolute: &dyn Fn(&str) -> String) {
+    if let Some(target) = &mut route.target
+        && let Some(directory) = &target.static_dir
+    {
+        target.static_dir = Some(absolute(directory));
+    }
+
+    if let Some(pages) = &mut route.error_pages {
+        for page in pages.values_mut() {
+            if let Some(file) = &page.file {
+                page.file = Some(absolute(file));
+            }
+        }
+    }
+
+    if let Some(routes) = &mut route.client_routes {
+        for route in routes.values_mut() {
+            resolve_route_overlay(route, absolute);
+        }
+    }
+}
+
 fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
     let mut files = Vec::new();
 
@@ -4356,40 +4452,14 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
         let mut parsed = muru_config::Document::parse(&text)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
 
-        // Sources are resolved here, where the file is, since the daemon
+        // Paths are resolved here, where the file is, since the daemon
         // may run elsewhere.
 
         let base = file
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let absolute = |path: &str| {
-            if Path::new(path).is_relative() {
-                base.join(path).display().to_string()
-            } else {
-                path.to_owned()
-            }
-        };
-
-        for app in parsed.app.values_mut() {
-            for release in app.release.values_mut() {
-                if let Some(source) = &release.source {
-                    release.source = Some(absolute(source));
-                }
-
-                if let Some(python) = &release.python {
-                    release.python = Some(absolute_interpreter(Path::new(python), Some(&base)));
-                }
-            }
-        }
-
-        for host in parsed.host.values_mut() {
-            if let Some(tls) = &mut host.tls {
-                tls.certificate = absolute(&tls.certificate);
-                tls.key = absolute(&tls.key);
-            }
-        }
-
+        resolve_paths(&mut parsed, &base);
         document
             .merge(parsed)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;

@@ -228,6 +228,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             access_log,
             limits,
             compression: muru_edge::compression::Compression::default(),
+            trust: muru_edge::proxy::Trust::default(),
             https: None,
             spool,
             rate_buckets: args.rate_buckets.clone(),

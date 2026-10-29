@@ -124,7 +124,12 @@ muructl config diff -f config/
 ```
 
 Each `[app.NAME.release.ID]` table needs a `source`; a relative path is
-taken from the file's own directory. The other keys are those of the
+taken from the file's own directory, as every other path in the file is:
+a route's or an overlay's `static` directory, `sendfile_roots`, a host's
+certificate and key, a host's and a route's error page files, an
+upstream's `tls.ca` and a client class's lists. A release's error page
+files are the one exception, taken from its `source`. The other keys are
+those of the
 `[tool.muru]` table (`entrypoint`, `interface`, `factory`,
 `factory_phase`, `python`, `processes`, `threads`, `sync_threads`,
 `concurrency`, `preload` and `hooks`), and what a table leaves out comes

@@ -226,10 +226,11 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     """Report the process, the thread count seen and the context.
 
     Each request also prints a line, which the host relays into the
-    release's log for the logs tests.
+    release's log for the logs tests. It is not flushed: the host makes
+    the worker's standard output line-buffered, and the test relies on it.
     """
 
-    print(f"shop: served {environ['PATH_INFO']}", flush=True)
+    print(f"shop: served {environ['PATH_INFO']}")
 
     if environ["PATH_INFO"].endswith("/error"):
         raise RuntimeError("deliberate failure")
