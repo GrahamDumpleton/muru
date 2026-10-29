@@ -9,6 +9,7 @@ application chose.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import sys
 import time
@@ -245,7 +246,15 @@ def test_open_websockets_are_counted_apart_from_requests() -> None:
             assert [(row["pattern"], row["open"]) for row in view["endpoints"]] == [("/ws/echo", 2)]
             assert {socket_["path"] for socket_ in view["sockets"]} == {"/ws/echo"}
             assert view["sockets"][0]["received"] == 1 and view["sockets"][0]["sent"] == 1
-            assert "WebSockets open" in read("/fragment/overview")
+
+            # The overview's In flight tile counts what the metric does,
+            # the sockets stand in their own tile, and the worker's busy
+            # slots include the two the sockets hold.
+
+            overview = read("/fragment/overview")
+            assert '<div class="label">In flight</div><div class="value">0</div>' in overview
+            assert '<div class="label">WebSockets open</div><div class="value">2</div>' in overview
+            assert re.search(r'<th class="num">Busy</th>.*?<td class="num">2</td>', overview, re.S)
 
         # Each close is a line of its own, with who closed, the code and
         # the messages each way; the lifetime goes to its own histogram.

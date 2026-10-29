@@ -150,8 +150,9 @@ pub struct Worker {
     pub link: String,
     /// Requests it can handle at once.
     pub slots: usize,
-    /// Requests it is handling now.
-    pub in_flight: usize,
+    /// Slots busy now: handling a request, or holding an open WebSocket
+    /// on a mount that does not bound its sockets apart from them.
+    pub busy: usize,
 }
 
 /// One recent request, already formatted.
