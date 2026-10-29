@@ -84,6 +84,11 @@ FORCE_KILL_SECONDS = 1.0
 
 TICK_SECONDS = 0.5
 
+# How often a worker's native side writes a report, as the link has it:
+# a worker is silent once a report is this much later than due.
+
+REPORT_INTERVAL_SECONDS = 1.0
+
 # How long a worker is given to answer a control request before the
 # host answers for it.
 
@@ -2339,15 +2344,25 @@ class Host:
                         f"the hard timeout of {hard_timeout:g} s",
                     },
                 )
-            elif now - state.last_report_at > gil_stall_timeout:
+            elif now - state.last_report_at > gil_stall_timeout + REPORT_INTERVAL_SECONDS:
                 # Section 7.6: a worker whose reports have stopped, which
-                # its native threads send, is stopped or frozen whole.
+                # its native threads send, is stopped or frozen whole, so
+                # none of its requests can finish. The silence is counted
+                # from when the next report was due, as a report interval
+                # of jitter is not a stall.
 
+                silent = now - state.last_report_at
                 self.replace(
                     state,
-                    f"sent no report for {now - state.last_report_at:.0f} s, longer than "
+                    f"sent no report for {silent:.0f} s, longer than "
                     f"the GIL stall timeout of {gil_stall_timeout:g} s",
                     "worker.timeout_killed",
+                    abandon={
+                        "which": "all",
+                        "reason": "worker_stalled",
+                        "error": f"the worker sent no report for {silent:.0f} s, longer than "
+                        f"the GIL stall timeout of {gil_stall_timeout:g} s",
+                    },
                 )
             elif state.recycle_at is not None and now >= state.recycle_at:
                 self.replace(
@@ -2384,6 +2399,15 @@ class Host:
         """
 
         if state.debug_sessions:
+            return
+
+        # A worker condemned twice, by the silence check and then by its
+        # own stall event, is replaced once: a second replacement would
+        # start a second worker, and queue its requests' abandonment
+        # behind the stacks request the first left blocked on the
+        # interpreter.
+
+        if state.replaced or state.index in self.replacing:
             return
 
         if self.control_listener is None:

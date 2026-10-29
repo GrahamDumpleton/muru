@@ -211,8 +211,9 @@ to the log by `faulthandler`, with a `worker.gil_stalled` event before
 the `worker.timeout_killed` one.
 
 The host also times each worker's reports, which the worker sends from
-outside Python once a second, and replaces a worker that has sent none
-for the same period: one stopped by a signal, or frozen whole.
+outside Python once a second, and replaces a worker whose next report
+is the same period late: one stopped by a signal, or frozen whole. Its
+requests are answered `502 worker_stalled` as well.
 
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |
