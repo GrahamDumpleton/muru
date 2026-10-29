@@ -857,6 +857,12 @@ class Host:
         # worker never touches the objects it inherited.
 
         gc.freeze()
+
+        # Anything the host has buffered would otherwise be written twice,
+        # once by each process.
+
+        sys.stdout.flush()
+        sys.stderr.flush()
         pid = os.fork()
 
         if pid == 0:
@@ -865,6 +871,13 @@ class Host:
             try:
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
+
+                # Standard output is now a pipe, which Python block-buffers,
+                # so a plain print() would wait for the buffer to fill. Line
+                # buffering makes each line arrive as it is written. (The
+                # typeshed TextIO has no reconfigure; the real stream does.)
+
+                sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
                 inherited = (
                     out_read,
                     out_write,
@@ -890,6 +903,15 @@ class Host:
             except BaseException:
                 traceback.print_exc()
             finally:
+                # os._exit skips the flush that a normal exit would do, so
+                # whatever is still buffered would be lost.
+
+                for stream in (sys.stdout, sys.stderr):
+                    try:
+                        stream.flush()
+                    except (OSError, ValueError):
+                        pass
+
                 os._exit(status)
 
         os.close(out_write)
