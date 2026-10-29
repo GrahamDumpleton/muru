@@ -52,7 +52,6 @@ def make_project(base: Path) -> Path:
     (project / "pyproject.toml").write_text('[tool.muru]\nentrypoint = "mysite.wsgi:application"\n')
     shutil.copy(CODE / "urls.py", project / "mysite" / "urls.py")
     shutil.copy(CODE / "production.py", project / "mysite" / "production.py")
-    shutil.copy(CODE / "site.toml", project / "site.toml")
     manage(project, "migrate")
     manage(
         project,
@@ -127,12 +126,19 @@ def test_the_django_tutorial(tmp_path: Path) -> None:
     finally:
         server.stop()
 
-    # Production settings, collected static files, and a deploy: the
-    # static files come from the edge once the site's routes are applied.
+    # Production settings, collected static files declared in the project,
+    # and a deploy: the static files come from the edge.
 
     production = {"DJANGO_SETTINGS_MODULE": "mysite.production", "DJANGO_SECRET_KEY": "x"}
     manage(project, "collectstatic", "--noinput", **production)
     assert (project / "static" / "admin" / "css" / "base.css").is_file()
+
+    with (project / "pyproject.toml").open("a") as pyproject:
+        pyproject.write(
+            '\n[[tool.muru.static]]\npath = "/static/"\ndir = "static"\n'
+            'cache = { max_age = "1h" }\n'
+        )
+
     (tmp_path / "daemon").mkdir()
     daemon = start_daemon(tmp_path / "daemon")
 
@@ -147,9 +153,6 @@ def test_the_django_tutorial(tmp_path: Path) -> None:
         )
         assert out == "muru: release mysite@r1 is ready and serving"
         base = f"http://127.0.0.1:{daemon.port}"
-        assert status(f"{base}{stylesheet}") == 404
-        applied = daemon.muructl("apply", "-f", str(project / "site.toml")).stdout
-        assert "create-route    route site /static/      created" in applied
         assert status(f"{base}{stylesheet}") == 200
         assert "Site administration" in log_in(base)
         access = daemon.muructl("logs", "--access").stdout

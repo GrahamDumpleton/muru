@@ -93,7 +93,7 @@ Under the daemon, the project's entry serves `STATIC_ROOT` after
 `collectstatic`, as a [static route](static-files.md) at the site level
 would, or use WhiteNoise. The
 [Django tutorial](../tutorials/first-django-site.md) uses the URL
-patterns in development and a static route in production.
+patterns in development and the project's entry in production.
 
 Flask serves its package's `static` folder itself under any server.
 Declaring it in the project hands those requests to the edge instead,
