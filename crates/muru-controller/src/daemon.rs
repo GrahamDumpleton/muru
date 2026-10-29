@@ -3605,8 +3605,9 @@ impl Daemon {
             &subject,
             "info",
             &format!(
-                "{} workers ready in {:.1} s{}",
+                "{} worker{} ready in {:.1} s{}",
                 host_sockets,
+                if host_sockets == 1 { "" } else { "s" },
                 started.elapsed().as_secs_f64(),
                 if awaited.is_empty() {
                     String::new()
