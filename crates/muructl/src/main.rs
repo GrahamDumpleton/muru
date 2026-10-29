@@ -299,6 +299,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         access_log,
         limits: muru_edge::Limits::default(),
         compression: compression.clone(),
+        trust: muru_edge::proxy::Trust::loopback(),
         https: None,
         spool: None,
         rate_buckets: None,
@@ -2012,6 +2013,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         } else {
             muru_edge::compression::Compression::default()
         },
+        // Section 13.1: a development run listens on loopback, so a
+        // forwarding header can only come from a proxy on this machine,
+        // which is trusted without setup.
+        trust: muru_edge::proxy::Trust::loopback(),
         https: tls.as_ref().map(|tls| tls.https.clone()),
         spool: None,
         rate_buckets: None,

@@ -160,6 +160,22 @@ pub struct Resolved {
 }
 
 impl Trust {
+    /// What a development run trusts: loopback peers, for every forwarding
+    /// header but X-Real-IP, so a proxy on the same machine that mounts
+    /// the application under a path (jupyter-server-proxy, code-server)
+    /// gets its prefix applied with no setup.
+    pub fn loopback() -> Self {
+        Self {
+            networks: vec![Network::Loopback],
+            headers: FORWARDING_HEADERS[..6]
+                .iter()
+                .map(|header| (*header).to_owned())
+                .collect(),
+            recursive: true,
+            consume: false,
+        }
+    }
+
     /// Compile the snapshot's proxy settings.
     pub fn from_snapshot(proxy: &pb::Proxy) -> Result<Self, String> {
         let mut networks = Vec::new();
