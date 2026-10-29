@@ -233,7 +233,13 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if path == "/threadlocal":
         LOCAL.count = getattr(LOCAL, "count", 0) + 1
-        body = json.dumps({"count": LOCAL.count, "thread": threading.get_ident()}).encode()
+        body = json.dumps(
+            {
+                "count": LOCAL.count,
+                "thread": threading.get_ident(),
+                "name": threading.current_thread().name,
+            }
+        ).encode()
         start_response(
             "200 OK",
             [("Content-Type", "application/json"), ("Content-Length", str(len(body)))],

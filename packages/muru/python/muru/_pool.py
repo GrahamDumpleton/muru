@@ -11,10 +11,20 @@ nothing raised into the thread can land in it.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 
-def serve_jobs(serve: Callable[[], None]) -> None:
-    """Run the runtime's loop for one application thread."""
+def serve_jobs(serve: Callable[[], None], name: str | None) -> None:
+    """Run the runtime's loop for one application thread, named `name`.
+
+    The runtime named the thread when it started it, but `threading` only
+    learns of a thread it did not start when the thread first asks, and
+    then calls it Dummy-N; naming it here makes logs, stacks and thread
+    listings agree with the runtime's own name.
+    """
+
+    if name is not None:
+        threading.current_thread().name = name
 
     serve()

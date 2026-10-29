@@ -132,7 +132,13 @@ muru: switched to release r2
 
 Each reload is a fresh host and worker; the old ones serve until the new
 ones are ready, then stop. If the new code fails to import, the terminal
-says so and the previous release keeps serving.
+says so and the previous release keeps serving:
+
+```
+muru: release r3 failed to start: ...; release r2 keeps serving
+```
+
+The failed attempt was still a release, so the fix after it is `r4`.
 
 ## More workers, more threads
 

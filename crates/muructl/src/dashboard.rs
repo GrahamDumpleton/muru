@@ -150,7 +150,7 @@ fn collect(inputs: &Inputs) -> Data {
             index: worker.index,
             link: worker.path.display().to_string(),
             slots: worker.slots,
-            in_flight: worker.in_flight,
+            busy: worker.in_flight,
         })
         .collect();
     let websockets = muru_controller::dashboard::websockets_view(muru_edge::endpoints::report(
@@ -158,16 +158,17 @@ fn collect(inputs: &Inputs) -> Data {
         "",
         SOCKET_ROWS,
     ));
+
+    // In flight is what the metric of that name counts, requests not
+    // yet answered, with the WebSockets open beside it; a worker's busy
+    // slots include a socket holding one, as muru_slots_busy does.
+
     let summary = Summary {
         rate: format!("{:.1}", minute.requests as f64 / minute.seconds as f64),
         p50: percentile(0.5),
         p95: percentile(0.95),
         errors: minute.errors,
-        in_flight: workers
-            .iter()
-            .map(|worker| worker.in_flight)
-            .sum::<usize>()
-            .saturating_sub(websockets.open),
+        in_flight: inputs.access_log.metrics().in_flight(),
         websockets: websockets.open,
     };
     let requests = records

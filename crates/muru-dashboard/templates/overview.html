@@ -9,9 +9,9 @@
 </div>
 <h2 style="margin-top:1rem">Workers</h2>
 <table>
-  <tr><th>Worker</th><th>Link</th><th class="num">Slots</th><th class="num">In flight</th></tr>
+  <tr><th>Worker</th><th>Link</th><th class="num">Slots</th><th class="num">Busy</th></tr>
   {% for worker in data.workers %}
-  <tr><td>{{ worker.index }}</td><td>{{ worker.link }}</td><td class="num">{{ worker.slots }}</td><td class="num">{{ worker.in_flight }}</td></tr>
+  <tr><td>{{ worker.index }}</td><td>{{ worker.link }}</td><td class="num">{{ worker.slots }}</td><td class="num">{{ worker.busy }}</td></tr>
   {% endfor %}
 </table>
 {% include "websockets.html" %}

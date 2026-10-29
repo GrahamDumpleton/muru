@@ -242,14 +242,21 @@ impl Admin for Service {
     ) -> Result<Response<pb::Release>, Status> {
         let request = request.into_inner();
         self.check_freeze(&request.app, "deploy", request.override_freeze)?;
-        let previous = self
-            .handle
-            .store
-            .app(&request.app)
-            .ok()
-            .and_then(|app| app.current.or(app.previous))
-            .and_then(|id| self.handle.store.release(&request.app, &id).ok())
-            .map(|release| release.spec);
+
+        // Section 3.3: a deploy takes what its flags and the source do
+        // not give from the release before it, unless it is fresh.
+
+        let previous = if request.fresh {
+            None
+        } else {
+            self.handle
+                .store
+                .app(&request.app)
+                .ok()
+                .and_then(|app| app.current.or(app.previous))
+                .and_then(|id| self.handle.store.release(&request.app, &id).ok())
+                .map(|release| release.spec)
+        };
         let spec = config::resolve_spec(&request, previous.as_ref(), &config::Tables::default())
             .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();

@@ -208,13 +208,16 @@ with `--fix`; the formatters keep what it inserts.
   fails, keep the feature branch, report the failure, and wait for
   instructions.
 
-- Feature branches are squash-merged into `develop`, so each change lands as
-  one commit whose message is the pull request title and description, and
-  fix-up commits on the branch disappear. Release pull requests from
-  `develop` into `main` use a normal merge commit, so `main` keeps the full
-  history of each release and tags sit on a real merge point. Never use
-  rebase merges, which are disabled in the repository settings; do not rebase
-  or force-push a branch that has been pushed, either.
+- Feature branches are merged into `develop` with a merge commit (`gh pr
+  merge --merge`), never squashed, so each commit on the branch survives
+  with the issue it names, and the history shows one commit an issue. That
+  is why a branch carries one commit per issue rather than fix-up commits:
+  amend or roll fixes into the issue's commit before the pull request.
+  Release pull requests from `develop` into `main` use a merge commit too,
+  so `main` keeps the full history of each release and tags sit on a real
+  merge point. Never use squash or rebase merges, which are disabled in the
+  repository settings; do not rebase or force-push a branch that has been
+  pushed, either.
 
 ## Project process
 

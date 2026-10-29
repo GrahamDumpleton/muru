@@ -240,6 +240,7 @@ message DeployRequest {
   repeated string grpc_web_origins = 47;    // section 6.13: origins whose pages may call it through gRPC-Web, or *; the table's when empty
   optional uint64 websocket_drain_grace_ms = 48; // how long a worker told to stop keeps its WebSockets before closing them with 1001
   optional uint64 gil_stall_timeout_ms = 49; // section 7.6: how long a worker may run no Python, or send no report, before it is replaced
+  bool fresh = 50;                          // section 3.3: take nothing from the previous release; the source and the defaults alone
 }
 
 // One environment variable: a value, or a secret reference.
