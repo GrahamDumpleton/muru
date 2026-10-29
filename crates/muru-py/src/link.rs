@@ -1200,12 +1200,17 @@ async fn handle_websocket(
             // Before the accept, the response ending (a decline) ends the
             // request; after it, only the edge's CLOSE does. A worker told
             // to stop closes an accepted socket itself and waits for the
-            // edge's CLOSE in answer.
+            // edge's CLOSE in answer. The drain arm is not gated on the
+            // accept: a precondition is read once, as the select is built,
+            // which is before the application has accepted a socket that
+            // has just connected, and the loop only comes round again on
+            // a client message. close_for_drain leaves an unaccepted
+            // socket alone itself.
 
             let ended = tokio::select! {
                 biased;
                 _ = done.notified(), if !channel.accepted() => None,
-                _ = draining.wait_for(|draining| *draining), if channel.accepted() && !drained => {
+                _ = draining.wait_for(|draining| *draining), if !drained => {
                     drained = true;
                     channel.close_for_drain();
                     continue;
