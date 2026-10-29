@@ -2268,7 +2268,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
-                            println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                            println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                             break;
                         }
                     };
@@ -2295,7 +2295,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 match connected {
                                     Ok(connected) => pools.replace(connected),
                                     Err(error) => {
-                                        println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                        println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                         next.stop(stop_budget).await;
                                         break;
                                     }
@@ -2309,7 +2309,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 break;
                             }
                             Err(error) => {
-                                println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                 next.stop(stop_budget).await;
                                 break;
                             }

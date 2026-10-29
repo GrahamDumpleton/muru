@@ -100,8 +100,18 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         server.mark_log()
         time.sleep(1.1)
         (project / "reload_app.py").write_text("def application(:\n")
-        assert server.wait_for_log("reload failed", timeout=30)
+        assert server.wait_for_log("failed to start", timeout=30)
         assert version_seen(server) == "two"
+
+        # The failure line names the attempt and the release that keeps
+        # serving; the attempt keeps its number, as section 9.8 says.
+
+        line = re.search(
+            r"muru: release (r\d+) failed to start: .*; release (r\d+) keeps serving", server.log()
+        )
+        assert line is not None, server.log()
+        assert line.group(2) == release_seen(server)
+        assert int(line.group(1)[1:]) > int(line.group(2)[1:])
 
         # Fixing it reloads again.
 

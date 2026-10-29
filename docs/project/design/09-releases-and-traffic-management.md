@@ -119,7 +119,7 @@ Reloading is off by default. Every reload creates a new release from the same so
 | watch | changes under watched directories | development |
 
 - One watcher in the daemon or muructl run process (inotify or FSEvents), never per worker. `__pycache__`, `.git`, virtualenvs, `*.pyc`, `node_modules` and editor files are ignored, and `.gitignore` is honoured.
-- Changes are debounced (default 300 ms). A release still starting when new changes arrive is abandoned and replaced. A failed import leaves the previous release serving and shows the error.
+- Changes are debounced (default 300 ms). A release still starting when new changes arrive is abandoned and replaced. A failed import leaves the previous release serving and shows the error, naming the release that failed: the attempt keeps its number, as a failed deploy does under the daemon, so under muructl run the fix after a failed r3 is r4.
 - Polling is used when poll = true or when the inotify watch limit is reached, which is needed on some network file systems and macOS container bind mounts.
 - Releases from mutable paths record a source fingerprint (git revision and dirty flag, or a hash of watched files).
 
