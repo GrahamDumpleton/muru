@@ -235,3 +235,38 @@ def test_the_hard_timeout_fires_with_a_second_request_on_a_stuck_worker() -> Non
         assert pid_of(server) != worker
     finally:
         server.stop()
+
+
+def test_the_hard_timeout_answers_the_stuck_request_at_once() -> None:
+    """The request that condemned the worker cannot finish, so its client
+    gets 504 hard_timeout when the worker is replaced, not after the drain
+    grace and the shutdown timeout that the worker's other requests get."""
+
+    server = support.start(
+        "plain_wsgi:application",
+        workers=1,
+        threads=2,
+        args=[
+            "--timeout",
+            "hard=2s",
+            "--timeout",
+            "hard_drain_grace=20s",
+            "--timeout",
+            "shutdown=20s",
+        ],
+    )
+
+    try:
+        started = time.monotonic()
+        response = server.get("/hold?seconds=30", headers={"Accept": "application/json"})
+        answered = time.monotonic() - started
+        assert response.status == 504, response.body
+        assert json.loads(response.body)["reason"] == "hard_timeout"
+        assert answered < 8, answered
+
+        # The worker's answer to the host, which logs it, follows the edge's
+        # answer to the client by a moment.
+
+        assert server.wait_for_log("gave up 1 request for the edge to answer")
+    finally:
+        server.stop()

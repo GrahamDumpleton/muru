@@ -67,7 +67,13 @@ def test_a_worker_holding_the_gil_is_replaced() -> None:
     try:
         stuck = pid_serving(server)
         assert stuck is not None
-        thread = threading.Thread(target=lambda: server.get("/hold?seconds=60"), daemon=True)
+        answers: list[support.Response] = []
+        thread = threading.Thread(
+            target=lambda: answers.append(
+                server.get("/hold?seconds=60", headers={"Accept": "application/json"})
+            ),
+            daemon=True,
+        )
         thread.start()
 
         # Nothing in the worker runs Python while the call holds the lock,
@@ -80,6 +86,15 @@ def test_a_worker_holding_the_gil_is_replaced() -> None:
         assert "past the GIL stall timeout of 1 s" in log, log
         assert "no thread of it ran Python for the GIL stall timeout of 1 s" in log, log
         assert "hold_the_interpreter" in log, "no stack dump"
+
+        # The stuck request is answered when the worker is condemned, not
+        # when it is finally killed, since it cannot finish.
+
+        thread.join(timeout=10)
+        assert answers, "the stuck request was not answered"
+        assert answers[0].status == 502, answers[0].body
+        assert json.loads(answers[0].body)["reason"] == "worker_stalled"
+        assert "gave up 1 request for the edge to answer" in server.log()
         wait_for(lambda: pid_serving(server) not in (None, stuck))
         assert server.get("/sleep?seconds=0.1").status == 200
     finally:

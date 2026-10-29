@@ -558,6 +558,27 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // Section 7.6: so is giving up the requests of a condemned worker,
+        // whose stuck code may hold the interpreter for good.
+
+        if let Some((id, which, error, reason)) = abandon_request(&line) {
+            let given_up: Vec<String> = shared
+                .abandon(which, &error, &reason)
+                .iter()
+                .map(|request| serde_json_string(request))
+                .collect();
+            let text = format!(
+                "{{\"id\":{id},\"ok\":true,\"result\":{{\"abandoned\":[{}]}}}}",
+                given_up.join(",")
+            );
+
+            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+                break;
+            }
+
+            continue;
+        }
+
         let answer = Python::attach(|py| {
             let active = shared.active_requests(py)?;
             let names = crate::pool::thread_names(py)?;
@@ -586,11 +607,42 @@ fn bookkeeping_request(line: &str) -> Option<i64> {
         return None;
     }
 
+    control_id(line)
+}
+
+/// A request line asking the worker to give up requests, as the host
+/// writes it: `{"id": N, "op": "abandon", "args": {"which": "oldest" or
+/// "all", "reason": R, "error": E}}`, where the reason is a word and the
+/// error a sentence with no quotes or backslashes in it.
+fn abandon_request(line: &str) -> Option<(i64, crate::pool::Abandon, String, String)> {
+    if !line.contains("\"op\": \"abandon\"") {
+        return None;
+    }
+
+    let which = if line.contains("\"which\": \"all\"") {
+        crate::pool::Abandon::All
+    } else {
+        crate::pool::Abandon::Oldest
+    };
+    let error = control_string(line, "error").unwrap_or_default();
+    let reason = control_string(line, "reason").unwrap_or_default();
+    Some((control_id(line)?, which, error, reason))
+}
+
+/// The id of a control request line: the number after `"id": `.
+fn control_id(line: &str) -> Option<i64> {
     let rest = line.split_once("\"id\": ")?.1;
     let end = rest
         .find(|c: char| c != '-' && !c.is_ascii_digit())
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// A string argument of a control request line, which the host writes
+/// without quotes or backslashes in it.
+fn control_string(line: &str, key: &str) -> Option<String> {
+    let rest = line.split_once(&format!("\"{key}\": \""))?.1;
+    Some(rest.split_once('"')?.0.to_owned())
 }
 
 /// The requests in flight, with the thread serving each, and the
@@ -942,6 +994,7 @@ async fn handle_request(
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
     let (request_id, interrupt) = shared.request_started(&head);
+    shared.request_outgoing(request_id, out_tx.clone());
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = pool.spawn(Box::new(move |py| {
@@ -1071,6 +1124,7 @@ async fn handle_asgi_request(
     // function returns, when the request has ended.
 
     let (request_id, _interrupt) = shared.request_started(&head);
+    shared.request_outgoing(request_id, out_tx.clone());
     let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
     let _uploads = uploads;
 

@@ -95,6 +95,22 @@ pub struct RequestInfo {
     /// Exempt from the timeouts: a streaming response or a WebSocket
     /// (section 7.6), which run as long as they need to.
     pub exempt: bool,
+    /// The request's way out to the edge, for giving it up (section 7.6)
+    /// when the host condemns the worker and the code serving it cannot
+    /// be interrupted.
+    pub outgoing: Option<tokio::sync::mpsc::Sender<crate::wsgi::Outgoing>>,
+    /// Given up: the edge has answered the client, whatever the
+    /// application thread still does.
+    pub abandoned: bool,
+}
+
+/// Which of a condemned worker's requests to give up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abandon {
+    /// The oldest, which is the one past the hard timeout.
+    Oldest,
+    /// Every one, when the whole worker is stalled.
+    All,
 }
 
 /// The soft timeout's way into a bridge call the application thread is
@@ -472,9 +488,74 @@ impl Shared {
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
                     exempt: false,
+                    outgoing: None,
+                    abandoned: false,
                 },
             );
         (id, interrupt)
+    }
+
+    /// Note a request's channel to the edge, for giving it up.
+    pub fn request_outgoing(
+        &self,
+        id: u64,
+        outgoing: tokio::sync::mpsc::Sender<crate::wsgi::Outgoing>,
+    ) {
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .get_mut(&id)
+        {
+            info.outgoing = Some(outgoing);
+        }
+    }
+
+    /// Give up requests the host has condemned the worker over (section
+    /// 7.6): each is ended towards the edge with the reason, so the client
+    /// is answered now rather than when the worker is finally killed, and
+    /// its application thread's output is dropped. This needs no
+    /// interpreter, which the stuck code may hold. Returns the request ids
+    /// given up.
+    pub fn abandon(&self, which: Abandon, error: &str, reason: &str) -> Vec<String> {
+        let mut active = self.active.lock().expect("active requests poisoned");
+
+        let candidates: Vec<u64> = match which {
+            Abandon::All => active
+                .iter()
+                .filter(|(_, info)| !info.exempt && !info.abandoned)
+                .map(|(id, _)| *id)
+                .collect(),
+            Abandon::Oldest => active
+                .iter()
+                .filter(|(_, info)| !info.exempt && !info.abandoned)
+                .min_by_key(|(_, info)| info.started)
+                .map(|(id, _)| vec![*id])
+                .unwrap_or_default(),
+        };
+
+        let mut given_up = Vec::new();
+
+        for id in candidates {
+            let Some(info) = active.get_mut(&id) else {
+                continue;
+            };
+            let Some(outgoing) = &info.outgoing else {
+                continue;
+            };
+            let abort = crate::wsgi::Outgoing::Abort {
+                error: error.to_owned(),
+                reason: reason.to_owned(),
+                detail: String::new(),
+            };
+
+            if outgoing.try_send(abort).is_ok() {
+                info.abandoned = true;
+                given_up.push(info.request_id.clone());
+            }
+        }
+
+        given_up
     }
 
     /// Note the channel of an ASGI request, for the soft timeout.

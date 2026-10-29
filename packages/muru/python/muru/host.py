@@ -2126,18 +2126,30 @@ class Host:
                 if report["event"] == "debug.detached":
                     self.debugging(state, -1)
                 elif report["event"] == "worker.loop_stalled":
+                    loop_stall = self.group_of(state.index).loop_stall_timeout
                     self.replace(
                         state,
-                        f"its event loop stalled past the loop stall timeout of "
-                        f"{self.group_of(state.index).loop_stall_timeout:g} s",
+                        f"its event loop stalled past the loop stall timeout of {loop_stall:g} s",
                         "worker.timeout_killed",
+                        abandon={
+                            "which": "all",
+                            "reason": "worker_stalled",
+                            "error": f"the worker's event loop stalled past the loop stall "
+                            f"timeout of {loop_stall:g} s",
+                        },
                     )
                 elif report["event"] == "worker.gil_stalled":
+                    gil_stall = self.group_of(state.index).gil_stall_timeout
                     self.replace(
                         state,
-                        f"no thread of it ran Python for the GIL stall timeout of "
-                        f"{self.group_of(state.index).gil_stall_timeout:g} s",
+                        f"no thread of it ran Python for the GIL stall timeout of {gil_stall:g} s",
                         "worker.timeout_killed",
+                        abandon={
+                            "which": "all",
+                            "reason": "worker_stalled",
+                            "error": f"no thread of the worker ran Python for the GIL stall "
+                            f"timeout of {gil_stall:g} s",
+                        },
                     )
 
                 continue
@@ -2320,6 +2332,12 @@ class Host:
                     f"a request has run for {state.oldest_ms / 1000:.1f} s, past the hard "
                     f"timeout of {hard_timeout:g} s",
                     "worker.timeout_killed",
+                    abandon={
+                        "which": "oldest",
+                        "reason": "hard_timeout",
+                        "error": f"the request ran for {state.oldest_ms / 1000:.1f} s, past "
+                        f"the hard timeout of {hard_timeout:g} s",
+                    },
                 )
             elif now - state.last_report_at > gil_stall_timeout:
                 # Section 7.6: a worker whose reports have stopped, which
@@ -2347,12 +2365,22 @@ class Host:
         for pending in list(self.pending.values()):
             self.finish_if_answered(pending, expired=now >= pending.deadline)
 
-    def replace(self, state: WorkerState, reason: str, kind: str, hard: bool = False) -> None:
+    def replace(
+        self,
+        state: WorkerState,
+        reason: str,
+        kind: str,
+        hard: bool = False,
+        abandon: dict[str, str] | None = None,
+    ) -> None:
         """Start replacing a worker with a fresh one on a new socket.
 
         For a hard timeout the old worker leaves routing at once and its
-        stacks are recorded. A worker being debugged is pinned: the policy
-        applies once the last session ends.
+        stacks are recorded, and `abandon` says which of its requests the
+        edge answers now rather than after the grace: the oldest, which is
+        the stuck one, or all of them when the whole worker is stalled. A
+        worker being debugged is pinned: the policy applies once the last
+        session ends.
         """
 
         if state.debug_sessions:
@@ -2388,6 +2416,14 @@ class Host:
             self.routed[index] = None
             self.announce()
 
+            # The requests are given up before the stacks are asked for:
+            # the worker's control thread takes requests in order, and
+            # reading stacks from inside waits on the interpreter, which
+            # the stuck code may hold for good.
+
+            if abandon is not None:
+                self.abandon_requests(state, abandon)
+
             if kind == "worker.timeout_killed":
                 self.capture_stacks(state, replacement)
 
@@ -2397,6 +2433,27 @@ class Host:
             )
 
         replacement.new_pid = self.spawn(index, replacing=True)
+
+    def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
+        """Have a condemned worker give up requests that cannot finish.
+
+        The worker answers without its interpreter, which the stuck code
+        may hold, and ends each request with the reason given, which the
+        edge turns into the client's error at once (section 7.6).
+        """
+
+        def answered(pending: Pending) -> None:
+            answer = pending.answers.get(state.pid) or {}
+            ids = answer.get("result", {}).get("abandoned", [])
+
+            if ids:
+                log(
+                    f"worker {state.index} (pid {state.pid}) gave up "
+                    f"{len(ids)} request{'s' if len(ids) != 1 else ''} for the edge to "
+                    f"answer: {', '.join(ids)}"
+                )
+
+        self.ask(state, "abandon", args, 1.0, answered)
 
     def ask(
         self,
