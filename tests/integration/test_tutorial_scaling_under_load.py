@@ -70,29 +70,34 @@ def test_the_scaling_tutorial(tmp_path: Path) -> None:
         assert workers(daemon) == "1"
 
         # Eight clients of load: the group grows to five workers, four to
-        # carry it and one in hand, and nothing fails.
+        # carry it and one in hand, and nothing fails. On a slow machine
+        # the clients arrive over more than one decision, so the group
+        # grows in steps, each a scale-out window and the hold after
+        # growth apart: the load runs long enough for a second step to
+        # land after a first one six seconds in, which fifteen seconds
+        # did not always leave room for on the macOS runner.
 
         url = f"http://127.0.0.1:{daemon.port}/"
         load = subprocess.run(
-            [sys.executable, str(project / "load.py"), "8", "15", url],
+            [sys.executable, str(project / "load.py"), "8", "25", url],
             capture_output=True,
             text=True,
             check=True,
         ).stdout
         assert load.splitlines()[-1].endswith("requests served, 0 failed"), load
 
-        # On a slow machine the clients can arrive over more than one
-        # decision, so the group may grow in steps; it ends at five. The
-        # diagnosis is read from the decision, made while slots ran out:
-        # at five workers eight clients fill eight of ten slots at most,
-        # on the threshold, so the status's diagnosis can go either way.
+        # The diagnosis is read from a decision made while slots ran out,
+        # whichever step it was: at five workers eight clients fill eight
+        # of ten slots at most, on the threshold, so the status's own
+        # diagnosis can go either way.
 
         events = daemon.muructl("events").stdout
-        scale_out = (
-            r"default: scale out from \d+ to 5 workers: "
+        assert re.search(r"default: scale out from \d+ to 5 workers: short by", events), events
+        exhausted = (
+            r"default: scale out from \d+ to \d+ workers: "
             r".*diagnosis: I/O bound with exhausted slots"
         )
-        assert re.search(scale_out, events), events
+        assert re.search(exhausted, events), events
         status = daemon.muructl("scale", "status", "busy").stdout
         assert "last: scaled out to 5: short by" in status, status
 
