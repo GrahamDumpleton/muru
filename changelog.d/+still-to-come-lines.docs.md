@@ -1,1 +1,0 @@
-Corrected the status notes of the mounts, secrets, metrics and worker recycling guides, which still listed as coming the groups `mounts` subset, per-application users, the worker CPU and scaling metrics and per-group memory and timeout settings.
