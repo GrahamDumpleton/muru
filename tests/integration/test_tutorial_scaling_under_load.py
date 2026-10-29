@@ -82,12 +82,19 @@ def test_the_scaling_tutorial(tmp_path: Path) -> None:
         assert load.splitlines()[-1].endswith("requests served, 0 failed"), load
 
         # On a slow machine the clients can arrive over more than one
-        # decision, so the group may grow in steps; it ends at five.
+        # decision, so the group may grow in steps; it ends at five. The
+        # diagnosis is read from the decision, made while slots ran out:
+        # at five workers eight clients fill eight of ten slots at most,
+        # on the threshold, so the status's diagnosis can go either way.
 
         events = daemon.muructl("events").stdout
-        assert re.search(r"default: scale out from \d+ to 5 workers", events), events
+        scale_out = (
+            r"default: scale out from \d+ to 5 workers: "
+            r".*diagnosis: I/O bound with exhausted slots"
+        )
+        assert re.search(scale_out, events), events
         status = daemon.muructl("scale", "status", "busy").stdout
-        assert "diagnosis: I/O bound with exhausted slots" in status
+        assert "last: scaled out to 5: short by" in status, status
 
         # Without load it comes back to one worker, by both rules.
 

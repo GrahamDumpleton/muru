@@ -93,27 +93,25 @@ muructl scale status busy
 ```
 busy@r1
 GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
-default      5            8/10       1.0     1000 ms    0/6        spare 1-8 workers, 1-3 idle
+default      5            7/10       1.0     1000 ms    0/6        spare 1-8 workers, 1-3 idle
   workers: cpu 1%, gil wait p95 0 ms, loop lag p95 -
-  diagnosis: I/O bound with exhausted slots; for the next release, more threads per worker, or more concurrency for an ASGI application
+  diagnosis: within capacity
   last: scaled out to 5: short by 3.0 workers for 5996ms (3s ago)
 ```
 
 When the load arrived, requests waited at the edge for a free thread,
 the group was short of workers for the 5 seconds of the scale-out window,
 and the daemon forked four more: four to carry the load and one to keep
-in hand. Eight of the ten slots are busy, one worker is idle, and the
-queue wait has fallen from the second the first requests spent waiting
-to a millisecond. The load script's lines climb from about ten requests a
-second to about forty, and none fails.
+in hand. Seven or eight of the ten slots are busy, depending on the
+moment, one worker is idle, and the queue wait has fallen from the
+second the first requests spent waiting to a millisecond. The load
+script's lines climb from about ten requests a second to about forty,
+and none fails.
 
-The diagnosis line says what holds the group back: its threads are busy
-but its CPU is not, which is what waiting on a database looks like. More
-threads per worker would carry the same load with fewer processes, and
-the daemon suggests it for the next release rather than changing a
-running one.
-
-Every decision is an event with its reasons:
+The diagnosis line describes the latest second. With five workers the
+group is just within capacity, so it may also read I/O bound when all
+eight clients are waiting at once. Why it grew is in the decision, which
+is an event with its reasons:
 
 ```
 muructl events
@@ -122,6 +120,14 @@ muructl events
 ```
     5 10:14:07 info     scaling.decision     busy@r1                  default: scale out from 1 to 5 workers: short by 3.0 workers for 5996ms; diagnosis: I/O bound with exhausted slots; ...
 ```
+
+The diagnosis when it decided says what held the group back: its
+threads were busy but its CPU was not, which is what waiting on a
+database looks like. More threads per worker would carry the same load
+with fewer processes, and the daemon suggests it for the next release
+rather than changing a running one. On a slower machine the clients can
+arrive over more than one decision, and the group grows to five in
+steps, each with its own event.
 
 ## Take the load away
 
