@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import textwrap
 import time
@@ -13,11 +14,13 @@ from support import server as support
 APP = """
 import os
 
+import muru
+
 VERSION = {version!r}
 
 
 def application(environ, start_response):
-    body = f"{{VERSION}} from {{os.getpid()}}".encode()
+    body = f"{{VERSION}} from {{os.getpid()}} in {{muru.context().release}}".encode()
     start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))])
     return [body]
 """
@@ -29,6 +32,22 @@ def write_app(directory: Path, version: str) -> None:
 
 def version_seen(server: support.Server) -> str:
     return server.get("/").body.decode().split(" from ")[0]
+
+
+def pid_seen(server: support.Server) -> str:
+    return server.get("/").body.decode().split(" from ")[1].split(" in ")[0]
+
+
+def release_seen(server: support.Server) -> str:
+    """The release the application reports through muru.context()."""
+
+    return server.get("/").body.decode().split(" in ")[1]
+
+
+def release_switched_to(server: support.Server) -> str:
+    """The release the last `switched to release` line of the log names."""
+
+    return re.findall(r"switched to release (r\d+)", server.log())[-1]
 
 
 def wait_for_version(server: support.Server, version: str, timeout: float = 30.0) -> None:
@@ -61,7 +80,8 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
     try:
         assert server.wait_for_log("watching")
         assert version_seen(server) == "one"
-        first_pid = server.get("/").body.decode().split(" from ")[1]
+        assert release_seen(server) == "r1"
+        first_pid = pid_seen(server)
 
         server.mark_log()
         time.sleep(1.1)  # keep the modification time distinct on coarse file systems
@@ -69,7 +89,11 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         assert server.wait_for_log("reloading", timeout=10)
         assert server.wait_for_log("switched to release r", timeout=30)
         wait_for_version(server, "two")
-        assert server.get("/").body.decode().split(" from ")[1] != first_pid
+        assert pid_seen(server) != first_pid
+
+        # muru.context().release names the release the log does.
+
+        assert release_seen(server) == release_switched_to(server)
 
         # A broken edit leaves the previous release serving and is reported.
 
@@ -86,6 +110,7 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         write_app(project, "three")
         assert server.wait_for_log("switched to release r", timeout=30)
         wait_for_version(server, "three")
+        assert release_seen(server) == release_switched_to(server)
     finally:
         server.stop()
 
