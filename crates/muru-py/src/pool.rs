@@ -864,7 +864,9 @@ impl Pool {
 /// closes, inside `muru._pool.serve_jobs`, so the thread always has a
 /// Python frame that a reader from outside can start from (section 11.7).
 fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
-    if let Some(name) = std::thread::current().name() {
+    let name = std::thread::current().name().map(str::to_owned);
+
+    if let Some(name) = &name {
         name_this_thread(name);
     }
 
@@ -877,7 +879,7 @@ fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
                 entered.store(true, Ordering::SeqCst);
                 serve_jobs(args.py(), &inner);
             })?;
-            module.call_method1("serve_jobs", (serve,))
+            module.call_method1("serve_jobs", (serve, name))
         });
 
         // Without the module the thread serves all the same, only without
