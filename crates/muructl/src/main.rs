@@ -295,6 +295,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         sockets: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
+        static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
         sendfile: Arc::default(),
@@ -523,6 +524,12 @@ struct RunArgs {
     /// Implies --processes 1 --threads 1.
     #[arg(long)]
     single: bool,
+
+    /// A directory of the application's own files the edge serves under
+    /// a path prefix, as PREFIX=DIR with DIR relative to the project,
+    /// over the [[tool.muru.static]] entries by prefix. Repeatable.
+    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = parse_static_setting)]
+    static_dirs: Vec<(String, String)>,
 
     /// Start a new release when a watched source file changes.
     #[arg(long)]
@@ -885,6 +892,20 @@ pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String
             _ => {}
         }
     }
+}
+
+/// Parse PREFIX=DIR for --static: a path prefix below / and a directory.
+pub(crate) fn parse_static_setting(text: &str) -> Result<(String, String), String> {
+    let (prefix, directory) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=static"))?;
+    let entry = muru_config::StaticDir {
+        path: prefix.trim().to_owned(),
+        dir: directory.trim().to_owned(),
+        ..Default::default()
+    };
+    muru_config::check_static(std::slice::from_ref(&entry))?;
+    Ok((entry.path, entry.dir))
 }
 
 /// Parse KEY=VALUE for --memory, checking the key and the value's form.
@@ -1254,6 +1275,9 @@ struct Resolved {
     /// Section 4.9: the default mount's file hints by path from the table.
     sendfile_roots: Vec<String>,
     sendfile_header: Option<String>,
+    /// Section 4.9: the application's own directories of files, the
+    /// table's with the flags' over them by prefix.
+    static_dirs: Vec<muru_config::StaticDir>,
     /// Section 4.12: the error pages, override and maintenance
     /// exemptions from the table.
     error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
@@ -1361,6 +1385,23 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
     }
 
+    // Section 4.9: the table's static directories, a flag replacing the
+    // entry with its prefix or adding one.
+
+    muru_config::check_static(&table.static_dirs)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    let mut static_dirs = table.static_dirs.clone();
+
+    for (prefix, directory) in &args.static_dirs {
+        let key = muru_edge::routing::group_prefix(prefix);
+        static_dirs.retain(|entry| muru_edge::routing::group_prefix(&entry.path) != key);
+        static_dirs.push(muru_config::StaticDir {
+            path: prefix.clone(),
+            dir: directory.clone(),
+            ..Default::default()
+        });
+    }
+
     Ok(Resolved {
         entrypoint,
         interface: args
@@ -1396,6 +1437,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         cgi_local_redirect: table.cgi_local_redirect.unwrap_or(false),
         sendfile_roots: table.sendfile_roots,
         sendfile_header: table.sendfile_header,
+        static_dirs,
         error_pages: table.error_pages,
         error_override: table.error_override,
         maintenance: table.maintenance,
@@ -1471,6 +1513,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
         sendfile_roots: resolved.sendfile_roots.clone(),
         sendfile_header: resolved.sendfile_header.clone(),
+        static_dirs: resolved.static_dirs.clone(),
         error_pages: resolved.error_pages.clone(),
         error_override: resolved.error_override.clone(),
         maintenance: resolved.maintenance.clone(),
@@ -1706,6 +1749,58 @@ fn mount_serves(mount: &muru_config::Mount) -> String {
 
 /// The named mounts as the edge selects them, with their redirect
 /// settings (section 4.10), the release's where a mount is silent.
+/// The application's own directories of files as the edge serves them
+/// (section 4.9), each under the project when relative and checked to
+/// be a directory.
+fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::StaticPath>> {
+    resolved
+        .static_dirs
+        .iter()
+        .map(|entry| {
+            let directory = if Path::new(&entry.dir).is_absolute() {
+                PathBuf::from(&entry.dir)
+            } else {
+                resolved.project.join(&entry.dir)
+            };
+            anyhow::ensure!(
+                directory.is_dir(),
+                "static {}: {} is not a directory",
+                entry.path,
+                directory.display()
+            );
+            let cache = entry.cache.as_ref();
+            let max_age = cache
+                .and_then(|cache| cache.max_age.as_deref())
+                .map(|text| {
+                    muru_config::parse_duration(text)
+                        .map(|duration| duration.as_secs())
+                        .map_err(|error| {
+                            anyhow::anyhow!("static {}: cache.max_age: {error}", entry.path)
+                        })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let except = cache.map(|cache| cache.except.clone()).unwrap_or_default();
+            let route =
+                muru_edge::static_files::StaticRoute::new(&muru_edge::static_files::Settings {
+                    directory: &directory.display().to_string(),
+                    index: &entry.index,
+                    fallback_file: entry.fallback.as_deref().unwrap_or_default(),
+                    cache_max_age_s: max_age,
+                    cache_immutable: cache.and_then(|cache| cache.immutable).unwrap_or(false),
+                    cache_except: &except,
+                    no_redirect_slash: entry.redirect_slash == Some(false),
+                    case_insensitive: entry.case.as_deref() == Some("insensitive"),
+                })
+                .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
+            Ok(muru_edge::routing::StaticPath {
+                prefix: muru_edge::routing::group_prefix(&entry.path),
+                route: Arc::new(route),
+            })
+        })
+        .collect()
+}
+
 fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
     resolved
         .mounts
@@ -1991,6 +2086,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         resolved.sendfile_header.as_deref().unwrap_or_default(),
     );
 
+    // Section 4.9: the application's own directories of files, under
+    // the project, each checked to exist before anything starts.
+
+    let static_paths = static_paths(&resolved)?;
+
     // Section 4.12: the project's error pages, with files under it.
 
     muru_config::check_error_pages(&resolved.error_pages, true)
@@ -2044,6 +2144,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         sockets: current.default_sockets(),
         groups: group_sockets(&current, &resolved.groups),
         mounts: mounts.clone(),
+        static_dirs: static_paths.clone(),
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
         sendfile: Arc::clone(&sendfile),
@@ -2126,6 +2227,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     for (name, mount) in &resolved.mounts {
         println!("muru: mount {name} {}", mount_serves(mount));
+    }
+
+    for entry in &static_paths {
+        println!(
+            "muru: static {}/ from {}",
+            entry.prefix.trim_end_matches('/'),
+            entry.route.directory.display()
+        );
     }
 
     if development {
@@ -2326,6 +2435,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 .with_errors(Arc::clone(&error_policy))
                                 .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
+                                .with_static_dirs(static_paths.clone())
                         });
 
                         match connected {
@@ -2380,6 +2490,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                         .with_errors(Arc::clone(&error_policy))
                                         .with_sendfile(Arc::clone(&sendfile))
                                         .with_grpc_web(&resolved.grpc_web_origins)
+                                .with_static_dirs(static_paths.clone())
                                 });
 
                                 match connected {

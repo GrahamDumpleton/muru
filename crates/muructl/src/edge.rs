@@ -219,6 +219,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             sockets: args.worker_sockets.clone(),
             groups: Vec::new(),
             mounts: Vec::new(),
+            static_dirs: Vec::new(),
             accel_redirect: false,
             cgi_local_redirect: false,
             sendfile: Arc::default(),

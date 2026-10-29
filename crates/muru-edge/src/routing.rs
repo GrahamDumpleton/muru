@@ -250,6 +250,17 @@ pub struct MountPath {
     pub sendfile: Arc<Sendfile>,
 }
 
+/// A directory of a release's own files (section 4.9), served under a
+/// path prefix ahead of the application, which takes what no file
+/// answers.
+#[derive(Debug, Clone)]
+pub struct StaticPath {
+    /// The prefix, without a trailing slash unless it is `/`.
+    pub prefix: String,
+    /// The directory and its settings.
+    pub route: Arc<crate::static_files::StaticRoute>,
+}
+
 /// Where a request goes within an application: the group's pool and the
 /// mount, with the prefix the application sees as SCRIPT_NAME.
 pub struct Selection {
@@ -275,6 +286,9 @@ pub struct Selection {
     /// The upstream that takes the request instead of workers (section
     /// 4.13); `pool` is then empty.
     pub upstream: Option<Arc<Upstream>>,
+    /// The release's own directory the path lies under (section 4.9),
+    /// tried for a file before the request reaches the workers.
+    pub static_path: Option<StaticPath>,
     /// The origins that may call the release through gRPC-Web (section
     /// 6.13).
     pub grpc_web: Arc<crate::grpc::WebOrigins>,
@@ -519,6 +533,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         maintenance: None,
         upstream: Some(Arc::clone(upstream)),
         grpc_web: Arc::default(),
+        static_path: None,
     }
 }
 
@@ -632,6 +647,9 @@ pub struct AppPools {
     /// ahead of the rest.
     groups: Vec<GroupPath>,
     mounts: Vec<MountPath>,
+    /// The release's own directories of files (section 4.9), the longest
+    /// prefix first.
+    statics: Vec<StaticPath>,
     /// The default mount's redirect forms (section 4.10).
     redirects: RedirectFlags,
     /// The default mount's file hints by path (section 4.9).
@@ -777,6 +795,7 @@ impl AppPools {
             default,
             groups: connected,
             mounts,
+            statics: Vec::new(),
             redirects,
             sendfile: Arc::default(),
             errors: Arc::new(ErrorPolicy::default()),
@@ -794,6 +813,7 @@ impl AppPools {
             default: Arc::new(pool),
             groups: Vec::new(),
             mounts: Vec::new(),
+            statics: Vec::new(),
             redirects: RedirectFlags::default(),
             sendfile: Arc::default(),
             errors: Arc::new(ErrorPolicy::default()),
@@ -801,6 +821,14 @@ impl AppPools {
             server: None,
             grpc_web: Arc::default(),
         }
+    }
+
+    /// The release's own directories of files (section 4.9).
+    pub fn with_static_dirs(mut self, statics: Vec<StaticPath>) -> Self {
+        self.statics = statics;
+        self.statics
+            .sort_by_key(|entry| std::cmp::Reverse(entry.prefix.len()));
+        self
     }
 
     /// The same pools with the default mount's file hints by path
@@ -869,6 +897,7 @@ impl AppPools {
                 maintenance: self.maintenance.clone(),
                 upstream: Some(Arc::clone(server)),
                 grpc_web: Arc::default(),
+                static_path: None,
             });
         }
 
@@ -902,6 +931,15 @@ impl AppPools {
             }
         }
 
+        // Section 4.9: a path under one of the release's own directories
+        // is tried as a file first, the workers taking what none answers.
+
+        let static_path = self
+            .statics
+            .iter()
+            .find(|entry| prefix_matches(&entry.prefix, path))
+            .cloned();
+
         Some(Selection {
             pool,
             app: self.app.clone(),
@@ -920,6 +958,7 @@ impl AppPools {
             maintenance: self.maintenance.clone(),
             upstream: None,
             grpc_web: Arc::clone(&self.grpc_web),
+            static_path,
         })
     }
 
@@ -1181,7 +1220,8 @@ impl Routing {
             .with_maintenance(maintenance)
             .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header))
             .with_waking(&app.waking_groups)
-            .with_grpc_web(&app.grpc_web_origins);
+            .with_grpc_web(&app.grpc_web_origins)
+            .with_static_dirs(static_paths_of(app)?);
 
             // Section 9.9: a managed HTTP release's instances stand in
             // for its workers, as an upstream named after the release.
@@ -1849,6 +1889,7 @@ impl Routing {
                 maintenance: None,
                 upstream: None,
                 grpc_web: Arc::default(),
+                static_path: None,
             }),
         }
     }
@@ -1879,6 +1920,28 @@ impl Routing {
 
 fn paths(sockets: &[String]) -> Vec<std::path::PathBuf> {
     sockets.iter().map(std::path::PathBuf::from).collect()
+}
+
+/// A release's own directories of files, from its snapshot entry.
+fn static_paths_of(app: &pb::AppWorkers) -> anyhow::Result<Vec<StaticPath>> {
+    app.static_dirs
+        .iter()
+        .map(|entry| {
+            Ok(StaticPath {
+                prefix: group_prefix(&entry.path),
+                route: Arc::new(
+                    crate::static_files::StaticRoute::from_static_dir(entry).map_err(|error| {
+                        anyhow::anyhow!(
+                            "{}@{}: static {}: {error}",
+                            app.app,
+                            app.release,
+                            entry.path
+                        )
+                    })?,
+                ),
+            })
+        })
+        .collect()
 }
 
 fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {

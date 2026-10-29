@@ -72,6 +72,8 @@ pub struct Config {
     pub groups: Vec<routing::GroupSockets>,
     /// The named mounts, with the paths that select them.
     pub mounts: Vec<routing::MountPath>,
+    /// The release's own directories of files (section 4.9).
+    pub static_dirs: Vec<routing::StaticPath>,
     /// The default mount honours X-Accel-Redirect (section 4.10).
     pub accel_redirect: bool,
     /// The default mount treats a 200 with a local Location and no body
@@ -400,7 +402,8 @@ impl Edge {
                     .await?
                     .with_errors(Arc::clone(&config.errors))
                     .with_sendfile(Arc::clone(&config.sendfile))
-                    .with_grpc_web(&config.grpc_web_origins),
+                    .with_grpc_web(&config.grpc_web_origins)
+                    .with_static_dirs(config.static_dirs.clone()),
                 )
                 .with_compression(config.compression.clone())
                 .with_trust(config.trust.clone()),
@@ -1150,16 +1153,59 @@ async fn serve<I>(
                                 context.upload = upload;
                             }
 
-                            dispatch(
-                                &mut parts,
-                                body.take(),
-                                buffered.take(),
-                                selection.pool,
-                                selection.upstream,
-                                &context,
-                                selection.redirects,
-                            )
-                            .await
+                            // Section 4.9: a path under one of the
+                            // release's own directories is answered by
+                            // the file when there is one; otherwise, and
+                            // for every other method, the workers take it.
+
+                            let mut served = None;
+
+                            if let Some(static_path) = &selection.static_path {
+                                let path = parts.uri.path().to_owned();
+                                let within = path
+                                    .strip_prefix(static_path.prefix.trim_end_matches('/'))
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let target = parts
+                                    .uri
+                                    .path_and_query()
+                                    .map_or_else(|| path.clone(), |target| target.to_string());
+
+                                if let static_files::Outcome::Served {
+                                    response,
+                                    status,
+                                    reason,
+                                    bytes,
+                                } = static_files::serve(
+                                    &static_path.route,
+                                    &parts.method,
+                                    &within,
+                                    &target,
+                                    &parts.headers,
+                                    routing.compression(),
+                                )
+                                .await
+                                {
+                                    link::record(&context, &parts, status, reason, bytes);
+                                    served = Some(link::Handled::Response(response));
+                                }
+                            }
+
+                            match served {
+                                Some(served) => served,
+                                None => {
+                                    dispatch(
+                                        &mut parts,
+                                        body.take(),
+                                        buffered.take(),
+                                        selection.pool,
+                                        selection.upstream,
+                                        &context,
+                                        selection.redirects,
+                                    )
+                                    .await
+                                }
+                            }
                         }
                     }
                     (None, routing::Decision::Redirect) => {

@@ -3922,6 +3922,18 @@ impl Daemon {
                         .release(name, id)
                         .map(|release| release.spec.grpc_web_origins)
                         .unwrap_or_default(),
+                    static_dirs: self
+                        .store
+                        .release(name, id)
+                        .map(|release| {
+                            release
+                                .spec
+                                .static_dirs
+                                .iter()
+                                .map(crate::model::StaticSpec::message)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     groups: running
                         .groups
                         .iter()

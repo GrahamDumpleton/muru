@@ -103,6 +103,71 @@ impl FromStr for ReleaseState {
     }
 }
 
+/// A directory of a release's own files (section 4.9), as the edge
+/// serves it: resolved under the source and checked to exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticSpec {
+    /// The path prefix.
+    pub path: String,
+    /// The directory, absolute.
+    pub dir: PathBuf,
+    /// The files tried, in order, when a directory is requested.
+    pub index: Vec<String>,
+    /// The file served for paths with no file of their own.
+    pub fallback_file: Option<String>,
+    /// `max-age`, in seconds, when set.
+    pub cache_max_age_s: Option<u64>,
+    /// Whether `immutable` is added.
+    pub cache_immutable: bool,
+    /// Files that get `no-cache` instead, by pattern.
+    pub cache_except: Vec<String>,
+    /// Whether a directory asked for without a trailing slash is
+    /// redirected to the slash form.
+    pub redirect_slash: bool,
+    /// Whether names may differ from the file's on disk in case.
+    pub case_insensitive: bool,
+}
+
+impl StaticSpec {
+    /// The entry as the snapshot carries it.
+    pub fn message(&self) -> muru_proto::edge::v1::StaticDir {
+        muru_proto::edge::v1::StaticDir {
+            path: self.path.clone(),
+            dir: self.dir.display().to_string(),
+            index: self.index.clone(),
+            fallback_file: self.fallback_file.clone().unwrap_or_default(),
+            cache_max_age_s: self.cache_max_age_s.unwrap_or(0),
+            cache_immutable: self.cache_immutable,
+            cache_except: self.cache_except.clone(),
+            no_redirect_slash: !self.redirect_slash,
+            case_insensitive: self.case_insensitive,
+        }
+    }
+
+    /// The entry as a declared release's table has it, the directory
+    /// absolute.
+    pub fn table(&self) -> muru_config::StaticDir {
+        muru_config::StaticDir {
+            path: self.path.clone(),
+            dir: self.dir.display().to_string(),
+            index: self.index.clone(),
+            fallback: self.fallback_file.clone(),
+            cache: (self.cache_max_age_s.is_some()
+                || self.cache_immutable
+                || !self.cache_except.is_empty())
+            .then(|| muru_config::CacheTable {
+                max_age: self.cache_max_age_s.map(|seconds| {
+                    muru_config::format_duration(std::time::Duration::from_secs(seconds))
+                }),
+                immutable: self.cache_immutable.then_some(true),
+                except: self.cache_except.clone(),
+            }),
+            redirect_slash: (!self.redirect_slash).then_some(false),
+            case: self.case_insensitive.then(|| "insensitive".to_owned()),
+        }
+    }
+}
+
 /// A mount of a release (section 6.7): a path served by another
 /// entrypoint in the same workers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +367,11 @@ pub struct ReleaseSpec {
     /// Named mounts beside the default one at /.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// The release's own directories of files (section 4.9), served by
+    /// the edge from under its source; none for a release recorded
+    /// before they existed.
+    #[serde(default)]
+    pub static_dirs: Vec<StaticSpec>,
     /// Python logging defaults (section 11.4).
     #[serde(default)]
     pub logging: muru_config::PythonLogging,

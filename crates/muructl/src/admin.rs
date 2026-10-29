@@ -2001,6 +2001,12 @@ pub struct DeployArgs {
     #[arg(long, value_name = "NAME")]
     sendfile_header: Option<String>,
 
+    /// A directory of the application's own files the edge serves under
+    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
+    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
+    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
+    static_dirs: Vec<(String, String)>,
+
     #[command(flatten)]
     socket: SocketArgs,
 
@@ -2317,6 +2323,14 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         cgi_local_redirect: None,
         sendfile_roots: args.sendfile_roots,
         sendfile_header: args.sendfile_header,
+        static_dirs: args
+            .static_dirs
+            .iter()
+            .map(|(path, dir)| pb::StaticDir {
+                path: path.clone(),
+                dir: dir.clone(),
+            })
+            .collect(),
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),

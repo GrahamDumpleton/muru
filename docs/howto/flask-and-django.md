@@ -68,9 +68,20 @@ when `DEBUG = True` and its `handler500` view otherwise. Setting
 answers with its own error page and records `reason=app_error`.
 
 Static files: Django serves them only under `runserver`, so under Muru a
-request for one reaches the application and finds no URL. In
-development, add Django's static file patterns to the URLs, which serve
-them while `DEBUG = True` and add nothing otherwise:
+request for one reaches the application and finds no URL. The edge can
+serve them instead, in development and production alike, from the
+directory `collectstatic` fills, declared in the project (see the
+[static files guide](static-files.md#an-applications-own-files)):
+
+```toml
+[[tool.muru.static]]
+path = '/static/'
+dir = 'static'
+```
+
+Or, in development, add Django's static file patterns to the URLs,
+which serve them while `DEBUG = True` from each application's own
+`static` directory, with no `collectstatic`, and add nothing otherwise:
 
 ```python
 from django.contrib.staticfiles.urls import staticfiles_urlpatterns
@@ -78,9 +89,21 @@ from django.contrib.staticfiles.urls import staticfiles_urlpatterns
 urlpatterns += staticfiles_urlpatterns()
 ```
 
-Under the daemon, a [static route](static-files.md) serves `STATIC_ROOT`
-after `collectstatic`, or use WhiteNoise. The
-[Django tutorial](../tutorials/first-django-site.md) does both.
+Under the daemon, the project's entry serves `STATIC_ROOT` after
+`collectstatic`, as a [static route](static-files.md) at the site level
+would, or use WhiteNoise. The
+[Django tutorial](../tutorials/first-django-site.md) uses the URL
+patterns in development and a static route in production.
+
+Flask serves its package's `static` folder itself under any server.
+Declaring it in the project hands those requests to the edge instead,
+with the same `url_for('static', ...)` paths:
+
+```toml
+[[tool.muru.static]]
+path = '/static/'
+dir = 'shop/static'
+```
 
 ## Both
 
