@@ -22,7 +22,8 @@ and are repeated here so that an agent needs nothing else to start work.
    directory exists in the repository but its contents are not part of it
    (`scratch/.gitignore` ignores everything except itself). Never reference
    files in `scratch/` by name from code or documentation that will be
-   committed, because they come and go.
+   committed, because they come and go. It is not where pending work is
+   tracked: that is GitHub issues (see Project process).
 
 ## Writing style, for every file in the repository
 
@@ -226,13 +227,38 @@ with `--fix`; the formatters keep what it inserts.
   the same change instead of deviating silently. Add new material as new
   subsections so section numbers stay stable.
 
+- Track pending work as GitHub issues, never in files. Every bug, planned
+  piece of work, part of a phase still to come and future idea has an
+  issue in this repository; a change a workshop needs is an issue in
+  GrahamDumpleton/muru-workshops, marked as blocked by the Muru issue it
+  waits on. When work is found or deferred, open an issue in the same
+  step instead of noting it in `scratch/`, a code comment or a document.
+  Write it with the headings and label of the matching issue form, or a
+  plain structure for work no form fits, and do not hard-wrap its text,
+  since GitHub shows every line break. A pull request that finishes an
+  issue says `Closes #N`.
+
+- Keep the [project board](https://github.com/users/GrahamDumpleton/projects/1)
+  true to the work, since it is how the maintainer decides what comes next.
+  Every open issue of both repositories is on it (issues in this
+  repository are added automatically; add a workshops issue with
+  `gh project item-add`), with Priority, Phase and Size set and Order
+  where it ranks against its neighbours. The maintainer moves issues to
+  Next; take the Next issue with the lowest Order, move it to In Progress
+  when its branch is made, and let `Closes #N` move it to In Review and
+  Done. When work changes an issue's size, priority or what blocks it,
+  update the issue and its fields in the same step. `gh project field-list
+  1 --owner GrahamDumpleton` gives the field and option ids that
+  `gh project item-edit` needs.
+
 - Keep the lists in sections 19 and 20 of the specification live. When a
   change resolves an open question (19.2), retires a risk (19.3) or brings a
   future idea (20) into scope, write the outcome into the relevant section
   (and the decisions table in 19.1 for a significant choice), record the
   reasoning in an ADR, and remove the entry from the list in the same change.
   The history of those lists is the git history and the ADR trail, not the
-  lists themselves.
+  lists themselves. Each future idea has an issue too: update or close it
+  in the same change.
 
 - ADRs are append-only. Never edit the decision in an existing record; add a
   new one that supersedes it and set the old record's status to superseded.
