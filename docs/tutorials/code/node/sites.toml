@@ -20,7 +20,7 @@ app = "shop"
 
 [[route]]
 host = "blog"
-static = "/home/you/node/blog"
+static = "blog"
 
 [[route]]
 host = "notes"

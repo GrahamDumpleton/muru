@@ -495,11 +495,11 @@ struct RunArgs {
     https_port: Option<Port>,
 
     /// Certificate chain to serve, PEM, instead of a development
-    /// certificate. Implies --https.
+    /// certificate; a relative path is the project's. Implies --https.
     #[arg(long, value_name = "FILE", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
 
-    /// Private key for --tls-cert, PEM.
+    /// Private key for --tls-cert, PEM; a relative path is the project's.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 
@@ -523,8 +523,8 @@ struct RunArgs {
     #[arg(long)]
     reload: bool,
 
-    /// Directory to watch for changes; defaults to --chdir or the current
-    /// directory. Repeatable.
+    /// Directory to watch for changes, relative to the project; defaults
+    /// to the project itself. Repeatable.
     #[arg(long = "reload-dir", value_name = "DIR")]
     reload_dir: Vec<PathBuf>,
 
@@ -537,9 +537,9 @@ struct RunArgs {
     #[arg(long = "reload-exclude", value_name = "GLOB")]
     reload_exclude: Vec<String>,
 
-    /// Python interpreter with the muru runtime library installed.
-    /// Defaults to the active virtualenv's interpreter, else the project's
-    /// .venv, else python3 on PATH.
+    /// Python interpreter with the muru runtime library installed; a
+    /// relative path is the project's. Defaults to the active virtualenv's
+    /// interpreter, else the project's .venv, else python3 on PATH.
     #[arg(long)]
     python: Option<PathBuf>,
 
@@ -1447,11 +1447,10 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         reflection: resolved.reflection.then_some(true),
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
-        python: Some(
-            python_interpreter(args.python.clone(), &resolved.project)
-                .display()
-                .to_string(),
-        ),
+        python: Some(written_interpreter(
+            &python_interpreter(args.python.clone(), &resolved.project),
+            &resolved.project,
+        )),
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
         sync_threads: Some(resolved.sync_threads),
@@ -1748,14 +1747,17 @@ struct Tls {
 }
 
 /// The HTTPS listener for --https, --https-only or --tls-cert (section 13.1).
-fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
+/// A relative certificate or key path is the project's, as --chdir makes
+/// every other path.
+fn tls(args: &RunArgs, project: &Path) -> anyhow::Result<Option<Tls>> {
     if !(args.https || args.https_only || args.tls_cert.is_some()) {
         return Ok(None);
     }
 
     let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
         (Some(certificate), Some(key)) => {
-            let (chain, key) = muru_edge::tls::load_pem_files(certificate, key)?;
+            let (chain, key) =
+                muru_edge::tls::load_pem_files(&project.join(certificate), &project.join(key))?;
             (chain, key, None)
         }
         _ => {
@@ -1778,10 +1780,18 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
 
 /// The interpreter to run the host with (section 13.1): --python, else the
 /// active virtualenv, else the project's own .venv, else python3 on PATH. A
-/// path is made absolute, because a virtualenv's interpreter locates its
+/// relative --python with a directory in it is the project's; a path is
+/// made absolute, because a virtualenv's interpreter locates its
 /// site-packages from its own path.
 fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
     let python = explicit
+        .map(|python| {
+            if python.components().count() > 1 {
+                project.join(python)
+            } else {
+                python
+            }
+        })
         .or_else(|| {
             std::env::var_os("VIRTUAL_ENV")
                 .map(|venv| PathBuf::from(venv).join("bin").join("python"))
@@ -1803,6 +1813,20 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
             }
         }
         _ => python,
+    }
+}
+
+/// An interpreter as --print-config writes it: relative to the project
+/// when it is inside it (the project's own .venv), so the file works in
+/// another checkout of the project, else absolute.
+fn written_interpreter(python: &Path, project: &Path) -> String {
+    let project = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+
+    match python.strip_prefix(&project) {
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => python.display().to_string(),
     }
 }
 
@@ -1858,7 +1882,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // Certificates are sorted out before anything is started, so a bad
     // --tls-cert or an unwritable cache fails with nothing to clean up.
 
-    let tls = tls(&args)?;
+    let tls = tls(&args, &resolved.project)?;
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
@@ -2142,7 +2166,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let directories = if args.reload_dir.is_empty() {
             vec![resolved.project.clone()]
         } else {
-            args.reload_dir.clone()
+            args.reload_dir
+                .iter()
+                .map(|directory| resolved.project.join(directory))
+                .collect()
         };
         let directories: Vec<PathBuf> = directories
             .into_iter()

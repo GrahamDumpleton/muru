@@ -135,13 +135,11 @@ unstyled again, since `DEBUG` is off and Django serves no static files.
 ## Static files from the edge
 
 Give the site a host with two routes, one to the application and one for
-`/static/` to the collected files. Save this as `site.toml`, with the
-full path of your project's `static` directory (`pwd` in the project
-prints the rest of it):
+`/static/` to the collected files. Save this as `site.toml` in the
+project, since the `static` path is taken from the file's directory:
 
 ```{literalinclude} code/mysite/site.toml
 :language: toml
-:emphasize-lines: 12
 ```
 
 and apply it:

@@ -13,7 +13,7 @@ from support import server as support
 PROJECTS = support.ROOT / "tests" / "fixtures" / "projects"
 
 
-def print_config(*args: str) -> dict[str, object]:
+def print_config(*args: str, python: str = sys.executable) -> dict[str, object]:
     muructl = support.muructl_path()
 
     if muructl is None:
@@ -22,7 +22,7 @@ def print_config(*args: str) -> dict[str, object]:
         pytest.skip("muructl is not built")
 
     completed = subprocess.run(
-        [str(muructl), "run", *args, "--print-config", "--python", sys.executable],
+        [str(muructl), "run", *args, "--print-config", "--python", python],
         capture_output=True,
         text=True,
         check=False,
@@ -101,3 +101,20 @@ def test_memory_settings_are_written() -> None:
         "hard_limit": "1200MB",
         "check_interval": "5s",
     }
+
+
+def test_an_interpreter_inside_the_project_is_written_relative_to_it(tmp_path: Path) -> None:
+    """A project's own .venv is written as a relative path, so the printed
+    file works in another checkout; an interpreter elsewhere stays absolute,
+    as the one above did."""
+
+    project = tmp_path / "site"
+    (project / ".venv" / "bin").mkdir(parents=True)
+    (project / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    (project / "pyproject.toml").write_text('[tool.muru]\nentrypoint = "app:application"\n')
+
+    # --python is relative to the project too, as --tls-cert is.
+
+    document = print_config(str(project), python=".venv/bin/python")
+    release = document["app"]["app"]["release"]["r1"]  # type: ignore[index]
+    assert release["python"] == ".venv/bin/python"

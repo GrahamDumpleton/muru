@@ -9,5 +9,5 @@ app = "mysite"
 [[route]]
 host = "site"
 path = "/static/"
-static = "/home/you/mysite/static"
+static = "static"
 cache = { max_age = "1h" }

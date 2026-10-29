@@ -300,3 +300,67 @@ def test_a_memory_table_round_trips_through_export(daemon: Daemon, tmp_path: Pat
         "check_interval": "5s",
     }
     assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+
+
+def test_relative_paths_are_taken_from_the_file(daemon: Daemon) -> None:
+    """Every path in an applied file is resolved from the file's directory,
+    as `source` is, since the daemon runs elsewhere (here, the test's own
+    working directory): static directories, file hint roots, a host's and a
+    route's error page files, and an overlay's static target."""
+
+    site = daemon.base / "site"
+
+    for directory in ("static", "more", "snapshot", "reports", "pages"):
+        (site / directory).mkdir(parents=True)
+
+    (site / "static" / "hello.txt").write_text("hello")
+    (site / "pages" / "route-404.html").write_text("route page")
+    (site / "pages" / "host-404.html").write_text("host page")
+    (site / "site.toml").write_text(
+        f"""[app.shop.release.r1]
+source = '{SHOP}'
+python = '{sys.executable}'
+processes = 1
+sendfile_roots = ['reports']
+
+[host.site]
+names = ['site.test']
+default = true
+
+[host.site.error_pages]
+404 = {{ file = 'pages/host-404.html' }}
+
+[[route]]
+name = 'files'
+host = 'site'
+path = '/files/'
+static = 'static'
+error_pages = {{ 404 = {{ file = 'pages/route-404.html' }} }}
+
+[[route]]
+host = 'site'
+path = '/more/'
+static = 'more'
+
+[overlay.snapshot]
+routes.files.target = {{ static = 'snapshot' }}
+"""
+    )
+    applied = daemon.muructl("apply", "-f", str(site / "site.toml"), check=False)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    # The exported configuration carries the resolved paths.
+
+    exported = daemon.muructl("config", "export").stdout
+
+    for path in ("static", "snapshot", "reports", "pages/route-404.html", "pages/host-404.html"):
+        assert str(site / path) in exported, (path, exported)
+
+    # And the files are found: the static route serves its directory, and
+    # a miss gets the nearest page, the route's or the host's.
+
+    assert daemon.request("/files/hello.txt", host="site.test").body == b"hello"
+    missed = daemon.request("/files/missing", host="site.test")
+    assert (missed.status, missed.body) == (404, b"route page")
+    missed = daemon.request("/more/missing", host="site.test")
+    assert (missed.status, missed.body) == (404, b"host page")

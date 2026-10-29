@@ -104,10 +104,7 @@ def test_the_two_sites_tutorial(tmp_path: Path) -> None:
         out = daemon.deploy("shop", node / "shop", "--entrypoint", "app:application")
         assert out == "muru: release shop@r1 is ready and serving"
         sites = (
-            (node / "sites.toml")
-            .read_text()
-            .replace("/home/you/node", str(node))
-            .replace("127.0.0.1:9001", f"127.0.0.1:{notes_port}")
+            (node / "sites.toml").read_text().replace("127.0.0.1:9001", f"127.0.0.1:{notes_port}")
         )
         (node / "sites.toml").write_text(sites)
         applied = daemon.muructl("apply", "-f", str(node / "sites.toml")).stdout
