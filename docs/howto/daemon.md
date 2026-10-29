@@ -36,12 +36,22 @@ first. No request is refused during the switch.
 ## Releases
 
 A release is a source directory and the settings fixed at creation: the
-entrypoint, interface, interpreter, processes, threads and preload mode,
-read from the directory's `[tool.muru]` table unless a flag overrides
-them, exactly as `muructl run` reads them. Release ids are `r1`, `r2` and
-so on unless `--release` names one. The interpreter is the source
-directory's `.venv` when it has one, otherwise the previous release's,
-otherwise `--python`.
+entrypoint, interface, interpreter, processes, threads, preload mode,
+timeouts, memory policy, environment and the rest a flag can set, read
+from the directory's `[tool.muru]` table unless a flag overrides them,
+exactly as `muructl run` reads them. Release ids are `r1`, `r2` and so
+on unless `--release` names one.
+
+A deploy takes what neither its flags nor the source's table give from
+the release before it, so a `--timeout soft=3s` or `--env DEBUG=1` given
+once stays in force through later deploys until a flag or the table
+changes it. Environment variables and secrets carry by name. The tables
+in `[tool.muru]`, worker groups, mounts, logging, scaling and error
+pages, come from the source alone, so a source that drops a group drops
+it. The interpreter is the source directory's `.venv` when it has one,
+otherwise the previous release's, otherwise `--python`. `--fresh` deploys
+from the flags, the source and the defaults alone, ignoring the previous
+release.
 
 ```
 muructl release list shop

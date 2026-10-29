@@ -1849,6 +1849,12 @@ pub struct DeployArgs {
     #[arg(long)]
     override_freeze: bool,
 
+    /// Take nothing from the previous release: every setting a flag can
+    /// set comes from the flags, the source's [tool.muru] table or the
+    /// default, the interpreter included.
+    #[arg(long)]
+    fresh: bool,
+
     /// How long the release this one replaces stays warm for an instant
     /// rollback (default 30m; 0 stops it as soon as it has drained).
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
@@ -2235,6 +2241,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         wait: !args.no_wait,
         hold: args.hold,
         override_freeze: args.override_freeze,
+        fresh: args.fresh,
         reflection: None,
         grpc_web_origins: Vec::new(),
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),

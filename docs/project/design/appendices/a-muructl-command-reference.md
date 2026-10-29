@@ -30,7 +30,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
 | Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
-| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers | 9.2 |
+| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers, --fresh (take nothing from the previous release, section 3.3) | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
 | Traffic | muructl host create, list, show, delete | Manage virtual hosts | 4.3 |
 | Traffic | muructl route set, list, show, delete | Manage routes and traffic splits | 4.5 |

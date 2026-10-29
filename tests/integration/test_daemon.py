@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 from support import server as support
@@ -469,3 +470,27 @@ def test_a_relative_or_deep_run_directory_is_refused_at_start(tmp_path: Path) ->
     assert deep.returncode != 0
     assert "leaves" in deep.stderr and "bytes" in deep.stderr, deep.stderr
     assert "shorter path" in deep.stderr
+
+
+def test_a_deploy_carries_settings_from_the_previous_release(daemon: Daemon) -> None:
+    # Section 3.3: what neither the flags nor the source's table give
+    # comes from the release before, a timeout, a memory key and an
+    # environment variable alike, and --fresh starts from the defaults.
+
+    daemon.deploy(
+        "shop", SHOP, "--timeout", "soft=3s", "--memory", "soft_limit=800MB", "--env", "DEBUG=1"
+    )
+    daemon.deploy("shop", SHOP)
+    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
+    assert "#   shop@r2: timeouts.soft_timeout = 3s (the previous release)" in shown
+    assert "#   shop@r2: memory.soft_limit = 800MB (the previous release)" in shown
+    assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
+    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    assert exported["app"]["shop"]["release"]["r2"]["env"] == {"DEBUG": "1"}
+
+    daemon.deploy("shop", SHOP, "--fresh")
+    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
+    assert "#   shop@r3: timeouts.soft_timeout = off (default)" in shown
+    assert "#   shop@r3: memory.soft_limit = off (default)" in shown
+    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    assert "env" not in exported["app"]["shop"]["release"]["r3"]
