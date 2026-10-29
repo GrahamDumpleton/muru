@@ -13,7 +13,7 @@
   <span>workers</span>
 </header>
 <main>
-  <nav><a href="./">daemon</a><a href="workers?release={{ release }}">{{ release }}</a></nav>
+  <nav><a href="./">{{ home }}</a><a href="workers?release={{ release }}">{{ release }}</a></nav>
   <section id="status" hx-get="fragment/workers/status?release={{ release }}" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "workers_status.html" %}
   </section>

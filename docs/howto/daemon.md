@@ -297,8 +297,11 @@ configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
 and `[error_override]` tables and the [node's
 budget](scaling.md#the-nodes-budget). The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
-daemon through its admin socket: `--socket` or `MURU_SOCKET`, else the
-socket in the runtime directory.
+daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
+development run started from the current directory, else the daemon's
+socket in the runtime directory, else the one development run listening;
+with several runs and no daemon the command names them, so one can be
+chosen with `--socket`. `muructl status` says which was found.
 
 The access log is written as JSON lines to `access.log` in the log
 directory, `muructl logs` shows or follows it and each release's output,

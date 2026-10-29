@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use muru_dashboard::{Data, History, MetricsSource, RequestRow, Sampler, Source, Summary, Worker};
 use muru_edge::Pools;
 use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
-use muru_edge::metrics::{aggregate, pool_samples, render};
+use muru_edge::metrics::pool_samples;
 
 use muru_controller::logs::Logs;
 
@@ -29,6 +29,10 @@ pub struct Inputs {
     pub development: bool,
     /// The application name.
     pub app: String,
+    /// The application as the release names it, for the worker pages.
+    pub label: String,
+    /// The host's control connection, which the worker pages ask through.
+    pub host: crate::run_admin::SharedHostLink,
     /// Where the application is served.
     pub listen: SocketAddr,
     /// Where it is served over TLS, when it is.
@@ -61,22 +65,19 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
     let pools = Arc::clone(&inputs.pools);
     let access_log = Arc::clone(&inputs.access_log);
     let connections = inputs.connections.clone();
-    let metrics: MetricsSource = Arc::new(move || {
-        let routing = pools.current();
-        let samples = access_log
-            .metrics()
-            .samples()
-            .into_iter()
-            .chain(pool_samples(&routing))
-            .chain(connections.samples());
-        render(&aggregate(samples))
-    });
+    let metrics: MetricsSource =
+        Arc::new(move || crate::run_admin::metrics_text(&pools, &access_log, &connections));
 
     // Section 10.7: a point of history a second for the charts, from
     // the same counters the metrics show.
 
     let history = Arc::new(History::new());
     let recorder = Arc::clone(&history);
+    let debug = crate::run_admin::debug_source(
+        Arc::clone(&inputs.host),
+        inputs.label.clone(),
+        Arc::clone(&inputs.release),
+    );
     let sampled_pools = Arc::clone(&inputs.pools);
     let sampled_log = Arc::clone(&inputs.access_log);
     tokio::spawn(async move {
@@ -105,7 +106,7 @@ pub async fn start(address: &str, inputs: Inputs) -> anyhow::Result<SocketAddr> 
     });
     let source: Source = Arc::new(move || collect(&inputs));
     tokio::spawn(async move {
-        if let Err(error) = muru_dashboard::serve(listener, source, metrics, history).await {
+        if let Err(error) = muru_dashboard::serve(listener, source, metrics, history, debug).await {
             tracing::warn!(%error, "the dashboard stopped");
         }
     });
@@ -200,6 +201,11 @@ fn collect(inputs: &Inputs) -> Data {
         .collect();
     Data {
         app: inputs.app.clone(),
+        target: format!(
+            "{}@r{}",
+            inputs.label,
+            inputs.release.load(Ordering::Relaxed)
+        ),
         release: inputs.release.load(Ordering::Relaxed),
         uptime: muru_dashboard::uptime(inputs.started.elapsed()),
         development: inputs.development,

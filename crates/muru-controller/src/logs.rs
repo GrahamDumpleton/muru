@@ -17,9 +17,21 @@ const CAPACITY: usize = 2000;
 
 /// A bounded ring of recent log lines, shared between the relay tasks that
 /// fill it and the dashboard that reads it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Logs {
     lines: Arc<Mutex<VecDeque<String>>>,
+    /// Each line as it arrives, for a follower such as `muructl logs`
+    /// under a development run (section 13.1).
+    live: tokio::sync::broadcast::Sender<String>,
+}
+
+impl Default for Logs {
+    fn default() -> Self {
+        Self {
+            lines: Arc::default(),
+            live: tokio::sync::broadcast::channel(CAPACITY).0,
+        }
+    }
 }
 
 impl Logs {
@@ -31,7 +43,17 @@ impl Logs {
             lines.pop_front();
         }
 
+        if self.live.receiver_count() > 0 {
+            let _ = self.live.send(line.clone());
+        }
+
         lines.push_back(line);
+    }
+
+    /// Every line from now on, for a follower; one that falls behind by
+    /// more than the ring holds skips the lines it missed.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.live.subscribe()
     }
 
     /// The most recent lines, oldest first.

@@ -13,7 +13,8 @@ pub async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
 
     if !socket.exists() {
         anyhow::bail!(
-            "no daemon is running: {} does not exist (muructl daemon start, or muructl up)",
+            "nothing is listening at {}: no daemon (muructl daemon start, or muructl up) and no \
+             development run (muructl run)",
             socket.display()
         );
     }

@@ -113,6 +113,10 @@ impl Admin for Service {
                 .map(|address| address.to_string())
                 .unwrap_or_default(),
             budget,
+            kind: "daemon".to_owned(),
+            app: String::new(),
+            release: String::new(),
+            project: String::new(),
         }))
     }
 

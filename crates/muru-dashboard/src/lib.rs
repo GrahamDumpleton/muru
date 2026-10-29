@@ -56,6 +56,8 @@ pub type EventsSource = Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<EventRo
 pub struct Data {
     /// The application name.
     pub app: String,
+    /// The release as the worker pages name it, app@release.
+    pub target: String,
     /// The current release number.
     pub release: u32,
     /// How long the run has been up, already formatted.
@@ -523,6 +525,8 @@ struct WorkersPage<'a> {
     release: &'a str,
     /// The signed-in session's form token, when actions are on.
     csrf: Option<&'a str>,
+    /// What the page the dashboard opens on is called: daemon, or run.
+    home: &'a str,
     /// The page a restart comes back to, relative to the dashboard.
     back: &'a str,
     status: &'a [inspect::StatusRow],
@@ -536,6 +540,8 @@ struct WorkerPage<'a> {
     release: &'a str,
     /// The signed-in session's form token, when actions are on.
     csrf: Option<&'a str>,
+    /// What the page the dashboard opens on is called: daemon, or run.
+    home: &'a str,
     /// The page a restart comes back to, relative to the dashboard.
     back: &'a str,
     worker: u32,
@@ -584,18 +590,25 @@ pub async fn serve(
     source: Source,
     metrics: MetricsSource,
     history: Arc<History>,
+    debug: DebugSource,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let source = Arc::clone(&source);
         let metrics = Arc::clone(&metrics);
         let history = Arc::clone(&history);
+        let debug = Arc::clone(&debug);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let source = Arc::clone(&source);
                 let metrics = Arc::clone(&metrics);
                 let history = Arc::clone(&history);
-                async move { Ok::<_, Infallible>(respond(&request, &source, &metrics, &history)) }
+                let debug = Arc::clone(&debug);
+                async move {
+                    Ok::<_, Infallible>(
+                        respond(&request, &source, &metrics, &history, &debug).await,
+                    )
+                }
             });
             if let Err(error) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -612,11 +625,12 @@ pub async fn bind(address: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::bind(address).await?)
 }
 
-fn respond(
+async fn respond(
     request: &Request<Incoming>,
     source: &Source,
     metrics: &MetricsSource,
     history: &Arc<History>,
+    debug: &DebugSource,
 ) -> Response<Body> {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return plain(StatusCode::METHOD_NOT_ALLOWED, "only GET is served\n");
@@ -627,6 +641,13 @@ fn respond(
     }
 
     if let Some(response) = history_paths(request, history) {
+        return response;
+    }
+
+    // Section 13.1: the worker pages, as the daemon's dashboard has them,
+    // with no actions since a run has no sign-in.
+
+    if let Some(response) = inspect_paths(request, debug, None, "run").await {
         return response;
     }
 
@@ -877,7 +898,7 @@ async fn respond_node(
         }));
     }
 
-    if let Some(response) = inspect_paths(request, debug, csrf.as_deref()).await {
+    if let Some(response) = inspect_paths(request, debug, csrf.as_deref(), "daemon").await {
         return response;
     }
 
@@ -942,6 +963,7 @@ async fn inspect_paths(
     request: &Request<Incoming>,
     debug: &DebugSource,
     csrf: Option<&str>,
+    home: &str,
 ) -> Option<Response<Body>> {
     use inspect::{failures, memory_views, merge_stacks, status_rows, tasks_views};
 
@@ -1024,6 +1046,7 @@ async fn inspect_paths(
             WorkersPage {
                 release: &release,
                 csrf,
+                home,
                 back: &back,
                 status: &status_rows(&answer),
                 error: &error,
@@ -1034,6 +1057,7 @@ async fn inspect_paths(
             WorkerPage {
                 release: &release,
                 csrf,
+                home,
                 back: &back,
                 worker: worker.unwrap_or_default(),
                 status: &status_rows(&answer),

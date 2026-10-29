@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod pstats;
+mod run_admin;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -27,6 +28,8 @@ use tokio::sync::mpsc;
 use crate::watch::Watch;
 use muru_controller::host::{HostProcess, HostSpec};
 use muru_controller::logs::Logs;
+
+use crate::run_admin::{HostLink, RunState, SharedHostLink};
 
 /// How long a host may take to get its workers listening.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2016,7 +2019,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         return Err(error);
     }
 
-    let (mut control, mut host_messages) = host_control(&current).await;
+    let (control, mut host_messages) = host_control(&current).await;
+
+    // Section 11.7: the host's control connection is shared with the
+    // admin socket, which asks the workers things through it.
+
+    let host_link: SharedHostLink = Arc::new(std::sync::Mutex::new(HostLink::default()));
+    host_link
+        .lock()
+        .expect("host link poisoned")
+        .attach(control);
 
     let (http_address, https_address) = addresses(&args);
 
@@ -2142,12 +2154,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    let mut dashboard_address = None;
+
     if let Some(address) = dashboard {
         match dashboard::start(
             &address,
             dashboard::Inputs {
                 development,
                 app: resolved.entrypoint.clone(),
+                label: label.clone(),
+                host: Arc::clone(&host_link),
                 listen: edge.local_addr(),
                 https: edge.https_addr(),
                 started: std::time::Instant::now(),
@@ -2160,8 +2176,66 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(address) => println!("muru: dashboard on http://{address}/"),
+            Ok(address) => {
+                println!("muru: dashboard on http://{address}/");
+                dashboard_address = Some(address);
+            }
             Err(error) => println!("muru: no dashboard: {error:#}"),
+        }
+    }
+
+    // Section 13.1: the admin socket, in the user runtime directory so
+    // nothing is written into the project, named by the port so two runs
+    // never share one; muructl finds it from the file beside it.
+
+    let (admin_stop_tx, admin_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let runtime = muru_controller::locations::Locations::resolve(&Default::default())
+        .run
+        .path;
+    let project = resolved
+        .project
+        .canonicalize()
+        .unwrap_or_else(|_| resolved.project.clone());
+    let registration =
+        match run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project) {
+            Ok(registration) => Some(registration),
+            Err(error) => {
+                println!("muru: no admin socket: {error:#}");
+                None
+            }
+        };
+
+    if let Some(registration) = &registration {
+        let mut listeners = vec![format!("http://{}", edge.local_addr())];
+
+        if let Some(https) = edge.https_addr() {
+            listeners.push(format!("https://{https}"));
+        }
+
+        let state = Arc::new(RunState {
+            app: label.clone(),
+            release: Arc::clone(&release_number),
+            project,
+            run_dir: run_dir.clone(),
+            socket: registration.socket.clone(),
+            listeners,
+            dashboard: dashboard_address,
+            started_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64),
+            pools: edge.pools(),
+            connections: edge.connections(),
+            access_log: edge.access_log(),
+            logs: logs.clone(),
+            host: Arc::clone(&host_link),
+        });
+
+        match run_admin::serve(state, admin_stop_rx).await {
+            Ok(serving) => {
+                println!("muru: admin socket {}", registration.socket.display());
+                tokio::spawn(serving);
+            }
+            Err(error) => println!("muru: no admin socket: {error:#}"),
         }
     }
 
@@ -2254,10 +2328,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         match connected {
                             Ok(connected) => {
                                 pools.replace(connected);
-
-                                if let Some(control) = &control {
-                                    control.acknowledge(version);
-                                }
+                                host_link.lock().expect("host link poisoned").acknowledge(version);
                             }
                             Err(error) => {
                                 println!("muru: the workers could not be reconnected: {error:#}");
@@ -2267,8 +2338,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     muru_controller::host::HostMessage::Event { kind, message, .. } => {
                         println!("muru: {kind}: {message}");
                     }
-                    muru_controller::host::HostMessage::Status { .. }
-                    | muru_controller::host::HostMessage::Response { .. } => {}
+                    muru_controller::host::HostMessage::Response { id, workers, error } => {
+                        host_link.lock().expect("host link poisoned").answer(id, workers, error);
+                    }
+                    muru_controller::host::HostMessage::Status { .. } => {}
                 }
             }
             Some(path) = changed.recv() => {
@@ -2319,7 +2392,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop(stop_budget));
-                                (control, host_messages) = host_control(&current).await;
+                                let (control, messages) = host_control(&current).await;
+                                host_link.lock().expect("host link poisoned").attach(control);
+                                host_messages = messages;
                                 break;
                             }
                             Err(error) => {
@@ -2349,6 +2424,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     drainer.drain(stop_budget).await;
     current.stop(stop_budget).await;
+    let _ = admin_stop_tx.send(());
+    drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);
     outcome
 }
