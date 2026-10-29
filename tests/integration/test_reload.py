@@ -158,3 +158,36 @@ def test_reload_is_off_by_default(project: Path) -> None:
         assert version_seen(server) == "one"
     finally:
         server.stop()
+
+
+def test_included_patterns_add_to_the_default(project: Path) -> None:
+    (project / "page.html").write_text("<p>one</p>\n")
+    server = support.start(
+        "reload_app:application",
+        workers=1,
+        chdir=project,
+        args=["--reload", "--reload-include", "**/*.html", "--reload-exclude", "unrelated.py"],
+    )
+
+    try:
+        # The start-up line names the patterns in force: the default, the
+        # include added to it, and the exclude.
+
+        assert server.wait_for_log("for changes to **/*.py, **/*.html, except unrelated.py")
+
+        # A template change reloads, and so does a module change: the
+        # include added **/*.html without replacing **/*.py.
+
+        server.mark_log()
+        time.sleep(1.1)
+        (project / "page.html").write_text("<p>two</p>\n")
+        assert server.wait_for_log("page.html changed", timeout=10)
+        assert server.wait_for_log("switched to release r", timeout=30)
+
+        server.mark_log()
+        time.sleep(1.1)
+        write_app(project, "two")
+        assert server.wait_for_log("reload_app.py changed", timeout=10)
+        wait_for_version(server, "two")
+    finally:
+        server.stop()

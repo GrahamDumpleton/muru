@@ -32,6 +32,8 @@ use muru_controller::logs::Logs;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the watcher looks for changes.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// What --reload watches by default; --reload-include adds to it.
+const RELOAD_INCLUDE: &str = "**/*.py";
 /// How long changes must have stopped before a reload starts.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -528,12 +530,15 @@ struct RunArgs {
     #[arg(long = "reload-dir", value_name = "DIR")]
     reload_dir: Vec<PathBuf>,
 
-    /// Files that count as source, relative to a watched directory.
-    /// Repeatable; the default is `**/*.py`.
+    /// Files that count as source besides `**/*.py`, relative to a
+    /// watched directory, such as `**/*.html`. Repeatable.
     #[arg(long = "reload-include", value_name = "GLOB")]
     reload_include: Vec<String>,
 
-    /// Files that never trigger a reload. Repeatable.
+    /// Files that never trigger a reload, besides editor files; an
+    /// exclude wins over an include, so `**/*.py` here watches the
+    /// included patterns alone. Virtualenvs, `__pycache__`, `.git` and
+    /// what `.gitignore` names are never watched. Repeatable.
     #[arg(long = "reload-exclude", value_name = "GLOB")]
     reload_exclude: Vec<String>,
 
@@ -2176,20 +2181,29 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             .map(|directory| directory.canonicalize().unwrap_or(directory))
             .collect();
 
-        let include = if args.reload_include.is_empty() {
-            vec!["**/*.py".to_owned()]
-        } else {
-            args.reload_include.clone()
-        };
+        // Includes add to the default and excludes win over includes, so
+        // a run that watches templates alone excludes **/*.py rather
+        // than losing it by naming a pattern.
+
+        let mut include = vec![RELOAD_INCLUDE.to_owned()];
+        include.extend(args.reload_include.iter().cloned());
         let watch = Watch::new(directories, &include, &args.reload_exclude)?;
+
+        let except = if args.reload_exclude.is_empty() {
+            String::new()
+        } else {
+            format!(", except {}", args.reload_exclude.join(", "))
+        };
+
         println!(
-            "muru: watching {} for changes",
+            "muru: watching {} for changes to {}{except}",
             watch
                 .directories()
                 .iter()
                 .map(|directory| directory.display().to_string())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            include.join(", ")
         );
         tokio::spawn(watch.run(WATCH_INTERVAL, changed_tx));
     } else {
