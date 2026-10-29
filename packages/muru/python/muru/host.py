@@ -2448,7 +2448,15 @@ class Host:
             self.outside_errors[pid] = str(error)
 
             if known is None and self.outside.unreadable is not None:
-                log(f"workers are read from inside, since they cannot be from outside: {error}")
+                # Expected on macOS, where only a signed and entitled
+                # process may read another's memory, so it is said as
+                # information rather than left to read as an error.
+
+                log(
+                    "stacks and profiles come from inside the workers, as reading them from "
+                    f"outside is not available here ({error})"
+                    + ("; that is usual on macOS" if sys.platform == "darwin" else "")
+                )
 
             return None
 
