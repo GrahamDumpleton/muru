@@ -47,8 +47,6 @@ pub struct EdgeSpec {
     pub log: PathBuf,
     /// Where the access log goes, or none.
     pub access_log: Option<PathBuf>,
-    /// The limits the edge enforces.
-    pub limits: muru_edge::Limits,
     /// Where upload routes store files (section 4.11).
     pub spool: PathBuf,
     /// Whom the edge runs as, when the daemon is root (ADR 0026): the
@@ -129,7 +127,6 @@ impl EdgeProcess {
         tls: Vec<bool>,
         log: PathBuf,
         access_log: Option<PathBuf>,
-        limits: muru_edge::Limits,
         spool: PathBuf,
         identity: Option<crate::host::Identity>,
     ) -> anyhow::Result<Self> {
@@ -172,7 +169,6 @@ impl EdgeProcess {
                 generation,
                 log,
                 access_log,
-                limits,
                 spool,
                 identity,
             },
@@ -198,6 +194,17 @@ impl EdgeProcess {
             .collect()
     }
 
+    /// A copy of the listening socket on an address the edge serves, so
+    /// a replacement on changed listeners keeps the backlog of those it
+    /// keeps.
+    pub fn socket_on(&self, address: std::net::SocketAddr) -> Option<std::net::TcpListener> {
+        self.spec
+            .listeners
+            .iter()
+            .find(|listener| listener.socket.local_addr().ok() == Some(address))
+            .and_then(|listener| listener.socket.try_clone().ok())
+    }
+
     /// The edge's pid.
     pub fn pid(&self) -> Option<u32> {
         pid_of(&self.process)
@@ -206,13 +213,6 @@ impl EdgeProcess {
     /// The generation of the edge's sockets.
     pub fn generation(&self) -> u32 {
         self.spec.generation
-    }
-
-    /// How long the edge is given to finish its connections when it is
-    /// replaced: the request deadline, so a response in flight can
-    /// complete, and a little over.
-    pub fn drain_grace(&self) -> Duration {
-        self.spec.limits.request_deadline + Duration::from_secs(5)
     }
 
     /// Move the spec's sockets to the next generation, into the edges'
@@ -388,16 +388,23 @@ impl EdgeProcess {
         Ok(true)
     }
 
-    /// Section 13.4: start a new edge on the same listeners, give it the
+    /// Section 13.4: start a new edge on the same listeners, or on
+    /// `listeners` when a reload changed them (section 13.3), give it the
     /// current snapshot, and only then tell the old one to stop: it stops
     /// accepting, finishes its connections and exits, waited for in the
     /// background for `grace` before it is killed. Returns the old edge's
     /// pid. If the new edge does not come up or refuses the snapshot, it
-    /// is discarded and the old one keeps serving.
-    pub async fn replace(&mut self, grace: Duration) -> anyhow::Result<u32> {
+    /// is discarded and the old one keeps serving on what it had.
+    pub async fn replace(
+        &mut self,
+        grace: Duration,
+        listeners: Option<Vec<Listener>>,
+    ) -> anyhow::Result<u32> {
         let old_control = self.spec.control.clone();
         let old_listener_socket = self.spec.listener_socket.clone();
         let old_generation = self.spec.generation;
+        let old_listeners =
+            listeners.map(|listeners| std::mem::replace(&mut self.spec.listeners, listeners));
         self.next_generation();
 
         let next = match launch(&self.spec, &self.snapshot.worker_sockets).await {
@@ -406,6 +413,11 @@ impl EdgeProcess {
                 self.spec.generation = old_generation;
                 self.spec.control = old_control;
                 self.spec.listener_socket = old_listener_socket;
+
+                if let Some(listeners) = old_listeners {
+                    self.spec.listeners = listeners;
+                }
+
                 return Err(error);
             }
         };
@@ -420,6 +432,11 @@ impl EdgeProcess {
                 std::mem::replace(&mut self.spec.listener_socket, old_listener_socket),
             );
             self.spec.generation = old_generation;
+
+            if let Some(listeners) = old_listeners {
+                self.spec.listeners = listeners;
+            }
+
             tokio::spawn(finish(
                 failed,
                 control,
@@ -560,24 +577,8 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         .arg(&spec.control)
         .arg("--listener-socket")
         .arg(&spec.listener_socket)
-        .arg("--max-body-size")
-        .arg(spec.limits.max_body_size.to_string())
-        .arg("--max-header-bytes")
-        .arg(spec.limits.max_header_bytes.to_string())
-        .arg("--max-headers")
-        .arg(spec.limits.max_headers.to_string())
-        .arg("--max-connections")
-        .arg(spec.limits.max_connections.to_string())
-        .arg("--max-connections-per-client")
-        .arg(spec.limits.max_connections_per_client.to_string())
-        .arg("--max-requests-per-connection")
-        .arg(spec.limits.max_requests_per_connection.to_string())
-        .arg("--http2-max-concurrent-streams")
-        .arg(spec.limits.http2_max_concurrent_streams.to_string())
         .arg("--spool")
-        .arg(&spec.spool)
-        .arg("--spool-quota")
-        .arg(spec.limits.spool_quota.to_string());
+        .arg(&spec.spool);
 
     // Section 4.15: the rate limits' buckets, in the edges' directory,
     // which every generation of the edge maps, so a replacement draws
@@ -587,20 +588,6 @@ fn start(spec: &EdgeSpec, worker_sockets: &[String]) -> anyhow::Result<Child> {
         command
             .arg("--rate-buckets")
             .arg(directory.join(BUCKETS_FILE));
-    }
-
-    for (name, duration) in [
-        ("queue", spec.limits.queue_timeout),
-        ("deadline", spec.limits.request_deadline),
-        ("header_read", spec.limits.header_read_timeout),
-        ("body_idle", spec.limits.body_idle_timeout),
-        ("response_idle", spec.limits.response_idle_timeout),
-        ("keep_alive", spec.limits.keep_alive_timeout),
-        ("keep_alive_proxy", spec.limits.keep_alive_timeout_proxy),
-    ] {
-        command
-            .arg("--timeout")
-            .arg(format!("{name}={}ms", duration.as_millis()));
     }
 
     if let Some(path) = &spec.access_log {

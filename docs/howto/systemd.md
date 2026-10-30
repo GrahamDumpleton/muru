@@ -6,9 +6,8 @@
 The shipped unit runs the daemon in system mode with readiness
 notification, detaches on stop and re-reads the configuration file on
 reload for [what can change while the daemon
-runs](daemon.md#reloading-the-configuration). Reloading listeners,
-limits and event sinks, journald as the log sink and socket activation
-are still to come.
+runs](daemon.md#reloading-the-configuration). Journald as the log sink
+and socket activation are still to come.
 ```
 
 The repository ships a unit at `packaging/systemd/muru.service`:

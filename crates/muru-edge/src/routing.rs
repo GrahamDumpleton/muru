@@ -2111,6 +2111,7 @@ mod tests {
             rate_limits: Vec::new(),
             default_traffic: None,
             compression: None,
+            limits: None,
             worker_sockets: Vec::new(),
             default_app: String::new(),
             default_release: String::new(),

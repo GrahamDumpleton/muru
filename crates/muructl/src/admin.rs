@@ -170,9 +170,9 @@ pub enum DaemonCommand {
         socket: SocketArgs,
     },
 
-    /// Re-read the daemon's configuration file for what can change while
-    /// it runs: the [proxy], [compression], [error_pages],
-    /// [error_override], [[client_class]] and [rate_limit] tables.
+    /// Re-read the daemon's configuration file and apply what changed:
+    /// the edge's tables, the listeners, the limits, the event sinks and
+    /// the budget; the reload says what is read only at start.
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
@@ -254,24 +254,22 @@ fn upgrade_arguments() -> Vec<std::ffi::OsString> {
 /// Run the daemon in the foreground.
 pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
     let locations = args.locations.resolve();
-    let document = read_config(&locations.config.path)?;
 
-    let listeners = match args.listen {
-        Some(listen) => vec![(listen, false)],
-        None => listeners_from(&document)?,
+    // The file is read the same way here and on every reload, with the
+    // command line's settings laid over it.
+
+    let overrides = muru_controller::settings::Overrides {
+        listen: args.listen,
+        metrics: args.metrics,
+        dashboard: args.dashboard,
+        user: args.user.clone(),
     };
-
-    let limits = limits_from(&document)?;
-    let h2c = h2c_from(&document)?;
-    let metrics = metrics_from(&document, args.metrics)?;
-    let dashboard = dashboard_from(&document, args.dashboard)?;
-    let sinks = sinks_from(&document)?;
-    let overlay_webhook = document
-        .overlay_webhook
-        .as_ref()
-        .map(muru_controller::triggers::Webhook::from_config)
-        .transpose()
-        .map_err(|error| anyhow::anyhow!("[overlay_webhook]: {error}"))?;
+    let settings = muru_controller::settings::NodeSettings::read(
+        &locations.config.path,
+        &locations.state.path.join("secrets"),
+        &overrides,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -293,51 +291,11 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
             location.rule
         );
     }
-    let secrets = muru_controller::secrets::Store::from_document(
-        &document,
-        &locations.state.path.join("secrets"),
-    )?;
-    let service_user = args.user.clone().or_else(|| {
-        document
-            .daemon
-            .as_ref()
-            .and_then(|table| table.user.clone())
-    });
     muru_controller::daemon::run(muru_controller::daemon::Config {
         locations,
-        listeners,
-        limits,
-        service_user,
-        h2c,
-        debug_exec: document
-            .daemon
-            .as_ref()
-            .and_then(|table| table.debug_exec)
-            .unwrap_or(false),
-        budget: muru_controller::budget::Budget::from_table(
-            document
-                .daemon
-                .as_ref()
-                .and_then(|table| table.budget.as_ref()),
-        )
-        .map_err(|error| anyhow::anyhow!("[daemon.budget]: {error}"))?,
-        proxy: document.proxy.clone(),
-        compression: document.compression.clone(),
-        error_pages: document.error_pages.clone(),
-        error_override: document.error_override.clone(),
-        client_classes: document.client_class.clone(),
-        rate_limits: document.rate_limit.clone(),
-        secrets,
-        rotation: muru_controller::rotation::Policy::from_table(document.logs.as_ref())?,
+        settings,
+        overrides,
         access_log,
-        metrics,
-        dashboard,
-        dashboard_actions: document
-            .dashboard
-            .as_ref()
-            .is_some_and(|dashboard| dashboard.actions),
-        overlay_webhook,
-        sinks,
         executable: std::env::current_exe().context("finding the muructl executable")?,
         upgrade_arguments: upgrade_arguments(),
         upgraded_from: args.upgraded_from.clone(),
@@ -4933,202 +4891,4 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-}
-
-/// The metrics address: the flag, else the [metrics] table's listen
-/// address, else none.
-fn metrics_from(
-    document: &muru_config::Document,
-    flag: Option<SocketAddr>,
-) -> anyhow::Result<Option<SocketAddr>> {
-    if flag.is_some() {
-        return Ok(flag);
-    }
-
-    let listen = document
-        .metrics
-        .as_ref()
-        .and_then(|metrics| metrics.listen.as_deref());
-
-    match listen {
-        Some(address) => Ok(Some(address.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "[metrics] listen = {address:?} is not an address such as 127.0.0.1:9464"
-            )
-        })?)),
-        None => Ok(None),
-    }
-}
-
-/// The dashboard address: the flag, else the [dashboard] table's listen
-/// address, else none; loopback only, as section 10.7 has it.
-fn dashboard_from(
-    document: &muru_config::Document,
-    flag: Option<SocketAddr>,
-) -> anyhow::Result<Option<SocketAddr>> {
-    let address = match flag {
-        Some(address) => Some(address),
-        None => document
-            .dashboard
-            .as_ref()
-            .and_then(|dashboard| dashboard.listen.as_deref())
-            .map(|address| {
-                address.parse().map_err(|_| {
-                    anyhow::anyhow!(
-                        "[dashboard] listen = {address:?} is not an address such as 127.0.0.1:8090"
-                    )
-                })
-            })
-            .transpose()?,
-    };
-
-    if let Some(address) = address {
-        anyhow::ensure!(
-            address.ip().is_loopback(),
-            "the dashboard is only served on loopback addresses, not {address}"
-        );
-    }
-
-    Ok(address)
-}
-
-/// The event sinks of the configuration file, checked, with their
-/// secrets read.
-fn sinks_from(
-    document: &muru_config::Document,
-) -> anyhow::Result<Vec<muru_controller::sinks::Webhook>> {
-    let mut sinks = Vec::new();
-
-    for sink in document.events.iter().flat_map(|events| &events.sink) {
-        let webhook = muru_controller::sinks::Webhook::from_config(sink)
-            .map_err(|error| anyhow::anyhow!("[[events.sink]]: {error}"))?;
-
-        if sinks
-            .iter()
-            .any(|seen: &muru_controller::sinks::Webhook| seen.name == webhook.name)
-        {
-            anyhow::bail!("[[events.sink]]: two sinks are named {}", webhook.name);
-        }
-
-        sinks.push(webhook);
-    }
-
-    Ok(sinks)
-}
-
-/// The listeners of the configuration file, or plain HTTP on 127.0.0.1:8080.
-fn listeners_from(document: &muru_config::Document) -> anyhow::Result<Vec<(SocketAddr, bool)>> {
-    if document.listener.is_empty() {
-        return Ok(vec![("127.0.0.1:8080".parse()?, false)]);
-    }
-
-    let mut listeners = Vec::new();
-
-    for listener in &document.listener {
-        let address = listener
-            .address
-            .parse()
-            .with_context(|| format!("listener address {:?}", listener.address))?;
-        listeners.push((address, listener.tls));
-    }
-
-    Ok(listeners)
-}
-
-/// Section 6.13: the listeners that limit cleartext HTTP/2, checked.
-fn h2c_from(
-    document: &muru_config::Document,
-) -> anyhow::Result<Vec<muru_proto::edge::v1::H2cPolicy>> {
-    let mut policies = Vec::new();
-
-    for listener in &document.listener {
-        let Some(allowed) = &listener.h2c else {
-            continue;
-        };
-
-        anyhow::ensure!(
-            !listener.tls,
-            "listener {}: h2c is for a listener without TLS, where HTTP/2 is cleartext",
-            listener.address
-        );
-        muru_edge::proxy::Networks::parse(allowed)
-            .map_err(|error| anyhow::anyhow!("listener {}: h2c: {error}", listener.address))?;
-        policies.push(muru_proto::edge::v1::H2cPolicy {
-            listener: listener.address.clone(),
-            allowed: allowed.clone(),
-        });
-    }
-
-    Ok(policies)
-}
-
-/// The edge limits from the [limits] table, with the defaults for the rest.
-fn limits_from(document: &muru_config::Document) -> anyhow::Result<muru_edge::Limits> {
-    let mut limits = muru_edge::Limits::default();
-    let Some(table) = &document.limits else {
-        return Ok(limits);
-    };
-
-    if let Some(size) = &table.max_body_size {
-        limits.max_body_size = muru_config::parse_size(size).map_err(anyhow::Error::msg)?;
-    }
-
-    if let Some(size) = &table.max_header_bytes {
-        limits.max_header_bytes =
-            usize::try_from(muru_config::parse_size(size).map_err(anyhow::Error::msg)?)?;
-    }
-
-    if let Some(count) = table.max_headers {
-        limits.max_headers = count;
-    }
-
-    if let Some(count) = table.max_connections {
-        anyhow::ensure!(count > 0, "[limits] max_connections must be at least 1");
-        limits.max_connections = count;
-    }
-
-    if let Some(count) = table.max_connections_per_client {
-        limits.max_connections_per_client = count;
-    }
-
-    if let Some(count) = table.max_requests_per_connection {
-        limits.max_requests_per_connection = count;
-    }
-
-    if let Some(size) = &table.spool_quota {
-        limits.spool_quota = muru_config::parse_size(size).map_err(anyhow::Error::msg)?;
-    }
-
-    if let Some(count) = table
-        .http2
-        .as_ref()
-        .and_then(|http2| http2.max_concurrent_streams)
-    {
-        anyhow::ensure!(
-            count > 0,
-            "[limits.http2] max_concurrent_streams must be at least 1"
-        );
-        limits.http2_max_concurrent_streams = count;
-    }
-
-    for (value, field) in [
-        (&table.header_read_timeout, &mut limits.header_read_timeout),
-        (&table.queue_timeout, &mut limits.queue_timeout),
-        (&table.request_deadline, &mut limits.request_deadline),
-        (&table.body_idle_timeout, &mut limits.body_idle_timeout),
-        (
-            &table.response_idle_timeout,
-            &mut limits.response_idle_timeout,
-        ),
-        (&table.keep_alive_timeout, &mut limits.keep_alive_timeout),
-        (
-            &table.keep_alive_timeout_proxy,
-            &mut limits.keep_alive_timeout_proxy,
-        ),
-    ] {
-        if let Some(text) = value {
-            *field = muru_config::parse_duration(text).map_err(anyhow::Error::msg)?;
-        }
-    }
-    Ok(limits)
 }

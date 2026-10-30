@@ -89,6 +89,8 @@ impl Admin for Service {
             socket: info.locations.admin_socket().display().to_string(),
             listeners: info
                 .listeners
+                .read()
+                .expect("listeners poisoned")
                 .iter()
                 .map(|(address, tls)| {
                     format!("{}://{address}", if *tls { "https" } else { "http" })

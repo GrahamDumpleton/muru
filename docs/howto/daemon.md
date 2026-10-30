@@ -310,25 +310,39 @@ webhooks; the [events guide](events.md) has the details.
 ## Reloading the configuration
 
 `muructl daemon reload`, or SIGHUP, reads the daemon's configuration
-file again and applies what can change while the daemon runs:
+file again, checks it whole, and applies what changed:
 
 - the `[proxy]`, `[compression]`, `[error_pages]`, `[error_override]`,
-  `[[client_class]]` and `[rate_limit]` tables, which the edge is given
-  at once;
+  `[[client_class]]`, `[rate_limit]` and `[limits]` tables, and the
+  `h2c` setting of a `[[listener]]` entry, which the edge is given at
+  once; a connection already open keeps the limits it was accepted
+  under;
+
+- the `[[listener]]` entries: a changed set starts a new edge on the new
+  listeners and tells the old one to stop, as `muructl daemon upgrade`
+  does, so a listener that stays keeps its socket and its backlog and no
+  request is lost; a listener that cannot be bound (its port in use,
+  say) fails the reload before anything is applied;
+
+- the `[[events.sink]]` entries: a sink added starts, one dropped stops,
+  and one whose entry changed is restarted; a sink's cursor stays in the
+  state store, so one that comes back delivers what it missed;
 
 - the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
 
 - the dashboard's `actions` switch, `[dashboard] actions`.
 
-The rest of the file is read when the daemon starts: the `[[listener]]`
-entries, the `[limits]`, `[metrics]` and `[dashboard]` tables (apart
-from `actions`), the `[[events.sink]]` entries, the `[secrets.store.NAME]`
-tables and the `[logs]` table. A change to those takes effect after
-`muructl daemon stop` and `muructl daemon start` (`systemctl restart
-muru` under systemd), which detaches from the hosts and the edge and
-takes them back, so it costs no request.
+The rest of the file is read when the daemon starts: the `[metrics]`
+table, the `[dashboard]` table's `listen` address, the
+`[overlay_webhook]` table, the `[daemon]` table's `user`, the
+`[secrets.store.NAME]` tables and the `[logs]` table. A change to those
+takes effect after `muructl daemon stop` and `muructl daemon start`
+(`systemctl restart muru` under systemd), which detaches from the hosts
+and the edge and takes them back, so it costs no request. A daemon
+started with `--listen`, `--metrics`, `--dashboard` or `--user` keeps
+those over the file's settings on every reload.
 
-The command prints what it applied and what is read at start, and the
-`config.reloaded` event records the same. A file the daemon cannot parse,
-or a table it refuses, leaves everything as it was and the command fails
-saying why.
+The command prints what changed and what was done about it, what is
+unchanged and what is read at start, and the `config.reloaded` event
+records the same. A file the daemon cannot parse, or a table it refuses,
+leaves everything as it was and the command fails saying why.

@@ -866,7 +866,7 @@ def test_the_actions_switch_is_reloaded_and_stops_earlier_sessions(tmp_path: Pat
         text = config.read_text()
         config.write_text(text.replace("actions = true", "actions = false"))
         reloaded = daemon.muructl("daemon", "reload").stdout
-        assert "the dashboard's actions are off" in reloaded, reloaded
+        assert "changed [dashboard] actions (off)" in reloaded, reloaded
         status, body = post_form(port, "/actions/maintenance", on, scripted)
         assert status == 409 and b"actions are off" in body, (status, body)
         assert daemon.request("/").status == 200
@@ -874,7 +874,7 @@ def test_the_actions_switch_is_reloaded_and_stops_earlier_sessions(tmp_path: Pat
         assert refused.returncode != 0 and "actions are off" in refused.stderr
 
         config.write_text(text)
-        assert "the dashboard's actions are on" in daemon.muructl("daemon", "reload").stdout
+        assert "changed [dashboard] actions (on)" in daemon.muructl("daemon", "reload").stdout
         assert post_form(port, "/actions/maintenance", on, scripted)[0] == 303
         assert daemon.request("/").status == 503
         post_form(port, "/actions/maintenance", off, scripted)

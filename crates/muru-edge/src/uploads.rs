@@ -124,7 +124,9 @@ impl Algorithm {
 #[derive(Debug)]
 pub struct Spool {
     root: PathBuf,
-    quota: Option<u64>,
+    /// What every application's uploads may hold together; 0 for no
+    /// limit. A snapshot may change it (section 4.6).
+    quota: AtomicU64,
     used: AtomicU64,
     apps: Mutex<HashMap<String, Arc<AtomicU64>>>,
     next: AtomicU64,
@@ -140,11 +142,17 @@ impl Spool {
 
         Ok(Arc::new(Self {
             root,
-            quota,
+            quota: AtomicU64::new(quota.unwrap_or(0)),
             used: AtomicU64::new(0),
             apps: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
         }))
+    }
+
+    /// Change what every application's uploads may hold together, for
+    /// the files stored from now on.
+    pub fn set_quota(&self, quota: Option<u64>) {
+        self.quota.store(quota.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Bytes held by each application's uploads in progress, as
@@ -239,8 +247,8 @@ impl Charge {
         let app = self.app.fetch_add(bytes, Ordering::SeqCst) + bytes;
         let node = self.spool.used.fetch_add(bytes, Ordering::SeqCst) + bytes;
         self.bytes += bytes;
-        app_quota.is_none_or(|quota| app <= quota)
-            && self.spool.quota.is_none_or(|quota| node <= quota)
+        let node_quota = self.spool.quota.load(Ordering::Relaxed);
+        app_quota.is_none_or(|quota| app <= quota) && (node_quota == 0 || node <= node_quota)
     }
 }
 
