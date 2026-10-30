@@ -4539,12 +4539,18 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
 
         // Paths are resolved here, where the file is, since the daemon
-        // may run elsewhere.
+        // may run elsewhere. The file's directory is made absolute first,
+        // so that a file named by a relative path gives absolute paths
+        // too: the daemon checks some of them, such as sendfile_roots,
+        // for being absolute.
 
         let base = file
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let base = std::fs::canonicalize(&base).unwrap_or_else(|_| {
+            std::env::current_dir().map_or(base.clone(), |cwd| cwd.join(&base))
+        });
         resolve_paths(&mut parsed, &base);
         document
             .merge(parsed)

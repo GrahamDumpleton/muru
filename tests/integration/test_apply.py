@@ -16,6 +16,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+from support import server as support
 from support.daemon import FACTORY, SHOP, Daemon
 from support.daemon import daemon as daemon_fixture
 
@@ -364,3 +365,33 @@ routes.files.target = {{ static = 'snapshot' }}
     assert (missed.status, missed.body) == (404, b"route page")
     missed = daemon.request("/more/missing", host="site.test")
     assert (missed.status, missed.body) == (404, b"host page")
+
+
+def test_a_file_named_by_a_relative_path_gives_absolute_paths(daemon: Daemon) -> None:
+    """The paths resolved from an applied file's directory come out absolute
+    whether `-f` named the file by an absolute or a relative path, since
+    the daemon checks some of them, `sendfile_roots` among them, for being
+    absolute."""
+
+    site = daemon.base / "relative"
+    (site / "reports").mkdir(parents=True)
+    (site / "site.toml").write_text(
+        f"""[app.shop.release.r1]
+source = '{SHOP}'
+python = '{sys.executable}'
+processes = 1
+sendfile_roots = ['reports']
+"""
+    )
+    muructl = support.muructl_path()
+    assert muructl is not None
+    applied = subprocess.run(
+        [str(muructl), "apply", "-f", "site.toml", "--socket", str(daemon.run_dir / "admin.sock")],
+        cwd=site,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    exported = daemon.muructl("config", "export").stdout
+    assert str(site / "reports") in exported, exported
