@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -84,6 +85,36 @@ def test_upgrade_keeps_the_pid_and_replaces_the_edge_under_load(daemon: Daemon) 
     )
     assert json.loads(daemon.get("/info").body)["pid"] != worker
     assert daemon.events().count("daemon.upgraded") == 2
+
+
+def test_connection_opened_before_the_handover_is_answered(daemon: Daemon) -> None:
+    """A connection the old edge accepted whose first request is still on
+    the wire when the edge is replaced is answered, with the connection
+    then closed, rather than closed unanswered: the client would see a
+    reset on a connection it has no response to retry on."""
+
+    daemon.deploy("shop", SHOP, "--processes", "1")
+    edge_before = edge_pid_of(daemon)
+
+    with socket.create_connection(("127.0.0.1", daemon.port), timeout=30) as client:
+        daemon.muructl("daemon", "upgrade")
+        assert edge_pid_of(daemon) != edge_before
+
+        # The old edge is told to stop once the new one answers; the
+        # request arrives while it drains.
+
+        time.sleep(0.5)
+        client.sendall(b"GET /info HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        received = b""
+
+        while chunk := client.recv(65536):
+            received += chunk
+
+    head, _, body = received.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200"), received
+    assert b"connection: close" in head.lower(), head
+    assert json.loads(body)["pid"]
+    wait_until_gone(edge_before)
 
 
 def test_upgraded_daemon_can_detach_and_shut_down_cleanly(tmp_path: Path) -> None:

@@ -147,6 +147,54 @@ def test_events_arrive_signed_in_order_and_filtered(tmp_path: Path, receiver: Re
         daemon.stop()
 
 
+def test_reload_starts_stops_and_restarts_sinks(tmp_path: Path, receiver: Receiver) -> None:
+    """A sink added to the daemon's file by a reload starts delivering,
+    one dropped stops, one whose entry changed is restarted, and a sink
+    that comes back delivers what it missed, from the cursor the store
+    kept for it."""
+
+    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+    config = daemon.base / "muru.toml"
+    base = config.read_text()
+
+    try:
+        config.write_text(base + sink_config(receiver.port, types="['release.*']"))
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [[events.sink]] (ops started)" in reloaded, reloaded
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        wait_for(lambda: "dev.muru.release.ready" in receiver.types())
+
+        # A changed entry restarts the sink on the new one.
+
+        config.write_text(base + sink_config(receiver.port, types="['release.*', 'traffic.*']"))
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [[events.sink]] (ops changed)" in reloaded, reloaded
+
+        # Dropped from the file, the sink stops delivering.
+
+        config.write_text(base)
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [[events.sink]] (ops stopped)" in reloaded, reloaded
+        delivered = len(receiver.events())
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r2 is ready and serving"
+        time.sleep(1.0)
+        assert len(receiver.events()) == delivered
+
+        # Back in the file, it delivers what it missed meanwhile.
+
+        config.write_text(base + sink_config(receiver.port, types="['release.*']"))
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [[events.sink]] (ops started)" in reloaded, reloaded
+        wait_for(lambda: receiver.types().count("dev.muru.release.ready") == 2)
+        assert [
+            event["subject"]
+            for event in receiver.events()
+            if event["type"] == "dev.muru.release.ready"
+        ] == ["shop@r1", "shop@r2"]
+    finally:
+        daemon.stop()
+
+
 def test_a_receiver_outage_delays_nothing_but_delivery(tmp_path: Path, receiver: Receiver) -> None:
     daemon = start_daemon(
         tmp_path,

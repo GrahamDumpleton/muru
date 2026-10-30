@@ -4,6 +4,7 @@
 //! the receiver answers, so an outage or a daemon restart loses nothing
 //! and a receiver sees every event at least once.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ const FAILURES_TO_REPORT: u32 = 3;
 const LEVELS: [&str; 4] = ["info", "notice", "warning", "error"];
 
 /// A webhook sink, from an `[[events.sink]]` entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Webhook {
     /// The sink's name, which names the cursor and the events about it.
     pub name: String,
@@ -185,6 +186,124 @@ fn backoff(failures: u32) -> Duration {
 }
 
 type Connector = HttpsConnector<HttpConnector>;
+
+/// The sinks delivering now, by name: started with the daemon and
+/// reconciled with the file on reload (section 13.3). Each keeps its
+/// cursor in the store, so a sink stopped and started again, or changed,
+/// carries on from where it was.
+pub struct Sinks {
+    running: BTreeMap<String, (Webhook, tokio::task::JoinHandle<()>)>,
+    store: Arc<Store>,
+    events: Events,
+}
+
+/// What reconciling the sinks with the file did, by sink name.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SinkChanges {
+    /// Sinks the file added.
+    pub started: Vec<String>,
+    /// Sinks the file dropped.
+    pub stopped: Vec<String>,
+    /// Sinks whose entry changed, restarted on the new one.
+    pub changed: Vec<String>,
+}
+
+impl SinkChanges {
+    /// Whether nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.started.is_empty() && self.stopped.is_empty() && self.changed.is_empty()
+    }
+
+    /// The changes as a reload names them: "audit started, ops stopped".
+    pub fn describe(&self) -> String {
+        [
+            (&self.started, "started"),
+            (&self.changed, "changed"),
+            (&self.stopped, "stopped"),
+        ]
+        .into_iter()
+        .filter(|(names, _)| !names.is_empty())
+        .map(|(names, what)| format!("{} {what}", names.join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+impl Sinks {
+    /// Start delivering to `webhooks`.
+    pub fn start(webhooks: Vec<Webhook>, store: Arc<Store>, events: Events) -> Self {
+        let mut sinks = Self {
+            running: BTreeMap::new(),
+            store,
+            events,
+        };
+
+        for webhook in webhooks {
+            sinks.spawn(webhook);
+        }
+
+        sinks
+    }
+
+    /// Make the running sinks those of `wanted`: a sink no longer in the
+    /// file stops, a new one starts, and one whose entry changed is
+    /// restarted on the new entry. A sink's cursor stays in the store
+    /// either way, so a sink that comes back delivers what it missed.
+    pub fn reconcile(&mut self, wanted: Vec<Webhook>) -> SinkChanges {
+        let mut changes = SinkChanges::default();
+
+        for name in self.running.keys().cloned().collect::<Vec<_>>() {
+            if !wanted.iter().any(|webhook| webhook.name == name) {
+                self.stop_one(&name);
+                changes.stopped.push(name);
+            }
+        }
+
+        for webhook in wanted {
+            match self.running.get(&webhook.name) {
+                Some((running, _)) if *running == webhook => {}
+                Some(_) => {
+                    self.stop_one(&webhook.name);
+                    changes.changed.push(webhook.name.clone());
+                    self.spawn(webhook);
+                }
+                None => {
+                    changes.started.push(webhook.name.clone());
+                    self.spawn(webhook);
+                }
+            }
+        }
+
+        changes
+    }
+
+    /// The names of the sinks delivering now.
+    pub fn names(&self) -> Vec<String> {
+        self.running.keys().cloned().collect()
+    }
+
+    /// Stop every sink, for the daemon's exit.
+    pub fn stop(&mut self) {
+        for (_, (_, task)) in std::mem::take(&mut self.running) {
+            task.abort();
+        }
+    }
+
+    fn spawn(&mut self, webhook: Webhook) {
+        let task = tokio::spawn(run(
+            webhook.clone(),
+            Arc::clone(&self.store),
+            self.events.clone(),
+        ));
+        self.running.insert(webhook.name.clone(), (webhook, task));
+    }
+
+    fn stop_one(&mut self, name: &str) {
+        if let Some((_, task)) = self.running.remove(name) {
+            task.abort();
+        }
+    }
+}
 
 /// Deliver events to the webhook until the event stream closes: the
 /// backlog after the sink's cursor first, then each event as it happens.
@@ -335,6 +454,49 @@ mod tests {
             types: types.iter().map(|&type_| type_.to_owned()).collect(),
             levels: levels.iter().map(|&level| level.to_owned()).collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn the_registry_starts_stops_and_restarts_sinks_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.db")).unwrap());
+        let events = Events::new(Arc::clone(&store));
+        let named = |name: &str, secret: &[u8]| Webhook {
+            name: name.to_owned(),
+            secret: secret.to_vec(),
+            ..webhook(&[], &[])
+        };
+        let mut sinks = Sinks::start(
+            vec![named("audit", b"a"), named("ops", b"o")],
+            store,
+            events,
+        );
+        assert_eq!(sinks.names(), vec!["audit", "ops"]);
+
+        // The same entry is left alone, a changed one is restarted, a new
+        // one starts and one gone from the file stops.
+
+        let changes = sinks.reconcile(vec![
+            named("audit", b"a"),
+            named("ops", b"changed"),
+            named("pager", b"p"),
+        ]);
+        assert_eq!(
+            changes,
+            SinkChanges {
+                started: vec!["pager".to_owned()],
+                stopped: Vec::new(),
+                changed: vec!["ops".to_owned()],
+            }
+        );
+        assert_eq!(changes.describe(), "pager started, ops changed");
+        assert_eq!(sinks.names(), vec!["audit", "ops", "pager"]);
+
+        let changes = sinks.reconcile(vec![named("pager", b"p")]);
+        assert_eq!(changes.describe(), "audit, ops stopped");
+        assert!(sinks.reconcile(vec![named("pager", b"p")]).is_empty());
+        sinks.stop();
+        assert!(sinks.names().is_empty());
     }
 
     #[test]

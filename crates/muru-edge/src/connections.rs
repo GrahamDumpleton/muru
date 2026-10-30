@@ -15,9 +15,11 @@ use crate::metrics::Sample;
 /// The open connections of one listener and what it refused.
 pub struct Connections {
     listener: String,
-    max: usize,
-    per_client: usize,
-    reserve: usize,
+    /// The limits, which a snapshot may change while connections are
+    /// open (section 4.6); those open stay counted against the new ones.
+    max: AtomicUsize,
+    per_client: AtomicUsize,
+    reserve: AtomicUsize,
     open: AtomicUsize,
     overloading: AtomicUsize,
     clients: Mutex<HashMap<IpAddr, usize>>,
@@ -64,9 +66,9 @@ impl Connections {
     pub fn new(listener: String, max: usize, per_client: usize) -> Self {
         Self {
             listener,
-            max: max.max(1),
-            per_client,
-            reserve: (max / 100).max(1),
+            max: AtomicUsize::new(max.max(1)),
+            per_client: AtomicUsize::new(per_client),
+            reserve: AtomicUsize::new((max / 100).max(1)),
             open: AtomicUsize::new(0),
             overloading: AtomicUsize::new(0),
             clients: Mutex::new(HashMap::new()),
@@ -76,17 +78,25 @@ impl Connections {
         }
     }
 
+    /// Change the limits for the connections accepted from now on.
+    pub fn set_limits(&self, max: usize, per_client: usize) {
+        self.max.store(max.max(1), Ordering::Relaxed);
+        self.per_client.store(per_client, Ordering::Relaxed);
+        self.reserve.store((max / 100).max(1), Ordering::Relaxed);
+    }
+
     /// Decide about a connection from `peer`. A trusted proxy has no
     /// per-client limit.
     pub fn admit(self: &std::sync::Arc<Self>, peer: IpAddr, trusted: bool) -> Admission {
         let client = client_key(peer);
+        let per_client = self.per_client.load(Ordering::Relaxed);
 
-        if self.open.load(Ordering::Relaxed) >= self.max {
+        if self.open.load(Ordering::Relaxed) >= self.max.load(Ordering::Relaxed) {
             // Up to the reserve, a fast 503 says why; beyond it the
             // connection is closed, which is what pausing accept amounts
             // to for a connection already accepted.
 
-            if self.overloading.load(Ordering::Relaxed) < self.reserve {
+            if self.overloading.load(Ordering::Relaxed) < self.reserve.load(Ordering::Relaxed) {
                 self.overloaded.fetch_add(1, Ordering::Relaxed);
                 return Admission::Overloaded;
             }
@@ -98,7 +108,7 @@ impl Connections {
         let mut clients = self.clients.lock().expect("clients poisoned");
         let held = clients.entry(client).or_insert(0);
 
-        if !trusted && self.per_client > 0 && *held >= self.per_client {
+        if !trusted && per_client > 0 && *held >= per_client {
             if *held == 0 {
                 clients.remove(&client);
             }

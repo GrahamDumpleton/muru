@@ -23,6 +23,51 @@ def env_of(daemon: Daemon, name: str) -> dict[str, object]:
     return dict(json.loads(response.body))
 
 
+def test_a_store_added_by_reload_serves_the_next_release(tmp_path: Path) -> None:
+    daemon = start_daemon(
+        tmp_path,
+        listeners=[(support.free_port(), False)],
+        env={"CI_TOKEN": "token-from-the-daemon-environment"},
+    )
+
+    try:
+        refused = daemon.muructl(
+            "deploy",
+            "plain",
+            str(PLAIN),
+            "--python",
+            sys.executable,
+            "--entrypoint",
+            "plain_wsgi:application",
+            "--processes",
+            "1",
+            "--secret",
+            "CI_TOKEN=ci:CI_TOKEN",
+            check=False,
+        )
+        assert refused.returncode != 0
+        assert "no secret store named ci" in refused.stdout + refused.stderr
+
+        with (daemon.base / "muru.toml").open("a") as handle:
+            handle.write("\n[secrets.store.ci]\nkind = 'env'\n")
+
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [secrets.store.NAME] (the stores are ci)" in reloaded, reloaded
+        assert "is ready and serving" in daemon.deploy(
+            "plain",
+            PLAIN,
+            "--entrypoint",
+            "plain_wsgi:application",
+            "--processes",
+            "1",
+            "--secret",
+            "CI_TOKEN=ci:CI_TOKEN",
+        )
+        assert env_of(daemon, "CI_TOKEN")["value"] == "token-from-the-daemon-environment"
+    finally:
+        daemon.stop()
+
+
 def test_secrets_are_resolved_from_every_kind_of_store_and_never_shown(tmp_path: Path) -> None:
     secrets_dir = tmp_path / "state" / "secrets"
     daemon = start_daemon(

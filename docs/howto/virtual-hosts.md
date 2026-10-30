@@ -110,9 +110,23 @@ host with a certificate claims, is given the default host's certificate,
 or the first host's. A host without a `tls` table still answers on a TLS
 listener under another host's certificate when the client accepts it.
 
-A replaced certificate file is picked up the next time the daemon pushes
-a snapshot: an apply that changes any host or route, or a deploy. Apply
-the file again with a changed host to rotate a certificate at once.
+A replaced certificate file is picked up by `muructl daemon reload` (or
+SIGHUP), by an apply of a file that declares the host, changed or not,
+and by anything else that sends the edge a snapshot, such as a deploy.
+The daemon reads every TLS host's files again, keeps each pair that is
+whole and goes together, and sends the edge those that changed, which new
+connections get at once. A file that cannot be read, or a key that does
+not go with its certificate, leaves the host on the certificate it had,
+which the reload or apply says and a `certificate.unreadable` event
+records. So a renewal that runs a hook needs one command, certbot's
+deploy hook for one:
+
+```
+certbot renew --deploy-hook 'muructl daemon reload'
+```
+
+Under systemd, `systemctl reload muru` does the same; the [systemd
+guide](systemd.md) has the unit.
 
 With `https_redirect = true`, plain HTTP requests to the host are answered
 with 307 to the same host, path and query on the first TLS listener's

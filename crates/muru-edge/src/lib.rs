@@ -123,7 +123,7 @@ pub struct Https {
 }
 
 /// The limits and timeouts of sections 4.6 and 7.6, with their defaults.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
     /// Largest request body accepted, else 413 (max_body_size in section
     /// 4.6; 10 MB by ADR 0008, 100 MB in development).
@@ -198,6 +198,94 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// The limits a snapshot carries (section 4.6).
+    pub fn from_message(message: &muru_proto::edge::v1::Limits) -> Self {
+        let millis = Duration::from_millis;
+        Self {
+            max_body_size: message.max_body_size,
+            max_header_bytes: usize::try_from(message.max_header_bytes).unwrap_or(usize::MAX),
+            max_headers: message.max_headers as usize,
+            header_read_timeout: millis(message.header_read_timeout_ms),
+            queue_timeout: millis(message.queue_timeout_ms),
+            request_deadline: millis(message.request_deadline_ms),
+            body_idle_timeout: millis(message.body_idle_timeout_ms),
+            response_idle_timeout: millis(message.response_idle_timeout_ms),
+            websocket_max_message_size: usize::try_from(message.websocket_max_message_size)
+                .unwrap_or(usize::MAX),
+            websocket_ping_interval: millis(message.websocket_ping_interval_ms),
+            websocket_idle_timeout: millis(message.websocket_idle_timeout_ms),
+            max_connections: usize::try_from(message.max_connections).unwrap_or(usize::MAX),
+            max_connections_per_client: usize::try_from(message.max_connections_per_client)
+                .unwrap_or(usize::MAX),
+            keep_alive_timeout: millis(message.keep_alive_timeout_ms),
+            keep_alive_timeout_proxy: millis(message.keep_alive_timeout_proxy_ms),
+            max_requests_per_connection: message.max_requests_per_connection,
+            http2_max_concurrent_streams: message.http2_max_concurrent_streams,
+            spool_quota: message.spool_quota,
+        }
+    }
+
+    /// These limits as a snapshot carries them.
+    pub fn to_message(&self) -> muru_proto::edge::v1::Limits {
+        let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        muru_proto::edge::v1::Limits {
+            max_body_size: self.max_body_size,
+            max_header_bytes: self.max_header_bytes as u64,
+            max_headers: u32::try_from(self.max_headers).unwrap_or(u32::MAX),
+            header_read_timeout_ms: millis(self.header_read_timeout),
+            queue_timeout_ms: millis(self.queue_timeout),
+            request_deadline_ms: millis(self.request_deadline),
+            body_idle_timeout_ms: millis(self.body_idle_timeout),
+            response_idle_timeout_ms: millis(self.response_idle_timeout),
+            max_connections: self.max_connections as u64,
+            max_connections_per_client: self.max_connections_per_client as u64,
+            keep_alive_timeout_ms: millis(self.keep_alive_timeout),
+            keep_alive_timeout_proxy_ms: millis(self.keep_alive_timeout_proxy),
+            max_requests_per_connection: self.max_requests_per_connection,
+            http2_max_concurrent_streams: self.http2_max_concurrent_streams,
+            spool_quota: self.spool_quota,
+            websocket_max_message_size: self.websocket_max_message_size as u64,
+            websocket_ping_interval_ms: millis(self.websocket_ping_interval),
+            websocket_idle_timeout_ms: millis(self.websocket_idle_timeout),
+        }
+    }
+}
+
+/// The limits in force with what is derived from them, swapped together
+/// when a snapshot changes them (section 4.6); a connection takes those
+/// current when it is accepted and keeps them.
+struct Tuning {
+    limits: Arc<Limits>,
+    /// Serves a connection as HTTP/1.1 or, when it opens with the HTTP/2
+    /// preface, as HTTP/2, within the header limits.
+    protocols: auto::Builder<TokioExecutor>,
+}
+
+impl Tuning {
+    fn new(limits: Limits) -> Self {
+        let mut protocols = auto::Builder::new(TokioExecutor::new());
+        protocols
+            .http1()
+            .timer(TokioTimer::new())
+            .keep_alive(true)
+            .max_headers(limits.max_headers)
+            .max_buf_size(limits.max_header_bytes.max(8192))
+            .header_read_timeout(limits.header_read_timeout);
+        protocols
+            .http2()
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(limits.http2_max_concurrent_streams)
+            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX))
+            // RFC 8441: WebSockets over HTTP/2 arrive as extended CONNECT.
+            .enable_connect_protocol();
+        Self {
+            limits: Arc::new(limits),
+            protocols,
+        }
+    }
+}
+
 /// The routing tables requests go through, replaceable while the edge
 /// runs: a reload or a snapshot swaps them (sections 4.4 and 9.8). Each
 /// request takes the tables current when it arrives.
@@ -257,11 +345,11 @@ pub struct BindError {
 struct Shared {
     pools: Arc<Pools>,
     request_ids: errors::RequestIds,
-    protocols: auto::Builder<TokioExecutor>,
     development: bool,
     occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
-    limits: Arc<Limits>,
+    /// The limits in force, which a snapshot may replace.
+    tuning: RwLock<Arc<Tuning>>,
     /// Where plain HTTP requests are redirected instead of being served.
     redirect_to: Option<SocketAddr>,
     /// The port of the first TLS listener, for hosts that insist on HTTPS.
@@ -289,6 +377,42 @@ struct Shared {
 #[derive(Clone)]
 pub struct Drainer {
     shared: Arc<Shared>,
+}
+
+impl Shared {
+    /// The limits in force now, for a connection being accepted.
+    fn tuning(&self) -> Arc<Tuning> {
+        Arc::clone(&self.tuning.read().expect("tuning poisoned"))
+    }
+}
+
+/// Changes an edge's limits while it runs (section 4.6): what a snapshot
+/// that carries them does.
+#[derive(Clone)]
+pub struct LimitsControl {
+    shared: Arc<Shared>,
+}
+
+impl LimitsControl {
+    /// The limits in force now.
+    pub fn current(&self) -> Arc<Limits> {
+        Arc::clone(&self.shared.tuning().limits)
+    }
+
+    /// Put new limits in force: connections accepted from now on take
+    /// them, the listeners' connection limits and the spool's quota
+    /// change at once, and connections already open keep what they had.
+    pub fn apply(&self, limits: Limits) {
+        for admission in &self.shared.admission {
+            admission.set_limits(limits.max_connections, limits.max_connections_per_client);
+        }
+
+        if let Some(spool) = &self.shared.spool {
+            spool.set_quota((limits.spool_quota > 0).then_some(limits.spool_quota));
+        }
+
+        *self.shared.tuning.write().expect("tuning poisoned") = Arc::new(Tuning::new(limits));
+    }
 }
 
 impl Drainer {
@@ -439,36 +563,16 @@ impl Edge {
             })
             .collect();
 
-        // Each connection is served as HTTP/1.1 or, when it opens with the
-        // HTTP/2 preface, as HTTP/2.
-
-        let limits = Arc::new(config.limits);
-        let mut protocols = auto::Builder::new(TokioExecutor::new());
-        protocols
-            .http1()
-            .timer(TokioTimer::new())
-            .keep_alive(true)
-            .max_headers(limits.max_headers)
-            .max_buf_size(limits.max_header_bytes.max(8192))
-            .header_read_timeout(limits.header_read_timeout);
-        protocols
-            .http2()
-            .timer(TokioTimer::new())
-            .max_concurrent_streams(limits.http2_max_concurrent_streams)
-            .max_header_list_size(u32::try_from(limits.max_header_bytes).unwrap_or(u32::MAX))
-            // RFC 8441: WebSockets over HTTP/2 arrive as extended CONNECT.
-            .enable_connect_protocol();
         Ok(Self {
             listeners: bound,
             local,
             shared: Arc::new(Shared {
                 pools,
                 request_ids: errors::RequestIds::new(),
-                protocols,
                 development: config.development,
                 occasions: config.occasions,
                 access_log,
-                limits,
+                tuning: RwLock::new(Arc::new(Tuning::new(config.limits))),
                 redirect_to,
                 https_port,
                 draining: tokio::sync::watch::channel(false).0,
@@ -503,6 +607,13 @@ impl Edge {
     /// A handle that stops this edge accepting and drains its connections.
     pub fn drainer(&self) -> Drainer {
         Drainer {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// A handle that changes the limits while the edge runs.
+    pub fn limits(&self) -> LimitsControl {
+        LimitsControl {
             shared: Arc::clone(&self.shared),
         }
     }
@@ -671,9 +782,11 @@ async fn accept(
         };
 
         // Counted here, before the task starts, so a drain that begins
-        // between the two still waits for this connection.
+        // between the two still waits for this connection. The limits
+        // current now are the connection's for its life.
 
         let token = Arc::clone(&shared.connections);
+        let tuning = shared.tuning();
 
         match acceptor.clone() {
             None => {
@@ -682,13 +795,16 @@ async fn accept(
                     // to some clients.
 
                     if !shared.pools.current().allows_h2c(&local, &peer)
-                        && opens_http2(&stream, shared.limits.header_read_timeout).await
+                        && opens_http2(&stream, tuning.limits.header_read_timeout).await
                     {
                         refuse_http2(stream).await;
                         return;
                     }
 
-                    serve(stream, peer, local, None, shared, token, guard, trusted).await;
+                    serve(
+                        stream, peer, local, None, shared, tuning, token, guard, trusted,
+                    )
+                    .await;
                 });
             }
             Some(acceptor) => {
@@ -696,15 +812,15 @@ async fn accept(
                     // A client that never finishes its handshake is cut off
                     // as one that never finishes its request head would be.
 
-                    let handshake =
-                        tokio::time::timeout(shared.limits.header_read_timeout, async {
-                            // Section 4.14: the ClientHello's fingerprint, read
-                            // before the handshake takes it.
+                    let head_timeout = tuning.limits.header_read_timeout;
+                    let handshake = tokio::time::timeout(head_timeout, async {
+                        // Section 4.14: the ClientHello's fingerprint, read
+                        // before the handshake takes it.
 
-                            let ja4 = ja4::peek(&stream, shared.limits.header_read_timeout).await;
-                            acceptor.accept(stream).await.map(|stream| (stream, ja4))
-                        })
-                        .await;
+                        let ja4 = ja4::peek(&stream, head_timeout).await;
+                        acceptor.accept(stream).await.map(|stream| (stream, ja4))
+                    })
+                    .await;
 
                     match handshake {
                         Ok(Ok((stream, ja4))) => {
@@ -716,6 +832,7 @@ async fn accept(
                                 local,
                                 Some(info),
                                 shared,
+                                tuning,
                                 token,
                                 guard,
                                 trusted,
@@ -775,8 +892,9 @@ async fn refuse_http2(mut stream: tokio::net::TcpStream) {
     let _ = stream.shutdown().await;
 }
 
-/// Serve one connection, cleartext or already inside TLS. The token is
-/// the connection's count towards a drain, held until it ends.
+/// Serve one connection, cleartext or already inside TLS, with the
+/// limits current when it was accepted. The token is the connection's
+/// count towards a drain, held until it ends.
 #[allow(clippy::too_many_arguments)] // one call site per listener kind, each argument a distinct fact
 async fn serve<I>(
     io: I,
@@ -784,6 +902,7 @@ async fn serve<I>(
     local: SocketAddr,
     tls: Option<pb::TlsInfo>,
     shared: Arc<Shared>,
+    tuning: Arc<Tuning>,
     token: Arc<()>,
     guard: connections::Guard,
     trusted: bool,
@@ -795,27 +914,33 @@ async fn serve<I>(
     let redirect_to = shared.redirect_to.filter(|_| tls.is_none());
     let state = Arc::clone(&shared);
     let listener = local.to_string();
+    let limits = Arc::clone(&tuning.limits);
 
     // Section 4.18: an idle keep-alive connection waits this long for its
     // next request; a trusted proxy gets the longer wait. The same timer
     // bounds reading a request head on the connection.
 
     let keep_alive = if trusted {
-        shared.limits.keep_alive_timeout_proxy
+        limits.keep_alive_timeout_proxy
     } else {
-        shared
-            .limits
-            .keep_alive_timeout
-            .min(shared.limits.header_read_timeout)
+        limits.keep_alive_timeout.min(limits.header_read_timeout)
     };
-    let max_requests = shared.limits.max_requests_per_connection;
+    let max_requests = limits.max_requests_per_connection;
+    let head_timeout = limits.header_read_timeout;
     let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Set once the first request head has been read, which a drain waits
+    // for (below) before it closes the connection.
+
+    let (first_request, mut first_request_seen) = tokio::sync::watch::channel(false);
     let service = service_fn(move |request: http::Request<Incoming>| {
         let shared = Arc::clone(&shared);
         let tls = tls.clone();
         let listener = listener.clone();
         let base_id = shared.request_ids.next();
         let served = Arc::clone(&served);
+        let limits = Arc::clone(&limits);
+        let _ = first_request.send_replace(true);
         async move {
             // Section 4.7: forwarding headers from a trusted proxy say who
             // the client is and how it connected; from anyone else they
@@ -932,7 +1057,7 @@ async fn serve<I>(
                     development: shared.development,
                     occasions: shared.occasions,
                     access_log: Arc::clone(&shared.access_log),
-                    limits: Arc::clone(&shared.limits),
+                    limits: Arc::clone(&limits),
                     server_name: None,
                     app: String::new(),
                     release: String::new(),
@@ -1565,24 +1690,35 @@ async fn serve<I>(
     // With upgrades, so a 101 hands the connection over for WebSockets.
     // A drain tells the connection to finish: HTTP/1.1 closes once the
     // response in flight is done, or at once when idle, and HTTP/2 sends
-    // GOAWAY and lets its streams complete.
+    // GOAWAY and lets its streams complete. A connection just accepted
+    // is idle too, with its first request still on the wire, and closing
+    // it would reset that request unanswered (the client has no response
+    // to retry on, unlike an idle keep-alive connection), so the drain
+    // first gives the first request the head read timeout to arrive and
+    // then closes after its response.
 
-    let mut protocols = state.protocols.clone();
+    let mut protocols = tuning.protocols.clone();
     protocols.http1().header_read_timeout(keep_alive);
     let connection = protocols.serve_connection_with_upgrades(TokioIo::new(io), service);
     let mut connection = std::pin::pin!(connection);
     let mut draining = state.draining.subscribe();
 
-    let ended = if *draining.borrow_and_update() {
-        connection.as_mut().graceful_shutdown();
-        connection.await
-    } else {
-        tokio::select! {
-            ended = connection.as_mut() => ended,
-            _ = draining.changed() => {
-                connection.as_mut().graceful_shutdown();
-                connection.await
-            }
+    let drain = async {
+        if !*draining.borrow_and_update() {
+            let _ = draining.changed().await;
+        }
+
+        if !*first_request_seen.borrow_and_update() {
+            let _ = tokio::time::timeout(head_timeout, first_request_seen.changed()).await;
+        }
+    };
+    let mut drain = std::pin::pin!(drain);
+
+    let ended = tokio::select! {
+        ended = connection.as_mut() => ended,
+        _ = &mut drain => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
         }
     };
 

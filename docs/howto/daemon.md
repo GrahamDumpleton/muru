@@ -292,11 +292,7 @@ unchanged by an upgrade, so no unit restart is involved.
 `muructl daemon run` runs it in the foreground, for a service manager or
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
-daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
-configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
-and `[error_override]` tables, the [node's
-budget](scaling.md#the-nodes-budget) and the dashboard's `actions`
-switch. The [systemd
+daemon to exit. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's
@@ -310,3 +306,52 @@ and `muructl logs reopen` works with logrotate; the [logging
 guide](logging.md) has the details. The events `muructl events` shows are
 kept in the state store, and `[[events.sink]]` entries deliver them to
 webhooks; the [events guide](events.md) has the details.
+
+## Reloading the configuration
+
+`muructl daemon reload`, or SIGHUP, reads the daemon's configuration
+file again, checks it whole, and applies what changed:
+
+- the `[proxy]`, `[compression]`, `[error_pages]`, `[error_override]`,
+  `[[client_class]]`, `[rate_limit]` and `[limits]` tables, and the
+  `h2c` setting of a `[[listener]]` entry, which the edge is given at
+  once; a connection already open keeps the limits it was accepted
+  under;
+
+- the `[[listener]]` entries: a changed set starts a new edge on the new
+  listeners and tells the old one to stop, as `muructl daemon upgrade`
+  does, so a listener that stays keeps its socket and its backlog and no
+  request is lost; a listener that cannot be bound (its port in use,
+  say) fails the reload before anything is applied;
+
+- the `[[events.sink]]` entries: a sink added starts, one dropped stops,
+  and one whose entry changed is restarted; a sink's cursor stays in the
+  state store, so one that comes back delivers what it missed;
+
+- the certificate and key files of every applied TLS host, read again
+  and, when changed, sent to the edge; the [virtual hosts
+  guide](virtual-hosts.md#tls) has the detail;
+
+- the `[secrets.store.NAME]` tables, which the next release to start
+  resolves its secrets from;
+
+- the `[logs]` table: the daemon rotates on the new policy from its
+  next check, and a period that changed rotates each file once;
+
+- the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
+
+- the dashboard's `actions` switch, `[dashboard] actions`.
+
+The rest of the file is read when the daemon starts: the `[metrics]`
+table, the `[dashboard]` table's `listen` address, the
+`[overlay_webhook]` table and the `[daemon]` table's `user`. A change to
+those takes effect after `muructl daemon stop` and `muructl daemon
+start` (`systemctl restart muru` under systemd), which detaches from the
+hosts and the edge and takes them back, so it costs no request. A daemon
+started with `--listen`, `--metrics`, `--dashboard` or `--user` keeps
+those over the file's settings on every reload.
+
+The command prints what changed and what was done about it, what is
+unchanged and what is read at start, and the `config.reloaded` event
+records the same. A file the daemon cannot parse, or a table it refuses,
+leaves everything as it was and the command fails saying why.

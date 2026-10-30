@@ -4,9 +4,10 @@
 :class: note
 
 The shipped unit runs the daemon in system mode with readiness
-notification, detaches on stop and re-reads the `[proxy]` table on
-reload. Reloading listeners, limits and event sinks, journald as the log
-sink and socket activation are still to come.
+notification, detaches on stop and re-reads the configuration file on
+reload for [what can change while the daemon
+runs](daemon.md#reloading-the-configuration). Journald as the log sink
+and socket activation are still to come.
 ```
 
 The repository ships a unit at `packaging/systemd/muru.service`:
@@ -87,11 +88,13 @@ request. The [daemon guide](daemon.md) says more about detaching and
 re-adoption.
 
 `systemctl reload` runs `muructl daemon reload`, which re-reads the
-configuration file for what can change while the daemon runs: today the
-`[proxy]` and `[compression]` tables, which the edge is given at once.
-Listeners, limits, the
-metrics listener and event sinks are read when the daemon starts, and the
-reload says so. SIGHUP does the same as the command.
+configuration file for what can change while the daemon runs; the
+[daemon guide](daemon.md#reloading-the-configuration) lists what that
+is and what is read only at start, and the reload says so too. SIGHUP
+does the same as the command. A certificate renewal needs the same
+reload, so a certbot deploy hook of `systemctl reload muru` makes the
+renewed certificate live, as the [virtual hosts
+guide](virtual-hosts.md#tls) describes.
 
 ## Logs
 

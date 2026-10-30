@@ -48,6 +48,13 @@ output, which is how Vault, a cloud secret manager or the 1Password
 command line are adapted; the command's exit status and the timeout
 decide whether the value counts.
 
+The stores are read from the daemon's configuration file when the daemon
+starts and again on `muructl daemon reload` (or SIGHUP), so a store added
+or changed is there for the next release to start; a release already
+running keeps the secrets it was given. The [daemon
+guide](daemon.md#reloading-the-configuration) lists what else a reload
+applies.
+
 ## References
 
 A release's `[env]` table, in a declared release or a project's
