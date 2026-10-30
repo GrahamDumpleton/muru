@@ -54,7 +54,7 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
     assert [line["pid"] for line in on_load] == [host]
     assert [line["pid"] for line in pre_fork] == [host]
     assert on_load[0]["worker"] == "None"
-    assert on_load[0]["app"] == "preload_wsgi"
+    assert on_load[0]["app"] == "preload-wsgi"
     assert len(post_fork) == WORKERS
     assert {line["worker"] for line in post_fork} == {"0", "1"}
     assert all(line["pid"] != host for line in post_fork)
@@ -65,7 +65,7 @@ def test_hooks_run_in_the_host_and_in_each_worker(hooked: support.Server) -> Non
     assert import_pids(hooked, WORKERS * 8) == {int(host)}
     info = json.loads(hooked.get("/").body)
     assert info["worker_id"] in (0, 1)
-    assert info["app"] == "preload_wsgi"
+    assert info["app"] == "preload-wsgi"
 
     # The workers run this interpreter fresh, so the build decides, not
     # whether an extension re-enabled the GIL in this process.
@@ -128,7 +128,7 @@ def test_unsafe_import_falls_back_to_per_worker_imports() -> None:
         assert on_load[0] == {
             "pid": str(server.host_pid()),
             "worker": "None",
-            "app": "unsafe_import_wsgi",
+            "app": "unsafe-import-wsgi",
         }
         assert sorted(line["worker"] for line in on_load[1:]) == ["0", "1"]
         assert sorted(line["worker"] for line in hook_lines(server, "pre_fork")) == ["0", "1"]
