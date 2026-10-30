@@ -61,7 +61,7 @@ protoc-bin-vendored = "3"
 pyo3 = { version = "0.30", features = ["extension-module"] }
 # TLS runs on the ring provider everywhere (ADR 0024): no aws-lc-rs, so no
 # cmake. Keep every rustls-family crate on the same provider features.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 regex = "1"
 ring = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
