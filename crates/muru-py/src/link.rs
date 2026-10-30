@@ -149,10 +149,16 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         let mut lifeline = Lifeline::new(lifeline)?;
 
         // The first report says the worker is listening; the rest keep
-        // the host informed of what it is doing.
+        // the host informed of what it is doing. On a thread of its own,
+        // so the host's view (and its hard timeout, section 7.6) never
+        // waits on the link's runtime.
 
         if let Some(fd) = report {
-            tokio::spawn(report_loop(fd, Arc::clone(&accepting), memory_interval));
+            let report_shared = Arc::clone(&accepting);
+            let stop = Arc::clone(&watchdog_stop);
+            std::thread::Builder::new()
+                .name("muru-report".to_owned())
+                .spawn(move || report_thread(fd, &report_shared, memory_interval, &stop))?;
         }
 
         // Section 7.6: the watchdog interrupts requests past the soft
@@ -552,6 +558,27 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // Section 7.6: so is giving up the requests of a condemned worker,
+        // whose stuck code may hold the interpreter for good.
+
+        if let Some((id, which, error, reason)) = abandon_request(&line) {
+            let given_up: Vec<String> = shared
+                .abandon(which, &error, &reason)
+                .iter()
+                .map(|request| serde_json_string(request))
+                .collect();
+            let text = format!(
+                "{{\"id\":{id},\"ok\":true,\"result\":{{\"abandoned\":[{}]}}}}",
+                given_up.join(",")
+            );
+
+            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+                break;
+            }
+
+            continue;
+        }
+
         let answer = Python::attach(|py| {
             let active = shared.active_requests(py)?;
             let names = crate::pool::thread_names(py)?;
@@ -580,11 +607,42 @@ fn bookkeeping_request(line: &str) -> Option<i64> {
         return None;
     }
 
+    control_id(line)
+}
+
+/// A request line asking the worker to give up requests, as the host
+/// writes it: `{"id": N, "op": "abandon", "args": {"which": "oldest" or
+/// "all", "reason": R, "error": E}}`, where the reason is a word and the
+/// error a sentence with no quotes or backslashes in it.
+fn abandon_request(line: &str) -> Option<(i64, crate::pool::Abandon, String, String)> {
+    if !line.contains("\"op\": \"abandon\"") {
+        return None;
+    }
+
+    let which = if line.contains("\"which\": \"all\"") {
+        crate::pool::Abandon::All
+    } else {
+        crate::pool::Abandon::Oldest
+    };
+    let error = control_string(line, "error").unwrap_or_default();
+    let reason = control_string(line, "reason").unwrap_or_default();
+    Some((control_id(line)?, which, error, reason))
+}
+
+/// The id of a control request line: the number after `"id": `.
+fn control_id(line: &str) -> Option<i64> {
     let rest = line.split_once("\"id\": ")?.1;
     let end = rest
         .find(|c: char| c != '-' && !c.is_ascii_digit())
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// A string argument of a control request line, which the host writes
+/// without quotes or backslashes in it.
+fn control_string(line: &str, key: &str) -> Option<String> {
+    let rest = line.split_once(&format!("\"{key}\": \""))?.1;
+    Some(rest.split_once('"')?.0.to_owned())
 }
 
 /// The requests in flight, with the thread serving each, and the
@@ -647,7 +705,7 @@ fn serde_json_string(text: &str) -> String {
 /// in flight, the age of the oldest, and requests served, and every
 /// `memory_interval` the worker's memory too. A write that cannot
 /// complete at once (the host is behind) is skipped.
-async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
+fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &AtomicBool) {
     // SAFETY: fcntl on a descriptor inherited for this purpose, setting
     // a flag; the descriptor stays open for the life of the worker.
 
@@ -692,7 +750,11 @@ async fn report_loop(fd: i32, shared: Arc<Shared>, memory_interval: Duration) {
             libc::write(fd, line.as_ptr().cast(), line.len());
         }
 
-        tokio::time::sleep(REPORT_INTERVAL).await;
+        std::thread::sleep(REPORT_INTERVAL);
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
@@ -932,6 +994,7 @@ async fn handle_request(
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
     let (request_id, interrupt) = shared.request_started(&head);
+    shared.request_outgoing(request_id, out_tx.clone());
     let worker_shared = Arc::clone(shared);
     let worker_cancelled = Arc::clone(&cancelled);
     let queued = pool.spawn(Box::new(move |py| {
@@ -1051,7 +1114,7 @@ async fn handle_asgi_request(
     request_end: bool,
     shared: &Arc<Shared>,
     asgi: &asgi::Asgi,
-    runner: Py<PyAny>,
+    runner: Arc<Py<PyAny>>,
 ) -> io::Result<Option<frame::Frame>> {
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
@@ -1061,6 +1124,7 @@ async fn handle_asgi_request(
     // function returns, when the request has ended.
 
     let (request_id, _interrupt) = shared.request_started(&head);
+    shared.request_outgoing(request_id, out_tx.clone());
     let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
     let _uploads = uploads;
 
@@ -1190,12 +1254,17 @@ async fn handle_websocket(
             // Before the accept, the response ending (a decline) ends the
             // request; after it, only the edge's CLOSE does. A worker told
             // to stop closes an accepted socket itself and waits for the
-            // edge's CLOSE in answer.
+            // edge's CLOSE in answer. The drain arm is not gated on the
+            // accept: a precondition is read once, as the select is built,
+            // which is before the application has accepted a socket that
+            // has just connected, and the loop only comes round again on
+            // a client message. close_for_drain leaves an unaccepted
+            // socket alone itself.
 
             let ended = tokio::select! {
                 biased;
                 _ = done.notified(), if !channel.accepted() => None,
-                _ = draining.wait_for(|draining| *draining), if channel.accepted() && !drained => {
+                _ = draining.wait_for(|draining| *draining), if !drained => {
                     drained = true;
                     channel.close_for_drain();
                     continue;

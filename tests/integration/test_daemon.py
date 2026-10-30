@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 from support import server as support
@@ -425,3 +426,71 @@ def test_only_one_release_is_retained_per_application(daemon: Daemon) -> None:
 
     assert [row["state"] for row in daemon.releases("shop")] == ["ready", "retained", "stopped"]
     assert "superseded again" in daemon.muructl("release", "list", "shop").stdout
+
+
+def test_a_relative_or_deep_run_directory_is_refused_at_start(tmp_path: Path) -> None:
+    """A worker's socket path must fit the platform's limit and be bound
+    where the daemon says, so a run directory that is relative or leaves
+    no room is refused by muructl daemon start before the daemon exists,
+    rather than after a 30 s wait for a daemon that never answers."""
+
+    muructl = support.muructl_path()
+
+    if muructl is None:
+        import pytest
+
+        pytest.skip("muructl is not built")
+
+    def start(run_dir: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(muructl),
+                "daemon",
+                "start",
+                "--run-dir",
+                run_dir,
+                "--state-dir",
+                str(tmp_path / "state"),
+                "--log-dir",
+                str(tmp_path / "logs"),
+                "--config",
+                str(tmp_path / "muru.toml"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    relative = start("muru/run")
+    assert relative.returncode != 0
+    assert "is a relative path" in relative.stderr, relative.stderr
+
+    deep = start("/tmp/" + "x" * 90)
+    assert deep.returncode != 0
+    assert "leaves" in deep.stderr and "bytes" in deep.stderr, deep.stderr
+    assert "shorter path" in deep.stderr
+
+
+def test_a_deploy_carries_settings_from_the_previous_release(daemon: Daemon) -> None:
+    # Section 3.3: what neither the flags nor the source's table give
+    # comes from the release before, a timeout, a memory key and an
+    # environment variable alike, and --fresh starts from the defaults.
+
+    daemon.deploy(
+        "shop", SHOP, "--timeout", "soft=3s", "--memory", "soft_limit=800MB", "--env", "DEBUG=1"
+    )
+    daemon.deploy("shop", SHOP)
+    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
+    assert "#   shop@r2: timeouts.soft_timeout = 3s (the previous release)" in shown
+    assert "#   shop@r2: memory.soft_limit = 800MB (the previous release)" in shown
+    assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
+    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    assert exported["app"]["shop"]["release"]["r2"]["env"] == {"DEBUG": "1"}
+
+    daemon.deploy("shop", SHOP, "--fresh")
+    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
+    assert "#   shop@r3: timeouts.soft_timeout = off (default)" in shown
+    assert "#   shop@r3: memory.soft_limit = off (default)" in shown
+    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    assert "env" not in exported["app"]["shop"]["release"]["r3"]

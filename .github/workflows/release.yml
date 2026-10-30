@@ -11,6 +11,13 @@ on:
   push:
     tags: ["v*"]
 
+# One run a tag: GitHub has delivered a tag push twice, and two runs
+# would build everything twice and both reach the PyPI gate. A duplicate
+# waits for the first rather than racing it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

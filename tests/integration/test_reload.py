@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import textwrap
 import time
@@ -13,11 +14,13 @@ from support import server as support
 APP = """
 import os
 
+import muru
+
 VERSION = {version!r}
 
 
 def application(environ, start_response):
-    body = f"{{VERSION}} from {{os.getpid()}}".encode()
+    body = f"{{VERSION}} from {{os.getpid()}} in {{muru.context().release}}".encode()
     start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))])
     return [body]
 """
@@ -29,6 +32,22 @@ def write_app(directory: Path, version: str) -> None:
 
 def version_seen(server: support.Server) -> str:
     return server.get("/").body.decode().split(" from ")[0]
+
+
+def pid_seen(server: support.Server) -> str:
+    return server.get("/").body.decode().split(" from ")[1].split(" in ")[0]
+
+
+def release_seen(server: support.Server) -> str:
+    """The release the application reports through muru.context()."""
+
+    return server.get("/").body.decode().split(" in ")[1]
+
+
+def release_switched_to(server: support.Server) -> str:
+    """The release the last `switched to release` line of the log names."""
+
+    return re.findall(r"switched to release (r\d+)", server.log())[-1]
 
 
 def wait_for_version(server: support.Server, version: str, timeout: float = 30.0) -> None:
@@ -61,7 +80,8 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
     try:
         assert server.wait_for_log("watching")
         assert version_seen(server) == "one"
-        first_pid = server.get("/").body.decode().split(" from ")[1]
+        assert release_seen(server) == "r1"
+        first_pid = pid_seen(server)
 
         server.mark_log()
         time.sleep(1.1)  # keep the modification time distinct on coarse file systems
@@ -69,15 +89,29 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         assert server.wait_for_log("reloading", timeout=10)
         assert server.wait_for_log("switched to release r", timeout=30)
         wait_for_version(server, "two")
-        assert server.get("/").body.decode().split(" from ")[1] != first_pid
+        assert pid_seen(server) != first_pid
+
+        # muru.context().release names the release the log does.
+
+        assert release_seen(server) == release_switched_to(server)
 
         # A broken edit leaves the previous release serving and is reported.
 
         server.mark_log()
         time.sleep(1.1)
         (project / "reload_app.py").write_text("def application(:\n")
-        assert server.wait_for_log("reload failed", timeout=30)
+        assert server.wait_for_log("failed to start", timeout=30)
         assert version_seen(server) == "two"
+
+        # The failure line names the attempt and the release that keeps
+        # serving; the attempt keeps its number, as section 9.8 says.
+
+        line = re.search(
+            r"muru: release (r\d+) failed to start: .*; release (r\d+) keeps serving", server.log()
+        )
+        assert line is not None, server.log()
+        assert line.group(2) == release_seen(server)
+        assert int(line.group(1)[1:]) > int(line.group(2)[1:])
 
         # Fixing it reloads again.
 
@@ -86,6 +120,7 @@ def test_source_changes_start_a_new_release(project: Path) -> None:
         write_app(project, "three")
         assert server.wait_for_log("switched to release r", timeout=30)
         wait_for_version(server, "three")
+        assert release_seen(server) == release_switched_to(server)
     finally:
         server.stop()
 
@@ -121,5 +156,38 @@ def test_reload_is_off_by_default(project: Path) -> None:
         write_app(project, "two")
         assert not server.wait_for_log("reloading", timeout=2)
         assert version_seen(server) == "one"
+    finally:
+        server.stop()
+
+
+def test_included_patterns_add_to_the_default(project: Path) -> None:
+    (project / "page.html").write_text("<p>one</p>\n")
+    server = support.start(
+        "reload_app:application",
+        workers=1,
+        chdir=project,
+        args=["--reload", "--reload-include", "**/*.html", "--reload-exclude", "unrelated.py"],
+    )
+
+    try:
+        # The start-up line names the patterns in force: the default, the
+        # include added to it, and the exclude.
+
+        assert server.wait_for_log("for changes to **/*.py, **/*.html, except unrelated.py")
+
+        # A template change reloads, and so does a module change: the
+        # include added **/*.html without replacing **/*.py.
+
+        server.mark_log()
+        time.sleep(1.1)
+        (project / "page.html").write_text("<p>two</p>\n")
+        assert server.wait_for_log("page.html changed", timeout=10)
+        assert server.wait_for_log("switched to release r", timeout=30)
+
+        server.mark_log()
+        time.sleep(1.1)
+        write_app(project, "two")
+        assert server.wait_for_log("reload_app.py changed", timeout=10)
+        wait_for_version(server, "two")
     finally:
         server.stop()

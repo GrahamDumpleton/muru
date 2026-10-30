@@ -699,6 +699,11 @@ pub struct Release {
     /// Mounts by name (section 6.7).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mounts: BTreeMap<String, Mount>,
+    /// The application's own static directories (section 4.9), served
+    /// by the edge from the release's source, which is the project
+    /// directory under `muructl run`.
+    #[serde(rename = "static", default, skip_serializing_if = "Vec::is_empty")]
+    pub static_dirs: Vec<StaticDir>,
     /// Logging defaults (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
@@ -2736,6 +2741,94 @@ pub struct Fallback {
     pub file: Option<String>,
 }
 
+/// A directory of an application's own files, an entry of the
+/// `[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]` array
+/// (section 4.9): a path prefix the edge serves from a directory under
+/// the release's source, with the application taking what no file
+/// answers. Served by `muructl run` and the daemon alike, from the
+/// release the request was routed to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticDir {
+    /// The path prefix, such as `/static/`; the longest wins, on segment
+    /// boundaries, and `/` is not allowed, since every path would then
+    /// be looked up as a file first.
+    pub path: String,
+    /// The directory, relative to the source directory, or absolute.
+    pub dir: String,
+    /// The files tried, in order, when a directory is requested
+    /// (default index.html).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index: Vec<String>,
+    /// The file served for paths with no file of their own, for a
+    /// single-page application under the prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// The cache headers files are sent with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheTable>,
+    /// Whether a directory asked for without a trailing slash is
+    /// redirected to the slash form (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_slash: Option<bool>,
+    /// `strict` (the default), which matches names as they are on disk,
+    /// or `insensitive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
+}
+
+/// Check an application's static directories (section 4.9): each path
+/// is a prefix below `/`, no two share one, each names a directory, and
+/// the settings parse.
+pub fn check_static(entries: &[StaticDir]) -> Result<(), String> {
+    for (index, entry) in entries.iter().enumerate() {
+        let label = format!("static {:?}", entry.path);
+
+        if !entry.path.starts_with('/') {
+            return Err(format!("{label}: the path must start with /"));
+        }
+
+        if entry.path.trim_end_matches('/').is_empty() {
+            return Err(format!(
+                "{label}: / cannot be a static prefix; name the directory's own prefix, such as /static/"
+            ));
+        }
+
+        if entry.dir.is_empty() {
+            return Err(format!("{label}: dir names the directory served"));
+        }
+
+        if let Some(other) = entries[..index]
+            .iter()
+            .find(|other| other.path.trim_end_matches('/') == entry.path.trim_end_matches('/'))
+        {
+            return Err(format!(
+                "{label}: the same prefix as static {:?}",
+                other.path
+            ));
+        }
+
+        if let Some(case) = &entry.case
+            && case != "strict"
+            && case != "insensitive"
+        {
+            return Err(format!(
+                "{label}: case is strict or insensitive, not {case:?}"
+            ));
+        }
+
+        if let Some(max_age) = entry
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.max_age.as_deref())
+        {
+            parse_duration(max_age).map_err(|error| format!("{label}: cache.max_age: {error}"))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// A static route's cache headers (section 4.9).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3715,6 +3808,11 @@ pub struct ToolMuru {
     /// Mounts by name (section 6.7).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mounts: BTreeMap<String, Mount>,
+    /// The application's own static directories (section 4.9), served
+    /// by the edge from the release's source, which is the project
+    /// directory under `muructl run`.
+    #[serde(rename = "static", default, skip_serializing_if = "Vec::is_empty")]
+    pub static_dirs: Vec<StaticDir>,
     /// Logging defaults (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,

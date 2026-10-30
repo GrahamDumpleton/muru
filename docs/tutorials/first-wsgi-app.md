@@ -132,7 +132,13 @@ muru: switched to release r2
 
 Each reload is a fresh host and worker; the old ones serve until the new
 ones are ready, then stop. If the new code fails to import, the terminal
-says so and the previous release keeps serving.
+says so and the previous release keeps serving:
+
+```
+muru: release r3 failed to start: ...; release r2 keeps serving
+```
+
+The failed attempt was still a release, so the fix after it is `r4`.
 
 ## More workers, more threads
 
@@ -180,5 +186,7 @@ on loopback only and is read-only.
   check that runs before workers are forked, and the message you will see
   when an import opens a connection too early.
 - Development mode serves loopback only and is not for production, which
-  is the daemon's job: the [daemon](../howto/daemon.md) guide starts one
-  and deploys an application to it.
+  is the daemon's job: [deploy with the daemon and roll
+  back](deploy-and-roll-back.md) starts one and deploys an application to
+  it, and [run an ASGI app with WebSockets](asgi-websockets.md) does for
+  ASGI what this tutorial did for WSGI.

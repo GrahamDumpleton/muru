@@ -36,12 +36,22 @@ first. No request is refused during the switch.
 ## Releases
 
 A release is a source directory and the settings fixed at creation: the
-entrypoint, interface, interpreter, processes, threads and preload mode,
-read from the directory's `[tool.muru]` table unless a flag overrides
-them, exactly as `muructl run` reads them. Release ids are `r1`, `r2` and
-so on unless `--release` names one. The interpreter is the source
-directory's `.venv` when it has one, otherwise the previous release's,
-otherwise `--python`.
+entrypoint, interface, interpreter, processes, threads, preload mode,
+timeouts, memory policy, environment and the rest a flag can set, read
+from the directory's `[tool.muru]` table unless a flag overrides them,
+exactly as `muructl run` reads them. Release ids are `r1`, `r2` and so
+on unless `--release` names one.
+
+A deploy takes what neither its flags nor the source's table give from
+the release before it, so a `--timeout soft=3s` or `--env DEBUG=1` given
+once stays in force through later deploys until a flag or the table
+changes it. Environment variables and secrets carry by name. The tables
+in `[tool.muru]`, worker groups, mounts, logging, scaling and error
+pages, come from the source alone, so a source that drops a group drops
+it. The interpreter is the source directory's `.venv` when it has one,
+otherwise the previous release's, otherwise `--python`. `--fresh` deploys
+from the flags, the source and the defaults alone, ignoring the previous
+release.
 
 ```
 muructl release list shop
@@ -124,7 +134,12 @@ muructl config diff -f config/
 ```
 
 Each `[app.NAME.release.ID]` table needs a `source`; a relative path is
-taken from the file's own directory. The other keys are those of the
+taken from the file's own directory, as every other path in the file is:
+a route's or an overlay's `static` directory, `sendfile_roots`, a host's
+certificate and key, a host's and a route's error page files, an
+upstream's `tls.ca` and a client class's lists. A release's error page
+files are the one exception, taken from its `source`. The other keys are
+those of the
 `[tool.muru]` table (`entrypoint`, `interface`, `factory`,
 `factory_phase`, `python`, `processes`, `threads`, `sync_threads`,
 `concurrency`, `preload` and `hooks`), and what a table leaves out comes
@@ -201,9 +216,12 @@ locations for the platform, or the system locations with `--system`:
 override each, as do `MURU_STATE_DIR`, `MURU_RUN_DIR`, `MURU_LOG_DIR`,
 `MURU_CACHE_DIR` and `MURU_CONFIG`, and the directories systemd provides
 through `StateDirectory=` and its siblings are used when set. `muructl
-daemon run` prints every location and which rule chose it. The socket
-path is limited to about a hundred bytes, so a deep `--run-dir` is
-refused with a message saying so.
+daemon run` prints every location and which rule chose it. The run
+directory must be an absolute path, and a Unix socket path is limited to
+104 bytes on macOS and 108 on Linux, so a run directory too deep to leave
+room for the workers' sockets, which sit about 35 bytes plus the
+application's name below it, is refused at start with a message saying
+so.
 
 The configuration file is optional. Its `[[listener]]` entries name the
 addresses to serve, each with `tls = true` when the edge terminates TLS
@@ -279,8 +297,11 @@ configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
 and `[error_override]` tables and the [node's
 budget](scaling.md#the-nodes-budget). The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
-daemon through its admin socket: `--socket` or `MURU_SOCKET`, else the
-socket in the runtime directory.
+daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
+development run started from the current directory, else the daemon's
+socket in the runtime directory, else the one development run listening;
+with several runs and no daemon the command names them, so one can be
+chosen with `--socket`. `muructl status` says which was found.
 
 The access log is written as JSON lines to `access.log` in the log
 directory, `muructl logs` shows or follows it and each release's output,

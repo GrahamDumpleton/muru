@@ -95,6 +95,22 @@ pub struct RequestInfo {
     /// Exempt from the timeouts: a streaming response or a WebSocket
     /// (section 7.6), which run as long as they need to.
     pub exempt: bool,
+    /// The request's way out to the edge, for giving it up (section 7.6)
+    /// when the host condemns the worker and the code serving it cannot
+    /// be interrupted.
+    pub outgoing: Option<tokio::sync::mpsc::Sender<crate::wsgi::Outgoing>>,
+    /// Given up: the edge has answered the client, whatever the
+    /// application thread still does.
+    pub abandoned: bool,
+}
+
+/// Which of a condemned worker's requests to give up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abandon {
+    /// The oldest, which is the one past the hard timeout.
+    Oldest,
+    /// Every one, when the whole worker is stalled.
+    All,
 }
 
 /// The soft timeout's way into a bridge call the application thread is
@@ -260,11 +276,13 @@ pub fn thread_names(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 
 /// One mount of a release (section 6.7): its application and, for an
 /// ASGI mount, the runner scheduled on the loop for each request.
+#[derive(Clone)]
 pub struct Mount {
-    /// The application callable.
-    pub app: Py<PyAny>,
+    /// The application callable, shared so a request's lookup needs no
+    /// interpreter.
+    pub app: Arc<Py<PyAny>>,
     /// The runner, when the mount is ASGI.
-    pub runner: Option<Py<PyAny>>,
+    pub runner: Option<Arc<Py<PyAny>>>,
     /// The mount's own threads, when it has them: those it reserves and
     /// the most requests it runs at once.
     pub threads: Option<(usize, usize)>,
@@ -275,19 +293,6 @@ pub struct Mount {
     /// The pool of its reserved threads, for a WSGI mount that reserves
     /// any; its other requests run on the shared pool.
     pub pool: Option<Arc<Pool>>,
-}
-
-impl Mount {
-    /// A new reference to the same mount.
-    pub fn clone_ref(&self, py: Python<'_>) -> Self {
-        Self {
-            app: self.app.clone_ref(py),
-            runner: self.runner.as_ref().map(|runner| runner.clone_ref(py)),
-            threads: self.threads,
-            limits: self.limits,
-            pool: self.pool.clone(),
-        }
-    }
 }
 
 /// The soft timeout (section 7.6): how long a request may run before it
@@ -302,8 +307,9 @@ pub struct SoftTimeout {
 
 /// State shared by every request handled by this worker.
 pub struct Shared {
-    /// The default mount's application callable, at /.
-    pub app: Py<PyAny>,
+    /// The default mount's application callable, at /, shared so a
+    /// request's lookup needs no interpreter.
+    pub app: Arc<Py<PyAny>>,
     /// The named mounts (section 6.7), by name.
     pub mounts: HashMap<String, Mount>,
     /// The `wsgi.errors` stream (sys.stderr at start-up).
@@ -351,7 +357,7 @@ impl Shared {
     ) -> std::io::Result<Self> {
         let threads = threads.max(1);
         Ok(Self {
-            app,
+            app: Arc::new(app),
             mounts,
             errors,
             threads,
@@ -382,23 +388,22 @@ impl Shared {
     }
 
     /// The application a request head names: the default mount for an
-    /// empty name, else the mount of that name.
+    /// empty name, else the mount of that name. This runs on a link
+    /// thread, so it must not attach to the interpreter: a request stuck
+    /// in C code holding the GIL would block the thread, and with it the
+    /// runtime's timers and every other connection (section 7.6).
     pub fn mount(&self, name: &str) -> Option<Mount> {
         if name.is_empty() {
             return Some(Mount {
-                app: Python::attach(|py| self.app.clone_ref(py)),
-                runner: self.asgi.as_ref().and_then(|asgi| {
-                    Python::attach(|py| asgi.runner.as_ref().map(|r| r.clone_ref(py)))
-                }),
+                app: Arc::clone(&self.app),
+                runner: self.asgi.as_ref().and_then(|asgi| asgi.runner.clone()),
                 threads: None,
                 limits: None,
                 pool: None,
             });
         }
 
-        self.mounts
-            .get(name)
-            .map(|mount| Python::attach(|py| mount.clone_ref(py)))
+        self.mounts.get(name).cloned()
     }
 
     /// wsgi.multithread for a request to the mount (section 6.5): whether
@@ -483,9 +488,74 @@ impl Shared {
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
                     exempt: false,
+                    outgoing: None,
+                    abandoned: false,
                 },
             );
         (id, interrupt)
+    }
+
+    /// Note a request's channel to the edge, for giving it up.
+    pub fn request_outgoing(
+        &self,
+        id: u64,
+        outgoing: tokio::sync::mpsc::Sender<crate::wsgi::Outgoing>,
+    ) {
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .get_mut(&id)
+        {
+            info.outgoing = Some(outgoing);
+        }
+    }
+
+    /// Give up requests the host has condemned the worker over (section
+    /// 7.6): each is ended towards the edge with the reason, so the client
+    /// is answered now rather than when the worker is finally killed, and
+    /// its application thread's output is dropped. This needs no
+    /// interpreter, which the stuck code may hold. Returns the request ids
+    /// given up.
+    pub fn abandon(&self, which: Abandon, error: &str, reason: &str) -> Vec<String> {
+        let mut active = self.active.lock().expect("active requests poisoned");
+
+        let candidates: Vec<u64> = match which {
+            Abandon::All => active
+                .iter()
+                .filter(|(_, info)| !info.exempt && !info.abandoned)
+                .map(|(id, _)| *id)
+                .collect(),
+            Abandon::Oldest => active
+                .iter()
+                .filter(|(_, info)| !info.exempt && !info.abandoned)
+                .min_by_key(|(_, info)| info.started)
+                .map(|(id, _)| vec![*id])
+                .unwrap_or_default(),
+        };
+
+        let mut given_up = Vec::new();
+
+        for id in candidates {
+            let Some(info) = active.get_mut(&id) else {
+                continue;
+            };
+            let Some(outgoing) = &info.outgoing else {
+                continue;
+            };
+            let abort = crate::wsgi::Outgoing::Abort {
+                error: error.to_owned(),
+                reason: reason.to_owned(),
+                detail: String::new(),
+            };
+
+            if outgoing.try_send(abort).is_ok() {
+                info.abandoned = true;
+                given_up.push(info.request_id.clone());
+            }
+        }
+
+        given_up
     }
 
     /// Note the channel of an ASGI request, for the soft timeout.
@@ -794,7 +864,9 @@ impl Pool {
 /// closes, inside `muru._pool.serve_jobs`, so the thread always has a
 /// Python frame that a reader from outside can start from (section 11.7).
 fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
-    if let Some(name) = std::thread::current().name() {
+    let name = std::thread::current().name().map(str::to_owned);
+
+    if let Some(name) = &name {
         name_this_thread(name);
     }
 
@@ -807,7 +879,7 @@ fn thread_main(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) {
                 entered.store(true, Ordering::SeqCst);
                 serve_jobs(args.py(), &inner);
             })?;
-            module.call_method1("serve_jobs", (serve,))
+            module.call_method1("serve_jobs", (serve, name))
         });
 
         // Without the module the thread serves all the same, only without

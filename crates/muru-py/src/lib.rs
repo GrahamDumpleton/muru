@@ -132,7 +132,7 @@ fn serve(
     let asgi = match (event_loop, runner) {
         (Some(event_loop), runner) => Some(asgi::Asgi {
             event_loop,
-            runner,
+            runner: runner.map(Arc::new),
             resolver: wrap_pyfunction!(asgi::resolve_future, py)?
                 .unbind()
                 .into_any(),
@@ -170,8 +170,8 @@ fn serve(
         named.insert(
             name,
             pool::Mount {
-                app,
-                runner,
+                app: Arc::new(app),
+                runner: runner.map(Arc::new),
                 threads,
                 limits: limits
                     .filter(|&(concurrency, connections)| concurrency > 0 || connections > 0),

@@ -32,6 +32,11 @@ design specification and are added as the features they cover land:
   sustained load from `support.load`, with zero failed requests; the
   minute-long cycle carries the slow marker.
 
+- `test_tutorial_*.py`: one per tutorial under `docs/tutorials`, each
+  running the tutorial's own code from `docs/tutorials/code` through the
+  page's steps, so a change that breaks a step fails here rather than
+  for a reader.
+
 Run with `just test-integration`. Scenarios that need Docker, network, root or
 a long time carry markers and are skipped by default. Helpers for starting
 muructl and talking to it are in `tests/support`.

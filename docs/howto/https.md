@@ -52,7 +52,9 @@ Names ending in `.localhost` resolve to loopback in browsers without any
 `/etc/hosts` entry, which is handy for testing subdomains and cookies.
 
 **Your own certificate.** `--tls-cert cert.pem --tls-key key.pem` serves
-those files instead, and implies `--https`.
+those files instead, and implies `--https`. A relative path is taken from
+the project (`--chdir` or the directory given), not from where `muructl`
+runs.
 
 ## HTTPS only
 

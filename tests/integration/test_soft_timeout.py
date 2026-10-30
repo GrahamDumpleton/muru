@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import threading
 import time
 
 import pytest
@@ -198,3 +199,74 @@ def test_the_hard_timeout_must_exceed_the_soft_timeout() -> None:
             workers=1,
             args=["--timeout", "soft=10s", "--timeout", "hard=12s"],
         )
+
+
+def test_the_hard_timeout_fires_with_a_second_request_on_a_stuck_worker() -> None:
+    """A request stuck in C code holding the GIL is replaced by the hard
+    timeout even when a second request reaches the same worker. The
+    worker's reports come from a thread of their own, so the second
+    request's arrival, which blocks a link thread on the interpreter,
+    does not stop the host seeing the first request's age."""
+
+    server = support.start(
+        "plain_wsgi:application",
+        workers=1,
+        threads=2,
+        args=["--timeout", "hard=3s", "--timeout", "shutdown=1s"],
+    )
+
+    def hold() -> None:
+        try:
+            server.get("/hold?seconds=30")
+        except OSError:
+            pass
+
+    try:
+        worker = pid_of(server)
+        first = threading.Thread(target=hold, daemon=True)
+        first.start()
+        time.sleep(1)
+        second = threading.Thread(target=hold, daemon=True)
+        second.start()
+        assert server.wait_for_log("past the hard timeout", timeout=10), server.log()
+        assert "GIL stall" not in server.log()
+        first.join(timeout=30)
+        second.join(timeout=30)
+        assert pid_of(server) != worker
+    finally:
+        server.stop()
+
+
+def test_the_hard_timeout_answers_the_stuck_request_at_once() -> None:
+    """The request that condemned the worker cannot finish, so its client
+    gets 504 hard_timeout when the worker is replaced, not after the drain
+    grace and the shutdown timeout that the worker's other requests get."""
+
+    server = support.start(
+        "plain_wsgi:application",
+        workers=1,
+        threads=2,
+        args=[
+            "--timeout",
+            "hard=2s",
+            "--timeout",
+            "hard_drain_grace=20s",
+            "--timeout",
+            "shutdown=20s",
+        ],
+    )
+
+    try:
+        started = time.monotonic()
+        response = server.get("/hold?seconds=30", headers={"Accept": "application/json"})
+        answered = time.monotonic() - started
+        assert response.status == 504, response.body
+        assert json.loads(response.body)["reason"] == "hard_timeout"
+        assert answered < 8, answered
+
+        # The worker's answer to the host, which logs it, follows the edge's
+        # answer to the client by a moment.
+
+        assert server.wait_for_log("gave up 1 request for the edge to answer")
+    finally:
+        server.stop()

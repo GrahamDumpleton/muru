@@ -72,6 +72,8 @@ pub struct Config {
     pub groups: Vec<routing::GroupSockets>,
     /// The named mounts, with the paths that select them.
     pub mounts: Vec<routing::MountPath>,
+    /// The release's own directories of files (section 4.9).
+    pub static_dirs: Vec<routing::StaticPath>,
     /// The default mount honours X-Accel-Redirect (section 4.10).
     pub accel_redirect: bool,
     /// The default mount treats a 200 with a local Location and no body
@@ -92,6 +94,9 @@ pub struct Config {
     pub limits: Limits,
     /// How responses are compressed (section 4.17).
     pub compression: compression::Compression,
+    /// Which peers are trusted to speak for the client, until a snapshot
+    /// says otherwise (section 4.7).
+    pub trust: proxy::Trust,
     /// The HTTPS listener, when TLS is on.
     pub https: Option<Https>,
     /// Where upload routes store files (section 4.11); a route that
@@ -197,6 +202,8 @@ pub struct Pools {
     current: RwLock<Arc<routing::Routing>>,
     /// The compression policy a development run keeps across replacements.
     compression: compression::Compression,
+    /// The trusted proxies a development run keeps across replacements.
+    trust: proxy::Trust,
 }
 
 impl Pools {
@@ -208,7 +215,11 @@ impl Pools {
     /// Send new requests to another application's workers, with no
     /// hosts. Requests in flight finish on the pool they started with.
     pub fn replace(&self, pools: routing::AppPools) {
-        self.apply(routing::Routing::single(pools).with_compression(self.compression.clone()));
+        self.apply(
+            routing::Routing::single(pools)
+                .with_compression(self.compression.clone())
+                .with_trust(self.trust.clone()),
+        );
     }
 
     /// Switch to the tables of a new snapshot, handing the pools of woken
@@ -391,11 +402,14 @@ impl Edge {
                     .await?
                     .with_errors(Arc::clone(&config.errors))
                     .with_sendfile(Arc::clone(&config.sendfile))
-                    .with_grpc_web(&config.grpc_web_origins),
+                    .with_grpc_web(&config.grpc_web_origins)
+                    .with_static_dirs(config.static_dirs.clone()),
                 )
-                .with_compression(config.compression.clone()),
+                .with_compression(config.compression.clone())
+                .with_trust(config.trust.clone()),
             )),
             compression: config.compression.clone(),
+            trust: config.trust.clone(),
         });
         let access_log = Arc::new(access::AccessLog::new(config.access_log)?);
 
@@ -1139,16 +1153,59 @@ async fn serve<I>(
                                 context.upload = upload;
                             }
 
-                            dispatch(
-                                &mut parts,
-                                body.take(),
-                                buffered.take(),
-                                selection.pool,
-                                selection.upstream,
-                                &context,
-                                selection.redirects,
-                            )
-                            .await
+                            // Section 4.9: a path under one of the
+                            // release's own directories is answered by
+                            // the file when there is one; otherwise, and
+                            // for every other method, the workers take it.
+
+                            let mut served = None;
+
+                            if let Some(static_path) = &selection.static_path {
+                                let path = parts.uri.path().to_owned();
+                                let within = path
+                                    .strip_prefix(static_path.prefix.trim_end_matches('/'))
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let target = parts
+                                    .uri
+                                    .path_and_query()
+                                    .map_or_else(|| path.clone(), |target| target.to_string());
+
+                                if let static_files::Outcome::Served {
+                                    response,
+                                    status,
+                                    reason,
+                                    bytes,
+                                } = static_files::serve(
+                                    &static_path.route,
+                                    &parts.method,
+                                    &within,
+                                    &target,
+                                    &parts.headers,
+                                    routing.compression(),
+                                )
+                                .await
+                                {
+                                    link::record(&context, &parts, status, reason, bytes);
+                                    served = Some(link::Handled::Response(response));
+                                }
+                            }
+
+                            match served {
+                                Some(served) => served,
+                                None => {
+                                    dispatch(
+                                        &mut parts,
+                                        body.take(),
+                                        buffered.take(),
+                                        selection.pool,
+                                        selection.upstream,
+                                        &context,
+                                        selection.redirects,
+                                    )
+                                    .await
+                                }
+                            }
                         }
                     }
                     (None, routing::Decision::Redirect) => {

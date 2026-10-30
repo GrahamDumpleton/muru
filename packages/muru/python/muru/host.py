@@ -84,6 +84,11 @@ FORCE_KILL_SECONDS = 1.0
 
 TICK_SECONDS = 0.5
 
+# How often a worker's native side writes a report, as the link has it:
+# a worker is silent once a report is this much later than due.
+
+REPORT_INTERVAL_SECONDS = 1.0
+
 # How long a worker is given to answer a control request before the
 # host answers for it.
 
@@ -127,6 +132,11 @@ def log(message: str) -> None:
 
 
 INTERFACES = ("auto", "wsgi", "asgi", "grpc")
+
+# The longest a Unix socket path may be, its NUL included: sun_path is 104
+# bytes on macOS and 108 on Linux.
+
+SOCKET_PATH_LIMIT = 104 if sys.platform == "darwin" else 108
 FACTORY_PHASES = ("worker", "host")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -169,6 +179,108 @@ def interface_name(interface: str) -> str:
     return "gRPC" if interface == "grpc" else interface.upper()
 
 
+# What a call passes: environ and start_response, or scope, receive and send.
+
+ARGUMENTS = {"wsgi": 2, "asgi": 3}
+
+
+def positional_shape(app: Any) -> tuple[int, int, str | None] | None:
+    """Return the positional arguments ``app`` needs and takes, and a required keyword-only name.
+
+    The signature is the callable's own: a class is read through its
+    constructor, since calling it is what serves a request, and an object
+    through its ``__call__``. ``*args`` takes any number. None when Python
+    cannot tell, as for some callables written in C, which are then taken
+    as they are.
+    """
+
+    try:
+        signature = inspect.signature(app)
+    except (TypeError, ValueError):
+        return None
+
+    required = accepted = 0
+    keyword = None
+
+    for parameter in signature.parameters.values():
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
+            accepted += 1
+
+            if parameter.default is parameter.empty:
+                required += 1
+        elif parameter.kind is parameter.VAR_POSITIONAL:
+            accepted = sys.maxsize
+        elif parameter.kind is parameter.KEYWORD_ONLY and parameter.default is parameter.empty:
+            keyword = keyword or parameter.name
+
+    return required, accepted, keyword
+
+
+def check_arguments(spec: str, app: Any, interface: str, declared: bool) -> None:
+    """Refuse ``app`` when it cannot be called as a ``interface`` application is.
+
+    A WSGI application is called with two positional arguments and an
+    ASGI application with three. A callable with no required positional
+    parameters is most likely an application factory named without the
+    factory setting, which would otherwise fail on every request; one
+    that fits the other interface is refused rather than guessed at.
+    """
+
+    shape = positional_shape(app)
+
+    if shape is None:
+        return
+
+    required, accepted, keyword = shape
+    wanted = ARGUMENTS[interface]
+    name = interface_name(interface)
+
+    if keyword is None and required <= wanted <= accepted:
+        return
+
+    if keyword is not None:
+        raise RuntimeError(
+            f"{spec} has a required keyword-only parameter {keyword!r}, which a {name} "
+            "application is never passed"
+        )
+
+    if required == 0 and accepted < wanted:
+        raise RuntimeError(
+            f"{spec} takes no required arguments, so it cannot be a {name} application; if it "
+            "is an application factory, set factory = true in [tool.muru], or give --factory "
+            "when the entrypoint is named on the command line"
+        )
+
+    other = "asgi" if interface == "wsgi" else "wsgi"
+    other_name = interface_name(other)
+    takes = f"takes {ARGUMENTS[other]} arguments, as an {other_name} application does"
+
+    if required <= ARGUMENTS[other] <= accepted:
+        if declared:
+            raise RuntimeError(f"{spec} is declared {name} but {takes}; declare it as {other}")
+
+        if interface == "asgi":
+            raise RuntimeError(
+                f"{spec} is a coroutine function, so it cannot be served as WSGI, but {takes}"
+            )
+
+        raise RuntimeError(
+            f"{spec} {takes}, but is not a coroutine function, so it was detected as WSGI; "
+            "declare interface = 'asgi' if it is one"
+        )
+
+    if accepted == sys.maxsize:
+        count = f"at least {required}"
+    elif required == accepted:
+        count = str(required)
+    else:
+        count = f"{required} to {accepted}"
+
+    raise RuntimeError(
+        f"{spec} takes {count} positional arguments, where a {name} application is passed {wanted}"
+    )
+
+
 def resolve_interface(spec: str, app: Any, interface: str) -> str:
     """Return the interface the application is served with: ``wsgi``, ``asgi`` or ``grpc``.
 
@@ -176,15 +288,15 @@ def resolve_interface(spec: str, app: Any, interface: str) -> str:
     detected, since its entrypoint is a registration function (section
     6.13). A declared interface is trusted, except that an application
     declared WSGI whose callable is a coroutine function cannot be served
-    that way and is refused.
+    that way and is refused. Either way the callable must take the
+    arguments the interface passes, which catches a factory named without
+    the factory setting at load rather than on every request.
     """
 
     if interface == "grpc":
         return interface
 
     detected = detect_interface(app)
-    if interface == "auto":
-        return detected
 
     if interface == "wsgi" and detected == "asgi":
         raise RuntimeError(
@@ -192,7 +304,9 @@ def resolve_interface(spec: str, app: Any, interface: str) -> str:
             "leave the interface to be detected"
         )
 
-    return interface
+    resolved = detected if interface == "auto" else interface
+    check_arguments(spec, app, resolved, declared=interface != "auto")
+    return resolved
 
 
 def app_name(spec: str) -> str:
@@ -857,6 +971,12 @@ class Host:
         # worker never touches the objects it inherited.
 
         gc.freeze()
+
+        # Anything the host has buffered would otherwise be written twice,
+        # once by each process.
+
+        sys.stdout.flush()
+        sys.stderr.flush()
         pid = os.fork()
 
         if pid == 0:
@@ -865,6 +985,13 @@ class Host:
             try:
                 os.dup2(out_write, 1)
                 os.dup2(err_write, 2)
+
+                # Standard output is now a pipe, which Python block-buffers,
+                # so a plain print() would wait for the buffer to fill. Line
+                # buffering makes each line arrive as it is written. (The
+                # typeshed TextIO has no reconfigure; the real stream does.)
+
+                sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
                 inherited = (
                     out_read,
                     out_write,
@@ -890,6 +1017,15 @@ class Host:
             except BaseException:
                 traceback.print_exc()
             finally:
+                # os._exit skips the flush that a normal exit would do, so
+                # whatever is still buffered would be lost.
+
+                for stream in (sys.stdout, sys.stderr):
+                    try:
+                        stream.flush()
+                    except (OSError, ValueError):
+                        pass
+
                 os._exit(status)
 
         os.close(out_write)
@@ -1995,18 +2131,30 @@ class Host:
                 if report["event"] == "debug.detached":
                     self.debugging(state, -1)
                 elif report["event"] == "worker.loop_stalled":
+                    loop_stall = self.group_of(state.index).loop_stall_timeout
                     self.replace(
                         state,
-                        f"its event loop stalled past the loop stall timeout of "
-                        f"{self.group_of(state.index).loop_stall_timeout:g} s",
+                        f"its event loop stalled past the loop stall timeout of {loop_stall:g} s",
                         "worker.timeout_killed",
+                        abandon={
+                            "which": "all",
+                            "reason": "worker_stalled",
+                            "error": f"the worker's event loop stalled past the loop stall "
+                            f"timeout of {loop_stall:g} s",
+                        },
                     )
                 elif report["event"] == "worker.gil_stalled":
+                    gil_stall = self.group_of(state.index).gil_stall_timeout
                     self.replace(
                         state,
-                        f"no thread of it ran Python for the GIL stall timeout of "
-                        f"{self.group_of(state.index).gil_stall_timeout:g} s",
+                        f"no thread of it ran Python for the GIL stall timeout of {gil_stall:g} s",
                         "worker.timeout_killed",
+                        abandon={
+                            "which": "all",
+                            "reason": "worker_stalled",
+                            "error": f"no thread of the worker ran Python for the GIL stall "
+                            f"timeout of {gil_stall:g} s",
+                        },
                     )
 
                 continue
@@ -2189,16 +2337,32 @@ class Host:
                     f"a request has run for {state.oldest_ms / 1000:.1f} s, past the hard "
                     f"timeout of {hard_timeout:g} s",
                     "worker.timeout_killed",
+                    abandon={
+                        "which": "oldest",
+                        "reason": "hard_timeout",
+                        "error": f"the request ran for {state.oldest_ms / 1000:.1f} s, past "
+                        f"the hard timeout of {hard_timeout:g} s",
+                    },
                 )
-            elif now - state.last_report_at > gil_stall_timeout:
+            elif now - state.last_report_at > gil_stall_timeout + REPORT_INTERVAL_SECONDS:
                 # Section 7.6: a worker whose reports have stopped, which
-                # its native threads send, is stopped or frozen whole.
+                # its native threads send, is stopped or frozen whole, so
+                # none of its requests can finish. The silence is counted
+                # from when the next report was due, as a report interval
+                # of jitter is not a stall.
 
+                silent = now - state.last_report_at
                 self.replace(
                     state,
-                    f"sent no report for {now - state.last_report_at:.0f} s, longer than "
+                    f"sent no report for {silent:.0f} s, longer than "
                     f"the GIL stall timeout of {gil_stall_timeout:g} s",
                     "worker.timeout_killed",
+                    abandon={
+                        "which": "all",
+                        "reason": "worker_stalled",
+                        "error": f"the worker sent no report for {silent:.0f} s, longer than "
+                        f"the GIL stall timeout of {gil_stall_timeout:g} s",
+                    },
                 )
             elif state.recycle_at is not None and now >= state.recycle_at:
                 self.replace(
@@ -2216,15 +2380,34 @@ class Host:
         for pending in list(self.pending.values()):
             self.finish_if_answered(pending, expired=now >= pending.deadline)
 
-    def replace(self, state: WorkerState, reason: str, kind: str, hard: bool = False) -> None:
+    def replace(
+        self,
+        state: WorkerState,
+        reason: str,
+        kind: str,
+        hard: bool = False,
+        abandon: dict[str, str] | None = None,
+    ) -> None:
         """Start replacing a worker with a fresh one on a new socket.
 
         For a hard timeout the old worker leaves routing at once and its
-        stacks are recorded. A worker being debugged is pinned: the policy
-        applies once the last session ends.
+        stacks are recorded, and `abandon` says which of its requests the
+        edge answers now rather than after the grace: the oldest, which is
+        the stuck one, or all of them when the whole worker is stalled. A
+        worker being debugged is pinned: the policy applies once the last
+        session ends.
         """
 
         if state.debug_sessions:
+            return
+
+        # A worker condemned twice, by the silence check and then by its
+        # own stall event, is replaced once: a second replacement would
+        # start a second worker, and queue its requests' abandonment
+        # behind the stacks request the first left blocked on the
+        # interpreter.
+
+        if state.replaced or state.index in self.replacing:
             return
 
         if self.control_listener is None:
@@ -2257,6 +2440,14 @@ class Host:
             self.routed[index] = None
             self.announce()
 
+            # The requests are given up before the stacks are asked for:
+            # the worker's control thread takes requests in order, and
+            # reading stacks from inside waits on the interpreter, which
+            # the stuck code may hold for good.
+
+            if abandon is not None:
+                self.abandon_requests(state, abandon)
+
             if kind == "worker.timeout_killed":
                 self.capture_stacks(state, replacement)
 
@@ -2266,6 +2457,27 @@ class Host:
             )
 
         replacement.new_pid = self.spawn(index, replacing=True)
+
+    def abandon_requests(self, state: WorkerState, args: dict[str, str]) -> None:
+        """Have a condemned worker give up requests that cannot finish.
+
+        The worker answers without its interpreter, which the stuck code
+        may hold, and ends each request with the reason given, which the
+        edge turns into the client's error at once (section 7.6).
+        """
+
+        def answered(pending: Pending) -> None:
+            answer = pending.answers.get(state.pid) or {}
+            ids = answer.get("result", {}).get("abandoned", [])
+
+            if ids:
+                log(
+                    f"worker {state.index} (pid {state.pid}) gave up "
+                    f"{len(ids)} request{'s' if len(ids) != 1 else ''} for the edge to "
+                    f"answer: {', '.join(ids)}"
+                )
+
+        self.ask(state, "abandon", args, 1.0, answered)
 
     def ask(
         self,
@@ -2322,7 +2534,15 @@ class Host:
             self.outside_errors[pid] = str(error)
 
             if known is None and self.outside.unreadable is not None:
-                log(f"workers are read from inside, since they cannot be from outside: {error}")
+                # Expected on macOS, where only a signed and entitled
+                # process may read another's memory, so it is said as
+                # information rather than left to read as an error.
+
+                log(
+                    "stacks and profiles come from inside the workers, as reading them from "
+                    f"outside is not available here ({error})"
+                    + ("; that is usual on macOS" if sys.platform == "darwin" else "")
+                )
 
             return None
 
@@ -3237,6 +3457,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.preload_gc_collect:
             gc.collect()
+
+    # A socket past the platform's path limit never binds, so the longest
+    # a default worker's socket can be is checked once here; a named
+    # group's sockets carry its name as well.
+
+    longest = os.path.join(args.socket_dir, "worker-99-g99.sock")
+
+    if len(longest.encode()) >= SOCKET_PATH_LIMIT:
+        log(
+            f"the worker socket path {longest} would be {len(longest.encode())} bytes, past "
+            f"the {SOCKET_PATH_LIMIT}-byte limit of this platform; give the daemon or "
+            "muructl run a shorter run directory"
+        )
+        return 1
 
     os.makedirs(args.socket_dir, exist_ok=True)
     host = Host(

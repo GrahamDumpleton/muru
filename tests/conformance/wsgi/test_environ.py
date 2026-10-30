@@ -7,6 +7,8 @@ import time
 import pytest
 from support.server import Server, text
 
+import muru
+
 AREA = "/environ"
 
 
@@ -106,6 +108,7 @@ def test_absent_keys(server: Server, key: str) -> None:
         "SCRIPT_NAME",
         "QUERY_STRING",
         "SERVER_PROTOCOL",
+        "SERVER_SOFTWARE",
         "SERVER_NAME",
         "SERVER_PORT",
         "REMOTE_ADDR",
@@ -132,6 +135,10 @@ def test_custom_header_values_are_native_strings(server: Server) -> None:
 )
 def test_wsgi_object_types(server: Server, key: str, expected: str) -> None:
     assert kind(server, key) == expected
+
+
+def test_server_software_names_muru_and_its_version(server: Server) -> None:
+    assert value(server, "SERVER_SOFTWARE") == f"muru/{muru.__version__}"
 
 
 def test_muru_keys(server: Server) -> None:

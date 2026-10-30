@@ -314,11 +314,12 @@ pub struct HostSpec {
     pub python: PathBuf,
     /// The application as module:callable.
     pub app: String,
-    /// The application's name and the release's id, which the runtime
-    /// library reports through `muru.context()` (section 6.9); none in
-    /// development, where they are `default` and `dev`.
+    /// The application's name, which the runtime library reports through
+    /// `muru.context()` (section 6.9); none in development, where the
+    /// host names it after the entrypoint's module.
     pub name: Option<String>,
-    /// The release's id, with `name`.
+    /// The release's id, likewise; none in development, where each
+    /// release of the run is `r1`, `r2` and so on, as the log names it.
     pub release: Option<String>,
     /// The interface the entrypoint speaks.
     pub interface: muru_config::Interface,
@@ -542,10 +543,11 @@ impl HostProcess {
                     .iter()
                     .flat_map(|name| ["--name".to_owned(), name.clone()]),
             )
-            .args(
+            .arg("--release")
+            .arg(
                 spec.release
-                    .iter()
-                    .flat_map(|release| ["--release".to_owned(), release.clone()]),
+                    .clone()
+                    .unwrap_or_else(|| format!("r{release}")),
             )
             .arg("--processes")
             .arg(spec.processes.to_string())

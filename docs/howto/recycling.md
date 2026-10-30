@@ -4,8 +4,9 @@
 :class: note
 
 Workers are replaced after a number of requests or a lifetime, on the
-hard timeout and over the memory limits. Per-group settings and the
-surge limit are still to come.
+hard timeout and over the memory limits, with the memory policy and
+timeouts settable per [worker group](worker-groups.md). Request and
+lifetime limits per group and the surge limit are still to come.
 ```
 
 A worker process that has served long enough is replaced by a fresh one,
@@ -107,5 +108,5 @@ was when the release started. New code is a new release (`muructl
 deploy`), and in development `muructl run` restarts on its own with
 `--reload`. The event is `worker.restarted`, with the reason and, for
 `--force`, where the stacks were; manual restarts do not count against
-the churn budget. The command needs the daemon: a development run has
-no admin socket, and Ctrl-C and running again does the same job.
+the churn budget. The command works against a development run too,
+through the run's admin socket, which prints the event to the terminal.

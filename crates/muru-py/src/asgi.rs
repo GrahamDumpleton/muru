@@ -32,7 +32,7 @@ pub struct Asgi {
     pub event_loop: Py<PyAny>,
     /// Called on the loop with (scope, channel) to start a request's task
     /// on the default mount, when that mount is ASGI.
-    pub runner: Option<Py<PyAny>>,
+    pub runner: Option<Arc<Py<PyAny>>>,
     /// Completes a future with a value unless it is already done.
     pub resolver: Py<PyAny>,
     /// How many requests the loop holds at once: the async slots in HELLO.

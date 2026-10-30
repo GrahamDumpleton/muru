@@ -5,8 +5,8 @@
 
 Secret stores of the file, env and exec kinds, references from a
 release's env table, delivery as variables or files, and `muructl secret`
-for file stores. Per-application users, which decide who can read a
-delivered file, are still to come.
+for file stores. A delivered file belongs to the application's
+[user](users.md).
 ```
 
 Applications need credentials, and the configuration refers to them by

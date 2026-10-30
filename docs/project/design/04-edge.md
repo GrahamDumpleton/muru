@@ -154,6 +154,7 @@ The edge sends a request again only when no worker can have seen it: a worker th
 ## 4.9 Static files and file hints
 
 - Static routes serve directories with ETag, Last-Modified, range requests, precompressed variants (.br, .zst, .gz) and configurable cache headers. A request for a directory without a trailing slash is redirected (301) to the slash form so relative links resolve, unless redirect_slash = false.
+- An application's own files are declared in its project rather than in a route: each `[[tool.muru.static]]` entry (or `--static PREFIX=DIR` on muructl run and muructl deploy, layered like any other setting) names a path prefix and a directory under the source, which the edge serves ahead of the application with a static route's behaviour, the application taking what no file answers and every method files do not. The directory is read from the release's own source, so the release a request was routed to serves its own files: a canary's pages get its own assets. `/` cannot be such a prefix; a site that is files at `/` is a static route with a fallback. muructl run serves the entries the same way, so development sees the serving production will.
 - File hints let an application hand the body of a response to the edge, which sends it with sendfile. There are two forms:
 
   | Form | How the application produces it | What the edge does |

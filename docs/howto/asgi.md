@@ -22,6 +22,16 @@ it with `--interface asgi`, or with `interface = "asgi"` in the project's
 `[tool.muru]` table. A callable that is a coroutine function but is
 declared `wsgi` is refused at start-up.
 
+Either way, the callable must take the arguments the interface passes:
+two for WSGI (`environ` and `start_response`), three for ASGI (`scope`,
+`receive` and `send`). One that takes no required arguments is refused as
+a likely application factory, naming the `factory` setting; a plain
+function that takes three is refused rather than guessed at, naming
+`interface = "asgi"`; and one declared `asgi` that takes two, or `wsgi`
+that takes three, is refused as declared wrongly. A callable whose
+arguments cannot be read, such as one taking `*args` or some written in
+C, is taken as it is.
+
 The start-up output says which interface the application is served with,
 and the serving line reports the loop's concurrency instead of a thread
 count:

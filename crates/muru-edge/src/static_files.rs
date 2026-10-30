@@ -61,6 +61,27 @@ pub struct Cache {
     pub except: Option<globset::GlobSet>,
 }
 
+/// What a static route or a release's own directory is made from, as
+/// the snapshot carries it (section 4.9).
+pub struct Settings<'a> {
+    /// The directory served.
+    pub directory: &'a str,
+    /// The files tried, in order, when a directory is requested.
+    pub index: &'a [String],
+    /// The file served for paths with no file of their own; none when empty.
+    pub fallback_file: &'a str,
+    /// `max-age`; none when 0.
+    pub cache_max_age_s: u64,
+    /// Whether `immutable` is added.
+    pub cache_immutable: bool,
+    /// Files that get `no-cache` instead, by pattern.
+    pub cache_except: &'a [String],
+    /// Do not redirect a directory to its slash form.
+    pub no_redirect_slash: bool,
+    /// Accept names that differ from the file's on disk.
+    pub case_insensitive: bool,
+}
+
 impl StaticRoute {
     /// A route from a snapshot's route message, when it names a directory.
     pub fn from_message(route: &pb::Route) -> Result<Option<Self>, String> {
@@ -68,16 +89,44 @@ impl StaticRoute {
             return Ok(None);
         }
 
+        Ok(Some(Self::new(&Settings {
+            directory: &route.static_dir,
+            index: &route.index,
+            fallback_file: &route.fallback_file,
+            cache_max_age_s: route.cache_max_age_s,
+            cache_immutable: route.cache_immutable,
+            cache_except: &route.cache_except,
+            no_redirect_slash: route.no_redirect_slash,
+            case_insensitive: route.case_insensitive,
+        })?))
+    }
+
+    /// A release's own directory, from its snapshot message.
+    pub fn from_static_dir(entry: &pb::StaticDir) -> Result<Self, String> {
+        Self::new(&Settings {
+            directory: &entry.dir,
+            index: &entry.index,
+            fallback_file: &entry.fallback_file,
+            cache_max_age_s: entry.cache_max_age_s,
+            cache_immutable: entry.cache_immutable,
+            cache_except: &entry.cache_except,
+            no_redirect_slash: entry.no_redirect_slash,
+            case_insensitive: entry.case_insensitive,
+        })
+    }
+
+    /// A route from its settings, the cache patterns compiled.
+    pub fn new(settings: &Settings<'_>) -> Result<Self, String> {
         let mut builder = globset::GlobSetBuilder::new();
 
-        for pattern in &route.cache_except {
+        for pattern in settings.cache_except {
             builder.add(
                 globset::Glob::new(pattern)
                     .map_err(|error| format!("cache.except {pattern:?}: {error}"))?,
             );
         }
 
-        let except = if route.cache_except.is_empty() {
+        let except = if settings.cache_except.is_empty() {
             None
         } else {
             Some(
@@ -87,22 +136,23 @@ impl StaticRoute {
             )
         };
 
-        Ok(Some(Self {
-            directory: PathBuf::from(&route.static_dir),
-            index: if route.index.is_empty() {
+        Ok(Self {
+            directory: PathBuf::from(settings.directory),
+            index: if settings.index.is_empty() {
                 vec!["index.html".to_owned()]
             } else {
-                route.index.clone()
+                settings.index.to_vec()
             },
-            fallback_file: (!route.fallback_file.is_empty()).then(|| route.fallback_file.clone()),
+            fallback_file: (!settings.fallback_file.is_empty())
+                .then(|| settings.fallback_file.to_owned()),
             cache: Cache {
-                max_age: (route.cache_max_age_s > 0).then_some(route.cache_max_age_s),
-                immutable: route.cache_immutable,
+                max_age: (settings.cache_max_age_s > 0).then_some(settings.cache_max_age_s),
+                immutable: settings.cache_immutable,
                 except,
             },
-            redirect_slash: !route.no_redirect_slash,
-            case_insensitive: route.case_insensitive,
-        }))
+            redirect_slash: !settings.no_redirect_slash,
+            case_insensitive: settings.case_insensitive,
+        })
     }
 }
 

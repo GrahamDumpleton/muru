@@ -857,6 +857,11 @@ struct Daemon {
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
 pub async fn run(mut config: Config) -> anyhow::Result<()> {
+    config
+        .locations
+        .check_run_dir()
+        .map_err(|error| anyhow::anyhow!(error))?;
+
     // A [proxy] table the edge would refuse is refused here, before
     // anything is bound.
 
@@ -3605,8 +3610,9 @@ impl Daemon {
             &subject,
             "info",
             &format!(
-                "{} workers ready in {:.1} s{}",
+                "{} worker{} ready in {:.1} s{}",
                 host_sockets,
+                if host_sockets == 1 { "" } else { "s" },
                 started.elapsed().as_secs_f64(),
                 if awaited.is_empty() {
                     String::new()
@@ -3915,6 +3921,18 @@ impl Daemon {
                         .store
                         .release(name, id)
                         .map(|release| release.spec.grpc_web_origins)
+                        .unwrap_or_default(),
+                    static_dirs: self
+                        .store
+                        .release(name, id)
+                        .map(|release| {
+                            release
+                                .spec
+                                .static_dirs
+                                .iter()
+                                .map(crate::model::StaticSpec::message)
+                                .collect()
+                        })
                         .unwrap_or_default(),
                     groups: running
                         .groups

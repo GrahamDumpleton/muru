@@ -328,7 +328,11 @@ names = ['extra.test']
     assert "exactly one of file, template and path" in refused(
         "error_pages = { 404 = { template = 'x', path = '/x' } }"
     )
-    assert "file must be an absolute path here" in refused(
+
+    # A relative file is taken from the applied file's directory, where
+    # this one does not exist.
+
+    assert f"{tmp_path / 'pages' / '404.html'} is not a file" in refused(
         "error_pages = { 404 = { file = 'pages/404.html' } }"
     )
 

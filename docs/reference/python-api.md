@@ -20,8 +20,8 @@ runs:
 
 | Field | Value |
 | --- | --- |
-| `app` | The application name: the top-level module of the entrypoint, so `shop.wsgi:application` is `shop` |
-| `release` | The release identifier; `dev` in development mode |
+| `app` | The application name as `muructl deploy` gave it; under `muructl run` the name the terminal and the commands use, the entrypoint's top-level module with underscores as hyphens, so `shop_site.wsgi:application` is `shop-site` |
+| `release` | The release identifier; under `muructl run` the one the terminal names, `r1`, then `r2` after a reload |
 | `group` | The worker group; `default` until worker groups arrive |
 | `worker_id` | The worker's index from 0, or `None` in the host (and outside Muru) |
 | `interface` | `wsgi`, `asgi` or `grpc`, detected from the callable or declared with `--interface` |

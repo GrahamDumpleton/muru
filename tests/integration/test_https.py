@@ -232,3 +232,32 @@ def test_mkcert_authority_issues_the_certificate(tmp_path: Path) -> None:
         assert f"issued by the mkcert authority in {root}" in instance.log()
     finally:
         instance.stop()
+
+
+def test_certificate_paths_are_relative_to_the_project(
+    server: support.Server, cache: Path, no_authority: dict[str, str], tmp_path: Path
+) -> None:
+    """--tls-cert and --tls-key are read from the project, as --chdir makes
+    every other path, not from where muructl runs."""
+
+    project = tmp_path / "site"
+    (project / "certs").mkdir(parents=True)
+    shutil.copy(certificate(cache), project / "certs" / "dev.pem")
+    shutil.copy(cache / "certs" / "dev-key.pem", project / "certs" / "dev-key.pem")
+    (project / "app.py").write_text(
+        "def application(environ, start_response):\n"
+        '    start_response("200 OK", [("Content-Type", "text/plain")])\n'
+        '    return [b"ok"]\n'
+    )
+    relative = support.start(
+        "app:application",
+        chdir=project,
+        args=["--tls-cert", "certs/dev.pem", "--tls-key", "certs/dev-key.pem"],
+        env={"MURU_CACHE_DIR": str(cache), **no_authority},
+        https=True,
+    )
+
+    try:
+        assert relative.request_tls("GET", "/", certificate(cache)).status == 200
+    finally:
+        relative.stop()

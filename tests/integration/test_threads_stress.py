@@ -65,6 +65,11 @@ def test_thread_locals_belong_to_their_threads(server: support.Server) -> None:
     assert 1 < len(threads) <= THREADS
     assert max(entry["count"] for entry in seen) >= 400 // THREADS
 
+    # The runtime's threads carry its names in Python too, rather than
+    # the Dummy-N that threading gives a thread it did not start.
+
+    assert all(entry["name"].startswith("muru-app-") for entry in seen), seen[0]["name"]
+
 
 def test_threads_run_in_parallel(server: support.Server) -> None:
     # 64 requests of 0.1 s on 32 threads take about 0.2 s in parallel and

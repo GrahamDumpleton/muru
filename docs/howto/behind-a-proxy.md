@@ -26,6 +26,17 @@ Nothing is trusted by default. A forwarding header from a peer that is
 not trusted is removed before the request reaches the application, so a
 client cannot claim another address by sending X-Forwarded-For itself.
 
+`muructl run` is the exception: it trusts loopback peers for every header
+type but `x-real-ip`, with nothing to configure, since it serves loopback
+and a forwarding header can only come from a proxy on the same machine.
+So an application behind jupyter-server-proxy, code-server or another
+development proxy that mounts it under a path gets `SCRIPT_NAME` (or
+`root_path`) from X-Forwarded-Prefix as it is. The same holds with
+`--allow-public`, for loopback peers only. Their headers are all it
+trusts: a loopback peer is as often a browser as a proxy, so it keeps a
+client's share of connections and keep-alive timeout rather than a
+proxy's.
+
 `trusted` lists addresses, CIDR ranges (IPv4 or IPv6), or the words
 `loopback`, `private` (RFC 1918, unique local and link-local addresses)
 and `unix`. `headers` lists the header types to apply from a trusted

@@ -446,6 +446,18 @@ impl Metrics {
             .or_default() -= 1;
     }
 
+    /// Requests taken and not yet answered, across every release: what
+    /// `muru_requests_in_flight` sums to. A WebSocket counts until the
+    /// application accepts it, then is open rather than in flight.
+    pub fn in_flight(&self) -> usize {
+        let inner = self.inner.lock().expect("metrics poisoned");
+        inner
+            .in_flight
+            .values()
+            .map(|count| usize::try_from(*count).unwrap_or(0))
+            .sum()
+    }
+
     /// Count a completed request and observe its timings. The queue and
     /// application times are observed only when a worker served it.
     pub fn observe(&self, record: &Record) {

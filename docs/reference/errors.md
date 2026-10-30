@@ -40,6 +40,8 @@ precisely than the status, appears in the access log line as
 | 503 | `mount_not_loaded` | The worker the request reached does not serve the request's mount, which a [worker group's `mounts` list](../howto/worker-groups.md#mounts-a-group-serves) left out |
 | 504 | `deadline` | The application or upstream did not produce a response head within the request deadline |
 | 504 | `soft_timeout` | The request ran past the soft timeout and was interrupted in the worker before it produced a response head; development mode includes the traceback of where it was (see the [timeouts guide](../howto/timeouts.md)) |
+| 504 | `hard_timeout` | The request ran past the hard timeout, so its worker is being replaced; the request is answered when the worker is condemned, since it cannot finish (see the [timeouts guide](../howto/timeouts.md)) |
+| 502 | `worker_stalled` | The worker's event loop or interpreter stalled past the loop stall or GIL stall timeout, or the worker stopped reporting for that long, so it is being replaced and every request it held is answered now (see the [timeouts guide](../howto/timeouts.md)) |
 | 507 | `upload_spool_full` | Storing an [upload](../howto/uploads.md) would take its application past the route's `spool_quota`, or every application past the daemon's, or the spool's disk is full |
 | any | `error_override` | The application's own response had a status that `error_override` lists, and the edge replaced it with the error page; the status is the application's |
 

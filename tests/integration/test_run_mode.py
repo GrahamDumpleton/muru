@@ -95,3 +95,48 @@ def test_allow_public_turns_development_behaviours_off() -> None:
     finally:
         process.terminate()
         process.wait(timeout=20)
+
+
+def test_loopback_proxies_are_trusted() -> None:
+    """A forwarding header from a loopback peer is applied, X-Forwarded-Prefix
+    included, so a development proxy that mounts the application under a
+    path sets SCRIPT_NAME with nothing configured."""
+
+    server = support.start("plain_wsgi:application", workers=1)
+    headers = {
+        "X-Forwarded-For": "203.0.113.5",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Prefix": "/proxy/8080",
+        "X-Real-IP": "198.51.100.9",
+    }
+
+    try:
+        response = server.get("/info", headers=headers)
+        assert response.status == 200, response.body
+        environ = json.loads(response.body)["environ"]
+        assert environ["REMOTE_ADDR"] == "203.0.113.5"
+        assert environ["muru.proxy_addr"] == "127.0.0.1"
+        assert environ["wsgi.url_scheme"] == "https"
+        assert environ["SCRIPT_NAME"] == "/proxy/8080"
+        assert environ["PATH_INFO"] == "/info"
+
+        # The applied headers stay for the application; X-Real-IP is not
+        # among the trusted types and goes.
+
+        assert environ["HTTP_X_FORWARDED_PREFIX"] == "/proxy/8080"
+        assert "HTTP_X_REAL_IP" not in environ
+    finally:
+        server.stop()
+
+    server = support.start("plain_asgi:application", workers=1)
+
+    try:
+        response = server.get("/info", headers=headers)
+        assert response.status == 200, response.body
+        scope = json.loads(response.body)["scope"]
+        assert scope["client"] == ["203.0.113.5", 0]
+        assert scope["scheme"] == "https"
+        assert scope["root_path"] == "/proxy/8080"
+        assert scope["path"] == "/proxy/8080/info"
+    finally:
+        server.stop()

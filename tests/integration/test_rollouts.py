@@ -308,3 +308,22 @@ def test_rollouts_pause_resume_approve_promote_and_abort(daemon: Daemon, tmp_pat
     ]:
         refused = daemon.muructl("rollout", "canary", *arguments, check=False)
         assert refused.returncode != 0 and complaint in refused.stderr, refused.stderr
+
+
+def test_a_held_release_previews_without_a_route(daemon: Daemon) -> None:
+    """With no host declared, a preview still reaches a held release of
+    the default application, before any rollout starts."""
+
+    daemon.deploy("shop", SHOP)
+    daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
+
+    def release(**headers: str) -> str:
+        response = daemon.request("/", headers=headers)
+        assert response.status == 200, response.body
+        served: str = json.loads(response.body)["release"]
+        return served
+
+    assert {release(Cookie=f"muru_id=default-{n}") for n in range(20)} == {"r1"}
+    assert release(**{"Muru-Preview": "r2"}) == "r2"
+    assert release(Cookie="muru_preview=r2") == "r2"
+    assert release() == "r1"

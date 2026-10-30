@@ -25,8 +25,13 @@ muructl run app:create_app --factory
 ```
 
 The factory is called in each worker after the fork, so a database pool or
-cache client it creates belongs to that worker. Flask's own development
-server is not involved; `flask run` and `muructl run` are alternatives.
+cache client it creates belongs to that worker. Without `--factory`, the
+factory itself would be served and fail on every request, so Muru refuses
+to start, since a callable taking no required arguments cannot be an
+application. The `factory` key of the `[tool.muru]` table applies to the
+table's own entrypoint only; an entrypoint named on the command line needs
+`--factory`. Flask's own development server is not involved; `flask run`
+and `muructl run` are alternatives.
 
 Flask catches an exception a view raises, logs it through its logger,
 which goes to standard error and so appears in the terminal tagged with
@@ -62,11 +67,43 @@ when `DEBUG = True` and its `handler500` view otherwise. Setting
 `DEBUG_PROPAGATE_EXCEPTIONS = True` lets the exception reach Muru, which
 answers with its own error page and records `reason=app_error`.
 
-Static files: Django does not serve them in production. Under the
-daemon, a [static route](static-files.md) serves `STATIC_ROOT` after
-`collectstatic`. In development, `DEBUG = True` with
-`django.contrib.staticfiles` serves them from the application as usual,
-or use WhiteNoise.
+Static files: Django serves them only under `runserver`, so under Muru a
+request for one reaches the application and finds no URL. The edge can
+serve them instead, in development and production alike, from the
+directory `collectstatic` fills, declared in the project (see the
+[static files guide](static-files.md#an-applications-own-files)):
+
+```toml
+[[tool.muru.static]]
+path = '/static/'
+dir = 'static'
+```
+
+Or, in development, add Django's static file patterns to the URLs,
+which serve them while `DEBUG = True` from each application's own
+`static` directory, with no `collectstatic`, and add nothing otherwise:
+
+```python
+from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+
+urlpatterns += staticfiles_urlpatterns()
+```
+
+Under the daemon, the project's entry serves `STATIC_ROOT` after
+`collectstatic`, as a [static route](static-files.md) at the site level
+would, or use WhiteNoise. The
+[Django tutorial](../tutorials/first-django-site.md) uses the URL
+patterns in development and the project's entry in production.
+
+Flask serves its package's `static` folder itself under any server.
+Declaring it in the project hands those requests to the edge instead,
+with the same `url_for('static', ...)` paths:
+
+```toml
+[[tool.muru.static]]
+path = '/static/'
+dir = 'shop/static'
+```
 
 ## Both
 
@@ -81,7 +118,11 @@ or use WhiteNoise.
 
 - `--reload` restarts on changes to any `.py` file under the project; the
   first request after a change waits for the new workers rather than
-  failing.
+  failing. `--reload-include '**/*.html'` adds templates to what is
+  watched, and `--reload-exclude` takes files out of it; an exclude wins,
+  so `--reload-exclude '**/*.py'` watches the included patterns alone.
+  Virtualenvs, `__pycache__`, `.git`, editor files and what `.gitignore`
+  names are never watched, and the start-up line says what is.
 - `--https` gives the browser a TLS connection, which is needed to test
   `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE` and `SECURE_SSL_REDIRECT`
   in Django, or `SESSION_COOKIE_SECURE` in Flask. Do not turn on HSTS in

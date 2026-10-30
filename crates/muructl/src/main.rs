@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod pstats;
+mod run_admin;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -28,10 +29,14 @@ use crate::watch::Watch;
 use muru_controller::host::{HostProcess, HostSpec};
 use muru_controller::logs::Logs;
 
+use crate::run_admin::{HostLink, RunState, SharedHostLink};
+
 /// How long a host may take to get its workers listening.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the watcher looks for changes.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// What --reload watches by default; --reload-include adds to it.
+const RELOAD_INCLUDE: &str = "**/*.py";
 /// How long changes must have stopped before a reload starts.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -290,6 +295,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         sockets: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
+        static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
         sendfile: Arc::default(),
@@ -299,6 +305,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         access_log,
         limits: muru_edge::Limits::default(),
         compression: compression.clone(),
+        trust: muru_edge::proxy::Trust::loopback(),
         https: None,
         spool: None,
         rate_buckets: None,
@@ -494,11 +501,11 @@ struct RunArgs {
     https_port: Option<Port>,
 
     /// Certificate chain to serve, PEM, instead of a development
-    /// certificate. Implies --https.
+    /// certificate; a relative path is the project's. Implies --https.
     #[arg(long, value_name = "FILE", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
 
-    /// Private key for --tls-cert, PEM.
+    /// Private key for --tls-cert, PEM; a relative path is the project's.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 
@@ -518,27 +525,36 @@ struct RunArgs {
     #[arg(long)]
     single: bool,
 
+    /// A directory of the application's own files the edge serves under
+    /// a path prefix, as PREFIX=DIR with DIR relative to the project,
+    /// over the [[tool.muru.static]] entries by prefix. Repeatable.
+    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = parse_static_setting)]
+    static_dirs: Vec<(String, String)>,
+
     /// Start a new release when a watched source file changes.
     #[arg(long)]
     reload: bool,
 
-    /// Directory to watch for changes; defaults to --chdir or the current
-    /// directory. Repeatable.
+    /// Directory to watch for changes, relative to the project; defaults
+    /// to the project itself. Repeatable.
     #[arg(long = "reload-dir", value_name = "DIR")]
     reload_dir: Vec<PathBuf>,
 
-    /// Files that count as source, relative to a watched directory.
-    /// Repeatable; the default is `**/*.py`.
+    /// Files that count as source besides `**/*.py`, relative to a
+    /// watched directory, such as `**/*.html`. Repeatable.
     #[arg(long = "reload-include", value_name = "GLOB")]
     reload_include: Vec<String>,
 
-    /// Files that never trigger a reload. Repeatable.
+    /// Files that never trigger a reload, besides editor files; an
+    /// exclude wins over an include, so `**/*.py` here watches the
+    /// included patterns alone. Virtualenvs, `__pycache__`, `.git` and
+    /// what `.gitignore` names are never watched. Repeatable.
     #[arg(long = "reload-exclude", value_name = "GLOB")]
     reload_exclude: Vec<String>,
 
-    /// Python interpreter with the muru runtime library installed.
-    /// Defaults to the active virtualenv's interpreter, else the project's
-    /// .venv, else python3 on PATH.
+    /// Python interpreter with the muru runtime library installed; a
+    /// relative path is the project's. Defaults to the active virtualenv's
+    /// interpreter, else the project's .venv, else python3 on PATH.
     #[arg(long)]
     python: Option<PathBuf>,
 
@@ -876,6 +892,20 @@ pub(crate) fn apply_timeouts(limits: &mut muru_edge::Limits, timeouts: &[(String
             _ => {}
         }
     }
+}
+
+/// Parse PREFIX=DIR for --static: a path prefix below / and a directory.
+pub(crate) fn parse_static_setting(text: &str) -> Result<(String, String), String> {
+    let (prefix, directory) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not PREFIX=DIR, for example /static/=static"))?;
+    let entry = muru_config::StaticDir {
+        path: prefix.trim().to_owned(),
+        dir: directory.trim().to_owned(),
+        ..Default::default()
+    };
+    muru_config::check_static(std::slice::from_ref(&entry))?;
+    Ok((entry.path, entry.dir))
 }
 
 /// Parse KEY=VALUE for --memory, checking the key and the value's form.
@@ -1245,6 +1275,9 @@ struct Resolved {
     /// Section 4.9: the default mount's file hints by path from the table.
     sendfile_roots: Vec<String>,
     sendfile_header: Option<String>,
+    /// Section 4.9: the application's own directories of files, the
+    /// table's with the flags' over them by prefix.
+    static_dirs: Vec<muru_config::StaticDir>,
     /// Section 4.12: the error pages, override and maintenance
     /// exemptions from the table.
     error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
@@ -1352,6 +1385,23 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
     }
 
+    // Section 4.9: the table's static directories, a flag replacing the
+    // entry with its prefix or adding one.
+
+    muru_config::check_static(&table.static_dirs)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    let mut static_dirs = table.static_dirs.clone();
+
+    for (prefix, directory) in &args.static_dirs {
+        let key = muru_edge::routing::group_prefix(prefix);
+        static_dirs.retain(|entry| muru_edge::routing::group_prefix(&entry.path) != key);
+        static_dirs.push(muru_config::StaticDir {
+            path: prefix.clone(),
+            dir: directory.clone(),
+            ..Default::default()
+        });
+    }
+
     Ok(Resolved {
         entrypoint,
         interface: args
@@ -1387,6 +1437,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         cgi_local_redirect: table.cgi_local_redirect.unwrap_or(false),
         sendfile_roots: table.sendfile_roots,
         sendfile_header: table.sendfile_header,
+        static_dirs,
         error_pages: table.error_pages,
         error_override: table.error_override,
         maintenance: table.maintenance,
@@ -1446,11 +1497,10 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         reflection: resolved.reflection.then_some(true),
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
-        python: Some(
-            python_interpreter(args.python.clone(), &resolved.project)
-                .display()
-                .to_string(),
-        ),
+        python: Some(written_interpreter(
+            &python_interpreter(args.python.clone(), &resolved.project),
+            &resolved.project,
+        )),
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
         sync_threads: Some(resolved.sync_threads),
@@ -1463,6 +1513,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         cgi_local_redirect: resolved.cgi_local_redirect.then_some(true),
         sendfile_roots: resolved.sendfile_roots.clone(),
         sendfile_header: resolved.sendfile_header.clone(),
+        static_dirs: resolved.static_dirs.clone(),
         error_pages: resolved.error_pages.clone(),
         error_override: resolved.error_override.clone(),
         maintenance: resolved.maintenance.clone(),
@@ -1698,6 +1749,58 @@ fn mount_serves(mount: &muru_config::Mount) -> String {
 
 /// The named mounts as the edge selects them, with their redirect
 /// settings (section 4.10), the release's where a mount is silent.
+/// The application's own directories of files as the edge serves them
+/// (section 4.9), each under the project when relative and checked to
+/// be a directory.
+fn static_paths(resolved: &Resolved) -> anyhow::Result<Vec<muru_edge::routing::StaticPath>> {
+    resolved
+        .static_dirs
+        .iter()
+        .map(|entry| {
+            let directory = if Path::new(&entry.dir).is_absolute() {
+                PathBuf::from(&entry.dir)
+            } else {
+                resolved.project.join(&entry.dir)
+            };
+            anyhow::ensure!(
+                directory.is_dir(),
+                "static {}: {} is not a directory",
+                entry.path,
+                directory.display()
+            );
+            let cache = entry.cache.as_ref();
+            let max_age = cache
+                .and_then(|cache| cache.max_age.as_deref())
+                .map(|text| {
+                    muru_config::parse_duration(text)
+                        .map(|duration| duration.as_secs())
+                        .map_err(|error| {
+                            anyhow::anyhow!("static {}: cache.max_age: {error}", entry.path)
+                        })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let except = cache.map(|cache| cache.except.clone()).unwrap_or_default();
+            let route =
+                muru_edge::static_files::StaticRoute::new(&muru_edge::static_files::Settings {
+                    directory: &directory.display().to_string(),
+                    index: &entry.index,
+                    fallback_file: entry.fallback.as_deref().unwrap_or_default(),
+                    cache_max_age_s: max_age,
+                    cache_immutable: cache.and_then(|cache| cache.immutable).unwrap_or(false),
+                    cache_except: &except,
+                    no_redirect_slash: entry.redirect_slash == Some(false),
+                    case_insensitive: entry.case.as_deref() == Some("insensitive"),
+                })
+                .map_err(|error| anyhow::anyhow!("static {}: {error}", entry.path))?;
+            Ok(muru_edge::routing::StaticPath {
+                prefix: muru_edge::routing::group_prefix(&entry.path),
+                route: Arc::new(route),
+            })
+        })
+        .collect()
+}
+
 fn mount_paths(resolved: &Resolved) -> Vec<muru_edge::routing::MountPath> {
     resolved
         .mounts
@@ -1747,14 +1850,17 @@ struct Tls {
 }
 
 /// The HTTPS listener for --https, --https-only or --tls-cert (section 13.1).
-fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
+/// A relative certificate or key path is the project's, as --chdir makes
+/// every other path.
+fn tls(args: &RunArgs, project: &Path) -> anyhow::Result<Option<Tls>> {
     if !(args.https || args.https_only || args.tls_cert.is_some()) {
         return Ok(None);
     }
 
     let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
         (Some(certificate), Some(key)) => {
-            let (chain, key) = muru_edge::tls::load_pem_files(certificate, key)?;
+            let (chain, key) =
+                muru_edge::tls::load_pem_files(&project.join(certificate), &project.join(key))?;
             (chain, key, None)
         }
         _ => {
@@ -1777,10 +1883,18 @@ fn tls(args: &RunArgs) -> anyhow::Result<Option<Tls>> {
 
 /// The interpreter to run the host with (section 13.1): --python, else the
 /// active virtualenv, else the project's own .venv, else python3 on PATH. A
-/// path is made absolute, because a virtualenv's interpreter locates its
+/// relative --python with a directory in it is the project's; a path is
+/// made absolute, because a virtualenv's interpreter locates its
 /// site-packages from its own path.
 fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
     let python = explicit
+        .map(|python| {
+            if python.components().count() > 1 {
+                project.join(python)
+            } else {
+                python
+            }
+        })
         .or_else(|| {
             std::env::var_os("VIRTUAL_ENV")
                 .map(|venv| PathBuf::from(venv).join("bin").join("python"))
@@ -1802,6 +1916,20 @@ fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
             }
         }
         _ => python,
+    }
+}
+
+/// An interpreter as --print-config writes it: relative to the project
+/// when it is inside it (the project's own .venv), so the file works in
+/// another checkout of the project, else absolute.
+fn written_interpreter(python: &Path, project: &Path) -> String {
+    let project = project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf());
+
+    match python.strip_prefix(&project) {
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => python.display().to_string(),
     }
 }
 
@@ -1857,17 +1985,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // Certificates are sorted out before anything is started, so a bad
     // --tls-cert or an unwritable cache fails with nothing to clean up.
 
-    let tls = tls(&args)?;
+    let tls = tls(&args, &resolved.project)?;
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&args);
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
+
+    // The application's name, as the edge labels it and muru.context()
+    // reports it, so a command the log names works as it is.
+
+    let label = app_name(&resolved.entrypoint).replace('_', "-");
     let spec = HostSpec {
         python: python_interpreter(args.python.clone(), &resolved.project),
         app: resolved.entrypoint.clone(),
-        name: None,
+        name: Some(label.clone()),
         release: None,
         interface: resolved.interface,
         factory: resolved.factory,
@@ -1953,6 +2086,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         resolved.sendfile_header.as_deref().unwrap_or_default(),
     );
 
+    // Section 4.9: the application's own directories of files, under
+    // the project, each checked to exist before anything starts.
+
+    let static_paths = static_paths(&resolved)?;
+
     // Section 4.12: the project's error pages, with files under it.
 
     muru_config::check_error_pages(&resolved.error_pages, true)
@@ -1986,11 +2124,18 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         return Err(error);
     }
 
-    let (mut control, mut host_messages) = host_control(&current).await;
+    let (control, mut host_messages) = host_control(&current).await;
+
+    // Section 11.7: the host's control connection is shared with the
+    // admin socket, which asks the workers things through it.
+
+    let host_link: SharedHostLink = Arc::new(std::sync::Mutex::new(HostLink::default()));
+    host_link
+        .lock()
+        .expect("host link poisoned")
+        .attach(control);
 
     let (http_address, https_address) = addresses(&args);
-
-    let label = app_name(&resolved.entrypoint).replace('_', "-");
 
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
@@ -1999,6 +2144,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         sockets: current.default_sockets(),
         groups: group_sockets(&current, &resolved.groups),
         mounts: mounts.clone(),
+        static_dirs: static_paths.clone(),
         accel_redirect: resolved.accel_redirect,
         cgi_local_redirect: resolved.cgi_local_redirect,
         sendfile: Arc::clone(&sendfile),
@@ -2012,6 +2158,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         } else {
             muru_edge::compression::Compression::default()
         },
+        // Section 13.1: a development run listens on loopback, so a
+        // forwarding header can only come from a proxy on this machine,
+        // which is trusted without setup.
+        trust: muru_edge::proxy::Trust::loopback(),
         https: tls.as_ref().map(|tls| tls.https.clone()),
         spool: None,
         rate_buckets: None,
@@ -2079,6 +2229,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         println!("muru: mount {name} {}", mount_serves(mount));
     }
 
+    for entry in &static_paths {
+        println!(
+            "muru: static {}/ from {}",
+            entry.prefix.trim_end_matches('/'),
+            entry.route.directory.display()
+        );
+    }
+
     if development {
         println!(
             "muru: development mode: error pages show tracebacks, nothing is persisted and only \
@@ -2108,12 +2266,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    let mut dashboard_address = None;
+
     if let Some(address) = dashboard {
         match dashboard::start(
             &address,
             dashboard::Inputs {
                 development,
                 app: resolved.entrypoint.clone(),
+                label: label.clone(),
+                host: Arc::clone(&host_link),
                 listen: edge.local_addr(),
                 https: edge.https_addr(),
                 started: std::time::Instant::now(),
@@ -2126,8 +2288,66 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(address) => println!("muru: dashboard on http://{address}/"),
+            Ok(address) => {
+                println!("muru: dashboard on http://{address}/");
+                dashboard_address = Some(address);
+            }
             Err(error) => println!("muru: no dashboard: {error:#}"),
+        }
+    }
+
+    // Section 13.1: the admin socket, in the user runtime directory so
+    // nothing is written into the project, named by the port so two runs
+    // never share one; muructl finds it from the file beside it.
+
+    let (admin_stop_tx, admin_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let runtime = muru_controller::locations::Locations::resolve(&Default::default())
+        .run
+        .path;
+    let project = resolved
+        .project
+        .canonicalize()
+        .unwrap_or_else(|_| resolved.project.clone());
+    let registration =
+        match run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project) {
+            Ok(registration) => Some(registration),
+            Err(error) => {
+                println!("muru: no admin socket: {error:#}");
+                None
+            }
+        };
+
+    if let Some(registration) = &registration {
+        let mut listeners = vec![format!("http://{}", edge.local_addr())];
+
+        if let Some(https) = edge.https_addr() {
+            listeners.push(format!("https://{https}"));
+        }
+
+        let state = Arc::new(RunState {
+            app: label.clone(),
+            release: Arc::clone(&release_number),
+            project,
+            run_dir: run_dir.clone(),
+            socket: registration.socket.clone(),
+            listeners,
+            dashboard: dashboard_address,
+            started_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64),
+            pools: edge.pools(),
+            connections: edge.connections(),
+            access_log: edge.access_log(),
+            logs: logs.clone(),
+            host: Arc::clone(&host_link),
+        });
+
+        match run_admin::serve(state, admin_stop_rx).await {
+            Ok(serving) => {
+                println!("muru: admin socket {}", registration.socket.display());
+                tokio::spawn(serving);
+            }
+            Err(error) => println!("muru: no admin socket: {error:#}"),
         }
     }
 
@@ -2137,27 +2357,39 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let directories = if args.reload_dir.is_empty() {
             vec![resolved.project.clone()]
         } else {
-            args.reload_dir.clone()
+            args.reload_dir
+                .iter()
+                .map(|directory| resolved.project.join(directory))
+                .collect()
         };
         let directories: Vec<PathBuf> = directories
             .into_iter()
             .map(|directory| directory.canonicalize().unwrap_or(directory))
             .collect();
 
-        let include = if args.reload_include.is_empty() {
-            vec!["**/*.py".to_owned()]
-        } else {
-            args.reload_include.clone()
-        };
+        // Includes add to the default and excludes win over includes, so
+        // a run that watches templates alone excludes **/*.py rather
+        // than losing it by naming a pattern.
+
+        let mut include = vec![RELOAD_INCLUDE.to_owned()];
+        include.extend(args.reload_include.iter().cloned());
         let watch = Watch::new(directories, &include, &args.reload_exclude)?;
+
+        let except = if args.reload_exclude.is_empty() {
+            String::new()
+        } else {
+            format!(", except {}", args.reload_exclude.join(", "))
+        };
+
         println!(
-            "muru: watching {} for changes",
+            "muru: watching {} for changes to {}{except}",
             watch
                 .directories()
                 .iter()
                 .map(|directory| directory.display().to_string())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            include.join(", ")
         );
         tokio::spawn(watch.run(WATCH_INTERVAL, changed_tx));
     } else {
@@ -2203,15 +2435,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 .with_errors(Arc::clone(&error_policy))
                                 .with_sendfile(Arc::clone(&sendfile))
                                 .with_grpc_web(&resolved.grpc_web_origins)
+                                .with_static_dirs(static_paths.clone())
                         });
 
                         match connected {
                             Ok(connected) => {
                                 pools.replace(connected);
-
-                                if let Some(control) = &control {
-                                    control.acknowledge(version);
-                                }
+                                host_link.lock().expect("host link poisoned").acknowledge(version);
                             }
                             Err(error) => {
                                 println!("muru: the workers could not be reconnected: {error:#}");
@@ -2221,8 +2451,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     muru_controller::host::HostMessage::Event { kind, message, .. } => {
                         println!("muru: {kind}: {message}");
                     }
-                    muru_controller::host::HostMessage::Status { .. }
-                    | muru_controller::host::HostMessage::Response { .. } => {}
+                    muru_controller::host::HostMessage::Response { id, workers, error } => {
+                        host_link.lock().expect("host link poisoned").answer(id, workers, error);
+                    }
+                    muru_controller::host::HostMessage::Status { .. } => {}
                 }
             }
             Some(path) = changed.recv() => {
@@ -2236,7 +2468,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
-                            println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                            println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                             break;
                         }
                     };
@@ -2258,12 +2490,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                         .with_errors(Arc::clone(&error_policy))
                                         .with_sendfile(Arc::clone(&sendfile))
                                         .with_grpc_web(&resolved.grpc_web_origins)
+                                .with_static_dirs(static_paths.clone())
                                 });
 
                                 match connected {
                                     Ok(connected) => pools.replace(connected),
                                     Err(error) => {
-                                        println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                        println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                         next.stop(stop_budget).await;
                                         break;
                                     }
@@ -2273,11 +2506,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop(stop_budget));
-                                (control, host_messages) = host_control(&current).await;
+                                let (control, messages) = host_control(&current).await;
+                                host_link.lock().expect("host link poisoned").attach(control);
+                                host_messages = messages;
                                 break;
                             }
                             Err(error) => {
-                                println!("muru: reload failed: {error:#}; release r{} keeps serving", current.release);
+                                println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                 next.stop(stop_budget).await;
                                 break;
                             }
@@ -2303,6 +2538,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     drainer.drain(stop_budget).await;
     current.stop(stop_budget).await;
+    let _ = admin_stop_tx.send(());
+    drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);
     outcome
 }

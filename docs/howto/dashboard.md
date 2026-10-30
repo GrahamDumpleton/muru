@@ -19,7 +19,13 @@ running release's workers with their status, stacks, tasks and memory.
 workers, requests per second and latency over the last minute, the
 WebSockets open, charts of requests, errors, latency and what is open
 over time, recent requests and the host's and workers' output, refreshed every two seconds, with no
-sign-in. `--dashboard ADDRESS` moves it to another loopback address and
+sign-in. The In flight tile counts requests not yet answered, as the
+`muru_requests_in_flight` metric does, with the WebSockets open in the
+tile beside it; a worker's busy slots in the table below include a
+WebSocket holding one. The Workers link opens the pages the daemon's
+dashboard has for [looking into the workers](#looking-into-the-workers):
+each worker's status, stacks, tasks and memory, read through the run's
+admin socket, without the restart actions. `--dashboard ADDRESS` moves it to another loopback address and
 `--dashboard off` turns it off; with `--allow-public` it is off unless
 asked for. `/metrics` on the same address is the Prometheus exposition
 the [metrics guide](metrics.md) describes.

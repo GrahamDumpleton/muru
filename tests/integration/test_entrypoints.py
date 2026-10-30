@@ -160,3 +160,35 @@ def test_missing_entrypoint_is_a_clear_error(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError) as failure:
         support.start(chdir=tmp_path, workers=None, threads=None)
     assert "workers" in str(failure.value), "an unknown key is named"
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "args", "message"),
+    [
+        ("factory_site:create_app", [], "takes no required arguments"),
+        ("factory_site:create_app_with_config", [], "set factory = true"),
+        ("factory_site:three_args", [], "as an ASGI application does, but is not a coroutine"),
+        ("factory_site:wsgi_app", ["--interface", "asgi"], "declared ASGI but takes 2 arguments"),
+        ("factory_site:three_args", ["--interface", "wsgi"], "declared WSGI but takes 3 arguments"),
+        ("factory_site:keyword_only", [], "required keyword-only parameter 'extra'"),
+    ],
+)
+def test_a_callable_that_cannot_take_the_interfaces_arguments_is_refused(
+    entrypoint: str, args: list[str], message: str
+) -> None:
+    """The first is a factory named without --factory: the table's factory =
+    true applies to the table's own entrypoint, not to one given here."""
+
+    with pytest.raises(RuntimeError) as failure:
+        support.start(entrypoint, chdir=PROJECTS / "factory", args=args)
+
+    assert message in str(failure.value), str(failure.value)
+
+
+def test_a_callable_taking_any_arguments_is_served_as_it_is() -> None:
+    server = support.start("factory_site:star_args", chdir=PROJECTS / "factory")
+
+    try:
+        assert server.get("/").body == b"wsgi\n"
+    finally:
+        server.stop()
