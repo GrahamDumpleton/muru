@@ -642,15 +642,17 @@ pub enum DebugCommand {
     /// --diff since a snapshot kept with --snapshot.
     Memory(MemoryArgs),
 
-    /// Run Python code in the workers and print its output and value;
-    /// allowed only when the daemon's [daemon] table sets debug_exec.
+    /// Run Python code in the workers and print its output and value.
+    /// Allowed as it is under muructl run; under the daemon, only when
+    /// its [daemon] table sets debug_exec.
     Exec(ExecArgs),
 
     /// Open a pdb session in a worker: on the thread stopped at
     /// breakpoint(), else on a thread of its own. Each line read is a pdb
     /// command, and the end of input lets the code go on. Without
-    /// --worker, the first worker with a breakpoint waiting. Allowed only
-    /// when the daemon's [daemon] table sets debug_exec.
+    /// --worker, the first worker with a breakpoint waiting. Allowed as it
+    /// is under muructl run; under the daemon, only when its [daemon]
+    /// table sets debug_exec.
     Attach(AttachArgs),
 }
 
