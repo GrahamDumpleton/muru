@@ -267,6 +267,11 @@ def test_a_subreaper_sees_orphaned_grandchildren_as_its_children() -> None:
         """
     )
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(host.__file__).resolve().parents[1])},
     )
+    assert result.returncode == 0, result.stderr
     assert result.stdout.split() == ["adopted", "True", "collected", "True", "gone", "True"]

@@ -39,7 +39,13 @@ pub fn become_init() {
     // rather than lost, and sigwaitinfo below is how they are taken. The
     // child restores the mask it would have had.
 
+    // SAFETY: a signal set is plain data for which all zeroes is a valid
+    // value, and sigemptyset fills it in below.
+
     let mut waited: libc::sigset_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY: as above; sigprocmask writes the current mask into it.
+
     let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
 
     // SAFETY: the sigset functions write only to the sets passed, which
@@ -94,6 +100,9 @@ pub fn become_init() {
 #[cfg(target_os = "linux")]
 fn supervise(child: libc::pid_t, waited: &libc::sigset_t) -> ! {
     loop {
+        // SAFETY: siginfo_t is plain data for which all zeroes is a valid
+        // value; sigwaitinfo fills it in.
+
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
 
         // SAFETY: the set is the one blocked above and info is owned here;
