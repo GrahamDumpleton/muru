@@ -1773,6 +1773,17 @@ fn command_mentions(pid: u32, path: &Path) -> bool {
     }
 }
 
+/// The index of the worker a link socket belongs to, from its name:
+/// `worker-N.sock`, or `worker-GROUP-N.sock` in a worker group.
+fn worker_index(socket: &str) -> Option<u32> {
+    let name = std::path::Path::new(socket).file_stem()?.to_str()?;
+    name.strip_prefix("worker-")?
+        .rsplit('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
 impl Daemon {
     /// Everything the dashboard shows (section 10.7): the node from the
     /// daemon's own facts, the releases from the store and the hosts,
@@ -4197,13 +4208,57 @@ impl Daemon {
         }
     }
 
-    /// Compile and push a snapshot.
+    /// Compile and push a snapshot. A worker the edge could not connect to
+    /// (section 5.1) is reported as an event and replaced at once, as
+    /// `muructl restart --force` would: the snapshot has been applied
+    /// without it, and a worker that accepts a connection and never
+    /// answers is not going to.
     async fn push_snapshot(&mut self) -> Result<(), String> {
         let snapshot = self.build_snapshot();
-        self.edge
+        let applied = self
+            .edge
             .apply(snapshot)
             .await
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| format!("{error:#}"))?;
+
+        for worker in applied.unreachable {
+            let subject = format!("{}@{}", worker.app, worker.release);
+            let index = worker_index(&worker.socket);
+            let whom = index.map_or_else(
+                || format!("the worker at {}", worker.socket),
+                |index| format!("worker {index}"),
+            );
+            let control = self
+                .running
+                .get(&(worker.app.clone(), worker.release.clone()))
+                .and_then(|running| running.control.as_ref());
+
+            let action = match (index, control) {
+                (Some(index), Some(control)) => {
+                    self.last_request += 1;
+                    control.request(
+                        self.last_request,
+                        "restart",
+                        Some(index),
+                        &serde_json::json!({ "force": true }),
+                    );
+                    "; it is being replaced"
+                }
+                _ => "",
+            };
+
+            self.events.emit(
+                "worker.unreachable",
+                &subject,
+                "warning",
+                &format!(
+                    "{whom} did not answer the edge ({}); the snapshot was applied without it{action}",
+                    worker.reason
+                ),
+            );
+        }
+
+        Ok(())
     }
 
     /// Section 9.5: with traffic already elsewhere, wait for the release's
