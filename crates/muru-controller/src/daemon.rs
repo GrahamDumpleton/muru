@@ -1461,6 +1461,40 @@ fn upload_message(route: &muru_config::Route) -> Option<pb::Upload> {
 }
 
 /// The directory a configuration file's relative paths start from.
+/// The tables of the daemon's file that `muructl daemon reload` applies
+/// to the edge (section 13.3), as the reload names them. The daemon
+/// guide lists the same tables, and an integration test holds the two
+/// to each other.
+const RELOADED_TABLES: &[&str] = &[
+    "[proxy]",
+    "[compression]",
+    "[error_pages]",
+    "[error_override]",
+    "[[client_class]]",
+    "[rate_limit]",
+];
+
+/// The tables of the daemon's file read only when the daemon starts, as
+/// the reload names them.
+const READ_AT_START: &[&str] = &[
+    "[[listener]]",
+    "[limits]",
+    "[metrics]",
+    "[dashboard] (apart from actions)",
+    "[[events.sink]]",
+    "[secrets.store.NAME]",
+    "[logs]",
+];
+
+/// Items as a sentence names them: "a, b and c".
+fn named_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 fn config_directory(path: &Path) -> PathBuf {
     path.parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
@@ -2103,8 +2137,8 @@ impl Daemon {
     }
 
     /// Section 13.3: re-read the configuration file for what can change
-    /// while running, which is the [proxy] table; listeners, limits, the
-    /// metrics listener and the event sinks are read at start.
+    /// while running, the tables of `RELOADED_TABLES` with the budget and
+    /// the dashboard's actions switch; `READ_AT_START` names the rest.
     async fn reload(&mut self) -> Result<String, String> {
         let path = self.locations.config.path.clone();
 
@@ -2170,15 +2204,17 @@ impl Daemon {
         }
 
         let message = format!(
-            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}, the budget is {}, and the dashboard's actions are {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the {} tables {}, the budget ([daemon.budget]) is {}, and [dashboard] actions are {}; {} are read at start",
             path.display(),
+            named_list(RELOADED_TABLES),
             if changed {
                 "changed and the edge has them"
             } else {
                 "are unchanged"
             },
             self.budget.describe(&self.budget_usage()),
-            if dashboard_actions { "on" } else { "off" }
+            if dashboard_actions { "on" } else { "off" },
+            named_list(READ_AT_START),
         );
         self.events
             .emit("config.reloaded", "daemon", "info", &message);

@@ -292,11 +292,7 @@ unchanged by an upgrade, so no unit restart is involved.
 `muructl daemon run` runs it in the foreground, for a service manager or
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
-daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
-configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
-and `[error_override]` tables, the [node's
-budget](scaling.md#the-nodes-budget) and the dashboard's `actions`
-switch. The [systemd
+daemon to exit. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's
@@ -310,3 +306,29 @@ and `muructl logs reopen` works with logrotate; the [logging
 guide](logging.md) has the details. The events `muructl events` shows are
 kept in the state store, and `[[events.sink]]` entries deliver them to
 webhooks; the [events guide](events.md) has the details.
+
+## Reloading the configuration
+
+`muructl daemon reload`, or SIGHUP, reads the daemon's configuration
+file again and applies what can change while the daemon runs:
+
+- the `[proxy]`, `[compression]`, `[error_pages]`, `[error_override]`,
+  `[[client_class]]` and `[rate_limit]` tables, which the edge is given
+  at once;
+
+- the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
+
+- the dashboard's `actions` switch, `[dashboard] actions`.
+
+The rest of the file is read when the daemon starts: the `[[listener]]`
+entries, the `[limits]`, `[metrics]` and `[dashboard]` tables (apart
+from `actions`), the `[[events.sink]]` entries, the `[secrets.store.NAME]`
+tables and the `[logs]` table. A change to those takes effect after
+`muructl daemon stop` and `muructl daemon start` (`systemctl restart
+muru` under systemd), which detaches from the hosts and the edge and
+takes them back, so it costs no request.
+
+The command prints what it applied and what is read at start, and the
+`config.reloaded` event records the same. A file the daemon cannot parse,
+or a table it refuses, leaves everything as it was and the command fails
+saying why.

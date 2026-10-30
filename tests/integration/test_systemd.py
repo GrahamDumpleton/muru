@@ -2,15 +2,16 @@
 
 The daemon reports readiness and stopping with sd_notify when
 NOTIFY_SOCKET names a socket, detaches on SIGTERM as `muructl daemon stop`
-does, re-reads the [proxy], [compression], [error_pages] and
-[error_override] tables on `muructl daemon reload` or SIGHUP, and
-`daemon stop --timeout` bounds the wait for it to exit.
+does, re-reads the configuration file on `muructl daemon reload` or
+SIGHUP for the tables the daemon guide lists, and `daemon stop --timeout`
+bounds the wait for it to exit.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -25,6 +26,22 @@ from support.daemon import SHOP, Daemon, daemon, start_daemon
 __all__ = ["daemon"]
 
 APPS = support.ROOT / "tests" / "fixtures" / "apps"
+DAEMON_GUIDE = support.ROOT / "docs" / "howto" / "daemon.md"
+
+
+def tables_named_in(text: str) -> set[str]:
+    """The configuration tables a text names, as `[table]` or `[[entry]]`."""
+
+    return set(re.findall(r"\[\[?[A-Za-z_.]+\]\]?", text))
+
+
+def reload_section_of_the_guide() -> str:
+    """The daemon guide's section on reloading, up to the next heading."""
+
+    text = DAEMON_GUIDE.read_text()
+    start = text.index("## Reloading the configuration")
+    end = text.find("\n## ", start + 1)
+    return text[start:] if end < 0 else text[start:end]
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
@@ -124,6 +141,12 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
 
         unchanged = daemon.muructl("daemon", "reload").stdout
         assert "[rate_limit] tables are unchanged" in unchanged, unchanged
+
+        # The reload names every table it applies and every table read at
+        # start, and the daemon guide lists the same ones, so that the
+        # next table added to one is missed by the test if not the other.
+
+        assert tables_named_in(unchanged) == tables_named_in(reload_section_of_the_guide())
 
         # The table appears in the file; a reload hands it to the edge.
 
