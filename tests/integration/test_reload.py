@@ -3,6 +3,7 @@ changed source file starts a new release (sections 9.8 and 13.1)."""
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import textwrap
@@ -28,7 +29,26 @@ def application(environ, start_response):
 
 
 def write_app(directory: Path, version: str) -> None:
-    (directory / "reload_app.py").write_text(textwrap.dedent(APP.format(version=version)))
+    """Write the application at `version`, with a modification time a whole
+    second past the file's last one.
+
+    Python accepts cached bytecode whose recorded source mtime, in whole
+    seconds, and size match the file, and every version here is the same
+    size, so a rewrite within the second of the last one would be served
+    from the cache of the version before.
+    """
+
+    path = directory / "reload_app.py"
+
+    try:
+        previous = int(path.stat().st_mtime)
+    except FileNotFoundError:
+        previous = None
+
+    path.write_text(textwrap.dedent(APP.format(version=version)))
+
+    if previous is not None and int(path.stat().st_mtime) <= previous:
+        os.utime(path, (previous + 1, previous + 1))
 
 
 def version_seen(server: support.Server) -> str:
