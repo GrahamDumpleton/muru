@@ -41,7 +41,7 @@ entrypoint = "mysite.wsgi:application"
 ## Run it
 
 ```
-muructl run --reload
+muructl run
 ```
 
 With no arguments, `muructl run` reads the `[tool.muru]` table and uses
@@ -64,7 +64,7 @@ patterns to the URLs. Change `mysite/urls.py` to this:
 :emphasize-lines: 2,9
 ```
 
-`--reload` sees the change, starts a new release and switches to it.
+The run sees the change, starts a new release and switches to it.
 Reload the page and the admin is styled. Django's welcome page at `/`
 gives way to its 404 page, as it does once a project has URLs of its
 own. `staticfiles_urlpatterns()`

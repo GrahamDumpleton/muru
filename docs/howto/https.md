@@ -15,7 +15,10 @@ muructl run app:application --https
 serves HTTPS on port 8443 next to HTTP on 8080. The TLS connection also
 carries HTTP/2, which browsers only use over TLS, so this is the way to
 test HTTP/2, Secure cookies, `wsgi.url_scheme == "https"` and anything
-that behaves differently behind TLS.
+that behaves differently behind TLS. Every flag on this page has a key in
+the project's run table, `https`, `https_only`, `https_port`, `hosts`,
+`tls_cert` and `tls_key`, so a project that is always served over TLS
+needs no flag; [settings for muructl run](run-settings.md) has the table.
 
 ## Certificates
 

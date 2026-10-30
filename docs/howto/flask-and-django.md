@@ -116,13 +116,16 @@ dir = 'shop/static'
   threads = 8
   ```
 
-- `--reload` restarts on changes to any `.py` file under the project; the
+- The run reloads on changes to any `.py` file under the project; the
   first request after a change waits for the new workers rather than
   failing. `--reload-include '**/*.html'` adds templates to what is
   watched, and `--reload-exclude` takes files out of it; an exclude wins,
   so `--reload-exclude '**/*.py'` watches the included patterns alone.
   Virtualenvs, `__pycache__`, `.git`, editor files and what `.gitignore`
   names are never watched, and the start-up line says what is.
+  `--no-reload` turns reloading off for a run, and the patterns can live
+  in the project's run table with the port, HTTPS and the access log;
+  [settings for muructl run](run-settings.md) has the table.
 - `--https` gives the browser a TLS connection, which is needed to test
   `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE` and `SECURE_SSL_REDIRECT`
   in Django, or `SESSION_COOKIE_SECURE` in Flask. Do not turn on HSTS in

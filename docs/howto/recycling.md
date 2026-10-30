@@ -105,8 +105,8 @@ muructl restart shop --worker 1 --force
 A restart resets the worker's state but loads no new code: workers fork
 from the host's already loaded interpreter, so the application is as it
 was when the release started. New code is a new release (`muructl
-deploy`), and in development `muructl run` restarts on its own with
-`--reload`. The event is `worker.restarted`, with the reason and, for
+deploy`), and in development `muructl run` reloads on its own when a
+source file changes. The event is `worker.restarted`, with the reason and, for
 `--force`, where the stacks were; manual restarts do not count against
 the churn budget. The command works against a development run too,
 through the run's admin socket, which prints the event to the terminal.
