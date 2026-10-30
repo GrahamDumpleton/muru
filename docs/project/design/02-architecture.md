@@ -48,7 +48,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | Edge (process title muru-edge) | muructl edge run, Rust, tokio, hyper, rustls | Listeners, TLS, virtual hosts, routing, load balancing, limits, buffering, static files, internal redirects, uploads, error pages | Replaced with listener handoff, no refused connections |
 | Daemon (process title murud) | muructl daemon run, Rust | Desired state, reconciler, supervision, admin API, dashboard, log collection, events, schedules | None on traffic. Hosts are re-adopted |
-| Host process | python -m muru.host, Python with the runtime library | Preload the application, fork and supervise workers, act as PID 1 in containers | Affects only its release |
+| Host process | python -m muru.host, Python with the runtime library | Preload the application, fork and supervise workers, collect what they leave behind as a subreaper | Affects only its release |
 | Worker | Forked from the host | Serve requests through the WSGI, ASGI and gRPC bridges | One worker, replaced from the host |
 | muructl client | Same binary | CLI over the admin API, development mode | None |
 

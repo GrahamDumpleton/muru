@@ -29,6 +29,10 @@ service EdgeControl {
   rpc GetWebSockets(WebSocketsRequest) returns (WebSockets);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
+  // Close connections after their response for the delay while still
+  // accepting, then stop accepting and let the requests in flight finish,
+  // keeping the WebSockets relaying until Stop. Answers once drained.
+  rpc Drain(DrainRequest) returns (Drained);
   // Section 7.4: the groups scaled to zero that requests are waiting
   // for, as they wait, for the daemon to wake.
   rpc WatchWakes(WatchWakesRequest) returns (stream Wake);
@@ -370,6 +374,15 @@ message Listener {
 message StopRequest {}
 
 message Stopped {}
+
+message DrainRequest {
+  uint64 delay_ms = 1;
+  uint64 grace_ms = 2;
+}
+
+message Drained {
+  bool finished = 1;                    // every request in flight finished within the grace
+}
 
 message MetricsRequest {}
 

@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
@@ -164,6 +165,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let connections = edge.connections();
     let limits = edge.limits();
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let drainer = edge.drainer();
 
     // The control socket, on which the daemon pushes snapshots.
 
@@ -180,6 +182,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         limits: limits.clone(),
         version: AtomicU64::new(0),
         stop: stop_tx,
+        drainer: drainer.clone(),
     });
     let mut api = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -203,12 +206,27 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let drainer = edge.drainer();
     let mut serving = tokio::spawn(edge.run());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!("muru: edge serving {listen} (pid {})", std::process::id());
     let outcome = tokio::select! {
-        served = &mut serving => served.map_err(anyhow::Error::from).and_then(|result| result),
+        served = &mut serving => {
+            // Section 13.3: the accept loops end when the daemon has the
+            // edge drain without stopping it yet; it keeps relaying what
+            // its WebSockets carry until the daemon, its workers stopped,
+            // tells it to stop.
+
+            let served = served.map_err(anyhow::Error::from).and_then(|result| result);
+
+            if served.is_ok() {
+                tokio::select! {
+                    _ = stop_rx.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+
+            served
+        }
         served = &mut api => served.map_err(anyhow::Error::from).and_then(|result| result),
         _ = stop_rx.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
@@ -274,6 +292,9 @@ struct Control {
     /// Changes the limits a snapshot carries (section 4.6).
     limits: muru_edge::LimitsControl,
     stop: tokio::sync::mpsc::Sender<()>,
+    /// Section 13.3: closes the connections and stops the accept loops
+    /// when the daemon has the edge drain ahead of stopping it.
+    drainer: muru_edge::Drainer,
 }
 
 #[tonic::async_trait]
@@ -471,6 +492,41 @@ impl EdgeControl for Control {
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {
         let _ = self.stop.try_send(());
         Ok(Response::new(pb::Stopped {}))
+    }
+
+    async fn drain(
+        &self,
+        request: Request<pb::DrainRequest>,
+    ) -> Result<Response<pb::Drained>, Status> {
+        let request = request.into_inner();
+        let delay = Duration::from_millis(request.delay_ms);
+        let grace = Duration::from_millis(request.grace_ms);
+
+        // Section 13.3: for the delay the edge still accepts, with every
+        // connection closing after its response; then it stops accepting
+        // and waits for the requests in flight.
+
+        if !delay.is_zero() {
+            eprintln!(
+                "muru: edge closing connections after their response for {} (pid {})",
+                muru_config::format_duration(delay),
+                std::process::id()
+            );
+            self.drainer.announce();
+            tokio::time::sleep(delay).await;
+        }
+
+        eprintln!("muru: edge draining (pid {})", std::process::id());
+        let finished = self.drainer.drain(grace).await;
+
+        if !finished {
+            eprintln!(
+                "muru: edge still has connections open after {}",
+                muru_config::format_duration(grace)
+            );
+        }
+
+        Ok(Response::new(pb::Drained { finished }))
     }
 
     type WatchWakesStream = tokio_stream::wrappers::ReceiverStream<Result<pb::Wake, Status>>;

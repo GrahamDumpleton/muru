@@ -581,6 +581,16 @@ impl Backend {
         }
     }
 
+    /// Stop the processes as `stop` does, killing what is still there at
+    /// `kill_at` (section 13.3).
+    async fn stop_until(self, kill_at: Instant) {
+        match self {
+            Self::Host(host) => host.stop_until(kill_at).await,
+            Self::Servers(servers) => servers.stop_until(kill_at).await,
+            Self::Dormant => {}
+        }
+    }
+
     /// Leave the processes running for the next daemon.
     fn release(self) {
         match self {
@@ -785,6 +795,8 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// Section 13.3: what SIGTERM means, and how a shutdown runs.
+    shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
     /// edge and the applications that name no user run as.
     service: Option<crate::host::Identity>,
@@ -1115,6 +1127,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         clock: (None, false),
         secrets: settings.secrets.clone(),
         rotation: settings.rotation.clone().map(crate::rotation::Rotator::new),
+        shutdown: settings.shutdown.clone(),
         service,
         debug_exec: settings.debug_exec,
         h2c: settings.h2c.clone(),
@@ -1167,8 +1180,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
-    // manager's stop or a terminal's interrupt should (section 13.3), and
-    // SIGHUP reloads the configuration file.
+    // manager's stop or a terminal's interrupt should, unless the
+    // [shutdown] table or being a container's main process makes them
+    // shut everything down (section 13.3), and SIGHUP reloads the
+    // configuration file.
 
     let mut drain_on_exit = true;
     let mut upgrade_to: Option<Upgrade> = None;
@@ -1195,11 +1210,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 }
             }
             _ = terminate.recv() => {
-                drain_on_exit = false;
+                drain_on_exit = daemon.signalled("SIGTERM");
                 break Ok(());
             }
             _ = interrupt.recv() => {
-                drain_on_exit = false;
+                drain_on_exit = daemon.signalled("SIGINT");
                 break Ok(());
             }
             command = inbox.recv() => match command {
@@ -1267,12 +1282,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     if drain_on_exit {
-        daemon.stop_all().await;
-        daemon.edge.stop().await;
-        let _ = std::fs::remove_file(daemon.locations.run.path.join("edge.toml"));
+        // The shutdown, as the stop signal and muructl daemon stop
+        // --shutdown both run it, inside the policy's budget: the delay
+        // with the edge still accepting, the drain of the requests in
+        // flight, every host stopped at once, and the edge last, so the
+        // workers' WebSocket close frames get through it.
+
+        let policy = daemon.shutdown.clone();
+        let started = Instant::now();
+        let deadline = started + policy.budget;
+        daemon.drain_edge(&policy, deadline).await;
+        daemon.stop_all_until(deadline).await;
         daemon
-            .events
-            .emit("daemon.stopped", "daemon", "info", "stopped");
+            .edge
+            .stop_within(deadline.saturating_duration_since(Instant::now()))
+            .await;
+        let _ = std::fs::remove_file(daemon.locations.run.path.join("edge.toml"));
+        daemon.events.emit(
+            "daemon.stopped",
+            "daemon",
+            "info",
+            &format!(
+                "stopped in {:.1} s of the {} budget",
+                started.elapsed().as_secs_f64(),
+                muru_config::format_duration(policy.budget)
+            ),
+        );
     } else if upgrade_to.is_none() {
         daemon.detach();
         daemon.events.emit(
@@ -2206,6 +2241,15 @@ impl Daemon {
             );
         } else {
             report.unchanged("[logs]");
+        }
+
+        // Section 13.3: what the next stop signal means.
+
+        if settings.shutdown != self.shutdown {
+            self.shutdown = settings.shutdown;
+            report.changed("[shutdown]", &self.shutdown.describe());
+        } else {
+            report.unchanged("[shutdown]");
         }
 
         // Section 4.2: the hosts' certificate files, read again.
@@ -6829,8 +6873,48 @@ impl Daemon {
         }
     }
 
-    /// Stop every host, for shutdown.
-    async fn stop_all(&mut self) {
+    /// Section 13.3: what a stop signal means to this daemon, said in the
+    /// log; whether it shuts everything down.
+    fn signalled(&self, signal: &str) -> bool {
+        if self.shutdown.shuts_down() {
+            tracing::info!("{signal}: shutting down ({})", self.shutdown.describe());
+        } else {
+            tracing::info!("{signal}: detaching; hosts and the edge keep serving");
+        }
+
+        self.shutdown.shuts_down()
+    }
+
+    /// Section 13.3: the edge's part of a shutdown. For the policy's
+    /// delay it keeps accepting, with every connection closing after its
+    /// response, then it stops accepting and the requests in flight
+    /// finish, within what the budget leaves after a moment for the
+    /// workers. The edge itself stays up for the WebSockets until it is
+    /// stopped last.
+    async fn drain_edge(&mut self, policy: &crate::shutdown::Policy, deadline: Instant) {
+        let grace = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(policy.delay)
+            .saturating_sub(crate::shutdown::WORKERS_RESERVE);
+
+        match self.edge.drain(policy.delay, grace).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "requests were still in flight when the drain's {} were up",
+                    muru_config::format_duration(grace)
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the edge could not be drained");
+            }
+        }
+    }
+
+    /// Stop every host, for shutdown: all at once, each given its workers'
+    /// stop budget or what the shutdown's budget leaves, whichever ends
+    /// first, and killed at `deadline` if it is still there.
+    async fn stop_all_until(&mut self, deadline: Instant) {
         let running = std::mem::take(&mut self.running);
         self.serving.clear();
 
@@ -6838,21 +6922,32 @@ impl Daemon {
             tracing::error!(%error, "pushing the empty snapshot failed");
         }
 
+        let mut stopping = Vec::new();
+
         for ((app, id), running) in running {
-            if let Ok(release) = self.store.release(&app, &id) {
-                self.set_state(&release, ReleaseState::Stopping, "the daemon is stopping");
+            let release = self.store.release(&app, &id).ok();
+
+            if let Some(release) = &release {
+                self.set_state(release, ReleaseState::Stopping, "the daemon is stopping");
             }
 
-            let grace = self
-                .store
-                .release(&app, &id)
+            let budget = release
+                .as_ref()
                 .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
-            let _ = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
+            let kill_at = deadline.min(Instant::now() + budget + crate::host::STOP_MARGIN);
+            stopping.push(async move {
+                running.backend.stop_until(kill_at).await;
+                release
+            });
+        }
 
-            if let Ok(release) = self.store.release(&app, &id) {
-                self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
-            }
+        for release in futures::future::join_all(stopping)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
         }
     }
 

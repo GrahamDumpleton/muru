@@ -266,7 +266,58 @@ stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
-its workers with it, and the next daemon starts its release again.
+its workers with it, and the next daemon starts its release again. A
+worker that is killed, by a hard timeout say, may leave a subprocess a
+request started; on Linux the host collects it, giving it the release's
+shutdown timeout to finish before it is stopped, so nothing lingers or
+sits as a zombie.
+
+The shutdown is one sequence, and it fits a budget. The daemon file's
+`[shutdown]` table sets the parts:
+
+```toml
+[shutdown]
+on_sigterm = 'detach'   # or 'shutdown'
+delay = '0s'
+budget = '8s'
+```
+
+For `delay` the edge keeps accepting and serving, with every response
+carrying `Connection: close` (GOAWAY on HTTP/2) and idle connections
+closed, so clients with keep-alive connections reconnect, to another
+node when a load balancer is in front; the default of none suits a
+single node. Then the edge stops accepting and the requests in flight
+finish, every host stops at once, each given its workers' stop budget or
+what remains of the shutdown's, whichever ends first, and the edge goes
+last, so the workers' WebSocket close frames reach their clients. The
+whole takes at most `budget`; whatever has not finished by then is
+killed. A long `shutdown_timeout` on a release wants a budget to match.
+
+SIGTERM (and an interrupt) means `muructl daemon stop` without
+`--shutdown`, that is a detach, which is what a service manager's restart
+wants, unless `on_sigterm = 'shutdown'` makes it the shutdown above. In a
+container that is the default; see below.
+
+## In a container
+
+`muructl daemon run` or `muructl run --allow-public` can be a container's
+main process. When muructl finds itself PID 1 it starts as an init of its
+own, as `tini` would: PID 1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1,
+SIGUSR2 and SIGQUIT to the command, which runs as its child, collects
+every process that exits, so nothing in the container stays a zombie,
+and exits with the command's status when the command exits. An image
+that uses `tini` or `docker run --init` sets `MURU_NO_INIT=1`, and the
+command runs as PID 1 itself.
+
+Under the init, and for a daemon that is PID 1 itself, SIGTERM means
+shutdown rather than detach: when PID 1 exits the kernel kills every
+other process in the container, so detaching would kill the edge and
+every worker mid-request. `docker stop` therefore drains and stops
+everything inside the budget above, whose default of eight seconds is
+under the ten `docker stop` allows, and the container exits 0. `muructl
+run` as the main process bounds its stop by the same budget. A
+`[shutdown]` table with `on_sigterm = 'detach'` turns that off, for a
+container that keeps its hosts across a daemon restart of its own.
 
 ## Upgrading
 
@@ -337,6 +388,9 @@ file again, checks it whole, and applies what changed:
 
 - the `[logs]` table: the daemon rotates on the new policy from its
   next check, and a period that changed rotates each file once;
+
+- the `[shutdown]` table, for the next stop signal or `muructl daemon
+  stop --shutdown`;
 
 - the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
 

@@ -11,6 +11,7 @@ mod admin;
 mod dashboard;
 mod devcert;
 mod edge;
+mod init;
 mod pstats;
 mod run_admin;
 mod watch;
@@ -19,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
@@ -749,6 +750,10 @@ enum Link {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Section 6.10: as a container's PID 1, muructl forks first and the
+    // parent stays as the init; everything below is the child.
+
+    init::become_init();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
@@ -2736,10 +2741,27 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // Section 13.4: the edge stops accepting and lets the requests in
     // flight finish before the host is told to stop, so no request is
-    // written to a worker that is going.
+    // written to a worker that is going. As a container's main process
+    // (section 13.3) the whole stop fits the shutdown budget, which is
+    // under the grace docker stop gives, the host getting what the drain
+    // leaves of it.
 
-    drainer.drain(stop_budget).await;
-    current.stop(stop_budget).await;
+    if muru_controller::shutdown::is_main_process() {
+        let deadline = Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET;
+        let for_drain = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+        drainer.drain(stop_budget.min(for_drain)).await;
+        current
+            .stop_until(
+                deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+            )
+            .await;
+    } else {
+        drainer.drain(stop_budget).await;
+        current.stop(stop_budget).await;
+    }
+
     let _ = admin_stop_tx.send(());
     drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);

@@ -1,0 +1,14 @@
+# What the container scenarios' image build (images/test/Dockerfile) leaves
+# out of its context: build outputs, environments and caches.
+.git
+target
+.venv
+.nox
+scratch
+docs/_build
+bench/results
+**/__pycache__
+**/*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache

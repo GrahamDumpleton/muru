@@ -55,6 +55,7 @@ Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path
 | MURU_INTERFACE, MURU_PROCESSES, MURU_THREADS | default mount interface and process model |
 | MURU_LOG_LEVEL, MURU_LOG_FORMAT | Python logging defaults |
 | MURU_DEVELOPMENT | set to 1 in muructl run |
+| MURU_UNDER_INIT | set to 1 by the built-in init of a container's PID 1 for the command it runs (section 6.10), which a daemon takes as the reason to shut down on SIGTERM |
 
 MURU_* variables cannot be overridden by application or release settings.
 
@@ -66,6 +67,7 @@ MURU_* variables cannot be overridden by application or release settings.
 | MURU_SOCKET, MURU_SERVER | admin endpoint for client commands |
 | MURU_UV | path to uv |
 | MURU_LOG | muructl's own log filter (tracing syntax) |
+| MURU_NO_INIT | set to 1, muructl as a container's PID 1 runs the command itself instead of forking the built-in init (section 6.10), for images that bring tini or use `docker run --init` |
 | NO_COLOR | disable coloured output |
 | MURU_STATE_DIR, MURU_RUN_DIR, MURU_LOG_DIR, MURU_CACHE_DIR | override file locations (section 13.8) |
 | STATE_DIRECTORY, RUNTIME_DIRECTORY, LOGS_DIRECTORY, CACHE_DIRECTORY, CONFIGURATION_DIRECTORY | set by systemd from the unit's directory settings and used when present |
