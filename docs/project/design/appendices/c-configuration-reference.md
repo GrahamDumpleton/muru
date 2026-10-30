@@ -24,6 +24,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[overlay_webhook]` | daemon file | the address of the overlays' signed webhook (`listen`) and its key (`secret` or `secret_file`), none by default |
 | `[limits]` | global, host, route, mount, group | request limits and timeouts |
 | `[logging.access]`, `[logging.apps]`, `[logging.python]` | global, application, release | sinks, formats, rotation, Python defaults |
+| `[shutdown]` | daemon file | what SIGTERM means (`on_sigterm`), the delay the edge keeps accepting for and the budget the whole shutdown fits (section 13.3) |
 | `[[events.sink]]` | daemon file | event sinks |
 | `[host.NAME]` | application files | virtual hosts |
 | `[[route]]` | application files | routes |
@@ -63,6 +64,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | h2c (the clients that may speak HTTP/2 in cleartext) | listener | every client | 6.13 |
 | grpc_web_origins (CORS for gRPC-Web) | release | none | 6.13 |
 | budget.workers, budget.memory, budget.cpu | `[daemon]` | off | 7.4 |
+| on_sigterm, delay, budget | `[shutdown]` | shutdown when the daemon is a container's main process and detach otherwise, 0s, 8s | 13.3 |
 | min_workers = 0 (scale to zero), host_idle_timeout | group; host_idle_timeout in the release's own scaling table | none, off | 7.4 |
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |

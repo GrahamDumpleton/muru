@@ -733,6 +733,18 @@ class Replacement:
     retire: bool = False
 
 
+@dataclass
+class Orphan:
+    """A process a dead worker left behind, a child of the host now (section 6.10)."""
+
+    pid: int
+    left_by: int
+    terminate_at: float
+    terminated: bool = False
+    kill_at: float | None = None
+    killed: bool = False
+
+
 class Host:
     """Preload once, fork workers, and keep them running until told to stop."""
 
@@ -784,6 +796,12 @@ class Host:
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
+
+        # Section 6.10: whether orphaned descendants come to this process,
+        # and those that have, each with when it is to be stopped.
+
+        self.subreaper = False
+        self.orphans: dict[int, Orphan] = {}
 
         # Workers are numbered across the groups in the order they are
         # forked: the default group first, then each named group, each
@@ -1435,6 +1453,14 @@ class Host:
         if self.control_listener is not None:
             selector.register(self.control_listener, selectors.EVENT_READ)
 
+        # Section 6.10: a subreaper, so what a worker leaves running comes
+        # back to the host to be stopped and collected, rather than to init.
+
+        self.subreaper = become_subreaper()
+
+        if not self.subreaper and os.uname().sysname == "Linux":
+            log("could not become a subreaper; processes the workers leave behind go to init")
+
         # An optional group's workers are routed to once they listen, as
         # a scale-out's are, so the edge holds the group's requests until
         # one does rather than sending them to a socket nobody serves.
@@ -1451,7 +1477,7 @@ class Host:
         while True:
             if self.restart_after:
                 timeout: float | None = 0.1
-            elif self.policies or self.replacing or self.pending or self.states:
+            elif self.policies or self.replacing or self.pending or self.states or self.orphans:
                 timeout = TICK_SECONDS
             else:
                 timeout = None
@@ -2338,6 +2364,7 @@ class Host:
         """Apply the lifetime and hard timeout policies and advance replacements."""
 
         now = time.monotonic()
+        self.advance_orphans(now)
 
         for state in list(self.states.values()):
             if state.replaced or state.index in self.replacing or not state.ready:
@@ -2863,9 +2890,13 @@ class Host:
             output.relay(data)
 
     def reap(self) -> None:
-        """Collect exited workers and schedule their replacement."""
+        """Collect exited workers and schedule their replacement.
 
-        while self.workers:
+        Section 6.10: a process a dead worker left behind, the host's
+        child now, is collected here too when it exits.
+        """
+
+        while True:
             try:
                 pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
@@ -2874,10 +2905,14 @@ class Host:
             if pid == 0:
                 return
             index = self.workers.pop(pid, None)
+
             if index is None:
+                self.orphans.pop(pid, None)
                 continue
+
             spawned_at = self.spawned_at.pop(pid, 0.0)
             self.states.pop(pid, None)
+            self.adopt_orphans(index, pid)
             if self.stopping:
                 continue
 
@@ -2978,6 +3013,96 @@ class Host:
                 del self.restart_after[index]
                 self.spawn(index, replacing=index in self.starting)
 
+    def adopt_orphans(self, index: int, pid: int) -> None:
+        """Take charge of what a worker that has just gone left running.
+
+        Section 6.10: with the host a subreaper, the worker's children are
+        the host's children now. Each gets the shutdown timeout to finish
+        on its own, is then told to stop, and is killed after as long again.
+        """
+
+        if not self.subreaper:
+            return
+
+        left = sorted(children_of(os.getpid()) - set(self.workers) - set(self.orphans))
+
+        if not left:
+            return
+
+        now = time.monotonic()
+
+        for child in left:
+            self.orphans[child] = Orphan(child, index, now + self.shutdown_timeout)
+
+        pids = ", ".join(str(child) for child in left)
+        log(
+            f"worker {index} (pid {pid}) left pid{'s' if len(left) != 1 else ''} {pids} running; "
+            f"stopping {'them' if len(left) != 1 else 'it'} in {self.shutdown_timeout:g} s "
+            f"unless {'they' if len(left) != 1 else 'it'} exit{'' if len(left) != 1 else 's'} first"
+        )
+
+    def advance_orphans(self, now: float) -> None:
+        """Stop the processes dead workers left behind once their time is up."""
+
+        for orphan in list(self.orphans.values()):
+            if not orphan.terminated and now >= orphan.terminate_at:
+                orphan.terminated = True
+                orphan.kill_at = now + self.shutdown_timeout
+                self.signal(orphan.pid, signal.SIGTERM)
+
+            if orphan.kill_at is not None and not orphan.killed and now >= orphan.kill_at:
+                orphan.killed = True
+                log(f"pid {orphan.pid}, left by worker {orphan.left_by}, did not stop, killing")
+                self.signal(orphan.pid, signal.SIGKILL)
+
+    def stop_orphans(self) -> None:
+        """Stop and collect whatever the workers left running, as the host stops.
+
+        Section 2.4: nothing of a release outlives its host. The leftovers
+        get the shutdown timeout to stop before they are killed, and the
+        pipes they inherited close with them, so relaying the workers'
+        last output does not wait on them.
+        """
+
+        left = children_of(os.getpid()) - set(self.workers)
+
+        if not left:
+            self.orphans.clear()
+            return
+
+        for pid in left:
+            self.signal(pid, signal.SIGTERM)
+
+        # Reap whatever stops within the grace period.
+
+        deadline = time.monotonic() + self.shutdown_timeout
+
+        while left and time.monotonic() < deadline:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                left.clear()
+                break
+
+            if pid == 0:
+                time.sleep(0.05)
+                continue
+
+            left.discard(pid)
+
+        # Whatever is left is killed and reaped.
+
+        for pid in sorted(left):
+            log(f"pid {pid}, left by a worker, did not stop, killing")
+
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+
+        self.orphans.clear()
+
     def stop_budget(self) -> float:
         """Return how long a worker told to stop may take before it is killed.
 
@@ -3024,6 +3149,7 @@ class Host:
                 pass
 
         self.workers.clear()
+        self.stop_orphans()
 
         if self.tcp_base_port is None:
             paths = {self.socket_path(index) for index in range(self.worker_count)}
@@ -3070,6 +3196,66 @@ def malloc_trim() -> bool:
         return bool(libc.malloc_trim(0))
     except (OSError, AttributeError):
         return False
+
+
+# Section 6.10: the prctl(2) option that makes orphaned descendants
+# reparent to this process rather than to init.
+
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_subreaper() -> bool:
+    """Make orphaned descendants reparent to this process, on Linux.
+
+    Section 6.10: a worker's children that outlive it come to the host
+    rather than to init, so the host can stop and collect them. Returns
+    whether it took, which it never does outside Linux, where the C
+    library has no prctl.
+    """
+
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        return int(libc.prctl(PR_SET_CHILD_SUBREAPER, ctypes.c_ulong(1), 0, 0, 0)) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def children_of(pid: int) -> set[int]:
+    """Return the pids whose parent is `pid` now, read from /proc.
+
+    Empty where there is no /proc, which is everywhere but Linux.
+    """
+
+    parent = str(pid).encode()
+    children: set[int] = set()
+
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return children
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                stat = handle.read()
+        except OSError:
+            continue
+
+        # The command name may hold spaces and parentheses, so the fields
+        # are read after its closing parenthesis: the state, then the
+        # parent's pid.
+
+        fields = stat[stat.rfind(b")") + 1 :].split()
+
+        if len(fields) > 1 and fields[1] == parent:
+            children.add(int(entry))
+
+    return children
 
 
 def describe(status: int) -> str:

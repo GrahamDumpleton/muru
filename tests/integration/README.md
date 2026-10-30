@@ -32,6 +32,19 @@ design specification and are added as the features they cover land:
   sustained load from `support.load`, with zero failed requests; the
   minute-long cycle carries the slow marker.
 
+- `test_shutdown.py`: what SIGTERM means to the daemon: a detach by
+  default, the shutdown under the `[shutdown]` table, with its delay,
+  its budget and the one sequence `muructl daemon stop --shutdown` runs.
+
+- `test_subreaper.py` (Linux only): the host collecting and stopping
+  what a killed worker, or a stopping one, leaves behind.
+
+- `test_containers.py` (marked requires_docker): muructl as a container's
+  main process, in an image built from the working tree with
+  `images/test/Dockerfile`: PID 1 as the built-in init, no zombies after a
+  hard timeout, and `docker stop` draining both `muructl run` and the
+  daemon inside the budget.
+
 - `test_tutorial_*.py`: one per tutorial under `docs/tutorials`, each
   running the tutorial's own code from `docs/tutorials/code` through the
   page's steps, so a change that breaks a step fails here rather than

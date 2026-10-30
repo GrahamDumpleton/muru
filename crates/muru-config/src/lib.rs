@@ -933,6 +933,29 @@ pub struct Logs {
     pub compress: Option<String>,
 }
 
+/// The `[shutdown]` table of the daemon's file (section 13.3): what
+/// SIGTERM and SIGINT mean to the daemon, and how a shutdown runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shutdown {
+    /// `shutdown`, which drains and stops every release and the edge
+    /// before the daemon exits, or `detach`, which leaves them serving
+    /// for the next daemon; shutdown when the daemon is a container's
+    /// main process, detach otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_sigterm: Option<String>,
+    /// How long the edge keeps accepting after the signal, closing each
+    /// connection after its response so clients reconnect elsewhere, for
+    /// example 5s (default 0s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<String>,
+    /// How long the whole shutdown may take, the delay, the drain, the
+    /// workers and the edge together (default 8s); what has not finished
+    /// by then is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<String>,
+}
+
 /// The `[daemon]` table of the daemon's file: how the daemon itself runs
 /// (ADR 0026).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -3575,6 +3598,10 @@ pub struct Document {
     /// Log rotation (section 11.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<Logs>,
+    /// What SIGTERM means to the daemon, and how a shutdown runs (section
+    /// 13.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<Shutdown>,
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,

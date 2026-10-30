@@ -451,13 +451,38 @@ impl EdgeProcess {
         Ok(old_pid)
     }
 
+    /// Section 13.3: tell the edge to close connections after their
+    /// response for `delay` while still accepting, then to stop accepting
+    /// and let the requests in flight finish, waiting at most `grace` for
+    /// them. Returns whether everything finished in time. The edge keeps
+    /// its WebSockets relaying until it is told to stop.
+    pub async fn drain(&self, delay: Duration, grace: Duration) -> anyhow::Result<bool> {
+        let mut client = connect(&self.spec.control).await?;
+        let drained = tokio::time::timeout(
+            delay + grace + Duration::from_secs(5),
+            client.drain(pb::DrainRequest {
+                delay_ms: delay.as_millis() as u64,
+                grace_ms: grace.as_millis() as u64,
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the edge did not answer the drain in time"))??;
+        Ok(drained.into_inner().finished)
+    }
+
     /// Tell the edge to stop and wait for it, killing it after a grace period.
     pub async fn stop(self) {
+        self.stop_within(Duration::from_secs(10)).await;
+    }
+
+    /// Tell the edge to stop and wait at most `grace` for it before it is
+    /// killed.
+    pub async fn stop_within(self, grace: Duration) {
         finish(
             self.process,
             self.spec.control,
             self.spec.listener_socket,
-            Duration::from_secs(10),
+            grace,
         )
         .await;
     }

@@ -28,7 +28,7 @@ specification is maintained.
 | wsgi.input_terminated | Always True. chunked_body defaults to buffer |
 | wsgi.multiprocess | True for daemon-managed releases, False for single-process development runs |
 | Body size limit | 10 MB by default, as in mod_wsgi-express. Routes that accept larger bodies raise it explicitly |
-| Containers | Host and workers in the container, daemon and edge outside, host as PID 1 without tini |
+| Containers | Host and workers in the container, daemon and edge outside; muructl is PID 1 with a built-in init and the host is a subreaper under it, so no tini (ADR 0035) |
 | Error override | Off by default |
 | Reload | Off by default. Every reload is a new release |
 | Licence | Apache-2.0 |

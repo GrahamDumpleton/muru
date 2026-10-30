@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
+import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -172,3 +177,96 @@ def test_arguments_are_checked_against_the_interface(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(host.inspect, "signature", lambda app: (_ for _ in ()).throw(ValueError()))
     assert host.resolve_interface("m:factory", factory, "auto") == "wsgi"
+
+
+def test_what_a_dead_worker_left_is_stopped_then_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1, shutdown_timeout=2.0)
+    instance.subreaper = True
+    instance.workers = {4243: 0}
+    sent: list[tuple[int, int]] = []
+    instance.signal = lambda pid, signum: sent.append((pid, signum))  # type: ignore[method-assign]
+
+    # The live worker is not an orphan; the other child the scan finds is.
+
+    monkeypatch.setattr(host, "children_of", lambda pid: {4242, 4243})
+    instance.adopt_orphans(0, 4000)
+    assert list(instance.orphans) == [4242]
+    assert instance.orphans[4242].left_by == 0
+
+    # Section 6.10: the shutdown timeout to exit on its own, then SIGTERM,
+    # then as long again before SIGKILL.
+
+    now = time.monotonic()
+    instance.advance_orphans(now + 1.0)
+    assert sent == []
+    instance.advance_orphans(now + 2.1)
+    assert sent == [(4242, signal.SIGTERM)]
+    instance.advance_orphans(now + 3.0)
+    assert sent == [(4242, signal.SIGTERM)]
+    instance.advance_orphans(now + 4.2)
+    assert sent == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+
+    # Adopting again finds nothing new, and a host that is no subreaper
+    # adopts nothing at all.
+
+    instance.adopt_orphans(0, 4000)
+    assert list(instance.orphans) == [4242]
+    instance.subreaper = False
+    monkeypatch.setattr(host, "children_of", lambda pid: {4242, 4243, 4244})
+    instance.adopt_orphans(0, 4000)
+    assert list(instance.orphans) == [4242]
+
+
+def test_become_subreaper_is_linux_only() -> None:
+    if sys.platform == "linux":
+        pytest.skip("on Linux the subreaper takes; the test below covers it")
+    assert host.become_subreaper() is False
+    assert host.children_of(os.getpid()) == set()
+
+
+@pytest.mark.requires_linux
+def test_a_subreaper_sees_orphaned_grandchildren_as_its_children() -> None:
+    # In a process of its own, since the subreaper setting is for life.
+
+    script = textwrap.dedent(
+        """
+        import os
+        import signal
+        import time
+
+        from muru import host
+
+        assert host.become_subreaper()
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+
+        if pid == 0:
+            grandchild = os.fork()
+
+            if grandchild == 0:
+                time.sleep(60)
+                os._exit(0)
+
+            os.write(write_end, str(grandchild).encode())
+            os._exit(0)
+
+        os.waitpid(pid, 0)
+        grandchild = int(os.read(read_end, 32))
+        deadline = time.monotonic() + 5
+
+        while grandchild not in host.children_of(os.getpid()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        print("adopted", grandchild in host.children_of(os.getpid()))
+        os.kill(grandchild, signal.SIGTERM)
+        print("collected", os.waitpid(grandchild, 0)[0] == grandchild)
+        print("gone", grandchild not in host.children_of(os.getpid()))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.split() == ["adopted", "True", "collected", "True", "gone", "True"]

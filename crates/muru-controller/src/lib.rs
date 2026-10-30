@@ -29,6 +29,7 @@ pub mod scaling;
 pub mod secrets;
 pub mod servers;
 pub mod settings;
+pub mod shutdown;
 pub mod sinks;
 pub mod store;
 pub mod triggers;

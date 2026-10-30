@@ -52,6 +52,8 @@ pub struct NodeSettings {
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
     pub rotation: Option<crate::rotation::Policy>,
+    /// Section 13.3: what SIGTERM means, and how a shutdown runs.
+    pub shutdown: crate::shutdown::Policy,
     /// The service user named by the `[daemon]` table or `--user`
     /// (ADR 0026); `muru` when none is named.
     pub service_user: Option<String>,
@@ -127,6 +129,11 @@ impl NodeSettings {
             .map_err(|error| format!("{error:#}"))?;
         let rotation = crate::rotation::Policy::from_table(document.logs.as_ref())
             .map_err(|error| format!("{error:#}"))?;
+        let shutdown = crate::shutdown::Policy::from_table(
+            document.shutdown.as_ref(),
+            crate::shutdown::is_main_process(),
+        )
+        .map_err(|error| format!("[shutdown]: {error}"))?;
         let overlay_webhook = document
             .overlay_webhook
             .as_ref()
@@ -148,6 +155,7 @@ impl NodeSettings {
             overlay_webhook,
             secrets,
             rotation,
+            shutdown,
             service_user: overrides
                 .user
                 .clone()

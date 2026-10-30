@@ -354,9 +354,10 @@ struct Shared {
     redirect_to: Option<SocketAddr>,
     /// The port of the first TLS listener, for hosts that insist on HTTPS.
     https_port: Option<u16>,
-    /// Set once the edge is draining, which stops the accept loops and
-    /// tells every connection to finish.
-    draining: tokio::sync::watch::Sender<bool>,
+    /// How far the edge is into stopping (section 13.3): closing tells
+    /// every connection to finish after its response while the listeners
+    /// keep accepting, and draining stops the accept loops too.
+    draining: tokio::sync::watch::Sender<Phase>,
     /// Cloned for each connection accepted and dropped when it ends, so
     /// a drain can wait for the count to come back to one.
     connections: Arc<()>,
@@ -377,6 +378,20 @@ struct Shared {
 #[derive(Clone)]
 pub struct Drainer {
     shared: Arc<Shared>,
+}
+
+/// How far an edge is into stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Accepting and serving as usual.
+    Serving,
+    /// Section 13.3: still accepting, but every connection finishes after
+    /// the response in flight (with GOAWAY on HTTP/2), so clients with
+    /// keep-alive connections reconnect, to another node when a load
+    /// balancer is in front.
+    Closing,
+    /// No longer accepting; the requests in flight finish.
+    Draining,
 }
 
 impl Shared {
@@ -416,12 +431,29 @@ impl LimitsControl {
 }
 
 impl Drainer {
+    /// Section 13.3: keep accepting, but have every connection, those
+    /// accepted from now on included, close after the response in flight
+    /// (with GOAWAY on HTTP/2) and at once when idle, so clients with
+    /// keep-alive connections reconnect before the drain. Nothing is
+    /// waited for.
+    pub fn announce(&self) {
+        self.shared.draining.send_if_modified(|phase| {
+            let announced = *phase == Phase::Serving;
+
+            if announced {
+                *phase = Phase::Closing;
+            }
+
+            announced
+        });
+    }
+
     /// Stop accepting, let the requests in flight finish and close idle
     /// keep-alive connections (with GOAWAY on HTTP/2), waiting at most
     /// `grace` for them. Returns whether every connection finished in
     /// time; connections handed over to WebSockets are not waited for.
     pub async fn drain(&self, grace: Duration) -> bool {
-        let _ = self.shared.draining.send(true);
+        let _ = self.shared.draining.send_replace(Phase::Draining);
         let deadline = tokio::time::Instant::now() + grace;
 
         while Arc::strong_count(&self.shared.connections) > 1 {
@@ -575,7 +607,7 @@ impl Edge {
                 tuning: RwLock::new(Arc::new(Tuning::new(config.limits))),
                 redirect_to,
                 https_port,
-                draining: tokio::sync::watch::channel(false).0,
+                draining: tokio::sync::watch::channel(Phase::Serving).0,
                 connections: Arc::new(()),
                 admission,
                 spool: config.spool,
@@ -719,13 +751,13 @@ async fn accept(
     let admission = Arc::clone(&shared.admission[index]);
 
     loop {
-        if *draining.borrow() {
+        if *draining.borrow() == Phase::Draining {
             return Ok(());
         }
 
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
-            _ = draining.changed() => return Ok(()),
+            _ = draining.wait_for(|phase| *phase == Phase::Draining) => return Ok(()),
         };
         let _ = stream.set_nodelay(true);
         let shared = Arc::clone(&shared);
@@ -1704,8 +1736,8 @@ async fn serve<I>(
     let mut draining = state.draining.subscribe();
 
     let drain = async {
-        if !*draining.borrow_and_update() {
-            let _ = draining.changed().await;
+        if *draining.borrow_and_update() == Phase::Serving {
+            let _ = draining.wait_for(|phase| *phase != Phase::Serving).await;
         }
 
         if !*first_request_seen.borrow_and_update() {
