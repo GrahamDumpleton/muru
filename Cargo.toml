@@ -31,7 +31,7 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
-brotli = "8"
+brotli = "9"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 flate2 = "1"
