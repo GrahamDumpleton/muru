@@ -41,6 +41,7 @@ pub mod grpc;
 pub mod ja4;
 pub mod link;
 pub mod metrics;
+pub mod occasions;
 pub mod proxy;
 pub mod ratelimit;
 pub mod routing;
@@ -88,6 +89,8 @@ pub struct Config {
     pub errors: Arc<errors::ErrorPolicy>,
     /// Development mode: error pages show tracebacks (section 4.12).
     pub development: bool,
+    /// What the run was told about the traceback page's seasonal themes.
+    pub occasions: occasions::Setting,
     /// Where the access log goes and what it leaves out.
     pub access_log: access::Config,
     /// Timeouts and header limits.
@@ -256,6 +259,7 @@ struct Shared {
     request_ids: errors::RequestIds,
     protocols: auto::Builder<TokioExecutor>,
     development: bool,
+    occasions: occasions::Setting,
     access_log: Arc<access::AccessLog>,
     limits: Arc<Limits>,
     /// Where plain HTTP requests are redirected instead of being served.
@@ -462,6 +466,7 @@ impl Edge {
                 request_ids: errors::RequestIds::new(),
                 protocols,
                 development: config.development,
+                occasions: config.occasions,
                 access_log,
                 limits,
                 redirect_to,
@@ -925,6 +930,7 @@ async fn serve<I>(
                     scheme,
                     tls: tls.as_deref(),
                     development: shared.development,
+                    occasions: shared.occasions,
                     access_log: Arc::clone(&shared.access_log),
                     limits: Arc::clone(&shared.limits),
                     server_name: None,

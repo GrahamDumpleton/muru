@@ -30,6 +30,7 @@ use http_body_util::{BodyExt, Full};
 use muru_proto::edge::v1 as pb;
 
 use crate::ResponseBody;
+use crate::occasions::{self, Mode, Occasion};
 
 /// The reason of a response the override replaced (section 4.12).
 pub const OVERRIDE_REASON: &str = "error_override";
@@ -291,6 +292,8 @@ pub struct Rendering<'a> {
     pub host: &'a str,
     /// The path the client asked for, for templates.
     pub path: &'a str,
+    /// What the run was told about the traceback page's seasonal themes.
+    pub occasions: occasions::Setting,
 }
 
 /// What the response depends on from the request.
@@ -364,6 +367,7 @@ pub fn respond(problem: &Problem, rendering: &Rendering<'_>) -> Response<Respons
         .detail
         .as_deref()
         .filter(|_| negotiation.development);
+    let theme = theme(detail, negotiation.format, rendering.occasions);
     let page = rendering
         .errors
         .page(problem.status.as_u16(), problem.reason);
@@ -422,6 +426,7 @@ pub fn respond(problem: &Problem, rendering: &Rendering<'_>) -> Response<Respons
                 rendering.request_id,
                 negotiation.format,
                 detail,
+                theme,
             )
         }
         None => built_in(
@@ -430,6 +435,7 @@ pub fn respond(problem: &Problem, rendering: &Rendering<'_>) -> Response<Respons
             rendering.request_id,
             negotiation.format,
             detail,
+            theme,
         ),
     };
 
@@ -459,6 +465,19 @@ pub fn respond(problem: &Problem, rendering: &Rendering<'_>) -> Response<Respons
     response
 }
 
+/// The seasonal theme for a built-in page: only the HTML page, and only
+/// when it carries a traceback, so API clients and the pages of
+/// production runs never see one.
+fn theme(
+    detail: Option<&str>,
+    format: Format,
+    occasions: occasions::Setting,
+) -> Option<&'static Occasion> {
+    detail
+        .filter(|_| format == Format::Html)
+        .and_then(|_| occasions.theme())
+}
+
 /// The built-in page in the client's format.
 fn built_in(
     problem: &Problem,
@@ -466,11 +485,12 @@ fn built_in(
     request_id: &str,
     format: Format,
     detail: Option<&str>,
+    theme: Option<&Occasion>,
 ) -> (HeaderValue, Bytes) {
     let (content_type, body) = match format {
         Format::Html => (
             "text/html; charset=utf-8",
-            html(problem, title, request_id, detail),
+            html(problem, title, request_id, detail, theme),
         ),
         Format::Problem => (
             "application/problem+json",
@@ -564,22 +584,43 @@ fn json(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) 
     body
 }
 
-fn html(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) -> String {
+/// The built-in HTML page's stylesheet.
+const PAGE_STYLES: &str = "\
+body { margin: 0; padding: 3rem 1.5rem; font: 16px/1.5 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }\n\
+main { max-width: 44rem; margin: 0 auto; }\n\
+h1 { font-size: 1.75rem; margin: 0 0 1rem; }\n\
+h1 span { color: #9aa5b1; font-weight: normal; margin-right: 0.5rem; }\n\
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 1.5rem 0; }\n\
+dt { color: #616e7c; }\n\
+pre { overflow: auto; padding: 1rem; background: #fff; border: 1px solid #d9e2ec; border-radius: 4px; font-size: 0.875rem; }\n\
+footer { margin-top: 2rem; color: #9aa5b1; font-size: 0.875rem; }\n";
+
+/// The built-in HTML page, with a seasonal theme when one is given: the
+/// page is marked with the theme's name, its stylesheet is kept or
+/// replaced as the theme says, and the theme's fragment follows the
+/// content.
+fn html(
+    problem: &Problem,
+    title: &str,
+    request_id: &str,
+    detail: Option<&str>,
+    theme: Option<&Occasion>,
+) -> String {
     let status = problem.status.as_u16();
+    let marker = theme
+        .map(|theme| format!(" data-occasion=\"{}\"", theme.id))
+        .unwrap_or_default();
+
+    let styles = if theme.is_some_and(|theme| theme.mode == Mode::Replace) {
+        String::new()
+    } else {
+        format!("<style>\n{PAGE_STYLES}</style>\n")
+    };
+
     let mut body = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+        "<!doctype html>\n<html lang=\"en\"{marker}>\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{status} {title}</title>\n\
-         <style>\n\
-         body {{ margin: 0; padding: 3rem 1.5rem; font: 16px/1.5 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; }}\n\
-         main {{ max-width: 44rem; margin: 0 auto; }}\n\
-         h1 {{ font-size: 1.75rem; margin: 0 0 1rem; }}\n\
-         h1 span {{ color: #9aa5b1; font-weight: normal; margin-right: 0.5rem; }}\n\
-         dl {{ display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 1.5rem 0; }}\n\
-         dt {{ color: #616e7c; }}\n\
-         pre {{ overflow: auto; padding: 1rem; background: #fff; border: 1px solid #d9e2ec; border-radius: 4px; font-size: 0.875rem; }}\n\
-         footer {{ margin-top: 2rem; color: #9aa5b1; font-size: 0.875rem; }}\n\
-         </style>\n</head>\n<body>\n<main>\n\
+         <title>{status} {title}</title>\n{styles}</head>\n<body>\n<main>\n\
          <h1><span>{status}</span>{}</h1>\n<p>{}</p>\n\
          <dl><dt>Reason</dt><dd>{}</dd><dt>Request id</dt><dd>{}</dd></dl>\n",
         escape(title),
@@ -594,7 +635,16 @@ fn html(problem: &Problem, title: &str, request_id: &str, detail: Option<&str>) 
         body.push_str("</pre>\n");
     }
 
-    body.push_str("<footer>Muru</footer>\n</main>\n</body>\n</html>\n");
+    body.push_str("<footer>Muru</footer>\n</main>\n");
+
+    if let Some(theme) = theme.filter(|theme| !theme.fragment.is_empty()) {
+        body.push_str("<style>\n");
+        body.push_str(occasions::BASE_STYLES);
+        body.push_str("</style>\n");
+        body.push_str(theme.fragment);
+    }
+
+    body.push_str("</body>\n</html>\n");
     body
 }
 
@@ -743,6 +793,64 @@ mod tests {
             "404 at /a&lt;b&gt; {unknown} {"
         );
         assert_eq!(render("{path}", false, &values), "/a<b>");
+    }
+
+    #[test]
+    fn a_theme_marks_the_html_traceback_page_and_nothing_else() {
+        let forced = occasions::Setting::Forced("christmas");
+        assert!(theme(Some("Traceback"), Format::Html, forced).is_some());
+        assert!(theme(None, Format::Html, forced).is_none());
+        assert!(theme(Some("Traceback"), Format::Problem, forced).is_none());
+        assert!(theme(Some("Traceback"), Format::Text, forced).is_none());
+        assert!(theme(Some("Traceback"), Format::Html, occasions::Setting::Off).is_none());
+
+        let problem = Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "app_error",
+            "The application raised.",
+        );
+        let page = |id: &str| {
+            html(
+                &problem,
+                "Internal Server Error",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("Traceback <x>"),
+                occasions::named(id),
+            )
+        };
+
+        // An appended theme keeps the page's stylesheet and adds its own
+        // with the fragment after the content; the traceback is escaped
+        // as before.
+
+        let christmas = page("christmas");
+        assert!(
+            christmas
+                .starts_with("<!doctype html>\n<html lang=\"en\" data-occasion=\"christmas\">")
+        );
+        assert_eq!(christmas.matches("<style>").count(), 3);
+        assert!(christmas.contains("<pre>Traceback &lt;x&gt;</pre>"));
+        assert!(christmas.contains("<div class=\"occasion\" aria-hidden=\"true\">"));
+        assert!(christmas.ends_with("</body>\n</html>\n"));
+
+        // A replacing theme drops the page's stylesheet, and a replacing
+        // theme with no fragment leaves the page bare.
+
+        assert_eq!(page("caps-lock-day").matches("<style>").count(), 2);
+        let naked = page("css-naked-day");
+        assert!(!naked.contains("<style>"));
+        assert!(naked.contains("data-occasion=\"css-naked-day\""));
+
+        let plain = html(
+            &problem,
+            "Internal Server Error",
+            "id",
+            Some("Traceback"),
+            None,
+        );
+        assert!(plain.starts_with("<!doctype html>\n<html lang=\"en\">"));
+        assert_eq!(plain.matches("<style>").count(), 1);
+        assert!(!plain.contains("occasion"));
     }
 
     #[tokio::test]

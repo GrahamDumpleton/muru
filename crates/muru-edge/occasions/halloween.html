@@ -1,0 +1,32 @@
+<style>
+body { background: #150f1d; color: #f4ecff; }
+h1 span { color: #ff7f11; }
+dt { color: #b89ad6; }
+footer { color: #7d6a9a; }
+pre { background: #211733; border-color: #4a3566; color: #f4ecff; }
+.occasion-top { height: 7vw; }
+.glow { animation: glow 1.6s ease-in-out infinite alternate; }
+.bat { animation: fly 9s linear infinite; }
+.bat2 { animation-delay: -3s; }
+.bat3 { animation-delay: -6s; }
+.wing { transform-box: fill-box; transform-origin: center; animation: flap 0.35s ease-in-out infinite alternate; }
+@keyframes glow { from { opacity: 0.55; } to { opacity: 1; } }
+@keyframes fly { from { transform: translateX(-10vw); } to { transform: translateX(110vw); } }
+@keyframes flap { from { transform: scaleY(0.4); } to { transform: scaleY(1); } }
+</style>
+<div class="occasion-top" aria-hidden="true"><svg viewBox="0 0 1000 70" preserveAspectRatio="xMidYMin meet" xmlns="http://www.w3.org/2000/svg" fill="#6b5a8e">
+<g transform="translate(0 20)"><g class="bat"><ellipse cx="0" cy="0" rx="6" ry="5"/><path class="wing" d="M-4 0q-14 -14 -28 -2q8 4 10 10q6 -4 12 2zM4 0q14 -14 28 -2q-8 4 -10 10q-6 -4 -12 2z"/></g></g>
+<g transform="translate(0 45) scale(0.7)"><g class="bat bat2"><ellipse cx="0" cy="0" rx="6" ry="5"/><path class="wing" d="M-4 0q-14 -14 -28 -2q8 4 10 10q6 -4 12 2zM4 0q14 -14 28 -2q-8 4 -10 10q-6 -4 -12 2z"/></g></g>
+<g transform="translate(0 32) scale(0.85)"><g class="bat bat3"><ellipse cx="0" cy="0" rx="6" ry="5"/><path class="wing" d="M-4 0q-14 -14 -28 -2q8 4 10 10q6 -4 12 2zM4 0q14 -14 28 -2q-8 4 -10 10q-6 -4 -12 2z"/></g></g>
+</svg></div>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<ellipse cx="100" cy="188" rx="80" ry="7" fill="#0c0812"/>
+<rect x="92" y="52" width="16" height="26" rx="4" fill="#4b7a2a"/>
+<ellipse cx="100" cy="130" rx="72" ry="58" fill="#e8700f"/>
+<ellipse cx="100" cy="130" rx="30" ry="58" fill="none" stroke="#c75c08" stroke-width="3"/>
+<ellipse cx="100" cy="130" rx="54" ry="58" fill="none" stroke="#c75c08" stroke-width="3"/>
+<g class="glow" fill="#ffe08a">
+<path d="M60 112l24 10l-24 10z"/><path d="M140 112l-24 10l24 10z"/>
+<path d="M56 148q44 34 88 0l-10 10l-10 -6l-10 8l-12 -8l-12 8l-10 -8l-10 6z"/>
+</g>
+</svg></div>

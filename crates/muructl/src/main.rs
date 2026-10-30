@@ -302,6 +302,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         grpc_web_origins: Vec::new(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
+        occasions: muru_edge::occasions::Setting::Calendar,
         access_log,
         limits: muru_edge::Limits::default(),
         compression: compression.clone(),
@@ -485,6 +486,11 @@ struct RunArgs {
     /// way to run in production, which is the daemon's job.
     #[arg(long)]
     allow_public: bool,
+
+    /// Show one of the traceback page's seasonal themes whatever the
+    /// date, by name, or off for none. Hidden: finding it is the point.
+    #[arg(long, hide = true, value_name = "NAME", value_parser = muru_edge::occasions::Setting::parse)]
+    easter_egg: Option<muru_edge::occasions::Setting>,
 
     /// Serve HTTPS as well, on --https-port, with a development certificate
     /// unless --tls-cert is given.
@@ -2151,6 +2157,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         grpc_web_origins: resolved.grpc_web_origins.clone(),
         errors: Arc::clone(&error_policy),
         development,
+        occasions: args.easter_egg.unwrap_or_default(),
         access_log,
         limits: limits(&args),
         compression: if args.no_compression {

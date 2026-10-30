@@ -1,0 +1,15 @@
+<style>
+body { background: #f8f4ee; }
+h1 { color: #6d4c41; }
+pre { border-color: #d7ccc8; }
+.gear { transform-box: fill-box; transform-origin: center; animation: spin 9s linear infinite; }
+.quill { transform-box: fill-box; transform-origin: bottom left; animation: write 2s ease-in-out infinite alternate; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes write { from { transform: rotate(-3deg) translateX(0); } to { transform: rotate(3deg) translateX(6px); } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<g class="gear" fill="none"><circle cx="60" cy="70" r="34" stroke="#8d6e63" stroke-width="13" stroke-dasharray="10 7"/><circle cx="60" cy="70" r="27" stroke="#8d6e63" stroke-width="5"/><circle cx="60" cy="70" r="7" fill="#8d6e63"/></g>
+<rect x="30" y="150" width="140" height="30" rx="3" fill="#fffdf7" stroke="#d7ccc8"/><path d="M40 160h60M40 168h90" stroke="#bcaaa4" stroke-width="1.5"/>
+<rect x="140" y="128" width="26" height="24" rx="3" fill="#263238"/><rect x="146" y="122" width="14" height="8" fill="#263238"/>
+<g class="quill"><path d="M100 158l40 -80q20 -20 30 -10q-2 24 -30 44z" fill="#90a4ae"/><path d="M100 158l45 -70" stroke="#546e7a" stroke-width="2"/><path d="M100 158l-4 6" stroke="#263238" stroke-width="3"/></g>
+</svg></div>

@@ -1,0 +1,25 @@
+<style>
+body { background: #fff8e7; }
+h1 { color: #8b4513; }
+h1 span, dt, footer { color: #c08a3e; }
+pre { border-color: #f0d9a8; }
+.digits { position: fixed; left: 0; right: 0; bottom: 0; overflow: hidden; white-space: nowrap; font: 0.9rem/2 ui-monospace, monospace; color: #c9a066; pointer-events: none; z-index: 0; }
+.digits span { display: inline-block; padding-right: 2rem; animation: slide 40s linear infinite; }
+.steam { animation: steam 2s ease-out infinite; }
+.s2 { animation-delay: 0.7s; }
+.s3 { animation-delay: 1.4s; }
+@keyframes slide { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+@keyframes steam { 0% { transform: translateY(0); opacity: 0.7; } 100% { transform: translateY(-24px); opacity: 0; } }
+</style>
+<div class="digits" aria-hidden="true"><span>3.14159265358979323846264338327950288419716939937510582097494459230781640628620899862803482534211706798214808651328230664709384460955058223172535940812848111745028410270193852110555964462294895493038196 3.14159265358979323846264338327950288419716939937510582097494459230781640628620899862803482534211706798214808651328230664709384460955058223172535940812848111745028410270193852110555964462294895493038196</span></div>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<ellipse cx="100" cy="150" rx="80" ry="22" fill="#e9dcc3"/>
+<path d="M30 140a70 70 0 0 1 140 0z" fill="#e0a458"/>
+<path d="M100 140l50 -49a70 70 0 0 1 20 49z" fill="#fff3e0" stroke="#c98a3a" stroke-width="2"/>
+<path d="M30 140a70 70 0 0 1 120 -49" fill="none" stroke="#b5742a" stroke-width="10" stroke-linecap="round"/>
+<path d="M60 115q15 -10 30 0t30 0" fill="none" stroke="#b5742a" stroke-width="3"/>
+<text x="76" y="134" font-size="34" font-family="serif" fill="#8b4513">π</text>
+<path class="steam" d="M70 70q-6 -10 0 -20" stroke="#bbb" stroke-width="2" fill="none"/>
+<path class="steam s2" d="M95 64q-6 -10 0 -20" stroke="#bbb" stroke-width="2" fill="none"/>
+<path class="steam s3" d="M120 70q-6 -10 0 -20" stroke="#bbb" stroke-width="2" fill="none"/>
+</svg></div>

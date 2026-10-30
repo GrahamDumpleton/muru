@@ -1,0 +1,28 @@
+<style>
+body { background: #1a120c; color: #f7ebdc; }
+h1 span { color: #ff8c1a; }
+dt, footer { color: #b08a66; }
+pre { background: #261a12; border-color: #5a3d25; color: #f7ebdc; }
+.flame { transform-box: fill-box; transform-origin: bottom center; animation: flicker 0.5s ease-in-out infinite alternate; }
+.f2 { animation-delay: 0.17s; }
+.f3 { animation-delay: 0.33s; }
+.spark { animation: rise 2.2s ease-out infinite; }
+.s2 { animation-delay: 0.7s; }
+.s3 { animation-delay: 1.4s; }
+.rocket { animation: launch 3s ease-in infinite; }
+@keyframes flicker { from { transform: scaleY(0.9) scaleX(1.05); } to { transform: scaleY(1.1) scaleX(0.95); } }
+@keyframes rise { 0% { transform: translateY(0); opacity: 1; } 100% { transform: translateY(-70px); opacity: 0; } }
+@keyframes launch { 0% { transform: translate(0, 0); opacity: 1; } 70% { transform: translate(30px, -150px); opacity: 1; } 71%, 100% { opacity: 0; } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<rect x="40" y="160" width="80" height="12" rx="6" fill="#5a3a1e" transform="rotate(-12 80 166)"/>
+<rect x="46" y="166" width="80" height="12" rx="6" fill="#4a2e16" transform="rotate(10 86 172)"/>
+<rect x="60" y="172" width="70" height="12" rx="6" fill="#6b4524"/>
+<path class="flame" d="M85 170q-30 -40 0 -80q4 30 20 40q10 -20 4 -40q30 40 -4 80z" fill="#ff6a00"/>
+<path class="flame f2" d="M88 170q-18 -30 0 -56q4 20 14 26q8 -12 2 -26q20 30 -4 56z" fill="#ffa726"/>
+<path class="flame f3" d="M92 170q-10 -18 0 -34q4 12 8 16q4 -8 2 -16q12 18 -2 34z" fill="#ffe082"/>
+<circle class="spark" cx="78" cy="96" r="2" fill="#ffd166"/>
+<circle class="spark s2" cx="96" cy="90" r="1.6" fill="#ffd166"/>
+<circle class="spark s3" cx="110" cy="100" r="2.2" fill="#ffd166"/>
+<g class="rocket"><rect x="150" y="150" width="8" height="26" rx="2" fill="#c62828"/><path d="M150 150l4 -10l4 10z" fill="#ffd166"/><line x1="154" y1="176" x2="154" y2="196" stroke="#8d6e63" stroke-width="2"/><path d="M151 178q3 10 6 0" fill="#ff8c1a"/></g>
+</svg></div>

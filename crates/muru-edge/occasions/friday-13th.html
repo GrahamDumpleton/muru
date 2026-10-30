@@ -1,0 +1,22 @@
+<style>
+body { background: #121212; color: #e0e0e0; }
+h1 span { color: #7a7a7a; }
+dt { color: #9a9a9a; }
+footer { color: #6a6a6a; }
+pre { background: #1c1c1c; border-color: #333; color: #e0e0e0; }
+.eye { transform-box: fill-box; transform-origin: center; animation: blink 4s ease-in-out infinite; }
+.tail { transform-box: fill-box; transform-origin: bottom left; animation: swish 2.4s ease-in-out infinite alternate; }
+@keyframes blink { 0%, 92%, 100% { transform: scaleY(1); } 96% { transform: scaleY(0.1); } }
+@keyframes swish { from { transform: rotate(-8deg); } to { transform: rotate(8deg); } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<path class="tail" d="M60 170q-40 -10 -30 -50q6 -16 20 -14" stroke="#000" stroke-width="12" fill="none" stroke-linecap="round"/>
+<ellipse cx="110" cy="150" rx="55" ry="36" fill="#000"/>
+<circle cx="140" cy="100" r="34" fill="#000"/>
+<path d="M112 84l-4 -32l24 18zM168 84l4 -32l-24 18z" fill="#000"/>
+<g fill="#7CFC00"><ellipse class="eye" cx="128" cy="98" rx="7" ry="9"/><ellipse class="eye" cx="152" cy="98" rx="7" ry="9"/></g>
+<g fill="#000"><ellipse cx="128" cy="98" rx="2" ry="8"/><ellipse cx="152" cy="98" rx="2" ry="8"/></g>
+<path d="M136 112l4 3l4 -3" stroke="#555" stroke-width="1.5" fill="none"/>
+<path d="M105 115l-20 -3M105 119l-20 3M175 115l20 -3M175 119l20 3" stroke="#555" stroke-width="1"/>
+<text x="30" y="40" font-size="40" font-family="serif" fill="#2a2a2a">13</text>
+</svg></div>
