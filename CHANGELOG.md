@@ -132,6 +132,9 @@ breaking changes, which are listed under each release.
   each function by the line it starts on, as a profile read from inside
   does, rather than by the line that was running, so a function's samples
   are counted together.
+- Fixed `muructl debug attach` detaching with the session reported as still
+  open when pdb wrote once more before the debugged code went on: the
+  detach now waits for the session to end.
 
 ### Documentation
 
