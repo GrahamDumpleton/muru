@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import sys
 import threading
 import time
 
@@ -272,6 +273,10 @@ def test_the_hard_timeout_answers_the_stuck_request_at_once() -> None:
         server.stop()
 
 
+@pytest.mark.skipif(
+    not getattr(sys, "_is_gil_enabled", lambda: True)(),
+    reason="a free-threaded build has no interpreter lock to hold",
+)
 def test_a_stall_on_a_condemned_worker_ends_its_grace() -> None:
     """A worker the hard timeout has condemned may still hold other
     requests, which get the drain grace to finish. When the GIL stall
