@@ -270,3 +270,57 @@ def test_the_hard_timeout_answers_the_stuck_request_at_once() -> None:
         assert server.wait_for_log("gave up 1 request for the edge to answer")
     finally:
         server.stop()
+
+
+def test_a_stall_on_a_condemned_worker_ends_its_grace() -> None:
+    """A worker the hard timeout has condemned may still hold other
+    requests, which get the drain grace to finish. When the GIL stall
+    timeout then finds it stalled, none of them can, so they are given up
+    and the worker is killed a moment later rather than after the grace
+    and the shutdown timeout."""
+
+    server = support.start(
+        "plain_wsgi:application",
+        workers=1,
+        threads=2,
+        args=[
+            "--timeout",
+            "hard=2s",
+            "--timeout",
+            "gil_stall=5s",
+            "--timeout",
+            "hard_drain_grace=20s",
+            "--timeout",
+            "shutdown=20s",
+        ],
+    )
+
+    try:
+        answers: dict[str, tuple[int, float]] = {}
+
+        def ask(name: str, path: str, delay: float) -> None:
+            time.sleep(delay)
+            started = time.monotonic()
+
+            try:
+                status = server.get(path, headers={"Accept": "application/json"}).status
+            except OSError:
+                status = 0
+
+            answers[name] = (status, time.monotonic() - started)
+
+        stuck = threading.Thread(target=ask, args=("stuck", "/hold?seconds=40", 0), daemon=True)
+        other = threading.Thread(target=ask, args=("other", "/", 1), daemon=True)
+        stuck.start()
+        other.start()
+        stuck.join(timeout=30)
+        other.join(timeout=30)
+        assert answers["stuck"][0] == 504, answers
+        assert server.wait_for_log("while being replaced; nothing it holds can finish"), (
+            server.log()
+        )
+        status, waited = answers["other"]
+        assert status == 502, answers
+        assert waited < 12, answers
+    finally:
+        server.stop()

@@ -75,6 +75,11 @@ RESTART_DELAY_SECONDS = 0.5
 ACK_TIMEOUT_SECONDS = 5.0
 ROUTE_SETTLE_SECONDS = 1.0
 
+# How long a stalled worker already being replaced gets to give up its
+# requests before it is killed.
+
+STALLED_KILL_SECONDS = 1.0
+
 # How long after a forced restart takes a worker out of routing it is
 # killed: time enough for its stacks to be taken.
 
@@ -714,6 +719,10 @@ class Replacement:
     capture: str | None = None
     announced: int | None = None
     announced_at: float | None = None
+
+    # A stall found after the condemnation ends the grace (section 7.6).
+
+    stalled: bool = False
     terminate_at: float | None = None
     terminated: bool = False
     kill_at: float | None = None
@@ -2402,12 +2411,36 @@ class Host:
             return
 
         # A worker condemned twice, by the silence check and then by its
-        # own stall event, is replaced once: a second replacement would
-        # start a second worker, and queue its requests' abandonment
-        # behind the stacks request the first left blocked on the
-        # interpreter.
+        # own stall event, or by the hard timeout and then a stall, is
+        # replaced once: a second replacement would start a second worker.
+        # A stall's verdict still counts, though. Nothing the worker holds
+        # can finish, so it is asked to give up the rest for the edge to
+        # answer, and killed in a moment rather than after the drain
+        # grace, since that ask may queue behind a stacks request the
+        # first condemnation left blocked on the interpreter.
 
         if state.replaced or state.index in self.replacing:
+            replacement = self.replacing.get(state.index)
+
+            if (
+                abandon is not None
+                and abandon.get("which") == "all"
+                and replacement is not None
+                and replacement.old_pid == state.pid
+                and not replacement.stalled
+            ):
+                replacement.stalled = True
+                log(
+                    f"worker {state.index} (pid {state.pid}) {reason} while being "
+                    "replaced; nothing it holds can finish"
+                )
+                self.abandon_requests(state, abandon)
+                now = time.monotonic()
+                replacement.terminate_at = now
+                replacement.terminated = True
+                replacement.kill_at = now + STALLED_KILL_SECONDS
+                self.signal(state.pid, signal.SIGTERM)
+
             return
 
         if self.control_listener is None:
