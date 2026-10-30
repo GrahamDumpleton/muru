@@ -294,8 +294,9 @@ a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
 daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
 configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
-and `[error_override]` tables and the [node's
-budget](scaling.md#the-nodes-budget). The [systemd
+and `[error_override]` tables, the [node's
+budget](scaling.md#the-nodes-budget) and the dashboard's `actions`
+switch. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's

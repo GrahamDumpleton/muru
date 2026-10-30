@@ -521,8 +521,10 @@ pub struct Info {
     /// The dashboard's login codes and sessions, when it is served
     /// (section 10.7).
     pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
-    /// Whether a dashboard session may be given the actions.
-    pub dashboard_actions: bool,
+    /// Whether a dashboard session may be given the actions, which
+    /// `muructl dashboard login --actions` asks for, and whether a session
+    /// that has them may act: `[dashboard] actions`, re-read on reload.
+    pub dashboard_actions: Arc<std::sync::atomic::AtomicBool>,
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
@@ -886,7 +888,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let metrics = config.metrics;
     let dashboard = config.dashboard;
     let dashboard_sessions = dashboard.is_some().then(muru_dashboard::Sessions::new);
-    let dashboard_actions = config.dashboard_actions;
+    let dashboard_actions = Arc::new(std::sync::atomic::AtomicBool::new(config.dashboard_actions));
     let sinks = std::mem::take(&mut config.sinks);
     let locations = config.locations;
 
@@ -1017,7 +1019,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        dashboard_actions,
+        dashboard_actions: Arc::clone(&dashboard_actions),
         defined: std::sync::RwLock::new(crate::config::Defined {
             budget: crate::budget::View {
                 budget: config.budget,
@@ -1068,6 +1070,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 events.clone(),
                 dashboard_sessions.unwrap_or_else(muru_dashboard::Sessions::new),
                 Arc::clone(&handle.store),
+                Arc::clone(&dashboard_actions),
             )))
         }
         None => None,
@@ -2138,6 +2141,13 @@ impl Daemon {
                 .and_then(|table| table.budget.as_ref()),
         )
         .map_err(|error| format!("[daemon.budget]: {error}"))?;
+        let dashboard_actions = document
+            .dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.actions);
+        self.info
+            .dashboard_actions
+            .store(dashboard_actions, std::sync::atomic::Ordering::Relaxed);
         let changed = proxy != self.proxy
             || compression != self.compression
             || error_pages != self.error_pages
@@ -2160,14 +2170,15 @@ impl Daemon {
         }
 
         let message = format!(
-            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}, and the budget is {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
+            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}, the budget is {}, and the dashboard's actions are {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
             path.display(),
             if changed {
                 "changed and the edge has them"
             } else {
                 "are unchanged"
             },
-            self.budget.describe(&self.budget_usage())
+            self.budget.describe(&self.budget_usage()),
+            if dashboard_actions { "on" } else { "off" }
         );
         self.events
             .emit("config.reloaded", "daemon", "info", &message);

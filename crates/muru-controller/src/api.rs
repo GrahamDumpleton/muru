@@ -169,7 +169,11 @@ impl Admin for Service {
             ));
         };
 
-        if request.actions && !info.dashboard_actions {
+        if request.actions
+            && !info
+                .dashboard_actions
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(Status::failed_precondition(
                 "the dashboard's actions are off; set actions = true in the [dashboard] table",
             ));

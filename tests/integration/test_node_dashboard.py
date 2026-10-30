@@ -842,3 +842,41 @@ def test_the_dashboard_works_under_a_proxy_path_prefix(tmp_path: Path) -> None:
     finally:
         proxy.shutdown()
         daemon.stop()
+
+
+def test_the_actions_switch_is_reloaded_and_stops_earlier_sessions(tmp_path: Path) -> None:
+    """`[dashboard] actions` is re-read by a reload; a session issued while
+    it was on is refused when it acts after it goes off, and acts again
+    once it is back on."""
+
+    port = support.free_port()
+    daemon = start_daemon(
+        tmp_path,
+        arguments=["--dashboard", f"127.0.0.1:{port}"],
+        config_extra="[dashboard]\nactions = true\n",
+    )
+
+    try:
+        assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+        bearer = daemon.muructl("dashboard", "login", "--actions", "--token").stdout.strip()
+        scripted = {"Authorization": f"Bearer {bearer}"}
+        on = {"app": "shop", "state": "on"}
+        off = {"app": "shop", "state": "off"}
+        config = tmp_path / "muru.toml"
+        text = config.read_text()
+        config.write_text(text.replace("actions = true", "actions = false"))
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "the dashboard's actions are off" in reloaded, reloaded
+        status, body = post_form(port, "/actions/maintenance", on, scripted)
+        assert status == 409 and b"actions are off" in body, (status, body)
+        assert daemon.request("/").status == 200
+        refused = daemon.muructl("dashboard", "login", "--actions", check=False)
+        assert refused.returncode != 0 and "actions are off" in refused.stderr
+
+        config.write_text(text)
+        assert "the dashboard's actions are on" in daemon.muructl("daemon", "reload").stdout
+        assert post_form(port, "/actions/maintenance", on, scripted)[0] == 303
+        assert daemon.request("/").status == 503
+        post_form(port, "/actions/maintenance", off, scripted)
+    finally:
+        daemon.stop()
