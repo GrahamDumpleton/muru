@@ -138,8 +138,8 @@ with 1001, which tells a client the server is going away and that it can
 connect again, and then exits. The access log lines say
 `websocket=closed by=edge code=1001`.
 
-The same happens on a reload. Start the server with `--reload`, join
-from a client, and change the text of the page in `chat.py`. The terminal
+The same happens on a reload. Join from a client and change the text of
+the page in `chat.py`; the run reloads on change by default. The terminal
 says `switched to release r2`, the client's socket is closed with 1001,
 and a client that joins again reaches the new code. The chat starts
 empty, because the new worker ran its own lifespan and made its own set.

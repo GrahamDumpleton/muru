@@ -34,6 +34,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[[app.NAME.release.ID.static]]` | application files, or `[[tool.muru.static]]` | the release's own directories of files (section 4.9) |
 | `[app.NAME.release.ID.groups.NAME]` | application files | worker groups |
 | `[tool.muru]` | the application's pyproject.toml or muru.toml | application-shipped defaults |
+| `[tool.muru.run]`, `[run]` | the application's pyproject.toml or muru.toml, and muru.local.toml | how `muructl run` serves the project (section 13.1): a key for each flag of the command that describes the serving, ignored by the daemon |
 | `[overlay.NAME]` | application files | overlays and triggers |
 | `[[client_class]]` | daemon or application files | classification rules |
 | `[rate_limit.NAME]` | daemon or application files | rate limits |

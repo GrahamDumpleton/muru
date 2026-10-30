@@ -17,6 +17,7 @@ Still to be written:
 flask-and-django
 asgi
 starlette-and-fastapi
+run-settings
 daemon
 secrets
 users
