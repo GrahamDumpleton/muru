@@ -9,6 +9,7 @@ what the first left running.
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import socket
 import ssl
@@ -185,6 +186,30 @@ class Daemon:
 
     def events(self) -> list[str]:
         return [line.split(None, 4)[3] for line in self.muructl("events").stdout.splitlines()]
+
+    def wait_for_routing(self, app: str, timeout: float = 20.0) -> None:
+        """Wait until the host says the edge routes to every worker of the
+        application's serving release.
+
+        The daemon pushes a snapshot once more when it takes the host's
+        first announcement, just after a deploy answers; a worker stopped
+        before that push is unreachable to it and gets replaced, so a test
+        that stops a worker waits for this first.
+        """
+
+        deadline = time.monotonic() + timeout
+
+        while True:
+            status = json.loads(self.muructl("debug", "status", app, "--json").stdout)
+            workers = status["workers"]
+
+            if workers and all(worker["result"]["routed"] for worker in workers):
+                return
+
+            if time.monotonic() > deadline:
+                raise AssertionError(f"the edge does not route to every worker of {app}: {status}")
+
+            time.sleep(0.1)
 
     def log(self) -> str:
         return self.log_path.read_text(errors="replace")

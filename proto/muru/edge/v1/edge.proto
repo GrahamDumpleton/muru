@@ -316,6 +316,16 @@ message Group {
 
 message Applied {
   uint64 version = 1;
+  // Workers the snapshot named that the edge could not connect to; the
+  // snapshot was applied without them (section 5.1).
+  repeated UnreachableWorker unreachable = 2;
+}
+
+message UnreachableWorker {
+  string app = 1;
+  string release = 2;
+  string socket = 3;
+  string reason = 4;
 }
 
 message EdgeStatusRequest {}

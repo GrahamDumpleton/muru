@@ -273,8 +273,10 @@ impl EdgeProcess {
         }
     }
 
-    /// Push a snapshot, numbered after the last one.
-    pub async fn apply(&mut self, snapshot: pb::Snapshot) -> anyhow::Result<()> {
+    /// Push a snapshot, numbered after the last one. The answer names the
+    /// workers the edge could not connect to, which the snapshot was
+    /// applied without (section 5.1).
+    pub async fn apply(&mut self, snapshot: pb::Snapshot) -> anyhow::Result<pb::Applied> {
         self.snapshot = pb::Snapshot {
             version: self.snapshot.version + 1,
             ..snapshot
@@ -282,7 +284,7 @@ impl EdgeProcess {
         *self.control_now.lock().expect("control poisoned") = self.spec.control.clone();
         let mut client = connect(&self.spec.control).await?;
 
-        tokio::time::timeout(APPLY_TIMEOUT, client.apply(self.snapshot.clone()))
+        let applied = tokio::time::timeout(APPLY_TIMEOUT, client.apply(self.snapshot.clone()))
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -294,7 +296,7 @@ impl EdgeProcess {
                 anyhow::anyhow!("the edge refused the snapshot: {}", status.message())
             })?;
 
-        Ok(())
+        Ok(applied.into_inner())
     }
 
     /// Section 7.4: send each group a request is waiting to wake to

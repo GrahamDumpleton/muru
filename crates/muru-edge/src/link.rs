@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Context as _;
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -281,10 +280,23 @@ pub struct WorkerStatus {
     pub in_flight: usize,
 }
 
+/// A worker a pool was to connect to and could not: its socket was
+/// missing, refused the connection, or did not answer HELLO in time
+/// (section 5.1). The pool is built from the workers that answered.
+#[derive(Debug, Clone)]
+pub struct Unreachable {
+    /// The worker's link socket.
+    pub path: PathBuf,
+    /// Why it could not be connected to.
+    pub reason: String,
+}
+
 /// Connection pools for a set of workers.
 pub struct LinkPool {
     workers: Vec<WorkerSlots>,
     next: AtomicUsize,
+    /// The workers that could not be connected to, left out of the pool.
+    unreachable: Vec<Unreachable>,
     /// Requests waiting for a slot, for the metrics.
     waiting: AtomicUsize,
     /// The gRPC methods the workers' mounts registered, from HELLO
@@ -323,15 +335,27 @@ pub(crate) struct Lease {
 impl LinkPool {
     /// Connect once to every worker socket and size its pool from what its
     /// HELLO declares (section 5.1): the edge acts on the capabilities, not
-    /// on the kind of worker. The first connection stays in the pool.
+    /// on the kind of worker. The first connection stays in the pool. A
+    /// worker that cannot be connected to, or does not answer HELLO in
+    /// time, is left out and listed as unreachable rather than failing the
+    /// pool: one stopped worker must not keep a snapshot from being
+    /// applied for everything else.
     pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
         let mut workers = Vec::with_capacity(sockets.len());
+        let mut unreachable = Vec::new();
         let mut grpc = Vec::new();
 
         for path in sockets {
-            let (conn, hello) = connect(path)
-                .await
-                .with_context(|| format!("connecting to the worker at {}", path.display()))?;
+            let (conn, hello) = match connect(path).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    unreachable.push(Unreachable {
+                        path: path.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
 
             // Every worker of a release registers the same methods.
 
@@ -345,10 +369,16 @@ impl LinkPool {
         Ok(Self {
             workers,
             next: AtomicUsize::new(0),
+            unreachable,
             waiting: AtomicUsize::new(0),
             grpc,
             wake: None,
         })
+    }
+
+    /// The workers the snapshot named that this pool could not connect to.
+    pub fn unreachable(&self) -> &[Unreachable] {
+        &self.unreachable
     }
 
     /// Whether the workers serve gRPC methods (section 6.13).
@@ -402,6 +432,7 @@ impl LinkPool {
         Self {
             workers: Vec::new(),
             next: AtomicUsize::new(0),
+            unreachable: Vec::new(),
             waiting: AtomicUsize::new(0),
             grpc: Vec::new(),
             wake: None,

@@ -183,6 +183,10 @@ actions = true
 $ muructl dashboard login --actions
 ```
 
+The switch is read again by `muructl daemon reload`: turned off, a
+session that has the actions is refused when it tries one, with a 409
+for a script, until the switch is turned on again.
+
 A session that may act shows buttons beside each release and worker
 group, and each worker, for what `muructl` would do:
 

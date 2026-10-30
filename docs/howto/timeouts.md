@@ -213,7 +213,10 @@ the `worker.timeout_killed` one.
 The host also times each worker's reports, which the worker sends from
 outside Python once a second, and replaces a worker whose next report
 is the same period late: one stopped by a signal, or frozen whole. Its
-requests are answered `502 worker_stalled` as well.
+requests are answered `502 worker_stalled` as well. A stall found on a
+worker the hard timeout has already condemned ends its drain grace: the
+requests it still holds are given up, and it is killed a moment later
+rather than after the grace and the shutdown timeout.
 
 | Name | Default | Measured | When it fires |
 | --- | --- | --- | --- |

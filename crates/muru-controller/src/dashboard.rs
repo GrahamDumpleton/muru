@@ -21,7 +21,8 @@ use crate::store::Store;
 
 /// Serve the dashboard on the listener until accepting fails, for the
 /// sessions given, which also take the actions when they may; `store`
-/// is read for what an action must check first.
+/// is read for what an action must check first, and `allowed` is the
+/// daemon's `[dashboard] actions` switch as it stands after any reload.
 pub async fn serve(
     listener: TcpListener,
     commands: mpsc::Sender<Command>,
@@ -29,10 +30,11 @@ pub async fn serve(
     events: Events,
     sessions: Arc<Sessions>,
     store: Arc<Store>,
+    allowed: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let actions = Actions {
         sessions,
-        sink: action_sink(commands.clone(), events.clone(), store),
+        sink: action_sink(commands.clone(), events.clone(), store, allowed),
     };
     let debug = debug_source(commands.clone());
     let data_commands = commands.clone();
@@ -152,12 +154,25 @@ fn action_sink(
     commands: mpsc::Sender<Command>,
     events: Events,
     store: Arc<Store>,
+    allowed: Arc<std::sync::atomic::AtomicBool>,
 ) -> muru_dashboard::ActionSink {
     Arc::new(move |action, session| {
         let commands = commands.clone();
         let events = events.clone();
         let store = Arc::clone(&store);
+        let allowed = Arc::clone(&allowed);
         Box::pin(async move {
+            // The switch is read as it stands now, so a session issued
+            // while actions were on stops acting once they are off.
+
+            if !allowed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(
+                    "the dashboard's actions are off; set actions = true in the \
+                            [dashboard] table and reload"
+                        .to_owned(),
+                );
+            }
+
             let what = carry_out(&commands, &store, action).await?;
             let (subject, what) = what;
             let what = format!("{what} from the dashboard, session {session}");

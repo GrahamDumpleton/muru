@@ -716,6 +716,23 @@ impl GroupPath {
 pub const SERVER_GROUP: &str = "http";
 
 impl AppPools {
+    /// The workers of any of this release's pools that could not be
+    /// connected to, each once.
+    pub fn unreachable(&self) -> Vec<crate::link::Unreachable> {
+        let mut pools: Vec<&Arc<LinkPool>> = vec![&self.default];
+
+        for group in &self.groups {
+            if !pools.iter().any(|pool| Arc::ptr_eq(pool, &group.pool)) {
+                pools.push(&group.pool);
+            }
+        }
+
+        pools
+            .into_iter()
+            .flat_map(|pool| pool.unreachable().iter().cloned())
+            .collect()
+    }
+
     /// Connect the default workers and each group's. `app` and `release`
     /// label the requests served in the access log; `redirects` says
     /// which response forms from the default mount are internal
@@ -1040,9 +1057,27 @@ pub fn group_prefix(path: &str) -> String {
 }
 
 /// The compiled routing tables of one snapshot.
+/// A worker a snapshot named that the edge could not connect to, so the
+/// snapshot was applied without it (section 5.1).
+#[derive(Debug, Clone)]
+pub struct UnreachableWorker {
+    /// The application the worker serves.
+    pub app: String,
+    /// Its release.
+    pub release: String,
+    /// The worker's link socket.
+    pub socket: std::path::PathBuf,
+    /// Why it could not be connected to.
+    pub reason: String,
+}
+
+/// Everything a snapshot gives the edge to route by: the hosts and
+/// routes, the applications' pools, the upstreams and the policies.
 pub struct Routing {
     version: u64,
     trust: Trust,
+    /// The workers left out of the pools, for the daemon to act on.
+    unreachable: Vec<UnreachableWorker>,
     compression: crate::compression::Compression,
     default: Arc<AppPools>,
     apps: HashMap<String, AppReleases>,
@@ -1142,12 +1177,18 @@ impl Decision {
 }
 
 impl Routing {
+    /// The workers the snapshot named that could not be connected to.
+    pub fn unreachable(&self) -> &[UnreachableWorker] {
+        &self.unreachable
+    }
+
     /// One application and nothing else: development mode, or a daemon
     /// with no host declared.
     pub fn single(pools: AppPools) -> Self {
         Self {
             version: 0,
             trust: Trust::default(),
+            unreachable: Vec::new(),
             compression: crate::compression::Compression::default(),
             default: Arc::new(pools),
             apps: HashMap::new(),
@@ -1346,9 +1387,39 @@ impl Routing {
             h2c.insert(listener, networks);
         }
 
+        // Section 5.1: a worker that could not be connected to is reported
+        // rather than refusing the snapshot.
+
+        let mut unreachable = Vec::new();
+
+        for (name, releases) in &apps {
+            for (release, pools) in &releases.releases {
+                for worker in pools.unreachable() {
+                    unreachable.push(UnreachableWorker {
+                        app: name.clone(),
+                        release: release.clone(),
+                        socket: worker.path.clone(),
+                        reason: worker.reason.clone(),
+                    });
+                }
+            }
+        }
+
+        if default_app.is_none() {
+            for worker in default.unreachable() {
+                unreachable.push(UnreachableWorker {
+                    app: snapshot.default_app.clone(),
+                    release: snapshot.default_release.clone(),
+                    socket: worker.path.clone(),
+                    reason: worker.reason.clone(),
+                });
+            }
+        }
+
         let mut routing = Self {
             version: snapshot.version,
             trust,
+            unreachable,
             compression,
             default,
             apps,

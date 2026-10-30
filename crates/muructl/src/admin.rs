@@ -642,15 +642,17 @@ pub enum DebugCommand {
     /// --diff since a snapshot kept with --snapshot.
     Memory(MemoryArgs),
 
-    /// Run Python code in the workers and print its output and value;
-    /// allowed only when the daemon's [daemon] table sets debug_exec.
+    /// Run Python code in the workers and print its output and value.
+    /// Allowed as it is under muructl run; under the daemon, only when
+    /// its [daemon] table sets debug_exec.
     Exec(ExecArgs),
 
     /// Open a pdb session in a worker: on the thread stopped at
     /// breakpoint(), else on a thread of its own. Each line read is a pdb
     /// command, and the end of input lets the code go on. Without
-    /// --worker, the first worker with a breakpoint waiting. Allowed only
-    /// when the daemon's [daemon] table sets debug_exec.
+    /// --worker, the first worker with a breakpoint waiting. Allowed as it
+    /// is under muructl run; under the daemon, only when its [daemon]
+    /// table sets debug_exec.
     Attach(AttachArgs),
 }
 
@@ -4539,12 +4541,18 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
 
         // Paths are resolved here, where the file is, since the daemon
-        // may run elsewhere.
+        // may run elsewhere. The file's directory is made absolute first,
+        // so that a file named by a relative path gives absolute paths
+        // too: the daemon checks some of them, such as sendfile_roots,
+        // for being absolute.
 
         let base = file
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let base = std::fs::canonicalize(&base).unwrap_or_else(|_| {
+            std::env::current_dir().map_or(base.clone(), |cwd| cwd.join(&base))
+        });
         resolve_paths(&mut parsed, &base);
         document
             .merge(parsed)

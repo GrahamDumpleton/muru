@@ -187,13 +187,18 @@ def readable_from_outside() -> bool:
 
 def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
+    daemon.wait_for_routing("plain")
     pid = json.loads(daemon.get("/info").body)["pid"]
     os.kill(pid, signal.SIGSTOP)
 
     try:
         started = time.monotonic()
-        answer = json.loads(daemon.muructl("debug", "stacks", "plain", "--json").stdout)
-        worker = answer["workers"][0]
+        asked = daemon.muructl("debug", "stacks", "plain", "--json", check=False)
+        assert asked.returncode == 0, (
+            f"{asked.stdout}{asked.stderr}\n--- events\n"
+            f"{daemon.muructl('events').stdout}\n--- daemon log\n{daemon.log()[-4000:]}"
+        )
+        worker = json.loads(asked.stdout)["workers"][0]
         assert time.monotonic() - started < 15
     finally:
         os.kill(pid, signal.SIGCONT)
@@ -214,28 +219,37 @@ def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
 
 def test_a_stopped_worker_does_not_hold_up_the_daemon(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
+    daemon.wait_for_routing("plain")
     pid = json.loads(daemon.get("/info").body)["pid"]
     os.kill(pid, signal.SIGSTOP)
 
     # A snapshot names the stopped worker, which accepts the edge's
-    # connection and never answers HELLO: the edge gives up on it, keeping
-    # its last snapshot, and the daemon goes on answering.
+    # connection and never answers HELLO: the edge gives up on it and
+    # applies the snapshot without it, the daemon goes on answering, and
+    # the worker is named and replaced.
 
     try:
         started = time.monotonic()
-        refused = daemon.muructl("maintenance", "on", "plain", check=False)
+        daemon.muructl("maintenance", "on", "plain")
         assert time.monotonic() - started < 15
-        assert "did not answer HELLO within 5 s" in refused.stderr, refused.stderr
 
         started = time.monotonic()
         assert "plain@r1" in daemon.muructl("release", "list", "plain").stdout
         daemon.muructl("debug", "status", "plain")
         assert time.monotonic() - started < 5
+        log = daemon.muructl("events").stdout
+        assert "worker.unreachable" in daemon.events(), log
+        assert "did not answer HELLO within 5 s" in log, log
+        wait_for(lambda: "worker.restarted" in daemon.events())
     finally:
-        os.kill(pid, signal.SIGCONT)
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
 
     daemon.muructl("maintenance", "off", "plain")
-    assert daemon.get("/").status == 200
+    wait_for(lambda: daemon.get("/").status == 200)
+    assert json.loads(daemon.get("/info").body)["pid"] != pid
 
 
 def test_stacks_are_read_from_outside_a_worker_holding_the_interpreter(daemon: Daemon) -> None:

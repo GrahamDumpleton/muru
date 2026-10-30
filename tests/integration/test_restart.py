@@ -90,6 +90,7 @@ def test_a_worker_is_named_by_pid_and_a_missing_one_is_refused(daemon: Daemon) -
 
 def test_force_recovers_a_frozen_worker(daemon: Daemon) -> None:
     before = deploy_shop(daemon)
+    daemon.wait_for_routing("shop")
     os.kill(before[0], signal.SIGSTOP)
 
     try:

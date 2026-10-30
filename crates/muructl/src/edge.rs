@@ -383,11 +383,36 @@ impl EdgeControl for Control {
             });
         }
 
+        // Section 5.1: a worker that did not answer is left out of its
+        // pool and reported to the daemon, rather than refusing the
+        // snapshot for every application.
+
+        let unreachable: Vec<pb::UnreachableWorker> = routing
+            .unreachable()
+            .iter()
+            .map(|worker| {
+                tracing::warn!(
+                    app = %worker.app,
+                    release = %worker.release,
+                    socket = %worker.socket.display(),
+                    reason = %worker.reason,
+                    "a worker could not be connected to; the snapshot is applied without it"
+                );
+                pb::UnreachableWorker {
+                    app: worker.app.clone(),
+                    release: worker.release.clone(),
+                    socket: worker.socket.display().to_string(),
+                    reason: worker.reason.clone(),
+                }
+            })
+            .collect();
+
         self.resolver.replace(certificates);
         self.pools.apply(routing);
         self.version.store(snapshot.version, Ordering::Relaxed);
         Ok(Response::new(pb::Applied {
             version: snapshot.version,
+            unreachable,
         }))
     }
 
