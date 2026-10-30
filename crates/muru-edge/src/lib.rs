@@ -809,13 +809,20 @@ async fn serve<I>(
             .min(shared.limits.header_read_timeout)
     };
     let max_requests = shared.limits.max_requests_per_connection;
+    let head_timeout = shared.limits.header_read_timeout;
     let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Set once the first request head has been read, which a drain waits
+    // for (below) before it closes the connection.
+
+    let (first_request, mut first_request_seen) = tokio::sync::watch::channel(false);
     let service = service_fn(move |request: http::Request<Incoming>| {
         let shared = Arc::clone(&shared);
         let tls = tls.clone();
         let listener = listener.clone();
         let base_id = shared.request_ids.next();
         let served = Arc::clone(&served);
+        let _ = first_request.send_replace(true);
         async move {
             // Section 4.7: forwarding headers from a trusted proxy say who
             // the client is and how it connected; from anyone else they
@@ -1565,7 +1572,12 @@ async fn serve<I>(
     // With upgrades, so a 101 hands the connection over for WebSockets.
     // A drain tells the connection to finish: HTTP/1.1 closes once the
     // response in flight is done, or at once when idle, and HTTP/2 sends
-    // GOAWAY and lets its streams complete.
+    // GOAWAY and lets its streams complete. A connection just accepted
+    // is idle too, with its first request still on the wire, and closing
+    // it would reset that request unanswered (the client has no response
+    // to retry on, unlike an idle keep-alive connection), so the drain
+    // first gives the first request the head read timeout to arrive and
+    // then closes after its response.
 
     let mut protocols = state.protocols.clone();
     protocols.http1().header_read_timeout(keep_alive);
@@ -1573,16 +1585,22 @@ async fn serve<I>(
     let mut connection = std::pin::pin!(connection);
     let mut draining = state.draining.subscribe();
 
-    let ended = if *draining.borrow_and_update() {
-        connection.as_mut().graceful_shutdown();
-        connection.await
-    } else {
-        tokio::select! {
-            ended = connection.as_mut() => ended,
-            _ = draining.changed() => {
-                connection.as_mut().graceful_shutdown();
-                connection.await
-            }
+    let drain = async {
+        if !*draining.borrow_and_update() {
+            let _ = draining.changed().await;
+        }
+
+        if !*first_request_seen.borrow_and_update() {
+            let _ = tokio::time::timeout(head_timeout, first_request_seen.changed()).await;
+        }
+    };
+    let mut drain = std::pin::pin!(drain);
+
+    let ended = tokio::select! {
+        ended = connection.as_mut() => ended,
+        _ = &mut drain => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
         }
     };
 
