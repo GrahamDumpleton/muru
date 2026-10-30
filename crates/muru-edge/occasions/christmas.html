@@ -1,0 +1,31 @@
+<style>
+body { background: #fbf7f2; }
+h1 { color: #b3261e; }
+h1 span, dt { color: #2e7d32; }
+pre { border-color: #c8e6c9; }
+footer { color: #2e7d32; }
+.bulb { animation: twinkle 1.4s ease-in-out infinite alternate; }
+.c2 { animation-delay: 0.35s; }
+.c3 { animation-delay: 0.7s; }
+.c4 { animation-delay: 1.05s; }
+.bow { transform-box: fill-box; transform-origin: bottom center; animation: wiggle 2.5s ease-in-out infinite alternate; }
+@keyframes twinkle { from { opacity: 0.35; } to { opacity: 1; } }
+@keyframes wiggle { from { transform: rotate(-4deg); } to { transform: rotate(4deg); } }
+</style>
+<div class="occasion-top" aria-hidden="true"><svg viewBox="0 0 1000 60" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M0 10q125 40 250 10t250 0t250 0t250 0" stroke="#2e7d32" stroke-width="2" fill="none"/>
+<g>
+<circle class="bulb" cx="60" cy="24" r="6" fill="#e53935"/><circle class="bulb c2" cx="140" cy="31" r="6" fill="#fdd835"/><circle class="bulb c3" cx="220" cy="24" r="6" fill="#1e88e5"/><circle class="bulb c4" cx="300" cy="18" r="6" fill="#43a047"/>
+<circle class="bulb" cx="380" cy="24" r="6" fill="#fdd835"/><circle class="bulb c2" cx="460" cy="31" r="6" fill="#e53935"/><circle class="bulb c3" cx="540" cy="24" r="6" fill="#43a047"/><circle class="bulb c4" cx="620" cy="18" r="6" fill="#1e88e5"/>
+<circle class="bulb" cx="700" cy="24" r="6" fill="#e53935"/><circle class="bulb c2" cx="780" cy="31" r="6" fill="#43a047"/><circle class="bulb c3" cx="860" cy="24" r="6" fill="#fdd835"/><circle class="bulb c4" cx="940" cy="18" r="6" fill="#1e88e5"/>
+</g>
+</svg></div>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<ellipse cx="100" cy="190" rx="90" ry="6" fill="#e0d6c8"/>
+<rect x="20" y="120" width="70" height="66" rx="4" fill="#b3261e"/><rect x="50" y="120" width="10" height="66" fill="#f2c14e"/><rect x="20" y="148" width="70" height="10" fill="#f2c14e"/>
+<g class="bow"><path d="M55 120q-20 -22 -6 -26q8 -2 6 26q20 -22 6 -26q-8 -2 -6 26z" fill="#f2c14e"/><circle cx="55" cy="120" r="4" fill="#d9a62e"/></g>
+<rect x="100" y="140" width="52" height="46" rx="4" fill="#2e7d32"/><rect x="122" y="140" width="8" height="46" fill="#fff"/><rect x="100" y="160" width="52" height="8" fill="#fff"/>
+<g class="bow"><path d="M126 140q-14 -16 -4 -18q6 -1 4 18q14 -16 4 -18q-6 -1 -4 18z" fill="#fff"/><circle cx="126" cy="140" r="3" fill="#ddd"/></g>
+<rect x="140" y="100" width="44" height="40" rx="4" fill="#1e88e5"/><rect x="158" y="100" width="8" height="40" fill="#f2c14e"/><rect x="140" y="116" width="44" height="8" fill="#f2c14e"/>
+<g class="bow"><path d="M162 100q-12 -14 -4 -16q5 -1 4 16q12 -14 4 -16q-5 -1 -4 16z" fill="#f2c14e"/><circle cx="162" cy="100" r="3" fill="#d9a62e"/></g>
+</svg></div>

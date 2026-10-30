@@ -1,0 +1,17 @@
+<style>
+body { background: #fbf9f3; }
+h1 { color: #5d4037; }
+pre { border-color: #d7ccc8; }
+.wing { transform-box: fill-box; animation: flap 0.3s ease-in-out infinite alternate; }
+.left { transform-origin: right center; }
+.right { transform-origin: left center; }
+@keyframes flap { from { transform: scaleX(1); } to { transform: scaleX(0.55); } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<rect x="20" y="120" width="120" height="60" rx="4" fill="#607d8b"/>
+<rect x="30" y="130" width="50" height="40" fill="#455a64"/><path d="M34 136h42M34 142h42M34 148h42M34 154h42M34 160h42" stroke="#cfd8dc" stroke-width="2"/>
+<path d="M90 150h30l10 -8" stroke="#ffb300" stroke-width="3" fill="none" stroke-linecap="round"/><circle cx="130" cy="142" r="3" fill="#ffb300"/><circle cx="120" cy="150" r="3" fill="#ffb300"/>
+<g transform="translate(125 128)"><ellipse class="wing left" cx="-14" cy="0" rx="16" ry="9" fill="#a1887f"/><ellipse class="wing right" cx="14" cy="0" rx="16" ry="9" fill="#a1887f"/><ellipse cx="0" cy="2" rx="5" ry="12" fill="#5d4037"/><circle cx="0" cy="-10" r="4" fill="#5d4037"/><path d="M-2 -13q-6 -8 -10 -10M2 -13q6 -8 10 -10" stroke="#5d4037" stroke-width="1.5" fill="none"/></g>
+<text x="100" y="40" text-anchor="middle" font-size="11" font-family="ui-monospace, monospace" fill="#8d6e63">first actual case of bug being found</text>
+<text x="100" y="56" text-anchor="middle" font-size="11" font-family="ui-monospace, monospace" fill="#8d6e63">9 September 1947</text>
+</svg></div>

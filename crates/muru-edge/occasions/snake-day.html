@@ -1,0 +1,18 @@
+<style>
+body { background: #f1f8e9; }
+h1 { color: #2e7d32; }
+pre { border-color: #c5e1a5; }
+.occasion { width: 7rem; height: 26rem; }
+.body { stroke-dasharray: 14 8; animation: slither 1.6s linear infinite; }
+.tongue { transform-box: fill-box; transform-origin: top center; animation: flick 0.6s ease-in-out infinite alternate; }
+@keyframes slither { to { stroke-dashoffset: -22; } }
+@keyframes flick { from { transform: scaleY(0.4); } to { transform: scaleY(1); } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 100 380" xmlns="http://www.w3.org/2000/svg">
+<path d="M50 20q40 40 0 80t0 80t0 80t0 80" stroke="#2e7d32" stroke-width="16" fill="none" stroke-linecap="round"/>
+<path class="body" d="M50 20q40 40 0 80t0 80t0 80t0 80" stroke="#66bb6a" stroke-width="8" fill="none" stroke-linecap="round"/>
+<ellipse cx="50" cy="345" rx="16" ry="20" fill="#2e7d32"/>
+<circle cx="43" cy="340" r="3" fill="#fff"/><circle cx="57" cy="340" r="3" fill="#fff"/>
+<circle cx="43" cy="341" r="1.5" fill="#000"/><circle cx="57" cy="341" r="1.5" fill="#000"/>
+<path class="tongue" d="M50 365v10l-4 5M50 375l4 5" stroke="#e53935" stroke-width="2" fill="none"/>
+</svg></div>

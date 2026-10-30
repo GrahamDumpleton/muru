@@ -1,0 +1,19 @@
+<style>
+body { margin: 0; padding: 3rem 1.5rem; font: 16px/1.5 system-ui, sans-serif; color: #1f2933; background: #f5f7fa; text-transform: uppercase; letter-spacing: 0.02em; }
+main { max-width: 44rem; margin: 0 auto; }
+h1 { font-size: 1.75rem; margin: 0 0 1rem; }
+h1 span { color: #9aa5b1; font-weight: normal; margin-right: 0.5rem; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 1.5rem 0; }
+dt { color: #616e7c; }
+pre { overflow: auto; padding: 1rem; background: #fff; border: 1px solid #d9e2ec; border-radius: 4px; font-size: 0.875rem; text-transform: none; letter-spacing: 0; }
+footer { margin-top: 2rem; color: #9aa5b1; font-size: 0.875rem; }
+.led { animation: led 1s steps(2) infinite; }
+@keyframes led { from { fill: #43a047; } to { fill: #1b5e20; } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<rect x="20" y="60" width="160" height="90" rx="12" fill="#cfd8dc"/>
+<rect x="24" y="56" width="152" height="84" rx="10" fill="#eceff1" stroke="#b0bec5" stroke-width="2"/>
+<path d="M60 112l20 -24l20 24h-12v14h-16v-14z" fill="#455a64"/>
+<text x="110" y="124" font-size="18" font-weight="bold" font-family="system-ui, sans-serif" fill="#455a64">CAPS</text>
+<circle class="led" cx="150" cy="72" r="5"/>
+</svg></div>

@@ -226,6 +226,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             grpc_web_origins: Vec::new(),
             errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
             development: false,
+            occasions: muru_edge::occasions::Setting::Calendar,
             access_log,
             limits,
             compression: muru_edge::compression::Compression::default(),

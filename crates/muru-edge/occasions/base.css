@@ -1,0 +1,8 @@
+main { position: relative; z-index: 1; }
+.occasion { position: fixed; right: 1.25rem; bottom: 1.25rem; width: 11rem; height: 11rem; pointer-events: none; z-index: 0; }
+.occasion svg { width: 100%; height: 100%; overflow: visible; }
+.occasion-top { position: fixed; left: 0; right: 0; top: 0; height: 3.5rem; pointer-events: none; z-index: 0; }
+.occasion-top svg { width: 100%; height: 100%; }
+@media (max-width: 48rem) { .occasion { width: 7rem; height: 7rem; opacity: 0.75; } }
+@media (prefers-reduced-motion: reduce) { .occasion, .occasion *, .occasion-top, .occasion-top * { animation: none !important; } }
+@media print { .occasion, .occasion-top { display: none; } }

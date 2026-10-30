@@ -1,0 +1,31 @@
+<style>
+body { background: #f1f8ee; }
+h1 { color: #00843d; }
+h1 span, dt { color: #b89a00; }
+pre { border-color: #ffcd00; }
+footer { color: #00843d; }
+.roo { transform-box: fill-box; transform-origin: bottom center; animation: bob 1.1s ease-in-out infinite alternate; }
+.jab { transform-box: fill-box; transform-origin: left center; animation: jab 0.55s ease-in-out infinite alternate; }
+.jab2 { animation-delay: 0.3s; }
+@keyframes bob { from { transform: translateY(0); } to { transform: translateY(-5px); } }
+@keyframes jab { from { transform: translateX(0); } to { transform: translateX(9px); } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<ellipse cx="100" cy="186" rx="80" ry="7" fill="#ffcd00" opacity="0.5"/>
+<g class="roo">
+<path d="M18 178Q40 130 86 152" stroke="#8b5a2b" stroke-width="15" fill="none" stroke-linecap="round"/>
+<ellipse cx="100" cy="132" rx="36" ry="46" fill="#8b5a2b"/>
+<ellipse cx="102" cy="142" rx="22" ry="30" fill="#c99b68"/>
+<path d="M112 100Q118 80 124 74" stroke="#8b5a2b" stroke-width="18" fill="none" stroke-linecap="round"/>
+<circle cx="124" cy="64" r="18" fill="#8b5a2b"/>
+<ellipse cx="139" cy="70" rx="12" ry="8" fill="#a06d3a"/>
+<ellipse cx="112" cy="44" rx="5" ry="12" fill="#8b5a2b" transform="rotate(-20 112 44)"/>
+<ellipse cx="128" cy="40" rx="5" ry="12" fill="#8b5a2b" transform="rotate(15 128 40)"/>
+<circle cx="128" cy="61" r="2.6" fill="#1f1f1f"/>
+<circle cx="148" cy="68" r="1.8" fill="#1f1f1f"/>
+<ellipse cx="86" cy="176" rx="24" ry="9" fill="#6f4522"/>
+<ellipse cx="118" cy="178" rx="24" ry="9" fill="#6f4522"/>
+<g class="jab"><path d="M118 108L146 100" stroke="#8b5a2b" stroke-width="10" fill="none" stroke-linecap="round"/><circle cx="154" cy="98" r="11" fill="#d52b1e"/><path d="M149 93l6 3" stroke="#f08a80" stroke-width="2" stroke-linecap="round"/></g>
+<g class="jab jab2"><path d="M116 122L138 126" stroke="#8b5a2b" stroke-width="10" fill="none" stroke-linecap="round"/><circle cx="146" cy="128" r="11" fill="#d52b1e"/><path d="M141 123l6 3" stroke="#f08a80" stroke-width="2" stroke-linecap="round"/></g>
+</g>
+</svg></div>

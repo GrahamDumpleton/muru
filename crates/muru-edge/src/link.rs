@@ -796,6 +796,8 @@ pub struct Context<'a> {
     pub tls: Option<&'a pb::TlsInfo>,
     /// Whether error pages show tracebacks.
     pub development: bool,
+    /// What the run was told about the traceback page's seasonal themes.
+    pub occasions: crate::occasions::Setting,
     /// Where the request's record goes once it is complete.
     pub access_log: Arc<AccessLog>,
     /// The timeouts in force.
@@ -877,6 +879,7 @@ impl<'a> Context<'a> {
             scheme: self.scheme,
             tls: self.tls,
             development: self.development,
+            occasions: self.occasions,
             access_log: Arc::clone(&self.access_log),
             limits: Arc::clone(&self.limits),
             server_name: self.server_name.clone(),
@@ -1126,6 +1129,7 @@ pub(crate) fn failing<'a>(
         request_id: context.request_id,
         max_body_size: context.limits.max_body_size,
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
+        occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(recording),
         errors: &context.errors,
@@ -1301,6 +1305,7 @@ async fn handle_inner(
         request_id: context.request_id,
         max_body_size: limits.max_body_size,
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
+        occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(None),
         errors: &context.errors,
@@ -2018,6 +2023,8 @@ pub(crate) struct Failing<'a> {
     request_id: &'a str,
     max_body_size: u64,
     negotiation: Negotiation,
+    /// What the run was told about the traceback page's seasonal themes.
+    occasions: crate::occasions::Setting,
     version: http::Version,
     recording: Mutex<Option<Recording>>,
     /// The custom pages in force (section 4.12).
@@ -2052,6 +2059,7 @@ impl Failing<'_> {
                 errors: self.errors,
                 host: &self.host,
                 path: &self.path,
+                occasions: self.occasions,
             },
         );
 
