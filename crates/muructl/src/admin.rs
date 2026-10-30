@@ -4564,6 +4564,10 @@ fn print_report(report: &pb::ConfigReport, dry_run: bool) {
         }
     }
 
+    for note in &report.notes {
+        println!("muru: {note}");
+    }
+
     for warning in &report.warnings {
         println!("muru: warning: {warning}");
     }
@@ -4595,6 +4599,7 @@ fn report_json(report: &pb::ConfigReport) -> serde_json::Value {
     serde_json::json!({
         "errors": report.errors,
         "warnings": report.warnings,
+        "notes": report.notes,
         "changes": report.changes.iter().map(|change| serde_json::json!({
             "action": change.action,
             "subject": change.subject,

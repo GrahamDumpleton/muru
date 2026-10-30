@@ -91,7 +91,10 @@ re-adoption.
 configuration file for what can change while the daemon runs; the
 [daemon guide](daemon.md#reloading-the-configuration) lists what that
 is and what is read only at start, and the reload says so too. SIGHUP
-does the same as the command.
+does the same as the command. A certificate renewal needs the same
+reload, so a certbot deploy hook of `systemctl reload muru` makes the
+renewed certificate live, as the [virtual hosts
+guide](virtual-hosts.md#tls) describes.
 
 ## Logs
 

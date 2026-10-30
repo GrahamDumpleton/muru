@@ -106,6 +106,17 @@ pub struct Config {
     pub upgraded_from: Option<String>,
 }
 
+/// What reading the TLS hosts' certificate files again found (section
+/// 4.2).
+#[derive(Debug, Clone, Default)]
+pub struct CertificateChanges {
+    /// Hosts whose certificate or key changed, which the edge is given.
+    pub renewed: Vec<String>,
+    /// Hosts kept on the certificate they had, with why the files were
+    /// refused.
+    pub kept: Vec<(String, String)>,
+}
+
 /// An upgrade the daemon is about to carry out (section 13.4).
 #[derive(Debug, Clone)]
 pub struct Upgrade {
@@ -275,6 +286,12 @@ pub enum Command {
     Reconfigure {
         /// Where the acknowledgement goes.
         done: oneshot::Sender<Result<(), String>>,
+    },
+    /// Section 4.2: read the TLS hosts' certificate files again, for an
+    /// apply that changed nothing else, and send the edge what changed.
+    RefreshCertificates {
+        /// Answered with what was renewed and what was kept.
+        done: oneshot::Sender<CertificateChanges>,
     },
     /// Re-read the configuration file for what can change while running
     /// (section 13.3).
@@ -781,6 +798,10 @@ struct Daemon {
     overrides: crate::settings::Overrides,
     /// The event sinks delivering (section 11.5), reconciled on reload.
     sinks: crate::sinks::Sinks,
+    /// Section 4.2: each TLS host's last good certificate chain and key
+    /// as PEM text, by host, for the snapshots; read again on reload and
+    /// apply, and kept when the files are wrong.
+    certificates: HashMap<String, (String, String)>,
     /// Section 7.4: the node's budget, and the schedule windows already
     /// checked against it, by overlay and start.
     budget: crate::budget::Budget,
@@ -1100,6 +1121,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         limits: settings.limits.clone(),
         overrides: config.overrides,
         sinks,
+        certificates: HashMap::new(),
         budget: settings.budget,
         budget_checked: BTreeSet::new(),
         history,
@@ -2186,6 +2208,27 @@ impl Daemon {
             report.unchanged("[logs]");
         }
 
+        // Section 4.2: the hosts' certificate files, read again.
+
+        let certificates = self.refresh_certificates(true);
+
+        if certificates.renewed.is_empty() {
+            report.unchanged("the hosts' certificates");
+        } else {
+            report.changed(
+                "the hosts' certificates",
+                &format!(
+                    "{} renewed; the edge has them",
+                    certificates.renewed.join(", ")
+                ),
+            );
+            snapshot = true;
+        }
+
+        for (host, why) in certificates.kept {
+            report.kept(&format!("host {host} keeps its certificate"), &why);
+        }
+
         if snapshot && let Err(error) = self.push_snapshot().await {
             report.failed("the edge's tables", &error);
         }
@@ -2208,6 +2251,67 @@ impl Daemon {
             &report.message(),
         );
         report.outcome()
+    }
+
+    /// Section 4.2: read the certificate and key files of the applied
+    /// TLS hosts again, every host or only those not read yet, and keep
+    /// each pair that is whole and goes together, for the snapshots. A
+    /// host whose files cannot be read, or do not go together, keeps its
+    /// last good pair, named in a `certificate.unreadable` event; a host
+    /// that never had one serves without TLS until the files are right.
+    fn refresh_certificates(&mut self, every: bool) -> CertificateChanges {
+        let mut changes = CertificateChanges::default();
+        let hosts = self.store.hosts().unwrap_or_default();
+        self.certificates.retain(|name, _| {
+            hosts
+                .iter()
+                .any(|(host, spec)| host == name && spec.tls.is_some())
+        });
+
+        for (name, host) in hosts {
+            let Some(tls) = &host.tls else {
+                continue;
+            };
+
+            if !every && self.certificates.contains_key(&name) {
+                continue;
+            }
+
+            let read = read_pem_pair(&tls.certificate, &tls.key).and_then(|(chain, key)| {
+                let (parsed_chain, parsed_key) = muru_edge::tls::parse_pem(&chain, &key)?;
+                muru_edge::tls::certified_key(parsed_chain, parsed_key)?;
+                Ok((chain, key))
+            });
+
+            match read {
+                Ok(pair) => {
+                    if self.certificates.get(&name) != Some(&pair)
+                        && self.certificates.insert(name.clone(), pair).is_some()
+                    {
+                        changes.renewed.push(name);
+                    }
+                }
+                Err(error) => {
+                    let kept = self.certificates.contains_key(&name);
+                    self.events.emit(
+                        "certificate.unreadable",
+                        &format!("host {name}"),
+                        "error",
+                        &format!(
+                            "{error:#}; {}",
+                            if kept {
+                                "the host keeps the certificate it had"
+                            } else {
+                                "the host serves without TLS until the files are right"
+                            }
+                        ),
+                    );
+                    changes.kept.push((name, format!("{error:#}")));
+                }
+            }
+        }
+
+        changes
     }
 
     /// Section 13.3: the sockets for a changed set of listeners, bound
@@ -3224,7 +3328,19 @@ impl Daemon {
                 }
 
                 self.reconcile_traffic().await;
+                self.refresh_certificates(true);
                 let _ = done.send(self.push_snapshot().await);
+            }
+            Command::RefreshCertificates { done } => {
+                let changes = self.refresh_certificates(true);
+
+                if !changes.renewed.is_empty()
+                    && let Err(error) = self.push_snapshot().await
+                {
+                    tracing::warn!(%error, "pushing the renewed certificates failed");
+                }
+
+                let _ = done.send(changes);
             }
             Command::Reload { done } => {
                 let _ = done.send(self.reload().await);
@@ -4156,26 +4272,16 @@ impl Daemon {
         let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
         let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
 
+        // Section 4.2: a host applied since the last snapshot has its
+        // certificate files read now; the others carry their last good
+        // pair.
+
+        self.refresh_certificates(false);
         let mut hosts = Vec::new();
 
         for (name, host) in self.store.hosts().unwrap_or_default() {
-            let (certificate_pem, key_pem) = match &host.tls {
-                Some(tls) => {
-                    match read_pem_pair(&tls.certificate, &tls.key) {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            self.events.emit(
-                            "certificate.unreadable",
-                            &format!("host {name}"),
-                            "error",
-                            &format!("{error:#}; the host serves without TLS until the files are back"),
-                        );
-                            (String::new(), String::new())
-                        }
-                    }
-                }
-                None => (String::new(), String::new()),
-            };
+            let (certificate_pem, key_pem) =
+                self.certificates.get(&name).cloned().unwrap_or_default();
 
             hosts.push(pb::Host {
                 name,

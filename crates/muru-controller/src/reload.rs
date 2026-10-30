@@ -23,6 +23,7 @@ pub struct Report {
     changed: Vec<String>,
     unchanged: Vec<String>,
     failed: Vec<String>,
+    kept: Vec<String>,
 }
 
 impl Report {
@@ -50,6 +51,12 @@ impl Report {
         self.failed.push(format!("{table}: {error}"));
     }
 
+    /// Something stays as it was because its replacement was refused:
+    /// a host's certificate, say. Said, but no failure of the reload.
+    pub fn kept(&mut self, what: &str, why: &str) {
+        self.kept.push(format!("{what} ({why})"));
+    }
+
     /// Whether every change was applied.
     pub fn is_ok(&self) -> bool {
         self.failed.is_empty()
@@ -75,6 +82,8 @@ impl Report {
         for failure in &self.failed {
             parts.push(format!("could not apply {failure}"));
         }
+
+        parts.extend(self.kept.iter().cloned());
 
         parts.push(format!("{} are read at start", named_list(READ_AT_START)));
         format!("reloaded {}: {}", self.path.display(), parts.join("; "))
@@ -141,6 +150,20 @@ mod tests {
             )
         );
         assert!(report.outcome().is_ok());
+    }
+
+    #[test]
+    fn what_is_kept_is_said_without_failing_the_reload() {
+        let mut report = Report::new(Path::new("muru.toml"));
+        report.unchanged("[proxy]");
+        report.kept(
+            "host shop keeps its certificate",
+            "the certificate and private key do not go together",
+        );
+        assert!(report.is_ok());
+        assert!(report.message().contains(
+            "nothing changed among [proxy]; host shop keeps its certificate (the certificate and private key do not go together); "
+        ));
     }
 
     #[test]

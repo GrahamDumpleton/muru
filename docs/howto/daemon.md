@@ -328,6 +328,10 @@ file again, checks it whole, and applies what changed:
   and one whose entry changed is restarted; a sink's cursor stays in the
   state store, so one that comes back delivers what it missed;
 
+- the certificate and key files of every applied TLS host, read again
+  and, when changed, sent to the edge; the [virtual hosts
+  guide](virtual-hosts.md#tls) has the detail;
+
 - the `[secrets.store.NAME]` tables, which the next release to start
   resolves its secrets from;
 
