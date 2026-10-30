@@ -13,8 +13,6 @@ pub const READ_AT_START: &[&str] = &[
     "[dashboard] listen",
     "[overlay_webhook]",
     "[daemon] user",
-    "[secrets.store.NAME]",
-    "[logs]",
 ];
 
 /// A reload's outcome, table by table, rendered as the command's message

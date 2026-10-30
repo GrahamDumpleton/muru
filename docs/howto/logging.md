@@ -200,6 +200,12 @@ keep = 14                # archives kept per log
 compress = 'zstd'        # zstd, gzip or off
 ```
 
+The table is read when the daemon starts and again on `muructl daemon
+reload` (or SIGHUP): the daemon rotates on the new policy from its next
+check, and a changed period rotates each file once, as a period's end
+does. The [daemon guide](daemon.md#reloading-the-configuration) lists
+what else a reload applies.
+
 `rotate = 'external'` turns the built-in rotation off for logrotate, or
 anything else that renames the files and then runs `muructl logs reopen`,
 which makes every writer open its file again by name, so lines go to the

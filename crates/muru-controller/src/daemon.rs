@@ -2139,6 +2139,53 @@ impl Daemon {
             report.changed("[[events.sink]]", &sink_changes.describe());
         }
 
+        // Section 10.8: the stores matter when a release starts, so they
+        // are swapped whole; section 11.3: the rotator takes the new
+        // policy and keeps what it has seen of each file.
+
+        if settings.secrets != self.secrets {
+            self.secrets = settings.secrets;
+            let names: Vec<&str> = self
+                .secrets
+                .iter()
+                .map(|store| store.name.as_str())
+                .collect();
+            report.changed(
+                "[secrets.store.NAME]",
+                &if names.is_empty() {
+                    "no stores".to_owned()
+                } else {
+                    format!("the stores are {}", names.join(", "))
+                },
+            );
+        } else {
+            report.unchanged("[secrets.store.NAME]");
+        }
+
+        let rotation = self
+            .rotation
+            .as_ref()
+            .map(|rotator| rotator.policy().clone());
+
+        if settings.rotation != rotation {
+            match (settings.rotation, self.rotation.as_mut()) {
+                (Some(policy), Some(rotator)) => rotator.set_policy(policy),
+                (Some(policy), None) => self.rotation = Some(crate::rotation::Rotator::new(policy)),
+                (None, _) => self.rotation = None,
+            }
+
+            report.changed(
+                "[logs]",
+                if self.rotation.is_some() {
+                    "the daemon rotates on the new policy"
+                } else {
+                    "rotation is external"
+                },
+            );
+        } else {
+            report.unchanged("[logs]");
+        }
+
         if snapshot && let Err(error) = self.push_snapshot().await {
             report.failed("the edge's tables", &error);
         }

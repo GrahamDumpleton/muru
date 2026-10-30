@@ -328,17 +328,22 @@ file again, checks it whole, and applies what changed:
   and one whose entry changed is restarted; a sink's cursor stays in the
   state store, so one that comes back delivers what it missed;
 
+- the `[secrets.store.NAME]` tables, which the next release to start
+  resolves its secrets from;
+
+- the `[logs]` table: the daemon rotates on the new policy from its
+  next check, and a period that changed rotates each file once;
+
 - the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
 
 - the dashboard's `actions` switch, `[dashboard] actions`.
 
 The rest of the file is read when the daemon starts: the `[metrics]`
 table, the `[dashboard]` table's `listen` address, the
-`[overlay_webhook]` table, the `[daemon]` table's `user`, the
-`[secrets.store.NAME]` tables and the `[logs]` table. A change to those
-takes effect after `muructl daemon stop` and `muructl daemon start`
-(`systemctl restart muru` under systemd), which detaches from the hosts
-and the edge and takes them back, so it costs no request. A daemon
+`[overlay_webhook]` table and the `[daemon]` table's `user`. A change to
+those takes effect after `muructl daemon stop` and `muructl daemon
+start` (`systemctl restart muru` under systemd), which detaches from the
+hosts and the edge and takes them back, so it costs no request. A daemon
 started with `--listen`, `--metrics`, `--dashboard` or `--user` keeps
 those over the file's settings on every reload.
 
