@@ -4,9 +4,10 @@
 :class: note
 
 This tutorial runs under the daemon and assumes you have done
-[deploy with the daemon and roll back](deploy-and-roll-back.md). The soft
-timeout also works in `muructl run`, where the same messages appear in
-the terminal, but the `muructl debug` commands need the daemon.
+[deploy with the daemon and roll back](deploy-and-roll-back.md). The same
+steps work in `muructl run`, where the soft timeout's messages appear in
+the terminal and the `muructl debug` commands find the run from the
+project directory without a flag.
 ```
 
 Sooner or later an application has a request that takes far longer than

@@ -30,6 +30,9 @@ use crate::metrics::{Metrics, SocketKey};
 /// Records kept in memory for `recent()`, the dashboard and the CLI.
 pub const RING_CAPACITY: usize = 1000;
 
+/// How many lines a follower may fall behind before it skips some.
+const FOLLOW_CAPACITY: usize = 1024;
+
 /// Where access log lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Destination {
@@ -340,6 +343,9 @@ pub struct AccessLog {
     /// The WebSockets open now, by a number of their own.
     websockets: Mutex<BTreeMap<u64, Arc<Socket>>>,
     next_websocket: AtomicU64,
+    /// Each record as its JSON line, for a follower such as `muructl
+    /// logs --access` under a development run (section 13.1).
+    lines: tokio::sync::broadcast::Sender<String>,
 }
 
 /// A request counted as in flight until this is dropped.
@@ -379,6 +385,7 @@ impl AccessLog {
             file,
             websockets: Mutex::new(BTreeMap::new()),
             next_websocket: AtomicU64::new(0),
+            lines: tokio::sync::broadcast::channel(FOLLOW_CAPACITY).0,
         })
     }
 
@@ -417,6 +424,13 @@ impl AccessLog {
     fn keep(&self, record: Record) {
         if self.shows(&record) {
             self.write(&record);
+        }
+
+        // A follower that is behind by more than the channel holds skips
+        // the lines it missed; no follower, and nothing is sent.
+
+        if self.lines.receiver_count() > 0 {
+            let _ = self.lines.send(json_line(&record));
         }
 
         let mut ring = self.ring.lock().expect("access log ring poisoned");
@@ -540,6 +554,16 @@ impl AccessLog {
         let reopened = OpenOptions::new().create(true).append(true).open(path)?;
         *file.lock().expect("access log file poisoned") = reopened;
         Ok(())
+    }
+
+    /// The most recent records as JSON lines, oldest first.
+    pub fn recent_lines(&self, limit: usize) -> Vec<String> {
+        self.recent(limit).iter().map(json_line).collect()
+    }
+
+    /// Every record from now on as its JSON line, for a follower.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.lines.subscribe()
     }
 
     /// The most recent records, oldest first.
@@ -681,7 +705,7 @@ fn text_line(record: &Record) -> String {
 }
 
 /// The structured form, one JSON object per line.
-fn json_line(record: &Record) -> String {
+pub fn json_line(record: &Record) -> String {
     let (date, hours, minutes, seconds, millis) = civil(record.started);
     let mut line = String::with_capacity(320);
     let _ = write!(

@@ -288,3 +288,80 @@ def test_serve_static_refuses_what_is_not_a_directory(tmp_path: Path) -> None:
     assert "is not a directory" in completed.stderr
     time.sleep(0)
     assert sys.executable
+
+
+def test_an_applications_own_directories_under_run_and_deploy(tmp_path: Path) -> None:
+    # Section 4.9: [[tool.muru.static]] and --static serve a directory
+    # under the source ahead of the application, which takes what no
+    # file answers, under muructl run and the daemon alike.
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "assets").mkdir()
+    (project / "assets" / "site.css").write_text("body { color: red }\n")
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'files'\nversion = '0'\n\n"
+        "[tool.muru]\nentrypoint = 'app:application'\n\n"
+        "[[tool.muru.static]]\npath = '/assets/'\ndir = 'assets'\n"
+        "cache = { max_age = '1h' }\n"
+    )
+    server = support.start(None, workers=1, chdir=project, args=["--static", f"/fixture/={STATIC}"])
+
+    try:
+        assert server.wait_for_log("muru: static /assets/ from")
+        assert server.wait_for_log(f"muru: static /fixture/ from {STATIC}")
+        css = server.get("/assets/site.css")
+        assert css.status == 200 and css.body == b"body { color: red }\n"
+        assert css.header("Cache-Control") == "public, max-age=3600"
+        assert css.header("Content-Type") == "text/css; charset=utf-8"
+        assert server.get("/fixture/fox.txt").status == 200
+        assert server.wait_for_log("GET /assets/site.css")
+
+        # What has no file, and every other method, reaches the application.
+
+        assert server.get("/assets/nothing.css").status == 404
+        assert server.post("/assets/site.css", b"x").status == 404
+        assert server.get("/info").status == 200
+    finally:
+        server.stop()
+
+    # A missing directory is refused before anything starts.
+
+    with pytest.raises(RuntimeError) as refused:
+        support.start(None, workers=1, chdir=project, args=["--static", "/gone/=nowhere"])
+
+    assert "static /gone/: " in str(refused.value) and "is not a directory" in str(refused.value)
+
+    # Under the daemon the table's entry serves, a flag adds one, a plain
+    # deploy carries both forward, and --fresh starts from the table.
+
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(tmp_path / "daemon")
+
+    try:
+        assert daemon.deploy("files", project, "--static", f"/fixture/={STATIC}") == (
+            "muru: release files@r1 is ready and serving"
+        )
+        css = daemon.get("/assets/site.css")
+        assert css.status == 200 and css.header("Cache-Control") == "public, max-age=3600"
+        assert daemon.get("/fixture/fox.txt").status == 200
+        assert daemon.get("/assets/nothing.css").status == 404
+
+        daemon.deploy("files", project)
+        assert daemon.get("/fixture/fox.txt").status == 200, "the flag's entry carried forward"
+        exported = daemon.muructl("config", "show", "files").stdout
+        assert "[[app.files.release.r2.static]]" in exported
+        assert f'dir = "{STATIC}"' in exported or f"dir = '{STATIC}'" in exported
+
+        daemon.deploy("files", project, "--fresh")
+        assert daemon.get("/assets/site.css").status == 200
+        assert daemon.get("/fixture/fox.txt").status == 404, "--fresh takes the table alone"
+
+        refused = daemon.muructl(
+            "deploy", "files", str(project), "--static", "/gone/=nowhere", check=False
+        )
+        assert refused.returncode != 0
+        assert "is not a directory" in refused.stdout + refused.stderr
+    finally:
+        daemon.stop()

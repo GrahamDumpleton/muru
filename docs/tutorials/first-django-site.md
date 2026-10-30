@@ -112,7 +112,20 @@ DJANGO_SETTINGS_MODULE=mysite.production DJANGO_SECRET_KEY=x uv run manage.py co
 ```
 
 That copies every application's static files, the admin's among them,
-into `static/` in the project.
+into `static/` in the project. With `DEBUG` off, Django serves nothing
+from it, so have the edge serve it. Add this to `pyproject.toml`, below
+the entrypoint:
+
+```toml
+[[tool.muru.static]]
+path = "/static/"
+dir = "static"
+cache = { max_age = "1h" }
+```
+
+A request under `/static/` is answered from the directory when a file
+is there and reaches Django otherwise. The entry is part of the project,
+like the entrypoint, so every deploy of it brings the files along.
 
 ## Deploy it
 
@@ -128,49 +141,23 @@ muructl deploy mysite . --env DJANGO_SETTINGS_MODULE=mysite.production --env DJA
 muru: release mysite@r1 is ready and serving
 ```
 
-The entrypoint came from `[tool.muru]` and the interpreter from the
-project's `.venv`. The admin is at http://127.0.0.1:8080/admin/ again,
-unstyled again, since `DEBUG` is off and Django serves no static files.
-
-## Static files from the edge
-
-Give the site a host with two routes, one to the application and one for
-`/static/` to the collected files. Save this as `site.toml` in the
-project, since the `static` path is taken from the file's directory:
-
-```{literalinclude} code/mysite/site.toml
-:language: toml
-```
-
-and apply it:
-
-```
-muructl apply -f site.toml
-```
-
-```
-muru: applied
-  create-host     host site                created
-  create-route    route site /             created
-  create-route    route site /static/      created
-```
-
-The admin is styled once more, and the access log shows the difference
-between the two kinds of request:
+The entrypoint and the static directory came from `[tool.muru]` and the
+interpreter from the project's `.venv`. The admin is at
+http://127.0.0.1:8080/admin/ again, styled, and the access log shows the
+difference between the two kinds of request:
 
 ```
 muructl logs --access
 ```
 
 ```
-10:11:13.430 200 GET /static/admin/css/base.css 24kB 0.0ms host=127.0.0.1 reason=static id=01M60ZW3WNC5HY2QHF3EFRTZQS
+10:11:13.430 200 GET /static/admin/css/base.css 24kB 0.0ms release=mysite@r1 host=127.0.0.1 reason=static id=01M60ZW3WNC5HY2QHF3EFRTZQS
 10:11:13.436 200 GET /admin/login/ 4294B 21ms release=mysite@r1 host=127.0.0.1 queue=0.0ms app=21ms worker=0 id=01M60ZW3WWC5HY2QHF3EFRTZQS
 ```
 
-The stylesheet was served by the edge from `static/`, with caching
-headers and an `ETag`, compressed for a client that accepts it, without
-reaching a worker. The login
-page came from the release.
+The stylesheet was served by the edge from the release's own `static/`,
+with caching headers and an `ETag`, compressed for a client that accepts
+it, without reaching a worker. The login page came from the release.
 
 ## Migrations
 

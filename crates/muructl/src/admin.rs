@@ -83,11 +83,12 @@ impl LocationArgs {
     }
 }
 
-/// How to reach a daemon: its admin socket.
+/// How to reach a daemon or a development run: its admin socket.
 #[derive(Args, Clone, Default)]
 pub struct SocketArgs {
-    /// The daemon's admin socket (default: MURU_SOCKET, else the socket of
-    /// the user daemon in the runtime directory).
+    /// The admin socket (default: MURU_SOCKET, else a development run
+    /// started from the current directory, else the user daemon's socket
+    /// in the runtime directory, else the one development run listening).
     #[arg(long, global = true, value_name = "PATH", env = "MURU_SOCKET")]
     socket: Option<PathBuf>,
 
@@ -96,11 +97,52 @@ pub struct SocketArgs {
 }
 
 impl SocketArgs {
-    /// The socket to connect to.
-    pub fn socket(&self) -> PathBuf {
-        self.socket
-            .clone()
-            .unwrap_or_else(|| self.locations.resolve().admin_socket())
+    /// The socket to connect to (design specification section 13.8): as
+    /// given, else a development run's from this project, else the
+    /// daemon's when it listens, else the one run listening; several runs
+    /// and no daemon are named, so one can be chosen.
+    pub fn socket(&self) -> anyhow::Result<PathBuf> {
+        if let Some(socket) = &self.socket {
+            return Ok(socket.clone());
+        }
+
+        let locations = self.locations.resolve();
+        let daemon = locations.admin_socket();
+        let runs = crate::run_admin::runs(&locations.run.path);
+        let here = std::env::current_dir()
+            .and_then(|directory| directory.canonicalize())
+            .ok();
+
+        if let Some(run) = runs
+            .iter()
+            .find(|run| here.as_ref().is_some_and(|here| run.project == *here))
+        {
+            return Ok(run.socket.clone());
+        }
+
+        if daemon.exists() {
+            return Ok(daemon);
+        }
+
+        match runs.as_slice() {
+            [] => Ok(daemon),
+            [run] => Ok(run.socket.clone()),
+            several => anyhow::bail!(
+                "no daemon is running and several development runs are: {}; name one with \
+                 --socket, or run the command from its project directory",
+                several
+                    .iter()
+                    .map(|run| format!(
+                        "{} on http://{} from {} (--socket {})",
+                        run.app,
+                        run.listen,
+                        run.project.display(),
+                        run.socket.display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }
     }
 }
 
@@ -422,7 +464,7 @@ pub async fn daemon_stop(
     shutdown: bool,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let path = socket.socket();
+    let path = socket.socket()?;
     let started = Instant::now();
     let bound = timeout.min(STOP_EXCHANGE);
     let connected = tokio::time::timeout(bound, client::connect(&path)).await;
@@ -487,7 +529,7 @@ pub async fn daemon_stop(
 /// Re-execute the daemon from the installed binary and wait until it
 /// answers again with the edge replaced.
 pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Result<()> {
-    let path = socket.socket();
+    let path = socket.socket()?;
     let mut client = client::connect(&path).await?;
     let before = client
         .get_status(pb::GetStatusRequest {})
@@ -1342,7 +1384,7 @@ async fn ask(
         None => (target, ""),
     };
 
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let response = client
         .debug(pb::DebugRequest {
             app: app.to_owned(),
@@ -1634,7 +1676,7 @@ fn print_inspect(response: &pb::DebugResponse) {
 
 /// Print the node's metrics as Prometheus text.
 pub async fn metrics(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let text = client
         .get_metrics(pb::GetMetricsRequest {})
         .await?
@@ -1666,7 +1708,7 @@ pub struct WebSocketsArgs {
 /// Show the WebSockets open now: counted by endpoint, where segments
 /// that are identifiers are {id} and many distinct values *, or listed.
 pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&args.socket.socket()).await?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
     let list = client
         .list_web_sockets(pb::ListWebSocketsRequest {
             app: args.app.unwrap_or_default(),
@@ -1733,7 +1775,7 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
 
 /// Re-read the daemon's configuration file.
 pub async fn daemon_reload(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let response = client
         .reload_config(pb::ReloadConfigRequest {})
         .await
@@ -1745,11 +1787,31 @@ pub async fn daemon_reload(socket: SocketArgs) -> anyhow::Result<()> {
 
 /// Show the daemon's status.
 pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
+
+    // A development run says what it runs and from where; it has no
+    // state directory, edge process or budget of its own.
+
+    if status.kind == "run" {
+        println!("run      pid {} version {}", status.pid, status.version);
+        println!("app      {}@{}", status.app, status.release);
+        println!("project  {}", status.project);
+        println!("serving  {}", status.listeners.join(", "));
+        println!("socket   {}", status.socket);
+
+        if !status.dashboard.is_empty() {
+            println!("dashboard http://{}/", status.dashboard);
+            println!("metrics  http://{}/metrics", status.dashboard);
+        }
+
+        println!("run dir  {}", status.run_dir);
+        println!("websockets {} open", status.websockets);
+        return Ok(());
+    }
 
     println!("daemon   pid {} version {}", status.pid, status.version);
     println!("edge     pid {}", status.edge_pid);
@@ -1938,6 +2000,12 @@ pub struct DeployArgs {
     /// X-Sendfile.
     #[arg(long, value_name = "NAME")]
     sendfile_header: Option<String>,
+
+    /// A directory of the application's own files the edge serves under
+    /// a path prefix, as PREFIX=DIR with DIR relative to the source, over
+    /// the source's [[tool.muru.static]] entries by prefix. Repeatable.
+    #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = crate::parse_static_setting)]
+    static_dirs: Vec<(String, String)>,
 
     #[command(flatten)]
     socket: SocketArgs,
@@ -2196,7 +2264,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         anyhow::bail!("a command after -- needs --server PROFILE");
     }
 
-    let mut client = client::connect(&args.socket.socket()).await?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
 
     let request = pb::DeployRequest {
         app: args.app.clone(),
@@ -2255,6 +2323,14 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         cgi_local_redirect: None,
         sendfile_roots: args.sendfile_roots,
         sendfile_header: args.sendfile_header,
+        static_dirs: args
+            .static_dirs
+            .iter()
+            .map(|(path, dir)| pb::StaticDir {
+                path: path.clone(),
+                dir: dir.clone(),
+            })
+            .collect(),
         hard_timeout_ms: timeout_ms(&args.timeouts, "hard"),
         hard_drain_grace_ms: timeout_ms(&args.timeouts, "hard_drain_grace"),
         shutdown_timeout_ms: timeout_ms(&args.timeouts, "shutdown"),
@@ -2715,7 +2791,7 @@ async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow:
 pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
     if let Some(ScaleCommand::Status { target, socket }) = args.command {
         let (app, release) = split_target(&target)?;
-        let mut client = client::connect(&socket.socket()).await?;
+        let mut client = client::connect(&socket.socket()?).await?;
         let status = client
             .get_scale_status(pb::GetScaleStatusRequest {
                 app: app.to_owned(),
@@ -2748,7 +2824,7 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         (None, None) => 0,
     };
 
-    let mut client = client::connect(&args.socket.socket()).await?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
     let status = client
         .set_scale(pb::SetScaleRequest {
             app: app.to_owned(),
@@ -2907,7 +2983,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
         } => {
             let (app, id) = split_release(&release)?;
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .start_rollout(pb::StartRolloutRequest {
                     app: app.to_owned(),
@@ -2953,7 +3029,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             socket,
         } => {
             let (app, id) = split_release(&release)?;
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let release = client
                 .promote_release(pb::PromoteReleaseRequest {
                     app: app.to_owned(),
@@ -2970,7 +3046,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             Ok(())
         }
         RolloutCommand::Status { app, wait, socket } => {
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
 
             if wait {
                 let Some(app) = app else {
@@ -3019,7 +3095,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             Ok(())
         }
         RolloutCommand::Pause { app, socket } => {
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .pause_rollout(pb::RolloutControlRequest {
                     app,
@@ -3035,7 +3111,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             Ok(())
         }
         RolloutCommand::Resume { app, socket } => {
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .resume_rollout(pb::RolloutControlRequest {
                     app,
@@ -3055,7 +3131,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             override_freeze,
             socket,
         } => {
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .promote_rollout(pb::RolloutControlRequest {
                     app,
@@ -3071,7 +3147,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             Ok(())
         }
         RolloutCommand::Abort { app, socket } => {
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .abort_rollout(pb::RolloutControlRequest {
                     app,
@@ -3135,7 +3211,7 @@ pub enum AppCommand {
 
 /// List applications.
 pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let apps = client
         .list_apps(pb::ListAppsRequest {})
         .await?
@@ -3249,7 +3325,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
     let (name, action, until, socket) = match command {
         OverlayCommand::List { socket } => return list_overlays(&socket).await,
         OverlayCommand::Preview { name, socket } => {
-            let mut client = client::connect(&socket.socket()).await?;
+            let mut client = client::connect(&socket.socket()?).await?;
             let preview = client
                 .preview_overlay(pb::PreviewOverlayRequest { name: name.clone() })
                 .await
@@ -3289,7 +3365,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
         OverlayCommand::Promote { name, socket } => (name, "promote", None, socket),
     };
 
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let response = client
         .control_overlay(pb::ControlOverlayRequest {
             name: name.clone(),
@@ -3310,7 +3386,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
 }
 
 async fn list_overlays(socket: &SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let overlays = client
         .list_overlays(pb::ListOverlaysRequest {})
         .await
@@ -3385,7 +3461,7 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
         MaintenanceCommand::Off { app, socket } => (app, false, socket),
     };
 
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let status = client
         .set_maintenance(pb::SetMaintenanceRequest { app, on })
         .await
@@ -3438,7 +3514,7 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
         url,
         socket,
     } = command;
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let link = client
         .dashboard_login(pb::DashboardLoginRequest { actions, token })
         .await
@@ -3477,7 +3553,7 @@ pub enum HostCommand {
 
 /// List virtual hosts.
 pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let hosts = client
         .list_hosts(pb::ListHostsRequest {})
         .await?
@@ -3529,7 +3605,7 @@ pub enum UpstreamCommand {
 
 /// List HTTP upstreams.
 pub async fn upstream_list(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let upstreams = client
         .list_upstreams(pb::ListUpstreamsRequest {})
         .await?
@@ -3580,7 +3656,7 @@ pub enum RouteCommand {
 
 /// List routes.
 pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let routes = client
         .list_routes(pb::ListRoutesRequest {})
         .await?
@@ -3728,7 +3804,7 @@ pub enum ReleaseCommand {
 
 /// List releases.
 pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let releases = client
         .list_releases(pb::ListReleasesRequest {
             app: app.unwrap_or_default(),
@@ -3772,7 +3848,7 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
 /// Show one release.
 pub async fn release_show(release: String, socket: SocketArgs) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let release = client
         .get_release(pb::GetReleaseRequest {
             app: app.to_owned(),
@@ -4044,7 +4120,7 @@ pub async fn release_wait(
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let release = client
         .wait_release(pb::WaitReleaseRequest {
             app: app.to_owned(),
@@ -4070,7 +4146,7 @@ pub async fn release_wait(
 
 /// Roll an application back to its previous release.
 pub async fn rollback(app: String, socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let release = client
         .rollback(pb::RollbackRequest { app })
         .await
@@ -4087,7 +4163,7 @@ pub async fn rollback(app: String, socket: SocketArgs) -> anyhow::Result<()> {
 /// Drain a release.
 pub async fn drain(release: String, socket: SocketArgs) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let release = client
         .drain_release(pb::DrainReleaseRequest {
             app: app.to_owned(),
@@ -4137,7 +4213,7 @@ pub struct ApplyArgs {
 /// and 1 for errors.
 pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
     let document = load_documents(&args.file)?;
-    let mut client = client::connect(&args.socket.socket()).await?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
     let report = client
         .apply_config(pb::ApplyConfigRequest {
             document: document.to_toml().context("writing the configuration")?,
@@ -4221,7 +4297,7 @@ pub async fn config_export(
     json: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
@@ -4259,7 +4335,7 @@ pub async fn config_show(
     effective: bool,
     socket: SocketArgs,
 ) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
@@ -4314,7 +4390,7 @@ pub async fn config_show(
 /// match, 2 when they differ and 1 for errors.
 pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyhow::Result<i32> {
     let document = load_documents(&file)?;
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let report = client
         .diff_config(pb::DiffConfigRequest {
             document: document.to_toml().context("writing the configuration")?,
@@ -4590,12 +4666,13 @@ fn format_time(unix_ms: u64) -> String {
 
 /// Show or follow the events.
 pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
 
     if !follow {
         let events = client
             .list_events(pb::ListEventsRequest { after, limit: 200 })
-            .await?
+            .await
+            .map_err(explain)?
             .into_inner()
             .events;
 
@@ -4608,7 +4685,8 @@ pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Res
 
     let mut stream = client
         .watch_events(pb::WatchEventsRequest { after })
-        .await?
+        .await
+        .map_err(explain)?
         .into_inner();
 
     while let Some(event) = stream.next().await {
@@ -4677,7 +4755,7 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
         None => (String::new(), String::new()),
     };
 
-    let mut client = client::connect(&args.socket.socket()).await?;
+    let mut client = client::connect(&args.socket.socket()?).await?;
     let mut stream = client
         .tail_logs(pb::TailLogsRequest {
             app,
@@ -4705,7 +4783,7 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
 
 /// Reopen every log file after an external rotation.
 pub async fn logs_reopen(workers: bool, socket: SocketArgs) -> anyhow::Result<()> {
-    let mut client = client::connect(&socket.socket()).await?;
+    let mut client = client::connect(&socket.socket()?).await?;
     let reopened = client
         .reopen_logs(pb::ReopenLogsRequest { workers })
         .await

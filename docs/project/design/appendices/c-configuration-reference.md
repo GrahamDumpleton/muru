@@ -31,6 +31,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[app.NAME]` | application files | application defaults, reload, schedules |
 | `[app.NAME.release.ID]` | application files | release definition |
 | `[app.NAME.release.ID.mounts.NAME]` | application files | mounts |
+| `[[app.NAME.release.ID.static]]` | application files, or `[[tool.muru.static]]` | the release's own directories of files (section 4.9) |
 | `[app.NAME.release.ID.groups.NAME]` | application files | worker groups |
 | `[tool.muru]` | the application's pyproject.toml or muru.toml | application-shipped defaults |
 | `[overlay.NAME]` | application files | overlays and triggers |
@@ -54,6 +55,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | match.client_class | group, route | none (every class) | 4.14 |
 | match.host, match.method | group | none (every host, every method) | 7.1 |
 | path, internal, cgi_local_redirect, accel_redirect, concurrency, max_connections | mount (cgi_local_redirect and accel_redirect also on the release, for the default mount and as the mounts' default) | none (required except for a gRPC mount, which takes none), false, false, false, 1000, 1000 | 6.7, 4.10, 6.13 |
+| path, dir, index, fallback, cache, redirect_slash, case | static entry (`[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]`) | none (path and dir required), index.html, none, none, true, strict | 4.9 |
 | scaling.mode, min_workers, max_workers, min_spare, max_spare, advisory | group | static, 1, required by spare and target, 1, max(3, 25% of max_workers), false | 7.2, 7.4 |
 | scaling targets (slot_utilization, queue_wait_p95) | group, target mode | 0.7, off | 7.2, 7.3 |
 | scaling windows and budgets (scale_out_window, scale_in_window, hold_after_growth, reap_interval, idle_reap_after, min_lifetime, max_step_up, churn_budget) | group | 5s, 10m, 5m, 60s, 10m, max(15m, 30 x ready time), 4, 6 per hour | 7.4 |

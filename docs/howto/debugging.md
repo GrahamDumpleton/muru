@@ -17,6 +17,14 @@ new. Each command takes a release as `app@release`, or an application for
 its current release, and asks every worker unless `--worker N` names one;
 `--json` prints each worker's answer as JSON.
 
+A development run serves the same commands: `muructl run` has an admin
+socket of its own, which a command run from the project directory finds
+without a flag, and the run's application and release are the ones its
+terminal names, so `muructl debug stacks app` reads the run's workers.
+`debug exec` and `debug attach` need no `debug_exec` there, since the
+person at the terminal started the workers. `muructl status` says which
+socket a command found.
+
 ```
 muructl debug status shop
 muructl debug stacks shop@r3 --worker 1
@@ -25,7 +33,8 @@ muructl debug inspect shop --json
 ```
 
 The daemon's [dashboard](dashboard.md#looking-into-the-workers) shows
-the status, stacks, tasks and memory of a release's workers too.
+the status, stacks, tasks and memory of a release's workers too, and so
+does a run's, from the Workers link on its first page.
 
 ## Status
 
@@ -164,7 +173,9 @@ raised:
 muructl debug exec shop --worker 0 -- 'import myapp.cache; len(myapp.cache.entries)'
 ```
 
-It is off unless the daemon's configuration file allows it:
+It is off unless the daemon's configuration file allows it, and on
+under `muructl run`, where the person at the terminal started the
+workers:
 
 ```toml
 [daemon]
@@ -193,7 +204,10 @@ def checkout(request):
 ```
 
 `muructl debug attach` opens a pdb session at the waiting breakpoint,
-taking the worker that waits unless `--worker` names one:
+taking the worker that waits unless `--worker` names one. The event's
+line names the command to run, with the application as the daemon or
+the run calls it, and under `muructl run` it works as it is, with no
+`debug_exec` to set:
 
 ```
 $ muructl debug attach shop

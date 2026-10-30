@@ -1075,6 +1075,7 @@ mod tests {
             grpc_web_origins: Vec::new(),
             groups: Vec::new(),
             mounts: Vec::new(),
+            static_dirs: Vec::new(),
             logging: Default::default(),
             max_requests: None,
             max_lifetime_ms: None,

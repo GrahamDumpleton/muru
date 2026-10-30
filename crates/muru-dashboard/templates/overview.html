@@ -7,7 +7,7 @@
   <div class="tile"><div class="label">In flight</div><div class="value">{{ data.summary.in_flight }}</div></div>
   <div class="tile"><div class="label">WebSockets open</div><div class="value">{{ data.summary.websockets }}</div></div>
 </div>
-<h2 style="margin-top:1rem">Workers</h2>
+<h2 style="margin-top:1rem">Workers <a href="workers?release={{ data.target }}" class="note">stacks, tasks and memory</a></h2>
 <table>
   <tr><th>Worker</th><th>Link</th><th class="num">Slots</th><th class="num">Busy</th></tr>
   {% for worker in data.workers %}

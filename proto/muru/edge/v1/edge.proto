@@ -277,6 +277,21 @@ message AppWorkers {
   string sendfile_header = 14;          // a second header honoured as X-Muru-Sendfile is; none when empty
   repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
   repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
+  repeated StaticDir static_dirs = 17;  // section 4.9: the release's own directories of files, by path prefix
+}
+
+// Section 4.9: a directory of a release's own files, served by the edge
+// under a path prefix, the application taking what no file answers.
+message StaticDir {
+  string path = 1;                      // the prefix
+  string dir = 2;                       // the directory, absolute
+  repeated string index = 3;            // index files tried for a directory; index.html when empty
+  string fallback_file = 4;             // the file served for paths with no file of their own
+  uint64 cache_max_age_s = 5;           // Cache-Control max-age; none when 0
+  bool cache_immutable = 6;
+  repeated string cache_except = 7;     // patterns of files that get no-cache instead
+  bool no_redirect_slash = 8;           // do not redirect a directory to its slash form
+  bool case_insensitive = 9;            // accept names that differ from the file's on disk
 }
 
 message Mount {

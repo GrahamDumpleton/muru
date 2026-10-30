@@ -5,11 +5,11 @@
 
 Static routes to a directory, with index files, conditional requests,
 ranges, precompressed variants, cache headers and a fallback to an
-application or a file, `muructl serve-static`, internal routes that only
-an [internal redirect](internal-redirects.md) reaches, and
-[file hints](file-hints.md) from applications. Directory listings,
-static files that belong to a release and the metadata cache are still
-to come.
+application or a file, an application's own directories served from
+its source in development and production alike, `muructl serve-static`,
+internal routes that only an [internal redirect](internal-redirects.md)
+reaches, and [file hints](file-hints.md) from applications. Directory
+listings and the metadata cache are still to come.
 ```
 
 A route that names a directory instead of an application is served by
@@ -42,6 +42,41 @@ alone. Where a client accepts `br`, `zstd` or `gzip` and a file with
 that suffix lies next to the file (`app.js.br`, `app.js.zst`,
 `app.js.gz`), the variant is served with `Content-Encoding` and `Vary`;
 otherwise a large text file is [compressed](compression.md) on the fly.
+
+## An application's own files
+
+Files that ship with the application, a Flask package's `static` folder
+or Django's collected `STATIC_ROOT`, are declared in the project rather
+than in a route, so `muructl run` and the daemon serve them the same
+way, and nothing in the application has to serve them in development:
+
+```toml
+[[tool.muru.static]]
+path = '/static/'
+dir = 'shop/static'
+cache = { max_age = '1h' }
+```
+
+Each entry names a path prefix and a directory under the project, with
+`index`, `fallback` (a file), `cache`, `redirect_slash` and `case` as a
+static route has them. `--static /static/=DIR`, repeatable on `muructl
+run` and `muructl deploy`, adds an entry or replaces the one with its
+prefix, and a deploy without the flag keeps what the release before it
+had, as it does every other setting. The edge serves a path under the
+prefix from the directory when a file answers it, with the cache
+headers, conditional requests, ranges and precompressed variants of a
+static route; what has no file, and every method files do not answer,
+reaches the application as usual, so a `/static/` path the application
+handles itself still works. `/` cannot be a prefix, since every request
+would then be looked up as a file first; a site that is files at `/`
+with the application under them is a [static route with a
+fallback](#mixing-files-and-an-application).
+
+Under the daemon the directory is read from the release's own source,
+so the release the request was routed to serves its own files: a canary
+answers with its own assets, and a rollback brings the old ones back
+with the old code. `muructl run` prints each entry at start-up and
+refuses a directory that does not exist, as a deploy does.
 
 ## Mixing files and an application
 

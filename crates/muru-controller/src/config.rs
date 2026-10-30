@@ -20,7 +20,7 @@ use muru_config::{
 use muru_proto::admin::v1 as pb;
 
 use crate::model::{
-    EnvSpec, GroupSpec, HttpServerSpec, MountSpec, ReleaseSpec, ScalingSpec, valid_name,
+    EnvSpec, GroupSpec, HttpServerSpec, MountSpec, ReleaseSpec, ScalingSpec, StaticSpec, valid_name,
 };
 use crate::store::{Store, StoreError};
 
@@ -483,6 +483,7 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
         let tables = Tables {
             groups: (!table.groups.is_empty()).then_some(&table.groups),
             mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
+            static_dirs: (!table.static_dirs.is_empty()).then_some(&table.static_dirs[..]),
             logging: table.logging.as_ref(),
             scaling: table.scaling.as_ref(),
             error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
@@ -2207,6 +2208,8 @@ pub struct Tables<'a> {
     pub groups: Option<&'a BTreeMap<String, GroupTable>>,
     /// Mounts (section 6.7).
     pub mounts: Option<&'a BTreeMap<String, MountTable>>,
+    /// The release's own directories of files (section 4.9).
+    pub static_dirs: Option<&'a [muru_config::StaticDir]>,
     /// Logging (section 11.4).
     pub logging: Option<&'a muru_config::Logging>,
     /// Scaling (section 7.2).
@@ -2268,6 +2271,7 @@ pub fn resolve_spec(
     let Tables {
         groups,
         mounts,
+        static_dirs,
         logging,
         scaling,
         ..
@@ -2658,6 +2662,17 @@ pub fn resolve_spec(
         }
     }
 
+    // Section 4.9: the release's own directories of files, by path: the
+    // previous release's, then the table's, then the request's; each
+    // directory resolved under the source and checked to exist.
+
+    let static_dirs = resolve_static_dirs(
+        previous.map_or(&[][..], |previous| &previous.static_dirs),
+        static_dirs.unwrap_or(&table.static_dirs),
+        &request.static_dirs,
+        &source,
+    )?;
+
     // Section 7.6 and 7.7: the host's own timeouts and recycling, from
     // the request, else the table, else the previous release, else the
     // defaults of appendix C.
@@ -2903,6 +2918,7 @@ pub fn resolve_spec(
         grpc_web_origins,
         groups: resolved_groups,
         mounts: resolved_mounts,
+        static_dirs,
         accel_redirect,
         cgi_local_redirect,
         sendfile_roots,
@@ -3283,6 +3299,81 @@ pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>,
     Ok(lines)
 }
 
+/// Section 4.9: the release's own directories of files, layered by
+/// path prefix: the previous release's, the table's, then the request's,
+/// each directory taken under the source when relative and checked to
+/// be one.
+fn resolve_static_dirs(
+    previous: &[StaticSpec],
+    table: &[muru_config::StaticDir],
+    request: &[pb::StaticDir],
+    source: &Path,
+) -> Result<Vec<StaticSpec>, String> {
+    muru_config::check_static(table)?;
+    let mut by_path: BTreeMap<String, StaticSpec> = previous
+        .iter()
+        .map(|entry| (prefix_key(&entry.path), entry.clone()))
+        .collect();
+
+    for entry in table {
+        by_path.insert(prefix_key(&entry.path), static_spec(entry, source)?);
+    }
+
+    for entry in request {
+        let table_entry = muru_config::StaticDir {
+            path: entry.path.clone(),
+            dir: entry.dir.clone(),
+            ..Default::default()
+        };
+        muru_config::check_static(std::slice::from_ref(&table_entry))?;
+        by_path.insert(prefix_key(&entry.path), static_spec(&table_entry, source)?);
+    }
+
+    Ok(by_path.into_values().collect())
+}
+
+/// A prefix as paths are matched by it, without a trailing slash.
+fn prefix_key(path: &str) -> String {
+    muru_edge::routing::group_prefix(path)
+}
+
+/// One of the release's own directories, resolved and checked.
+fn static_spec(entry: &muru_config::StaticDir, source: &Path) -> Result<StaticSpec, String> {
+    let dir = if Path::new(&entry.dir).is_absolute() {
+        PathBuf::from(&entry.dir)
+    } else {
+        source.join(&entry.dir)
+    };
+
+    if !dir.is_dir() {
+        return Err(format!(
+            "static {}: {} is not a directory",
+            entry.path,
+            dir.display()
+        ));
+    }
+
+    let cache = entry.cache.as_ref();
+    Ok(StaticSpec {
+        path: entry.path.clone(),
+        dir,
+        index: entry.index.clone(),
+        fallback_file: entry.fallback.clone(),
+        cache_max_age_s: cache
+            .and_then(|cache| cache.max_age.as_deref())
+            .map(|text| {
+                muru_config::parse_duration(text)
+                    .map(|duration| duration.as_secs())
+                    .map_err(|error| format!("static {}: cache.max_age: {error}", entry.path))
+            })
+            .transpose()?,
+        cache_immutable: cache.and_then(|cache| cache.immutable).unwrap_or(false),
+        cache_except: cache.map(|cache| cache.except.clone()).unwrap_or_default(),
+        redirect_slash: entry.redirect_slash.unwrap_or(true),
+        case_insensitive: entry.case.as_deref() == Some("insensitive"),
+    })
+}
+
 /// Section 10.8: the environment, the table's entries with the
 /// request's over them, references kept as references.
 fn resolve_env_specs(
@@ -3404,6 +3495,15 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         || request.memory_check_interval_ms.is_some();
 
     Ok(muru_config::Release {
+        static_dirs: request
+            .static_dirs
+            .iter()
+            .map(|entry| muru_config::StaticDir {
+                path: entry.path.clone(),
+                dir: entry.dir.clone(),
+                ..Default::default()
+            })
+            .collect(),
         kind: parse_optional(&request.kind)?,
         profile: parse_optional(&request.profile)?,
         command: request.command.clone(),
@@ -3518,6 +3618,7 @@ fn resolve_http_spec(
         grpc_web_origins: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
+        static_dirs: Vec::new(),
         accel_redirect: false,
         cgi_local_redirect: false,
         sendfile_roots: table.sendfile_roots.clone(),
@@ -3811,6 +3912,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         source: source.to_owned(),
         override_freeze: false,
         fresh: false,
+        static_dirs: Vec::new(),
         retain_workers: None,
         kind: table
             .kind
@@ -4048,6 +4150,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 )
             })
             .collect(),
+        static_dirs: spec.static_dirs.iter().map(StaticSpec::table).collect(),
         mounts: spec
             .mounts
             .iter()
@@ -4321,6 +4424,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "mounts",
         describe_mounts(&declared.mounts),
         describe_mounts(&recorded.mounts),
+    );
+    compare(
+        "static",
+        describe_static(&declared.static_dirs),
+        describe_static(&recorded.static_dirs),
     );
     compare(
         "accel_redirect",
@@ -4612,6 +4720,19 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
                     .unwrap_or_default()
             )
         })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The release's own directories as one phrase, for the report.
+fn describe_static(entries: &[StaticSpec]) -> String {
+    if entries.is_empty() {
+        return "none".to_owned();
+    }
+
+    entries
+        .iter()
+        .map(|entry| format!("{} from {}", entry.path, entry.dir.display()))
         .collect::<Vec<_>>()
         .join("; ")
 }

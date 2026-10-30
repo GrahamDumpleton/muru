@@ -22,7 +22,10 @@ over time, recent requests and the host's and workers' output, refreshed every t
 sign-in. The In flight tile counts requests not yet answered, as the
 `muru_requests_in_flight` metric does, with the WebSockets open in the
 tile beside it; a worker's busy slots in the table below include a
-WebSocket holding one. `--dashboard ADDRESS` moves it to another loopback address and
+WebSocket holding one. The Workers link opens the pages the daemon's
+dashboard has for [looking into the workers](#looking-into-the-workers):
+each worker's status, stacks, tasks and memory, read through the run's
+admin socket, without the restart actions. `--dashboard ADDRESS` moves it to another loopback address and
 `--dashboard off` turns it off; with `--allow-public` it is off unless
 asked for. `/metrics` on the same address is the Prometheus exposition
 the [metrics guide](metrics.md) describes.
