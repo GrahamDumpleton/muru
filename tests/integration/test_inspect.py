@@ -187,6 +187,7 @@ def readable_from_outside() -> bool:
 
 def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
+    daemon.wait_for_routing("plain")
     pid = json.loads(daemon.get("/info").body)["pid"]
     os.kill(pid, signal.SIGSTOP)
 
@@ -218,6 +219,7 @@ def test_a_worker_that_cannot_answer_is_reported(daemon: Daemon) -> None:
 
 def test_a_stopped_worker_does_not_hold_up_the_daemon(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
+    daemon.wait_for_routing("plain")
     pid = json.loads(daemon.get("/info").body)["pid"]
     os.kill(pid, signal.SIGSTOP)
 

@@ -1888,7 +1888,13 @@ class Host:
         log(f"worker {state.index} (pid {state.pid}) leaves routing: scaled in")
 
     def status_of(self, state: WorkerState) -> dict[str, Any]:
-        """One worker's state as the host knows it."""
+        """One worker's state as the host knows it.
+
+        A worker is routed once the host's latest announcement names it
+        and the supervisor has acknowledged that announcement, so the edge
+        routes to it; a replacement still warming, or a worker out of
+        routing while it is traced or debugged, is not.
+        """
 
         return {
             "index": state.index,
@@ -1900,6 +1906,7 @@ class Host:
                 "socket": state.path,
                 "ready": state.ready,
                 "replaced": state.replaced,
+                "routed": self.routed.get(state.index) == state.path and self.acked >= self.version,
                 "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,

@@ -411,6 +411,8 @@ def test_a_frozen_worker_does_not_hold_up_other_applications(daemon: Daemon) -> 
     assert daemon.deploy("other", SHOP, "--processes", "1") == (
         "muru: release other@r1 is ready and serving"
     )
+    daemon.wait_for_routing("shop")
+    daemon.wait_for_routing("other")
     status = json.loads(daemon.muructl("debug", "status", "shop", "--json").stdout)
     pids = {worker["pid"] for worker in status["workers"]}
     assert len(pids) == 2, status
