@@ -20,10 +20,13 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 | Requests | muru_requests_total by status class and reason, muru_request_duration_seconds histograms (queue, application, total), muru_requests_in_flight, muru_retries_total |
 | Capacity | muru_queue_depth, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_websocket_connections; with the handoff of section 6.14, muru_handoffs_total by direction and muru_handoff_queue_wait_seconds |
 | Workers | muru_worker_cpu_seconds_total, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds and muru_loop_lag_seconds histograms, muru_worker_recycles_total by reason, muru_worker_exits_total by reason |
+| Garbage collection | muru_gc_collections_total, muru_gc_seconds_total and muru_gc_collected_objects_total by generation, muru_gc_pause_seconds histogram by generation and by whether requests were in flight |
 | Scaling | muru_scaling_decisions_total, muru_workers_desired, muru_workers_ready, muru_churn_reaps_total |
 | Edge | muru_connections_open, muru_connections_refused_total, muru_tls_handshakes_total by result, muru_snapshot_version, muru_upstream_health |
 | Bodies and uploads | muru_upload_spool_bytes |
 | Clients | muru_requests_total by client_class, muru_rate_limited_total by limit, client class and action |
+
+**Garbage collection.** CPython's cyclic collector pauses the whole process while it runs: on a regular build the collecting thread holds the GIL, on a free-threaded build the collector stops every thread. The gc.freeze() sequence of section 6.2 keeps the preloaded heap out of a worker's collections, and what remains is measured rather than guessed at. Each worker's runtime registers a `gc.callbacks` entry that notes the time and the requests in flight when a collection starts and, when it stops, records the pause, the generation and the objects freed, keeping pauses with requests in flight apart from pauses that cost nothing. The figures travel with the worker's status line, as its CPU time and GIL waits do, and are exported for each worker: counters of collections, time collecting and objects freed by generation, and a histogram of pauses by generation and by `requests` (`in_flight` or `none`) over the signal bounds of section 7.3. The generation label is what the interpreter reports: `0`, `1` or `2` on a build with generations, `full` on a free-threaded build, whose collector takes the whole heap each time. `muructl debug memory` and the dashboard's worker view show the same figures beside the gc counts (section 11.7), and the scaling diagnosis names collection when it takes a tenth of the workers' time or more (section 7.3). The callback costs two calls into the extension, a monotonic clock read and a few atomic additions per collection, about a microsecond against the tens of microseconds or more an automatic collection takes, so it is on in every worker with no setting (ADR 0038).
 
 Some figures are read from a family above rather than exported again: the queue wait is the `queue` phase of muru_request_duration_seconds, a worker's CPU ratio is `rate()` over muru_worker_cpu_seconds_total, and bodies refused for their size are muru_requests_total with the `body_too_large` reason, so there is no muru_queue_wait_seconds, muru_worker_cpu_ratio or muru_body_rejections_total. The edge's own CPU time per thread is not exported.
 
@@ -85,7 +88,7 @@ Every worker has a control connection to its host, and the host to the daemon, s
 
 **Memory.**
 
-- `muructl debug memory`: resident size and gc generation counts at any time, and object counts by type. With `--trace --for 30s`, tracemalloc for the period and the top allocation sites, or a snapshot diff between two points.
+- `muructl debug memory`: resident size, gc generation counts and the collections timed since the worker started (how many, how long, what they freed, and how many ran while requests were in flight, by generation; section 11.1) at any time, and object counts by type. With `--trace --for 30s`, tracemalloc for the period and the top allocation sites, or a snapshot diff between two points.
 - Before a memory recycle (section 7.7) the host can take a snapshot of the worker it is about to replace, so the leak is attributed rather than just survived.
 
 **Stepping in.**

@@ -72,6 +72,12 @@ def suspend_timeouts() -> bool:
 def loop_beat() -> None:
     """Tell the loop stall watchdog that the event loop has run."""
 
+def gc_callback(phase: str, info: dict[str, Any]) -> None:
+    """Time a collection, for gc.callbacks: start notes the time, stop records it."""
+
+def gc_stats() -> list[dict[str, Any]]:
+    """Return the collections timed since the worker started, one dict per generation."""
+
 def resolve_future(future: Any, value: Any) -> None:
     """Complete an asyncio future with a value unless it is already done."""
 

@@ -1813,6 +1813,7 @@ fn scale_message(
                 worker_cpu: status.workers.worker_cpu,
                 gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
                 loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
+                gc_share: status.workers.gc_share,
                 bottleneck: status.diagnosis.bottleneck.to_owned(),
                 diagnosis: status.diagnosis.summary.to_owned(),
                 advice: status.diagnosis.advice.to_owned(),

@@ -43,18 +43,23 @@ impl Histogram {
         self.sum_us.load(Ordering::Relaxed)
     }
 
-    /// The counts at or below each bound, then the count of all, as a
-    /// JSON array.
-    pub(crate) fn cumulative(&self) -> String {
+    /// The counts at or below each bound, then the count of all.
+    pub(crate) fn counts(&self) -> Vec<u64> {
         let mut total = 0;
-        let counts: Vec<String> = self
-            .counts
+
+        self.counts
             .iter()
             .map(|count| {
                 total += count.load(Ordering::Relaxed);
-                total.to_string()
+                total
             })
-            .collect();
+            .collect()
+    }
+
+    /// The counts at or below each bound, then the count of all, as a
+    /// JSON array.
+    pub(crate) fn cumulative(&self) -> String {
+        let counts: Vec<String> = self.counts().iter().map(u64::to_string).collect();
         format!("[{}]", counts.join(","))
     }
 }
@@ -108,7 +113,7 @@ pub fn report_fields() -> String {
         GIL_WAIT.sum_us(),
         LOOP_LAG.cumulative(),
         LOOP_LAG.sum_us()
-    )
+    ) + &crate::gc::report_field()
 }
 
 #[cfg(test)]

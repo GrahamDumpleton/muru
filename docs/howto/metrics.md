@@ -4,8 +4,8 @@
 :class: note
 
 The daemon serves request counters and histograms, slot and queue gauges,
-the workers ready, each worker's requests, memory, CPU time, GIL waits and
-event loop lag, the workers recycled and exited, the autoscaler's decisions
+the workers ready, each worker's requests, memory, CPU time, GIL waits,
+event loop lag and garbage collections, the workers recycled and exited, the autoscaler's decisions
 and reaps, and each listener's connections and TLS handshakes in the
 Prometheus text format, on a metrics listener and through `muructl
 metrics`; a development run serves the request and connection figures from
@@ -77,6 +77,10 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_worker_memory_bytes` | gauge | app, release, group, worker, measure | a worker's memory as `rss`, `pss` or `uss`, measured every `check_interval` of its [memory policy](memory.md) |
 | `muru_gil_wait_seconds` | histogram | app, release, group, worker | how long a worker's threads waited for the GIL when they had work to run, in buckets from 0.1 ms to 5 s, cumulative since the worker started and reported with its memory; absent until the worker has waited at all, so a free-threaded worker never reports it |
 | `muru_loop_lag_seconds` | histogram | app, release, group, worker | how much later than due an ASGI worker's event loop heartbeat ran, which beats twice a second, in the same buckets; absent for a worker without a loop |
+| `muru_gc_collections_total` | counter | app, release, group, worker, generation | garbage collections a worker has run since it started, by generation: `0`, `1` or `2`, or `full` on a free-threaded interpreter, whose collector takes the whole heap each time |
+| `muru_gc_seconds_total` | counter | app, release, group, worker, generation | time the worker spent collecting, during which it served nothing |
+| `muru_gc_collected_objects_total` | counter | app, release, group, worker, generation | objects the collections freed |
+| `muru_gc_pause_seconds` | histogram | app, release, group, worker, generation, requests | how long each collection paused the worker, in buckets from 0.1 ms to 5 s; `requests` is `in_flight` for pauses that landed on requests being served and `none` for pauses that cost no request anything |
 | `muru_worker_recycles_total` | counter | app, release, group, reason | workers their host replaced since the release started: `max_requests`, `max_lifetime`, `memory` ([recycling](recycling.md) and the [memory policy](memory.md)), `hard_timeout`, `loop_stalled` or `gil_stalled` ([timeouts](timeouts.md)) |
 | `muru_worker_exits_total` | counter | app, release, group, reason | workers that exited since the release started: `scaled_in` by the autoscaler, `crashed` (exited on their own and were restarted) or `start_failed` (a replacement or a worker of an optional group that never became ready) |
 | `muru_connections_open` | gauge | listener | connections open on a listener |

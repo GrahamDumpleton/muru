@@ -122,6 +122,9 @@ pub struct WorkerSignals {
     pub gil_wait_p95_ms: Option<f64>,
     /// The 95th percentile lateness of the event loop, in milliseconds.
     pub loop_lag_p95_ms: Option<f64>,
+    /// The share of a worker's wall time spent in garbage collection,
+    /// averaged over the workers (section 11.1).
+    pub gc_share: Option<f64>,
 }
 
 impl WorkerSignals {
@@ -139,6 +142,7 @@ impl WorkerSignals {
         let mut cores = Vec::new();
         let mut gil_wait = Vec::new();
         let mut loop_lag = Vec::new();
+        let mut gc = Vec::new();
         let wall_ms = elapsed.as_millis() as f64;
 
         for worker in after.iter().filter(|worker| worker.group == group) {
@@ -162,6 +166,17 @@ impl WorkerSignals {
 
             add_growth(&mut gil_wait, &worker.gil_wait, &earlier.gil_wait);
             add_growth(&mut loop_lag, &worker.loop_lag, &earlier.loop_lag);
+
+            // Time collecting since the earlier report, over every
+            // generation, as a share of the wall time.
+
+            if wall_ms > 0.0 {
+                let nanos = |status: &crate::host::WorkerStatus| -> u64 {
+                    status.gc.iter().map(|generation| generation.nanos).sum()
+                };
+                let spent = nanos(worker).saturating_sub(nanos(earlier)) as f64;
+                gc.push(spent / 1_000_000.0 / wall_ms);
+            }
         }
 
         Self {
@@ -169,6 +184,7 @@ impl WorkerSignals {
             cores: mean(&cores),
             gil_wait_p95_ms: p95_ms(&gil_wait),
             loop_lag_p95_ms: p95_ms(&loop_lag),
+            gc_share: mean(&gc),
         }
     }
 }
@@ -212,7 +228,8 @@ fn p95_ms(counts: &[u64]) -> Option<f64> {
 /// release, from its slots, its queue and its workers' own signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnosis {
-    /// The bottleneck: cpu, gil, io, heavy, loop, memory, idle or none.
+    /// The bottleneck: cpu, gil, io, heavy, loop, memory, gc, idle or
+    /// none.
     pub bottleneck: &'static str,
     /// The bottleneck in words.
     pub summary: &'static str,
@@ -243,6 +260,18 @@ pub fn diagnose(
             "memory",
             "memory bound",
             "fewer threads per worker, or a higher memory limit",
+        );
+    }
+
+    // A collection stops every thread, so time spent collecting shows up
+    // as GIL wait and loop lag too; it is named first when it is a tenth
+    // of the workers' time or more.
+
+    if signals.gc_share.unwrap_or(0.0) >= 0.1 {
+        return diagnosis(
+            "gc",
+            "paused by garbage collection",
+            "fewer long-lived objects created after the fork, or gc.freeze() once the worker has warmed up",
         );
     }
 
@@ -1591,7 +1620,35 @@ mod tests {
             gil_wait_us: 0,
             loop_lag: Vec::new(),
             loop_lag_us: 0,
+            gc: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_gc_share_is_the_time_collecting_over_the_wall_time() {
+        let zeros = vec![0; 11];
+        let generation = |nanos: u64| crate::host::GcGeneration {
+            generation: "2".to_owned(),
+            collections: 1,
+            nanos,
+            collected: 0,
+            busy: 0,
+            waited: 0,
+            idle: Vec::new(),
+            idle_us: 0,
+            busy_pauses: Vec::new(),
+            busy_us: 0,
+        };
+        let mut before = worker(1, 0, zeros.clone(), true);
+        before.gc = vec![generation(1_000_000_000)];
+        let mut after = worker(1, 0, zeros, true);
+        after.gc = vec![generation(3_000_000_000)];
+
+        // Two seconds collecting over ten seconds of wall time.
+
+        let signals =
+            WorkerSignals::between(&[before], &[after], "default", Duration::from_secs(10), 4);
+        assert_eq!(signals.gc_share, Some(0.2));
     }
 
     #[test]
@@ -1650,6 +1707,14 @@ mod tests {
             loop_lag_p95_ms: Some(500.0),
             ..WorkerSignals::default()
         };
+        let collecting = WorkerSignals {
+            gc_share: Some(0.15),
+            gil_wait_p95_ms: Some(50.0),
+            loop_lag_p95_ms: Some(500.0),
+            ..WorkerSignals::default()
+        };
+
+        assert_eq!(diagnose(0.9, None, &collecting, false).bottleneck, "gc");
         assert_eq!(diagnose(0.9, None, &busy_cpu, false).bottleneck, "cpu");
         assert_eq!(diagnose(0.9, None, &contended, false).bottleneck, "gil");
         assert_eq!(diagnose(0.9, Some(200.0), &quiet, false).bottleneck, "io");

@@ -285,11 +285,11 @@ $ muructl scale status shop
 shop@r42
 GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
 default      3 -> 5       12/12      -1.0    230 ms     0/6        spare 2-12 workers, 1-4 idle
-  workers: cpu 12%, gil wait p95 1 ms, loop lag p95 -
+  workers: cpu 12%, gc 0%, gil wait p95 1 ms, loop lag p95 -
   diagnosis: I/O bound with exhausted slots; for the next release, more threads per worker, or more concurrency for an ASGI application
   last: scale out from 3 to 5 workers: short by 1.0 workers for 5s (2s ago)
 reports      1            0/1        1.0     -          0/6        target 1-6 workers, 80% of slots busy
-  workers: cpu 2%, gil wait p95 1 ms, loop lag p95 -
+  workers: cpu 2%, gc 0%, gil wait p95 1 ms, loop lag p95 -
   diagnosis: idle
 ```
 
@@ -299,9 +299,10 @@ group's workers report about themselves every `check_interval` of the
 [memory policy](memory.md) (5 seconds by default), over the time since
 their last report: their CPU time per second as a share of what a
 worker can use (one core with the GIL, a core per thread on a
-free-threaded interpreter without it), the 95th percentile wait of a
-thread for the GIL when it has work to run, and the 95th percentile
-lateness of an ASGI worker's event loop, which beats twice a second.
+free-threaded interpreter without it), the share of their time spent in
+garbage collection, the 95th percentile wait of a thread for the GIL when
+it has work to run, and the 95th percentile lateness of an ASGI worker's
+event loop, which beats twice a second.
 
 The `diagnosis` line names what holds the group back and what to change
 in the next release:
@@ -309,6 +310,7 @@ in the next release:
 | Diagnosis | When | Suggested |
 | --- | --- | --- |
 | memory bound | a worker within 10% of its soft memory limit | fewer threads per worker, or a higher memory limit |
+| paused by garbage collection | 10% or more of the workers' time spent collecting | fewer long-lived objects created after the fork, or `gc.freeze()` once the worker has warmed up (see [debugging](debugging.md)) |
 | event loop held by blocking code | loop lag p95 of 100 ms or more | await blocking calls, or run them in a thread |
 | GIL bound | GIL wait p95 of 10 ms or more | more processes with fewer threads each |
 | CPU bound | CPU at 80% or more of what a worker can use | more processes, up to the node's cores |
@@ -327,8 +329,9 @@ Every decision is a `scaling.decision` event with its reasons and the
 diagnosis, and `muru_workers_desired`, `muru_scaling_decisions_total`
 and `muru_churn_reaps_total` are in the [metrics](metrics.md) beside
 `muru_workers_ready`, with each worker's CPU time as
-`muru_worker_cpu_seconds_total` and its GIL waits and event loop lag as
-the `muru_gil_wait_seconds` and `muru_loop_lag_seconds` histograms.
+`muru_worker_cpu_seconds_total`, its GIL waits and event loop lag as
+the `muru_gil_wait_seconds` and `muru_loop_lag_seconds` histograms, and
+its garbage collections as the `muru_gc_` families.
 
 A pin overrides the autoscaler:
 

@@ -1118,6 +1118,14 @@ class Host:
         _in_worker = True
         gc.enable()
 
+        # Section 11.1: every collection is timed by the runtime, with the
+        # generation, what it freed and the requests in flight meanwhile,
+        # and reported with the worker's other signals.
+
+        from muru import _native
+
+        gc.callbacks.append(_native.gc_callback)
+
         # Section 11.7: faulthandler is on in every worker, and SIGQUIT
         # writes every thread's stack to the worker's standard error (the
         # host relays it into the log), which the host uses before it
@@ -2250,6 +2258,7 @@ class Host:
                         "gil_wait_us",
                         "loop_lag",
                         "loop_lag_us",
+                        "gc",
                     )
                     if key in report
                 }

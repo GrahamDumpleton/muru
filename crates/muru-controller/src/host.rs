@@ -110,6 +110,37 @@ pub struct WorkerStatus {
     pub loop_lag: Vec<u64>,
     /// The sum of its event loop's lateness, in microseconds.
     pub loop_lag_us: u64,
+    /// Its garbage collections by generation (section 11.1), those with
+    /// a collection so far.
+    pub gc: Vec<GcGeneration>,
+}
+
+/// One generation's garbage collections since a worker started, as the
+/// runtime reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcGeneration {
+    /// The generation: `0`, `1` or `2`, or `full` for a collector that
+    /// takes the whole heap each time.
+    pub generation: String,
+    /// Collections run.
+    pub collections: u64,
+    /// Time spent collecting, in nanoseconds.
+    pub nanos: u64,
+    /// Objects the collections freed.
+    pub collected: u64,
+    /// Collections that ran while requests were in flight.
+    pub busy: u64,
+    /// The requests in flight during those, summed.
+    pub waited: u64,
+    /// Pauses with no request in flight, cumulative over the signal
+    /// bounds then the count of all.
+    pub idle: Vec<u64>,
+    /// Their sum, in microseconds.
+    pub idle_us: u64,
+    /// Pauses with requests in flight, likewise.
+    pub busy_pauses: Vec<u64>,
+    /// Their sum, in microseconds.
+    pub busy_us: u64,
 }
 
 /// A histogram's counts from a status line, or none.
@@ -117,6 +148,30 @@ fn counts(value: &serde_json::Value) -> Vec<u64> {
     value
         .as_array()
         .map(|items| items.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+/// The garbage collections of a status line, by generation.
+fn generations(value: &serde_json::Value) -> Vec<GcGeneration> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| GcGeneration {
+                    generation: item["generation"].as_str().unwrap_or("0").to_owned(),
+                    collections: item["collections"].as_u64().unwrap_or(0),
+                    nanos: item["ns"].as_u64().unwrap_or(0),
+                    collected: item["collected"].as_u64().unwrap_or(0),
+                    busy: item["busy"].as_u64().unwrap_or(0),
+                    waited: item["waited"].as_u64().unwrap_or(0),
+                    idle: counts(&item["idle_hist"]),
+                    idle_us: item["idle_us"].as_u64().unwrap_or(0),
+                    busy_pauses: counts(&item["busy_hist"]),
+                    busy_us: item["busy_us"].as_u64().unwrap_or(0),
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -221,6 +276,7 @@ impl HostMessage {
                                 gil_wait_us: worker["gil_wait_us"].as_u64().unwrap_or(0),
                                 loop_lag: counts(&worker["loop_lag"]),
                                 loop_lag_us: worker["loop_lag_us"].as_u64().unwrap_or(0),
+                                gc: generations(&worker["gc"]),
                             })
                             .collect()
                     })

@@ -219,6 +219,26 @@ pub const FAMILIES: &[Family] = &[
         help: "How much later than due a worker's event loop heartbeat ran, as it last reported.",
     },
     Family {
+        name: "muru_gc_collections_total",
+        kind: Kind::Counter,
+        help: "Garbage collections a worker has run, by generation, as it last reported.",
+    },
+    Family {
+        name: "muru_gc_seconds_total",
+        kind: Kind::Counter,
+        help: "Time a worker has spent in garbage collection, by generation.",
+    },
+    Family {
+        name: "muru_gc_collected_objects_total",
+        kind: Kind::Counter,
+        help: "Objects a worker's garbage collections freed, by generation.",
+    },
+    Family {
+        name: "muru_gc_pause_seconds",
+        kind: Kind::Histogram,
+        help: "How long a worker's garbage collections paused it, by generation and whether requests were in flight.",
+    },
+    Family {
         name: "muru_worker_recycles_total",
         kind: Kind::Counter,
         help: "Workers their host replaced, by reason: max_requests, max_lifetime, memory, hard_timeout, loop_stalled or gil_stalled.",

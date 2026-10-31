@@ -1960,6 +1960,7 @@ impl Daemon {
                     },
                     policy: status.spec.describe(),
                     cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
                     gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
                     loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
                     diagnosis: status.diagnosis.summary.to_owned(),
@@ -3072,6 +3073,43 @@ impl Daemon {
                     &worker.loop_lag,
                     worker.loop_lag_us,
                 ));
+
+                // Section 11.1: its garbage collections, by generation.
+
+                for generation in &worker.gc {
+                    let labels = [
+                        ("app", app.as_str()),
+                        ("release", id.as_str()),
+                        ("group", worker.group.as_str()),
+                        ("worker", index.as_str()),
+                        ("generation", generation.generation.as_str()),
+                    ];
+
+                    for (name, value) in [
+                        ("muru_gc_collections_total", generation.collections as f64),
+                        ("muru_gc_seconds_total", generation.nanos as f64 / 1e9),
+                        (
+                            "muru_gc_collected_objects_total",
+                            generation.collected as f64,
+                        ),
+                    ] {
+                        samples.push(muru_edge::metrics::Sample::new(name, &labels, value));
+                    }
+
+                    for (requests, counts, sum_us) in [
+                        ("none", &generation.idle, generation.idle_us),
+                        ("in_flight", &generation.busy_pauses, generation.busy_us),
+                    ] {
+                        let mut with_requests = labels.to_vec();
+                        with_requests.push(("requests", requests));
+                        samples.extend(muru_edge::metrics::signal_histogram(
+                            "muru_gc_pause_seconds",
+                            &with_requests,
+                            counts,
+                            sum_us,
+                        ));
+                    }
+                }
 
                 for (measure, bytes) in [
                     ("rss", worker.rss),

@@ -1185,6 +1185,36 @@ fn print_memory(response: &pb::DebugResponse) {
         }
 
         println!("  gc counts {}", result["gc"]["counts"]);
+
+        // Section 11.1: the collections the runtime timed, by generation.
+
+        for generation in result["gc"]["pauses"].as_array().into_iter().flatten() {
+            let count = |key: &str| generation[key].as_u64().unwrap_or(0);
+            let pauses: Vec<u64> = ["idle_hist", "busy_hist"]
+                .iter()
+                .map(|key| {
+                    generation[*key]
+                        .as_array()
+                        .map(|items| items.iter().filter_map(serde_json::Value::as_u64).collect())
+                        .unwrap_or_default()
+                })
+                .reduce(|idle: Vec<u64>, busy: Vec<u64>| {
+                    idle.iter().zip(&busy).map(|(a, b)| a + b).collect()
+                })
+                .unwrap_or_default();
+            let p95 = signal_p95_ms(&pauses).map_or("-".to_owned(), |ms| format!("{ms} ms"));
+            println!(
+                "  gc generation {}: {} collections, {:.1} ms in all, p95 under {}, {} objects freed, {} while {} requests were in flight",
+                generation["generation"].as_str().unwrap_or("?"),
+                count("collections"),
+                count("ns") as f64 / 1e6,
+                p95,
+                count("collected"),
+                count("busy"),
+                count("waited"),
+            );
+        }
+
         println!("  objects:");
 
         for entry in result["objects"].as_array().into_iter().flatten() {
@@ -1372,6 +1402,22 @@ async fn ask(
 }
 
 /// A worker's answer as JSON, when it answered.
+/// The 95th percentile of a worker's cumulative histogram over the
+/// signal bounds, in milliseconds: the bound holding 95 percent of the
+/// observations, or none without any.
+fn signal_p95_ms(counts: &[u64]) -> Option<f64> {
+    let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
+    let total = *counts.last()?;
+
+    if total == 0 || counts.len() != bounds.len() + 1 {
+        return None;
+    }
+
+    let target = total as f64 * 0.95;
+    let index = counts.iter().position(|count| *count as f64 >= target)?;
+    Some(*bounds.get(index).or(bounds.last())? as f64 / 1000.0)
+}
+
 fn parse_result(answer: &pb::WorkerDebug) -> Option<serde_json::Value> {
     if !answer.ok {
         return None;
@@ -2920,8 +2966,9 @@ fn print_scale_status(status: &pb::ScaleStatus) {
             value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
         };
         println!(
-            "  workers: cpu {}, gil wait p95 {}, loop lag p95 {}",
+            "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}",
             measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+            measured(group.gc_share.map(|share| share * 100.0), "%"),
             measured(group.gil_wait_p95_ms, " ms"),
             measured(group.loop_lag_p95_ms, " ms")
         );
