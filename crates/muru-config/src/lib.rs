@@ -674,6 +674,9 @@ pub struct Release {
     /// When and how the environment is built on the node (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Build>,
+    /// Where compiled bytecode goes (section 8.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytecode: Option<Bytecode>,
     /// Worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processes: Option<usize>,
@@ -3875,6 +3878,48 @@ pub struct Build {
     pub compile_bytecode: Option<bool>,
 }
 
+/// Where compiled bytecode goes for a daemon-managed release (section
+/// 8.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bytecode {
+    /// A writable directory of the release's own under the state
+    /// directory, so nothing lands in the source tree (the default).
+    #[default]
+    Redirect,
+    /// `__pycache__` beside the source, as Python does by default; what a
+    /// release with precompiled bytecode uses.
+    Source,
+    /// No bytecode is written.
+    Off,
+}
+
+impl Bytecode {
+    /// The value as the file spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Bytecode::Redirect => "redirect",
+            Bytecode::Source => "source",
+            Bytecode::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for Bytecode {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "redirect" => Ok(Bytecode::Redirect),
+            "source" => Ok(Bytecode::Source),
+            "off" => Ok(Bytecode::Off),
+            other => Err(format!(
+                "{other} is not a bytecode setting: redirect, source or off"
+            )),
+        }
+    }
+}
+
 /// When an environment is built (section 8.2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -4162,6 +4207,9 @@ pub struct ToolMuru {
     /// When and how the environment is built (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Build>,
+    /// Where compiled bytecode goes under the daemon (section 8.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytecode: Option<Bytecode>,
 }
 
 /// Why a project's configuration could not be read.

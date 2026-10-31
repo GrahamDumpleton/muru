@@ -1719,6 +1719,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             &resolved.project,
         )),
         build: resolved.build.clone(),
+        bytecode: None,
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
         sync_threads: Some(resolved.sync_threads),
@@ -2270,6 +2271,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut spec = HostSpec {
         python: python.python.clone(),
         pythonpath: library.pythonpath.clone(),
+        pycache_prefix: None,
+        no_bytecode: false,
         app: resolved.entrypoint.clone(),
         name: Some(label.clone()),
         release: None,

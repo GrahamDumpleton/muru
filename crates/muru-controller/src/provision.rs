@@ -73,6 +73,11 @@ impl Provisioning {
         state_dir.join("envs").join(app).join(id)
     }
 
+    /// Where a release's redirected bytecode goes (section 8.2).
+    pub fn pycache_dir(state_dir: &Path, app: &str, id: &str) -> std::path::PathBuf {
+        state_dir.join("pycache").join(app).join(id)
+    }
+
     /// The isolation a build runs with: the daemon's directories, the
     /// project's own uv configuration kept (no `UV_NO_CONFIG`), the
     /// daemon's config file when `tools.uv_config` names one, and a cache

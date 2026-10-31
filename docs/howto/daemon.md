@@ -226,6 +226,20 @@ Python the request names and the node lacks is downloaded into the state
 directory first, unless the `[tools]` table says `python_downloads =
 "never"` or `offline = true`.
 
+## Bytecode caches
+
+Python writes compiled bytecode into `__pycache__` beside the source,
+which an immutable release directory should not take and a release
+directory owned by another user cannot. Under the daemon, bytecode goes to
+a directory of the release's own under the state directory, `pycache/APP/RELEASE`,
+writable by the release's user and removed with the release, so cold
+starts stay fast and the source tree stays clean. A source that already
+holds bytecode for the release's interpreter, compiled by `muructl build
+--deployment` or `python -m compileall`, is used as it is. `bytecode` in
+the project's `[tool.muru]` table, in a declared release or as
+`--bytecode` on `muructl deploy` takes `redirect` (the default), `source`
+or `off`, and `muructl release show` says which is in force.
+
 ## Where things live
 
 The daemon keeps its state store, run directory and logs in the user

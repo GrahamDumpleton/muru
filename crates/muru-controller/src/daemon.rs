@@ -3909,9 +3909,44 @@ impl Daemon {
                 .emit("release.state_changed", &subject, level, note);
         }
 
+        // Section 8.2: redirected bytecode goes to a directory of the
+        // release's own, writable by its user and removed with it;
+        // precompiled bytecode in the source is used where it is.
+
+        let pycache_prefix = match spec.bytecode.effective() {
+            muru_config::Bytecode::Redirect => {
+                let prefix = crate::provision::Provisioning::pycache_dir(
+                    &self.locations.state.path,
+                    app,
+                    id,
+                );
+
+                match std::fs::create_dir_all(&prefix) {
+                    Ok(()) => {
+                        if let Some(identity) = identity {
+                            let _ = std::os::unix::fs::chown(
+                                &prefix,
+                                Some(identity.uid),
+                                Some(identity.gid),
+                            );
+                        }
+
+                        Some(prefix)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "creating {} failed; bytecode is left to Python", prefix.display());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let host_spec = HostSpec {
             python,
             pythonpath: library.pythonpath.clone(),
+            pycache_prefix,
+            no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),

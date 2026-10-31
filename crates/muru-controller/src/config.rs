@@ -2373,6 +2373,26 @@ pub fn resolve_spec(
         build.builds,
     )?;
 
+    // Section 8.2: where bytecode goes, and whether the source already
+    // holds bytecode for the interpreter, which a redirected release then
+    // runs on instead.
+
+    let bytecode_mode = if request.bytecode.is_empty() {
+        table.bytecode.unwrap_or_default()
+    } else {
+        request
+            .bytecode
+            .parse()
+            .map_err(|error: String| format!("--bytecode {error}"))?
+    };
+    let bytecode = crate::model::BytecodeSpec {
+        mode: bytecode_mode,
+        precompiled: interpreter
+            .as_ref()
+            .filter(|interpreter| !interpreter.cache_tag.is_empty())
+            .is_some_and(|interpreter| precompiled(&source, &interpreter.cache_tag)),
+    };
+
     // Section 7.1: groups from the declaration, else the source's own
     // table; each takes its sizes from the release's where it is silent.
 
@@ -2966,7 +2986,58 @@ pub fn resolve_spec(
         layers,
         interpreter,
         build,
+        bytecode,
     })
+}
+
+/// Whether the source holds compiled bytecode for an interpreter: a
+/// `__pycache__` with a file of its cache tag, beside the source. The walk
+/// is bounded, since a source tree can be large and the first hit decides.
+fn precompiled(source: &Path, cache_tag: &str) -> bool {
+    let suffix = format!(".{cache_tag}.pyc");
+    let mut pending = vec![(source.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            seen += 1;
+
+            if seen > 5000 {
+                return false;
+            }
+
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+
+            if path.is_dir() {
+                if name == "__pycache__" {
+                    let compiled = std::fs::read_dir(&path)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|file| file.file_name().to_string_lossy().ends_with(&suffix));
+
+                    if compiled {
+                        return true;
+                    }
+                } else if depth < 6
+                    && !name.starts_with('.')
+                    && name != "node_modules"
+                    && name != "site-packages"
+                {
+                    pending.push((path, depth + 1));
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Section 8.2: the build settings for a release, and whether the daemon
@@ -3341,6 +3412,7 @@ fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
         ("entrypoint", spec.entrypoint.clone()),
         ("python", spec.python.display().to_string()),
         ("build.when", spec.build.when.as_str().to_owned()),
+        ("bytecode", spec.bytecode.describe()),
         ("interface", spec.interface.to_string()),
         ("preload", spec.preload.to_string()),
         ("processes", spec.processes.to_string()),
@@ -3661,6 +3733,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         factory_phase: parse_optional(&request.factory_phase)?,
         python: (!request.python.is_empty()).then(|| request.python.clone()),
         build: None,
+        bytecode: None,
         processes: request.processes.map(|value| value as usize),
         threads: request.threads.map(|value| value as usize),
         sync_threads: request.sync_threads.map(|value| value as usize),
@@ -3790,6 +3863,7 @@ fn resolve_http_spec(
         layers: crate::model::Layers::default(),
         interpreter: None,
         build: crate::model::BuildSpec::default(),
+        bytecode: crate::model::BytecodeSpec::default(),
     })
 }
 
@@ -4105,6 +4179,10 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
             .as_ref()
             .map(|build| build.groups.clone())
             .unwrap_or_default(),
+        bytecode: table
+            .bytecode
+            .map(|bytecode| bytecode.as_str().to_owned())
+            .unwrap_or_default(),
         processes: table.processes.map(|value| value as u32),
         threads: table.threads.map(|value| value as u32),
         sync_threads: table.sync_threads.map(|value| value as u32),
@@ -4274,6 +4352,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         factory_phase: spec.factory,
         python: Some(spec.python.display().to_string()),
         build: None,
+        bytecode: None,
         processes: Some(spec.processes as usize),
         threads: Some(spec.threads as usize),
         sync_threads: Some(spec.sync_threads as usize),

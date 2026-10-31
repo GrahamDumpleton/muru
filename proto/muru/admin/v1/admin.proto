@@ -249,6 +249,7 @@ message DeployRequest {
   string build_when = 52;                   // section 8.2: auto, always or never; the table's, else auto, when empty
   repeated string build_extras = 53;        // extras the built environment includes, beside the table's
   repeated string build_groups = 54;        // dependency groups the built environment includes, beside the table's
+  string bytecode = 55;                     // section 8.2: redirect, source or off; the table's, else redirect, when empty
 }
 
 // Section 4.9: a directory of the release's own files, as --static gives it.
@@ -479,6 +480,7 @@ message Release {
   string python_request = 28;       // the request that chose the interpreter and its source, if one did
   string environment = 29;          // the environment the daemon built for the release, when it builds one
   string build_when = 30;           // the build mode in force: auto, always or never
+  string bytecode = 31;             // where bytecode goes: redirect with its directory, source (precompiled when detected), or off
 }
 
 // A named mount of a release: a path served by another entrypoint in

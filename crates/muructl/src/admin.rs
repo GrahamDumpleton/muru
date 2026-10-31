@@ -1840,6 +1840,12 @@ pub struct DeployArgs {
     #[arg(long = "build-group", value_name = "NAME")]
     build_group: Vec<String>,
 
+    /// Where the release's bytecode goes: redirect (the default, a
+    /// directory of its own under the state directory), source (beside
+    /// the source, as Python does) or off.
+    #[arg(long, value_name = "MODE")]
+    bytecode: Option<String>,
+
     /// Worker processes.
     #[arg(long)]
     processes: Option<u32>,
@@ -2273,6 +2279,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
         build_when: args.build.unwrap_or_default(),
         build_extras: args.build_extra,
         build_groups: args.build_group,
+        bytecode: args.bytecode.unwrap_or_default(),
         processes: args.processes,
         threads: args.threads,
         sync_threads: args.sync_threads,
@@ -3925,6 +3932,10 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                 release.environment, release.build_when
             ),
         ));
+    }
+
+    if !release.bytecode.is_empty() {
+        lines.push(("bytecode".to_owned(), release.bytecode.clone()));
     }
 
     lines.push((

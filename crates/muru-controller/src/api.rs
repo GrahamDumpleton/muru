@@ -1591,18 +1591,20 @@ impl Service {
             .delete_release(app, id)
             .map_err(|error| error.to_string())?;
 
-        // Section 8.2: the environment built for the release goes with it.
+        // Section 8.2: the environment built for the release and its
+        // bytecode go with it.
 
-        let environment = crate::provision::Provisioning::environment_dir(
-            &self.handle.info.locations.state.path,
-            app,
-            id,
-        );
+        let state = &self.handle.info.locations.state.path;
 
-        if environment.is_dir()
-            && let Err(error) = std::fs::remove_dir_all(&environment)
-        {
-            tracing::warn!(%error, "removing {} failed", environment.display());
+        for dir in [
+            crate::provision::Provisioning::environment_dir(state, app, id),
+            crate::provision::Provisioning::pycache_dir(state, app, id),
+        ] {
+            if dir.is_dir()
+                && let Err(error) = std::fs::remove_dir_all(&dir)
+            {
+                tracing::warn!(%error, "removing {} failed", dir.display());
+            }
         }
 
         Ok(outcome.to_owned())
@@ -1883,6 +1885,19 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .unwrap_or_default()
     };
 
+    let bytecode = match release.spec.bytecode.effective() {
+        muru_config::Bytecode::Redirect => format!(
+            "redirect, under {}",
+            crate::provision::Provisioning::pycache_dir(
+                &handle.info.locations.state.path,
+                &release.app,
+                &release.id,
+            )
+            .display()
+        ),
+        _ => release.spec.bytecode.describe(),
+    };
+
     let environment = if release.spec.build.builds {
         crate::provision::Provisioning::environment_dir(
             &handle.info.locations.state.path,
@@ -1930,6 +1945,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .unwrap_or_default(),
         environment,
         build_when: release.spec.build.when.as_str().to_owned(),
+        bytecode,
         processes: release.spec.processes,
         threads: release.spec.threads,
         sync_threads: release.spec.sync_threads,

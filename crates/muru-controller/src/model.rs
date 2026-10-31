@@ -439,6 +439,9 @@ pub struct ReleaseSpec {
     /// Section 8.2: when and how the environment is built on the node.
     #[serde(default)]
     pub build: BuildSpec,
+    /// Section 8.2: where compiled bytecode goes.
+    #[serde(default)]
+    pub bytecode: BytecodeSpec,
 }
 
 /// Section 3.3: where each of a release's settings came from, by key:
@@ -465,6 +468,47 @@ impl PartialEq for Layers {
 }
 
 impl Eq for Layers {}
+
+/// Section 8.2: where a release's bytecode goes. `precompiled` records
+/// what was found in the source at resolution, so it stays out of the
+/// comparison that keeps releases immutable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BytecodeSpec {
+    /// The setting.
+    #[serde(default)]
+    pub mode: muru_config::Bytecode,
+    /// Whether the source holds bytecode for the interpreter's cache tag,
+    /// in which case a redirected release runs on it instead.
+    #[serde(default)]
+    pub precompiled: bool,
+}
+
+impl BytecodeSpec {
+    /// What the release runs with: the setting, except that redirecting
+    /// gives way to precompiled bytecode in the source.
+    pub fn effective(&self) -> muru_config::Bytecode {
+        match self.mode {
+            muru_config::Bytecode::Redirect if self.precompiled => muru_config::Bytecode::Source,
+            mode => mode,
+        }
+    }
+
+    /// A short description, as `redirect`, `source (precompiled)` or `off`.
+    pub fn describe(&self) -> String {
+        match (self.mode, self.precompiled) {
+            (muru_config::Bytecode::Redirect, true) => "source (precompiled)".to_owned(),
+            (mode, _) => mode.as_str().to_owned(),
+        }
+    }
+}
+
+impl PartialEq for BytecodeSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl Eq for BytecodeSpec {}
 
 /// Section 8.2: the build table as resolved for a release, and whether
 /// the daemon builds an environment for it. `builds` follows from the
@@ -514,6 +558,10 @@ pub struct Interpreter {
     pub version: String,
     /// The wheel tag, as `cp313` or `cp314t`.
     pub tag: String,
+    /// `sys.implementation.cache_tag`, as `cpython-313`, which names the
+    /// bytecode files.
+    #[serde(default)]
+    pub cache_tag: String,
     /// Whether the GIL is disabled.
     #[serde(default)]
     pub free_threaded: bool,
@@ -532,6 +580,7 @@ impl Interpreter {
         Self {
             version: resolved.probe.version.clone(),
             tag: resolved.probe.tag(),
+            cache_tag: resolved.probe.cache_tag.clone(),
             free_threaded: resolved.probe.free_threaded,
             platform: format!("{} {}", resolved.probe.platform, resolved.probe.machine),
             request: resolved

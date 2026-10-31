@@ -387,6 +387,11 @@ pub struct HostSpec {
     /// Section 8.3: the runtime library directory to put first on
     /// PYTHONPATH, when the environment's own `muru` is not used.
     pub pythonpath: Option<PathBuf>,
+    /// Section 8.2: the directory bytecode is written under
+    /// (PYTHONPYCACHEPREFIX), when it is redirected.
+    pub pycache_prefix: Option<PathBuf>,
+    /// Section 8.2: write no bytecode at all.
+    pub no_bytecode: bool,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -780,6 +785,16 @@ impl HostProcess {
         }
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
+
+        // Section 8.2: where bytecode goes, when it is not left to Python.
+
+        if let Some(prefix) = &spec.pycache_prefix {
+            command.env("PYTHONPYCACHEPREFIX", prefix);
+        }
+
+        if spec.no_bytecode {
+            command.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
 
         // Section 8.3: the runtime library first on PYTHONPATH, ahead of
         // whatever the environment or the settings put there.
