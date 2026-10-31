@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from support import server as support
 from support.daemon import SHOP, start_daemon
 
 
@@ -24,6 +25,31 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
 
 def archives(directory: Path, name: str) -> list[Path]:
     return sorted(path for path in directory.glob(f"{name}.*") if path.name != name)
+
+
+def test_a_rotation_policy_added_by_reload_takes_effect(tmp_path: Path) -> None:
+    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+    logs = tmp_path / "logs"
+
+    try:
+        assert daemon.deploy("shop", SHOP, "--processes", "1") == (
+            "muru: release shop@r1 is ready and serving"
+        )
+
+        for _ in range(60):
+            assert daemon.get("/catalogue").status == 200
+
+        time.sleep(1.5)
+        assert archives(logs, "access.log") == []
+
+        with (daemon.base / "muru.toml").open("a") as handle:
+            handle.write("\n[logs]\nsize = '4KB'\nkeep = 2\ncompress = 'off'\nevery = 'off'\n")
+
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [logs] (the daemon rotates on the new policy)" in reloaded, reloaded
+        wait_for(lambda: len(archives(logs, "access.log")) >= 1)
+    finally:
+        daemon.stop()
 
 
 def test_logs_are_rotated_by_size_compressed_and_pruned(tmp_path: Path) -> None:

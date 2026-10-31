@@ -1,0 +1,21 @@
+<style>
+body { background: #fff8f0; }
+h1 { color: #6d4c41; }
+pre { border-color: #ffe0b2; }
+.flame { transform-box: fill-box; transform-origin: bottom center; animation: flicker 0.4s ease-in-out infinite alternate; }
+.steam { animation: steam 2.2s ease-out infinite; }
+.s2 { animation-delay: 0.8s; }
+@keyframes flicker { from { transform: scale(0.9, 0.95) rotate(-3deg); } to { transform: scale(1.05, 1.1) rotate(3deg); } }
+@keyframes steam { 0% { transform: translateY(0); opacity: 0.7; } 100% { transform: translateY(-22px); opacity: 0; } }
+</style>
+<div class="occasion" aria-hidden="true"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+<ellipse cx="80" cy="176" rx="70" ry="10" fill="#e0d4c8"/>
+<rect x="30" y="120" width="100" height="54" rx="6" fill="#f4a261"/>
+<path d="M30 126q10 14 20 0t20 0t20 0t20 0t20 0v-6h-100z" fill="#fff1e6"/>
+<rect x="76" y="86" width="8" height="36" fill="#e63946"/><rect x="76" y="94" width="8" height="5" fill="#fff"/><rect x="76" y="108" width="8" height="5" fill="#fff"/>
+<path class="flame" d="M80 84q-8 -10 0 -22q8 12 0 22z" fill="#ffb703"/>
+<rect x="140" y="110" width="40" height="46" rx="5" fill="#3d5a80"/><path d="M180 120q16 2 14 16t-14 14" stroke="#3d5a80" stroke-width="6" fill="none"/>
+<rect x="144" y="114" width="32" height="8" fill="#98c1d9"/>
+<path class="steam" d="M152 104q-5 -8 0 -16" stroke="#bbb" stroke-width="2" fill="none"/><path class="steam s2" d="M168 104q-5 -8 0 -16" stroke="#bbb" stroke-width="2" fill="none"/>
+<text x="100" y="196" text-anchor="middle" font-size="12" font-family="system-ui, sans-serif" fill="#a1887f">thank your sysadmin</text>
+</svg></div>

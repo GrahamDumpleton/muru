@@ -6,6 +6,7 @@ import contextvars
 import gc
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -166,6 +167,23 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         time.sleep(float(query.get("seconds", "0.1")))
         start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", "5")])
         return [b"slept"]
+
+    if path == "/spawn":
+        # A child that outlives the request, for the subreaper scenarios:
+        # its pid goes to the file the query names, then the request runs
+        # on, past a hard timeout if the test sets one.
+
+        child = subprocess.Popen(["sleep", "300"])
+
+        with open(query["pidfile"], "w") as handle:
+            handle.write(str(child.pid))
+
+        time.sleep(float(query.get("seconds", "0")))
+        body = str(child.pid).encode()
+        start_response(
+            "200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))]
+        )
+        return [body]
 
     if path == "/hold":
         hold_the_interpreter(int(query.get("seconds", "1")))

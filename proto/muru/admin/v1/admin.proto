@@ -622,6 +622,7 @@ message ConfigReport {
   repeated ConfigChange changes = 3;
   uint32 unchanged = 4;             // releases already as declared
   bool applied = 5;                 // the changes were carried out
+  repeated string notes = 6;        // what else the apply did: certificates renewed
 }
 
 message ConfigChange {

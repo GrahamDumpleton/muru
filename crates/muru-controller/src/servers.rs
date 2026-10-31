@@ -534,14 +534,20 @@ impl Servers {
     /// Stop every instance: the graceful signal, then SIGKILL for one
     /// still there after `grace`, and the sockets and run directory
     /// removed.
-    pub async fn stop(mut self, grace: Duration) {
+    pub async fn stop(self, grace: Duration) {
+        self.stop_until(Instant::now() + grace).await;
+    }
+
+    /// Stop the instances as `stop` does, killing what is still there at
+    /// `kill_at`.
+    pub async fn stop_until(mut self, kill_at: Instant) {
         let signal = self.stop_signal();
 
         for instance in &self.instances {
             instance.signal(signal);
         }
 
-        let deadline = Instant::now() + grace;
+        let deadline = kill_at;
 
         for instance in &mut self.instances {
             instance.finish(deadline).await;

@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
+from support import server as support
 from support.daemon import FACTORY, SHOP, Daemon
 from support.daemon import daemon as daemon_fixture
 
@@ -364,3 +367,101 @@ routes.files.target = {{ static = 'snapshot' }}
     assert (missed.status, missed.body) == (404, b"route page")
     missed = daemon.request("/more/missing", host="site.test")
     assert (missed.status, missed.body) == (404, b"host page")
+
+
+def test_a_file_named_by_a_relative_path_gives_absolute_paths(daemon: Daemon) -> None:
+    """The paths resolved from an applied file's directory come out absolute
+    whether `-f` named the file by an absolute or a relative path, since
+    the daemon checks some of them, `sendfile_roots` among them, for being
+    absolute."""
+
+    site = daemon.base / "relative"
+    (site / "reports").mkdir(parents=True)
+    (site / "site.toml").write_text(
+        f"""[app.shop.release.r1]
+source = '{SHOP}'
+python = '{sys.executable}'
+processes = 1
+sendfile_roots = ['reports']
+"""
+    )
+    muructl = support.muructl_path()
+    assert muructl is not None
+    applied = subprocess.run(
+        [str(muructl), "apply", "-f", "site.toml", "--socket", str(daemon.run_dir / "admin.sock")],
+        cwd=site,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    exported = daemon.muructl("config", "export").stdout
+    assert str(site / "reports") in exported, exported
+
+
+def test_a_frozen_worker_does_not_hold_up_other_applications(daemon: Daemon) -> None:
+    """The edge keeps its connections to the workers an apply does not
+    change, so a stopped worker of one application neither delays a routing
+    change for another by the HELLO timeout nor is put out of its pool and
+    replaced for a change that did not touch it; the host's own liveness
+    checks are what deal with it."""
+
+    assert daemon.deploy("shop", SHOP, "--processes", "2") == (
+        "muru: release shop@r1 is ready and serving"
+    )
+    assert daemon.deploy("other", SHOP, "--processes", "1") == (
+        "muru: release other@r1 is ready and serving"
+    )
+    daemon.wait_for_routing("shop")
+    daemon.wait_for_routing("other")
+    status = json.loads(daemon.muructl("debug", "status", "shop", "--json").stdout)
+    pids = {worker["pid"] for worker in status["workers"]}
+    assert len(pids) == 2, status
+    frozen = pids.pop()
+    os.kill(frozen, signal.SIGSTOP)
+
+    try:
+        site = daemon.base / "frozen"
+        site.mkdir()
+        (site / "site.toml").write_text(
+            """[host.shop]
+names = ['shop.test']
+default = true
+
+[host.other]
+names = ['other.test']
+
+[[route]]
+host = 'shop'
+app = 'shop'
+
+[[route]]
+host = 'other'
+app = 'other'
+"""
+        )
+        started = time.monotonic()
+        applied = daemon.muructl("apply", "-f", str(site / "site.toml"), check=False)
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        assert time.monotonic() - started < 4
+
+        # The change landed, and the frozen worker is still one of its
+        # release's: nothing reported it and nothing replaced it.
+
+        assert json.loads(daemon.request("/", host="other.test").body)["app"] == "other"
+        assert "worker.unreachable" not in daemon.events(), daemon.muructl("events").stdout
+        status = json.loads(daemon.muructl("debug", "status", "shop", "--json").stdout)
+        assert {worker["pid"] for worker in status["workers"]} == pids | {frozen}, status
+    finally:
+        try:
+            os.kill(frozen, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+
+    # Woken, it serves on the connection the edge kept.
+
+    for _ in range(50):
+        if json.loads(daemon.request("/").body)["pid"] == frozen:
+            break
+    else:
+        raise AssertionError(f"pid {frozen} served nothing after it was woken")

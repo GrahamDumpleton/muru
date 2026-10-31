@@ -29,6 +29,10 @@ service EdgeControl {
   rpc GetWebSockets(WebSocketsRequest) returns (WebSockets);
   // Stop accepting and exit once the requests in flight have finished.
   rpc Stop(StopRequest) returns (Stopped);
+  // Close connections after their response for the delay while still
+  // accepting, then stop accepting and let the requests in flight finish,
+  // keeping the WebSockets relaying until Stop. Answers once drained.
+  rpc Drain(DrainRequest) returns (Drained);
   // Section 7.4: the groups scaled to zero that requests are waiting
   // for, as they wait, for the daemon to wake.
   rpc WatchWakes(WatchWakesRequest) returns (stream Wake);
@@ -51,6 +55,31 @@ message Snapshot {
   repeated RateLimit rate_limits = 14;  // section 4.15: the rate limits hosts and routes name
   Traffic default_traffic = 15;         // with no host declared, the default application's policy: its rollout's share (section 9.3)
   repeated H2cPolicy h2c = 16;          // section 6.13: listeners that limit cleartext HTTP/2; every client elsewhere
+  Limits limits = 17;                   // section 4.6: the limits in force; the edge keeps its current ones when absent
+}
+
+// Section 4.6: the limits and timeouts the edge enforces, durations in
+// milliseconds. A reload that changes the [limits] table sends them in
+// the next snapshot, and connections accepted from then on take them.
+message Limits {
+  uint64 max_body_size = 1;
+  uint64 max_header_bytes = 2;
+  uint32 max_headers = 3;
+  uint64 header_read_timeout_ms = 4;
+  uint64 queue_timeout_ms = 5;
+  uint64 request_deadline_ms = 6;
+  uint64 body_idle_timeout_ms = 7;
+  uint64 response_idle_timeout_ms = 8;
+  uint64 max_connections = 9;
+  uint64 max_connections_per_client = 10;
+  uint64 keep_alive_timeout_ms = 11;
+  uint64 keep_alive_timeout_proxy_ms = 12;
+  uint64 max_requests_per_connection = 13;
+  uint32 http2_max_concurrent_streams = 14;
+  uint64 spool_quota = 15;
+  uint64 websocket_max_message_size = 16;
+  uint64 websocket_ping_interval_ms = 17;
+  uint64 websocket_idle_timeout_ms = 18;
 }
 
 // Section 6.13: who may speak HTTP/2 in cleartext on a listener without
@@ -316,6 +345,16 @@ message Group {
 
 message Applied {
   uint64 version = 1;
+  // Workers the snapshot named that the edge could not connect to; the
+  // snapshot was applied without them (section 5.1).
+  repeated UnreachableWorker unreachable = 2;
+}
+
+message UnreachableWorker {
+  string app = 1;
+  string release = 2;
+  string socket = 3;
+  string reason = 4;
 }
 
 message EdgeStatusRequest {}
@@ -335,6 +374,15 @@ message Listener {
 message StopRequest {}
 
 message Stopped {}
+
+message DrainRequest {
+  uint64 delay_ms = 1;
+  uint64 grace_ms = 2;
+}
+
+message Drained {
+  bool finished = 1;                    // every request in flight finished within the grace
+}
 
 message MetricsRequest {}
 

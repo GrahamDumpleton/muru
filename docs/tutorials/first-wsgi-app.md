@@ -116,12 +116,11 @@ dead process.
 
 ## Reload on change
 
-```
-muructl run app:application --reload
-```
-
-Now fix the application and save. The terminal says what changed and that
-it switched to a new release:
+The run has been watching the project all along: in development mode,
+`muructl run` starts a new release whenever a `.py` file under the
+project changes, and the start-up line said so. Fix the application and
+save. The terminal says what changed and that it switched to a new
+release:
 
 ```
 muru: reloading, app.py changed

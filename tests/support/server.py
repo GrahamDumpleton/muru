@@ -273,6 +273,7 @@ def start(
     https: bool = False,
     host: str = "127.0.0.1",
     new_session: bool = False,
+    reload: bool | None = False,
 ) -> Server:
     """Start muructl for `module:callable`, skipping the test when it cannot run.
 
@@ -286,7 +287,9 @@ def start(
     in `args`). With `new_session`, muructl leads a session of its own, so
     a test can signal its process group as a terminal's Ctrl-C would. When
     muructl exits before its workers are ready, the RuntimeError raised
-    carries its output.
+    carries its output. Reloading is off unless `reload` is True, or None
+    to leave it to muructl's default; a `--reload` or `--no-reload` in
+    `args` is left as given.
     """
 
     muructl = muructl_path()
@@ -305,6 +308,8 @@ def start(
         options += ["--threads", str(threads)]
     if chdir is not None:
         options += ["--chdir", str(chdir)]
+    if reload is not None and not {"--reload", "--no-reload"} & set(args):
+        options += ["--reload" if reload else "--no-reload"]
     log = Path(tempfile.mkstemp(prefix="muru-test-", suffix=".log")[1])
 
     with log.open("wb") as handle:

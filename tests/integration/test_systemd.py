@@ -2,15 +2,17 @@
 
 The daemon reports readiness and stopping with sd_notify when
 NOTIFY_SOCKET names a socket, detaches on SIGTERM as `muructl daemon stop`
-does, re-reads the [proxy], [compression], [error_pages] and
-[error_override] tables on `muructl daemon reload` or SIGHUP, and
-`daemon stop --timeout` bounds the wait for it to exit.
+does, re-reads the configuration file on `muructl daemon reload` or
+SIGHUP for the tables the daemon guide lists, and `daemon stop --timeout`
+bounds the wait for it to exit.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -25,6 +27,40 @@ from support.daemon import SHOP, Daemon, daemon, start_daemon
 __all__ = ["daemon"]
 
 APPS = support.ROOT / "tests" / "fixtures" / "apps"
+DAEMON_GUIDE = support.ROOT / "docs" / "howto" / "daemon.md"
+
+
+def tables_named_in(text: str) -> set[str]:
+    """The configuration tables a text names, as `[table]` or `[[entry]]`."""
+
+    return set(re.findall(r"\[\[?[A-Za-z_.]+\]\]?", text))
+
+
+def reload_section_of_the_guide() -> str:
+    """The daemon guide's section on reloading, up to the next heading."""
+
+    text = DAEMON_GUIDE.read_text()
+    start = text.index("## Reloading the configuration")
+    end = text.find("\n## ", start + 1)
+    return text[start:] if end < 0 else text[start:end]
+
+
+def edge_pid_of(daemon: Daemon) -> int:
+    status = daemon.muructl("daemon", "status").stdout
+    return int(next(line.split()[2] for line in status.splitlines() if line.startswith("edge")))
+
+
+def post(port: int, body: bytes) -> support.Response:
+    """One POST to /echo with `body`."""
+
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+
+    try:
+        connection.request("POST", "/echo", body=body)
+        raw = connection.getresponse()
+        return support.Response(raw.status, raw.reason, raw.getheaders(), raw.read())
+    finally:
+        connection.close()
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
@@ -123,7 +159,13 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
         # Nothing changed yet, and the daemon says so.
 
         unchanged = daemon.muructl("daemon", "reload").stdout
-        assert "[rate_limit] tables are unchanged" in unchanged, unchanged
+        assert "nothing changed among [proxy]," in unchanged, unchanged
+
+        # The reload names every table it applies and every table read at
+        # start, and the daemon guide lists the same ones, so that the
+        # next table added to one is missed by the test if not the other.
+
+        assert tables_named_in(unchanged) == tables_named_in(reload_section_of_the_guide())
 
         # The table appears in the file; a reload hands it to the edge.
 
@@ -131,7 +173,7 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
             handle.write("\n[proxy]\ntrusted = ['loopback']\n")
 
         reloaded = daemon.muructl("daemon", "reload").stdout
-        assert "[rate_limit] tables changed and the edge has them" in reloaded
+        assert "changed [proxy] (the edge has it); unchanged [compression]," in reloaded, reloaded
         environ = json.loads(daemon.request("/info", headers=headers).body)["environ"]
         assert environ["REMOTE_ADDR"] == "203.0.113.5"
         assert daemon.events().count("config.reloaded") == 2
@@ -160,6 +202,98 @@ def test_reload_applies_the_proxy_table(tmp_path: Path) -> None:
         wait_for(lambda: daemon.events().count("config.reloaded") == 3)
         environ = json.loads(daemon.request("/info", headers=headers).body)["environ"]
         assert environ["REMOTE_ADDR"] == "127.0.0.1"
+    finally:
+        daemon.stop()
+
+
+def test_reload_applies_limits_and_listeners(tmp_path: Path) -> None:
+    """A changed [limits] table reaches the edge in a snapshot, with no
+    new edge; a changed set of listeners takes a new edge on the new set,
+    the kept listener serving throughout; a listener that cannot be bound
+    fails the reload before anything is applied."""
+
+    daemon = start_daemon(tmp_path, listeners=[(support.free_port(), False)])
+
+    try:
+        config = daemon.base / "echo.toml"
+        config.write_text(
+            f"[app.echo.release.r1]\nsource = '{APPS}'\nentrypoint = 'plain_wsgi:application'\n"
+            f"python = '{sys.executable}'\n"
+        )
+        assert "ready and serving" in daemon.muructl("apply", "-f", str(config)).stdout
+        edge_before = edge_pid_of(daemon)
+        assert post(daemon.port, b"x" * 2048).status == 200
+        base = (daemon.base / "muru.toml").read_text()
+
+        # The limits go to the edge in a snapshot: the same edge, and a
+        # body over the new limit is refused.
+
+        limited = base + "\n[limits]\nmax_body_size = '1KB'\n"
+        (daemon.base / "muru.toml").write_text(limited)
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "changed [limits] (the edge has it)" in reloaded, reloaded
+        assert post(daemon.port, b"x" * 2048).status == 413
+        assert post(daemon.port, b"x" * 512).status == 200
+        assert edge_pid_of(daemon) == edge_before
+
+        # A listener added takes a new edge on both, the first serving
+        # throughout.
+
+        extra = support.free_port()
+        (daemon.base / "muru.toml").write_text(
+            limited + f"\n[[listener]]\naddress = '127.0.0.1:{extra}'\n"
+        )
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert (
+            f"changed [[listener]] (http://127.0.0.1:{extra} added; the edge was replaced)"
+            in reloaded
+        ), reloaded
+        assert daemon.request("/", port=extra).status == 200
+        assert daemon.get("/").status == 200
+        edge_after = edge_pid_of(daemon)
+        assert edge_after != edge_before
+        assert f"http://127.0.0.1:{extra}" in daemon.muructl("daemon", "status").stdout
+        assert "edge.replaced" in daemon.events()
+
+        # A listener whose port is taken fails the reload, and nothing is
+        # applied: the edge, and its limits, are as they were.
+
+        with socket.socket() as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen()
+            port = taken.getsockname()[1]
+            (daemon.base / "muru.toml").write_text(
+                base + f"\n[[listener]]\naddress = '127.0.0.1:{extra}'\n"
+                f"[[listener]]\naddress = '127.0.0.1:{port}'\n[limits]\nmax_body_size = '1MB'\n"
+            )
+            refused = daemon.muructl("daemon", "reload", check=False)
+
+        assert refused.returncode != 0
+        assert f"cannot listen on 127.0.0.1:{port}" in refused.stdout + refused.stderr
+        assert edge_pid_of(daemon) == edge_after
+        assert post(daemon.port, b"x" * 2048).status == 413
+
+        # The listener dropped from the file is closed once the old edge
+        # has finished.
+
+        (daemon.base / "muru.toml").write_text(base)
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert (
+            f"changed [limits] (the edge has it) and [[listener]] "
+            f"(http://127.0.0.1:{extra} removed; the edge was replaced)" in reloaded
+        ), reloaded
+        assert post(daemon.port, b"x" * 2048).status == 200
+
+        def refused_on_extra() -> bool:
+            try:
+                socket.create_connection(("127.0.0.1", extra), timeout=1).close()
+            except OSError:
+                return True
+
+            return False
+
+        wait_for(refused_on_extra)
+        assert daemon.get("/").status == 200
     finally:
         daemon.stop()
 

@@ -1010,7 +1010,14 @@ impl HostProcess {
     /// the WebSockets' grace and the shutdown timeout, before it kills
     /// them, and is itself killed if it has not exited `STOP_MARGIN`
     /// after that.
-    pub async fn stop(mut self, budget: Duration) {
+    pub async fn stop(self, budget: Duration) {
+        self.stop_until(Instant::now() + budget + STOP_MARGIN).await;
+    }
+
+    /// Stop the host as `stop` does, killing it at `kill_at` if it is
+    /// still there: for a shutdown that has a budget of its own (section
+    /// 13.3), which may be shorter than the workers' stop budget.
+    pub async fn stop_until(mut self, kill_at: Instant) {
         if let Some(pid) = self.pid() {
             // SAFETY: kill(2) with a valid pid and signal has no memory-safety
             // preconditions; the pid is a host this daemon started or adopted.
@@ -1022,12 +1029,16 @@ impl HostProcess {
 
         drop(self.stdin.take());
 
-        let grace = budget + STOP_MARGIN;
+        let grace = kill_at.saturating_duration_since(Instant::now());
 
         match &mut self.process {
             Process::Child(child) => {
                 if tokio::time::timeout(grace, child.wait()).await.is_err() {
-                    let _ = child.kill().await;
+                    if let Some(pid) = child.id() {
+                        kill_with_workers(pid);
+                    }
+
+                    let _ = child.wait().await;
                 }
             }
             Process::Adopted(pid) => {
@@ -1039,11 +1050,7 @@ impl HostProcess {
                 }
 
                 if alive(pid) {
-                    // SAFETY: as above.
-
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
+                    kill_with_workers(pid);
                 }
             }
         }
@@ -1061,6 +1068,26 @@ impl HostProcess {
             let _ = child.try_wait();
             std::mem::forget(child);
         }
+    }
+}
+
+/// Kill a host that has outstayed its grace, and its workers with it when
+/// it leads a process group of its own (a daemon's host does, through
+/// `own_session`), so a host killed before it could stop them leaves no
+/// worker running on (section 13.3).
+fn kill_with_workers(pid: u32) {
+    let pid = pid as libc::pid_t;
+
+    // SAFETY: getpgid(2) and kill(2) with a valid pid and signal have no
+    // memory-safety preconditions; the pid is a host this daemon started
+    // or adopted, and the group is killed only when the host leads it.
+
+    unsafe {
+        if libc::getpgid(pid) == pid {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+
+        libc::kill(pid, libc::SIGKILL);
     }
 }
 

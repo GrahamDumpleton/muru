@@ -9,6 +9,37 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a12 (2026-10-31)
+
+### Added
+
+- When `muructl` is a container's PID 1 it starts as an init of its own, forwarding signals to the command, collecting every process that exits so none stays a zombie, and exiting with the command's status; `MURU_NO_INIT=1` leaves that to `tini` or `docker run --init`. ([#99](https://github.com/GrahamDumpleton/muru/issues/99))
+- Added the daemon file's `[shutdown]` table: `on_sigterm` says whether SIGTERM detaches the daemon or shuts everything down, which it does by default as a container's main process so `docker stop` drains; `delay` keeps the edge accepting while connections close after their response, and `budget` bounds the whole shutdown, which `muructl daemon stop --shutdown` now runs as the same sequence, stopping every host at once and the edge last. ([#100](https://github.com/GrahamDumpleton/muru/issues/100))
+
+### Changed
+
+- `muructl run` reloads on change by default in development mode, as `runserver` and `flask run` do: `--no-reload` turns it off for one run and `reload = false` in the project's run table or `muru.local.toml` for good. A `[tool.muru.run]` table in pyproject.toml (`[run]` in muru.toml) holds the settings only `muructl run` has, such as the port, HTTPS and its certificate, the extra names, the reload patterns, the access log and the dashboard, and `muru.local.toml` beside the project holds the same table for one machine; a flag wins over the local file, which wins over the project's table.\n ([#85](https://github.com/GrahamDumpleton/muru/issues/85))
+- `[dashboard] actions` is re-read by `muructl daemon reload`, which names it in what it reloaded, and a session that has the actions is refused when it tries one while the switch is off, rather than the switch being read once at start and sessions issued earlier acting on. ([#89](https://github.com/GrahamDumpleton/muru/issues/89))
+- `muructl daemon reload` and SIGHUP now apply changes to the `[[listener]]` entries (a changed set takes a new edge, as an upgrade does, with no request lost), the `[limits]` table (sent to the edge in the snapshot, for connections accepted from then on) and the `[[events.sink]]` entries (started, stopped or restarted on their cursors), and the reload names what changed and what was done about it, what is unchanged and what is still read only at start. ([#158](https://github.com/GrahamDumpleton/muru/issues/158))
+- The edge keeps its connections to the workers a snapshot leaves unchanged and connects only to the workers new to it, so an apply no longer reconnects every worker of every application on the node, and a worker that is busy or stopped at that moment is no longer reported as unreachable and replaced by a change that did not touch it. ([#207](https://github.com/GrahamDumpleton/muru/issues/207))
+- `muructl daemon reload`, SIGHUP and an apply of a file that declares the host, changed or not, read every TLS host's certificate and key files again and send the edge those that changed, so a renewal hook needs one command; files that cannot be read, or do not go together, leave the host on the certificate it had rather than serving without TLS, and the reload or apply says so. ([#222](https://github.com/GrahamDumpleton/muru/issues/222))
+- `muructl daemon reload` and SIGHUP now apply the `[secrets.store.NAME]` tables, for the next release to start, and the `[logs]` rotation policy, and the secrets and logging guides say so; before, both were read only at daemon start and neither guide said it. ([#223](https://github.com/GrahamDumpleton/muru/issues/223))
+
+### Fixed
+
+- Fixed one stopped or frozen worker failing every snapshot apply, so that no routing change landed for any application until the worker was replaced. A worker that does not answer the edge within its 5 s is left out of its pool and the snapshot is applied without it; the daemon records a `worker.unreachable` event naming the worker and the reason, and replaces the worker at once. ([#88](https://github.com/GrahamDumpleton/muru/issues/88))
+- The host is now a subreaper on Linux, as specified: a process a worker started and left behind when a hard timeout or a memory policy killed it reparents to the host, is given the shutdown timeout to finish, stopped and collected, so no zombie or stray process remains, and what the workers leave running is stopped before the host exits rather than holding its pipes open. ([#101](https://github.com/GrahamDumpleton/muru/issues/101))
+- Fixed `muructl apply -f FILE` leaving a release's `sendfile_roots`, and any other path it resolves from the file's directory, relative when `FILE` was given as a relative path, which the daemon then refused as not absolute. The file's directory is made absolute before its paths are resolved. ([#201](https://github.com/GrahamDumpleton/muru/issues/201))
+- The help of `muructl debug exec` and `muructl debug attach` says they are allowed as they are under `muructl run`, and under the daemon when its `[daemon]` table sets `debug_exec`, rather than naming the daemon's table alone. ([#202](https://github.com/GrahamDumpleton/muru/issues/202))
+- Fixed a worker condemned by the hard timeout and then found stalled, by the GIL stall or loop stall timeout, keeping its other requests for the hard drain grace and the shutdown timeout, which a stalled worker can never use: a stall on a worker already being replaced gives up the requests it still holds for the edge to answer and kills it a moment later. ([#203](https://github.com/GrahamDumpleton/muru/issues/203))
+- The daemon no longer pushes a second snapshot for the host's first announcement after a deploy, which repeated the sockets it already routed by: every deploy cost an edge apply it did not need, and a worker that was busy at that moment was left out and replaced for nothing. ([#206](https://github.com/GrahamDumpleton/muru/issues/206))
+- A connection accepted by the edge just before it was replaced, by `muructl daemon upgrade`, whose first request had not yet arrived, was closed without an answer. The replaced edge now waits for that request and answers it before closing the connection. ([#220](https://github.com/GrahamDumpleton/muru/issues/220))
+
+### Documentation
+
+- The daemon guide lists, in one place, the tables `muructl daemon reload` applies and those read only at daemon start, the systemd guide links to it instead of repeating it, and the reload's message names the same tables. ([#221](https://github.com/GrahamDumpleton/muru/issues/221))
+
+
 ## 0.1.0a11 (2026-10-30)
 
 ### Added

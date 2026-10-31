@@ -34,9 +34,11 @@ def test_the_chat_room_tutorial() -> None:
     )
 
     try:
-        log = server.log()
-        assert "chat:application is served as ASGI" in log
-        assert "with 1 worker of concurrency 1000" in log
+        # The port accepts connections before muructl has connected to
+        # the worker and written its serving line, so that is waited for.
+
+        assert server.wait_for_log("chat:application is served as ASGI")
+        assert server.wait_for_log("with 1 worker of concurrency 1000")
         assert page(server) == "0 in the chat\n"
 
         # Join the chat: what one member says the other hears, and the

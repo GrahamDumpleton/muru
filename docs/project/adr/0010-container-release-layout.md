@@ -48,4 +48,8 @@ restart policy off and supervises the release itself.
 
 ## More information
 
-Specification sections 6.10, 8.5 and 8.6.
+Specification sections 6.10, 8.5 and 8.6. The PID 1 sentences are
+superseded by [ADR 0035](0035-muructl-is-pid-1-with-a-built-in-init.md):
+muructl is the container's main process with a built-in init, and the
+host a subreaper under it. The layout, with the daemon and the edge
+outside the container, stands.

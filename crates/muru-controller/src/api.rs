@@ -14,7 +14,7 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::config::{self, Action, Change, Plan};
-use crate::daemon::{Command, Handle, RolloutAction};
+use crate::daemon::{CertificateChanges, Command, Handle, RolloutAction};
 use crate::model::{
     Event, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutStep, now_unix_ms,
 };
@@ -89,6 +89,8 @@ impl Admin for Service {
             socket: info.locations.admin_socket().display().to_string(),
             listeners: info
                 .listeners
+                .read()
+                .expect("listeners poisoned")
                 .iter()
                 .map(|(address, tls)| {
                     format!("{}://{address}", if *tls { "https" } else { "http" })
@@ -169,7 +171,11 @@ impl Admin for Service {
             ));
         };
 
-        if request.actions && !info.dashboard_actions {
+        if request.actions
+            && !info
+                .dashboard_actions
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(Status::failed_precondition(
                 "the dashboard's actions are off; set actions = true in the [dashboard] table",
             ));
@@ -1265,18 +1271,40 @@ impl Admin for Service {
 
         report.applied = true;
 
-        // Hosts and routes reach the edge with the next snapshot.
+        // Hosts and routes reach the edge with the next snapshot. An apply
+        // that changes nothing still reads the TLS hosts' certificate
+        // files again (section 4.2), so applying the same file after a
+        // renewal is enough.
 
         if plan
             .changes
             .iter()
             .any(|change| change.action.reconfigures())
-            && let Err(error) = self.reconfigure().await
         {
-            report
-                .warnings
-                .push(format!("the edge did not take the new snapshot: {error}"));
-            failures += 1;
+            if let Err(error) = self.reconfigure().await {
+                report
+                    .warnings
+                    .push(format!("the edge did not take the new snapshot: {error}"));
+                failures += 1;
+            }
+        } else if document.host.values().any(|host| host.tls.is_some()) {
+            match self.refresh_certificates().await {
+                Ok(changes) => {
+                    if !changes.renewed.is_empty() {
+                        report.notes.push(format!(
+                            "certificates of {} renewed; the edge has them",
+                            changes.renewed.join(", ")
+                        ));
+                    }
+
+                    for (host, why) in changes.kept {
+                        report
+                            .warnings
+                            .push(format!("host {host} keeps its certificate: {why}"));
+                    }
+                }
+                Err(error) => report.warnings.push(error),
+            }
         }
 
         let summary = format!(
@@ -1539,6 +1567,17 @@ impl Service {
     }
 
     /// Push a snapshot with the hosts and routes as they now are.
+    async fn refresh_certificates(&self) -> Result<CertificateChanges, String> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RefreshCertificates { done: done_tx })
+            .await
+            .map_err(|_| STOPPING.to_owned())?;
+
+        done_rx.await.map_err(|_| STOPPING.to_owned())
+    }
+
     async fn reconfigure(&self) -> Result<(), String> {
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -1578,6 +1617,7 @@ fn report_message(plan: &Plan) -> pb::ConfigReport {
             .collect(),
         unchanged: plan.unchanged,
         applied: false,
+        notes: Vec::new(),
     }
 }
 

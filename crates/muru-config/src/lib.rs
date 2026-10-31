@@ -933,6 +933,29 @@ pub struct Logs {
     pub compress: Option<String>,
 }
 
+/// The `[shutdown]` table of the daemon's file (section 13.3): what
+/// SIGTERM and SIGINT mean to the daemon, and how a shutdown runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shutdown {
+    /// `shutdown`, which drains and stops every release and the edge
+    /// before the daemon exits, or `detach`, which leaves them serving
+    /// for the next daemon; shutdown when the daemon is a container's
+    /// main process, detach otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_sigterm: Option<String>,
+    /// How long the edge keeps accepting after the signal, closing each
+    /// connection after its response so clients reconnect elsewhere, for
+    /// example 5s (default 0s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<String>,
+    /// How long the whole shutdown may take, the delay, the drain, the
+    /// workers and the edge together (default 8s); what has not finished
+    /// by then is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<String>,
+}
+
 /// The `[daemon]` table of the daemon's file: how the daemon itself runs
 /// (ADR 0026).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -3575,6 +3598,10 @@ pub struct Document {
     /// Log rotation (section 11.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<Logs>,
+    /// What SIGTERM means to the daemon, and how a shutdown runs (section
+    /// 13.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<Shutdown>,
     /// The metrics listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
@@ -3751,6 +3778,142 @@ impl Document {
     }
 }
 
+/// A port of the run table (section 13.1): a number, or `auto` for a
+/// free one, as the `--port` and `--https-port` flags take it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RunPort {
+    /// A port number.
+    Number(u16),
+    /// `auto`, the only word accepted.
+    Named(String),
+}
+
+impl RunPort {
+    /// Whether this is `auto`.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Named(name) if name.eq_ignore_ascii_case("auto"))
+    }
+}
+
+/// The `[tool.muru.run]` table of pyproject.toml, `[run]` in muru.toml and
+/// in muru.local.toml (section 13.1): how `muructl run` serves this
+/// project, with a key for each flag of the command that describes the
+/// serving rather than the application. The daemon ignores it. Lists add
+/// across the layers, as a list flag adds to a key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunSettings {
+    /// The HTTP port, or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<RunPort>,
+    /// Serve HTTPS beside HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https: Option<bool>,
+    /// Serve HTTPS alone, HTTP redirecting to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_only: Option<bool>,
+    /// The HTTPS port, or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_port: Option<RunPort>,
+    /// A certificate chain to serve, relative to the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<String>,
+    /// Its private key, relative to the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+    /// Names the development certificate covers besides localhost.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// Reload on changes; on by default in development mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<bool>,
+    /// Directories watched, relative to the project; the project when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reload_dirs: Vec<String>,
+    /// Patterns watched besides `**/*.py`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reload_include: Vec<String>,
+    /// Patterns that never trigger a reload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reload_exclude: Vec<String>,
+    /// Where the access log goes: terminal, off, errors or a file path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log: Option<String>,
+    /// Paths left out of the access log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_exclude: Vec<String>,
+    /// How long a request may take before `errors` shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow: Option<String>,
+    /// The dashboard's address, or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard: Option<String>,
+    /// Whether responses are compressed; `false` is `--no-compression`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<bool>,
+}
+
+impl RunSettings {
+    /// This table with `over` laid on top: a key `over` sets wins, and
+    /// the lists add, this table's entries first.
+    pub fn layered(&self, over: &RunSettings) -> RunSettings {
+        let join = |under: &[String], over: &[String]| {
+            under.iter().chain(over).cloned().collect::<Vec<_>>()
+        };
+
+        RunSettings {
+            port: over.port.clone().or_else(|| self.port.clone()),
+            https: over.https.or(self.https),
+            https_only: over.https_only.or(self.https_only),
+            https_port: over.https_port.clone().or_else(|| self.https_port.clone()),
+            tls_cert: over.tls_cert.clone().or_else(|| self.tls_cert.clone()),
+            tls_key: over.tls_key.clone().or_else(|| self.tls_key.clone()),
+            hosts: join(&self.hosts, &over.hosts),
+            reload: over.reload.or(self.reload),
+            reload_dirs: join(&self.reload_dirs, &over.reload_dirs),
+            reload_include: join(&self.reload_include, &over.reload_include),
+            reload_exclude: join(&self.reload_exclude, &over.reload_exclude),
+            access_log: over.access_log.clone().or_else(|| self.access_log.clone()),
+            access_log_exclude: join(&self.access_log_exclude, &over.access_log_exclude),
+            slow: over.slow.clone().or_else(|| self.slow.clone()),
+            dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
+            compression: over.compression.or(self.compression),
+        }
+    }
+
+    /// Check the values, as the flags they stand for are checked.
+    pub fn check(&self) -> Result<(), String> {
+        for (key, port) in [("port", &self.port), ("https_port", &self.https_port)] {
+            if let Some(RunPort::Named(name)) = port
+                && !name.eq_ignore_ascii_case("auto")
+            {
+                return Err(format!("{key} = {name:?} is not a port number or auto"));
+            }
+        }
+
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err("tls_cert and tls_key go together".to_owned());
+        }
+
+        if let Some(slow) = &self.slow {
+            parse_duration(slow).map_err(|error| format!("slow: {error}"))?;
+        }
+
+        if let Some(dashboard) = &self.dashboard
+            && dashboard != "off"
+            && dashboard.parse::<std::net::SocketAddr>().is_err()
+        {
+            return Err(format!(
+                "dashboard = {dashboard:?} is not an address such as 127.0.0.1:8081, or off"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// The `[tool.muru]` table: defaults an application ships with (section
 /// 6.8). Every field is optional; what a command line or a release
 /// definition sets takes precedence.
@@ -3861,6 +4024,10 @@ pub struct ToolMuru {
     /// What maintenance mode lets through (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<Maintenance>,
+    /// How `muructl run` serves the project (section 13.1), which the
+    /// daemon ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSettings>,
 }
 
 /// Why a project's configuration could not be read.
@@ -3921,6 +4088,62 @@ pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectEr
     }
 
     Ok(None)
+}
+
+/// The per-developer file beside a project's pyproject.toml or muru.toml
+/// (section 13.1), never committed.
+pub const LOCAL_FILE: &str = "muru.local.toml";
+
+/// Read a project's muru.local.toml from `dir`, which holds the `[run]`
+/// table and nothing else: a key outside it is refused, naming
+/// `committed`, the project's own file, as where it belongs. Returns the
+/// file read and the table, or None when there is no such file.
+pub fn load_local(
+    dir: &Path,
+    committed: Option<&Path>,
+) -> Result<Option<(PathBuf, RunSettings)>, ProjectError> {
+    let path = dir.join(LOCAL_FILE);
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ProjectError::Read { path, source }),
+    };
+
+    let table = parse_local(&text, committed).map_err(|message| ProjectError::Invalid {
+        path: path.clone(),
+        message,
+    })?;
+
+    Ok(Some((path, table)))
+}
+
+/// Parse a muru.local.toml: the `[run]` table alone.
+pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<RunSettings, String> {
+    let document: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+
+    if let Some(key) = document.keys().find(|key| key.as_str() != "run") {
+        let there = committed.map_or_else(
+            || "the project's pyproject.toml or muru.toml".to_owned(),
+            |path| path.display().to_string(),
+        );
+
+        return Err(format!(
+            "{key} is not a key of {LOCAL_FILE}, which holds the [run] table only; the application's settings belong in {there}"
+        ));
+    }
+
+    let run = match document.get("run") {
+        Some(run) => run
+            .clone()
+            .try_into::<RunSettings>()
+            .map_err(|error| format!("[run] {error}"))?,
+        None => RunSettings::default(),
+    };
+
+    run.check().map_err(|error| format!("[run] {error}"))?;
+
+    Ok(run)
 }
 
 /// Parse a muru.toml: the `[tool.muru]` keys at the top level.
@@ -4443,6 +4666,72 @@ traffic = { classes = { ai_crawler = 'r1' } }"
         assert!(error.contains("workers"), "{error}");
         let error = parse_pyproject("[tool.muru]\npreload = 'maybe'\n").unwrap_err();
         assert!(error.contains("maybe"), "{error}");
+    }
+
+    #[test]
+    fn the_run_table_is_known_to_both_project_files_and_strict() {
+        let table = parse_pyproject(
+            "[tool.muru]\nentrypoint = 'a:b'\n[tool.muru.run]\nport = 9000\nhttps = true\nhosts = ['shop.localhost']\nreload_include = ['**/*.html']\naccess_log = 'errors'\n",
+        )
+        .unwrap()
+        .unwrap();
+        let run = table.run.unwrap();
+        assert_eq!(run.port, Some(RunPort::Number(9000)));
+        assert_eq!(run.https, Some(true));
+        assert_eq!(run.hosts, vec!["shop.localhost".to_owned()]);
+        assert_eq!(run.access_log.as_deref(), Some("errors"));
+        let top = parse_muru_toml("entrypoint = 'a:b'\n[run]\nport = 'auto'\n").unwrap();
+        assert!(top.run.unwrap().port.unwrap().is_auto());
+        let error = parse_pyproject("[tool.muru.run]\nbind = '0.0.0.0'\n").unwrap_err();
+        assert!(error.contains("bind"), "{error}");
+    }
+
+    #[test]
+    fn run_settings_layer_and_are_checked() {
+        let under = RunSettings {
+            port: Some(RunPort::Number(9000)),
+            hosts: vec!["a".to_owned()],
+            reload: Some(false),
+            ..RunSettings::default()
+        };
+        let over = RunSettings {
+            port: Some(RunPort::Number(9001)),
+            hosts: vec!["b".to_owned()],
+            ..RunSettings::default()
+        };
+        let layered = under.layered(&over);
+        assert_eq!(layered.port, Some(RunPort::Number(9001)));
+        assert_eq!(layered.hosts, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(layered.reload, Some(false));
+        let bad = |text: &str| {
+            toml::from_str::<RunSettings>(text)
+                .unwrap()
+                .check()
+                .unwrap_err()
+        };
+        assert!(bad("port = 'free'").contains("not a port number or auto"));
+        assert!(bad("tls_cert = 'x.pem'").contains("go together"));
+        assert!(bad("slow = 'soon'").starts_with("slow:"));
+        assert!(bad("dashboard = 'yes'").contains("127.0.0.1:8081, or off"));
+    }
+
+    #[test]
+    fn the_local_file_holds_the_run_table_only() {
+        let run = parse_local("[run]\nport = 9000\n", Some(Path::new("pyproject.toml"))).unwrap();
+        assert_eq!(run.port, Some(RunPort::Number(9000)));
+        assert_eq!(parse_local("", None).unwrap(), RunSettings::default());
+        let error =
+            parse_local("entrypoint = 'a:b'\n", Some(Path::new("pyproject.toml"))).unwrap_err();
+        assert!(
+            error.contains("entrypoint is not a key of muru.local.toml")
+                && error.contains("belong in pyproject.toml"),
+            "{error}"
+        );
+        let error = parse_local("[run]\nbind = '0.0.0.0'\n", None).unwrap_err();
+        assert!(
+            error.starts_with("[run]") && error.contains("bind"),
+            "{error}"
+        );
     }
 
     #[test]

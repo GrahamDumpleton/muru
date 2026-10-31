@@ -123,6 +123,17 @@ impl Rotator {
         }
     }
 
+    /// The policy in force.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// Take a new policy, for the next check of each file: a changed
+    /// period rotates each file once, as a period's end does.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
     /// Whether a file is due: it has reached the size, or the period has
     /// changed since it was last seen. A file seen for the first time
     /// only notes its period.

@@ -4,9 +4,10 @@
 :class: note
 
 The shipped unit runs the daemon in system mode with readiness
-notification, detaches on stop and re-reads the `[proxy]` table on
-reload. Reloading listeners, limits and event sinks, journald as the log
-sink and socket activation are still to come.
+notification, detaches on stop and re-reads the configuration file on
+reload for [what can change while the daemon
+runs](daemon.md#reloading-the-configuration). Journald as the log sink
+and socket activation are still to come.
 ```
 
 The repository ships a unit at `packaging/systemd/muru.service`:
@@ -72,26 +73,33 @@ The status line systemd shows names the listeners.
 
 `systemctl stop` runs the `ExecStop` line: `muructl daemon stop
 --shutdown` drains every release, stops the hosts and the edge, then the
-daemon exits, which is what a node going out of service wants.
-`--timeout` bounds how long muructl waits for that, and `TimeoutStopSec`
-is longer, so a drain that overruns is reported before systemd kills what
-is left.
+daemon exits, which is what a node going out of service wants. The
+shutdown fits the `budget` of the daemon file's `[shutdown]` table,
+eight seconds unless set, past which what is left is killed; a release
+with a long `shutdown_timeout` wants a budget to match. `--timeout`
+bounds how long muructl waits for the daemon, and `TimeoutStopSec` is
+longer, so a shutdown that overruns is reported before systemd kills
+what is left.
 
 `systemctl restart`, or a daemon that is killed or crashes, is different:
 `KillMode=process` means systemd stops only the daemon, and the daemon
 treats SIGTERM as `muructl daemon stop` without `--shutdown`, that is it
-detaches, leaving the hosts and the edge serving. `RuntimeDirectoryPreserve`
+detaches, leaving the hosts and the edge serving (the `[shutdown]`
+table's `on_sigterm` can make it shut down instead, which a unit that
+stops with SIGTERM alone would want). `RuntimeDirectoryPreserve`
 keeps their sockets in `/run/muru`, and the next daemon finds them there
 and carries on, so a restart of the daemon costs no
 request. The [daemon guide](daemon.md) says more about detaching and
 re-adoption.
 
 `systemctl reload` runs `muructl daemon reload`, which re-reads the
-configuration file for what can change while the daemon runs: today the
-`[proxy]` and `[compression]` tables, which the edge is given at once.
-Listeners, limits, the
-metrics listener and event sinks are read when the daemon starts, and the
-reload says so. SIGHUP does the same as the command.
+configuration file for what can change while the daemon runs; the
+[daemon guide](daemon.md#reloading-the-configuration) lists what that
+is and what is read only at start, and the reload says so too. SIGHUP
+does the same as the command. A certificate renewal needs the same
+reload, so a certbot deploy hook of `systemctl reload muru` makes the
+renewed certificate live, as the [virtual hosts
+guide](virtual-hosts.md#tls) describes.
 
 ## Logs
 

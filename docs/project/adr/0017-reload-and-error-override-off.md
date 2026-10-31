@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded
 date: 2026-10-23
 ---
 
@@ -45,4 +45,4 @@ Chosen options: the second and the fourth.
 
 ## More information
 
-Specification sections 4.12, 9.8 and 13.1.
+Specification sections 4.12, 9.8 and 13.1. Superseded by [ADR 0034](0034-reload-on-by-default-in-development.md) for the reload default in development mode; the production default and the error override decision stand.

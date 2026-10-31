@@ -90,53 +90,12 @@ pub const SERVICE_USER: &str = "muru";
 pub struct Config {
     /// Where everything lives.
     pub locations: Locations,
-    /// The listeners, each with whether it carries TLS; the first is the
-    /// main one.
-    pub listeners: Vec<(SocketAddr, bool)>,
-    /// Timeouts and limits for the edge.
-    pub limits: muru_edge::Limits,
-    /// The service user named by the `[daemon]` table or `--user`, whom
-    /// a daemon that runs as root starts the edge and the applications
-    /// that name no user as (ADR 0026); `muru` when none is named.
-    pub service_user: Option<String>,
-    /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
-    /// clients, with those clients.
-    pub h2c: Vec<pb::H2cPolicy>,
-    /// Whether `muructl debug exec` may run code in workers (section
-    /// 11.7).
-    pub debug_exec: bool,
-    /// The node's budget (section 7.4).
-    pub budget: crate::budget::Budget,
-    /// Trusted proxies and the headers taken from them (section 4.7).
-    pub proxy: Option<muru_config::Proxy>,
-    /// How responses are compressed (section 4.17).
-    pub compression: Option<muru_config::Compression>,
-    /// The node-wide error pages (section 4.12), by status or
-    /// status:reason.
-    pub error_pages: std::collections::BTreeMap<String, muru_config::ErrorPage>,
-    /// The node-wide error override (section 4.12).
-    pub error_override: Option<muru_config::ErrorOverride>,
-    /// The client classification rules (section 4.14).
-    pub client_classes: Vec<muru_config::ClientClass>,
-    /// The rate limits hosts and routes may name (section 4.15).
-    pub rate_limits: std::collections::BTreeMap<String, muru_config::RateLimit>,
-    /// The secret stores (section 10.8).
-    pub secrets: Vec<crate::secrets::Store>,
-    /// Log rotation (section 11.3), or none for external rotation.
-    pub rotation: Option<crate::rotation::Policy>,
+    /// The configuration file's settings, read as a reload reads them.
+    pub settings: crate::settings::NodeSettings,
+    /// The command line's settings, laid over the file on every reload.
+    pub overrides: crate::settings::Overrides,
     /// Where the edge writes the access log, or none.
     pub access_log: Option<PathBuf>,
-    /// Where the Prometheus exposition is served, or nowhere.
-    pub metrics: Option<SocketAddr>,
-    /// Where the dashboard and JSON gateway are served, or nowhere.
-    pub dashboard: Option<SocketAddr>,
-    /// Whether a dashboard session may be given the actions, which
-    /// `muructl dashboard login --actions` asks for.
-    pub dashboard_actions: bool,
-    /// The overlays' signed webhook (section 9.10), or none.
-    pub overlay_webhook: Option<crate::triggers::Webhook>,
-    /// The webhooks events are delivered to (section 11.5).
-    pub sinks: Vec<crate::sinks::Webhook>,
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
     /// The arguments to re-execute the daemon with on an upgrade (section
@@ -145,6 +104,17 @@ pub struct Config {
     /// The version this daemon ran before it re-executed itself for an
     /// upgrade, or none when it started afresh.
     pub upgraded_from: Option<String>,
+}
+
+/// What reading the TLS hosts' certificate files again found (section
+/// 4.2).
+#[derive(Debug, Clone, Default)]
+pub struct CertificateChanges {
+    /// Hosts whose certificate or key changed, which the edge is given.
+    pub renewed: Vec<String>,
+    /// Hosts kept on the certificate they had, with why the files were
+    /// refused.
+    pub kept: Vec<(String, String)>,
 }
 
 /// An upgrade the daemon is about to carry out (section 13.4).
@@ -316,6 +286,12 @@ pub enum Command {
     Reconfigure {
         /// Where the acknowledgement goes.
         done: oneshot::Sender<Result<(), String>>,
+    },
+    /// Section 4.2: read the TLS hosts' certificate files again, for an
+    /// apply that changed nothing else, and send the edge what changed.
+    RefreshCertificates {
+        /// Answered with what was renewed and what was kept.
+        done: oneshot::Sender<CertificateChanges>,
     },
     /// Re-read the configuration file for what can change while running
     /// (section 13.3).
@@ -508,8 +484,9 @@ pub struct Handle {
 pub struct Info {
     /// Where everything lives.
     pub locations: Locations,
-    /// The addresses the edge serves, each with whether it carries TLS.
-    pub listeners: Vec<(SocketAddr, bool)>,
+    /// The addresses the edge serves, each with whether it carries TLS,
+    /// as a reload may change them.
+    pub listeners: std::sync::RwLock<Vec<(SocketAddr, bool)>>,
     /// When the daemon started, Unix milliseconds.
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
@@ -521,8 +498,10 @@ pub struct Info {
     /// The dashboard's login codes and sessions, when it is served
     /// (section 10.7).
     pub dashboard_sessions: Option<Arc<muru_dashboard::Sessions>>,
-    /// Whether a dashboard session may be given the actions.
-    pub dashboard_actions: bool,
+    /// Whether a dashboard session may be given the actions, which
+    /// `muructl dashboard login --actions` asks for, and whether a session
+    /// that has them may act: `[dashboard] actions`, re-read on reload.
+    pub dashboard_actions: Arc<std::sync::atomic::AtomicBool>,
     /// The rate limits (section 4.15) and client classes (section 4.14)
     /// the daemon's file defines, which applied files may name.
     pub defined: std::sync::RwLock<crate::config::Defined>,
@@ -598,6 +577,16 @@ impl Backend {
         match self {
             Self::Host(host) => host.stop(grace).await,
             Self::Servers(servers) => servers.stop(grace).await,
+            Self::Dormant => {}
+        }
+    }
+
+    /// Stop the processes as `stop` does, killing what is still there at
+    /// `kill_at` (section 13.3).
+    async fn stop_until(self, kill_at: Instant) {
+        match self {
+            Self::Host(host) => host.stop_until(kill_at).await,
+            Self::Servers(servers) => servers.stop_until(kill_at).await,
             Self::Dormant => {}
         }
     }
@@ -692,6 +681,18 @@ impl Running {
                 .or(fallback),
             cpu: group.scaler.worker_signals().cores,
         }
+    }
+
+    /// Every socket the edge routes to: the default group's, then the
+    /// named groups'.
+    fn routed_sockets(&self) -> Vec<PathBuf> {
+        let mut all = self.sockets.clone();
+
+        for group in &self.groups {
+            all.extend(group.sockets.iter().cloned());
+        }
+
+        all
     }
 
     /// A group's workers, as the sockets the host announced; none for a
@@ -806,6 +807,8 @@ struct Daemon {
     secrets: Vec<crate::secrets::Store>,
     /// Built-in log rotation (section 11.3), when it is on.
     rotation: Option<crate::rotation::Rotator>,
+    /// Section 13.3: what SIGTERM means, and how a shutdown runs.
+    shutdown: crate::shutdown::Policy,
     /// The service user (ADR 0026), when this daemon is root: whom the
     /// edge and the applications that name no user run as.
     service: Option<crate::host::Identity>,
@@ -813,6 +816,16 @@ struct Daemon {
     debug_exec: bool,
     /// The listeners' h2c policies, for every snapshot (section 6.13).
     h2c: Vec<pb::H2cPolicy>,
+    /// The `[limits]` table (section 4.6), for every snapshot.
+    limits: muru_edge::Limits,
+    /// The command line's settings, laid over the file on every reload.
+    overrides: crate::settings::Overrides,
+    /// The event sinks delivering (section 11.5), reconciled on reload.
+    sinks: crate::sinks::Sinks,
+    /// Section 4.2: each TLS host's last good certificate chain and key
+    /// as PEM text, by host, for the snapshots; read again on reload and
+    /// apply, and kept when the files are wrong.
+    certificates: HashMap<String, (String, String)>,
     /// Section 7.4: the node's budget, and the schedule windows already
     /// checked against it, by overlay and start.
     budget: crate::budget::Budget,
@@ -856,38 +869,28 @@ struct Daemon {
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
-pub async fn run(mut config: Config) -> anyhow::Result<()> {
+pub async fn run(config: Config) -> anyhow::Result<()> {
     config
         .locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
 
-    // A [proxy] table the edge would refuse is refused here, before
-    // anything is bound.
+    // The file was checked whole when it was read (section 10.3); a
+    // reload reads it the same way and applies the difference.
 
-    let proxy = config.proxy.as_ref().map(proxy_message);
-
-    if let Some(proxy) = &proxy {
-        muru_edge::proxy::Trust::from_snapshot(proxy)
-            .map_err(|error| anyhow::anyhow!("[proxy]: {error}"))?;
-    }
-
-    let compression = compression_message(config.compression.as_ref())
-        .map_err(|error| anyhow::anyhow!("[compression]: {error}"))?;
-    let (error_pages, error_override) =
-        error_tables_message(&config.error_pages, config.error_override.as_ref())
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let client_rules = crate::clients::FileRules {
-        classes: config.client_classes.clone(),
-        limits: config.rate_limits.clone(),
-        directory: config_directory(&config.locations.config.path),
-    };
-
-    let metrics = config.metrics;
-    let dashboard = config.dashboard;
+    let mut settings = config.settings;
+    let proxy = settings.proxy.clone();
+    let compression = settings.compression.clone();
+    let error_pages = settings.error_pages.clone();
+    let error_override = settings.error_override.clone();
+    let client_rules = settings.client_rules.clone();
+    let metrics = settings.metrics;
+    let dashboard = settings.dashboard;
     let dashboard_sessions = dashboard.is_some().then(muru_dashboard::Sessions::new);
-    let dashboard_actions = config.dashboard_actions;
-    let sinks = std::mem::take(&mut config.sinks);
+    let dashboard_actions = Arc::new(std::sync::atomic::AtomicBool::new(
+        settings.dashboard_actions,
+    ));
+    let sinks = std::mem::take(&mut settings.sinks);
     let locations = config.locations;
 
     for location in [&locations.state, &locations.run, &locations.logs] {
@@ -898,7 +901,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // ADR 0026: a daemon that is root starts everything else as the
     // service user, and does not start without one.
 
-    let service = service_identity(config.service_user.as_deref())?;
+    let service = service_identity(settings.service_user.as_deref())?;
 
     if let (Some(service), Some(access_log)) = (&service, &config.access_log) {
         let _ = std::fs::OpenOptions::new()
@@ -919,16 +922,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // Section 11.5: each sink delivers from its own cursor, so nothing
     // emitted from here on is missed by one.
 
-    let deliveries: Vec<_> = sinks
-        .into_iter()
-        .map(|webhook| {
-            tokio::spawn(crate::sinks::run(
-                webhook,
-                Arc::clone(&store),
-                events.clone(),
-            ))
-        })
-        .collect();
+    let sinks = crate::sinks::Sinks::start(sinks, Arc::clone(&store), events.clone());
 
     // An edge a previous daemon left running is taken over, with its
     // listener handed back. Otherwise the daemon binds the listener and
@@ -959,7 +953,6 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 .collect(),
             edge_log.clone(),
             config.access_log.clone(),
-            config.limits.clone(),
             spool.clone(),
             service,
         )
@@ -975,10 +968,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
             edge
         }
         None => {
-            anyhow::ensure!(!config.listeners.is_empty(), "no listener to serve on");
+            anyhow::ensure!(!settings.listeners.is_empty(), "no listener to serve on");
             let mut listeners = Vec::new();
 
-            for (address, tls) in &config.listeners {
+            for (address, tls) in &settings.listeners {
                 let socket = std::net::TcpListener::bind(address)
                     .with_context(|| format!("cannot listen on {address}"))?;
                 listeners.push(crate::edges::Listener { socket, tls: *tls });
@@ -994,7 +987,6 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 generation: 1,
                 log: edge_log,
                 access_log: config.access_log,
-                limits: config.limits,
                 spool,
                 identity: service,
             })
@@ -1011,16 +1003,16 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let handle_commands = commands.clone();
     let info = Arc::new(Info {
         locations: locations.clone(),
-        listeners: listeners.clone(),
+        listeners: std::sync::RwLock::new(listeners.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        dashboard_actions,
+        dashboard_actions: Arc::clone(&dashboard_actions),
         defined: std::sync::RwLock::new(crate::config::Defined {
             budget: crate::budget::View {
-                budget: config.budget,
+                budget: settings.budget,
                 ..crate::budget::View::default()
             },
             ..client_rules.defined()
@@ -1068,6 +1060,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 events.clone(),
                 dashboard_sessions.unwrap_or_else(muru_dashboard::Sessions::new),
                 Arc::clone(&handle.store),
+                Arc::clone(&dashboard_actions),
             )))
         }
         None => None,
@@ -1075,7 +1068,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     // The overlays' external trigger (section 9.10), on its own address.
 
-    let triggers = match config.overlay_webhook.take() {
+    let triggers = match settings.overlay_webhook.take() {
         Some(webhook) => {
             let listener = tokio::net::TcpListener::bind(webhook.address)
                 .await
@@ -1144,12 +1137,17 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         maintenance: HashMap::new(),
         warm_ups: BTreeMap::new(),
         clock: (None, false),
-        secrets: config.secrets.clone(),
-        rotation: config.rotation.clone().map(crate::rotation::Rotator::new),
+        secrets: settings.secrets.clone(),
+        rotation: settings.rotation.clone().map(crate::rotation::Rotator::new),
+        shutdown: settings.shutdown.clone(),
         service,
-        debug_exec: config.debug_exec,
-        h2c: config.h2c.clone(),
-        budget: config.budget,
+        debug_exec: settings.debug_exec,
+        h2c: settings.h2c.clone(),
+        limits: settings.limits.clone(),
+        overrides: config.overrides,
+        sinks,
+        certificates: HashMap::new(),
+        budget: settings.budget,
         budget_checked: BTreeSet::new(),
         history,
         sampler: muru_dashboard::Sampler::default(),
@@ -1181,7 +1179,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     // whole again.
 
     if config.upgraded_from.is_some() {
-        daemon.replace_edge().await;
+        let _ = daemon.replace_edge(None, "the same listeners").await;
     }
 
     // Section 7.4: the edge says when a request waits for a group with
@@ -1194,8 +1192,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
-    // manager's stop or a terminal's interrupt should (section 13.3), and
-    // SIGHUP reloads the configuration file.
+    // manager's stop or a terminal's interrupt should, unless the
+    // [shutdown] table or being a container's main process makes them
+    // shut everything down (section 13.3), and SIGHUP reloads the
+    // configuration file.
 
     let mut drain_on_exit = true;
     let mut upgrade_to: Option<Upgrade> = None;
@@ -1222,11 +1222,11 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                 }
             }
             _ = terminate.recv() => {
-                drain_on_exit = false;
+                drain_on_exit = daemon.signalled("SIGTERM");
                 break Ok(());
             }
             _ = interrupt.recv() => {
-                drain_on_exit = false;
+                drain_on_exit = daemon.signalled("SIGINT");
                 break Ok(());
             }
             command = inbox.recv() => match command {
@@ -1294,12 +1294,32 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
     }
 
     if drain_on_exit {
-        daemon.stop_all().await;
-        daemon.edge.stop().await;
-        let _ = std::fs::remove_file(daemon.locations.run.path.join("edge.toml"));
+        // The shutdown, as the stop signal and muructl daemon stop
+        // --shutdown both run it, inside the policy's budget: the delay
+        // with the edge still accepting, the drain of the requests in
+        // flight, every host stopped at once, and the edge last, so the
+        // workers' WebSocket close frames get through it.
+
+        let policy = daemon.shutdown.clone();
+        let started = Instant::now();
+        let deadline = started + policy.budget;
+        daemon.drain_edge(&policy, deadline).await;
+        daemon.stop_all_until(deadline).await;
         daemon
-            .events
-            .emit("daemon.stopped", "daemon", "info", "stopped");
+            .edge
+            .stop_within(deadline.saturating_duration_since(Instant::now()))
+            .await;
+        let _ = std::fs::remove_file(daemon.locations.run.path.join("edge.toml"));
+        daemon.events.emit(
+            "daemon.stopped",
+            "daemon",
+            "info",
+            &format!(
+                "stopped in {:.1} s of the {} budget",
+                started.elapsed().as_secs_f64(),
+                muru_config::format_duration(policy.budget)
+            ),
+        );
     } else if upgrade_to.is_none() {
         daemon.detach();
         daemon.events.emit(
@@ -1332,9 +1352,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         scraper.abort();
     }
 
-    for delivery in deliveries {
-        delivery.abort();
-    }
+    daemon.sinks.stop();
 
     if let Some(pages) = pages {
         pages.abort();
@@ -1455,12 +1473,6 @@ fn upload_message(route: &muru_config::Route) -> Option<pb::Upload> {
         precheck: settings.precheck,
         spool_quota: settings.spool_quota,
     })
-}
-
-/// The directory a configuration file's relative paths start from.
-fn config_directory(path: &Path) -> PathBuf {
-    path.parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// The upload spool, open to the edge's user alone: the service user
@@ -1589,7 +1601,7 @@ fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::
 /// The [proxy] table as the snapshot carries it, with the defaults of
 /// section 4.7 filled in: the four common header types, recursive
 /// resolution, and the configured headers kept.
-fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
+pub(crate) fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
     let headers = if proxy.headers.is_empty() {
         muru_config::DEFAULT_PROXY_HEADERS
             .iter()
@@ -1609,7 +1621,7 @@ fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
 
 /// The node-wide error pages and override as the snapshot carries them
 /// (section 4.12), checked; a page file must be an absolute path.
-fn error_tables_message(
+pub(crate) fn error_tables_message(
     pages: &std::collections::BTreeMap<String, muru_config::ErrorPage>,
     override_: Option<&muru_config::ErrorOverride>,
 ) -> Result<(Vec<pb::ErrorPage>, Option<pb::ErrorOverride>), String> {
@@ -1706,7 +1718,7 @@ fn maintenance_message(on: bool, table: Option<&muru_config::Maintenance>) -> pb
 
 /// The [compression] table as the snapshot carries it, checked: the
 /// defaults of section 4.17 where the table is silent.
-fn compression_message(
+pub(crate) fn compression_message(
     table: Option<&muru_config::Compression>,
 ) -> Result<pb::Compression, String> {
     let Some(table) = table else {
@@ -1771,6 +1783,17 @@ fn command_mentions(pid: u32, path: &Path) -> bool {
         Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
         Err(_) => false,
     }
+}
+
+/// The index of the worker a link socket belongs to, from its name:
+/// `worker-N.sock`, or `worker-GROUP-N.sock` in a worker group.
+fn worker_index(socket: &str) -> Option<u32> {
+    let name = std::path::Path::new(socket).file_stem()?.to_str()?;
+    name.strip_prefix("worker-")?
+        .rsplit('-')
+        .next()?
+        .parse()
+        .ok()
 }
 
 impl Daemon {
@@ -2061,6 +2084,8 @@ impl Daemon {
             listeners: self
                 .info
                 .listeners
+                .read()
+                .expect("listeners poisoned")
                 .iter()
                 .map(|(address, tls)| {
                     format!("{}://{address}", if *tls { "https" } else { "http" })
@@ -2088,79 +2113,321 @@ impl Daemon {
         }
     }
 
-    /// Section 13.3: re-read the configuration file for what can change
-    /// while running, which is the [proxy] table; listeners, limits, the
-    /// metrics listener and the event sinks are read at start.
+    /// Section 13.3: read the configuration file again and apply what
+    /// changed, each table in its own way: the edge's tables go to it in
+    /// a snapshot, changed listeners replace the edge, sinks are started
+    /// and stopped, and the rest are swapped in place. The file is
+    /// checked whole and the new listeners bound before anything is
+    /// applied, so a mistake applies nothing.
     async fn reload(&mut self) -> Result<String, String> {
         let path = self.locations.config.path.clone();
+        let settings = crate::settings::NodeSettings::read(
+            &path,
+            &self.locations.state.path.join("secrets"),
+            &self.overrides,
+        )?;
+        let clients = settings.client_rules.policies(&self.store)?;
+        let listeners = self.bind_listeners(&settings.listeners)?;
+        let mut report = crate::reload::Report::new(&path);
 
-        let document = match std::fs::read_to_string(&path) {
-            Ok(text) => muru_config::Document::parse(&text)
-                .map_err(|error| format!("{}: {error}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                muru_config::Document::default()
+        // Section 4.4: the tables the edge takes from each snapshot, and
+        // the limits with them (section 4.6).
+
+        let mut snapshot = false;
+
+        for (table, changed) in [
+            ("[proxy]", settings.proxy != self.proxy),
+            ("[compression]", settings.compression != self.compression),
+            ("[error_pages]", settings.error_pages != self.error_pages),
+            (
+                "[error_override]",
+                settings.error_override != self.error_override,
+            ),
+            (
+                "[[client_class]]",
+                clients.classes_message != self.clients.classes_message,
+            ),
+            (
+                "[rate_limit]",
+                clients.limits_message != self.clients.limits_message,
+            ),
+            ("[limits]", settings.limits != self.limits),
+            ("[[listener]] h2c", settings.h2c != self.h2c),
+        ] {
+            if changed {
+                report.changed(table, "the edge has it");
+                snapshot = true;
+            } else {
+                report.unchanged(table);
             }
-            Err(error) => return Err(format!("reading {}: {error}", path.display())),
-        };
-
-        let proxy = document.proxy.as_ref().map(proxy_message);
-
-        if let Some(proxy) = &proxy {
-            muru_edge::proxy::Trust::from_snapshot(proxy)
-                .map_err(|error| format!("[proxy]: {error}"))?;
         }
 
-        let compression = compression_message(document.compression.as_ref())
-            .map_err(|error| format!("[compression]: {error}"))?;
-        let (error_pages, error_override) =
-            error_tables_message(&document.error_pages, document.error_override.as_ref())?;
-        let client_rules = crate::clients::FileRules {
-            classes: document.client_class.clone(),
-            limits: document.rate_limit.clone(),
-            directory: config_directory(&path),
-        };
-        let clients = client_rules.policies(&self.store)?;
-        let budget = crate::budget::Budget::from_table(
-            document
-                .daemon
-                .as_ref()
-                .and_then(|table| table.budget.as_ref()),
-        )
-        .map_err(|error| format!("[daemon.budget]: {error}"))?;
-        let changed = proxy != self.proxy
-            || compression != self.compression
-            || error_pages != self.error_pages
-            || error_override != self.error_override
-            || clients.classes_message != self.clients.classes_message
-            || clients.limits_message != self.clients.limits_message;
-        self.proxy = proxy;
-        self.compression = compression;
-        self.error_pages = error_pages;
-        self.error_override = error_override;
-        self.budget = budget;
-        let mut defined = client_rules.defined();
-        defined.budget = self.budget_view(self.budget_usage());
-        *self.info.defined.write().expect("defined names poisoned") = defined;
-        self.client_rules = client_rules;
+        self.proxy = settings.proxy;
+        self.compression = settings.compression;
+        self.error_pages = settings.error_pages;
+        self.error_override = settings.error_override;
+        self.limits = settings.limits;
+        self.h2c = settings.h2c;
+        self.client_rules = settings.client_rules;
         self.clients = clients;
 
-        if changed {
-            self.push_snapshot().await?;
+        // Section 7.4: the budget, and the dashboard's actions switch.
+
+        if settings.budget != self.budget {
+            self.budget = settings.budget;
+            report.changed(
+                "[daemon.budget]",
+                &self.budget.describe(&self.budget_usage()),
+            );
+        } else {
+            report.unchanged("[daemon.budget]");
         }
 
-        let message = format!(
-            "reloaded {}: the [proxy], [compression], [error_pages], [error_override], [[client_class]] and [rate_limit] tables {}, and the budget is {}; listeners, limits, metrics, event sinks, secret stores and log rotation are read at start",
-            path.display(),
-            if changed {
-                "changed and the edge has them"
-            } else {
-                "are unchanged"
+        let mut defined = self.client_rules.defined();
+        defined.budget = self.budget_view(self.budget_usage());
+        *self.info.defined.write().expect("defined names poisoned") = defined;
+        let actions = settings.dashboard_actions;
+        let actions_were = self
+            .info
+            .dashboard_actions
+            .swap(actions, std::sync::atomic::Ordering::Relaxed);
+
+        if actions_were != actions {
+            report.changed("[dashboard] actions", if actions { "on" } else { "off" });
+        } else {
+            report.unchanged("[dashboard] actions");
+        }
+
+        // Section 11.5: sinks start, stop and restart on their cursors.
+
+        let sink_changes = self.sinks.reconcile(settings.sinks);
+
+        if sink_changes.is_empty() {
+            report.unchanged("[[events.sink]]");
+        } else {
+            report.changed("[[events.sink]]", &sink_changes.describe());
+        }
+
+        // Section 10.8: the stores matter when a release starts, so they
+        // are swapped whole; section 11.3: the rotator takes the new
+        // policy and keeps what it has seen of each file.
+
+        if settings.secrets != self.secrets {
+            self.secrets = settings.secrets;
+            let names: Vec<&str> = self
+                .secrets
+                .iter()
+                .map(|store| store.name.as_str())
+                .collect();
+            report.changed(
+                "[secrets.store.NAME]",
+                &if names.is_empty() {
+                    "no stores".to_owned()
+                } else {
+                    format!("the stores are {}", names.join(", "))
+                },
+            );
+        } else {
+            report.unchanged("[secrets.store.NAME]");
+        }
+
+        let rotation = self
+            .rotation
+            .as_ref()
+            .map(|rotator| rotator.policy().clone());
+
+        if settings.rotation != rotation {
+            match (settings.rotation, self.rotation.as_mut()) {
+                (Some(policy), Some(rotator)) => rotator.set_policy(policy),
+                (Some(policy), None) => self.rotation = Some(crate::rotation::Rotator::new(policy)),
+                (None, _) => self.rotation = None,
+            }
+
+            report.changed(
+                "[logs]",
+                if self.rotation.is_some() {
+                    "the daemon rotates on the new policy"
+                } else {
+                    "rotation is external"
+                },
+            );
+        } else {
+            report.unchanged("[logs]");
+        }
+
+        // Section 13.3: what the next stop signal means.
+
+        if settings.shutdown != self.shutdown {
+            self.shutdown = settings.shutdown;
+            report.changed("[shutdown]", &self.shutdown.describe());
+        } else {
+            report.unchanged("[shutdown]");
+        }
+
+        // Section 4.2: the hosts' certificate files, read again.
+
+        let certificates = self.refresh_certificates(true);
+
+        if certificates.renewed.is_empty() {
+            report.unchanged("the hosts' certificates");
+        } else {
+            report.changed(
+                "the hosts' certificates",
+                &format!(
+                    "{} renewed; the edge has them",
+                    certificates.renewed.join(", ")
+                ),
+            );
+            snapshot = true;
+        }
+
+        for (host, why) in certificates.kept {
+            report.kept(&format!("host {host} keeps its certificate"), &why);
+        }
+
+        if snapshot && let Err(error) = self.push_snapshot().await {
+            report.failed("the edge's tables", &error);
+        }
+
+        // Section 13.4: changed listeners take a new edge, which gets the
+        // snapshot just pushed before the old one is told to stop.
+
+        match listeners {
+            Some((listeners, what)) => match self.replace_edge(Some(listeners), &what).await {
+                Ok(_) => report.changed("[[listener]]", &format!("{what}; the edge was replaced")),
+                Err(error) => report.failed("[[listener]]", &error),
             },
-            self.budget.describe(&self.budget_usage())
+            None => report.unchanged("[[listener]]"),
+        }
+
+        self.events.emit(
+            "config.reloaded",
+            "daemon",
+            if report.is_ok() { "info" } else { "warning" },
+            &report.message(),
         );
-        self.events
-            .emit("config.reloaded", "daemon", "info", &message);
-        Ok(message)
+        report.outcome()
+    }
+
+    /// Section 4.2: read the certificate and key files of the applied
+    /// TLS hosts again, every host or only those not read yet, and keep
+    /// each pair that is whole and goes together, for the snapshots. A
+    /// host whose files cannot be read, or do not go together, keeps its
+    /// last good pair, named in a `certificate.unreadable` event; a host
+    /// that never had one serves without TLS until the files are right.
+    fn refresh_certificates(&mut self, every: bool) -> CertificateChanges {
+        let mut changes = CertificateChanges::default();
+        let hosts = self.store.hosts().unwrap_or_default();
+        self.certificates.retain(|name, _| {
+            hosts
+                .iter()
+                .any(|(host, spec)| host == name && spec.tls.is_some())
+        });
+
+        for (name, host) in hosts {
+            let Some(tls) = &host.tls else {
+                continue;
+            };
+
+            if !every && self.certificates.contains_key(&name) {
+                continue;
+            }
+
+            let read = read_pem_pair(&tls.certificate, &tls.key).and_then(|(chain, key)| {
+                let (parsed_chain, parsed_key) = muru_edge::tls::parse_pem(&chain, &key)?;
+                muru_edge::tls::certified_key(parsed_chain, parsed_key)?;
+                Ok((chain, key))
+            });
+
+            match read {
+                Ok(pair) => {
+                    if self.certificates.get(&name) != Some(&pair)
+                        && self.certificates.insert(name.clone(), pair).is_some()
+                    {
+                        changes.renewed.push(name);
+                    }
+                }
+                Err(error) => {
+                    let kept = self.certificates.contains_key(&name);
+                    self.events.emit(
+                        "certificate.unreadable",
+                        &format!("host {name}"),
+                        "error",
+                        &format!(
+                            "{error:#}; {}",
+                            if kept {
+                                "the host keeps the certificate it had"
+                            } else {
+                                "the host serves without TLS until the files are right"
+                            }
+                        ),
+                    );
+                    changes.kept.push((name, format!("{error:#}")));
+                }
+            }
+        }
+
+        changes
+    }
+
+    /// Section 13.3: the sockets for a changed set of listeners, bound
+    /// before anything else is applied so that a port in use applies
+    /// nothing. A kept listener's socket is the edge's own, so its
+    /// backlog survives the replacement. None when the set is unchanged.
+    fn bind_listeners(
+        &self,
+        wanted: &[(SocketAddr, bool)],
+    ) -> Result<Option<(Vec<crate::edges::Listener>, String)>, String> {
+        let current = self.edge.listeners();
+
+        if wanted.len() == current.len() && wanted.iter().all(|listener| current.contains(listener))
+        {
+            return Ok(None);
+        }
+
+        let mut listeners = Vec::new();
+
+        for &(address, tls) in wanted {
+            let socket = match self.edge.socket_on(address) {
+                Some(socket) => socket,
+                None => std::net::TcpListener::bind(address)
+                    .map_err(|error| format!("cannot listen on {address}: {error}"))?,
+            };
+
+            listeners.push(crate::edges::Listener { socket, tls });
+        }
+
+        let describe = |(address, tls): &(SocketAddr, bool)| {
+            format!("{}://{address}", if *tls { "https" } else { "http" })
+        };
+        let added: Vec<String> = wanted
+            .iter()
+            .filter(|listener| !current.contains(listener))
+            .map(describe)
+            .collect();
+        let removed: Vec<String> = current
+            .iter()
+            .filter(|listener| !wanted.contains(listener))
+            .map(describe)
+            .collect();
+        let mut what = Vec::new();
+
+        if !added.is_empty() {
+            what.push(format!("{} added", added.join(", ")));
+        }
+
+        if !removed.is_empty() {
+            what.push(format!("{} removed", removed.join(", ")));
+        }
+
+        Ok(Some((listeners, what.join(", "))))
+    }
+
+    /// How long an edge is given to finish its connections when it is
+    /// replaced: the request deadline, so a response in flight can
+    /// complete, and a little over.
+    fn drain_grace(&self) -> Duration {
+        self.limits.request_deadline + Duration::from_secs(5)
     }
 
     /// Section 9.10: the routes and the applications in maintenance mode
@@ -3117,7 +3384,19 @@ impl Daemon {
                 }
 
                 self.reconcile_traffic().await;
+                self.refresh_certificates(true);
                 let _ = done.send(self.push_snapshot().await);
+            }
+            Command::RefreshCertificates { done } => {
+                let changes = self.refresh_certificates(true);
+
+                if !changes.renewed.is_empty()
+                    && let Err(error) = self.push_snapshot().await
+                {
+                    tracing::warn!(%error, "pushing the renewed certificates failed");
+                }
+
+                let _ = done.send(changes);
             }
             Command::Reload { done } => {
                 let _ = done.send(self.reload().await);
@@ -4049,26 +4328,16 @@ impl Daemon {
         let default_app = default.map(|app| app.app.clone()).unwrap_or_default();
         let default_release = default.map(|app| app.release.clone()).unwrap_or_default();
 
+        // Section 4.2: a host applied since the last snapshot has its
+        // certificate files read now; the others carry their last good
+        // pair.
+
+        self.refresh_certificates(false);
         let mut hosts = Vec::new();
 
         for (name, host) in self.store.hosts().unwrap_or_default() {
-            let (certificate_pem, key_pem) = match &host.tls {
-                Some(tls) => {
-                    match read_pem_pair(&tls.certificate, &tls.key) {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            self.events.emit(
-                            "certificate.unreadable",
-                            &format!("host {name}"),
-                            "error",
-                            &format!("{error:#}; the host serves without TLS until the files are back"),
-                        );
-                            (String::new(), String::new())
-                        }
-                    }
-                }
-                None => (String::new(), String::new()),
-            };
+            let (certificate_pem, key_pem) =
+                self.certificates.get(&name).cloned().unwrap_or_default();
 
             hosts.push(pb::Host {
                 name,
@@ -4194,16 +4463,65 @@ impl Daemon {
             rate_limits: self.clients.limits_message.clone(),
             default_traffic,
             h2c: self.h2c.clone(),
+            limits: Some(self.limits.to_message()),
         }
     }
 
-    /// Compile and push a snapshot.
+    /// Compile and push a snapshot. A worker the edge could not connect to
+    /// (section 5.1) is reported as an event and replaced at once, as
+    /// `muructl restart --force` would: the snapshot has been applied
+    /// without it, and a worker that accepts a connection and never
+    /// answers is not going to.
     async fn push_snapshot(&mut self) -> Result<(), String> {
         let snapshot = self.build_snapshot();
-        self.edge
+        let applied = self
+            .edge
             .apply(snapshot)
             .await
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| format!("{error:#}"))?;
+        self.replace_unreachable(applied);
+        Ok(())
+    }
+
+    /// Section 5.1: report each worker the edge's answer to a snapshot
+    /// names as one it could not connect to, and replace it at once.
+    fn replace_unreachable(&mut self, applied: pb::Applied) {
+        for worker in applied.unreachable {
+            let subject = format!("{}@{}", worker.app, worker.release);
+            let index = worker_index(&worker.socket);
+            let whom = index.map_or_else(
+                || format!("the worker at {}", worker.socket),
+                |index| format!("worker {index}"),
+            );
+            let control = self
+                .running
+                .get(&(worker.app.clone(), worker.release.clone()))
+                .and_then(|running| running.control.as_ref());
+
+            let action = match (index, control) {
+                (Some(index), Some(control)) => {
+                    self.last_request += 1;
+                    control.request(
+                        self.last_request,
+                        "restart",
+                        Some(index),
+                        &serde_json::json!({ "force": true }),
+                    );
+                    "; it is being replaced"
+                }
+                _ => "",
+            };
+
+            self.events.emit(
+                "worker.unreachable",
+                &subject,
+                "warning",
+                &format!(
+                    "{whom} did not answer the edge ({}); the snapshot was applied without it{action}",
+                    worker.reason
+                ),
+            );
+        }
     }
 
     /// Section 9.5: with traffic already elsewhere, wait for the release's
@@ -6284,8 +6602,8 @@ impl Daemon {
     /// last snapshot (section 2.4).
     async fn check_edge(&mut self) {
         match self.edge.check().await {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(None) => {}
+            Ok(Some(applied)) => {
                 self.info.edge_pid.store(
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
@@ -6297,6 +6615,7 @@ impl Daemon {
                     "warning",
                     "the edge process exited and was started again on the same listener",
                 );
+                self.replace_unreachable(applied);
             }
             Err(error) => {
                 self.events
@@ -6389,6 +6708,7 @@ impl Daemon {
                 }) else {
                     return;
                 };
+                let before: BTreeSet<PathBuf> = running.routed_sockets().into_iter().collect();
                 running.sockets = sockets;
 
                 for (name, group_sockets) in groups {
@@ -6398,11 +6718,7 @@ impl Daemon {
                     }
                 }
 
-                let mut all = running.sockets.clone();
-
-                for group in &running.groups {
-                    all.extend(group.sockets.iter().cloned());
-                }
+                let all = running.routed_sockets();
 
                 // Section 7.4: a socket new to the routing is a worker
                 // that just became ready.
@@ -6414,6 +6730,15 @@ impl Daemon {
                     running.ready_at.entry(socket.clone()).or_insert(now);
                 }
 
+                // The host's first announcement on a control connection
+                // repeats what the daemon read from the run directory when
+                // the release started, just after a deploy answers. A push
+                // for it would cost an edge apply and leave out a worker
+                // that happens to be busy (section 5.1), for a routing that
+                // is already in place, so one that changes nothing the edge
+                // routes by is acknowledged without a push.
+
+                let changed = before != all.iter().cloned().collect::<BTreeSet<PathBuf>>();
                 write_record(
                     &record,
                     &HostRecord {
@@ -6423,7 +6748,8 @@ impl Daemon {
                     },
                 );
 
-                if self.routable(app, id)
+                if changed
+                    && self.routable(app, id)
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::error!(%error, "pushing the snapshot after a worker change failed");
@@ -6531,42 +6857,89 @@ impl Daemon {
         }
     }
 
-    /// Section 13.4: replace the edge with one started from this image on
-    /// the same listeners; the old one finishes its connections and exits.
-    async fn replace_edge(&mut self) {
-        let grace = self.edge.drain_grace();
+    /// Section 13.4: replace the edge with one from this daemon's image,
+    /// on the same listeners or on `listeners` when a reload changed
+    /// them (section 13.3); the old one finishes its connections and
+    /// exits. `where_` says which in the event. Returns the old edge's
+    /// pid; on failure the old edge keeps serving, and the event says so.
+    async fn replace_edge(
+        &mut self,
+        listeners: Option<Vec<crate::edges::Listener>>,
+        where_: &str,
+    ) -> Result<u32, String> {
+        let grace = self.drain_grace();
 
-        match self.edge.replace(grace).await {
-            Ok(old_pid) => {
+        match self.edge.replace(grace, listeners).await {
+            Ok((old_pid, applied)) => {
                 let pid = self.edge.pid().unwrap_or(0);
                 self.info
                     .edge_pid
                     .store(pid, std::sync::atomic::Ordering::Relaxed);
+                *self.info.listeners.write().expect("listeners poisoned") = self.edge.listeners();
                 write_edge_record(&self.locations.run.path, &self.edge);
                 self.events.emit(
                     "edge.replaced",
                     "edge",
                     "info",
                     &format!(
-                        "edge pid {old_pid} replaced by pid {pid} on the same listeners; the old edge finishes its connections and exits"
+                        "edge pid {old_pid} replaced by pid {pid} on {where_}; the old edge finishes its connections and exits"
                     ),
                 );
+                self.replace_unreachable(applied);
+                Ok(old_pid)
             }
             Err(error) => {
-                self.events.emit(
-                    "edge.failed",
-                    "edge",
-                    "error",
-                    &format!(
-                        "the edge could not be replaced: {error:#}; the old edge keeps serving"
-                    ),
+                let message = format!(
+                    "the edge could not be replaced: {error:#}; the old edge keeps serving"
                 );
+                self.events.emit("edge.failed", "edge", "error", &message);
+                Err(message)
             }
         }
     }
 
-    /// Stop every host, for shutdown.
-    async fn stop_all(&mut self) {
+    /// Section 13.3: what a stop signal means to this daemon, said in the
+    /// log; whether it shuts everything down.
+    fn signalled(&self, signal: &str) -> bool {
+        if self.shutdown.shuts_down() {
+            tracing::info!("{signal}: shutting down ({})", self.shutdown.describe());
+        } else {
+            tracing::info!("{signal}: detaching; hosts and the edge keep serving");
+        }
+
+        self.shutdown.shuts_down()
+    }
+
+    /// Section 13.3: the edge's part of a shutdown. For the policy's
+    /// delay it keeps accepting, with every connection closing after its
+    /// response, then it stops accepting and the requests in flight
+    /// finish, within what the budget leaves after a moment for the
+    /// workers. The edge itself stays up for the WebSockets until it is
+    /// stopped last.
+    async fn drain_edge(&mut self, policy: &crate::shutdown::Policy, deadline: Instant) {
+        let grace = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(policy.delay)
+            .saturating_sub(crate::shutdown::WORKERS_RESERVE);
+
+        match self.edge.drain(policy.delay, grace).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "requests were still in flight when the drain's {} were up",
+                    muru_config::format_duration(grace)
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the edge could not be drained");
+            }
+        }
+    }
+
+    /// Stop every host, for shutdown: all at once, each given its workers'
+    /// stop budget or what the shutdown's budget leaves, whichever ends
+    /// first, and killed at `deadline` if it is still there.
+    async fn stop_all_until(&mut self, deadline: Instant) {
         let running = std::mem::take(&mut self.running);
         self.serving.clear();
 
@@ -6574,21 +6947,32 @@ impl Daemon {
             tracing::error!(%error, "pushing the empty snapshot failed");
         }
 
+        let mut stopping = Vec::new();
+
         for ((app, id), running) in running {
-            if let Ok(release) = self.store.release(&app, &id) {
-                self.set_state(&release, ReleaseState::Stopping, "the daemon is stopping");
+            let release = self.store.release(&app, &id).ok();
+
+            if let Some(release) = &release {
+                self.set_state(release, ReleaseState::Stopping, "the daemon is stopping");
             }
 
-            let grace = self
-                .store
-                .release(&app, &id)
+            let budget = release
+                .as_ref()
                 .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
-            let _ = tokio::time::timeout(stop_wait(grace), running.backend.stop(grace)).await;
+            let kill_at = deadline.min(Instant::now() + budget + crate::host::STOP_MARGIN);
+            stopping.push(async move {
+                running.backend.stop_until(kill_at).await;
+                release
+            });
+        }
 
-            if let Ok(release) = self.store.release(&app, &id) {
-                self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
-            }
+        for release in futures::future::join_all(stopping)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
         }
     }
 

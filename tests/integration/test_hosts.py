@@ -286,6 +286,51 @@ def test_a_replaced_certificate_is_served_once_the_host_is_applied_again(
         daemon.request("/", host="echo.test", port=secure, cafile=stale)
 
 
+def test_a_replaced_certificate_is_served_after_a_reload_or_an_unchanged_apply(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    cert, key = certificate(tmp_path, "echo", "echo.test")
+    config = hosts_file(tmp_path, cert, key)
+    assert apply(daemon, config).returncode == 0
+    secure = daemon.https_port
+    assert secure is not None
+    assert daemon.request("/", host="echo.test", port=secure, cafile=cert).status == 200
+
+    # A reload reads the files again and sends the edge the new pair.
+
+    stale = tmp_path / "stale.pem"
+    stale.write_bytes(cert.read_bytes())
+    certificate(tmp_path, "echo", "echo.test")
+    assert cert.read_bytes() != stale.read_bytes()
+    reloaded = daemon.muructl("daemon", "reload").stdout
+    assert "changed the hosts' certificates (echo renewed; the edge has them)" in reloaded, reloaded
+    assert daemon.request("/", host="echo.test", port=secure, cafile=cert).status == 200
+    with pytest.raises(OSError):
+        daemon.request("/", host="echo.test", port=secure, cafile=stale)
+
+    # So does applying the same file again, which changes nothing else.
+
+    stale.write_bytes(cert.read_bytes())
+    certificate(tmp_path, "echo", "echo.test")
+    reapplied = apply(daemon, config)
+    assert reapplied.returncode == 0, reapplied.stdout + reapplied.stderr
+    assert "muru: certificates of echo renewed; the edge has them" in reapplied.stdout
+    assert daemon.request("/", host="echo.test", port=secure, cafile=cert).status == 200
+    with pytest.raises(OSError):
+        daemon.request("/", host="echo.test", port=secure, cafile=stale)
+
+    # A key that does not go with its certificate leaves the host on the
+    # certificate it has, and the reload says so.
+
+    _other_cert, other_key = certificate(tmp_path, "other", "other.test")
+    key.write_bytes(other_key.read_bytes())
+    reloaded = daemon.muructl("daemon", "reload").stdout
+    assert "host echo keeps its certificate (" in reloaded, reloaded
+    assert "do not go together" in reloaded
+    assert daemon.request("/", host="echo.test", port=secure, cafile=cert).status == 200
+    assert "certificate.unreadable" in daemon.events()
+
+
 def test_export_round_trips_hosts_and_routes_and_prune_removes_them(
     daemon: Daemon, tmp_path: Path
 ) -> None:

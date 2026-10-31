@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Context as _;
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -87,6 +86,8 @@ struct WorkerSlots {
     semaphore: Arc<Semaphore>,
     /// Section 6.7: the mounts with threads of their own, by name.
     mounts: HashMap<String, MountSlots>,
+    /// The gRPC methods its mounts registered, from HELLO (section 6.13).
+    grpc: Vec<pb::GrpcMethod>,
     idle: Mutex<Vec<Conn>>,
 }
 
@@ -128,6 +129,7 @@ impl WorkerSlots {
             async_slots: usize::try_from(hello.async_slots).unwrap_or(usize::MAX),
             semaphore: Arc::new(Semaphore::new(slots)),
             mounts,
+            grpc: hello.grpc_methods,
             idle: Mutex::new(vec![conn]),
         }
     }
@@ -281,10 +283,56 @@ pub struct WorkerStatus {
     pub in_flight: usize,
 }
 
+/// A worker a pool was to connect to and could not: its socket was
+/// missing, refused the connection, or did not answer HELLO in time
+/// (section 5.1). The pool is built from the workers that answered.
+#[derive(Debug, Clone)]
+pub struct Unreachable {
+    /// The worker's link socket.
+    pub path: PathBuf,
+    /// Why it could not be connected to.
+    pub reason: String,
+}
+
+/// The workers of the routing being replaced, by socket. A pool built
+/// for the next routing keeps a worker found here, with its connections
+/// and its slots as they stand, rather than connecting to it again
+/// (section 5.1): an apply reconnects only to the workers new to it, and
+/// a worker that is slow to answer cannot be put out of a routing that
+/// did not change it.
+#[derive(Default)]
+pub struct Kept {
+    workers: HashMap<PathBuf, Arc<WorkerSlots>>,
+}
+
+impl Kept {
+    /// Add every worker of a pool.
+    pub fn add(&mut self, pool: &LinkPool) {
+        for worker in &pool.workers {
+            self.workers.insert(worker.path.clone(), Arc::clone(worker));
+        }
+    }
+
+    /// How many workers are kept.
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Whether no worker is kept.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+}
+
 /// Connection pools for a set of workers.
 pub struct LinkPool {
-    workers: Vec<WorkerSlots>,
+    /// Shared with the pool that had a worker before, so requests in
+    /// flight on the old routing and new ones count against the same
+    /// slots and give their connections back to the same place.
+    workers: Vec<Arc<WorkerSlots>>,
     next: AtomicUsize,
+    /// The workers that could not be connected to, left out of the pool.
+    unreachable: Vec<Unreachable>,
     /// Requests waiting for a slot, for the metrics.
     waiting: AtomicUsize,
     /// The gRPC methods the workers' mounts registered, from HELLO
@@ -323,32 +371,57 @@ pub(crate) struct Lease {
 impl LinkPool {
     /// Connect once to every worker socket and size its pool from what its
     /// HELLO declares (section 5.1): the edge acts on the capabilities, not
-    /// on the kind of worker. The first connection stays in the pool.
-    pub async fn connect(sockets: &[PathBuf]) -> anyhow::Result<Self> {
-        let mut workers = Vec::with_capacity(sockets.len());
-        let mut grpc = Vec::new();
+    /// on the kind of worker. The first connection stays in the pool. A
+    /// worker in `kept`, from the routing being replaced, is taken as it
+    /// is instead, connections and all. A worker that cannot be connected
+    /// to, or does not answer HELLO in time, is left out and listed as
+    /// unreachable rather than failing the pool: one stopped worker must
+    /// not keep a snapshot from being applied for everything else.
+    pub async fn connect(sockets: &[PathBuf], kept: &Kept) -> anyhow::Result<Self> {
+        let mut workers: Vec<Arc<WorkerSlots>> = Vec::with_capacity(sockets.len());
+        let mut unreachable = Vec::new();
 
         for path in sockets {
-            let (conn, hello) = connect(path)
-                .await
-                .with_context(|| format!("connecting to the worker at {}", path.display()))?;
-
-            // Every worker of a release registers the same methods.
-
-            if grpc.is_empty() {
-                grpc = hello.grpc_methods.clone();
+            if let Some(worker) = kept.workers.get(path) {
+                workers.push(Arc::clone(worker));
+                continue;
             }
 
-            workers.push(WorkerSlots::new(path.clone(), hello, conn));
+            let (conn, hello) = match connect(path).await {
+                Ok(connected) => connected,
+                Err(error) => {
+                    unreachable.push(Unreachable {
+                        path: path.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            workers.push(Arc::new(WorkerSlots::new(path.clone(), hello, conn)));
         }
+
+        // Every worker of a release registers the same methods.
+
+        let grpc = workers
+            .iter()
+            .map(|worker| worker.grpc.clone())
+            .find(|methods| !methods.is_empty())
+            .unwrap_or_default();
 
         Ok(Self {
             workers,
             next: AtomicUsize::new(0),
+            unreachable,
             waiting: AtomicUsize::new(0),
             grpc,
             wake: None,
         })
+    }
+
+    /// The workers the snapshot named that this pool could not connect to.
+    pub fn unreachable(&self) -> &[Unreachable] {
+        &self.unreachable
     }
 
     /// Whether the workers serve gRPC methods (section 6.13).
@@ -402,6 +475,7 @@ impl LinkPool {
         Self {
             workers: Vec::new(),
             next: AtomicUsize::new(0),
+            unreachable: Vec::new(),
             waiting: AtomicUsize::new(0),
             grpc: Vec::new(),
             wake: None,
@@ -434,7 +508,7 @@ impl LinkPool {
 
     /// Requests in flight across every worker.
     pub fn in_flight(&self) -> usize {
-        self.workers.iter().map(WorkerSlots::in_flight).sum()
+        self.workers.iter().map(|worker| worker.in_flight()).sum()
     }
 
     /// Take a connection from the worker with the most free slots for the
@@ -765,6 +839,8 @@ pub struct Context<'a> {
     pub tls: Option<&'a pb::TlsInfo>,
     /// Whether error pages show tracebacks.
     pub development: bool,
+    /// What the run was told about the traceback page's seasonal themes.
+    pub occasions: crate::occasions::Setting,
     /// Where the request's record goes once it is complete.
     pub access_log: Arc<AccessLog>,
     /// The timeouts in force.
@@ -846,6 +922,7 @@ impl<'a> Context<'a> {
             scheme: self.scheme,
             tls: self.tls,
             development: self.development,
+            occasions: self.occasions,
             access_log: Arc::clone(&self.access_log),
             limits: Arc::clone(&self.limits),
             server_name: self.server_name.clone(),
@@ -1095,6 +1172,7 @@ pub(crate) fn failing<'a>(
         request_id: context.request_id,
         max_body_size: context.limits.max_body_size,
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
+        occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(recording),
         errors: &context.errors,
@@ -1270,6 +1348,7 @@ async fn handle_inner(
         request_id: context.request_id,
         max_body_size: limits.max_body_size,
         negotiation: Negotiation::from_headers(&parts.headers, context.development),
+        occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(None),
         errors: &context.errors,
@@ -1987,6 +2066,8 @@ pub(crate) struct Failing<'a> {
     request_id: &'a str,
     max_body_size: u64,
     negotiation: Negotiation,
+    /// What the run was told about the traceback page's seasonal themes.
+    occasions: crate::occasions::Setting,
     version: http::Version,
     recording: Mutex<Option<Recording>>,
     /// The custom pages in force (section 4.12).
@@ -2021,6 +2102,7 @@ impl Failing<'_> {
                 errors: self.errors,
                 host: &self.host,
                 path: &self.path,
+                occasions: self.occasions,
             },
         );
 
@@ -2564,5 +2646,94 @@ async fn discard(mut body: Incoming) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use muru_proto::descriptors::FdReader;
+    use muru_proto::frame::{self, kind};
+    use muru_proto::worker::v1 as pb;
+    use prost::Message;
+    use tokio::io::BufReader;
+    use tokio::net::UnixListener;
+
+    use super::{Kept, LinkPool};
+
+    /// A worker that answers HELLO on every connection and counts them.
+    fn fake_worker(path: &Path) -> Arc<AtomicUsize> {
+        let listener = UnixListener::bind(path).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let (read_half, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(FdReader::new(read_half));
+
+                tokio::spawn(async move {
+                    let Ok(Some(_)) = frame::read(&mut reader).await else {
+                        return;
+                    };
+
+                    let reply = pb::Hello {
+                        protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                        slots: 2,
+                        ..Default::default()
+                    };
+                    let _ = frame::write(&mut writer, kind::HELLO, 0, reply.encode_to_vec().into())
+                        .await;
+
+                    // The connection stays open until the edge drops it.
+
+                    let _ = frame::read(&mut reader).await;
+                });
+            }
+        });
+
+        accepted
+    }
+
+    #[tokio::test]
+    async fn a_kept_worker_is_not_connected_to_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker-0.sock");
+        let accepted = fake_worker(&path);
+        let first = LinkPool::connect(std::slice::from_ref(&path), &Kept::default())
+            .await
+            .unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(first.workers[0].slots, 2);
+
+        // The next routing keeps the worker, connections and all, and
+        // connects only to what is new to it; a socket that is missing
+        // is listed as unreachable.
+
+        let mut kept = Kept::default();
+        kept.add(&first);
+        assert_eq!(kept.len(), 1);
+        let missing = dir.path().join("worker-1.sock");
+        let second = LinkPool::connect(&[path.clone(), missing.clone()], &kept)
+            .await
+            .unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(second.workers.len(), 1);
+        assert!(Arc::ptr_eq(&first.workers[0], &second.workers[0]));
+        assert_eq!(second.unreachable().len(), 1);
+        assert_eq!(second.unreachable()[0].path, missing);
+
+        // With nothing to keep from, as in a new edge process, the worker
+        // is connected to afresh.
+
+        let third = LinkPool::connect(std::slice::from_ref(&path), &Kept::default())
+            .await
+            .unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert!(!Arc::ptr_eq(&first.workers[0], &third.workers[0]));
     }
 }

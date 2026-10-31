@@ -11,6 +11,7 @@ mod admin;
 mod dashboard;
 mod devcert;
 mod edge;
+mod init;
 mod pstats;
 mod run_admin;
 mod watch;
@@ -19,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
@@ -302,6 +303,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         grpc_web_origins: Vec::new(),
         errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
         development: true,
+        occasions: muru_edge::occasions::Setting::Calendar,
         access_log,
         limits: muru_edge::Limits::default(),
         compression: compression.clone(),
@@ -334,7 +336,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         compression: Some(compression.to_message()),
         ..Default::default()
     };
-    let routing = muru_edge::routing::Routing::from_snapshot(&snapshot).await?;
+    let routing = muru_edge::routing::Routing::from_snapshot(&snapshot, None).await?;
     edge.pools().apply(routing);
     println!(
         "muru: serving {} on http://{}",
@@ -406,11 +408,11 @@ struct RunArgs {
     #[arg(long)]
     hooks: Option<String>,
 
-    /// Where access log lines go: terminal, off, errors (4xx and 5xx
-    /// responses and requests slower than --slow) or a file path, which
-    /// receives JSON lines.
-    #[arg(long, default_value = "terminal")]
-    access_log: String,
+    /// Where access log lines go: terminal (the default), off, errors
+    /// (4xx and 5xx responses and requests slower than --slow) or a file
+    /// path, which receives JSON lines.
+    #[arg(long, value_name = "WHERE")]
+    access_log: Option<String>,
 
     /// Hide requests whose path matches the pattern from the access log
     /// (`*` matches anything, `?` one character). Repeatable.
@@ -418,9 +420,9 @@ struct RunArgs {
     access_log_exclude: Vec<String>,
 
     /// Requests at least this slow count as errors for --access-log errors,
-    /// for example 500ms or 2s.
-    #[arg(long, default_value = "1s", value_parser = muru_config::parse_duration)]
-    slow: Duration,
+    /// for example 500ms or 2s (default 1s).
+    #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
+    slow: Option<Duration>,
 
     /// Largest request body accepted, for example 100MB or 512KB (KB, MB
     /// and GB are powers of 1024). Development runs default to 100MB, and
@@ -486,14 +488,27 @@ struct RunArgs {
     #[arg(long)]
     allow_public: bool,
 
+    /// Show one of the traceback page's seasonal themes whatever the
+    /// date, by name, or off for none. Hidden: finding it is the point.
+    #[arg(long, hide = true, value_name = "NAME", value_parser = muru_edge::occasions::Setting::parse)]
+    easter_egg: Option<muru_edge::occasions::Setting>,
+
     /// Serve HTTPS as well, on --https-port, with a development certificate
     /// unless --tls-cert is given.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_https")]
     https: bool,
 
-    /// Serve HTTPS only: plain HTTP requests are redirected to it.
+    /// Do not serve HTTPS, whatever the project's run table says.
     #[arg(long)]
+    no_https: bool,
+
+    /// Serve HTTPS only: plain HTTP requests are redirected to it.
+    #[arg(long, conflicts_with = "no_https_only")]
     https_only: bool,
+
+    /// Serve plain HTTP too, whatever the project's run table says.
+    #[arg(long)]
+    no_https_only: bool,
 
     /// Port for HTTPS, on the address of --bind (default 8443, or auto
     /// when --port is auto).
@@ -531,9 +546,16 @@ struct RunArgs {
     #[arg(long = "static", value_name = "PREFIX=DIR", value_parser = parse_static_setting)]
     static_dirs: Vec<(String, String)>,
 
-    /// Start a new release when a watched source file changes.
-    #[arg(long)]
+    /// Start a new release when a watched source file changes: the
+    /// default in development mode, so this turns it back on over a run
+    /// table that turned it off.
+    #[arg(long, conflicts_with = "no_reload")]
     reload: bool,
+
+    /// Do not reload on changes for this run; reload = false in the
+    /// project's run table or muru.local.toml turns it off for good.
+    #[arg(long)]
+    no_reload: bool,
 
     /// Directory to watch for changes, relative to the project; defaults
     /// to the project itself. Repeatable.
@@ -612,20 +634,20 @@ fn parse_port(text: &str) -> Result<Port, String> {
 /// The HTTP and HTTPS addresses to bind (section 13.1): --port wins over a
 /// port in --bind, then 8080; --https-port, else auto when --port is auto,
 /// else 8443. Port 0 asks the system for a free one.
-fn addresses(args: &RunArgs) -> (SocketAddr, SocketAddr) {
+fn addresses(args: &RunArgs, serving: &Serving) -> (SocketAddr, SocketAddr) {
     const HTTP: u16 = 8080;
     const HTTPS: u16 = 8443;
 
-    let http = match args.port {
+    let http = match serving.port {
         Some(Port::Auto) => 0,
         Some(Port::Number(port)) => port,
         None => args.bind.port.unwrap_or(HTTP),
     };
 
-    let https = match args.https_port {
+    let https = match serving.https_port {
         Some(Port::Auto) => 0,
         Some(Port::Number(port)) => port,
-        None if args.port == Some(Port::Auto) => 0,
+        None if serving.port == Some(Port::Auto) => 0,
         None => HTTPS,
     };
 
@@ -633,6 +655,27 @@ fn addresses(args: &RunArgs) -> (SocketAddr, SocketAddr) {
         SocketAddr::new(args.bind.ip, http),
         SocketAddr::new(args.bind.ip, https),
     )
+}
+
+/// Whether the project's .gitignore, when it has one, names `file`; a
+/// project without one has nothing to say.
+fn gitignore_covers(project: &Path, file: &str) -> bool {
+    let gitignore = project.join(".gitignore");
+
+    if !gitignore.is_file() {
+        return true;
+    }
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(project);
+
+    if builder.add(&gitignore).is_some() {
+        return true;
+    }
+
+    builder
+        .build()
+        .map(|rules| rules.matched(project.join(file), false).is_ignore())
+        .unwrap_or(true)
 }
 
 /// Turn a failure to bind into advice: which port, who holds it when that
@@ -707,6 +750,10 @@ enum Link {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Section 6.10: as a container's PID 1, muructl forks first and the
+    // parent stays as the init; everything below is the child.
+
+    init::become_init();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
@@ -1219,10 +1266,10 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
     limits
 }
 
-fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
+fn access_log_config(serving: &Serving) -> muru_edge::access::Config {
     use muru_edge::access::Destination;
 
-    let destination = match args.access_log.as_str() {
+    let destination = match serving.access_log.as_str() {
         "terminal" => Destination::Terminal,
         "off" => Destination::Off,
         "errors" => Destination::Errors,
@@ -1231,8 +1278,121 @@ fn access_log_config(args: &RunArgs) -> muru_edge::access::Config {
 
     muru_edge::access::Config {
         destination,
-        slow: args.slow,
-        exclude: args.access_log_exclude.clone(),
+        slow: serving.slow,
+        exclude: serving.access_log_exclude.clone(),
+    }
+}
+
+/// How `muructl run` serves (section 13.1), once the flags, muru.local.toml,
+/// the project's run table and the defaults are merged: a flag wins, then
+/// the local file, then the table; lists add across the layers.
+struct Serving {
+    port: Option<Port>,
+    https: bool,
+    https_only: bool,
+    https_port: Option<Port>,
+    /// A certificate and key to serve, relative to the project.
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    /// Names the development certificate covers besides localhost.
+    hosts: Vec<String>,
+    /// Whether the run reloads on changes.
+    reload: bool,
+    reload_dirs: Vec<PathBuf>,
+    reload_include: Vec<String>,
+    reload_exclude: Vec<String>,
+    /// terminal, off, errors or a file path.
+    access_log: String,
+    access_log_exclude: Vec<String>,
+    slow: Duration,
+    /// The dashboard's address, off, or none for the default.
+    dashboard: Option<String>,
+    compression: bool,
+    /// The muru.local.toml read, when there was one.
+    local: Option<PathBuf>,
+}
+
+impl Serving {
+    /// Lay the flags over `settings`, the local file and the table
+    /// already layered. Reload is on by default in development mode and
+    /// off under --allow-public, where only the flag turns it on.
+    fn resolve(
+        args: &RunArgs,
+        settings: &muru_config::RunSettings,
+        local: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let port = |flag: Option<Port>, key: &Option<muru_config::RunPort>| {
+            flag.or_else(|| {
+                key.as_ref().map(|port| match port {
+                    muru_config::RunPort::Number(number) => Port::Number(*number),
+                    muru_config::RunPort::Named(_) => Port::Auto,
+                })
+            })
+        };
+        let strings = |under: &[String], over: &[String]| -> Vec<String> {
+            under.iter().chain(over).cloned().collect()
+        };
+
+        let reload = if args.no_reload {
+            false
+        } else if args.reload {
+            true
+        } else if args.allow_public {
+            false
+        } else {
+            settings.reload.unwrap_or(true)
+        };
+
+        let slow = match (args.slow, &settings.slow) {
+            (Some(slow), _) => slow,
+            (None, Some(text)) => muru_config::parse_duration(text)
+                .map_err(|error| anyhow::anyhow!("[run] slow: {error}"))?,
+            (None, None) => Duration::from_secs(1),
+        };
+
+        Ok(Self {
+            port: port(args.port, &settings.port),
+            https: !args.no_https && (args.https || settings.https == Some(true)),
+            https_only: !args.no_https_only
+                && (args.https_only || settings.https_only == Some(true)),
+            https_port: port(args.https_port, &settings.https_port),
+            tls_cert: args
+                .tls_cert
+                .clone()
+                .or_else(|| settings.tls_cert.as_deref().map(PathBuf::from)),
+            tls_key: args
+                .tls_key
+                .clone()
+                .or_else(|| settings.tls_key.as_deref().map(PathBuf::from)),
+            hosts: strings(&settings.hosts, &args.hosts),
+            reload,
+            reload_dirs: settings
+                .reload_dirs
+                .iter()
+                .map(PathBuf::from)
+                .chain(args.reload_dir.iter().cloned())
+                .collect(),
+            reload_include: strings(&settings.reload_include, &args.reload_include),
+            reload_exclude: strings(&settings.reload_exclude, &args.reload_exclude),
+            access_log: args
+                .access_log
+                .clone()
+                .or_else(|| settings.access_log.clone())
+                .unwrap_or_else(|| "terminal".to_owned()),
+            access_log_exclude: strings(&settings.access_log_exclude, &args.access_log_exclude),
+            slow,
+            dashboard: args
+                .dashboard
+                .clone()
+                .or_else(|| settings.dashboard.clone()),
+            compression: !args.no_compression && settings.compression != Some(false),
+            local,
+        })
+    }
+
+    /// Whether TLS is served at all.
+    fn tls(&self) -> bool {
+        self.https || self.https_only || self.tls_cert.is_some()
     }
 }
 
@@ -1290,6 +1450,8 @@ struct Resolved {
     /// The scaling table (sections 7.2 and 7.4), written out by
     /// --print-config; a development run never scales.
     scaling: Option<muru_config::Scaling>,
+    /// How the run serves (section 13.1).
+    serving: Serving,
 }
 
 /// Defaults for development runs (section 13.1): one worker with a few threads.
@@ -1347,6 +1509,28 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         Some((path, table)) => (Some(path), table),
         None => (None, muru_config::ToolMuru::default()),
     };
+
+    // Section 13.1: how the run serves, from the flags over muru.local.toml
+    // over the project's run table over the defaults. The table is
+    // checked as the local file was when it was read.
+
+    let run_table = table.run.clone().unwrap_or_default();
+    run_table.check().map_err(|error| {
+        anyhow::anyhow!(
+            "{}: [run] {error}",
+            source.as_deref().map_or_else(
+                || "the project".to_owned(),
+                |path| path.display().to_string()
+            )
+        )
+    })?;
+
+    let (local, local_run) = match muru_config::load_local(&project, source.as_deref())? {
+        Some((path, run)) => (Some(path), run),
+        None => (None, muru_config::RunSettings::default()),
+    };
+
+    let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
 
     // Whether the entrypoint is a factory belongs to the entrypoint: the
     // table's factory settings apply to the table's entrypoint only.
@@ -1455,6 +1639,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         memory: table.memory,
         env: table.env,
         scaling: table.scaling,
+        serving,
     })
 }
 
@@ -1465,14 +1650,14 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
 
     let name = app_name(&resolved.entrypoint).replace('_', "-");
     let limits = limits(args);
-    let (http, https) = addresses(args);
+    let (http, https) = addresses(args, &resolved.serving);
     let mut listeners = vec![Listener {
         address: http.to_string(),
         tls: false,
         h2c: None,
     }];
 
-    if args.https || args.https_only || args.tls_cert.is_some() {
+    if resolved.serving.tls() {
         listeners.push(Listener {
             address: https.to_string(),
             tls: true,
@@ -1547,7 +1732,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
     };
     let document = Document {
         listener: listeners,
-        compression: args.no_compression.then(|| muru_config::Compression {
+        compression: (!resolved.serving.compression).then(|| muru_config::Compression {
             enabled: Some(false),
             ..Default::default()
         }),
@@ -1852,19 +2037,19 @@ struct Tls {
 /// The HTTPS listener for --https, --https-only or --tls-cert (section 13.1).
 /// A relative certificate or key path is the project's, as --chdir makes
 /// every other path.
-fn tls(args: &RunArgs, project: &Path) -> anyhow::Result<Option<Tls>> {
-    if !(args.https || args.https_only || args.tls_cert.is_some()) {
+fn tls(args: &RunArgs, serving: &Serving, project: &Path) -> anyhow::Result<Option<Tls>> {
+    if !serving.tls() {
         return Ok(None);
     }
 
-    let (chain, key, development) = match (&args.tls_cert, &args.tls_key) {
+    let (chain, key, development) = match (&serving.tls_cert, &serving.tls_key) {
         (Some(certificate), Some(key)) => {
             let (chain, key) =
                 muru_edge::tls::load_pem_files(&project.join(certificate), &project.join(key))?;
             (chain, key, None)
         }
         _ => {
-            let certificate = devcert::obtain(&devcert::cache_dir()?, &args.hosts)?;
+            let certificate = devcert::obtain(&devcert::cache_dir()?, &serving.hosts)?;
             let (chain, key) =
                 muru_edge::tls::load_pem_files(&certificate.certificate, &certificate.key)?;
             (chain, key, Some(certificate))
@@ -1873,9 +2058,9 @@ fn tls(args: &RunArgs, project: &Path) -> anyhow::Result<Option<Tls>> {
 
     Ok(Some(Tls {
         https: muru_edge::Https {
-            listen: addresses(args).1,
+            listen: addresses(args, serving).1,
             config: muru_edge::tls::server_config(chain, key)?,
-            only: args.https_only,
+            only: serving.https_only,
         },
         development,
     }))
@@ -1982,13 +2167,27 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         println!("muru: using [tool.muru] from {}", source.display());
     }
 
+    // Section 13.1: the local file is said once, and so is a .gitignore
+    // that would let it be committed.
+
+    if let Some(local) = &resolved.serving.local {
+        println!("muru: using [run] from {}", local.display());
+
+        if !gitignore_covers(&resolved.project, muru_config::LOCAL_FILE) {
+            println!(
+                "muru: {} is not covered by the project's .gitignore; add it, since the file is for this machine alone",
+                muru_config::LOCAL_FILE
+            );
+        }
+    }
+
     // Certificates are sorted out before anything is started, so a bad
     // --tls-cert or an unwritable cache fails with nothing to clean up.
 
-    let tls = tls(&args, &resolved.project)?;
+    let tls = tls(&args, &resolved.serving, &resolved.project)?;
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    let access_log = access_log_config(&args);
+    let access_log = access_log_config(&resolved.serving);
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
@@ -2135,7 +2334,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .expect("host link poisoned")
         .attach(control);
 
-    let (http_address, https_address) = addresses(&args);
+    let (http_address, https_address) = addresses(&args, &resolved.serving);
 
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
@@ -2151,12 +2350,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         grpc_web_origins: resolved.grpc_web_origins.clone(),
         errors: Arc::clone(&error_policy),
         development,
+        occasions: args.easter_egg.unwrap_or_default(),
         access_log,
         limits: limits(&args),
-        compression: if args.no_compression {
-            muru_edge::compression::Compression::off()
-        } else {
+        compression: if resolved.serving.compression {
             muru_edge::compression::Compression::default()
+        } else {
+            muru_edge::compression::Compression::off()
         },
         // Section 13.1: a development run listens on loopback, so a
         // forwarding header can only come from a proxy on this machine,
@@ -2177,7 +2377,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     let addresses = match edge.https_addr() {
-        Some(https) if args.https_only => {
+        Some(https) if resolved.serving.https_only => {
             format!(
                 "https://{https} (http://{} redirects to it)",
                 edge.local_addr()
@@ -2239,8 +2439,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     if development {
         println!(
-            "muru: development mode: error pages show tracebacks, nothing is persisted and only \
-             loopback is served; production runs under the daemon (muructl daemon start)"
+            "muru: development mode: error pages show tracebacks, nothing is persisted{} and only \
+             loopback is served; production runs under the daemon (muructl daemon start)",
+            if resolved.serving.reload {
+                ", the run reloads on change"
+            } else {
+                ""
+            }
         );
     } else {
         println!(
@@ -2250,7 +2455,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     if let Some(tls) = &tls {
-        match (&tls.development, &args.tls_cert) {
+        match (&tls.development, &resolved.serving.tls_cert) {
             (Some(certificate), _) => println!("{}", certificate.describe()),
             (None, Some(path)) => println!("muru: TLS certificate from {}", path.display()),
             (None, None) => {}
@@ -2259,7 +2464,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let release_number = Arc::new(AtomicU32::new(1));
 
-    let dashboard = match args.dashboard.as_deref() {
+    let dashboard = match resolved.serving.dashboard.as_deref() {
         Some("off") => None,
         Some(address) => Some(address.to_owned()),
         None if development => Some("127.0.0.1:8081".to_owned()),
@@ -2353,11 +2558,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
 
-    if args.reload {
-        let directories = if args.reload_dir.is_empty() {
+    if resolved.serving.reload {
+        let directories = if resolved.serving.reload_dirs.is_empty() {
             vec![resolved.project.clone()]
         } else {
-            args.reload_dir
+            resolved
+                .serving
+                .reload_dirs
                 .iter()
                 .map(|directory| resolved.project.join(directory))
                 .collect()
@@ -2372,13 +2579,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         // than losing it by naming a pattern.
 
         let mut include = vec![RELOAD_INCLUDE.to_owned()];
-        include.extend(args.reload_include.iter().cloned());
-        let watch = Watch::new(directories, &include, &args.reload_exclude)?;
+        include.extend(resolved.serving.reload_include.iter().cloned());
+        let watch = Watch::new(directories, &include, &resolved.serving.reload_exclude)?;
 
-        let except = if args.reload_exclude.is_empty() {
+        let except = if resolved.serving.reload_exclude.is_empty() {
             String::new()
         } else {
-            format!(", except {}", args.reload_exclude.join(", "))
+            format!(", except {}", resolved.serving.reload_exclude.join(", "))
         };
 
         println!(
@@ -2421,13 +2628,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
                 match message {
                     muru_controller::host::HostMessage::Workers { version, sockets, groups, .. } => {
+                        let release = format!("r{}", current.release);
+                        let kept = pools.current().kept(&label, &release);
                         let connected = muru_edge::routing::AppPools::connect(
                             &label,
-                            &format!("r{}", current.release),
+                            &release,
                             &sockets,
                             &group_sockets_from(&groups, &group_tables),
                             &mounts,
                             redirect_flags,
+                            &kept,
                         )
                         .await
                         .map(|pools| {
@@ -2483,6 +2693,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     &group_sockets(&next, &group_tables),
                                     &mounts,
                                     redirect_flags,
+                                    &muru_edge::link::Kept::default(),
                                 )
                                 .await
                                 .map(|pools| {
@@ -2534,10 +2745,27 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // Section 13.4: the edge stops accepting and lets the requests in
     // flight finish before the host is told to stop, so no request is
-    // written to a worker that is going.
+    // written to a worker that is going. As a container's main process
+    // (section 13.3) the whole stop fits the shutdown budget, which is
+    // under the grace docker stop gives, the host getting what the drain
+    // leaves of it.
 
-    drainer.drain(stop_budget).await;
-    current.stop(stop_budget).await;
+    if muru_controller::shutdown::is_main_process() {
+        let deadline = Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET;
+        let for_drain = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+        drainer.drain(stop_budget.min(for_drain)).await;
+        current
+            .stop_until(
+                deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+            )
+            .await;
+    } else {
+        drainer.drain(stop_budget).await;
+        current.stop(stop_budget).await;
+    }
+
     let _ = admin_stop_tx.send(());
     drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);

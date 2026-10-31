@@ -40,51 +40,14 @@ pub struct EdgeRunArgs {
     #[arg(long, value_name = "PATH", default_value = "off")]
     access_log: String,
 
-    /// Largest request body accepted, in bytes.
-    #[arg(long, value_name = "BYTES")]
-    max_body_size: Option<u64>,
-
-    /// Largest request head accepted, in bytes.
-    #[arg(long, value_name = "BYTES")]
-    max_header_bytes: Option<usize>,
-
-    /// Most headers accepted in a request.
-    #[arg(long, value_name = "N")]
-    max_headers: Option<usize>,
-
-    /// A timeout as NAME=DURATION: queue, deadline, header_read, body_idle,
-    /// response_idle, keep_alive or keep_alive_proxy.
-    #[arg(long = "timeout", value_name = "NAME=DURATION", value_parser = crate::parse_timeout)]
-    timeouts: Vec<(String, Duration)>,
-
-    /// Open connections per listener.
-    #[arg(long, value_name = "N")]
-    max_connections: Option<usize>,
-
-    /// Open connections per client address; 0 disables it.
-    #[arg(long, value_name = "N")]
-    max_connections_per_client: Option<usize>,
-
-    /// Requests served on one connection before it is closed; 0 for no
-    /// limit.
-    #[arg(long, value_name = "N")]
-    max_requests_per_connection: Option<u64>,
-
-    /// Concurrent streams per HTTP/2 connection.
-    #[arg(long, value_name = "N")]
-    http2_max_concurrent_streams: Option<u32>,
-
     /// A worker socket to serve from the start, before any snapshot.
     #[arg(long = "worker-socket", value_name = "PATH")]
     worker_sockets: Vec<PathBuf>,
 
-    /// Where upload routes store files.
+    /// Where upload routes store files; the quota comes with each
+    /// snapshot, as the other limits do.
     #[arg(long, value_name = "PATH")]
     spool: Option<PathBuf>,
-
-    /// What stored uploads may hold at once, in bytes; 0 for no limit.
-    #[arg(long, value_name = "BYTES")]
-    spool_quota: Option<u64>,
 
     /// The rate limits' buckets, shared with the node's other edge
     /// processes; this process's own when absent.
@@ -95,47 +58,6 @@ pub struct EdgeRunArgs {
     /// a daemon that restarted without it.
     #[arg(long, value_name = "PATH")]
     listener_socket: Option<PathBuf>,
-}
-
-impl EdgeRunArgs {
-    fn limits(&self) -> muru_edge::Limits {
-        let mut limits = muru_edge::Limits::default();
-
-        if let Some(size) = self.max_body_size {
-            limits.max_body_size = size;
-        }
-
-        if let Some(size) = self.max_header_bytes {
-            limits.max_header_bytes = size;
-        }
-
-        if let Some(count) = self.max_headers {
-            limits.max_headers = count;
-        }
-
-        if let Some(count) = self.max_connections {
-            limits.max_connections = count;
-        }
-
-        if let Some(count) = self.max_connections_per_client {
-            limits.max_connections_per_client = count;
-        }
-
-        if let Some(count) = self.max_requests_per_connection {
-            limits.max_requests_per_connection = count;
-        }
-
-        if let Some(count) = self.http2_max_concurrent_streams {
-            limits.http2_max_concurrent_streams = count;
-        }
-
-        if let Some(bytes) = self.spool_quota {
-            limits.spool_quota = bytes;
-        }
-
-        crate::apply_timeouts(&mut limits, &self.timeouts);
-        limits
-    }
 }
 
 /// Parse FD or FD:tls.
@@ -187,12 +109,11 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     };
 
     // Section 4.11: without a usable spool, upload routes answer 507.
+    // The limits, the spool's quota among them, come with the first
+    // snapshot; the defaults serve until then (section 4.6).
 
-    let limits = args.limits();
     let spool = args.spool.as_ref().and_then(|path| {
-        let quota = (limits.spool_quota > 0).then_some(limits.spool_quota);
-
-        muru_edge::uploads::Spool::new(path.clone(), quota)
+        muru_edge::uploads::Spool::new(path.clone(), None)
             .map_err(|error| {
                 eprintln!(
                     "muru: the upload spool {} is unusable: {error}",
@@ -226,8 +147,9 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             grpc_web_origins: Vec::new(),
             errors: Arc::new(muru_edge::errors::ErrorPolicy::default()),
             development: false,
+            occasions: muru_edge::occasions::Setting::Calendar,
             access_log,
-            limits,
+            limits: muru_edge::Limits::default(),
             compression: muru_edge::compression::Compression::default(),
             trust: muru_edge::proxy::Trust::default(),
             https: None,
@@ -241,7 +163,9 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     let pools = edge.pools();
     let listeners = edge.listeners();
     let connections = edge.connections();
+    let limits = edge.limits();
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let drainer = edge.drainer();
 
     // The control socket, on which the daemon pushes snapshots.
 
@@ -255,8 +179,10 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         listeners,
         access_log: edge.access_log(),
         connections,
+        limits: limits.clone(),
         version: AtomicU64::new(0),
         stop: stop_tx,
+        drainer: drainer.clone(),
     });
     let mut api = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -280,13 +206,27 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let drainer = edge.drainer();
-    let grace = args.limits().request_deadline;
     let mut serving = tokio::spawn(edge.run());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!("muru: edge serving {listen} (pid {})", std::process::id());
     let outcome = tokio::select! {
-        served = &mut serving => served.map_err(anyhow::Error::from).and_then(|result| result),
+        served = &mut serving => {
+            // Section 13.3: the accept loops end when the daemon has the
+            // edge drain without stopping it yet; it keeps relaying what
+            // its WebSockets carry until the daemon, its workers stopped,
+            // tells it to stop.
+
+            let served = served.map_err(anyhow::Error::from).and_then(|result| result);
+
+            if served.is_ok() {
+                tokio::select! {
+                    _ = stop_rx.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+
+            served
+        }
         served = &mut api => served.map_err(anyhow::Error::from).and_then(|result| result),
         _ = stop_rx.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
@@ -298,6 +238,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // next edge, which holds the same sockets.
 
     if outcome.is_ok() {
+        let grace = limits.current().request_deadline;
         eprintln!("muru: edge draining (pid {})", std::process::id());
 
         if !drainer.drain(grace).await {
@@ -348,7 +289,12 @@ struct Control {
     access_log: Arc<muru_edge::access::AccessLog>,
     connections: muru_edge::ConnectionCounts,
     version: AtomicU64,
+    /// Changes the limits a snapshot carries (section 4.6).
+    limits: muru_edge::LimitsControl,
     stop: tokio::sync::mpsc::Sender<()>,
+    /// Section 13.3: closes the connections and stops the accept loops
+    /// when the daemon has the edge drain ahead of stopping it.
+    drainer: muru_edge::Drainer,
 }
 
 #[tonic::async_trait]
@@ -356,10 +302,13 @@ impl EdgeControl for Control {
     async fn apply(&self, request: Request<pb::Snapshot>) -> Result<Response<pb::Applied>, Status> {
         let snapshot = request.into_inner();
 
-        // The tables are built and every worker connected before anything
-        // replaces the last good snapshot, and so are the certificates.
+        // The tables are built and every worker new to the routing
+        // connected, the rest keeping their connections (section 5.1),
+        // before anything replaces the last good snapshot, and so are the
+        // certificates.
 
-        let routing = muru_edge::routing::Routing::from_snapshot(&snapshot)
+        let previous = self.pools.current();
+        let routing = muru_edge::routing::Routing::from_snapshot(&snapshot, Some(&*previous))
             .await
             .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
         let mut certificates = Vec::new();
@@ -383,11 +332,43 @@ impl EdgeControl for Control {
             });
         }
 
+        // Section 5.1: a worker that did not answer is left out of its
+        // pool and reported to the daemon, rather than refusing the
+        // snapshot for every application.
+
+        let unreachable: Vec<pb::UnreachableWorker> = routing
+            .unreachable()
+            .iter()
+            .map(|worker| {
+                tracing::warn!(
+                    app = %worker.app,
+                    release = %worker.release,
+                    socket = %worker.socket.display(),
+                    reason = %worker.reason,
+                    "a worker could not be connected to; the snapshot is applied without it"
+                );
+                pb::UnreachableWorker {
+                    app: worker.app.clone(),
+                    release: worker.release.clone(),
+                    socket: worker.socket.display().to_string(),
+                    reason: worker.reason.clone(),
+                }
+            })
+            .collect();
+
+        // Section 4.6: the limits change with the tables, for the
+        // connections accepted from now on.
+
+        if let Some(limits) = &snapshot.limits {
+            self.limits.apply(muru_edge::Limits::from_message(limits));
+        }
+
         self.resolver.replace(certificates);
         self.pools.apply(routing);
         self.version.store(snapshot.version, Ordering::Relaxed);
         Ok(Response::new(pb::Applied {
             version: snapshot.version,
+            unreachable,
         }))
     }
 
@@ -514,6 +495,41 @@ impl EdgeControl for Control {
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {
         let _ = self.stop.try_send(());
         Ok(Response::new(pb::Stopped {}))
+    }
+
+    async fn drain(
+        &self,
+        request: Request<pb::DrainRequest>,
+    ) -> Result<Response<pb::Drained>, Status> {
+        let request = request.into_inner();
+        let delay = Duration::from_millis(request.delay_ms);
+        let grace = Duration::from_millis(request.grace_ms);
+
+        // Section 13.3: for the delay the edge still accepts, with every
+        // connection closing after its response; then it stops accepting
+        // and waits for the requests in flight.
+
+        if !delay.is_zero() {
+            eprintln!(
+                "muru: edge closing connections after their response for {} (pid {})",
+                muru_config::format_duration(delay),
+                std::process::id()
+            );
+            self.drainer.announce();
+            tokio::time::sleep(delay).await;
+        }
+
+        eprintln!("muru: edge draining (pid {})", std::process::id());
+        let finished = self.drainer.drain(grace).await;
+
+        if !finished {
+            eprintln!(
+                "muru: edge still has connections open after {}",
+                muru_config::format_duration(grace)
+            );
+        }
+
+        Ok(Response::new(pb::Drained { finished }))
     }
 
     type WatchWakesStream = tokio_stream::wrappers::ReceiverStream<Result<pb::Wake, Status>>;

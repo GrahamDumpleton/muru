@@ -266,7 +266,58 @@ stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
-its workers with it, and the next daemon starts its release again.
+its workers with it, and the next daemon starts its release again. A
+worker that is killed, by a hard timeout say, may leave a subprocess a
+request started; on Linux the host collects it, giving it the release's
+shutdown timeout to finish before it is stopped, so nothing lingers or
+sits as a zombie.
+
+The shutdown is one sequence, and it fits a budget. The daemon file's
+`[shutdown]` table sets the parts:
+
+```toml
+[shutdown]
+on_sigterm = 'detach'   # or 'shutdown'
+delay = '0s'
+budget = '8s'
+```
+
+For `delay` the edge keeps accepting and serving, with every response
+carrying `Connection: close` (GOAWAY on HTTP/2) and idle connections
+closed, so clients with keep-alive connections reconnect, to another
+node when a load balancer is in front; the default of none suits a
+single node. Then the edge stops accepting and the requests in flight
+finish, every host stops at once, each given its workers' stop budget or
+what remains of the shutdown's, whichever ends first, and the edge goes
+last, so the workers' WebSocket close frames reach their clients. The
+whole takes at most `budget`; whatever has not finished by then is
+killed. A long `shutdown_timeout` on a release wants a budget to match.
+
+SIGTERM (and an interrupt) means `muructl daemon stop` without
+`--shutdown`, that is a detach, which is what a service manager's restart
+wants, unless `on_sigterm = 'shutdown'` makes it the shutdown above. In a
+container that is the default; see below.
+
+## In a container
+
+`muructl daemon run` or `muructl run --allow-public` can be a container's
+main process. When muructl finds itself PID 1 it starts as an init of its
+own, as `tini` would: PID 1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1,
+SIGUSR2 and SIGQUIT to the command, which runs as its child, collects
+every process that exits, so nothing in the container stays a zombie,
+and exits with the command's status when the command exits. An image
+that uses `tini` or `docker run --init` sets `MURU_NO_INIT=1`, and the
+command runs as PID 1 itself.
+
+Under the init, and for a daemon that is PID 1 itself, SIGTERM means
+shutdown rather than detach: when PID 1 exits the kernel kills every
+other process in the container, so detaching would kill the edge and
+every worker mid-request. `docker stop` therefore drains and stops
+everything inside the budget above, whose default of eight seconds is
+under the ten `docker stop` allows, and the container exits 0. `muructl
+run` as the main process bounds its stop by the same budget. A
+`[shutdown]` table with `on_sigterm = 'detach'` turns that off, for a
+container that keeps its hosts across a daemon restart of its own.
 
 ## Upgrading
 
@@ -292,10 +343,7 @@ unchanged by an upgrade, so no unit restart is involved.
 `muructl daemon run` runs it in the foreground, for a service manager or
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
-daemon to exit. `muructl daemon reload`, or SIGHUP, re-reads the
-configuration file for the `[proxy]`, `[compression]`, `[error_pages]`
-and `[error_override]` tables and the [node's
-budget](scaling.md#the-nodes-budget). The [systemd
+daemon to exit. The [systemd
 guide](systemd.md) has the unit and what it does. Commands find the
 daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
 development run started from the current directory, else the daemon's
@@ -309,3 +357,55 @@ and `muructl logs reopen` works with logrotate; the [logging
 guide](logging.md) has the details. The events `muructl events` shows are
 kept in the state store, and `[[events.sink]]` entries deliver them to
 webhooks; the [events guide](events.md) has the details.
+
+## Reloading the configuration
+
+`muructl daemon reload`, or SIGHUP, reads the daemon's configuration
+file again, checks it whole, and applies what changed:
+
+- the `[proxy]`, `[compression]`, `[error_pages]`, `[error_override]`,
+  `[[client_class]]`, `[rate_limit]` and `[limits]` tables, and the
+  `h2c` setting of a `[[listener]]` entry, which the edge is given at
+  once; a connection already open keeps the limits it was accepted
+  under;
+
+- the `[[listener]]` entries: a changed set starts a new edge on the new
+  listeners and tells the old one to stop, as `muructl daemon upgrade`
+  does, so a listener that stays keeps its socket and its backlog and no
+  request is lost; a listener that cannot be bound (its port in use,
+  say) fails the reload before anything is applied;
+
+- the `[[events.sink]]` entries: a sink added starts, one dropped stops,
+  and one whose entry changed is restarted; a sink's cursor stays in the
+  state store, so one that comes back delivers what it missed;
+
+- the certificate and key files of every applied TLS host, read again
+  and, when changed, sent to the edge; the [virtual hosts
+  guide](virtual-hosts.md#tls) has the detail;
+
+- the `[secrets.store.NAME]` tables, which the next release to start
+  resolves its secrets from;
+
+- the `[logs]` table: the daemon rotates on the new policy from its
+  next check, and a period that changed rotates each file once;
+
+- the `[shutdown]` table, for the next stop signal or `muructl daemon
+  stop --shutdown`;
+
+- the [node's budget](scaling.md#the-nodes-budget), `[daemon.budget]`;
+
+- the dashboard's `actions` switch, `[dashboard] actions`.
+
+The rest of the file is read when the daemon starts: the `[metrics]`
+table, the `[dashboard]` table's `listen` address, the
+`[overlay_webhook]` table and the `[daemon]` table's `user`. A change to
+those takes effect after `muructl daemon stop` and `muructl daemon
+start` (`systemctl restart muru` under systemd), which detaches from the
+hosts and the edge and takes them back, so it costs no request. A daemon
+started with `--listen`, `--metrics`, `--dashboard` or `--user` keeps
+those over the file's settings on every reload.
+
+The command prints what changed and what was done about it, what is
+unchanged and what is read at start, and the `config.reloaded` event
+records the same. A file the daemon cannot parse, or a table it refuses,
+leaves everything as it was and the command fails saying why.
