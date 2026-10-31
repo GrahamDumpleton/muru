@@ -2983,17 +2983,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             format!(", except {}", resolved.serving.reload_exclude.join(", "))
         };
 
+        let watched = watch
+            .directories()
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // The baseline is taken before the watch is announced, so any
+        // change made after the line below is seen.
+
+        let watching = watch.start(WATCH_INTERVAL, changed_tx);
         println!(
-            "muru: watching {} for changes to {}{except}",
-            watch
-                .directories()
-                .iter()
-                .map(|directory| directory.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
+            "muru: watching {watched} for changes to {}{except}",
             include.join(", ")
         );
-        tokio::spawn(watch.run(WATCH_INTERVAL, changed_tx));
+        tokio::spawn(watching);
     } else {
         drop(changed_tx);
     }
