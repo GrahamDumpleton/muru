@@ -975,6 +975,52 @@ pub struct Daemon {
     pub budget: Option<Budget>,
 }
 
+/// The `[tools]` table of the daemon's file (section 8.4): uv, and how
+/// interpreters are installed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tools {
+    /// The uv to run, in place of the lookup order (`MURU_UV`, a uv
+    /// beside muructl, uv on PATH, the managed copy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv: Option<String>,
+    /// The uv versions accepted, as a specifier such as `>=0.9`; the
+    /// daemon reports what an older one cannot do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv_version: Option<String>,
+    /// A `uv.toml` passed to builds as their configuration file, for
+    /// mirrors and TLS settings; the project's own `[tool.uv]` still
+    /// applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv_config: Option<String>,
+    /// Whether a Python the node lacks is downloaded for a release that
+    /// requests it (default automatic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_downloads: Option<PythonDownloads>,
+    /// Where managed interpreters go (default `python` under the state
+    /// directory); a shared read-only directory for several daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_install_dir: Option<String>,
+    /// No network at all: nothing is downloaded, and wheels come from
+    /// `wheel_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
+    /// A local directory of wheels for the runtime library and for builds
+    /// when offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wheel_dir: Option<String>,
+}
+
+/// Whether interpreters may be downloaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PythonDownloads {
+    /// Download a Python a release requests and the node lacks.
+    Automatic,
+    /// Never download; a request the node cannot satisfy fails the release.
+    Never,
+}
+
 /// The `[daemon.budget]` table (section 7.4): what the releases on the
 /// node may hold between them. Each limit is off when omitted.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -3573,6 +3619,9 @@ pub struct Document {
     /// How the daemon itself runs (ADR 0026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<Daemon>,
+    /// uv and interpreter installs (section 8.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Tools>,
     /// Listeners.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listener: Vec<Listener>,
@@ -3962,7 +4011,8 @@ pub struct ToolMuru {
     /// The module providing the lifecycle hooks (section 6.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
-    /// The Python requirement, for example "3.13" or ">=3.12".
+    /// The interpreter: a path, or a request in uv's syntax such as
+    /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<String>,
     /// Worker groups by name (section 7.1).

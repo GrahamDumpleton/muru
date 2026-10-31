@@ -23,6 +23,7 @@ muru-config = { workspace = true }
 muru-dashboard = { workspace = true }
 muru-edge = { workspace = true }
 muru-proto = { workspace = true }
+muru-provision = { workspace = true }
 ring = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

@@ -574,11 +574,13 @@ struct RunArgs {
     #[arg(long = "reload-exclude", value_name = "GLOB")]
     reload_exclude: Vec<String>,
 
-    /// Python interpreter with the muru runtime library installed; a
-    /// relative path is the project's. Defaults to the active virtualenv's
-    /// interpreter, else the project's .venv, else python3 on PATH.
-    #[arg(long)]
-    python: Option<PathBuf>,
+    /// The interpreter: a path (a relative one is the project's), or a
+    /// version request such as 3.13, 3.14t or >=3.12 that uv resolves.
+    /// Without it: the active virtualenv, else the project's .venv, else
+    /// the project's own request (python in [tool.muru], .python-version,
+    /// requires-python), else python3 on PATH.
+    #[arg(long, value_name = "PATH or VERSION")]
+    python: Option<String>,
 
     /// Directory to run the host in, added to the module search path.
     #[arg(long)]
@@ -1417,6 +1419,8 @@ struct Resolved {
     project: PathBuf,
     /// The file the table came from, when there was one.
     source: Option<PathBuf>,
+    /// The table's `python` key: a path or a request (section 8.1).
+    python: Option<String>,
     /// Named worker groups from the table (section 7.1).
     groups: std::collections::BTreeMap<String, muru_config::Group>,
     /// Named mounts from the table (section 6.7).
@@ -1588,6 +1592,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
 
     Ok(Resolved {
         entrypoint,
+        python: table.python.clone(),
         interface: args
             .interface
             .or(table.interface)
@@ -1683,7 +1688,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
         python: Some(written_interpreter(
-            &python_interpreter(args.python.clone(), &resolved.project),
+            &interpreter(args, resolved)?.python,
             &resolved.project,
         )),
         processes: Some(resolved.processes),
@@ -2066,42 +2071,26 @@ fn tls(args: &RunArgs, serving: &Serving, project: &Path) -> anyhow::Result<Opti
     }))
 }
 
-/// The interpreter to run the host with (section 13.1): --python, else the
-/// active virtualenv, else the project's own .venv, else python3 on PATH. A
-/// relative --python with a directory in it is the project's; a path is
-/// made absolute, because a virtualenv's interpreter locates its
-/// site-packages from its own path.
-fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
-    let python = explicit
-        .map(|python| {
-            if python.components().count() > 1 {
-                project.join(python)
-            } else {
-                python
-            }
-        })
-        .or_else(|| {
-            std::env::var_os("VIRTUAL_ENV")
-                .map(|venv| PathBuf::from(venv).join("bin").join("python"))
-        })
-        .or_else(|| {
-            let venv = project.join(".venv").join("bin").join("python");
-            venv.is_file().then_some(venv)
-        })
-        .unwrap_or_else(|| PathBuf::from("python3"));
+/// The interpreter to run the host with (sections 8.1 and 13.1): --python
+/// as a path or a request, else the active virtualenv, else the project's
+/// own .venv, else the project's request through the developer's own uv,
+/// else python3 on PATH; probed, so an interpreter that cannot run Muru or
+/// is outside requires-python fails here, before anything starts.
+fn interpreter(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<muru_provision::Resolved> {
+    let uv = muru_provision::Uv::find(None, None);
+    let isolation = muru_provision::Isolation::default();
+    let inputs = muru_provision::Inputs {
+        mode: muru_provision::Mode::Development,
+        flag: args.python.as_deref(),
+        table: resolved.python.as_deref(),
+        project: &resolved.project,
+        previous: None,
+        always: false,
+        uv: uv.as_ref(),
+        isolation: &isolation,
+    };
 
-    match (python.parent(), python.file_name()) {
-        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
-            // Resolve the directory, not the file: the interpreter is often a
-            // symlink into a virtualenv, and following it would lose the venv.
-
-            match dir.canonicalize() {
-                Ok(dir) => dir.join(name),
-                Err(_) => python,
-            }
-        }
-        _ => python,
-    }
+    Ok(muru_provision::resolve(&inputs)?)
 }
 
 /// An interpreter as --print-config writes it: relative to the project
@@ -2167,6 +2156,21 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         println!("muru: using [tool.muru] from {}", source.display());
     }
 
+    // Section 8.1: the interpreter, said when something other than the
+    // flag or an environment chose it, since those are what the developer
+    // expects.
+
+    let python = interpreter(&args, &resolved)?;
+
+    if !matches!(
+        python.chosen,
+        muru_provision::Chosen::Path(_)
+            | muru_provision::Chosen::ActiveVirtualenv
+            | muru_provision::Chosen::ProjectVirtualenv
+    ) {
+        println!("muru: {}", python.describe());
+    }
+
     // Section 13.1: the local file is said once, and so is a .gitignore
     // that would let it be committed.
 
@@ -2197,7 +2201,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let label = app_name(&resolved.entrypoint).replace('_', "-");
     let spec = HostSpec {
-        python: python_interpreter(args.python.clone(), &resolved.project),
+        python: python.python.clone(),
         app: resolved.entrypoint.clone(),
         name: Some(label.clone()),
         release: None,

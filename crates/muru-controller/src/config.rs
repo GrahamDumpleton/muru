@@ -268,7 +268,13 @@ pub struct Plan {
 /// last declared release of an application is the one that serves; hosts
 /// and routes follow; with `prune`, removals of what the document does
 /// not contain come last.
-pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) -> Plan {
+pub fn plan(
+    store: &Store,
+    document: &Document,
+    prune: bool,
+    defined: &Defined,
+    provisioning: &crate::provision::Provisioning,
+) -> Plan {
     let mut plan = Plan::default();
 
     // Listeners and limits are node settings, read from the daemon's own
@@ -338,7 +344,7 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
     let defined = &defined.with_applied(store, document, prune);
 
     for (name, app) in &document.app {
-        plan_app(store, name, app, &mut plan);
+        plan_app(store, name, app, &mut plan, provisioning);
 
         // Section 4.14: a worker group's classes are the daemon's.
 
@@ -372,7 +378,13 @@ pub fn plan(store: &Store, document: &Document, prune: bool, defined: &Defined) 
 }
 
 /// The changes one application's table implies.
-fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
+fn plan_app(
+    store: &Store,
+    name: &str,
+    app: &AppTable,
+    plan: &mut Plan,
+    provisioning: &crate::provision::Provisioning,
+) {
     if !valid_name(name) {
         plan.errors.push(format!(
             "{name:?} is not a valid application name: lowercase letters, digits and hyphens, up to 63 characters"
@@ -492,7 +504,12 @@ fn plan_app(store: &Store, name: &str, app: &AppTable, plan: &mut Plan) {
             declared: true,
         };
 
-        let spec = match resolve_spec(&request_from(name, table, source), None, &tables) {
+        let spec = match resolve_spec(
+            &request_from(name, table, source),
+            None,
+            &tables,
+            provisioning,
+        ) {
             Ok(spec) => spec,
             Err(error) => {
                 plan.errors.push(format!("{name}@{id}: {error}"));
@@ -2262,6 +2279,7 @@ pub fn resolve_spec(
     request: &pb::DeployRequest,
     previous: Option<&ReleaseSpec>,
     tables: &Tables<'_>,
+    provisioning: &crate::provision::Provisioning,
 ) -> Result<ReleaseSpec, String> {
     // Section 9.9: a managed server's release has no workers, entrypoint
     // or interpreter of its own, so the native release after it, the
@@ -2333,22 +2351,13 @@ pub fn resolve_spec(
         (None, _) => None,
     };
 
-    // The interpreter: as given, else the source's own virtualenv, else
-    // what the previous release ran, else the python3 on the path.
+    // Section 8.1: the interpreter as given, else the source's own
+    // virtualenv, else a request resolved through uv, else what the
+    // previous release ran, else the python3 on the path; probed, so an
+    // interpreter that cannot run Muru fails the deploy here.
 
-    let python = if !request.python.is_empty() {
-        PathBuf::from(&request.python)
-    } else {
-        let venv = source.join(".venv").join("bin").join("python");
-
-        if venv.is_file() {
-            venv
-        } else if let Some(previous) = previous {
-            previous.python.clone()
-        } else {
-            PathBuf::from("python3")
-        }
-    };
+    let (python, interpreter) =
+        resolve_interpreter(request, &table, previous, &source, provisioning)?;
 
     // Section 7.1: groups from the declaration, else the source's own
     // table; each takes its sizes from the release's where it is silent.
@@ -2941,7 +2950,51 @@ pub fn resolve_spec(
         maintenance,
         http: None,
         layers,
+        interpreter,
     })
+}
+
+/// Section 8.1: the release's interpreter and what the probe found. With
+/// provisioning off, the order before probing existed: the request's
+/// value as a path, the source's .venv, the previous release's, python3.
+fn resolve_interpreter(
+    request: &pb::DeployRequest,
+    table: &muru_config::ToolMuru,
+    previous: Option<&ReleaseSpec>,
+    source: &Path,
+    provisioning: &crate::provision::Provisioning,
+) -> Result<(PathBuf, Option<crate::model::Interpreter>), String> {
+    if !provisioning.active {
+        let python = if !request.python.is_empty() {
+            PathBuf::from(&request.python)
+        } else {
+            let venv = source.join(".venv").join("bin").join("python");
+
+            if venv.is_file() {
+                venv
+            } else if let Some(previous) = previous {
+                previous.python.clone()
+            } else {
+                PathBuf::from("python3")
+            }
+        };
+
+        return Ok((python, None));
+    }
+
+    let inputs = muru_provision::Inputs {
+        mode: muru_provision::Mode::Daemon,
+        flag: (!request.python.is_empty()).then_some(request.python.as_str()),
+        table: table.python.as_deref(),
+        project: source,
+        previous: previous.map(|previous| previous.python.as_path()),
+        always: false,
+        uv: provisioning.uv.as_ref(),
+        isolation: &provisioning.isolation,
+    };
+    let resolved = muru_provision::resolve(&inputs).map_err(|error| error.to_string())?;
+    let interpreter = crate::model::Interpreter::from_resolved(&resolved);
+    Ok((resolved.python, Some(interpreter)))
 }
 
 /// Section 3.3: where each of a release's settings comes from, by the
@@ -2960,6 +3013,10 @@ fn resolve_layers(
 
     let python = if request.python.is_empty() && venv {
         "the source's .venv"
+    } else if request.python.is_empty()
+        && (table.python.is_some() || source.join(".python-version").is_file())
+    {
+        "the project's Python request"
     } else {
         layer(!request.python.is_empty(), false, before, declared)
     };
@@ -3647,6 +3704,7 @@ fn resolve_http_spec(
             stop_signal: table.stop_signal.clone(),
         }),
         layers: crate::model::Layers::default(),
+        interpreter: None,
     })
 }
 
@@ -4818,6 +4876,7 @@ mod tests {
             },
             None,
             &Tables::default(),
+            &crate::provision::Provisioning::off(),
         )
         .unwrap();
         store.create_release("shop", "r1", &spec).unwrap();
@@ -4848,6 +4907,7 @@ mod tests {
             &Document::parse(&text).unwrap(),
             true,
             &Defined::default(),
+            &crate::provision::Provisioning::off(),
         );
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.changes.is_empty(), "{:?}", plan.changes);
@@ -4887,7 +4947,8 @@ mod tests {
             threads: Some(2),
             ..Default::default()
         };
-        let next = resolve_spec(&request, Some(&previous), &Tables::default()).unwrap();
+        let off = crate::provision::Provisioning::off();
+        let next = resolve_spec(&request, Some(&previous), &Tables::default(), &off).unwrap();
         assert_eq!(next.layers.0["entrypoint"], "the previous release");
         assert_eq!(next.layers.0["threads"], "deploy flags");
         assert_eq!(next.layers.0["sync_threads"], "the previous release");
@@ -4896,7 +4957,7 @@ mod tests {
             declared: true,
             ..Tables::default()
         };
-        let spec = resolve_spec(&request, Some(&previous), &declared).unwrap();
+        let spec = resolve_spec(&request, Some(&previous), &declared, &off).unwrap();
         assert_eq!(spec.layers.0["threads"], "the release table");
         assert_eq!(spec, next, "layers are not settings");
     }
@@ -4929,6 +4990,7 @@ mod tests {
             &Document::parse(&text).unwrap(),
             false,
             &Defined::default(),
+            &crate::provision::Provisioning::off(),
         );
         assert_eq!(plan.errors.len(), 1, "{:?}", plan.errors);
         assert!(
@@ -4992,7 +5054,13 @@ mod tests {
             class("late"),
             class("early")
         );
-        let first = plan(&store, &Document::parse(&text).unwrap(), false, &file);
+        let first = plan(
+            &store,
+            &Document::parse(&text).unwrap(),
+            false,
+            &file,
+            &crate::provision::Provisioning::off(),
+        );
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert_eq!(
             placed(&first),
@@ -5002,9 +5070,15 @@ mod tests {
 
         let again = format!("{}{}", class("late"), class("early"));
         assert!(
-            plan(&store, &Document::parse(&again).unwrap(), false, &file)
-                .changes
-                .is_empty()
+            plan(
+                &store,
+                &Document::parse(&again).unwrap(),
+                false,
+                &file,
+                &crate::provision::Provisioning::off(),
+            )
+            .changes
+            .is_empty()
         );
 
         // A new class goes after those recorded; with prune the
@@ -5015,11 +5089,18 @@ mod tests {
             &Document::parse(&class("extra")).unwrap(),
             false,
             &file,
+            &crate::provision::Provisioning::off(),
         );
         assert_eq!(placed(&added), [("extra".to_owned(), 2)]);
 
         let reordered = format!("{}{}", class("early"), class("late"));
-        let pruned = plan(&store, &Document::parse(&reordered).unwrap(), true, &file);
+        let pruned = plan(
+            &store,
+            &Document::parse(&reordered).unwrap(),
+            true,
+            &file,
+            &crate::provision::Provisioning::off(),
+        );
         assert_eq!(
             placed(&pruned),
             [("early".to_owned(), 0), ("late".to_owned(), 1)]
@@ -5030,9 +5111,15 @@ mod tests {
              [rate_limit.crawlers]\nrate = '1/s'\n",
             class("partner")
         );
-        let errors = plan(&store, &Document::parse(&refused).unwrap(), false, &file)
-            .errors
-            .join("\n");
+        let errors = plan(
+            &store,
+            &Document::parse(&refused).unwrap(),
+            false,
+            &file,
+            &crate::provision::Provisioning::off(),
+        )
+        .errors
+        .join("\n");
 
         for expected in [
             "client_class partner: the daemon configuration file defines it",
@@ -5065,6 +5152,7 @@ mod tests {
             &Document::parse(&routes("")).unwrap(),
             false,
             &defined,
+            &crate::provision::Provisioning::off(),
         );
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         let subjects: Vec<String> = plan.changes.iter().map(Change::subject).collect();
@@ -5078,7 +5166,13 @@ mod tests {
             "[[route]]\nhost = 'shop'\napp = 'shop'\nmatch = { client_class = ['partner', 'bots'] }\n\
              traffic = { classes = { robots = 'r9' } }\n",
         );
-        let refused = super::plan(&store, &Document::parse(&text).unwrap(), false, &defined);
+        let refused = super::plan(
+            &store,
+            &Document::parse(&text).unwrap(),
+            false,
+            &defined,
+            &crate::provision::Provisioning::off(),
+        );
         let errors = refused.errors.join("\n");
 
         for expected in [
@@ -5095,7 +5189,13 @@ mod tests {
     fn prune_removes_what_is_not_declared() {
         let source = source_dir();
         let store = store_with_shop(&source);
-        let plan = plan(&store, &Document::default(), true, &Defined::default());
+        let plan = plan(
+            &store,
+            &Document::default(),
+            true,
+            &Defined::default(),
+            &crate::provision::Provisioning::off(),
+        );
         let names: Vec<(&str, String)> = plan
             .changes
             .iter()
@@ -5124,6 +5224,7 @@ mod tests {
             &Document::parse(text).unwrap(),
             false,
             &Defined::default(),
+            &crate::provision::Provisioning::off(),
         );
         assert_eq!(plan.errors.len(), 3, "{:?}", plan.errors);
         assert!(plan.errors[0].contains("\"Shop\" is not a valid application name"));

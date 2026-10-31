@@ -427,6 +427,11 @@ pub struct ReleaseSpec {
     /// Section 3.3: the layer each setting came from, by key.
     #[serde(default, skip_serializing_if = "Layers::is_empty")]
     pub layers: Layers,
+    /// Section 8.1: what the interpreter was found to be when the release
+    /// was resolved, and the request that chose it; none for a release
+    /// recorded before probing existed or resolved without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<Interpreter>,
 }
 
 /// Section 3.3: where each of a release's settings came from, by key:
@@ -453,6 +458,61 @@ impl PartialEq for Layers {
 }
 
 impl Eq for Layers {}
+
+/// Section 8.1: the interpreter as the probe found it when the release
+/// was resolved. It records what was found, not a setting, so two specs
+/// are equal whatever their probes say.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Interpreter {
+    /// The version, as `3.13.9`.
+    pub version: String,
+    /// The wheel tag, as `cp313` or `cp314t`.
+    pub tag: String,
+    /// Whether the GIL is disabled.
+    #[serde(default)]
+    pub free_threaded: bool,
+    /// `sys.platform` and the machine, as `linux x86_64`.
+    #[serde(default)]
+    pub platform: String,
+    /// The request that chose the interpreter and its source, as `3.13
+    /// from .python-version`, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
+impl Interpreter {
+    /// What a resolution found.
+    pub fn from_resolved(resolved: &muru_provision::Resolved) -> Self {
+        Self {
+            version: resolved.probe.version.clone(),
+            tag: resolved.probe.tag(),
+            free_threaded: resolved.probe.free_threaded,
+            platform: format!("{} {}", resolved.probe.platform, resolved.probe.machine),
+            request: resolved
+                .request()
+                .map(|request| format!("{} from {}", request.text, request.source.as_str())),
+        }
+    }
+
+    /// A short description, as `3.13.9, cp313, free-threaded`.
+    pub fn describe(&self) -> String {
+        let mut text = format!("{}, {}", self.version, self.tag);
+
+        if self.free_threaded {
+            text.push_str(", free-threaded");
+        }
+
+        text
+    }
+}
+
+impl PartialEq for Interpreter {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Interpreter {}
 
 /// Section 9.9: a release that runs an HTTP server of its own instead
 /// of Muru workers, started from a command and routed to as an upstream.

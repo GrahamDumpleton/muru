@@ -512,6 +512,9 @@ pub struct Info {
     /// and release, then by mount, the default mount's under the empty
     /// name: as its host last announced them.
     pub interfaces: std::sync::Mutex<Interfaces>,
+    /// Section 8.4: uv as found and how it is run, from the `[tools]`
+    /// table read at start.
+    pub provisioning: crate::provision::Provisioning,
 }
 
 /// Detected interfaces by application and release, then by mount.
@@ -995,6 +998,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let listeners = edge.listeners();
+
+    // Section 8.4: uv as found and how it is run, said once at start.
+
+    let provisioning =
+        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
+    tracing::info!("{}", provisioning.describe_uv());
     write_edge_record(&locations.run.path, &edge);
 
     // The admin API on its socket.
@@ -1019,6 +1028,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: std::sync::Mutex::new(Interfaces::new()),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        provisioning,
     });
     let handle = Handle {
         store: Arc::clone(&store),

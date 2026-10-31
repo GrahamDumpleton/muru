@@ -471,6 +471,9 @@ message Release {
   repeated ReleaseGroup groups = 23; // named worker groups beside the default one (section 7.1)
   string detected_interface = 24;   // wsgi, asgi or grpc as the host settled it; empty until known
   uint32 websockets = 25;           // WebSockets open on its workers, as last sampled
+  string python_version = 26;       // as probed when the release was resolved, as 3.13.9; empty when not probed
+  string python_tag = 27;           // the wheel tag, as cp313, with ", free-threaded" when the GIL is off
+  string python_request = 28;       // the request that chose the interpreter and its source, if one did
 }
 
 // A named mount of a release: a path served by another entrypoint in

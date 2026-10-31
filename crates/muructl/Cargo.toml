@@ -25,6 +25,7 @@ muru-controller = { workspace = true }
 muru-dashboard = { workspace = true }
 muru-edge = { workspace = true }
 muru-proto = { workspace = true }
+muru-provision = { workspace = true }
 rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 serde = { workspace = true }

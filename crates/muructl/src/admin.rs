@@ -1820,7 +1820,9 @@ pub struct DeployArgs {
     #[arg(long, value_name = "NAME")]
     interface: Option<muru_config::Interface>,
 
-    /// The interpreter (default: the source's .venv, else the previous release's).
+    /// The interpreter: a path, or a version request such as 3.13 that
+    /// the daemon resolves with uv (default: the source's .venv, else its
+    /// own request, else the previous release's).
     #[arg(long)]
     python: Option<PathBuf>,
 
@@ -3883,7 +3885,20 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         event_loop: interfaces.iter().any(|interface| *interface != "wsgi"),
     };
 
-    lines.push(("python".to_owned(), release.python.clone()));
+    let mut python = release.python.clone();
+
+    if !release.python_version.is_empty() {
+        python.push_str(&format!(
+            " ({}, {})",
+            release.python_version, release.python_tag
+        ));
+    }
+
+    if !release.python_request.is_empty() {
+        python.push_str(&format!(", requested {}", release.python_request));
+    }
+
+    lines.push(("python".to_owned(), python));
     lines.push((
         "entrypoint".to_owned(),
         format!(
