@@ -107,11 +107,13 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
         assert "watching" not in server.log()
         assert "dashboard on" not in server.log()
 
-        # errors: a 200 is not logged, a 404 is.
+        # errors: a 200 is not logged, a 404 is. The access log's lines
+        # start with the time and the status, which keeps a pid or any
+        # other number in the start-up lines from matching.
 
         assert server.get("/missing").status == 404
-        assert server.wait_for_log("404")
-        assert " 200" not in server.log()
+        assert server.wait_for_log(" 404 GET /missing ")
+        assert not re.search(r"^\d\d:\d\d:\d\d\.\d{3} 200 ", server.log(), re.MULTILINE)
     finally:
         server.stop()
 
