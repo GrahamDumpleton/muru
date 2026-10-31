@@ -191,10 +191,9 @@ class Daemon:
         """Wait until the host says the edge routes to every worker of the
         application's serving release.
 
-        The daemon pushes a snapshot once more when it takes the host's
-        first announcement, just after a deploy answers; a worker stopped
-        before that push is unreachable to it and gets replaced, so a test
-        that stops a worker waits for this first.
+        The daemon takes the host's first announcement, and acknowledges
+        it, just after a deploy answers; a test that then reasons about
+        snapshots or stops a worker waits for that to have happened.
         """
 
         deadline = time.monotonic() + timeout

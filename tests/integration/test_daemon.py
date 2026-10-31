@@ -382,6 +382,36 @@ def test_a_dead_edge_is_started_again_without_refusing_connections(daemon: Daemo
     assert new_pid != edge_pid
 
 
+def snapshot_version(daemon: Daemon) -> int:
+    """The version of the snapshot the edge was last given, from the metrics."""
+
+    text = daemon.muructl("metrics").stdout
+    return next(
+        int(line.split()[1])
+        for line in text.splitlines()
+        if line.startswith("muru_snapshot_version ")
+    )
+
+
+def test_a_deploy_pushes_one_snapshot(daemon: Daemon) -> None:
+    """The host's first announcement on its control connection, taken just
+    after the deploy answers, repeats the sockets the daemon already routes
+    by, so it is acknowledged without another push: an apply the edge did
+    not need, and one that replaced a worker busy at that moment."""
+
+    before = snapshot_version(daemon)
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    daemon.wait_for_routing("shop")
+    assert snapshot_version(daemon) == before + 1
+
+    # A worker the host replaces is a change the edge must hear about.
+
+    pid = json.loads(daemon.get("/").body)["pid"]
+    daemon.muructl("restart", "shop", "--pid", str(pid))
+    daemon.wait_for_routing("shop")
+    assert snapshot_version(daemon) == before + 2
+
+
 def test_superseded_release_is_retained_and_rollback_is_instant(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     first_pid = json.loads(daemon.get("/info").body)["pid"]
