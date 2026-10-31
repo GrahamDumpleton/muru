@@ -4,6 +4,7 @@
 //! procedure, called by `muructl run`, the daemon and `muructl build`, so
 //! the three never drift (ADR 0036).
 
+pub mod build;
 pub mod interpreter;
 pub mod probe;
 pub mod resolve;
@@ -11,6 +12,7 @@ pub mod runtime;
 pub mod specifier;
 pub mod uv;
 
+pub use build::{Build, BuildError};
 pub use interpreter::{Python, Request, Source};
 pub use probe::{Probe, ProbeError};
 pub use resolve::{Chosen, Inputs, Mode, ResolveError, Resolved, resolve};

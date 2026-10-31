@@ -3846,6 +3846,84 @@ impl RunPort {
 }
 
 /// The `[tool.muru.run]` table of pyproject.toml, `[run]` in muru.toml and
+/// The `[tool.muru.build]` table (section 8.2): when and how the
+/// release's environment is built from the lock. `when` is read by
+/// `muructl run` and the daemon alike; the rest describes the deployment
+/// flavour, which development ignores.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Build {
+    /// When an environment is built: `auto` (the default) builds a
+    /// missing one and leaves an existing one alone, `always` builds on
+    /// every start and on a lock change, `never` builds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<BuildWhen>,
+    /// Extras the deployment environment includes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extras: Vec<String>,
+    /// Dependency groups beyond the defaults; dev is never included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Allow sdists to be built on the node (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_builds: Option<bool>,
+    /// Compile bytecode at build time (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_bytecode: Option<bool>,
+}
+
+/// When an environment is built (section 8.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildWhen {
+    /// Build a missing environment; leave an existing one alone at start,
+    /// and under `muructl run` build when the lock changes.
+    #[default]
+    Auto,
+    /// Build before every start too.
+    Always,
+    /// Build nothing.
+    Never,
+}
+
+impl BuildWhen {
+    /// The value as the file spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BuildWhen::Auto => "auto",
+            BuildWhen::Always => "always",
+            BuildWhen::Never => "never",
+        }
+    }
+}
+
+impl std::str::FromStr for BuildWhen {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "auto" => Ok(BuildWhen::Auto),
+            "always" => Ok(BuildWhen::Always),
+            "never" => Ok(BuildWhen::Never),
+            other => Err(format!(
+                "{other} is not a build mode: auto, always or never"
+            )),
+        }
+    }
+}
+
+/// What muru.local.toml holds (section 13.1): the `[run]` table, and a
+/// `[build]` table whose `when` key development reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalFile {
+    /// The `[run]` table.
+    pub run: RunSettings,
+    /// `when` from the `[build]` table, if given.
+    pub build_when: Option<BuildWhen>,
+}
+
+/// The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a
+/// muru.toml and
 /// in muru.local.toml (section 13.1): how `muructl run` serves this
 /// project, with a key for each flag of the command that describes the
 /// serving rather than the application. The daemon ignores it. Lists add
@@ -4078,6 +4156,9 @@ pub struct ToolMuru {
     /// daemon ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunSettings>,
+    /// When and how the environment is built (section 8.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Build>,
 }
 
 /// Why a project's configuration could not be read.
@@ -4145,13 +4226,14 @@ pub fn load_project(dir: &Path) -> Result<Option<(PathBuf, ToolMuru)>, ProjectEr
 pub const LOCAL_FILE: &str = "muru.local.toml";
 
 /// Read a project's muru.local.toml from `dir`, which holds the `[run]`
-/// table and nothing else: a key outside it is refused, naming
-/// `committed`, the project's own file, as where it belongs. Returns the
-/// file read and the table, or None when there is no such file.
+/// table and a `[build]` table with `when` and nothing else: a key outside
+/// them is refused, naming `committed`, the project's own file, as where
+/// it belongs. Returns the file read and what it holds, or None when
+/// there is no such file.
 pub fn load_local(
     dir: &Path,
     committed: Option<&Path>,
-) -> Result<Option<(PathBuf, RunSettings)>, ProjectError> {
+) -> Result<Option<(PathBuf, LocalFile)>, ProjectError> {
     let path = dir.join(LOCAL_FILE);
 
     let text = match std::fs::read_to_string(&path) {
@@ -4168,18 +4250,20 @@ pub fn load_local(
     Ok(Some((path, table)))
 }
 
-/// Parse a muru.local.toml: the `[run]` table alone.
-pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<RunSettings, String> {
+/// Parse a muru.local.toml: the `[run]` table, and `[build]` with `when`.
+pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, String> {
     let document: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+    let there = committed.map_or_else(
+        || "the project's pyproject.toml or muru.toml".to_owned(),
+        |path| path.display().to_string(),
+    );
 
-    if let Some(key) = document.keys().find(|key| key.as_str() != "run") {
-        let there = committed.map_or_else(
-            || "the project's pyproject.toml or muru.toml".to_owned(),
-            |path| path.display().to_string(),
-        );
-
+    if let Some(key) = document
+        .keys()
+        .find(|key| !matches!(key.as_str(), "run" | "build"))
+    {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which holds the [run] table only; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which holds the [run] table and [build] when only; the application's settings belong in {there}"
         ));
     }
 
@@ -4193,7 +4277,32 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<RunSettings, 
 
     run.check().map_err(|error| format!("[run] {error}"))?;
 
-    Ok(run)
+    // The build table here is for one machine: when alone, since extras
+    // and groups describe the application and belong in the project.
+
+    let build_when = match document.get("build") {
+        Some(toml::Value::Table(build)) => {
+            if let Some(key) = build.keys().find(|key| key.as_str() != "when") {
+                return Err(format!(
+                    "[build] {key} is not a key {LOCAL_FILE} takes; only when is, and the rest belongs in {there}"
+                ));
+            }
+
+            match build.get("when") {
+                Some(value) => Some(
+                    value
+                        .clone()
+                        .try_into::<BuildWhen>()
+                        .map_err(|error| format!("[build] when: {error}"))?,
+                ),
+                None => None,
+            }
+        }
+        Some(_) => return Err("[build] is not a table".to_owned()),
+        None => None,
+    };
+
+    Ok(LocalFile { run, build_when })
 }
 
 /// Parse a muru.toml: the `[tool.muru]` keys at the top level.
@@ -4767,9 +4876,19 @@ traffic = { classes = { ai_crawler = 'r1' } }"
 
     #[test]
     fn the_local_file_holds_the_run_table_only() {
-        let run = parse_local("[run]\nport = 9000\n", Some(Path::new("pyproject.toml"))).unwrap();
-        assert_eq!(run.port, Some(RunPort::Number(9000)));
-        assert_eq!(parse_local("", None).unwrap(), RunSettings::default());
+        let local = parse_local("[run]\nport = 9000\n", Some(Path::new("pyproject.toml"))).unwrap();
+        assert_eq!(local.run.port, Some(RunPort::Number(9000)));
+        assert_eq!(local.build_when, None);
+        assert_eq!(parse_local("", None).unwrap(), LocalFile::default());
+
+        let local = parse_local("[build]\nwhen = 'always'\n", None).unwrap();
+        assert_eq!(local.build_when, Some(BuildWhen::Always));
+        let error = parse_local(
+            "[build]\nextras = ['x']\n",
+            Some(Path::new("pyproject.toml")),
+        )
+        .unwrap_err();
+        assert!(error.contains("only when is"), "{error}");
         let error =
             parse_local("entrypoint = 'a:b'\n", Some(Path::new("pyproject.toml"))).unwrap_err();
         assert!(

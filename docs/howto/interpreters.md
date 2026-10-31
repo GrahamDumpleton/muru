@@ -1,9 +1,10 @@
-# Choose the Python interpreter
+# Interpreters and environments
 
 Muru runs your application on an interpreter you name, on the environment
-your project already has, or on a Python it finds for you through uv.
-This page covers the first two and how a version request is resolved;
-building the environment itself is the next step.
+your project already has, or on a Python it finds for you through uv, and
+it builds the environment from your `uv.lock` when there is none. This
+page covers how the interpreter is chosen, when the environment is built,
+and where the runtime library comes from.
 
 ## What is used, in order
 
@@ -69,6 +70,77 @@ environment, unless its `[tools]` table says `python_downloads =
 Without uv, a path or an existing environment works as before, and a
 request fails with a message saying uv is needed. Install uv, or set
 `MURU_UV` to where it is.
+
+## Building the environment
+
+`muructl run` is a build, then a serve. A project with a `uv.lock` and no
+`.venv` is built on the first run, with `uv sync --frozen` into its own
+`.venv`, exactly what you would type, and uv's lines show on the terminal:
+
+```
+muru: no environment for this project, building .venv with uv sync --frozen
+muru: Resolved 14 packages in 2ms
+muru: Installed 14 packages in 120ms
+```
+
+So a fresh clone followed by `muructl run` works. Muru installs from the
+lock and never resolves; a project without a lock is told to run
+`uv lock`. Building needs `pyproject.toml`, `uv.lock` and uv.
+
+An environment that exists is used as it is, however stale, so an
+experiment you installed by hand is never undone by a server start. When
+it is behind the lock, the start-up says so:
+
+```
+muru: the environment is behind uv.lock (would install 2 packages); run with --build, or muructl build, to bring it up to date
+```
+
+While the run is up, a change to `uv.lock`, to `.python-version` or to
+`requires-python` builds before the new release starts; the old release
+serves meanwhile, and a failed build leaves it serving with uv's output on
+the terminal. A change to `pyproject.toml` alone reloads without a build,
+since the lock did not change, with a note naming `uv lock` when the
+manifest is newer than the lock.
+
+One setting, `when`, says how far this goes, and `--build` sets it for a
+run:
+
+| Mode | Builds |
+| --- | --- |
+| `auto` (the default) | a missing environment, and on a lock change under reload |
+| `always` | also before every start |
+| `never` | nothing; a missing environment is the error it would be anyway |
+
+```
+muructl run --build              # always, for this run: bring .venv up to date first
+muructl run --build never
+```
+
+```toml
+[tool.muru.build]
+when = "always"
+```
+
+In `muru.local.toml`, a `[build]` table with `when` sets it for one
+machine without touching the project. Under `--allow-public` nothing is
+built unasked.
+
+`muructl build` is the same procedure on its own, for a laptop, a
+devcontainer or a workshop image prepared ahead of a session: it builds
+the environment (an existing one too, since asking is the point),
+resolves and probes the interpreter, provides the runtime library and
+exits.
+
+```
+muructl build                                  # the project in the current directory
+muructl build --deployment                     # what the daemon or an image runs
+muructl build --deployment --deps-only         # dependencies only, before the source is copied in
+muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
+```
+
+The deployment flavour leaves the dev group out, refuses to build sdists
+unless `source_builds = true`, compiles bytecode, and installs the extras
+and groups the `[tool.muru.build]` table names.
 
 ## The runtime library
 
