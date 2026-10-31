@@ -649,6 +649,10 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// Section 11.1: workers the host replaced, by group and reason, and
+    /// workers that exited, likewise, since the release started.
+    recycles: BTreeMap<(String, String), u64>,
+    exits: BTreeMap<(String, String), u64>,
     /// Section 7.3: the report the workers' signals are measured from,
     /// and when it arrived.
     signals_from: Option<(Instant, Vec<crate::host::WorkerStatus>)>,
@@ -3053,6 +3057,22 @@ impl Daemon {
                     worker.in_flight as f64,
                 ));
 
+                // Section 7.3: the worker's own signals, as histograms
+                // once it has observed anything.
+
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_gil_wait_seconds",
+                    &labels,
+                    &worker.gil_wait,
+                    worker.gil_wait_us,
+                ));
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_loop_lag_seconds",
+                    &labels,
+                    &worker.loop_lag,
+                    worker.loop_lag_us,
+                ));
+
                 for (measure, bytes) in [
                     ("rss", worker.rss),
                     ("pss", worker.pss),
@@ -3071,6 +3091,26 @@ impl Daemon {
                             bytes as f64,
                         ));
                     }
+                }
+            }
+
+            // Sections 7.6 and 7.7: workers replaced and workers gone.
+
+            for (name, counts) in [
+                ("muru_worker_recycles_total", &running.recycles),
+                ("muru_worker_exits_total", &running.exits),
+            ] {
+                for ((group, reason), count) in counts {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        name,
+                        &[
+                            ("app", app.as_str()),
+                            ("release", id.as_str()),
+                            ("group", group.as_str()),
+                            ("reason", reason.as_str()),
+                        ],
+                        *count as f64,
+                    ));
                 }
             }
         }
@@ -3209,6 +3249,8 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        recycles: BTreeMap::new(),
+                        exits: BTreeMap::new(),
                         signals_from: None,
                         scalers,
                         host_pss: None,
@@ -3296,6 +3338,8 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        recycles: BTreeMap::new(),
+                        exits: BTreeMap::new(),
                         signals_from: None,
                         scalers: Vec::new(),
                         host_pss: None,
@@ -4092,6 +4136,8 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                recycles: BTreeMap::new(),
+                exits: BTreeMap::new(),
                 signals_from: None,
                 scalers,
                 host_pss: None,
@@ -4291,6 +4337,8 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                recycles: BTreeMap::new(),
+                exits: BTreeMap::new(),
                 signals_from: None,
                 scalers: Vec::new(),
                 host_pss: None,
@@ -7054,6 +7102,8 @@ impl Daemon {
                 kind,
                 level,
                 message,
+                group,
+                reason,
             } => {
                 let level = match level.as_str() {
                     "error" => "error",
@@ -7061,6 +7111,32 @@ impl Daemon {
                     "notice" => "notice",
                     _ => "info",
                 };
+
+                // Section 11.1: a replaced worker and an exit are counted
+                // by group and reason.
+
+                if let Some(running) = self.running.get_mut(&key) {
+                    let counts = match kind.as_str() {
+                        "worker.recycled" | "worker.timeout_killed" => Some(&mut running.recycles),
+                        "worker.exited" => Some(&mut running.exits),
+                        _ => None,
+                    };
+
+                    if let Some(counts) = counts {
+                        let group = if group.is_empty() {
+                            muru_edge::routing::DEFAULT_GROUP.to_owned()
+                        } else {
+                            group
+                        };
+
+                        let reason = if reason.is_empty() {
+                            "other".to_owned()
+                        } else {
+                            reason
+                        };
+                        *counts.entry((group, reason)).or_default() += 1;
+                    }
+                }
 
                 // Section 9.3: a crash or a timeout kill counts against
                 // the release in a rollout's gates.

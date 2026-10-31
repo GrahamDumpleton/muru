@@ -18,12 +18,14 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 | Area | Examples |
 | --- | --- |
 | Requests | muru_requests_total by status class and reason, muru_request_duration_seconds histograms (queue, application, total), muru_requests_in_flight, muru_retries_total |
-| Capacity | muru_queue_depth, muru_queue_wait_seconds, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_websocket_connections, muru_handoffs_total by direction, muru_handoff_queue_wait_seconds |
-| Workers | muru_worker_cpu_ratio, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds, muru_loop_lag_seconds, muru_worker_recycles_total by reason, muru_worker_exits_total |
+| Capacity | muru_queue_depth, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_websocket_connections; with the handoff of section 6.14, muru_handoffs_total by direction and muru_handoff_queue_wait_seconds |
+| Workers | muru_worker_cpu_seconds_total, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds and muru_loop_lag_seconds histograms, muru_worker_recycles_total by reason, muru_worker_exits_total by reason |
 | Scaling | muru_scaling_decisions_total, muru_workers_desired, muru_workers_ready, muru_churn_reaps_total |
-| Edge | muru_edge_connections, muru_tls_handshakes_total, muru_snapshot_version, muru_edge_cpu_ratio per thread, muru_upstream_health |
-| Bodies and uploads | muru_body_rejections_total, muru_upload_spool_bytes |
+| Edge | muru_connections_open, muru_connections_refused_total, muru_tls_handshakes_total by result, muru_snapshot_version, muru_upstream_health |
+| Bodies and uploads | muru_upload_spool_bytes |
 | Clients | muru_requests_total by client_class, muru_rate_limited_total by limit, client class and action |
+
+Some figures are read from a family above rather than exported again: the queue wait is the `queue` phase of muru_request_duration_seconds, a worker's CPU ratio is `rate()` over muru_worker_cpu_seconds_total, and bodies refused for their size are muru_requests_total with the `body_too_large` reason, so there is no muru_queue_wait_seconds, muru_worker_cpu_ratio or muru_body_rejections_total. The edge's own CPU time per thread is not exported.
 
 The dashboard reads the same values from in-memory history. OTLP metric export is optional.
 

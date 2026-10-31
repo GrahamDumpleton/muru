@@ -159,6 +159,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Worker slots across the workers: threads, or the event loop's concurrency.",
     },
     Family {
+        name: "muru_async_slots_busy",
+        kind: Kind::Gauge,
+        help: "Requests held on the event loops of ASGI workers.",
+    },
+    Family {
         name: "muru_upstream_health",
         kind: Kind::Gauge,
         help: "Whether an upstream address takes requests: 1 in service, 0 unhealthy or ejected.",
@@ -204,6 +209,26 @@ pub const FAMILIES: &[Family] = &[
         help: "A worker's memory as it last reported it, by measure: rss, pss or uss.",
     },
     Family {
+        name: "muru_gil_wait_seconds",
+        kind: Kind::Histogram,
+        help: "How long a worker's threads waited for the GIL when they had work to run, as it last reported.",
+    },
+    Family {
+        name: "muru_loop_lag_seconds",
+        kind: Kind::Histogram,
+        help: "How much later than due a worker's event loop heartbeat ran, as it last reported.",
+    },
+    Family {
+        name: "muru_worker_recycles_total",
+        kind: Kind::Counter,
+        help: "Workers their host replaced, by reason: max_requests, max_lifetime, memory, hard_timeout, loop_stalled or gil_stalled.",
+    },
+    Family {
+        name: "muru_worker_exits_total",
+        kind: Kind::Counter,
+        help: "Workers that exited, by reason: scaled_in, crashed or start_failed.",
+    },
+    Family {
         name: "muru_connections_open",
         kind: Kind::Gauge,
         help: "Connections open on a listener.",
@@ -212,6 +237,11 @@ pub const FAMILIES: &[Family] = &[
         name: "muru_connections_refused_total",
         kind: Kind::Counter,
         help: "Connections a listener refused, by reason: client_limit, overloaded (answered 503) or paused (closed).",
+    },
+    Family {
+        name: "muru_tls_handshakes_total",
+        kind: Kind::Counter,
+        help: "TLS handshakes a listener began, by result: completed, failed or timed_out.",
     },
     Family {
         name: "muru_snapshot_version",
@@ -417,6 +447,8 @@ struct Inner {
     /// Authentication sub-requests by result (section 4.16).
     auth: BTreeMap<String, u64>,
     rate_limited: BTreeMap<(String, String, String), u64>,
+    /// TLS handshakes by listener and result (section 4.3).
+    tls_handshakes: BTreeMap<(String, &'static str), u64>,
 }
 
 /// The request metrics of one edge, fed by the access log as each request
@@ -539,6 +571,16 @@ impl Metrics {
         *inner.rate_limited.entry(key).or_default() += 1;
     }
 
+    /// Count a TLS handshake on a listener (section 4.3) by its result:
+    /// `completed`, `failed` or `timed_out`.
+    pub fn count_tls_handshake(&self, listener: &str, result: &'static str) {
+        let mut inner = self.inner.lock().expect("metrics poisoned");
+        *inner
+            .tls_handshakes
+            .entry((listener.to_owned(), result))
+            .or_default() += 1;
+    }
+
     /// Every sample of the request metrics.
     pub fn samples(&self) -> Vec<Sample> {
         let inner = self.inner.lock().expect("metrics poisoned");
@@ -635,8 +677,76 @@ impl Metrics {
             });
         }
 
+        for ((listener, result), count) in &inner.tls_handshakes {
+            samples.push(Sample {
+                name: "muru_tls_handshakes_total".to_owned(),
+                labels: vec![
+                    ("listener".to_owned(), listener.clone()),
+                    ("result".to_owned(), (*result).to_owned()),
+                ],
+                value: *count as f64,
+            });
+        }
+
         samples
     }
+}
+
+/// A worker's cumulative histogram over the worker protocol's signal
+/// bounds (section 7.3), as the samples of a Prometheus histogram:
+/// `counts` holds the count at or below each bound and then the count of
+/// all, and `sum_us` the sum of the observations in microseconds. Counts
+/// of another shape, or without an observation, give no samples.
+pub fn signal_histogram(
+    name: &str,
+    labels: &[(&str, &str)],
+    counts: &[u64],
+    sum_us: u64,
+) -> Vec<Sample> {
+    let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
+    let mut samples = Vec::new();
+
+    let Some(&total) = counts.last() else {
+        return samples;
+    };
+
+    if counts.len() != bounds.len() + 1 || total == 0 {
+        return samples;
+    }
+
+    let owned: Vec<(String, String)> = labels
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+
+    for (bound, count) in bounds.iter().zip(counts) {
+        let mut with_le = owned.clone();
+        with_le.push(("le".to_owned(), number(*bound as f64 / 1_000_000.0)));
+        samples.push(Sample {
+            name: format!("{name}_bucket"),
+            labels: with_le,
+            value: *count as f64,
+        });
+    }
+
+    let mut with_le = owned.clone();
+    with_le.push(("le".to_owned(), "+Inf".to_owned()));
+    samples.push(Sample {
+        name: format!("{name}_bucket"),
+        labels: with_le,
+        value: total as f64,
+    });
+    samples.push(Sample {
+        name: format!("{name}_sum"),
+        labels: owned.clone(),
+        value: sum_us as f64 / 1_000_000.0,
+    });
+    samples.push(Sample {
+        name: format!("{name}_count"),
+        labels: owned,
+        value: total as f64,
+    });
+    samples
 }
 
 fn release_key(app: &str, release: &str) -> ReleaseKey {
@@ -682,6 +792,19 @@ pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
                 "muru_slots_total",
                 &labels,
                 workers.iter().map(|worker| worker.slots).sum::<usize>() as f64,
+            ));
+
+            // An ASGI worker holds every request it has on its loop; a
+            // WSGI worker's are on its threads.
+
+            samples.push(Sample::new(
+                "muru_async_slots_busy",
+                &labels,
+                workers
+                    .iter()
+                    .filter(|worker| worker.worker_type == "asgi")
+                    .map(|worker| worker.in_flight)
+                    .sum::<usize>() as f64,
             ));
         }
     }
@@ -838,6 +961,78 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
+
+    #[test]
+    fn every_family_is_in_the_metrics_guide_and_nothing_else_is() {
+        // The table of the how-to names each family once, in a backticked
+        // first column; the two lists must agree or the guide has drifted.
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/howto/metrics.md");
+        let guide = std::fs::read_to_string(path).expect("the metrics how-to is readable");
+        let documented: std::collections::BTreeSet<&str> = guide
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `muru_"))
+            .filter_map(|rest| rest.split_once('`'))
+            .map(|(name, _)| name)
+            .collect();
+        let exported: std::collections::BTreeSet<&str> = FAMILIES
+            .iter()
+            .map(|family| family.name.trim_start_matches("muru_"))
+            .collect();
+
+        let undocumented: Vec<&&str> = exported.difference(&documented).collect();
+        let unexported: Vec<&&str> = documented.difference(&exported).collect();
+        assert!(
+            undocumented.is_empty(),
+            "not in the guide: {undocumented:?}"
+        );
+        assert!(unexported.is_empty(), "in the guide only: {unexported:?}");
+    }
+
+    #[test]
+    fn a_signal_histogram_is_rendered_from_cumulative_counts() {
+        // Three observations: one within 0.1 ms, one within 5 ms and one
+        // beyond every bound, summing to 60.00305 s.
+
+        let counts = [1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3];
+        let labels = [("app", "shop"), ("worker", "0")];
+        let samples = signal_histogram("muru_gil_wait_seconds", &labels, &counts, 60_003_050);
+        let text = render(&samples);
+
+        assert!(
+            text.contains("# TYPE muru_gil_wait_seconds histogram\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "muru_gil_wait_seconds_bucket{app=\"shop\",worker=\"0\",le=\"0.0001\"} 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("muru_gil_wait_seconds_bucket{app=\"shop\",worker=\"0\",le=\"5\"} 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "muru_gil_wait_seconds_bucket{app=\"shop\",worker=\"0\",le=\"+Inf\"} 3\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("muru_gil_wait_seconds_sum{app=\"shop\",worker=\"0\"} 60.00305\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("muru_gil_wait_seconds_count{app=\"shop\",worker=\"0\"} 3\n"),
+            "{text}"
+        );
+
+        // Nothing observed, or counts of another shape, give nothing.
+
+        assert!(signal_histogram("muru_loop_lag_seconds", &labels, &[0; 11], 0).is_empty());
+        assert!(signal_histogram("muru_loop_lag_seconds", &labels, &[1, 2], 7).is_empty());
+    }
 
     fn record(status: u16, reason: &str, worker: Option<usize>, total_ms: u64) -> Record {
         Record {

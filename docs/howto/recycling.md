@@ -63,9 +63,10 @@ Events record each replacement: `worker.started` and `worker.ready` for
 the new worker, then `worker.recycled` (or `worker.timeout_killed`, or
 `worker.restarted`) with the reason once the old one has gone, under the
 release's subject; a worker that exits on its own is `worker.exited`.
-The daemon restarts a release whose host dies, and a host that cannot
-start a replacement three times running keeps the old worker and stops
-trying.
+The [metrics](metrics.md) count them too, as `muru_worker_recycles_total`
+by reason and `muru_worker_exits_total`. The daemon restarts a release
+whose host dies, and a host that cannot start a replacement three times
+running keeps the old worker and stops trying.
 
 ## Restarting a worker by hand
 

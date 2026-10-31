@@ -1588,7 +1588,9 @@ mod tests {
             cpu_ms: Some(cpu_ms),
             gil_enabled,
             gil_wait,
+            gil_wait_us: 0,
             loop_lag: Vec::new(),
+            loop_lag_us: 0,
         }
     }
 
@@ -1648,7 +1650,6 @@ mod tests {
             loop_lag_p95_ms: Some(500.0),
             ..WorkerSignals::default()
         };
-
         assert_eq!(diagnose(0.9, None, &busy_cpu, false).bottleneck, "cpu");
         assert_eq!(diagnose(0.9, None, &contended, false).bottleneck, "gil");
         assert_eq!(diagnose(0.9, Some(200.0), &quiet, false).bottleneck, "io");

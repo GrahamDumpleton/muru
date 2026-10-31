@@ -38,6 +38,11 @@ pub enum HostMessage {
         level: String,
         /// What happened.
         message: String,
+        /// The worker's group, when the event is about one worker.
+        group: String,
+        /// The reason as one word, for the counters of section 11.1:
+        /// why a worker was recycled or how it exited.
+        reason: String,
     },
     /// What every worker reported last, for metrics and the dashboard.
     Status {
@@ -99,8 +104,12 @@ pub struct WorkerStatus {
     /// Its GIL waits, cumulative at or below each of the worker
     /// protocol's signal bounds, then the count of all.
     pub gil_wait: Vec<u64>,
+    /// The sum of its GIL waits, in microseconds.
+    pub gil_wait_us: u64,
     /// Its event loop's lateness, likewise.
     pub loop_lag: Vec<u64>,
+    /// The sum of its event loop's lateness, in microseconds.
+    pub loop_lag_us: u64,
 }
 
 /// A histogram's counts from a status line, or none.
@@ -165,6 +174,8 @@ impl HostMessage {
                 kind: value["kind"].as_str().unwrap_or("worker.event").to_owned(),
                 level: value["level"].as_str().unwrap_or("info").to_owned(),
                 message: value["message"].as_str().unwrap_or_default().to_owned(),
+                group: value["group"].as_str().unwrap_or_default().to_owned(),
+                reason: value["reason"].as_str().unwrap_or_default().to_owned(),
             }),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
@@ -207,7 +218,9 @@ impl HostMessage {
                                 cpu_ms: worker["cpu_ms"].as_u64(),
                                 gil_enabled: worker["gil_enabled"].as_bool().unwrap_or(true),
                                 gil_wait: counts(&worker["gil_wait"]),
+                                gil_wait_us: worker["gil_wait_us"].as_u64().unwrap_or(0),
                                 loop_lag: counts(&worker["loop_lag"]),
+                                loop_lag_us: worker["loop_lag_us"].as_u64().unwrap_or(0),
                             })
                             .collect()
                     })

@@ -325,9 +325,10 @@ used in the last hour, with `halt` while scale-in is suspended.
 
 Every decision is a `scaling.decision` event with its reasons and the
 diagnosis, and `muru_workers_desired`, `muru_scaling_decisions_total`
-and `muru_churn_reaps_total` are in the metrics beside
+and `muru_churn_reaps_total` are in the [metrics](metrics.md) beside
 `muru_workers_ready`, with each worker's CPU time as
-`muru_worker_cpu_seconds_total`.
+`muru_worker_cpu_seconds_total` and its GIL waits and event loop lag as
+the `muru_gil_wait_seconds` and `muru_loop_lag_seconds` histograms.
 
 A pin overrides the autoscaler:
 

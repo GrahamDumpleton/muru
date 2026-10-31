@@ -711,6 +711,7 @@ class Replacement:
     old_pid: int
     reason: str
     kind: str  # worker.recycled or worker.timeout_killed
+    cause: str = ""  # the reason as one word, for muru_worker_recycles_total
     new_pid: int | None = None
 
     # Section 11.7: what the worker was doing when it was replaced (its
@@ -1655,11 +1656,31 @@ class Host:
         self.send_to_supervisor(self.workers_message())
         return self.version
 
-    def emit(self, kind: str, level: str, message: str) -> None:
-        """Log a worker event and pass it to the supervisor."""
+    def emit(
+        self,
+        kind: str,
+        level: str,
+        message: str,
+        group: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Log a worker event and pass it to the supervisor.
+
+        `group` and `reason` are the worker's group and the event's reason
+        as one word, which the supervisor counts (section 11.1); the
+        message says the same in words.
+        """
 
         log(message)
-        self.send_to_supervisor({"type": "event", "kind": kind, "level": level, "message": message})
+        event = {"type": "event", "kind": kind, "level": level, "message": message}
+
+        if group is not None:
+            event["group"] = group
+
+        if reason is not None:
+            event["reason"] = reason
+
+        self.send_to_supervisor(event)
 
     # Section 11.7: the supervisor's questions, answered by the host or
     # passed to the workers.
@@ -1821,7 +1842,9 @@ class Host:
 
         if force:
             state.debug_sessions = 0
-            self.replace(state, "restarted on request, killed at once", "worker.restarted", True)
+            self.replace(
+                state, "restarted on request, killed at once", "worker.restarted", hard=True
+            )
         else:
             self.replace(state, "restarted on request", "worker.restarted")
 
@@ -1906,7 +1929,9 @@ class Host:
 
         state = max(candidates, key=lambda candidate: candidate.started_at)
         state.replaced = True
-        retirement = Replacement(state.index, state.pid, "scaled in", "worker.exited", retire=True)
+        retirement = Replacement(
+            state.index, state.pid, "scaled in", "worker.exited", "scaled_in", retire=True
+        )
         self.replacing[state.index] = retirement
         self.routed[state.index] = None
         retirement.announced = self.announce()
@@ -2178,6 +2203,7 @@ class Host:
                         state,
                         f"its event loop stalled past the loop stall timeout of {loop_stall:g} s",
                         "worker.timeout_killed",
+                        "loop_stalled",
                         abandon={
                             "which": "all",
                             "reason": "worker_stalled",
@@ -2191,6 +2217,7 @@ class Host:
                         state,
                         f"no thread of it ran Python for the GIL stall timeout of {gil_stall:g} s",
                         "worker.timeout_killed",
+                        "gil_stalled",
                         abandon={
                             "which": "all",
                             "reason": "worker_stalled",
@@ -2216,7 +2243,14 @@ class Host:
                 measured = True
                 state.signals = {
                     key: report[key]
-                    for key in ("cpu_ms", "gil_enabled", "gil_wait", "loop_lag")
+                    for key in (
+                        "cpu_ms",
+                        "gil_enabled",
+                        "gil_wait",
+                        "gil_wait_us",
+                        "loop_lag",
+                        "loop_lag_us",
+                    )
                     if key in report
                 }
 
@@ -2252,6 +2286,7 @@ class Host:
                 f"{policy.measure} {format_size(value)} is over the hard limit of "
                 f"{format_size(hard)}",
                 "worker.recycled",
+                "memory",
                 hard=True,
             )
             return
@@ -2282,6 +2317,7 @@ class Host:
             f"{format_size(soft)} for {now - state.over_soft_since:.0f} s"
             + (" after reclaiming" if state.reclaimed_at is not None else ""),
             "worker.recycled",
+            "memory",
         )
 
     def note_memory_recycle(self, index: int) -> None:
@@ -2358,6 +2394,7 @@ class Host:
                 state,
                 f"served {state.requests} requests (max_requests {self.max_requests})",
                 "worker.recycled",
+                "max_requests",
             )
 
     def tick(self) -> None:
@@ -2380,6 +2417,7 @@ class Host:
                     f"a request has run for {state.oldest_ms / 1000:.1f} s, past the hard "
                     f"timeout of {hard_timeout:g} s",
                     "worker.timeout_killed",
+                    "hard_timeout",
                     abandon={
                         "which": "oldest",
                         "reason": "hard_timeout",
@@ -2400,6 +2438,7 @@ class Host:
                     f"sent no report for {silent:.0f} s, longer than "
                     f"the GIL stall timeout of {gil_stall_timeout:g} s",
                     "worker.timeout_killed",
+                    "gil_stalled",
                     abandon={
                         "which": "all",
                         "reason": "worker_stalled",
@@ -2412,6 +2451,7 @@ class Host:
                     state,
                     f"lived {now - state.started_at:.0f} s (max_lifetime {self.max_lifetime:g} s)",
                     "worker.recycled",
+                    "max_lifetime",
                 )
 
         for replacement in list(self.replacing.values()):
@@ -2428,11 +2468,13 @@ class Host:
         state: WorkerState,
         reason: str,
         kind: str,
+        cause: str = "",
         hard: bool = False,
         abandon: dict[str, str] | None = None,
     ) -> None:
         """Start replacing a worker with a fresh one on a new socket.
 
+        `cause` is the reason as one word, for the supervisor's counters.
         For a hard timeout the old worker leaves routing at once and its
         stacks are recorded, and `abandon` says which of its requests the
         edge answers now rather than after the grace: the oldest, which is
@@ -2494,7 +2536,7 @@ class Host:
 
         state.replaced = True
         self.generation[index] = self.generation.get(index, 0) + 1
-        replacement = Replacement(index, state.pid, reason, kind)
+        replacement = Replacement(index, state.pid, reason, kind, cause)
         self.replacing[index] = replacement
         hard = hard or kind == "worker.timeout_killed"
         log(f"worker {index} (pid {state.pid}) {reason}; replacing it")
@@ -2924,7 +2966,13 @@ class Host:
             if replacement is not None and replacement.old_pid == pid and replacement.retire:
                 del self.replacing[index]
                 self.retired.add(index)
-                self.emit("worker.exited", "info", f"worker {index} (pid {pid}) stopped: scaled in")
+                self.emit(
+                    "worker.exited",
+                    "info",
+                    f"worker {index} (pid {pid}) stopped: scaled in",
+                    group=self.group_of(index).name,
+                    reason="scaled_in",
+                )
                 continue
 
             if replacement is not None and replacement.old_pid == pid:
@@ -2936,6 +2984,8 @@ class Host:
                     level,
                     f"worker {index} (pid {pid}) replaced by pid {replacement.new_pid}: "
                     f"{replacement.reason}{capture}",
+                    group=self.group_of(index).name,
+                    reason=replacement.cause,
                 )
                 continue
 
@@ -2954,6 +3004,8 @@ class Host:
                         "error",
                         f"worker {index} replacement (pid {pid}) exited with "
                         f"{describe(status)} before it was ready; pid {old.pid} keeps serving",
+                        group=self.group_of(index).name,
+                        reason="start_failed",
                     )
                     continue
 
@@ -2982,6 +3034,8 @@ class Host:
                             f"worker {index} (pid {pid}) of the optional group {group.name} "
                             f"failed {MAX_START_FAILURES} times at start, last with "
                             f"{describe(status)}; it is given up",
+                            group=group.name,
+                            reason="start_failed",
                         )
                         self.announce()
                         continue
@@ -3000,6 +3054,8 @@ class Host:
                 "worker.exited",
                 "warning",
                 f"worker {index} (pid {pid}) exited with {describe(status)}, restarting",
+                group=self.group_of(index).name,
+                reason="crashed",
             )
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
 
