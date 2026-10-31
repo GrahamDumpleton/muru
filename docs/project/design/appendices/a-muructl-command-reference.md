@@ -13,8 +13,9 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 
 | Group | Command | What it does | Section |
 | --- | --- | --- | --- |
-| Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --timeout, --max-body-size, --dashboard, --bind, --port, --allow-public, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --static, --print-config | 13.1 |
-| Development | muructl check [PATH or RELEASE] | Load in a throwaway host and validate entrypoints, hooks, mounts and environment | 6.8 |
+| Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --timeout, --max-body-size, --dashboard, --bind, --port, --allow-public, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --static, --build [MODE] (auto, always or never; a bare --build is always), --print-config | 13.1 |
+| Development | muructl build [PATH] | Resolve the interpreter, build the environment from the lock, install the runtime library, exit. Flags: --deployment, --deps-only, --target DIR, --runtime-dir DIR, --python, --extra, --group, --no-runtime | 8.2 |
+| Development | muructl check [PATH or RELEASE] | Load in a throwaway host and validate what build prepared: entrypoint, hooks, mounts, configuration, interpreter requirement, runtime library and bytecode cache; no side effects. Flags: --strict, --env-file; --image in an image build (section 8.6) | 6.8 |
 | Development | muructl exec RELEASE -- COMMAND | One-off command with the release's interpreter, environment, user and directory | 6.8 |
 | Daemon | muructl daemon run | Run the daemon in the foreground. Flags: --listen, and the location flags --config, --state-dir, --run-dir, --log-dir, --cache-dir and --system (section 13.8) | 13.3 |
 | Daemon | muructl daemon start, stop, restart, status, reload | Background daemon without a service manager. start takes the flags of daemon run; stop takes --shutdown and --timeout; reload re-reads the configuration file | 13.3 |
@@ -30,7 +31,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Configuration | muructl config schema | Print the JSON Schema for configuration files | 10.3 |
 | Applications | muructl app create, list, show, delete | Manage applications | 3.1 |
 | Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
-| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers, --fresh (take nothing from the previous release, section 3.3), --static (a directory of the release's own files, section 4.9) | 9.2 |
+| Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers, --fresh (take nothing from the previous release, section 3.3), --static (a directory of the release's own files, section 4.9), --build MODE, --build-extra, --build-group (the build table for this deploy, section 8.2) | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
 | Traffic | muructl host create, list, show, delete | Manage virtual hosts | 4.3 |
 | Traffic | muructl route set, list, show, delete | Manage routes and traffic splits | 4.5 |
@@ -62,6 +63,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Images and tools | muructl image check IMAGE | Probe an image against the contract | 8.6 |
 | Images and tools | muructl image build, dockerfile | Build an image or print the generated Dockerfile (later) | 8.6 |
 | Images and tools | muructl tools install uv | Managed copy of uv | 8.4 |
+| Images and tools | muructl runtime install --python PYTHON --target DIR | Unpack the runtime library for that interpreter's tag, the image build step | 8.3 |
 | Traffic | muructl overlay list, show, preview NAME | Overlays, triggers and effective changes | 9.10 |
 | Traffic | muructl overlay activate, end NAME [--for, --until] | Manual activation and ending | 9.10 |
 | Traffic | muructl overlay promote NAME | Fold an active overlay into the base configuration | 9.10 |
