@@ -143,6 +143,12 @@ impl Build {
         let mut command = uv.command(isolation);
         command.args(self.args());
 
+        // uv reads its configuration from the working directory's
+        // ancestry, so the build runs inside the project: its own
+        // settings apply, never those of wherever muructl was started.
+
+        command.current_dir(&self.project);
+
         if let Some(target) = &self.target {
             command.env("UV_PROJECT_ENVIRONMENT", target);
         }
@@ -362,6 +368,7 @@ pub fn behind_lock(
     let mut command = uv.command(isolation);
     command.args(["sync", "--frozen", "--dry-run", "--project"]);
     command.arg(project);
+    command.current_dir(project);
 
     if let Some(python) = python {
         command.arg("--python").arg(python);

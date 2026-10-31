@@ -130,7 +130,16 @@ def offline_env(tmp_path: Path, wheels: Path | None = None) -> dict[str, str]:
     """An environment for muructl with the network off limits, its cache in
     the test's directory and, given one, a wheel directory."""
 
-    env = {"MURU_OFFLINE": "1", "MURU_CACHE_DIR": str(tmp_path / "cache"), "UV_NO_PROGRESS": "1"}
+    # CI leaves the repository's own group selection in the environment
+    # (UV_NO_GROUP for the free-threaded jobs), which a test project does
+    # not define; an empty value is how uv is told to forget it.
+
+    env = {
+        "MURU_OFFLINE": "1",
+        "MURU_CACHE_DIR": str(tmp_path / "cache"),
+        "UV_NO_PROGRESS": "1",
+        "UV_NO_GROUP": "",
+    }
 
     if wheels is not None:
         env["MURU_WHEEL_DIR"] = str(wheels)

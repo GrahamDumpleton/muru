@@ -23,7 +23,7 @@ def offline_daemon(tmp_path: Path):
     daemon = start_daemon(
         tmp_path / "daemon",
         config_extra=f"\n[tools]\noffline = true\nwheel_dir = '{wheels}'\n",
-        env={"MURU_OFFLINE": "1"},
+        env={"MURU_OFFLINE": "1", "UV_NO_GROUP": ""},
     )
 
     try:
