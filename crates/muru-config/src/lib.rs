@@ -668,9 +668,12 @@ pub struct Release {
     /// When a factory is called.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory_phase: Option<FactoryPhase>,
-    /// The interpreter.
+    /// The interpreter: a path, or a request in uv's syntax (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<String>,
+    /// When and how the environment is built on the node (section 8.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Build>,
     /// Worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processes: Option<usize>,

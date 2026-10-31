@@ -286,77 +286,28 @@ async fn build_environment(
         );
         return Ok(false);
     };
-    let groups: Vec<String> = Vec::new();
     let build = muru_provision::Build {
-        project,
-        python,
+        project: project.to_path_buf(),
+        python: python.map(str::to_owned),
         deployment: false,
         deps_only: false,
         target: None,
-        extras: &groups,
-        groups: &groups,
+        extras: Vec::new(),
+        groups: Vec::new(),
         source_builds: false,
         compile_bytecode: false,
     };
     println!("muru: {reason}, building .venv with {}", build.describe());
     let isolation = muru_provision::Isolation::default();
-    let owned = OwnedBuild::from(&build);
     let _ = development;
 
     tokio::task::spawn_blocking(move || {
-        owned
-            .as_build()
-            .run(&uv, &isolation, &mut |line| println!("muru: {line}"))
+        build.run(&uv, &isolation, &mut |line| println!("muru: {line}"))
     })
     .await?
     .map_err(|error| anyhow::anyhow!("the environment build failed: {error}"))?;
 
     Ok(true)
-}
-
-/// A build with its own storage, for a blocking task.
-struct OwnedBuild {
-    project: PathBuf,
-    python: Option<String>,
-    deployment: bool,
-    deps_only: bool,
-    target: Option<PathBuf>,
-    extras: Vec<String>,
-    groups: Vec<String>,
-    source_builds: bool,
-    compile_bytecode: bool,
-}
-
-impl From<&muru_provision::Build<'_>> for OwnedBuild {
-    fn from(build: &muru_provision::Build<'_>) -> Self {
-        Self {
-            project: build.project.to_path_buf(),
-            python: build.python.map(str::to_owned),
-            deployment: build.deployment,
-            deps_only: build.deps_only,
-            target: build.target.map(Path::to_path_buf),
-            extras: build.extras.to_vec(),
-            groups: build.groups.to_vec(),
-            source_builds: build.source_builds,
-            compile_bytecode: build.compile_bytecode,
-        }
-    }
-}
-
-impl OwnedBuild {
-    fn as_build(&self) -> muru_provision::Build<'_> {
-        muru_provision::Build {
-            project: &self.project,
-            python: self.python.as_deref(),
-            deployment: self.deployment,
-            deps_only: self.deps_only,
-            target: self.target.as_deref(),
-            extras: &self.extras,
-            groups: &self.groups,
-            source_builds: self.source_builds,
-            compile_bytecode: self.compile_bytecode,
-        }
-    }
 }
 
 /// `muructl build`: the provisioning procedure as a command.
@@ -432,13 +383,13 @@ pub async fn build(args: BuildArgs) -> anyhow::Result<()> {
     let mut groups = settings.groups.clone();
     groups.extend(args.group.iter().cloned());
     let build = muru_provision::Build {
-        project: &project,
-        python: python.as_deref(),
+        project: project.clone(),
+        python,
         deployment: args.deployment,
         deps_only: args.deps_only,
-        target: args.target.as_deref(),
-        extras: &extras,
-        groups: &groups,
+        target: args.target.clone(),
+        extras,
+        groups,
         source_builds: settings.source_builds.unwrap_or(false),
         compile_bytecode: settings.compile_bytecode.unwrap_or(true),
     };
@@ -448,13 +399,10 @@ pub async fn build(args: BuildArgs) -> anyhow::Result<()> {
         environment.display(),
         build.describe()
     );
-    let owned = OwnedBuild::from(&build);
     let isolation = muru_provision::Isolation::default();
 
     tokio::task::spawn_blocking(move || {
-        owned
-            .as_build()
-            .run(&uv, &isolation, &mut |line| println!("muru: {line}"))
+        build.run(&uv, &isolation, &mut |line| println!("muru: {line}"))
     })
     .await?
     .map_err(|error| anyhow::anyhow!("the environment build failed: {error}"))?;

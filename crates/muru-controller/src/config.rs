@@ -2351,13 +2351,27 @@ pub fn resolve_spec(
         (None, _) => None,
     };
 
+    // Section 8.2: the build table from the flags over the declaration
+    // over the source's own, and whether the daemon builds for this
+    // release: the mode says so and the source has a lock.
+
+    let build = resolve_build(request, &table, &source, provisioning)?;
+
     // Section 8.1: the interpreter as given, else the source's own
     // virtualenv, else a request resolved through uv, else what the
     // previous release ran, else the python3 on the path; probed, so an
-    // interpreter that cannot run Muru fails the deploy here.
+    // interpreter that cannot run Muru fails the deploy here. A release
+    // that builds takes a request over the source's virtualenv, since the
+    // request says what to build with.
 
-    let (python, interpreter) =
-        resolve_interpreter(request, &table, previous, &source, provisioning)?;
+    let (python, interpreter) = resolve_interpreter(
+        request,
+        &table,
+        previous,
+        &source,
+        provisioning,
+        build.builds,
+    )?;
 
     // Section 7.1: groups from the declaration, else the source's own
     // table; each takes its sizes from the release's where it is silent.
@@ -2951,6 +2965,56 @@ pub fn resolve_spec(
         http: None,
         layers,
         interpreter,
+        build,
+    })
+}
+
+/// Section 8.2: the build settings for a release, and whether the daemon
+/// builds an environment for it.
+fn resolve_build(
+    request: &pb::DeployRequest,
+    table: &muru_config::ToolMuru,
+    source: &Path,
+    provisioning: &crate::provision::Provisioning,
+) -> Result<crate::model::BuildSpec, String> {
+    let settings = table.build.clone().unwrap_or_default();
+
+    let when = if request.build_when.is_empty() {
+        settings.when.unwrap_or_default()
+    } else {
+        request
+            .build_when
+            .parse()
+            .map_err(|error: String| format!("--build {error}"))?
+    };
+    let lock = muru_provision::build::lock_file(source).is_some();
+    let venv = source.join(".venv").join("bin").join("python").is_file();
+
+    let builds = match when {
+        muru_config::BuildWhen::Never => false,
+        muru_config::BuildWhen::Always => lock,
+        muru_config::BuildWhen::Auto => lock && !venv,
+    };
+
+    if builds && provisioning.active && provisioning.uv.is_none() {
+        return Err(format!(
+            "{} has a uv.lock and no .venv, so the release needs an environment built, and uv was              not found (tools.uv, MURU_UV, beside muructl, PATH); install uv, or deploy a source              with its environment built",
+            source.display()
+        ));
+    }
+
+    let mut extras = settings.extras.clone();
+    extras.extend(request.build_extras.iter().cloned());
+    let mut groups = settings.groups.clone();
+    groups.extend(request.build_groups.iter().cloned());
+
+    Ok(crate::model::BuildSpec {
+        when,
+        extras,
+        groups,
+        source_builds: settings.source_builds.unwrap_or(false),
+        compile_bytecode: settings.compile_bytecode.unwrap_or(true),
+        builds,
     })
 }
 
@@ -2963,6 +3027,7 @@ fn resolve_interpreter(
     previous: Option<&ReleaseSpec>,
     source: &Path,
     provisioning: &crate::provision::Provisioning,
+    builds: bool,
 ) -> Result<(PathBuf, Option<crate::model::Interpreter>), String> {
     if !provisioning.active {
         let python = if !request.python.is_empty() {
@@ -2988,11 +3053,28 @@ fn resolve_interpreter(
         table: table.python.as_deref(),
         project: source,
         previous: previous.map(|previous| previous.python.as_path()),
-        always: false,
+        always: builds,
         uv: provisioning.uv.as_ref(),
         isolation: &provisioning.isolation,
     };
-    let resolved = muru_provision::resolve(&inputs).map_err(|error| error.to_string())?;
+
+    // A request the node cannot satisfy is installed when downloads are
+    // allowed (section 8.1), then resolved again; otherwise it fails
+    // naming the install command.
+
+    let resolved = match muru_provision::resolve(&inputs) {
+        Ok(resolved) => resolved,
+        Err(muru_provision::ResolveError::NotFound { request, .. })
+            if provisioning.downloads_allowed() && provisioning.uv.is_some() =>
+        {
+            let uv = provisioning.uv.as_ref().expect("uv is present");
+            uv.python_install(&request, &provisioning.isolation)
+                .map_err(|error| format!("installing Python {request}: {error}"))?;
+            muru_provision::resolve(&inputs).map_err(|error| error.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
     let interpreter = crate::model::Interpreter::from_resolved(&resolved);
     Ok((resolved.python, Some(interpreter)))
 }
@@ -3258,6 +3340,7 @@ fn release_settings(spec: &ReleaseSpec) -> Vec<(&'static str, String)> {
     vec![
         ("entrypoint", spec.entrypoint.clone()),
         ("python", spec.python.display().to_string()),
+        ("build.when", spec.build.when.as_str().to_owned()),
         ("interface", spec.interface.to_string()),
         ("preload", spec.preload.to_string()),
         ("processes", spec.processes.to_string()),
@@ -3577,6 +3660,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         factory: request.factory,
         factory_phase: parse_optional(&request.factory_phase)?,
         python: (!request.python.is_empty()).then(|| request.python.clone()),
+        build: None,
         processes: request.processes.map(|value| value as usize),
         threads: request.threads.map(|value| value as usize),
         sync_threads: request.sync_threads.map(|value| value as usize),
@@ -3705,6 +3789,7 @@ fn resolve_http_spec(
         }),
         layers: crate::model::Layers::default(),
         interpreter: None,
+        build: crate::model::BuildSpec::default(),
     })
 }
 
@@ -4004,6 +4089,22 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
             .map(|value| value.as_str().to_owned())
             .unwrap_or_default(),
         python: table.python.clone().unwrap_or_default(),
+        build_when: table
+            .build
+            .as_ref()
+            .and_then(|build| build.when)
+            .map(|when| when.as_str().to_owned())
+            .unwrap_or_default(),
+        build_extras: table
+            .build
+            .as_ref()
+            .map(|build| build.extras.clone())
+            .unwrap_or_default(),
+        build_groups: table
+            .build
+            .as_ref()
+            .map(|build| build.groups.clone())
+            .unwrap_or_default(),
         processes: table.processes.map(|value| value as u32),
         threads: table.threads.map(|value| value as u32),
         sync_threads: table.sync_threads.map(|value| value as u32),
@@ -4172,6 +4273,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         factory: spec.factory.map(|_| true),
         factory_phase: spec.factory,
         python: Some(spec.python.display().to_string()),
+        build: None,
         processes: Some(spec.processes as usize),
         threads: Some(spec.threads as usize),
         sync_threads: Some(spec.sync_threads as usize),

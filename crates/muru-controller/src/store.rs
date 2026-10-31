@@ -1093,6 +1093,7 @@ mod tests {
             http: None,
             layers: crate::model::Layers::default(),
             interpreter: None,
+            build: crate::model::BuildSpec::default(),
         }
     }
 

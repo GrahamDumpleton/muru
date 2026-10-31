@@ -51,6 +51,7 @@ impl Provisioning {
                 || tools.python_downloads == Some(muru_config::PythonDownloads::Never),
             offline,
             no_config: true,
+            config_file: None,
         };
 
         Self {
@@ -58,6 +59,30 @@ impl Provisioning {
             isolation,
             tools: tools.clone(),
             active: true,
+        }
+    }
+
+    /// Whether a Python the node lacks may be downloaded for a release:
+    /// `tools.python_downloads` is not never and the node is not offline.
+    pub fn downloads_allowed(&self) -> bool {
+        self.active && !self.isolation.no_downloads
+    }
+
+    /// Where the environment built for a release lives (section 8.2).
+    pub fn environment_dir(state_dir: &Path, app: &str, id: &str) -> std::path::PathBuf {
+        state_dir.join("envs").join(app).join(id)
+    }
+
+    /// The isolation a build runs with: the daemon's directories, the
+    /// project's own uv configuration kept (no `UV_NO_CONFIG`), the
+    /// daemon's config file when `tools.uv_config` names one, and a cache
+    /// of the release user's own, since hard links need files it can read.
+    pub fn build_isolation(&self, cache_dir: std::path::PathBuf) -> Isolation {
+        Isolation {
+            cache_dir: Some(cache_dir),
+            no_config: false,
+            config_file: self.tools.uv_config.as_deref().map(Into::into),
+            ..self.isolation.clone()
         }
     }
 

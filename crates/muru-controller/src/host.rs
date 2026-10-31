@@ -1118,6 +1118,13 @@ fn kill_with_workers(pid: u32) {
 /// terminal do not reach it, and as `identity` when one is set (section
 /// 10.9).
 pub(crate) fn own_session(command: &mut Command, identity: Option<Identity>) {
+    own_session_std(command.as_std_mut(), identity);
+}
+
+/// `own_session` for a standard library command, as a build runs.
+pub(crate) fn own_session_std(command: &mut std::process::Command, identity: Option<Identity>) {
+    use std::os::unix::process::CommandExt;
+
     // SAFETY: setsid, setgroups, setgid, setuid and umask are
     // async-signal-safe and the closure runs in the child between fork
     // and exec, touching nothing else.

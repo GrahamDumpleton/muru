@@ -64,6 +64,9 @@ pub struct Isolation {
     /// `UV_NO_CONFIG=1`, for the interpreter operations where no project
     /// settings matter.
     pub no_config: bool,
+    /// `UV_CONFIG_FILE`: the daemon's own uv.toml for builds, over which
+    /// the project's `[tool.uv]` still applies.
+    pub config_file: Option<PathBuf>,
 }
 
 /// What went wrong running uv.
@@ -210,6 +213,10 @@ impl Uv {
 
         if isolation.no_config {
             command.env("UV_NO_CONFIG", "1");
+        }
+
+        if let Some(file) = &isolation.config_file {
+            command.env("UV_CONFIG_FILE", file);
         }
 
         command

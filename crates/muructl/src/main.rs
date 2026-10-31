@@ -1718,6 +1718,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             &interpreter(args, resolved, false)?.python,
             &resolved.project,
         )),
+        build: resolved.build.clone(),
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
         sync_threads: Some(resolved.sync_threads),

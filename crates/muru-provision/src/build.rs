@@ -18,11 +18,11 @@ pub const TRIGGER_FILES: [&str; 3] = [LOCK_FILE, "pyproject.toml", ".python-vers
 
 /// One build.
 #[derive(Debug, Clone)]
-pub struct Build<'a> {
+pub struct Build {
     /// The project directory.
-    pub project: &'a Path,
+    pub project: PathBuf,
     /// `--python`, a path or request, when one was given.
-    pub python: Option<&'a str>,
+    pub python: Option<String>,
     /// The deployment flavour: no dev group, no source builds, bytecode
     /// compiled, the project non-editable outside the source.
     pub deployment: bool,
@@ -30,11 +30,11 @@ pub struct Build<'a> {
     /// dependency layer).
     pub deps_only: bool,
     /// Where the environment goes; the project's `.venv` when none.
-    pub target: Option<&'a Path>,
+    pub target: Option<PathBuf>,
     /// Extras to install, deployment flavour.
-    pub extras: &'a [String],
+    pub extras: Vec<String>,
     /// Dependency groups beyond the defaults, deployment flavour.
-    pub groups: &'a [String],
+    pub groups: Vec<String>,
     /// Whether sdists may be built, deployment flavour.
     pub source_builds: bool,
     /// Whether bytecode is compiled, deployment flavour.
@@ -63,16 +63,16 @@ pub enum BuildError {
     },
 }
 
-impl Build<'_> {
+impl Build {
     /// The arguments after `uv`.
     pub fn args(&self) -> Vec<String> {
         let mut args = vec!["sync".to_owned(), "--frozen".to_owned()];
         args.push("--project".to_owned());
         args.push(self.project.display().to_string());
 
-        if let Some(python) = self.python {
+        if let Some(python) = &self.python {
             args.push("--python".to_owned());
-            args.push(python.to_owned());
+            args.push(python.clone());
         }
 
         if self.deployment {
@@ -92,17 +92,18 @@ impl Build<'_> {
 
             if self
                 .target
-                .is_some_and(|target| !target.starts_with(self.project))
+                .as_ref()
+                .is_some_and(|target| !target.starts_with(&self.project))
             {
                 args.push("--no-editable".to_owned());
             }
 
-            for extra in self.extras {
+            for extra in &self.extras {
                 args.push("--extra".to_owned());
                 args.push(extra.clone());
             }
 
-            for group in self.groups {
+            for group in &self.groups {
                 args.push("--group".to_owned());
                 args.push(group.clone());
             }
@@ -136,6 +137,19 @@ impl Build<'_> {
         format!("uv {}", shown.join(" "))
     }
 
+    /// The uv command for the build, for a caller that changes how it runs
+    /// (as another user, say) before `run_command`.
+    pub fn command(&self, uv: &Uv, isolation: &Isolation) -> std::process::Command {
+        let mut command = uv.command(isolation);
+        command.args(self.args());
+
+        if let Some(target) = &self.target {
+            command.env("UV_PROJECT_ENVIRONMENT", target);
+        }
+
+        command
+    }
+
     /// Run the build with `uv`, streaming each line of its output to
     /// `on_line` as it arrives.
     pub fn run(
@@ -144,24 +158,28 @@ impl Build<'_> {
         isolation: &Isolation,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), BuildError> {
+        self.run_command(self.command(uv, isolation), on_line)
+    }
+
+    /// Run a command made by `command`, streaming each line of its output
+    /// to `on_line` as it arrives.
+    pub fn run_command(
+        &self,
+        mut command: std::process::Command,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), BuildError> {
         if !self.project.join(LOCK_FILE).is_file() {
             return Err(BuildError::NoLock {
-                project: self.project.to_path_buf(),
+                project: self.project.clone(),
             });
         }
 
-        let mut command = uv.command(isolation);
-        command.args(self.args());
-
-        if let Some(target) = self.target {
-            command.env("UV_PROJECT_ENVIRONMENT", target);
-        }
-
+        let uv = PathBuf::from(command.get_program());
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|source| UvError::Spawn {
-            uv: uv.path.clone(),
+            uv: uv.clone(),
             source,
         })?;
 
@@ -215,10 +233,9 @@ impl Build<'_> {
             let _ = reader.join();
         }
 
-        let status = child.wait().map_err(|source| UvError::Spawn {
-            uv: uv.path.clone(),
-            source,
-        })?;
+        let status = child
+            .wait()
+            .map_err(|source| UvError::Spawn { uv, source })?;
 
         if !status.success() {
             return Err(BuildError::Failed {
@@ -232,6 +249,18 @@ impl Build<'_> {
 
         Ok(())
     }
+}
+
+/// The lock's SHA-256, shortened, for the record of what was built.
+pub fn lock_digest(project: &Path) -> Option<String> {
+    let bytes = std::fs::read(project.join(LOCK_FILE)).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let hex: String = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(hex[..12].to_owned())
 }
 
 /// The project's lock, if it has one.
@@ -340,16 +369,14 @@ mod tests {
 
     #[test]
     fn the_two_flavours_spell_their_uv_commands() {
-        let extras = ["postgres".to_owned()];
-        let groups: [String; 0] = [];
         let development = Build {
-            project: Path::new("/srv/shop"),
-            python: Some("3.13"),
+            project: PathBuf::from("/srv/shop"),
+            python: Some("3.13".to_owned()),
             deployment: false,
             deps_only: false,
             target: None,
-            extras: &extras,
-            groups: &groups,
+            extras: vec!["postgres".to_owned()],
+            groups: Vec::new(),
             source_builds: false,
             compile_bytecode: true,
         };
@@ -363,7 +390,7 @@ mod tests {
         let deployment = Build {
             deployment: true,
             deps_only: true,
-            target: Some(Path::new("/var/lib/muru/envs/shop/r42")),
+            target: Some(PathBuf::from("/var/lib/muru/envs/shop/r42")),
             python: None,
             ..development.clone()
         };
@@ -373,7 +400,7 @@ mod tests {
         );
 
         let inside = Build {
-            target: Some(Path::new("/srv/shop/.venv")),
+            target: Some(PathBuf::from("/srv/shop/.venv")),
             source_builds: true,
             deps_only: false,
             ..deployment
@@ -390,15 +417,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = crate::uv::tests::fake_uv(dir.path(), None);
         let uv = Uv::find(Some(&fake), None).unwrap();
-        let groups: [String; 0] = [];
         let build = Build {
-            project: dir.path(),
+            project: dir.path().to_path_buf(),
             python: None,
             deployment: false,
             deps_only: false,
             target: None,
-            extras: &groups,
-            groups: &groups,
+            extras: Vec::new(),
+            groups: Vec::new(),
             source_builds: false,
             compile_bytecode: false,
         };
@@ -425,5 +451,6 @@ mod tests {
 
         assert!(lock_behind_manifest(dir.path()));
         assert!(lock_file(dir.path()).is_some());
+        assert_eq!(lock_digest(dir.path()).unwrap().len(), 12);
     }
 }

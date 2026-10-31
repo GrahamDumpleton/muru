@@ -1590,6 +1590,21 @@ impl Service {
             .store
             .delete_release(app, id)
             .map_err(|error| error.to_string())?;
+
+        // Section 8.2: the environment built for the release goes with it.
+
+        let environment = crate::provision::Provisioning::environment_dir(
+            &self.handle.info.locations.state.path,
+            app,
+            id,
+        );
+
+        if environment.is_dir()
+            && let Err(error) = std::fs::remove_dir_all(&environment)
+        {
+            tracing::warn!(%error, "removing {} failed", environment.display());
+        }
+
         Ok(outcome.to_owned())
     }
 
@@ -1868,6 +1883,18 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .unwrap_or_default()
     };
 
+    let environment = if release.spec.build.builds {
+        crate::provision::Provisioning::environment_dir(
+            &handle.info.locations.state.path,
+            &release.app,
+            &release.id,
+        )
+        .display()
+        .to_string()
+    } else {
+        String::new()
+    };
+
     pb::Release {
         app: release.app,
         id: release.id,
@@ -1901,6 +1928,8 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .as_ref()
             .and_then(|interpreter| interpreter.request.clone())
             .unwrap_or_default(),
+        environment,
+        build_when: release.spec.build.when.as_str().to_owned(),
         processes: release.spec.processes,
         threads: release.spec.threads,
         sync_threads: release.spec.sync_threads,

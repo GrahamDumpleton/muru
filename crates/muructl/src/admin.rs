@@ -1826,6 +1826,20 @@ pub struct DeployArgs {
     #[arg(long)]
     python: Option<PathBuf>,
 
+    /// When the daemon builds the release's environment from uv.lock:
+    /// auto (the default) when the source has a lock and no .venv, always
+    /// when it has a lock, never.
+    #[arg(long, value_name = "MODE")]
+    build: Option<String>,
+
+    /// An extra the built environment includes; repeatable.
+    #[arg(long = "build-extra", value_name = "NAME")]
+    build_extra: Vec<String>,
+
+    /// A dependency group the built environment includes; repeatable.
+    #[arg(long = "build-group", value_name = "NAME")]
+    build_group: Vec<String>,
+
     /// Worker processes.
     #[arg(long)]
     processes: Option<u32>,
@@ -2256,6 +2270,9 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             .python
             .map(|path| absolute_interpreter(&path, None))
             .unwrap_or_default(),
+        build_when: args.build.unwrap_or_default(),
+        build_extras: args.build_extra,
+        build_groups: args.build_group,
         processes: args.processes,
         threads: args.threads,
         sync_threads: args.sync_threads,
@@ -3899,6 +3916,17 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
     }
 
     lines.push(("python".to_owned(), python));
+
+    if !release.environment.is_empty() {
+        lines.push((
+            "environment".to_owned(),
+            format!(
+                "{} (built, build.when = {})",
+                release.environment, release.build_when
+            ),
+        ));
+    }
+
     lines.push((
         "entrypoint".to_owned(),
         format!(
