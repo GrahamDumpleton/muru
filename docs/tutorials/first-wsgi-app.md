@@ -16,8 +16,10 @@ application fails, and try watch reload, HTTPS and the dashboard.
 ## Install
 
 Muru is two pieces: `muructl`, the command, and `muru`, the Python runtime
-library that runs inside your application's interpreter. Both are on PyPI,
-with wheels for Linux and macOS on CPython 3.11 and later, including the
+library that runs inside your application's interpreter. You install the
+first; `muructl` provides the second, matching its own version, for
+whatever interpreter your application runs on. Both are on PyPI, with
+wheels for Linux and macOS on CPython 3.11 and later, including the
 free-threaded builds.
 
 Install the command once, for your user:
@@ -28,17 +30,21 @@ uv tool install muructl
 
 (or `pipx install muructl`, or `pip install muructl` into any environment;
 it is a single binary with no Python dependencies). Then make a project
-directory with a virtualenv and the runtime library in it:
+directory with a virtualenv:
 
 ```
 mkdir hello && cd hello
 uv init --bare
-uv add muru
+uv venv
 ```
 
-With pip instead: `python -m venv .venv && .venv/bin/pip install muru`.
-`muructl` finds the interpreter in the active virtualenv or the project's
-`.venv`, so it knows where `muru` is.
+With pip instead: `python -m venv .venv`. `muructl` finds the interpreter
+in the active virtualenv or the project's `.venv`, and the first time it
+runs on a Python version it fetches the runtime library for it, once,
+into your user cache. Nothing is installed into the project. If your
+editor should know about `muru` for completion, `uv add --dev muru` adds
+it as a development dependency, and the copy `muructl` provides is used
+when the versions match.
 
 ## A small application
 

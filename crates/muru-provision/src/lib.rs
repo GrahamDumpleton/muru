@@ -7,11 +7,13 @@
 pub mod interpreter;
 pub mod probe;
 pub mod resolve;
+pub mod runtime;
 pub mod specifier;
 pub mod uv;
 
 pub use interpreter::{Python, Request, Source};
 pub use probe::{Probe, ProbeError};
 pub use resolve::{Chosen, Inputs, Mode, ResolveError, Resolved, resolve};
+pub use runtime::{How, Provided, RuntimeError};
 pub use specifier::{SpecifierSet, Version};
 pub use uv::{Found, Isolation, Uv, UvError};

@@ -3656,6 +3656,28 @@ impl Daemon {
             .map_err(|error| error.to_string())
     }
 
+    /// Section 8.3: the runtime library for an interpreter, from the
+    /// environment, the state directory's runtime directories or a fetch,
+    /// under the `[tools]` table's offline and wheel directory settings.
+    async fn runtime_library(&self, python: &Path) -> Result<muru_provision::Provided, String> {
+        let probe = muru_provision::probe::probe(python).map_err(|error| error.to_string())?;
+        let tools = &self.info.provisioning.tools;
+        let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
+        let root = self.locations.state.path.join("runtime");
+        let wheel_dir = tools.wheel_dir.as_deref().map(PathBuf::from);
+        let options = muru_provision::runtime::Options {
+            probe: &probe,
+            version: &version,
+            root: &root,
+            wheel_dir: wheel_dir.as_deref(),
+            offline: tools.offline.unwrap_or(false),
+        };
+
+        muru_provision::runtime::provide(&options, "tools.wheel_dir")
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Start a release's host and wait until every worker listens
     /// (pending or stopped to starting and warming; or failed). The
     /// caller marks the release ready once the edge has it, with
@@ -3734,8 +3756,34 @@ impl Daemon {
                 .await;
         }
 
+        // Section 8.3: the runtime library for the release's interpreter,
+        // from the environment when it matches, else the state directory,
+        // else fetched once. A mismatched copy that has to do is a warning
+        // in the release's events; nothing usable fails the release.
+
+        let library = match self.runtime_library(&spec.python).await {
+            Ok(library) => library,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
+        for note in &library.notes {
+            let level = if library.how == muru_provision::How::Fallback {
+                "warning"
+            } else {
+                "info"
+            };
+            self.events
+                .emit("release.state_changed", &subject, level, note);
+        }
+
         let host_spec = HostSpec {
             python: spec.python.clone(),
+            pythonpath: library.pythonpath.clone(),
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),

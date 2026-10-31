@@ -1324,11 +1324,18 @@ dependencies = [
 name = "muru-provision"
 version = "0.1.0-alpha.12"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
  "muru-config",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
 ]
 

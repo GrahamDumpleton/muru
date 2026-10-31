@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod init;
+mod provision;
 mod pstats;
 mod run_admin;
 mod watch;
@@ -172,6 +173,12 @@ enum Command {
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
+    },
+
+    /// The runtime library on its own: unpack it for an image.
+    Runtime {
+        #[command(subcommand)]
+        command: provision::RuntimeCommand,
     },
 
     /// Change logger levels in a release's workers for a period.
@@ -791,6 +798,7 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
@@ -2171,6 +2179,18 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         println!("muru: {}", python.describe());
     }
 
+    // Section 8.3: the runtime library, from the environment when it
+    // matches, else the user cache, else fetched once; said on the
+    // terminal, with the warning when a mismatched copy has to do.
+
+    let library = provision::runtime(&python.probe).await?;
+
+    for note in &library.notes {
+        println!("muru: {note}");
+    }
+
+    println!("muru: {}", library.describe());
+
     // Section 13.1: the local file is said once, and so is a .gitignore
     // that would let it be committed.
 
@@ -2202,6 +2222,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let label = app_name(&resolved.entrypoint).replace('_', "-");
     let spec = HostSpec {
         python: python.python.clone(),
+        pythonpath: library.pythonpath.clone(),
         app: resolved.entrypoint.clone(),
         name: Some(label.clone()),
         release: None,

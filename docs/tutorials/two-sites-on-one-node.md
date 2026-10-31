@@ -23,13 +23,13 @@ name the daemon does not know will reach none of them.
 
 ## The node
 
-Make a directory for everything this node serves, with the runtime
-library for the shop:
+Make a directory for everything this node serves, with a virtualenv the
+shop runs on:
 
 ```
 mkdir node && cd node
 uv init --bare
-uv add muru
+uv venv
 mkdir shop blog notes certs
 ```
 

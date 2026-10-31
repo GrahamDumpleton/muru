@@ -70,6 +70,38 @@ Without uv, a path or an existing environment works as before, and a
 request fails with a message saying uv is needed. Install uv, or set
 `MURU_UV` to where it is.
 
+## The runtime library
+
+The `muru` package that runs inside your interpreter is Muru's, not your
+application's, so it is not a dependency of your project. muructl puts
+the copy matching its own version on the host's `PYTHONPATH`, one
+directory per interpreter tag, and goes to the network last:
+
+1. If the environment already has `muru` of muructl's version, it is
+   used as it is and nothing is injected or fetched. An offline machine
+   that has it installed needs no flag.
+
+2. Else an unpacked copy already in the cache is used: your user cache
+   under `muructl run`, the daemon's state directory under the daemon.
+
+3. Else the wheel is fetched from PyPI, once per interpreter tag, with
+   its published hash checked, or from a local directory of wheels named
+   by `MURU_WHEEL_DIR` under `muructl run` or `wheel_dir` in the daemon's
+   `[tools]` table.
+
+4. If that fails and the environment has `muru` of another version, it is
+   used with a warning naming both versions.
+
+Set `MURU_OFFLINE=1` (uv's `UV_OFFLINE=1` works too) under `muructl run`,
+or `offline = true` in the daemon's `[tools]` table, on a machine where the
+attempt to connect is itself a problem; the fetch is then skipped. Where
+nothing usable exists, the message names the two ways out: a wheel in the
+wheel directory, or `pip install muru==VERSION` into the environment.
+
+For an image, `muructl runtime install --python /app/.venv/bin/python
+--target /opt/muru` unpacks the library during the build, and the
+container puts `/opt/muru` first on `PYTHONPATH`.
+
 ## The daemon's `[tools]` table
 
 ```toml

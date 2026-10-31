@@ -38,6 +38,8 @@ print(json.dumps({
     "platform": sys.platform,
     "machine": platform.machine(),
     "libc": platform.libc_ver()[0],
+    "libc_version": platform.libc_ver()[1],
+    "mac_version": platform.mac_ver()[0],
     "prefix": sys.prefix,
     "base_prefix": sys.base_prefix,
     "executable": sys.executable,
@@ -62,6 +64,12 @@ pub struct Probe {
     pub machine: String,
     /// The C library, `glibc` or `musl`, or empty where it is not reported.
     pub libc: String,
+    /// The C library's version, as `2.35`, or empty.
+    #[serde(default)]
+    pub libc_version: String,
+    /// The macOS version, as `15.1`, or empty elsewhere.
+    #[serde(default)]
+    pub mac_version: String,
     /// `sys.prefix`, the virtualenv when there is one.
     pub prefix: PathBuf,
     /// `sys.base_prefix`, the interpreter a virtualenv was made from.
@@ -240,6 +248,8 @@ mod tests {
             platform: "darwin".to_owned(),
             machine: "arm64".to_owned(),
             libc: String::new(),
+            libc_version: String::new(),
+            mac_version: String::new(),
             prefix: PathBuf::from("/usr"),
             base_prefix: PathBuf::from("/usr"),
             executable: PathBuf::from("/usr/bin/python3"),

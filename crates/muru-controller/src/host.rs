@@ -384,6 +384,9 @@ pub struct HostSpec {
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
+    /// Section 8.3: the runtime library directory to put first on
+    /// PYTHONPATH, when the environment's own `muru` is not used.
+    pub pythonpath: Option<PathBuf>,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -777,6 +780,26 @@ impl HostProcess {
         }
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
+
+        // Section 8.3: the runtime library first on PYTHONPATH, ahead of
+        // whatever the environment or the settings put there.
+
+        if let Some(runtime) = &spec.pythonpath {
+            let existing = spec
+                .env
+                .iter()
+                .find(|(name, _)| name == "PYTHONPATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PYTHONPATH").ok())
+                .filter(|value| !value.is_empty());
+
+            let value = match existing {
+                Some(existing) => format!("{}:{existing}", runtime.display()),
+                None => runtime.display().to_string(),
+            };
+
+            command.env("PYTHONPATH", value);
+        }
 
         let mut child = command
             .spawn()
