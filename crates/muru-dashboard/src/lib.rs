@@ -290,6 +290,9 @@ pub struct ScalingRow {
     /// CPU per wall second as a share of what a worker can use,
     /// formatted, or a dash.
     pub cpu: String,
+    /// The share of the workers' time spent in garbage collection,
+    /// formatted, or a dash.
+    pub gc: String,
     /// The 95th percentile GIL wait, formatted, or a dash.
     pub gil_wait: String,
     /// The 95th percentile event loop lag, formatted, or a dash.

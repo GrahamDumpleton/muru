@@ -10,6 +10,14 @@
   <div class="tile"><div class="label">USS</div><div class="value">{{ view.uss }}</div></div>
   <div class="tile"><div class="label">GC counts</div><div class="value">{{ view.gc_counts }}</div></div>
 </div>
+{% if !view.gc_pauses.is_empty() %}
+<table>
+  <tr><th>Generation</th><th class="num">Collections</th><th class="num">Time</th><th class="num">Objects freed</th><th class="num">With requests in flight</th><th class="num">Requests waiting</th></tr>
+  {% for row in view.gc_pauses %}
+  <tr><td>{{ row.generation }}</td><td class="num">{{ row.collections }}</td><td class="num">{{ row.total }}</td><td class="num">{{ row.collected }}</td><td class="num">{{ row.busy }}</td><td class="num">{{ row.waited }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
 <table>
   <tr><th>Type</th><th class="num">Objects</th></tr>
   {% for object in view.objects %}

@@ -156,7 +156,10 @@ def test_a_lock_change_under_reload_builds_before_the_new_release(tmp_path: Path
     process, log = prov.run_until_serving(directory, env, python=Path(sys.executable), reload=True)
 
     try:
-        prov.wait_for(log, "muru: serving")
+        # The watcher starts after the first release serves, so a change
+        # made before "watching" is printed would go unseen.
+
+        prov.wait_for(log, "muru: watching")
         lock = directory / "uv.lock"
         lock.write_text(lock.read_text() + "\n# touched by the test\n")
         text = prov.wait_for(log, "muru: switched to release r2")

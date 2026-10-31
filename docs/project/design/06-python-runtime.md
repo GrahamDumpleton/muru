@@ -57,7 +57,7 @@ Per-worker imports keep everything else the same: worker groups, mounts, variant
 3. gc.freeze() immediately before each fork, which moves every tracked object into a permanent generation the collector ignores.
 4. gc.enable() in each worker immediately after fork, before post_fork hooks run, so objects the worker creates are collected normally.
 
-Limits: reference count updates still write to objects that are used, so frequently used objects still diverge (immortal objects in Python 3.12 and later cover only some core objects). Objects not tracked by the collector, such as strings and numbers, are unaffected. Frozen garbage is never collected, which costs only shared memory. Behaviour on free-threaded builds, whose collector works differently, is to be verified in the phase 0 spike. Shared and private memory per worker (PSS and USS) are reported so the effect can be measured.
+What collection still costs a worker after this sequence is measured rather than assumed: each worker times its collections and reports them with its other signals (section 11.1). Limits: reference count updates still write to objects that are used, so frequently used objects still diverge (immortal objects in Python 3.12 and later cover only some core objects). Objects not tracked by the collector, such as strings and numbers, are unaffected. Frozen garbage is never collected, which costs only shared memory. Behaviour on free-threaded builds, whose collector works differently, is to be verified in the phase 0 spike. Shared and private memory per worker (PSS and USS) are reported so the effect can be measured.
 
 ## 6.3 Hooks
 

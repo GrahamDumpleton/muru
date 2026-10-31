@@ -9,13 +9,19 @@ metrics. A development run serves the same text from its dashboard.
 from __future__ import annotations
 
 import http.client
+import json
+import os
 import re
-from collections.abc import Iterator
+import signal
+import sys
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 from support import server as support
 from support.daemon import SHOP, Daemon, daemon, start_daemon
+from test_hosts import certificate
 
 __all__ = ["daemon"]
 
@@ -118,3 +124,131 @@ def test_nothing_is_served_unless_asked(daemon: Daemon) -> None:
     assert "metrics" not in daemon.muructl("status").stdout
     text = daemon.muructl("metrics").stdout
     assert "muru_snapshot_version" in text
+
+
+def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("the condition was not met in time")
+
+        time.sleep(0.2)
+
+
+def test_worker_and_listener_families_are_exported(tmp_path: Path) -> None:
+    """The families fed by the hosts' reports and events, and by the TLS
+    acceptor: each worker's GIL waits, the workers recycled and exited by
+    reason, the requests on ASGI loops, and the handshakes by result."""
+
+    cert, key = certificate(tmp_path, "shop", "shop.test")
+    plain, secure = support.free_port(), support.free_port()
+    daemon = start_daemon(tmp_path, listeners=[(plain, False), (secure, True)])
+
+    try:
+        config = tmp_path / "node.toml"
+        config.write_text(
+            f"""[app.shop.release.r1]
+source = '{SHOP}'
+python = '{sys.executable}'
+processes = 1
+max_requests = 5
+memory = {{ check_interval = "1s" }}
+
+[app.asgi.release.r1]
+source = '{support.FIXTURES}'
+python = '{sys.executable}'
+entrypoint = 'plain_asgi:application'
+processes = 1
+
+[host.shop]
+names = ["shop.test"]
+tls = {{ certificate = "{cert.name}", key = "{key.name}" }}
+default = true
+
+[[route]]
+host = "shop"
+app = "shop"
+
+[[route]]
+host = "shop"
+path = "/asgi"
+app = "asgi"
+"""
+        )
+        applied = daemon.muructl("apply", "-f", str(config), check=False)
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        daemon.wait_for_routing("shop")
+
+        # Six requests to a worker allowed five: the host recycles it.
+
+        pid = json.loads(daemon.request("/info", host="shop.test").body)["pid"]
+
+        for _ in range(6):
+            assert daemon.request("/info", host="shop.test").status == 200
+
+        wait_for(lambda: "worker.recycled" in daemon.events())
+
+        # A handshake the client completes, and one it refuses once it
+        # sees a certificate for another name.
+
+        assert daemon.request("/info", host="shop.test", port=secure, cafile=cert).status == 200
+
+        with pytest.raises(OSError):
+            daemon.request("/info", host="shop.test", port=secure, cafile=cert, server_hostname="x")
+
+        # A worker killed from outside exits on its own and is restarted.
+
+        daemon.wait_for_routing("shop")
+        pid = json.loads(daemon.request("/info", host="shop.test").body)["pid"]
+        os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: "worker.exited" in daemon.events())
+
+        def restarted() -> bool:
+            response = daemon.request("/info", host="shop.test")
+            return response.status == 200 and json.loads(response.body)["pid"] != pid
+
+        wait_for(restarted)
+
+        def exported() -> str:
+            return daemon.muructl("metrics").stdout
+
+        labels = 'app="shop",release="r1",group="default"'
+        wait_for(lambda: f'muru_worker_exits_total{{{labels},reason="crashed"}} 1\n' in exported())
+        text = exported()
+        assert re.search(
+            rf'muru_worker_recycles_total\{{{re.escape(labels)},reason="max_requests"\}} [1-9]\n',
+            text,
+        ), text
+        assert "# TYPE muru_worker_recycles_total counter\n" in text
+        assert "# TYPE muru_worker_exits_total counter\n" in text
+        assert 'muru_async_slots_busy{app="asgi",release="r1",group="default"} 0\n' in text, text
+        assert f"muru_async_slots_busy{{{labels}}} 0\n" in text, "a WSGI group holds none"
+        listener = f'listener="127.0.0.1:{secure}"'
+        assert f'muru_tls_handshakes_total{{{listener},result="completed"}} 1\n' in text, text
+        assert f'muru_tls_handshakes_total{{{listener},result="failed"}} 1\n' in text, text
+
+        # The worker's own histograms arrive with its memory report, once
+        # the restarted worker has served something; a free-threaded
+        # worker never waits for a GIL.
+
+        if sys._is_gil_enabled():  # type: ignore[attr-defined]
+            wait_for(lambda: f"muru_gil_wait_seconds_count{{{labels}," in exported())
+            text = exported()
+            assert "# TYPE muru_gil_wait_seconds histogram\n" in text
+            bucket = (
+                rf'muru_gil_wait_seconds_bucket\{{{re.escape(labels)},worker="0",le="0.0001"\}}'
+            )
+            assert re.search(bucket + r" \d+\n", text), text
+            assert re.search(
+                rf'muru_gil_wait_seconds_sum\{{{re.escape(labels)},worker="0"\}} [0-9.e-]+\n', text
+            ), text
+
+        wait_for(
+            lambda: (
+                'muru_loop_lag_seconds_count{app="asgi",release="r1",group="default",worker="0"}'
+                in exported()
+            )
+        )
+    finally:
+        daemon.stop()

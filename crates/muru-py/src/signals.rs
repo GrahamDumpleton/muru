@@ -12,15 +12,18 @@ use muru_proto::worker::v1::SIGNAL_BOUNDS_US;
 use pyo3::prelude::*;
 
 /// A cumulative histogram over `SIGNAL_BOUNDS_US`, with the count of
-/// all after the bounds.
+/// all after the bounds, and the sum of what was observed, so the
+/// daemon can export it as a Prometheus histogram (section 11.1).
 pub struct Histogram {
     counts: [AtomicU64; SIGNAL_BOUNDS_US.len() + 1],
+    sum_us: AtomicU64,
 }
 
 impl Histogram {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             counts: [const { AtomicU64::new(0) }; SIGNAL_BOUNDS_US.len() + 1],
+            sum_us: AtomicU64::new(0),
         }
     }
 
@@ -32,20 +35,31 @@ impl Histogram {
             .position(|bound| micros <= *bound)
             .unwrap_or(SIGNAL_BOUNDS_US.len());
         self.counts[slot].fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// The sum of every observation, in microseconds.
+    pub(crate) fn sum_us(&self) -> u64 {
+        self.sum_us.load(Ordering::Relaxed)
+    }
+
+    /// The counts at or below each bound, then the count of all.
+    pub(crate) fn counts(&self) -> Vec<u64> {
+        let mut total = 0;
+
+        self.counts
+            .iter()
+            .map(|count| {
+                total += count.load(Ordering::Relaxed);
+                total
+            })
+            .collect()
     }
 
     /// The counts at or below each bound, then the count of all, as a
     /// JSON array.
-    fn cumulative(&self) -> String {
-        let mut total = 0;
-        let counts: Vec<String> = self
-            .counts
-            .iter()
-            .map(|count| {
-                total += count.load(Ordering::Relaxed);
-                total.to_string()
-            })
-            .collect();
+    pub(crate) fn cumulative(&self) -> String {
+        let counts: Vec<String> = self.counts().iter().map(u64::to_string).collect();
         format!("[{}]", counts.join(","))
     }
 }
@@ -89,15 +103,17 @@ fn gil_enabled() -> bool {
 }
 
 /// The signals as fields to add to a status line: the CPU time, whether
-/// the interpreter has a GIL, and the two histograms.
+/// the interpreter has a GIL, and the two histograms with their sums.
 pub fn report_fields() -> String {
     format!(
-        ",\"cpu_ms\":{},\"gil_enabled\":{},\"gil_wait\":{},\"loop_lag\":{}",
+        ",\"cpu_ms\":{},\"gil_enabled\":{},\"gil_wait\":{},\"gil_wait_us\":{},\"loop_lag\":{},\"loop_lag_us\":{}",
         cpu_ms(),
         gil_enabled(),
         GIL_WAIT.cumulative(),
-        LOOP_LAG.cumulative()
-    )
+        GIL_WAIT.sum_us(),
+        LOOP_LAG.cumulative(),
+        LOOP_LAG.sum_us()
+    ) + &crate::gc::report_field()
 }
 
 #[cfg(test)]
@@ -111,6 +127,7 @@ mod tests {
         histogram.record(Duration::from_millis(3));
         histogram.record(Duration::from_secs(60));
         assert_eq!(histogram.cumulative(), "[1,1,1,2,2,2,2,2,2,2,3]");
+        assert_eq!(histogram.sum_us(), 50 + 3_000 + 60_000_000);
         assert!(cpu_ms() < u64::MAX);
     }
 }

@@ -173,10 +173,29 @@ pub struct MemoryView {
     pub uss: String,
     /// The garbage collector's counts by generation.
     pub gc_counts: String,
+    /// The collections the runtime timed, by generation (section 11.1).
+    pub gc_pauses: Vec<GcRow>,
     /// The commonest object types with their counts.
     pub objects: Vec<ObjectRow>,
     /// Why the worker could not answer, when it could not.
     pub error: String,
+}
+
+/// One generation's garbage collections since the worker started.
+#[derive(Debug, Clone, Default)]
+pub struct GcRow {
+    /// The generation: 0, 1, 2 or full.
+    pub generation: String,
+    /// Collections run.
+    pub collections: u64,
+    /// Time spent collecting, formatted.
+    pub total: String,
+    /// Objects freed.
+    pub collected: u64,
+    /// Collections that ran while requests were in flight.
+    pub busy: u64,
+    /// The requests in flight during them, summed.
+    pub waited: u64,
 }
 
 /// One object type and how many there are.
@@ -438,6 +457,23 @@ pub fn memory_views(answer: &DebugAnswer) -> Vec<MemoryView> {
                 pss: size("pss"),
                 uss: size("uss"),
                 gc_counts: result["gc"]["counts"].to_string(),
+                gc_pauses: result["gc"]["pauses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|generation| {
+                        let count = |key: &str| generation[key].as_u64().unwrap_or(0);
+
+                        GcRow {
+                            generation: generation["generation"].as_str().unwrap_or("?").to_owned(),
+                            collections: count("collections"),
+                            total: format!("{:.1} ms", count("ns") as f64 / 1e6),
+                            collected: count("collected"),
+                            busy: count("busy"),
+                            waited: count("waited"),
+                        }
+                    })
+                    .collect(),
                 objects,
                 error: String::new(),
             }

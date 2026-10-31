@@ -442,9 +442,10 @@ message GroupScale {
   optional double worker_cpu = 25;  // section 7.3: CPU seconds per wall second, as a share of what a worker can use
   optional double gil_wait_p95_ms = 26;
   optional double loop_lag_p95_ms = 27;
-  string bottleneck = 28;           // cpu, gil, io, heavy, loop, memory, idle or none
+  string bottleneck = 28;           // cpu, gil, io, heavy, loop, memory, gc, idle or none
   string diagnosis = 29;            // the bottleneck in words
   string advice = 30;               // the tuning it suggests for the next release, when any
+  optional double gc_share = 31;    // section 11.1: the share of the workers' time spent in garbage collection
 }
 
 // Section 9.1: pending, starting, warming, ready, draining, stopping,
