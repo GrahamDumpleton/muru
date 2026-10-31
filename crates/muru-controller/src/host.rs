@@ -384,6 +384,14 @@ pub struct HostSpec {
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
+    /// Section 8.3: the runtime library directory to put first on
+    /// PYTHONPATH, when the environment's own `muru` is not used.
+    pub pythonpath: Option<PathBuf>,
+    /// Section 8.2: the directory bytecode is written under
+    /// (PYTHONPYCACHEPREFIX), when it is redirected.
+    pub pycache_prefix: Option<PathBuf>,
+    /// Section 8.2: write no bytecode at all.
+    pub no_bytecode: bool,
     /// The user and group the host runs as, and its umask, when the
     /// daemon is root and the application names them (section 10.9).
     pub identity: Option<Identity>,
@@ -778,6 +786,36 @@ impl HostProcess {
 
         command.envs(spec.env.iter().map(|(name, value)| (name, value)));
 
+        // Section 8.2: where bytecode goes, when it is not left to Python.
+
+        if let Some(prefix) = &spec.pycache_prefix {
+            command.env("PYTHONPYCACHEPREFIX", prefix);
+        }
+
+        if spec.no_bytecode {
+            command.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
+
+        // Section 8.3: the runtime library first on PYTHONPATH, ahead of
+        // whatever the environment or the settings put there.
+
+        if let Some(runtime) = &spec.pythonpath {
+            let existing = spec
+                .env
+                .iter()
+                .find(|(name, _)| name == "PYTHONPATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PYTHONPATH").ok())
+                .filter(|value| !value.is_empty());
+
+            let value = match existing {
+                Some(existing) => format!("{}:{existing}", runtime.display()),
+                None => runtime.display().to_string(),
+            };
+
+            command.env("PYTHONPATH", value);
+        }
+
         let mut child = command
             .spawn()
             .with_context(|| format!("starting the host with {}", spec.python.display()))?;
@@ -1095,6 +1133,13 @@ fn kill_with_workers(pid: u32) {
 /// terminal do not reach it, and as `identity` when one is set (section
 /// 10.9).
 pub(crate) fn own_session(command: &mut Command, identity: Option<Identity>) {
+    own_session_std(command.as_std_mut(), identity);
+}
+
+/// `own_session` for a standard library command, as a build runs.
+pub(crate) fn own_session_std(command: &mut std::process::Command, identity: Option<Identity>) {
+    use std::os::unix::process::CommandExt;
+
     // SAFETY: setsid, setgroups, setgid, setuid and umask are
     // async-signal-safe and the closure runs in the child between fork
     // and exec, touching nothing else.

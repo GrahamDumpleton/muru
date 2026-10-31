@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod model;
 pub mod notify;
 pub mod overlays;
+pub mod provision;
 pub mod reload;
 pub mod rollouts;
 pub mod rotation;

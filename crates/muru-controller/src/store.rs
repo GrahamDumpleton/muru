@@ -1092,6 +1092,9 @@ mod tests {
             maintenance: None,
             http: None,
             layers: crate::model::Layers::default(),
+            interpreter: None,
+            build: crate::model::BuildSpec::default(),
+            bytecode: crate::model::BytecodeSpec::default(),
         }
     }
 

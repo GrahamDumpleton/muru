@@ -62,6 +62,8 @@ pub struct NodeSettings {
     pub debug_exec: bool,
     /// The node's budget (section 7.4).
     pub budget: crate::budget::Budget,
+    /// The `[tools]` table (section 8.4): uv and interpreter installs.
+    pub tools: muru_config::Tools,
     /// The `[proxy]` table as the edge takes it (section 4.7).
     pub proxy: Option<pb::Proxy>,
     /// The `[compression]` table as the edge takes it (section 4.17).
@@ -162,6 +164,7 @@ impl NodeSettings {
                 .or_else(|| daemon.and_then(|table| table.user.clone())),
             debug_exec: daemon.and_then(|table| table.debug_exec).unwrap_or(false),
             budget,
+            tools: document.tools.clone().unwrap_or_default(),
             proxy,
             compression,
             error_pages,

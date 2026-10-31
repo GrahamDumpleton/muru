@@ -23,6 +23,8 @@ pub struct Watch {
     directories: Vec<PathBuf>,
     include: GlobSet,
     exclude: GlobSet,
+    /// Files watched whatever the patterns and directories say.
+    files: Vec<PathBuf>,
 }
 
 type Snapshot = HashMap<PathBuf, (SystemTime, u64)>;
@@ -38,7 +40,15 @@ impl Watch {
             directories,
             include: globs(include)?,
             exclude: globs(&[exclude, &EDITOR_FILES.map(str::to_owned)].concat())?,
+            files: Vec::new(),
         })
+    }
+
+    /// Also watch these files, whatever the patterns and directories say
+    /// (section 9.8: the lock, the manifest and uv's pin).
+    pub fn with_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.files = files;
+        self
     }
 
     /// The directories watched.
@@ -94,6 +104,17 @@ impl Watch {
 
                 let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 files.insert(entry.path().to_path_buf(), (modified, metadata.len()));
+            }
+        }
+
+        for file in &self.files {
+            let Ok(metadata) = std::fs::metadata(file) else {
+                continue;
+            };
+
+            if metadata.is_file() {
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                files.insert(file.clone(), (modified, metadata.len()));
             }
         }
 

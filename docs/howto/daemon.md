@@ -200,6 +200,46 @@ $ muructl config show shop --effective
 ...
 ```
 
+## Building the environment on the node
+
+A source with a `uv.lock` and no `.venv` gets an environment of its own,
+built by the daemon before the release starts: `uv sync --frozen` without
+the dev group, without building sdists, with bytecode compiled and the
+project's extras and groups, into the state directory under
+`envs/APP/RELEASE`, as the release's user. The release is in the
+`building` state meanwhile, uv's lines go to the release log tagged
+`[build]`, and a failed build fails the release with uv's last line. A
+source with its own `.venv` is used as it is, as before.
+
+```
+muructl deploy shop /srv/shop                        # builds when the source has a lock and no .venv
+muructl deploy shop /srv/shop --build always          # builds although the source has a .venv
+muructl deploy shop /srv/shop --build never           # runs on what is there
+muructl deploy shop /srv/shop --build-extra postgres
+```
+
+The same keys live in the project's `[tool.muru.build]` table and in a
+declared release's `build` table: `when`, `extras`, `groups`,
+`source_builds` and `compile_bytecode`. `muructl release show` names the
+environment a release runs on, and it is removed with the release. A
+Python the request names and the node lacks is downloaded into the state
+directory first, unless the `[tools]` table says `python_downloads =
+"never"` or `offline = true`.
+
+## Bytecode caches
+
+Python writes compiled bytecode into `__pycache__` beside the source,
+which an immutable release directory should not take and a release
+directory owned by another user cannot. Under the daemon, bytecode goes to
+a directory of the release's own under the state directory, `pycache/APP/RELEASE`,
+writable by the release's user and removed with the release, so cold
+starts stay fast and the source tree stays clean. A source that already
+holds bytecode for the release's interpreter, compiled by `muructl build
+--deployment` or `python -m compileall`, is used as it is. `bytecode` in
+the project's `[tool.muru]` table, in a declared release or as
+`--bytecode` on `muructl deploy` takes `redirect` (the default), `source`
+or `off`, and `muructl release show` says which is in force.
+
 ## Where things live
 
 The daemon keeps its state store, run directory and logs in the user

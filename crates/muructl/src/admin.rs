@@ -1820,9 +1820,31 @@ pub struct DeployArgs {
     #[arg(long, value_name = "NAME")]
     interface: Option<muru_config::Interface>,
 
-    /// The interpreter (default: the source's .venv, else the previous release's).
+    /// The interpreter: a path, or a version request such as 3.13 that
+    /// the daemon resolves with uv (default: the source's .venv, else its
+    /// own request, else the previous release's).
     #[arg(long)]
     python: Option<PathBuf>,
+
+    /// When the daemon builds the release's environment from uv.lock:
+    /// auto (the default) when the source has a lock and no .venv, always
+    /// when it has a lock, never.
+    #[arg(long, value_name = "MODE")]
+    build: Option<String>,
+
+    /// An extra the built environment includes; repeatable.
+    #[arg(long = "build-extra", value_name = "NAME")]
+    build_extra: Vec<String>,
+
+    /// A dependency group the built environment includes; repeatable.
+    #[arg(long = "build-group", value_name = "NAME")]
+    build_group: Vec<String>,
+
+    /// Where the release's bytecode goes: redirect (the default, a
+    /// directory of its own under the state directory), source (beside
+    /// the source, as Python does) or off.
+    #[arg(long, value_name = "MODE")]
+    bytecode: Option<String>,
 
     /// Worker processes.
     #[arg(long)]
@@ -2254,6 +2276,10 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             .python
             .map(|path| absolute_interpreter(&path, None))
             .unwrap_or_default(),
+        build_when: args.build.unwrap_or_default(),
+        build_extras: args.build_extra,
+        build_groups: args.build_group,
+        bytecode: args.bytecode.unwrap_or_default(),
         processes: args.processes,
         threads: args.threads,
         sync_threads: args.sync_threads,
@@ -3883,7 +3909,35 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         event_loop: interfaces.iter().any(|interface| *interface != "wsgi"),
     };
 
-    lines.push(("python".to_owned(), release.python.clone()));
+    let mut python = release.python.clone();
+
+    if !release.python_version.is_empty() {
+        python.push_str(&format!(
+            " ({}, {})",
+            release.python_version, release.python_tag
+        ));
+    }
+
+    if !release.python_request.is_empty() {
+        python.push_str(&format!(", requested {}", release.python_request));
+    }
+
+    lines.push(("python".to_owned(), python));
+
+    if !release.environment.is_empty() {
+        lines.push((
+            "environment".to_owned(),
+            format!(
+                "{} (built, build.when = {})",
+                release.environment, release.build_when
+            ),
+        ));
+    }
+
+    if !release.bytecode.is_empty() {
+        lines.push(("bytecode".to_owned(), release.bytecode.clone()));
+    }
+
     lines.push((
         "entrypoint".to_owned(),
         format!(

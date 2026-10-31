@@ -21,7 +21,7 @@ production settings, the edge serving the static files itself.
 ```
 mkdir mysite && cd mysite
 uv init --bare
-uv add django muru
+uv add django
 uv run django-admin startproject mysite .
 uv run manage.py migrate
 uv run manage.py createsuperuser

@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod init;
+mod provision;
 mod pstats;
 mod run_admin;
 mod watch;
@@ -53,6 +54,12 @@ struct Cli {
 enum Command {
     /// Run an application with an embedded controller and edge (development mode).
     Run(Box<RunArgs>),
+
+    /// Build a project's environment from uv.lock and provide the runtime library, then exit.
+    Build(Box<provision::BuildArgs>),
+
+    /// Load an application in a throwaway host and report what would fail, without serving.
+    Check(Box<CheckArgs>),
 
     /// Run or control the daemon.
     Daemon {
@@ -172,6 +179,12 @@ enum Command {
     Debug {
         #[command(subcommand)]
         command: admin::DebugCommand,
+    },
+
+    /// The runtime library on its own: unpack it for an image.
+    Runtime {
+        #[command(subcommand)]
+        command: provision::RuntimeCommand,
     },
 
     /// Change logger levels in a release's workers for a period.
@@ -557,6 +570,14 @@ struct RunArgs {
     #[arg(long)]
     no_reload: bool,
 
+    /// When the environment is built from uv.lock: auto (the default)
+    /// builds a missing .venv and leaves an existing one alone, always
+    /// also builds before the start, never builds nothing; a bare --build
+    /// means always. The project's [tool.muru.build] or muru.local.toml
+    /// sets it for good.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "always")]
+    build: Option<String>,
+
     /// Directory to watch for changes, relative to the project; defaults
     /// to the project itself. Repeatable.
     #[arg(long = "reload-dir", value_name = "DIR")]
@@ -574,11 +595,13 @@ struct RunArgs {
     #[arg(long = "reload-exclude", value_name = "GLOB")]
     reload_exclude: Vec<String>,
 
-    /// Python interpreter with the muru runtime library installed; a
-    /// relative path is the project's. Defaults to the active virtualenv's
-    /// interpreter, else the project's .venv, else python3 on PATH.
-    #[arg(long)]
-    python: Option<PathBuf>,
+    /// The interpreter: a path (a relative one is the project's), or a
+    /// version request such as 3.13, 3.14t or >=3.12 that uv resolves.
+    /// Without it: the active virtualenv, else the project's .venv, else
+    /// the project's own request (python in [tool.muru], .python-version,
+    /// requires-python), else python3 on PATH.
+    #[arg(long, value_name = "PATH or VERSION")]
+    python: Option<String>,
 
     /// Directory to run the host in, added to the module search path.
     #[arg(long)]
@@ -770,6 +793,8 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
+        Command::Build(args) => runtime.block_on(provision::build(*args)),
+        Command::Check(args) => runtime.block_on(check(*args)),
         Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
@@ -789,6 +814,7 @@ fn main() -> anyhow::Result<()> {
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
+        Command::Runtime { command } => runtime.block_on(provision::run(command)),
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
@@ -1417,6 +1443,12 @@ struct Resolved {
     project: PathBuf,
     /// The file the table came from, when there was one.
     source: Option<PathBuf>,
+    /// The table's `python` key: a path or a request (section 8.1).
+    python: Option<String>,
+    /// The table's build settings (section 8.2).
+    build: Option<muru_config::Build>,
+    /// The build mode muru.local.toml sets for this machine.
+    local_build_when: Option<muru_config::BuildWhen>,
     /// Named worker groups from the table (section 7.1).
     groups: std::collections::BTreeMap<String, muru_config::Group>,
     /// Named mounts from the table (section 6.7).
@@ -1525,10 +1557,11 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         )
     })?;
 
-    let (local, local_run) = match muru_config::load_local(&project, source.as_deref())? {
-        Some((path, run)) => (Some(path), run),
-        None => (None, muru_config::RunSettings::default()),
-    };
+    let (local, local_run, local_build_when) =
+        match muru_config::load_local(&project, source.as_deref())? {
+            Some((path, file)) => (Some(path), file.run, file.build_when),
+            None => (None, muru_config::RunSettings::default(), None),
+        };
 
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
 
@@ -1588,6 +1621,9 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
 
     Ok(Resolved {
         entrypoint,
+        python: table.python.clone(),
+        build: table.build.clone(),
+        local_build_when,
         interface: args
             .interface
             .or(table.interface)
@@ -1683,9 +1719,11 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
         python: Some(written_interpreter(
-            &python_interpreter(args.python.clone(), &resolved.project),
+            &interpreter(args, resolved, false)?.python,
             &resolved.project,
         )),
+        build: resolved.build.clone(),
+        bytecode: None,
         processes: Some(resolved.processes),
         threads: Some(resolved.threads),
         sync_threads: Some(resolved.sync_threads),
@@ -2066,41 +2104,341 @@ fn tls(args: &RunArgs, serving: &Serving, project: &Path) -> anyhow::Result<Opti
     }))
 }
 
-/// The interpreter to run the host with (section 13.1): --python, else the
-/// active virtualenv, else the project's own .venv, else python3 on PATH. A
-/// relative --python with a directory in it is the project's; a path is
-/// made absolute, because a virtualenv's interpreter locates its
-/// site-packages from its own path.
-fn python_interpreter(explicit: Option<PathBuf>, project: &Path) -> PathBuf {
-    let python = explicit
-        .map(|python| {
-            if python.components().count() > 1 {
-                project.join(python)
-            } else {
-                python
-            }
-        })
-        .or_else(|| {
-            std::env::var_os("VIRTUAL_ENV")
-                .map(|venv| PathBuf::from(venv).join("bin").join("python"))
-        })
-        .or_else(|| {
-            let venv = project.join(".venv").join("bin").join("python");
-            venv.is_file().then_some(venv)
-        })
-        .unwrap_or_else(|| PathBuf::from("python3"));
+/// The interpreter to run the host with (sections 8.1 and 13.1): --python
+/// as a path or a request, else the active virtualenv, else the project's
+/// own .venv, else the project's request through the developer's own uv,
+/// else python3 on PATH; probed, so an interpreter that cannot run Muru or
+/// is outside requires-python fails here, before anything starts.
+fn interpreter(
+    args: &RunArgs,
+    resolved: &Resolved,
+    built: bool,
+) -> anyhow::Result<muru_provision::Resolved> {
+    let uv = muru_provision::Uv::find(None, None);
+    let isolation = muru_provision::Isolation::default();
 
-    match (python.parent(), python.file_name()) {
-        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
-            // Resolve the directory, not the file: the interpreter is often a
-            // symlink into a virtualenv, and following it would lose the venv.
+    // After a build the environment just made is what runs: the flag's
+    // Python was what it was built with, and a request is satisfied by it.
 
-            match dir.canonicalize() {
-                Ok(dir) => dir.join(name),
-                Err(_) => python,
-            }
+    let inputs = muru_provision::Inputs {
+        mode: muru_provision::Mode::Development,
+        flag: if built { None } else { args.python.as_deref() },
+        table: resolved.python.as_deref(),
+        project: &resolved.project,
+        previous: None,
+        always: false,
+        uv: uv.as_ref(),
+        isolation: &isolation,
+    };
+
+    Ok(muru_provision::resolve(&inputs)?)
+}
+
+/// `muructl check` (section 6.8): what `build` prepared, validated with no
+/// side effects.
+#[derive(Debug, Args)]
+struct CheckArgs {
+    /// The application as module:callable, or a project directory (or its
+    /// pyproject.toml or muru.toml) whose [tool.muru] table names it.
+    /// Without it, the project in --chdir or the current directory.
+    #[arg(value_name = "ENTRYPOINT or PATH")]
+    app: Option<String>,
+
+    /// The interpreter, as muructl run takes it: a path or a version
+    /// request. Without it: the active virtualenv, the project's .venv,
+    /// the project's own request, python3 on PATH.
+    #[arg(long, value_name = "PATH or VERSION")]
+    python: Option<String>,
+
+    /// The project directory, when the entrypoint is given.
+    #[arg(long, value_name = "DIR")]
+    chdir: Option<PathBuf>,
+
+    /// Fail on anything the import check finds, not only on an error.
+    #[arg(long)]
+    strict: bool,
+
+    /// A file of NAME=VALUE lines, for settings the import reads.
+    #[arg(long, value_name = "FILE")]
+    env_file: Option<PathBuf>,
+}
+
+/// What the interpreter's check reports (muru.check).
+#[derive(Debug, serde::Deserialize)]
+struct CheckReport {
+    ok: bool,
+    #[serde(default)]
+    muru: String,
+    #[serde(default)]
+    entrypoints: Vec<CheckEntrypoint>,
+    #[serde(default)]
+    hooks: Vec<String>,
+    #[serde(default)]
+    findings: Vec<CheckFinding>,
+    #[serde(default)]
+    errors: Vec<CheckError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckEntrypoint {
+    entrypoint: String,
+    interface: String,
+    #[serde(default)]
+    factory: Option<String>,
+    #[serde(default)]
+    mount: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckFinding {
+    description: String,
+    advice: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckError {
+    error: String,
+    #[serde(default)]
+    traceback: String,
+}
+
+/// Validate a project the way `muructl run` would start it, and stop
+/// there: the tables, the interpreter and its requirement, the runtime
+/// library, then the application loaded in the interpreter under the
+/// import check, with the mounts and hooks. Nothing is built or served.
+async fn check(args: CheckArgs) -> anyhow::Result<()> {
+    // The project and its tables resolve exactly as a run's would, so the
+    // check sees what the run sees.
+
+    let mut argv = vec!["muructl".to_owned(), "run".to_owned()];
+
+    if let Some(app) = &args.app {
+        argv.push(app.clone());
+    }
+
+    if let Some(dir) = &args.chdir {
+        argv.push("--chdir".to_owned());
+        argv.push(dir.display().to_string());
+    }
+
+    if let Some(python) = &args.python {
+        argv.push("--python".to_owned());
+        argv.push(python.clone());
+    }
+
+    let cli = Cli::try_parse_from(&argv).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let Command::Run(run_args) = cli.command else {
+        anyhow::bail!("the check could not read its arguments as a run's");
+    };
+    let resolved = resolve(&run_args)?;
+    let mut failed = false;
+
+    if let Some(source) = &resolved.source {
+        println!(
+            "muru: check: [tool.muru] from {} is valid",
+            source.display()
+        );
+    }
+
+    let python = interpreter(&run_args, &resolved, false)?;
+    println!("muru: check: {}", python.describe());
+    let library = provision::runtime(&python.probe).await?;
+
+    for note in &library.notes {
+        println!("muru: check: {note}");
+    }
+
+    println!("muru: check: {}", library.describe());
+
+    if library.how == muru_provision::How::Fallback {
+        println!("muru: check: warning: the runtime library does not match muructl");
+    }
+
+    // Section 8.2: a source nobody can write to, with no bytecode compiled
+    // for this interpreter, recompiles on every start except under the
+    // daemon, which redirects.
+
+    let writable = {
+        let probe = resolved.project.join(".muru-check-write");
+        let ok = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    };
+
+    if !writable && !muru_provision::build::precompiled(&resolved.project, &python.probe.cache_tag)
+    {
+        println!(
+            "muru: check: warning: {} is not writable and holds no bytecode compiled for {}, so              outside the daemon every start recompiles the application; muructl build --deployment              compiles it",
+            resolved.project.display(),
+            python.probe.cache_tag
+        );
+    }
+
+    // The application, loaded in the interpreter under the import check.
+
+    let mut command = tokio::process::Command::new(&python.python);
+    command
+        .arg("-m")
+        .arg("muru.check")
+        .arg("--app")
+        .arg(&resolved.entrypoint)
+        .arg("--interface")
+        .arg(resolved.interface.as_str())
+        .arg("--chdir")
+        .arg(&resolved.project);
+
+    if let Some(phase) = resolved.factory {
+        command
+            .arg("--factory")
+            .arg("--factory-phase")
+            .arg(phase.as_str());
+    }
+
+    if let Some(hooks) = &resolved.hooks {
+        command.arg("--hooks").arg(hooks);
+    }
+
+    for (name, mount) in &resolved.mounts {
+        command.arg("--mount").arg(format!(
+            "{name}={}={}",
+            mount.entrypoint,
+            mount
+                .interface
+                .map_or("auto", |interface| interface.as_str())
+        ));
+    }
+
+    if let Some(runtime) = &library.pythonpath {
+        let existing = std::env::var("PYTHONPATH")
+            .ok()
+            .filter(|value| !value.is_empty());
+        command.env(
+            "PYTHONPATH",
+            match existing {
+                Some(existing) => format!("{}:{existing}", runtime.display()),
+                None => runtime.display().to_string(),
+            },
+        );
+    }
+
+    for (name, value) in &resolved.env {
+        if let muru_config::EnvValue::Plain(text) = value {
+            command.env(name, text);
         }
-        _ => python,
+    }
+
+    if let Some(file) = &args.env_file {
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+
+        for line in text.lines() {
+            let line = line.trim();
+
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((name, value)) = line.split_once('=') else {
+                anyhow::bail!("{}: {line:?} is not NAME=VALUE", file.display());
+            };
+
+            command.env(name.trim(), value.trim().trim_matches('"'));
+        }
+    }
+
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("running {}", python.python.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let report: CheckReport = match serde_json::from_str(stdout.trim()) {
+        Ok(report) => report,
+        Err(_) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "the interpreter did not report: {}",
+                stderr
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|line| !line.is_empty())
+                    .unwrap_or("no output")
+            );
+        }
+    };
+
+    if !report.muru.is_empty() && report.muru != library.version {
+        println!(
+            "muru: check: warning: the interpreter imported muru {} where {} was provided",
+            report.muru, library.version
+        );
+    }
+
+    for entrypoint in &report.entrypoints {
+        let what = match &entrypoint.mount {
+            Some(mount) => format!("mount {mount}: {}", entrypoint.entrypoint),
+            None => entrypoint.entrypoint.clone(),
+        };
+
+        match entrypoint.factory.as_deref() {
+            Some("worker") => println!(
+                "muru: check: {what} is a factory called in each worker, so its application is                  not checked here"
+            ),
+            _ => println!(
+                "muru: check: {what} is served as {}",
+                interface_label(&entrypoint.interface)
+            ),
+        }
+    }
+
+    if !report.hooks.is_empty() {
+        println!(
+            "muru: check: hooks module {} defines {}",
+            resolved.hooks.as_deref().unwrap_or("?"),
+            report.hooks.join(", ")
+        );
+    }
+
+    for finding in &report.findings {
+        println!(
+            "muru: check: warning: {}; {}",
+            finding.description, finding.advice
+        );
+    }
+
+    for error in &report.errors {
+        println!("muru: check: error: {}", error.error);
+        eprint!("{}", error.traceback);
+        failed = true;
+    }
+
+    if !report.ok {
+        failed = true;
+    }
+
+    if args.strict && !report.findings.is_empty() {
+        println!(
+            "muru: check: {} finding(s) fail the check under --strict",
+            report.findings.len()
+        );
+        failed = true;
+    }
+
+    if failed {
+        anyhow::bail!("the check failed");
+    }
+
+    println!("muru: check: {} passed", resolved.entrypoint);
+    Ok(())
+}
+
+/// An interface as the check names it.
+fn interface_label(interface: &str) -> &str {
+    match interface {
+        "wsgi" => "WSGI",
+        "asgi" => "ASGI",
+        "grpc" => "gRPC",
+        other => other,
     }
 }
 
@@ -2167,6 +2505,52 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         println!("muru: using [tool.muru] from {}", source.display());
     }
 
+    // Section 8.2: run is build under the build mode, then serve. A
+    // project with a lock and no environment is built once; an existing
+    // one is used as it is, and said to be behind the lock when it is.
+
+    let when = provision::effective_when(
+        args.build.as_deref(),
+        resolved.local_build_when,
+        resolved.build.as_ref(),
+        development,
+    )?;
+    let built = provision::prepare(
+        &resolved.project,
+        when,
+        args.python.as_deref(),
+        resolved.python.as_deref(),
+        development,
+    )
+    .await?;
+
+    // Section 8.1: the interpreter, said when something other than the
+    // flag or an environment chose it, since those are what the developer
+    // expects.
+
+    let python = interpreter(&args, &resolved, built)?;
+
+    if !matches!(
+        python.chosen,
+        muru_provision::Chosen::Path(_)
+            | muru_provision::Chosen::ActiveVirtualenv
+            | muru_provision::Chosen::ProjectVirtualenv
+    ) {
+        println!("muru: {}", python.describe());
+    }
+
+    // Section 8.3: the runtime library, from the environment when it
+    // matches, else the user cache, else fetched once; said on the
+    // terminal, with the warning when a mismatched copy has to do.
+
+    let library = provision::runtime(&python.probe).await?;
+
+    for note in &library.notes {
+        println!("muru: {note}");
+    }
+
+    println!("muru: {}", library.describe());
+
     // Section 13.1: the local file is said once, and so is a .gitignore
     // that would let it be committed.
 
@@ -2196,8 +2580,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // reports it, so a command the log names works as it is.
 
     let label = app_name(&resolved.entrypoint).replace('_', "-");
-    let spec = HostSpec {
-        python: python_interpreter(args.python.clone(), &resolved.project),
+    let mut spec = HostSpec {
+        python: python.python.clone(),
+        pythonpath: library.pythonpath.clone(),
+        pycache_prefix: None,
+        no_bytecode: false,
         app: resolved.entrypoint.clone(),
         name: Some(label.clone()),
         release: None,
@@ -2557,6 +2944,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let (changed_tx, mut changed) = mpsc::channel::<PathBuf>(64);
+    let mut requires_python =
+        muru_provision::interpreter::requires_python(&resolved.project).map(|set| set.to_string());
 
     if resolved.serving.reload {
         let directories = if resolved.serving.reload_dirs.is_empty() {
@@ -2580,7 +2969,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
         let mut include = vec![RELOAD_INCLUDE.to_owned()];
         include.extend(resolved.serving.reload_include.iter().cloned());
-        let watch = Watch::new(directories, &include, &resolved.serving.reload_exclude)?;
+        let watch = Watch::new(directories, &include, &resolved.serving.reload_exclude)?
+            .with_files(
+                muru_provision::build::TRIGGER_FILES
+                    .iter()
+                    .map(|name| resolved.project.join(name))
+                    .collect(),
+            );
 
         let except = if resolved.serving.reload_exclude.is_empty() {
             String::new()
@@ -2671,6 +3066,57 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
                 println!("muru: reloading, {} changed", describe(&paths));
+
+                // Section 8.2: a change to the lock, or to what names the
+                // interpreter, builds before the new release starts; the
+                // interpreter and the runtime library are then settled
+                // again, since a pin may have changed them. A failed build
+                // leaves the current release serving.
+
+                let rebuilt = provision::rebuild(
+                    &resolved.project,
+                    when,
+                    args.python.as_deref(),
+                    resolved.python.as_deref(),
+                    development,
+                    &paths,
+                    &mut requires_python,
+                )
+                .await;
+
+                match rebuilt {
+                    Ok(true) => {
+                        let settled = match interpreter(&args, &resolved, true) {
+                            Ok(python) => match provision::runtime(&python.probe).await {
+                                Ok(library) => Some((python, library)),
+                                Err(error) => {
+                                    println!("muru: {error:#}; release r{} keeps serving", current.release);
+                                    None
+                                }
+                            },
+                            Err(error) => {
+                                println!("muru: {error:#}; release r{} keeps serving", current.release);
+                                None
+                            }
+                        };
+
+                        let Some((python, library)) = settled else {
+                            continue;
+                        };
+
+                        for note in &library.notes {
+                            println!("muru: {note}");
+                        }
+
+                        spec.python = python.python.clone();
+                        spec.pythonpath = library.pythonpath.clone();
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        println!("muru: {error:#}; release r{} keeps serving", current.release);
+                        continue;
+                    }
+                }
 
                 loop {
                     release += 1;

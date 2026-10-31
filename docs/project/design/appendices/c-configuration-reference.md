@@ -16,7 +16,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Table | Where | Holds |
 | --- | --- | --- |
 | `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode, debug_exec (section 11.7) |
-| `[tools]` | daemon file | uv path and version constraints |
+| `[tools]` | daemon file | uv path and version constraints, its configuration file, interpreter downloads and install directory, offline mode and the wheel directory (section 8.4) |
 | `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, processes, threads |
 | `[proxy]` | daemon, host or listener | trusted proxies and header types |
 | `[metrics]` | daemon file | the internal address `/metrics` is served on (`listen`), none by default |
@@ -36,6 +36,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[app.NAME.release.ID.groups.NAME]` | application files | worker groups |
 | `[tool.muru]` | the application's pyproject.toml or muru.toml | application-shipped defaults |
 | `[tool.muru.run]`, `[run]` | the application's pyproject.toml or muru.toml, and muru.local.toml | how `muructl run` serves the project (section 13.1): a key for each flag of the command that describes the serving, ignored by the daemon |
+| `[tool.muru.build]`, `[build]` | the application's pyproject.toml or muru.toml, a release's table, and muru.local.toml (`when` only) | when and how the release's environment is built (section 8.2) |
 | `[overlay.NAME]` | application files | overlays and triggers |
 | `[[client_class]]` | daemon or application files | classification rules |
 | `[rate_limit.NAME]` | daemon or application files | rate limits |
@@ -47,7 +48,9 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- | --- | --- |
 | entrypoint, interface (auto, wsgi, asgi or grpc), factory, factory_phase | release, mount | interface detected, factory_phase worker | 6.8, 6.13 |
 | reflection | release | false (gRPC server reflection for the registered services) | 6.13 |
-| source or image, python, build, runtime_source | release | none, none, none, image | 8.1 to 8.5 |
+| source or image, python (a path, or a request in uv's syntax), runtime_source | release, variant for python | none, none, image | 8.1 to 8.5 |
+| build.when, build.extras, build.groups, build.source_builds, build.compile_bytecode | release, variant, `[tool.muru.build]`, and `when` in muru.local.toml | auto, none, none, false, true | 8.2 |
+| tools.uv, tools.uv_version, tools.uv_config, tools.python_downloads, tools.python_install_dir, tools.offline, tools.wheel_dir | daemon | the lookup order, the tested range, none, automatic, STATE/python, false, none | 8.4 |
 | preload | release | auto (preload with the import check, falling back to per-worker imports) | 6.1, 6.2 |
 | processes, threads, sync_threads | release, group, mount | 2, 8 for WSGI, 1 loop for ASGI | 6.4 |
 | threads on a mount: a number for a pool of its own, or `{ reserved, max }` to borrow the shared pool's threads beyond the reserved ones | mount (WSGI, and a number on gRPC) | the worker's shared pool | 6.7, 6.13 |
@@ -123,7 +126,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Category | Types (prefix dev.muru.) |
 | --- | --- |
 | Configuration | config.applied, route.changed, traffic_policy.changed, maintenance.changed |
-| Releases | release.created, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
+| Releases | release.created, release.building, release.built, release.build_failed, release.state_changed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
 | Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, server.started, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, clock.unsynchronised, clock.synchronised |

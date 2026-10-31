@@ -1231,6 +1231,7 @@ dependencies = [
  "muru-dashboard",
  "muru-edge",
  "muru-proto",
+ "muru-provision",
  "ring",
  "rusqlite",
  "serde",
@@ -1320,6 +1321,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "muru-provision"
+version = "0.1.0-alpha.12"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "muru-config",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "muru-py"
 version = "0.1.0-alpha.12"
 dependencies = [
@@ -1355,6 +1375,7 @@ dependencies = [
  "muru-dashboard",
  "muru-edge",
  "muru-proto",
+ "muru-provision",
  "rcgen",
  "rustls-pki-types",
  "serde",

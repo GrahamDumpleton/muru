@@ -147,13 +147,14 @@ The daemon starts hosts itself and imports applications as modules, so applicati
 | Entrypoint | module:callable, or a factory called per worker after post_fork (factory_phase = 'host' to call it during preload). The callable must take what the interface passes (two positional arguments for WSGI, three for ASGI), checked at load: one taking no required arguments is refused as a likely factory named without the setting, one fitting the other interface is refused rather than guessed at, and one whose signature cannot be read is taken as it is |
 | Environment variables | Primary application settings, layered system, application, release and secrets (including NAME_FILE secrets) |
 | Files | Files in the release, or files supplied by the release spec and snapshotted read-only into the run directory |
-| `[tool.muru]` in pyproject.toml, or muru.toml | Application-shipped defaults: entrypoint, interface, python requirement, process model, mounts, groups, hooks, readiness and liveness probes, release checks, static directories |
+| `[tool.muru]` in pyproject.toml, or muru.toml | Application-shipped defaults: entrypoint, interface, python requirement and the build table (section 8.2), process model, mounts, groups, hooks, readiness and liveness probes, release checks, static directories |
 | Hooks module | Lifecycle hooks (section 6.3) |
 | MURU_* variables | Read-only runtime context (Appendix D) |
 
 - Configuration changes are releases, so they get the same audit trail, canary and rollback as code. There is no in-process reload.
 - sys.argv is a single element. One-off commands run with muructl exec RELEASE -- COMMAND, using the release's interpreter, environment, user and working directory.
-- Applications run unchanged under other servers, because environment variables are the primary interface and the muru module is optional.
+- Applications run unchanged under other servers, because environment variables are the primary interface and the muru module is optional. The module is provided by muructl on the host's PYTHONPATH (section 8.3), so an application does not list it as a dependency; one that does, for its editor or for an offline machine, has its own copy used when the versions match and the injected copy, with a warning, when they do not.
+- **Build, then check.** muructl build prepares a project (the interpreter, the environment from the lock, the runtime library, section 8.2) and muructl check validates what was prepared without side effects: the application imports, its entrypoint resolves to a callable of the declared interface under the signature rules above, the preload import check finds nothing unsafe to fork (--strict fails on any finding), the `[tool.muru]` tables and any shipped configuration validate, requires-python and the python request are met by the interpreter in use, the runtime library the host would inject is found and speaks a supported protocol version, and an environment that would run without a usable bytecode cache is reported. --env-file supplies placeholder values for settings read at import. check finds the interpreter and environment as muructl run does and never builds; a project without an environment is told to run muructl build. A CI job reads muructl build --deployment --target DIR && muructl check.
 
 ## 6.9 Python API
 

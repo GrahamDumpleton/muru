@@ -6,7 +6,6 @@ Still to be written:
 
 - Migrating from mod_wsgi, gunicorn and uvicorn.
 - Containers and images.
-- uv and Python versions.
 - OpenTelemetry export.
 - Database migrations during overlapping releases.
 - Upgrading Muru.
@@ -18,6 +17,7 @@ flask-and-django
 asgi
 starlette-and-fastapi
 run-settings
+interpreters
 daemon
 secrets
 users

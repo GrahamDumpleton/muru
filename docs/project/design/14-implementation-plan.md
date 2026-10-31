@@ -25,6 +25,7 @@ muru/
     muru-common/             names, ids, errors, durations and sizes, shared types
     muru-config/             schema types, TOML parsing, validation, precedence merge, JSON Schema output
     muru-proto/              frame codec of the worker link, generated prost and tonic code
+    muru-provision/          uv discovery, interpreter resolution and probing, environment builds, the runtime library
     muru-edge/               edge library: listeners, TLS, hosts, routing, pipeline, upstreams, static, uploads
     muru-controller/         reconciler, state store, admin API and JSON gateway, rollouts, autoscaler, schedules, events
     muru-supervisor/         spawning hosts, users, cgroups, containers, descriptor passing, log collector
