@@ -58,6 +58,9 @@ enum Command {
     /// Build a project's environment from uv.lock and provide the runtime library, then exit.
     Build(Box<provision::BuildArgs>),
 
+    /// Load an application in a throwaway host and report what would fail, without serving.
+    Check(Box<CheckArgs>),
+
     /// Run or control the daemon.
     Daemon {
         #[command(subcommand)]
@@ -791,6 +794,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
         Command::Build(args) => runtime.block_on(provision::build(*args)),
+        Command::Check(args) => runtime.block_on(check(*args)),
         Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
@@ -2128,6 +2132,314 @@ fn interpreter(
     };
 
     Ok(muru_provision::resolve(&inputs)?)
+}
+
+/// `muructl check` (section 6.8): what `build` prepared, validated with no
+/// side effects.
+#[derive(Debug, Args)]
+struct CheckArgs {
+    /// The application as module:callable, or a project directory (or its
+    /// pyproject.toml or muru.toml) whose [tool.muru] table names it.
+    /// Without it, the project in --chdir or the current directory.
+    #[arg(value_name = "ENTRYPOINT or PATH")]
+    app: Option<String>,
+
+    /// The interpreter, as muructl run takes it: a path or a version
+    /// request. Without it: the active virtualenv, the project's .venv,
+    /// the project's own request, python3 on PATH.
+    #[arg(long, value_name = "PATH or VERSION")]
+    python: Option<String>,
+
+    /// The project directory, when the entrypoint is given.
+    #[arg(long, value_name = "DIR")]
+    chdir: Option<PathBuf>,
+
+    /// Fail on anything the import check finds, not only on an error.
+    #[arg(long)]
+    strict: bool,
+
+    /// A file of NAME=VALUE lines, for settings the import reads.
+    #[arg(long, value_name = "FILE")]
+    env_file: Option<PathBuf>,
+}
+
+/// What the interpreter's check reports (muru.check).
+#[derive(Debug, serde::Deserialize)]
+struct CheckReport {
+    ok: bool,
+    #[serde(default)]
+    muru: String,
+    #[serde(default)]
+    entrypoints: Vec<CheckEntrypoint>,
+    #[serde(default)]
+    hooks: Vec<String>,
+    #[serde(default)]
+    findings: Vec<CheckFinding>,
+    #[serde(default)]
+    errors: Vec<CheckError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckEntrypoint {
+    entrypoint: String,
+    interface: String,
+    #[serde(default)]
+    factory: Option<String>,
+    #[serde(default)]
+    mount: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckFinding {
+    description: String,
+    advice: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckError {
+    error: String,
+    #[serde(default)]
+    traceback: String,
+}
+
+/// Validate a project the way `muructl run` would start it, and stop
+/// there: the tables, the interpreter and its requirement, the runtime
+/// library, then the application loaded in the interpreter under the
+/// import check, with the mounts and hooks. Nothing is built or served.
+async fn check(args: CheckArgs) -> anyhow::Result<()> {
+    // The project and its tables resolve exactly as a run's would, so the
+    // check sees what the run sees.
+
+    let mut argv = vec!["muructl".to_owned(), "run".to_owned()];
+
+    if let Some(app) = &args.app {
+        argv.push(app.clone());
+    }
+
+    if let Some(dir) = &args.chdir {
+        argv.push("--chdir".to_owned());
+        argv.push(dir.display().to_string());
+    }
+
+    if let Some(python) = &args.python {
+        argv.push("--python".to_owned());
+        argv.push(python.clone());
+    }
+
+    let cli = Cli::try_parse_from(&argv).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let Command::Run(run_args) = cli.command else {
+        anyhow::bail!("the check could not read its arguments as a run's");
+    };
+    let resolved = resolve(&run_args)?;
+    let mut failed = false;
+
+    if let Some(source) = &resolved.source {
+        println!(
+            "muru: check: [tool.muru] from {} is valid",
+            source.display()
+        );
+    }
+
+    let python = interpreter(&run_args, &resolved, false)?;
+    println!("muru: check: {}", python.describe());
+    let library = provision::runtime(&python.probe).await?;
+
+    for note in &library.notes {
+        println!("muru: check: {note}");
+    }
+
+    println!("muru: check: {}", library.describe());
+
+    if library.how == muru_provision::How::Fallback {
+        println!("muru: check: warning: the runtime library does not match muructl");
+    }
+
+    // Section 8.2: a source nobody can write to, with no bytecode compiled
+    // for this interpreter, recompiles on every start except under the
+    // daemon, which redirects.
+
+    let writable = {
+        let probe = resolved.project.join(".muru-check-write");
+        let ok = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    };
+
+    if !writable && !muru_provision::build::precompiled(&resolved.project, &python.probe.cache_tag)
+    {
+        println!(
+            "muru: check: warning: {} is not writable and holds no bytecode compiled for {}, so              outside the daemon every start recompiles the application; muructl build --deployment              compiles it",
+            resolved.project.display(),
+            python.probe.cache_tag
+        );
+    }
+
+    // The application, loaded in the interpreter under the import check.
+
+    let mut command = tokio::process::Command::new(&python.python);
+    command
+        .arg("-m")
+        .arg("muru.check")
+        .arg("--app")
+        .arg(&resolved.entrypoint)
+        .arg("--interface")
+        .arg(resolved.interface.as_str())
+        .arg("--chdir")
+        .arg(&resolved.project);
+
+    if let Some(phase) = resolved.factory {
+        command
+            .arg("--factory")
+            .arg("--factory-phase")
+            .arg(phase.as_str());
+    }
+
+    if let Some(hooks) = &resolved.hooks {
+        command.arg("--hooks").arg(hooks);
+    }
+
+    for (name, mount) in &resolved.mounts {
+        command.arg("--mount").arg(format!(
+            "{name}={}={}",
+            mount.entrypoint,
+            mount
+                .interface
+                .map_or("auto", |interface| interface.as_str())
+        ));
+    }
+
+    if let Some(runtime) = &library.pythonpath {
+        let existing = std::env::var("PYTHONPATH")
+            .ok()
+            .filter(|value| !value.is_empty());
+        command.env(
+            "PYTHONPATH",
+            match existing {
+                Some(existing) => format!("{}:{existing}", runtime.display()),
+                None => runtime.display().to_string(),
+            },
+        );
+    }
+
+    for (name, value) in &resolved.env {
+        if let muru_config::EnvValue::Plain(text) = value {
+            command.env(name, text);
+        }
+    }
+
+    if let Some(file) = &args.env_file {
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+
+        for line in text.lines() {
+            let line = line.trim();
+
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((name, value)) = line.split_once('=') else {
+                anyhow::bail!("{}: {line:?} is not NAME=VALUE", file.display());
+            };
+
+            command.env(name.trim(), value.trim().trim_matches('"'));
+        }
+    }
+
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("running {}", python.python.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let report: CheckReport = match serde_json::from_str(stdout.trim()) {
+        Ok(report) => report,
+        Err(_) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "the interpreter did not report: {}",
+                stderr
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|line| !line.is_empty())
+                    .unwrap_or("no output")
+            );
+        }
+    };
+
+    if !report.muru.is_empty() && report.muru != library.version {
+        println!(
+            "muru: check: warning: the interpreter imported muru {} where {} was provided",
+            report.muru, library.version
+        );
+    }
+
+    for entrypoint in &report.entrypoints {
+        let what = match &entrypoint.mount {
+            Some(mount) => format!("mount {mount}: {}", entrypoint.entrypoint),
+            None => entrypoint.entrypoint.clone(),
+        };
+
+        match entrypoint.factory.as_deref() {
+            Some("worker") => println!(
+                "muru: check: {what} is a factory called in each worker, so its application is                  not checked here"
+            ),
+            _ => println!(
+                "muru: check: {what} is served as {}",
+                interface_label(&entrypoint.interface)
+            ),
+        }
+    }
+
+    if !report.hooks.is_empty() {
+        println!(
+            "muru: check: hooks module {} defines {}",
+            resolved.hooks.as_deref().unwrap_or("?"),
+            report.hooks.join(", ")
+        );
+    }
+
+    for finding in &report.findings {
+        println!(
+            "muru: check: warning: {}; {}",
+            finding.description, finding.advice
+        );
+    }
+
+    for error in &report.errors {
+        println!("muru: check: error: {}", error.error);
+        eprint!("{}", error.traceback);
+        failed = true;
+    }
+
+    if !report.ok {
+        failed = true;
+    }
+
+    if args.strict && !report.findings.is_empty() {
+        println!(
+            "muru: check: {} finding(s) fail the check under --strict",
+            report.findings.len()
+        );
+        failed = true;
+    }
+
+    if failed {
+        anyhow::bail!("the check failed");
+    }
+
+    println!("muru: check: {} passed", resolved.entrypoint);
+    Ok(())
+}
+
+/// An interface as the check names it.
+fn interface_label(interface: &str) -> &str {
+    match interface {
+        "wsgi" => "WSGI",
+        "asgi" => "ASGI",
+        "grpc" => "gRPC",
+        other => other,
+    }
 }
 
 /// An interpreter as --print-config writes it: relative to the project

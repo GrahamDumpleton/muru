@@ -263,6 +263,56 @@ pub fn lock_digest(project: &Path) -> Option<String> {
     Some(hex[..12].to_owned())
 }
 
+/// Whether the source holds compiled bytecode for an interpreter: a
+/// `__pycache__` with a file of its cache tag, beside the source. The walk
+/// is bounded, since a source tree can be large and the first hit decides.
+pub fn precompiled(source: &Path, cache_tag: &str) -> bool {
+    let suffix = format!(".{cache_tag}.pyc");
+    let mut pending = vec![(source.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            seen += 1;
+
+            if seen > 5000 {
+                return false;
+            }
+
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+
+            if path.is_dir() {
+                if name == "__pycache__" {
+                    let compiled = std::fs::read_dir(&path)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|file| file.file_name().to_string_lossy().ends_with(&suffix));
+
+                    if compiled {
+                        return true;
+                    }
+                } else if depth < 6
+                    && !name.starts_with('.')
+                    && name != "node_modules"
+                    && name != "site-packages"
+                {
+                    pending.push((path, depth + 1));
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// The project's lock, if it has one.
 pub fn lock_file(project: &Path) -> Option<PathBuf> {
     let path = project.join(LOCK_FILE);

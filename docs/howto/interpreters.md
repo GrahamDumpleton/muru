@@ -142,6 +142,43 @@ The deployment flavour leaves the dev group out, refuses to build sdists
 unless `source_builds = true`, compiles bytecode, and installs the extras
 and groups the `[tool.muru.build]` table names.
 
+## Checking before you serve
+
+`muructl check` does everything `muructl run` does up to the point of
+serving, and stops there: the project's tables are read and validated,
+the interpreter is chosen and probed against `requires-python`, the
+runtime library is found, and the application is loaded in a throwaway
+interpreter under the import check of the preload step, with its hooks
+module and mounts. Nothing is built and nothing listens.
+
+```
+muructl check                       # the project in the current directory
+muructl check app:application --chdir src
+muructl check --strict              # anything the import check finds fails it
+muructl check --env-file check.env  # placeholder settings the import reads
+```
+
+```
+muru: check: [tool.muru] from pyproject.toml is valid
+muru: check: Python 3.13.9 (cp313) at .venv/bin/python (the project's .venv)
+muru: check: runtime library 0.1.0a13 from the environment
+muru: check: shop.wsgi:application is served as WSGI
+muru: check: hooks module shop.hooks defines on_load, on_reopen_logs
+muru: check: warning: the import of shop.db left a connected socket (fd 7, to 127.0.0.1:5432); open connections on first use, or in a post_fork hook
+muru: check: shop.wsgi:application passed
+```
+
+An entrypoint that does not import, a callable that cannot be called as
+its interface is, an interpreter outside `requires-python` or a missing
+runtime library fail the check with the message the run would have shown.
+The import check's findings are warnings, and `--strict` makes them
+failures, which is what a CI job wants. A build followed by a check is
+the whole of a pre-deploy test:
+
+```
+muructl build --deployment --target /tmp/env && muructl check --python /tmp/env/bin/python
+```
+
 ## The runtime library
 
 The `muru` package that runs inside your interpreter is Muru's, not your
