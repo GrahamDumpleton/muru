@@ -382,6 +382,41 @@ def test_a_dead_edge_is_started_again_without_refusing_connections(daemon: Daemo
     assert new_pid != edge_pid
 
 
+def test_a_new_edge_replaces_a_worker_that_cannot_answer_it(daemon: Daemon) -> None:
+    """An edge started again has no connections to keep, so it connects to
+    every worker afresh. One that accepts the connection and never answers
+    HELLO (a stopped process) is left out of its pool, so the snapshot still
+    lands, and the daemon names it and replaces it."""
+
+    assert daemon.deploy("shop", SHOP) == "muru: release shop@r1 is ready and serving"
+    daemon.wait_for_routing("shop")
+    frozen = json.loads(daemon.get("/").body)["pid"]
+    os.kill(frozen, signal.SIGSTOP)
+
+    try:
+        os.kill(edge_pid_of(daemon), signal.SIGKILL)
+        deadline = time.monotonic() + 30
+
+        while time.monotonic() < deadline and "worker.unreachable" not in daemon.events():
+            time.sleep(0.2)
+
+        log = daemon.muructl("events").stdout
+        assert "worker.unreachable" in daemon.events(), log
+        assert "did not answer HELLO within 5 s" in log and "it is being replaced" in log, log
+
+        while time.monotonic() < deadline and "worker.restarted" not in daemon.events():
+            time.sleep(0.2)
+
+        assert "worker.restarted" in daemon.events(), daemon.muructl("events").stdout
+    finally:
+        try:
+            os.kill(frozen, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+
+    assert json.loads(daemon.get("/").body)["pid"] != frozen
+
+
 def snapshot_version(daemon: Daemon) -> int:
     """The version of the snapshot the edge was last given, from the metrics."""
 

@@ -4479,7 +4479,13 @@ impl Daemon {
             .apply(snapshot)
             .await
             .map_err(|error| format!("{error:#}"))?;
+        self.replace_unreachable(applied);
+        Ok(())
+    }
 
+    /// Section 5.1: report each worker the edge's answer to a snapshot
+    /// names as one it could not connect to, and replace it at once.
+    fn replace_unreachable(&mut self, applied: pb::Applied) {
         for worker in applied.unreachable {
             let subject = format!("{}@{}", worker.app, worker.release);
             let index = worker_index(&worker.socket);
@@ -4516,8 +4522,6 @@ impl Daemon {
                 ),
             );
         }
-
-        Ok(())
     }
 
     /// Section 9.5: with traffic already elsewhere, wait for the release's
@@ -6598,8 +6602,8 @@ impl Daemon {
     /// last snapshot (section 2.4).
     async fn check_edge(&mut self) {
         match self.edge.check().await {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(None) => {}
+            Ok(Some(applied)) => {
                 self.info.edge_pid.store(
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
@@ -6611,6 +6615,7 @@ impl Daemon {
                     "warning",
                     "the edge process exited and was started again on the same listener",
                 );
+                self.replace_unreachable(applied);
             }
             Err(error) => {
                 self.events
@@ -6865,7 +6870,7 @@ impl Daemon {
         let grace = self.drain_grace();
 
         match self.edge.replace(grace, listeners).await {
-            Ok(old_pid) => {
+            Ok((old_pid, applied)) => {
                 let pid = self.edge.pid().unwrap_or(0);
                 self.info
                     .edge_pid
@@ -6880,6 +6885,7 @@ impl Daemon {
                         "edge pid {old_pid} replaced by pid {pid} on {where_}; the old edge finishes its connections and exits"
                     ),
                 );
+                self.replace_unreachable(applied);
                 Ok(old_pid)
             }
             Err(error) => {
