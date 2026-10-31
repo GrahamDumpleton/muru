@@ -336,7 +336,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         compression: Some(compression.to_message()),
         ..Default::default()
     };
-    let routing = muru_edge::routing::Routing::from_snapshot(&snapshot).await?;
+    let routing = muru_edge::routing::Routing::from_snapshot(&snapshot, None).await?;
     edge.pools().apply(routing);
     println!(
         "muru: serving {} on http://{}",
@@ -2628,13 +2628,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
                 match message {
                     muru_controller::host::HostMessage::Workers { version, sockets, groups, .. } => {
+                        let release = format!("r{}", current.release);
+                        let kept = pools.current().kept(&label, &release);
                         let connected = muru_edge::routing::AppPools::connect(
                             &label,
-                            &format!("r{}", current.release),
+                            &release,
                             &sockets,
                             &group_sockets_from(&groups, &group_tables),
                             &mounts,
                             redirect_flags,
+                            &kept,
                         )
                         .await
                         .map(|pools| {
@@ -2690,6 +2693,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                     &group_sockets(&next, &group_tables),
                                     &mounts,
                                     redirect_flags,
+                                    &muru_edge::link::Kept::default(),
                                 )
                                 .await
                                 .map(|pools| {

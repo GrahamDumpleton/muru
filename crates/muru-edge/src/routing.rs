@@ -733,10 +733,10 @@ impl AppPools {
             .collect()
     }
 
-    /// Connect the default workers and each group's. `app` and `release`
-    /// label the requests served in the access log; `redirects` says
-    /// which response forms from the default mount are internal
-    /// redirects.
+    /// Connect the default workers and each group's, keeping the workers
+    /// of `kept` as they are (section 5.1). `app` and `release` label the
+    /// requests served in the access log; `redirects` says which response
+    /// forms from the default mount are internal redirects.
     pub async fn connect(
         app: &str,
         release: &str,
@@ -744,12 +744,13 @@ impl AppPools {
         groups: &[GroupSockets],
         mounts: &[MountPath],
         redirects: RedirectFlags,
+        kept: &crate::link::Kept,
     ) -> anyhow::Result<Self> {
-        let default = Arc::new(LinkPool::connect(default).await?);
+        let default = Arc::new(LinkPool::connect(default, kept).await?);
         let mut connected = Vec::new();
 
         for group in groups {
-            let pool = Arc::new(LinkPool::connect(&group.sockets).await?);
+            let pool = Arc::new(LinkPool::connect(&group.sockets, kept).await?);
 
             // Section 4.14 and ADR 0033: a group with match lists and no
             // paths of its own takes the requests they name for every path.
@@ -1033,6 +1034,18 @@ impl AppPools {
 
         pools
     }
+
+    /// The workers of every pool, for the routing that replaces this one
+    /// to keep (section 5.1).
+    pub fn kept(&self) -> crate::link::Kept {
+        let mut kept = crate::link::Kept::default();
+
+        for (_, pool) in self.pools() {
+            kept.add(&pool);
+        }
+
+        kept
+    }
 }
 
 /// The name of the group a release's own settings size (section 7.1).
@@ -1208,7 +1221,10 @@ impl Routing {
 
     /// Compile a snapshot, connecting to every worker it names first, so
     /// a snapshot that cannot be reached is refused whole.
-    pub async fn from_snapshot(snapshot: &pb::Snapshot) -> anyhow::Result<Self> {
+    pub async fn from_snapshot(
+        snapshot: &pb::Snapshot,
+        previous: Option<&Routing>,
+    ) -> anyhow::Result<Self> {
         let mut apps: HashMap<String, AppReleases> = HashMap::new();
         let mut upstreams: HashMap<String, Arc<Upstream>> = HashMap::new();
 
@@ -1245,6 +1261,14 @@ impl Routing {
                 .map_err(|error| anyhow::anyhow!("{}@{}: {error}", app.app, app.release))?
                 .flatten()
                 .map(Arc::new);
+
+            // Section 5.1: the release's workers the last routing had
+            // keep their connections; only the ones new to it are
+            // connected to.
+
+            let kept = previous.map_or_else(Default::default, |previous| {
+                previous.kept(&app.app, &app.release)
+            });
             let mut pools = AppPools::connect(
                 &app.app,
                 &app.release,
@@ -1255,6 +1279,7 @@ impl Routing {
                     accel_redirect: app.accel_redirect,
                     cgi_local_redirect: app.cgi_local_redirect,
                 },
+                &kept,
             )
             .await?
             .with_errors(Arc::new(errors))
@@ -1314,9 +1339,13 @@ impl Routing {
 
         let default = match default_app {
             Some(pools) => Arc::clone(pools),
-            None => Arc::new(AppPools::single(
-                LinkPool::connect(&paths(&snapshot.worker_sockets)).await?,
-            )),
+            None => {
+                let kept =
+                    previous.map_or_else(Default::default, |previous| previous.default.kept());
+                Arc::new(AppPools::single(
+                    LinkPool::connect(&paths(&snapshot.worker_sockets), &kept).await?,
+                ))
+            }
         };
 
         let default_policy = match &snapshot.default_traffic {
@@ -1704,6 +1733,18 @@ impl Routing {
                     .map(|(group, pool)| ((app.to_owned(), release.to_owned(), group), pool))
             })
             .collect()
+    }
+
+    /// The workers of a release's pools, for the routing that replaces
+    /// this one to keep (section 5.1); none when the release is not here.
+    /// A development run's pools, which have no application table, are
+    /// found by their labels.
+    pub fn kept(&self, app: &str, release: &str) -> crate::link::Kept {
+        self.apps
+            .get(app)
+            .and_then(|releases| releases.releases.get(release))
+            .or_else(|| (self.default.labels() == (app, release)).then_some(&self.default))
+            .map_or_else(Default::default, |pools| pools.kept())
     }
 
     /// Every application's pools once: the named applications, and the
@@ -2166,7 +2207,7 @@ mod tests {
     fn routing() -> Routing {
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(Routing::from_snapshot(&snapshot()))
+            .block_on(Routing::from_snapshot(&snapshot(), None))
             .unwrap()
     }
 
@@ -2420,7 +2461,7 @@ mod tests {
     fn the_policy_spreads_clients_and_issues_an_id_cookie() {
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(Routing::from_snapshot(&split_snapshot(false, "")))
+            .block_on(Routing::from_snapshot(&split_snapshot(false, ""), None))
             .unwrap();
         let ids = crate::errors::RequestIds::new();
         let mut seen = std::collections::HashSet::new();
@@ -2465,10 +2506,10 @@ mod tests {
     fn preview_and_sticky_cookies_pin_the_release() {
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(Routing::from_snapshot(&split_snapshot(
-                true,
-                "header:x-user",
-            )))
+            .block_on(Routing::from_snapshot(
+                &split_snapshot(true, "header:x-user"),
+                None,
+            ))
             .unwrap();
         let ids = crate::errors::RequestIds::new();
         let plain = "127.0.0.1:8080";
@@ -2653,7 +2694,7 @@ mod tests {
 
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(Routing::from_snapshot(&snapshot))
+            .block_on(Routing::from_snapshot(&snapshot, None))
             .unwrap();
         let at = |path: &str, host: &str, method: &str| grouped(&routing, path, host, method);
 
@@ -2697,7 +2738,7 @@ mod tests {
         ];
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(Routing::from_snapshot(&snapshot))
+            .block_on(Routing::from_snapshot(&snapshot, None))
             .unwrap();
         let at = |path: &str, class: &str| placed(&routing, path, class);
 
@@ -2726,7 +2767,7 @@ mod tests {
         snapshot.routes[0].traffic = None;
         let routing = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(Routing::from_snapshot(&snapshot))
+            .block_on(Routing::from_snapshot(&snapshot, None))
             .unwrap();
         assert_eq!(placed(&routing, "/status", "ai_crawler").2, "crawlers");
         assert_eq!(placed(&routing, "/", "ai_crawler").2, "crawlers");

@@ -302,10 +302,13 @@ impl EdgeControl for Control {
     async fn apply(&self, request: Request<pb::Snapshot>) -> Result<Response<pb::Applied>, Status> {
         let snapshot = request.into_inner();
 
-        // The tables are built and every worker connected before anything
-        // replaces the last good snapshot, and so are the certificates.
+        // The tables are built and every worker new to the routing
+        // connected, the rest keeping their connections (section 5.1),
+        // before anything replaces the last good snapshot, and so are the
+        // certificates.
 
-        let routing = muru_edge::routing::Routing::from_snapshot(&snapshot)
+        let previous = self.pools.current();
+        let routing = muru_edge::routing::Routing::from_snapshot(&snapshot, Some(&*previous))
             .await
             .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
         let mut certificates = Vec::new();

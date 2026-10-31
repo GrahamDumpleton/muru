@@ -372,20 +372,21 @@ impl EdgeProcess {
 
     /// Respawn the edge if it has exited, with the same listener and the
     /// last snapshot. Returns whether it had to.
-    pub async fn check(&mut self) -> anyhow::Result<bool> {
+    pub async fn check(&mut self) -> anyhow::Result<Option<pb::Applied>> {
         if !self.exited()? {
-            return Ok(false);
+            return Ok(None);
         }
 
         // The new edge starts with the default workers of the last
         // snapshot, so a connection that waited in the backlog is served,
-        // and takes the whole snapshot again right after.
+        // and takes the whole snapshot again right after. Its answer names
+        // the workers it could not connect to, which a new edge, with no
+        // connections to keep, asks HELLO of afresh (section 5.1).
 
         self.next_generation();
         self.process = Process::Child(launch(&self.spec, &self.snapshot.worker_sockets).await?);
         let snapshot = self.snapshot.clone();
-        self.apply(snapshot).await?;
-        Ok(true)
+        Ok(Some(self.apply(snapshot).await?))
     }
 
     /// Section 13.4: start a new edge on the same listeners, or on
@@ -393,13 +394,15 @@ impl EdgeProcess {
     /// current snapshot, and only then tell the old one to stop: it stops
     /// accepting, finishes its connections and exits, waited for in the
     /// background for `grace` before it is killed. Returns the old edge's
-    /// pid. If the new edge does not come up or refuses the snapshot, it
-    /// is discarded and the old one keeps serving on what it had.
+    /// pid and the new edge's answer, which names the workers it could
+    /// not connect to. If the new edge does not come up or refuses the
+    /// snapshot, it is discarded and the old one keeps serving on what it
+    /// had.
     pub async fn replace(
         &mut self,
         grace: Duration,
         listeners: Option<Vec<Listener>>,
-    ) -> anyhow::Result<u32> {
+    ) -> anyhow::Result<(u32, pb::Applied)> {
         let old_control = self.spec.control.clone();
         let old_listener_socket = self.spec.listener_socket.clone();
         let old_generation = self.spec.generation;
@@ -425,30 +428,33 @@ impl EdgeProcess {
         let old = std::mem::replace(&mut self.process, Process::Child(next));
         let snapshot = self.snapshot.clone();
 
-        if let Err(error) = self.apply(snapshot).await {
-            let failed = std::mem::replace(&mut self.process, old);
-            let (control, listener_socket) = (
-                std::mem::replace(&mut self.spec.control, old_control),
-                std::mem::replace(&mut self.spec.listener_socket, old_listener_socket),
-            );
-            self.spec.generation = old_generation;
+        let applied = match self.apply(snapshot).await {
+            Ok(applied) => applied,
+            Err(error) => {
+                let failed = std::mem::replace(&mut self.process, old);
+                let (control, listener_socket) = (
+                    std::mem::replace(&mut self.spec.control, old_control),
+                    std::mem::replace(&mut self.spec.listener_socket, old_listener_socket),
+                );
+                self.spec.generation = old_generation;
 
-            if let Some(listeners) = old_listeners {
-                self.spec.listeners = listeners;
+                if let Some(listeners) = old_listeners {
+                    self.spec.listeners = listeners;
+                }
+
+                tokio::spawn(finish(
+                    failed,
+                    control,
+                    listener_socket,
+                    Duration::from_secs(1),
+                ));
+                return Err(error);
             }
-
-            tokio::spawn(finish(
-                failed,
-                control,
-                listener_socket,
-                Duration::from_secs(1),
-            ));
-            return Err(error);
-        }
+        };
 
         let old_pid = pid_of(&old).unwrap_or(0);
         tokio::spawn(finish(old, old_control, old_listener_socket, grace));
-        Ok(old_pid)
+        Ok((old_pid, applied))
     }
 
     /// Section 13.3: tell the edge to close connections after their

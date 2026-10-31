@@ -683,6 +683,18 @@ impl Running {
         }
     }
 
+    /// Every socket the edge routes to: the default group's, then the
+    /// named groups'.
+    fn routed_sockets(&self) -> Vec<PathBuf> {
+        let mut all = self.sockets.clone();
+
+        for group in &self.groups {
+            all.extend(group.sockets.iter().cloned());
+        }
+
+        all
+    }
+
     /// A group's workers, as the sockets the host announced; none for a
     /// group it has not announced yet.
     fn group_sockets(&self, group: &str) -> Option<&[PathBuf]> {
@@ -4467,7 +4479,13 @@ impl Daemon {
             .apply(snapshot)
             .await
             .map_err(|error| format!("{error:#}"))?;
+        self.replace_unreachable(applied);
+        Ok(())
+    }
 
+    /// Section 5.1: report each worker the edge's answer to a snapshot
+    /// names as one it could not connect to, and replace it at once.
+    fn replace_unreachable(&mut self, applied: pb::Applied) {
         for worker in applied.unreachable {
             let subject = format!("{}@{}", worker.app, worker.release);
             let index = worker_index(&worker.socket);
@@ -4504,8 +4522,6 @@ impl Daemon {
                 ),
             );
         }
-
-        Ok(())
     }
 
     /// Section 9.5: with traffic already elsewhere, wait for the release's
@@ -6586,8 +6602,8 @@ impl Daemon {
     /// last snapshot (section 2.4).
     async fn check_edge(&mut self) {
         match self.edge.check().await {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(None) => {}
+            Ok(Some(applied)) => {
                 self.info.edge_pid.store(
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
@@ -6599,6 +6615,7 @@ impl Daemon {
                     "warning",
                     "the edge process exited and was started again on the same listener",
                 );
+                self.replace_unreachable(applied);
             }
             Err(error) => {
                 self.events
@@ -6691,6 +6708,7 @@ impl Daemon {
                 }) else {
                     return;
                 };
+                let before: BTreeSet<PathBuf> = running.routed_sockets().into_iter().collect();
                 running.sockets = sockets;
 
                 for (name, group_sockets) in groups {
@@ -6700,11 +6718,7 @@ impl Daemon {
                     }
                 }
 
-                let mut all = running.sockets.clone();
-
-                for group in &running.groups {
-                    all.extend(group.sockets.iter().cloned());
-                }
+                let all = running.routed_sockets();
 
                 // Section 7.4: a socket new to the routing is a worker
                 // that just became ready.
@@ -6716,6 +6730,15 @@ impl Daemon {
                     running.ready_at.entry(socket.clone()).or_insert(now);
                 }
 
+                // The host's first announcement on a control connection
+                // repeats what the daemon read from the run directory when
+                // the release started, just after a deploy answers. A push
+                // for it would cost an edge apply and leave out a worker
+                // that happens to be busy (section 5.1), for a routing that
+                // is already in place, so one that changes nothing the edge
+                // routes by is acknowledged without a push.
+
+                let changed = before != all.iter().cloned().collect::<BTreeSet<PathBuf>>();
                 write_record(
                     &record,
                     &HostRecord {
@@ -6725,7 +6748,8 @@ impl Daemon {
                     },
                 );
 
-                if self.routable(app, id)
+                if changed
+                    && self.routable(app, id)
                     && let Err(error) = self.push_snapshot().await
                 {
                     tracing::error!(%error, "pushing the snapshot after a worker change failed");
@@ -6846,7 +6870,7 @@ impl Daemon {
         let grace = self.drain_grace();
 
         match self.edge.replace(grace, listeners).await {
-            Ok(old_pid) => {
+            Ok((old_pid, applied)) => {
                 let pid = self.edge.pid().unwrap_or(0);
                 self.info
                     .edge_pid
@@ -6861,6 +6885,7 @@ impl Daemon {
                         "edge pid {old_pid} replaced by pid {pid} on {where_}; the old edge finishes its connections and exits"
                     ),
                 );
+                self.replace_unreachable(applied);
                 Ok(old_pid)
             }
             Err(error) => {

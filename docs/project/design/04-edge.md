@@ -102,7 +102,7 @@ This is closest to Apache's event MPM in a single process with a work-stealing s
 
 ## 4.4 Routing snapshots
 
-The controller compiles desired state into a complete, versioned, immutable snapshot: virtual hosts, compiled path matchers (radix trees), traffic policies, worker endpoints, upstreams, certificates, limits and error page tables. The edge builds the new tables aside, checks every endpoint and file reference, swaps an arc-swap pointer atomically and acknowledges. Each request holds the snapshot it started with until it finishes. A rejected snapshot is answered with a reason and the edge keeps the last good one. The snapshot version appears in every access log line.
+The controller compiles desired state into a complete, versioned, immutable snapshot: virtual hosts, compiled path matchers (radix trees), traffic policies, worker endpoints, upstreams, certificates, limits and error page tables. The edge builds the new tables aside, checks every endpoint and file reference, swaps an arc-swap pointer atomically and acknowledges. Only the workers new to the snapshot are connected to; the rest keep the connections they have (section 5.1). Each request holds the snapshot it started with until it finishes. A rejected snapshot is answered with a reason and the edge keeps the last good one. The snapshot version appears in every access log line.
 
 ## 4.5 Route matching and selection
 

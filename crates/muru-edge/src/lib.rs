@@ -558,6 +558,7 @@ impl Edge {
                             accel_redirect: config.accel_redirect,
                             cgi_local_redirect: config.cgi_local_redirect,
                         },
+                        &link::Kept::default(),
                     )
                     .await?
                     .with_errors(Arc::clone(&config.errors))

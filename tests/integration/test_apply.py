@@ -400,10 +400,11 @@ sendfile_roots = ['reports']
 
 
 def test_a_frozen_worker_does_not_hold_up_other_applications(daemon: Daemon) -> None:
-    """One worker that accepts the edge's connection and never answers
-    HELLO (a stopped process) is left out of its pool, and the snapshot is
-    applied without it, so a routing change for another application still
-    lands. The daemon records the worker as unreachable and replaces it."""
+    """The edge keeps its connections to the workers an apply does not
+    change, so a stopped worker of one application neither delays a routing
+    change for another by the HELLO timeout nor is put out of its pool and
+    replaced for a change that did not touch it; the host's own liveness
+    checks are what deal with it."""
 
     assert daemon.deploy("shop", SHOP, "--processes", "2") == (
         "muru: release shop@r1 is ready and serving"
@@ -442,28 +443,25 @@ app = 'other'
         started = time.monotonic()
         applied = daemon.muructl("apply", "-f", str(site / "site.toml"), check=False)
         assert applied.returncode == 0, applied.stdout + applied.stderr
-        assert time.monotonic() - started < 15
+        assert time.monotonic() - started < 4
 
-        # The change landed, the other worker of the first application still
-        # serves, and the frozen one is named and replaced.
+        # The change landed, and the frozen worker is still one of its
+        # release's: nothing reported it and nothing replaced it.
 
         assert json.loads(daemon.request("/", host="other.test").body)["app"] == "other"
-        served = daemon.request("/")
-        assert served.status == 200, served.body
-        assert json.loads(served.body)["pid"] != frozen
-        log = daemon.muructl("events").stdout
-        assert "worker.unreachable" in daemon.events(), log
-        assert "did not answer the edge" in log and "it is being replaced" in log, log
-
-        for _ in range(50):
-            if "worker.restarted" in daemon.events():
-                break
-
-            time.sleep(0.2)
-        else:
-            raise AssertionError(daemon.muructl("events").stdout)
+        assert "worker.unreachable" not in daemon.events(), daemon.muructl("events").stdout
+        status = json.loads(daemon.muructl("debug", "status", "shop", "--json").stdout)
+        assert {worker["pid"] for worker in status["workers"]} == pids | {frozen}, status
     finally:
         try:
             os.kill(frozen, signal.SIGCONT)
         except ProcessLookupError:
             pass
+
+    # Woken, it serves on the connection the edge kept.
+
+    for _ in range(50):
+        if json.loads(daemon.request("/").body)["pid"] == frozen:
+            break
+    else:
+        raise AssertionError(f"pid {frozen} served nothing after it was woken")

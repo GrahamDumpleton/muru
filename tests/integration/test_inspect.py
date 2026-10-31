@@ -223,24 +223,21 @@ def test_a_stopped_worker_does_not_hold_up_the_daemon(daemon: Daemon) -> None:
     pid = json.loads(daemon.get("/info").body)["pid"]
     os.kill(pid, signal.SIGSTOP)
 
-    # A snapshot names the stopped worker, which accepts the edge's
-    # connection and never answers HELLO: the edge gives up on it and
-    # applies the snapshot without it, the daemon goes on answering, and
-    # the worker is named and replaced.
+    # A snapshot names the stopped worker, which the edge already has a
+    # connection to: it keeps that rather than asking HELLO again, so the
+    # change lands at once, the daemon goes on answering, and the worker
+    # is neither reported nor replaced for it.
 
     try:
         started = time.monotonic()
         daemon.muructl("maintenance", "on", "plain")
-        assert time.monotonic() - started < 15
+        assert time.monotonic() - started < 4
 
         started = time.monotonic()
         assert "plain@r1" in daemon.muructl("release", "list", "plain").stdout
         daemon.muructl("debug", "status", "plain")
         assert time.monotonic() - started < 5
-        log = daemon.muructl("events").stdout
-        assert "worker.unreachable" in daemon.events(), log
-        assert "did not answer HELLO within 5 s" in log, log
-        wait_for(lambda: "worker.restarted" in daemon.events())
+        assert "worker.unreachable" not in daemon.events(), daemon.muructl("events").stdout
     finally:
         try:
             os.kill(pid, signal.SIGCONT)
@@ -248,8 +245,7 @@ def test_a_stopped_worker_does_not_hold_up_the_daemon(daemon: Daemon) -> None:
             pass
 
     daemon.muructl("maintenance", "off", "plain")
-    wait_for(lambda: daemon.get("/").status == 200)
-    assert json.loads(daemon.get("/info").body)["pid"] != pid
+    assert json.loads(daemon.get("/info").body)["pid"] == pid
 
 
 def test_stacks_are_read_from_outside_a_worker_holding_the_interpreter(daemon: Daemon) -> None:
