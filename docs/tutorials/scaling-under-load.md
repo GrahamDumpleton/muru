@@ -24,7 +24,7 @@ request.
 ```
 mkdir busy && cd busy
 uv init --bare
-uv add muru
+uv venv
 ```
 
 Save this as `app.py`:

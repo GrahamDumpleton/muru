@@ -27,7 +27,7 @@ the project's virtualenv:
 ```
 mkdir site && cd site
 uv init --bare
-uv add muru
+uv venv
 mkdir v1
 ```
 

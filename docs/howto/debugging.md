@@ -141,8 +141,9 @@ last of its group in service keeps serving.
 ## Memory
 
 `muructl debug memory` shows each worker's resident, proportional and
-unique size, the garbage collector's counts, and the object types it
-holds most of. With `--trace`, tracemalloc runs for `--for` (30 s) and
+unique size, the garbage collector's counts, the collections it has run
+and the object types it holds most of. With `--trace`, tracemalloc runs
+for `--for` (30 s) and
 the sites that allocated most in that time are shown, by bytes and
 objects added:
 
@@ -162,6 +163,32 @@ muructl debug memory shop --snapshot
 muructl debug memory shop --diff
 muructl debug memory shop --drop
 ```
+
+The collections are timed in every worker from the moment it starts, by
+generation (`0`, `1` and `2`, or `full` on a free-threaded interpreter,
+whose collector takes the whole heap each time): how many ran, how long
+they took in all and at the 95th percentile, how many objects they freed,
+and how many of them ran while the worker had requests in flight, with
+how many requests were waiting through them:
+
+```
+worker 0 (pid 4133)
+  rss 61.2MB  pss 38.9MB  uss 30.1MB
+  gc counts [412,3,0]
+  gc generation 0: 1840 collections, 92.3 ms in all, p95 under 0.1 ms, 12 objects freed, 1611 while 2904 requests were in flight
+  gc generation 2: 3 collections, 48.0 ms in all, p95 under 50 ms, 219 objects freed, 2 while 5 requests were in flight
+  objects:
+```
+
+A collection pauses the whole worker, so pauses that landed on requests
+in flight are tail latency no single endpoint explains. The same figures
+are in the [metrics](metrics.md) as `muru_gc_pause_seconds`, and the
+[scaling](scaling.md) diagnosis names collection when it takes a tenth of
+the workers' time or more. The host already calls `gc.freeze()` before
+every fork, so a worker's collections scan only what the worker itself
+created; an application whose collections still cost it can create fewer
+long-lived cyclic objects after the fork, or call `gc.freeze()` itself once
+its caches are warm.
 
 ## Running code
 

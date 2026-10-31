@@ -46,4 +46,8 @@ Prebuilt release directories need no build step, so uv is optional.
 
 ## More information
 
-Specification sections 8.1 to 8.4 and 17.1.
+Specification sections 8.1 to 8.4 and 17.1. The isolation sentences are
+softened by [ADR 0036](0036-install-from-locks-and-build-what-is-missing.md):
+development mode runs the developer's uv as it is, and the daemon isolates
+its directories but passes `UV_CONFIG_FILE` rather than `UV_NO_CONFIG` for
+builds, so the project's own `[tool.uv]` table applies. External uv stands.

@@ -9,6 +9,7 @@ default-members = [
     "crates/muru-common",
     "crates/muru-config",
     "crates/muru-proto",
+    "crates/muru-provision",
     "crates/muru-edge",
     "crates/muru-controller",
     "crates/muru-supervisor",
@@ -18,7 +19,7 @@ default-members = [
 
 [workspace.package]
 # The only place the project version is stated. Change it with `just bump`.
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -55,6 +56,7 @@ muru-config = { path = "crates/muru-config" }
 muru-controller = { path = "crates/muru-controller" }
 muru-edge = { path = "crates/muru-edge" }
 muru-proto = { path = "crates/muru-proto" }
+muru-provision = { path = "crates/muru-provision" }
 percent-encoding = "2"
 prost = "0.14"
 protoc-bin-vendored = "3"

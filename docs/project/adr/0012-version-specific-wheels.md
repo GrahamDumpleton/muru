@@ -46,3 +46,6 @@ x86_64 and aarch64, built by maturin-action in the release workflow.
 ## More information
 
 Specification sections 6.11, 8.3, 17.1 and 19.3 (runtime wheel matrix risk).
+[ADR 0037](0037-the-runtime-library-is-provided-by-muructl.md) decides who
+installs these wheels: muructl itself, onto the host's PYTHONPATH, never
+the application's dependencies. The wheel matrix is unchanged.

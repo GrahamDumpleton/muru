@@ -66,9 +66,9 @@
 {% if !data.scaling.is_empty() %}
 <h3>Scaling</h3>
 <table>
-  <tr><th>Group</th><th>Workers</th><th>Policy</th><th class="num">CPU</th><th class="num">GIL wait p95</th><th class="num">Loop lag p95</th><th>Diagnosis</th><th>Last decision</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
+  <tr><th>Group</th><th>Workers</th><th>Policy</th><th class="num">CPU</th><th class="num">GC</th><th class="num">GIL wait p95</th><th class="num">Loop lag p95</th><th>Diagnosis</th><th>Last decision</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
   {% for row in data.scaling %}
-  <tr><td>{{ row.release }} {{ row.group }}{% if row.optional %} (optional){% endif %}</td><td>{{ row.workers }}</td><td>{{ row.policy }}</td><td class="num">{{ row.cpu }}</td><td class="num">{{ row.gil_wait }}</td><td class="num">{{ row.loop_lag }}</td><td>{{ row.diagnosis }}{% if !row.advice.is_empty() %}<br><small>{{ row.advice }}</small>{% endif %}</td><td>{{ row.last_decision }}</td>
+  <tr><td>{{ row.release }} {{ row.group }}{% if row.optional %} (optional){% endif %}</td><td>{{ row.workers }}</td><td>{{ row.policy }}</td><td class="num">{{ row.cpu }}</td><td class="num">{{ row.gc }}</td><td class="num">{{ row.gil_wait }}</td><td class="num">{{ row.loop_lag }}</td><td>{{ row.diagnosis }}{% if !row.advice.is_empty() %}<br><small>{{ row.advice }}</small>{% endif %}</td><td>{{ row.last_decision }}</td>
     {% if let Some(token) = csrf %}
     <td class="actions"><form method="post" action="actions/scale">
       <input type="hidden" name="csrf" value="{{ token }}">

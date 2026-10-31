@@ -855,8 +855,14 @@ async fn accept(
                     })
                     .await;
 
+                    // Section 11.1: every handshake is counted by its result.
+
+                    let listener = local.to_string();
+                    let metrics = shared.access_log.metrics();
+
                     match handshake {
                         Ok(Ok((stream, ja4))) => {
+                            metrics.count_tls_handshake(&listener, "completed");
                             let mut info = tls::info(stream.get_ref().1);
                             info.ja4 = ja4.unwrap_or_default();
                             serve(
@@ -873,9 +879,13 @@ async fn accept(
                             .await;
                         }
                         Ok(Err(error)) => {
+                            metrics.count_tls_handshake(&listener, "failed");
                             tracing::debug!(%peer, %error, "TLS handshake failed");
                         }
-                        Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
+                        Err(_) => {
+                            metrics.count_tls_handshake(&listener, "timed_out");
+                            tracing::debug!(%peer, "TLS handshake timed out");
+                        }
                     }
                 });
             }

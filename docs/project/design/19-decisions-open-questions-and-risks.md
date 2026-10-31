@@ -21,8 +21,11 @@ specification is maintained.
 | WSGI and ASGI in one worker | Requests handed across per request in either direction: the muru.wsgi_to_asgi environ key and the asgi_to_wsgi scope extension, with lifespan registration and a WebSocket adapter under muru.asgi (ADR 0023) |
 | Preload | auto by default everywhere: preload with an import check, falling back to per-worker imports when the import left sockets, threads, child processes or event loops behind (sections 6.1 and 6.2) |
 | Releases | Immutable. Configuration changes are new releases |
-| Environment builds | Prebuilt directories supported first, optional uv build step |
-| uv | External program, optional muructl[uv] extra, isolated configuration |
+| Provisioning | One procedure, muructl build, called by muructl run, the daemon's Building state and the image build stage. Install from locks, never resolve. One knob, build.when: auto builds what is missing and leaves what exists alone, always builds on every start and lock change, never builds nothing; the same key in development and under the daemon. A missing interpreter is installed only where an environment would be built (ADR 0036) |
+| Environment builds | Development builds the project's own .venv with the developer's uv, as uv sync would; the daemon builds into STATE/envs/APP/RELEASE as the release's user with --no-dev and no source builds. Building needs pyproject.toml, uv.lock and uv; a machine without uv runs on an existing environment and is told how to get uv (section 8.2) |
+| uv | External program, optional muructl[uv] extra. Development uses the developer's uv as it is; the daemon isolates its directories but keeps the project's own [tool.uv] configuration, passing UV_CONFIG_FILE rather than UV_NO_CONFIG for builds (ADR 0036) |
+| Garbage collection | Measured in every worker through gc.callbacks, on by default with no setting, since the callback costs far less than the shortest collection; the generation label is what the interpreter reports, full on free-threaded builds. Muru does not yet decide when collection runs (ADR 0038) |
+| Runtime library | Provided by muructl on the host's PYTHONPATH in every mode, one directory per interpreter tag, fetched as a wheel and unpacked without pip or uv; never a required application dependency. A matching copy already in the environment is used as it is and nothing is fetched, so offline machines need no flag (ADR 0037) |
 | Python versions | CPython 3.11 and later, free-threaded from 3.14t |
 | Platforms | Linux for production, macOS for development, no Windows |
 | wsgi.input_terminated | Always True. chunked_body defaults to buffer |

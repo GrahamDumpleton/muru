@@ -512,6 +512,9 @@ pub struct Info {
     /// and release, then by mount, the default mount's under the empty
     /// name: as its host last announced them.
     pub interfaces: std::sync::Mutex<Interfaces>,
+    /// Section 8.4: uv as found and how it is run, from the `[tools]`
+    /// table read at start.
+    pub provisioning: crate::provision::Provisioning,
 }
 
 /// Detected interfaces by application and release, then by mount.
@@ -646,6 +649,10 @@ struct Running {
     control: Option<HostControl>,
     /// What the workers last reported, for metrics.
     status: Vec<crate::host::WorkerStatus>,
+    /// Section 11.1: workers the host replaced, by group and reason, and
+    /// workers that exited, likewise, since the release started.
+    recycles: BTreeMap<(String, String), u64>,
+    exits: BTreeMap<(String, String), u64>,
     /// Section 7.3: the report the workers' signals are measured from,
     /// and when it arrived.
     signals_from: Option<(Instant, Vec<crate::host::WorkerStatus>)>,
@@ -995,6 +1002,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let listeners = edge.listeners();
+
+    // Section 8.4: uv as found and how it is run, said once at start.
+
+    let provisioning =
+        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
+    tracing::info!("{}", provisioning.describe_uv());
     write_edge_record(&locations.run.path, &edge);
 
     // The admin API on its socket.
@@ -1019,6 +1032,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: std::sync::Mutex::new(Interfaces::new()),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        provisioning,
     });
     let handle = Handle {
         store: Arc::clone(&store),
@@ -1946,6 +1960,7 @@ impl Daemon {
                     },
                     policy: status.spec.describe(),
                     cpu: measured(status.workers.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+                    gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
                     gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
                     loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
                     diagnosis: status.diagnosis.summary.to_owned(),
@@ -3043,6 +3058,59 @@ impl Daemon {
                     worker.in_flight as f64,
                 ));
 
+                // Section 7.3: the worker's own signals, as histograms
+                // once it has observed anything.
+
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_gil_wait_seconds",
+                    &labels,
+                    &worker.gil_wait,
+                    worker.gil_wait_us,
+                ));
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_loop_lag_seconds",
+                    &labels,
+                    &worker.loop_lag,
+                    worker.loop_lag_us,
+                ));
+
+                // Section 11.1: its garbage collections, by generation.
+
+                for generation in &worker.gc {
+                    let labels = [
+                        ("app", app.as_str()),
+                        ("release", id.as_str()),
+                        ("group", worker.group.as_str()),
+                        ("worker", index.as_str()),
+                        ("generation", generation.generation.as_str()),
+                    ];
+
+                    for (name, value) in [
+                        ("muru_gc_collections_total", generation.collections as f64),
+                        ("muru_gc_seconds_total", generation.nanos as f64 / 1e9),
+                        (
+                            "muru_gc_collected_objects_total",
+                            generation.collected as f64,
+                        ),
+                    ] {
+                        samples.push(muru_edge::metrics::Sample::new(name, &labels, value));
+                    }
+
+                    for (requests, counts, sum_us) in [
+                        ("none", &generation.idle, generation.idle_us),
+                        ("in_flight", &generation.busy_pauses, generation.busy_us),
+                    ] {
+                        let mut with_requests = labels.to_vec();
+                        with_requests.push(("requests", requests));
+                        samples.extend(muru_edge::metrics::signal_histogram(
+                            "muru_gc_pause_seconds",
+                            &with_requests,
+                            counts,
+                            sum_us,
+                        ));
+                    }
+                }
+
                 for (measure, bytes) in [
                     ("rss", worker.rss),
                     ("pss", worker.pss),
@@ -3061,6 +3129,26 @@ impl Daemon {
                             bytes as f64,
                         ));
                     }
+                }
+            }
+
+            // Sections 7.6 and 7.7: workers replaced and workers gone.
+
+            for (name, counts) in [
+                ("muru_worker_recycles_total", &running.recycles),
+                ("muru_worker_exits_total", &running.exits),
+            ] {
+                for ((group, reason), count) in counts {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        name,
+                        &[
+                            ("app", app.as_str()),
+                            ("release", id.as_str()),
+                            ("group", group.as_str()),
+                            ("reason", reason.as_str()),
+                        ],
+                        *count as f64,
+                    ));
                 }
             }
         }
@@ -3199,6 +3287,8 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        recycles: BTreeMap::new(),
+                        exits: BTreeMap::new(),
                         signals_from: None,
                         scalers,
                         host_pss: None,
@@ -3286,6 +3376,8 @@ impl Daemon {
                         held: false,
                         control: None,
                         status: Vec::new(),
+                        recycles: BTreeMap::new(),
+                        exits: BTreeMap::new(),
                         signals_from: None,
                         scalers: Vec::new(),
                         host_pss: None,
@@ -3646,6 +3738,141 @@ impl Daemon {
             .map_err(|error| error.to_string())
     }
 
+    /// Section 8.2: build the release's environment when its spec says
+    /// so and it is not there yet (a release started again after a daemon
+    /// restart, or a rollback target, keeps the one it has), as the
+    /// release's user, with uv's lines in the release log tagged [build].
+    /// Returns the interpreter the host runs: the environment's, or the
+    /// spec's when nothing is built.
+    async fn build_environment(
+        &self,
+        app: &str,
+        id: &str,
+        release: &Release,
+        identity: Option<crate::host::Identity>,
+    ) -> Result<PathBuf, String> {
+        let spec = &release.spec;
+
+        if !spec.build.builds {
+            return Ok(spec.python.clone());
+        }
+
+        let environment =
+            crate::provision::Provisioning::environment_dir(&self.locations.state.path, app, id);
+        let python = environment.join("bin").join("python");
+
+        if python.is_file() {
+            return Ok(python);
+        }
+
+        let Some(uv) = self.info.provisioning.uv.clone() else {
+            return Err(
+                "the release needs an environment built and uv was not found; install uv, or                  deploy a source with its environment built"
+                    .to_owned(),
+            );
+        };
+        let subject = format!("{app}@{id}");
+        self.set_state(release, ReleaseState::Building, "building the environment");
+        self.events.emit(
+            "release.building",
+            &subject,
+            "info",
+            &format!("from {}", spec.source.join("uv.lock").display()),
+        );
+
+        // The directories the build writes, owned by the release's user:
+        // the application's environments and a uv cache of its own.
+
+        let user =
+            identity.map_or_else(|| "daemon".to_owned(), |identity| identity.uid.to_string());
+        let cache = self.locations.state.path.join("uv-cache").join(&user);
+        let parent = environment
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.locations.state.path.clone());
+
+        for dir in [&parent, &cache] {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("creating {}: {error}", dir.display()))?;
+
+            if let Some(identity) = identity {
+                std::os::unix::fs::chown(dir, Some(identity.uid), Some(identity.gid))
+                    .map_err(|error| format!("owning {}: {error}", dir.display()))?;
+            }
+        }
+
+        let isolation = self.info.provisioning.build_isolation(cache);
+        let build = muru_provision::Build {
+            project: spec.source.clone(),
+            python: Some(spec.python.display().to_string()),
+            deployment: true,
+            deps_only: false,
+            target: Some(environment.clone()),
+            extras: spec.build.extras.clone(),
+            groups: spec.build.groups.clone(),
+            source_builds: spec.build.source_builds,
+            compile_bytecode: spec.build.compile_bytecode,
+        };
+        let log_path = self.host_log(app, id);
+        let started = std::time::Instant::now();
+        let digest = muru_provision::build::lock_digest(&spec.source).unwrap_or_default();
+        let outcome = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|error| format!("opening {}: {error}", log_path.display()))?;
+            let mut command = build.command(&uv, &isolation);
+            crate::host::own_session_std(&mut command, identity);
+            let _ = writeln!(log, "[build] {}", build.describe());
+
+            build
+                .run_command(command, &mut |line| {
+                    let _ = writeln!(log, "[build] {line}");
+                })
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+        outcome?;
+        self.events.emit(
+            "release.built",
+            &subject,
+            "info",
+            &format!(
+                "{} in {:.1}s from uv.lock {digest}",
+                environment.display(),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        Ok(python)
+    }
+
+    /// Section 8.3: the runtime library for an interpreter, from the
+    /// environment, the state directory's runtime directories or a fetch,
+    /// under the `[tools]` table's offline and wheel directory settings.
+    async fn runtime_library(&self, python: &Path) -> Result<muru_provision::Provided, String> {
+        let probe = muru_provision::probe::probe(python).map_err(|error| error.to_string())?;
+        let tools = &self.info.provisioning.tools;
+        let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
+        let root = self.locations.state.path.join("runtime");
+        let wheel_dir = tools.wheel_dir.as_deref().map(PathBuf::from);
+        let options = muru_provision::runtime::Options {
+            probe: &probe,
+            version: &version,
+            root: &root,
+            wheel_dir: wheel_dir.as_deref(),
+            offline: tools.offline.unwrap_or(false),
+        };
+
+        muru_provision::runtime::provide(&options, "tools.wheel_dir")
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Start a release's host and wait until every worker listens
     /// (pending or stopped to starting and warming; or failed). The
     /// caller marks the release ready once the edge has it, with
@@ -3724,8 +3951,84 @@ impl Daemon {
                 .await;
         }
 
+        // Section 8.2: the Building state, for a release whose mode and
+        // source call for an environment of its own, built from the lock
+        // as the release's user into the state directory. A failed build
+        // fails the release before start-up, with uv's last line.
+
+        let python = match self.build_environment(app, id, &release, identity).await {
+            Ok(python) => python,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.build_failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
+        // Section 8.3: the runtime library for the release's interpreter,
+        // from the environment when it matches, else the state directory,
+        // else fetched once. A mismatched copy that has to do is a warning
+        // in the release's events; nothing usable fails the release.
+
+        let library = match self.runtime_library(&python).await {
+            Ok(library) => library,
+            Err(message) => {
+                self.set_state(&release, ReleaseState::Failed, &message);
+                self.events
+                    .emit("release.failed", &subject, "error", &message);
+                return Err(message);
+            }
+        };
+
+        for note in &library.notes {
+            let level = if library.how == muru_provision::How::Fallback {
+                "warning"
+            } else {
+                "info"
+            };
+            self.events
+                .emit("release.state_changed", &subject, level, note);
+        }
+
+        // Section 8.2: redirected bytecode goes to a directory of the
+        // release's own, writable by its user and removed with it;
+        // precompiled bytecode in the source is used where it is.
+
+        let pycache_prefix = match spec.bytecode.effective() {
+            muru_config::Bytecode::Redirect => {
+                let prefix = crate::provision::Provisioning::pycache_dir(
+                    &self.locations.state.path,
+                    app,
+                    id,
+                );
+
+                match std::fs::create_dir_all(&prefix) {
+                    Ok(()) => {
+                        if let Some(identity) = identity {
+                            let _ = std::os::unix::fs::chown(
+                                &prefix,
+                                Some(identity.uid),
+                                Some(identity.gid),
+                            );
+                        }
+
+                        Some(prefix)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "creating {} failed; bytecode is left to Python", prefix.display());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let host_spec = HostSpec {
-            python: spec.python.clone(),
+            python,
+            pythonpath: library.pythonpath.clone(),
+            pycache_prefix,
+            no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
             app: spec.entrypoint.clone(),
             name: Some(app.to_owned()),
             release: Some(id.to_owned()),
@@ -3871,6 +4174,8 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                recycles: BTreeMap::new(),
+                exits: BTreeMap::new(),
                 signals_from: None,
                 scalers,
                 host_pss: None,
@@ -4070,6 +4375,8 @@ impl Daemon {
                 held: false,
                 control: None,
                 status: Vec::new(),
+                recycles: BTreeMap::new(),
+                exits: BTreeMap::new(),
                 signals_from: None,
                 scalers: Vec::new(),
                 host_pss: None,
@@ -6833,6 +7140,8 @@ impl Daemon {
                 kind,
                 level,
                 message,
+                group,
+                reason,
             } => {
                 let level = match level.as_str() {
                     "error" => "error",
@@ -6840,6 +7149,32 @@ impl Daemon {
                     "notice" => "notice",
                     _ => "info",
                 };
+
+                // Section 11.1: a replaced worker and an exit are counted
+                // by group and reason.
+
+                if let Some(running) = self.running.get_mut(&key) {
+                    let counts = match kind.as_str() {
+                        "worker.recycled" | "worker.timeout_killed" => Some(&mut running.recycles),
+                        "worker.exited" => Some(&mut running.exits),
+                        _ => None,
+                    };
+
+                    if let Some(counts) = counts {
+                        let group = if group.is_empty() {
+                            muru_edge::routing::DEFAULT_GROUP.to_owned()
+                        } else {
+                            group
+                        };
+
+                        let reason = if reason.is_empty() {
+                            "other".to_owned()
+                        } else {
+                            reason
+                        };
+                        *counts.entry((group, reason)).or_default() += 1;
+                    }
+                }
 
                 // Section 9.3: a crash or a timeout kill counts against
                 // the release in a rollout's gates.

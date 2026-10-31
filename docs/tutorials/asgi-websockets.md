@@ -15,13 +15,12 @@ there is more than one worker.
 
 ## A project
 
-Make a project directory with the runtime library in it, as in the first
-tutorial:
+Make a project directory with a virtualenv, as in the first tutorial:
 
 ```
 mkdir chat && cd chat
 uv init --bare
-uv add muru
+uv venv
 ```
 
 ## A chat room

@@ -267,8 +267,23 @@ impl Admin for Service {
                 .and_then(|id| self.handle.store.release(&request.app, &id).ok())
                 .map(|release| release.spec)
         };
-        let spec = config::resolve_spec(&request, previous.as_ref(), &config::Tables::default())
-            .map_err(Status::invalid_argument)?;
+
+        // Resolution may run uv and the interpreter, so it is off the
+        // runtime's threads.
+
+        let info = std::sync::Arc::clone(&self.handle.info);
+        let resolving = request.clone();
+        let spec = tokio::task::spawn_blocking(move || {
+            config::resolve_spec(
+                &resolving,
+                previous.as_ref(),
+                &config::Tables::default(),
+                &info.provisioning,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(Status::invalid_argument)?;
         let (created_tx, created_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -1220,7 +1235,13 @@ impl Admin for Service {
             .read()
             .expect("defined names poisoned")
             .clone();
-        let mut plan = config::plan(&self.handle.store, &document, request.prune, &defined);
+        let mut plan = config::plan(
+            &self.handle.store,
+            &document,
+            request.prune,
+            &defined,
+            &self.handle.info.provisioning,
+        );
         let frozen = self.frozen().map_err(internal)?;
         let mut overridden = BTreeMap::new();
 
@@ -1341,7 +1362,13 @@ impl Admin for Service {
             .read()
             .expect("defined names poisoned")
             .clone();
-        let plan = config::plan(&self.handle.store, &document, true, &defined);
+        let plan = config::plan(
+            &self.handle.store,
+            &document,
+            true,
+            &defined,
+            &self.handle.info.provisioning,
+        );
         Ok(Response::new(report_message(&plan)))
     }
 
@@ -1563,6 +1590,23 @@ impl Service {
             .store
             .delete_release(app, id)
             .map_err(|error| error.to_string())?;
+
+        // Section 8.2: the environment built for the release and its
+        // bytecode go with it.
+
+        let state = &self.handle.info.locations.state.path;
+
+        for dir in [
+            crate::provision::Provisioning::environment_dir(state, app, id),
+            crate::provision::Provisioning::pycache_dir(state, app, id),
+        ] {
+            if dir.is_dir()
+                && let Err(error) = std::fs::remove_dir_all(&dir)
+            {
+                tracing::warn!(%error, "removing {} failed", dir.display());
+            }
+        }
+
         Ok(outcome.to_owned())
     }
 
@@ -1769,6 +1813,7 @@ fn scale_message(
                 worker_cpu: status.workers.worker_cpu,
                 gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
                 loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
+                gc_share: status.workers.gc_share,
                 bottleneck: status.diagnosis.bottleneck.to_owned(),
                 diagnosis: status.diagnosis.summary.to_owned(),
                 advice: status.diagnosis.advice.to_owned(),
@@ -1841,6 +1886,31 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
             .unwrap_or_default()
     };
 
+    let bytecode = match release.spec.bytecode.effective() {
+        muru_config::Bytecode::Redirect => format!(
+            "redirect, under {}",
+            crate::provision::Provisioning::pycache_dir(
+                &handle.info.locations.state.path,
+                &release.app,
+                &release.id,
+            )
+            .display()
+        ),
+        _ => release.spec.bytecode.describe(),
+    };
+
+    let environment = if release.spec.build.builds {
+        crate::provision::Provisioning::environment_dir(
+            &handle.info.locations.state.path,
+            &release.app,
+            &release.id,
+        )
+        .display()
+        .to_string()
+    } else {
+        String::new()
+    };
+
     pb::Release {
         app: release.app,
         id: release.id,
@@ -1850,6 +1920,33 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         entrypoint: release.spec.entrypoint,
         interface: release.spec.interface.as_str().to_owned(),
         python: release.spec.python.display().to_string(),
+        python_version: release
+            .spec
+            .interpreter
+            .as_ref()
+            .map(|interpreter| interpreter.version.clone())
+            .unwrap_or_default(),
+        python_tag: release
+            .spec
+            .interpreter
+            .as_ref()
+            .map(|interpreter| {
+                if interpreter.free_threaded {
+                    format!("{}, free-threaded", interpreter.tag)
+                } else {
+                    interpreter.tag.clone()
+                }
+            })
+            .unwrap_or_default(),
+        python_request: release
+            .spec
+            .interpreter
+            .as_ref()
+            .and_then(|interpreter| interpreter.request.clone())
+            .unwrap_or_default(),
+        environment,
+        build_when: release.spec.build.when.as_str().to_owned(),
+        bytecode,
         processes: release.spec.processes,
         threads: release.spec.threads,
         sync_threads: release.spec.sync_threads,

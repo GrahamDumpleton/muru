@@ -1185,6 +1185,36 @@ fn print_memory(response: &pb::DebugResponse) {
         }
 
         println!("  gc counts {}", result["gc"]["counts"]);
+
+        // Section 11.1: the collections the runtime timed, by generation.
+
+        for generation in result["gc"]["pauses"].as_array().into_iter().flatten() {
+            let count = |key: &str| generation[key].as_u64().unwrap_or(0);
+            let pauses: Vec<u64> = ["idle_hist", "busy_hist"]
+                .iter()
+                .map(|key| {
+                    generation[*key]
+                        .as_array()
+                        .map(|items| items.iter().filter_map(serde_json::Value::as_u64).collect())
+                        .unwrap_or_default()
+                })
+                .reduce(|idle: Vec<u64>, busy: Vec<u64>| {
+                    idle.iter().zip(&busy).map(|(a, b)| a + b).collect()
+                })
+                .unwrap_or_default();
+            let p95 = signal_p95_ms(&pauses).map_or("-".to_owned(), |ms| format!("{ms} ms"));
+            println!(
+                "  gc generation {}: {} collections, {:.1} ms in all, p95 under {}, {} objects freed, {} while {} requests were in flight",
+                generation["generation"].as_str().unwrap_or("?"),
+                count("collections"),
+                count("ns") as f64 / 1e6,
+                p95,
+                count("collected"),
+                count("busy"),
+                count("waited"),
+            );
+        }
+
         println!("  objects:");
 
         for entry in result["objects"].as_array().into_iter().flatten() {
@@ -1372,6 +1402,22 @@ async fn ask(
 }
 
 /// A worker's answer as JSON, when it answered.
+/// The 95th percentile of a worker's cumulative histogram over the
+/// signal bounds, in milliseconds: the bound holding 95 percent of the
+/// observations, or none without any.
+fn signal_p95_ms(counts: &[u64]) -> Option<f64> {
+    let bounds = muru_proto::worker::v1::SIGNAL_BOUNDS_US;
+    let total = *counts.last()?;
+
+    if total == 0 || counts.len() != bounds.len() + 1 {
+        return None;
+    }
+
+    let target = total as f64 * 0.95;
+    let index = counts.iter().position(|count| *count as f64 >= target)?;
+    Some(*bounds.get(index).or(bounds.last())? as f64 / 1000.0)
+}
+
 fn parse_result(answer: &pb::WorkerDebug) -> Option<serde_json::Value> {
     if !answer.ok {
         return None;
@@ -1820,9 +1866,31 @@ pub struct DeployArgs {
     #[arg(long, value_name = "NAME")]
     interface: Option<muru_config::Interface>,
 
-    /// The interpreter (default: the source's .venv, else the previous release's).
+    /// The interpreter: a path, or a version request such as 3.13 that
+    /// the daemon resolves with uv (default: the source's .venv, else its
+    /// own request, else the previous release's).
     #[arg(long)]
     python: Option<PathBuf>,
+
+    /// When the daemon builds the release's environment from uv.lock:
+    /// auto (the default) when the source has a lock and no .venv, always
+    /// when it has a lock, never.
+    #[arg(long, value_name = "MODE")]
+    build: Option<String>,
+
+    /// An extra the built environment includes; repeatable.
+    #[arg(long = "build-extra", value_name = "NAME")]
+    build_extra: Vec<String>,
+
+    /// A dependency group the built environment includes; repeatable.
+    #[arg(long = "build-group", value_name = "NAME")]
+    build_group: Vec<String>,
+
+    /// Where the release's bytecode goes: redirect (the default, a
+    /// directory of its own under the state directory), source (beside
+    /// the source, as Python does) or off.
+    #[arg(long, value_name = "MODE")]
+    bytecode: Option<String>,
 
     /// Worker processes.
     #[arg(long)]
@@ -2254,6 +2322,10 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             .python
             .map(|path| absolute_interpreter(&path, None))
             .unwrap_or_default(),
+        build_when: args.build.unwrap_or_default(),
+        build_extras: args.build_extra,
+        build_groups: args.build_group,
+        bytecode: args.bytecode.unwrap_or_default(),
         processes: args.processes,
         threads: args.threads,
         sync_threads: args.sync_threads,
@@ -2894,8 +2966,9 @@ fn print_scale_status(status: &pb::ScaleStatus) {
             value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
         };
         println!(
-            "  workers: cpu {}, gil wait p95 {}, loop lag p95 {}",
+            "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}",
             measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
+            measured(group.gc_share.map(|share| share * 100.0), "%"),
             measured(group.gil_wait_p95_ms, " ms"),
             measured(group.loop_lag_p95_ms, " ms")
         );
@@ -3883,7 +3956,35 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         event_loop: interfaces.iter().any(|interface| *interface != "wsgi"),
     };
 
-    lines.push(("python".to_owned(), release.python.clone()));
+    let mut python = release.python.clone();
+
+    if !release.python_version.is_empty() {
+        python.push_str(&format!(
+            " ({}, {})",
+            release.python_version, release.python_tag
+        ));
+    }
+
+    if !release.python_request.is_empty() {
+        python.push_str(&format!(", requested {}", release.python_request));
+    }
+
+    lines.push(("python".to_owned(), python));
+
+    if !release.environment.is_empty() {
+        lines.push((
+            "environment".to_owned(),
+            format!(
+                "{} (built, build.when = {})",
+                release.environment, release.build_when
+            ),
+        ));
+    }
+
+    if !release.bytecode.is_empty() {
+        lines.push(("bytecode".to_owned(), release.bytecode.clone()));
+    }
+
     lines.push((
         "entrypoint".to_owned(),
         format!(

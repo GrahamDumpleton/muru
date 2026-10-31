@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 pub enum ReleaseState {
     /// Recorded, not yet started.
     Pending,
+    /// The environment is being built from the lock (section 8.2).
+    Building,
     /// The host is starting and preloading.
     Starting,
     /// Workers are forking and not yet all ready, or all are ready and
@@ -40,8 +42,9 @@ pub enum ReleaseState {
 
 impl ReleaseState {
     /// Every state, for parsing.
-    pub const ALL: [ReleaseState; 9] = [
+    pub const ALL: [ReleaseState; 10] = [
         ReleaseState::Pending,
+        ReleaseState::Building,
         ReleaseState::Starting,
         ReleaseState::Warming,
         ReleaseState::Ready,
@@ -56,6 +59,7 @@ impl ReleaseState {
     pub fn as_str(self) -> &'static str {
         match self {
             ReleaseState::Pending => "pending",
+            ReleaseState::Building => "building",
             ReleaseState::Starting => "starting",
             ReleaseState::Warming => "warming",
             ReleaseState::Ready => "ready",
@@ -427,6 +431,17 @@ pub struct ReleaseSpec {
     /// Section 3.3: the layer each setting came from, by key.
     #[serde(default, skip_serializing_if = "Layers::is_empty")]
     pub layers: Layers,
+    /// Section 8.1: what the interpreter was found to be when the release
+    /// was resolved, and the request that chose it; none for a release
+    /// recorded before probing existed or resolved without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<Interpreter>,
+    /// Section 8.2: when and how the environment is built on the node.
+    #[serde(default)]
+    pub build: BuildSpec,
+    /// Section 8.2: where compiled bytecode goes.
+    #[serde(default)]
+    pub bytecode: BytecodeSpec,
 }
 
 /// Section 3.3: where each of a release's settings came from, by key:
@@ -453,6 +468,146 @@ impl PartialEq for Layers {
 }
 
 impl Eq for Layers {}
+
+/// Section 8.2: where a release's bytecode goes. `precompiled` records
+/// what was found in the source at resolution, so it stays out of the
+/// comparison that keeps releases immutable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BytecodeSpec {
+    /// The setting.
+    #[serde(default)]
+    pub mode: muru_config::Bytecode,
+    /// Whether the source holds bytecode for the interpreter's cache tag,
+    /// in which case a redirected release runs on it instead.
+    #[serde(default)]
+    pub precompiled: bool,
+}
+
+impl BytecodeSpec {
+    /// What the release runs with: the setting, except that redirecting
+    /// gives way to precompiled bytecode in the source.
+    pub fn effective(&self) -> muru_config::Bytecode {
+        match self.mode {
+            muru_config::Bytecode::Redirect if self.precompiled => muru_config::Bytecode::Source,
+            mode => mode,
+        }
+    }
+
+    /// A short description, as `redirect`, `source (precompiled)` or `off`.
+    pub fn describe(&self) -> String {
+        match (self.mode, self.precompiled) {
+            (muru_config::Bytecode::Redirect, true) => "source (precompiled)".to_owned(),
+            (mode, _) => mode.as_str().to_owned(),
+        }
+    }
+}
+
+impl PartialEq for BytecodeSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl Eq for BytecodeSpec {}
+
+/// Section 8.2: the build table as resolved for a release, and whether
+/// the daemon builds an environment for it. `builds` follows from the
+/// mode and the source as they were at resolution, so it stays out of
+/// the comparison that keeps releases immutable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildSpec {
+    /// The mode in force.
+    #[serde(default)]
+    pub when: muru_config::BuildWhen,
+    /// Extras the environment includes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extras: Vec<String>,
+    /// Dependency groups beyond the defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Whether sdists may be built on the node.
+    #[serde(default)]
+    pub source_builds: bool,
+    /// Whether bytecode is compiled at build time.
+    #[serde(default = "default_true")]
+    pub compile_bytecode: bool,
+    /// Whether the daemon builds an environment for the release: the mode
+    /// says so and the source has a lock.
+    #[serde(default)]
+    pub builds: bool,
+}
+
+impl PartialEq for BuildSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.when == other.when
+            && self.extras == other.extras
+            && self.groups == other.groups
+            && self.source_builds == other.source_builds
+            && self.compile_bytecode == other.compile_bytecode
+    }
+}
+
+impl Eq for BuildSpec {}
+
+/// Section 8.1: the interpreter as the probe found it when the release
+/// was resolved. It records what was found, not a setting, so two specs
+/// are equal whatever their probes say.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Interpreter {
+    /// The version, as `3.13.9`.
+    pub version: String,
+    /// The wheel tag, as `cp313` or `cp314t`.
+    pub tag: String,
+    /// `sys.implementation.cache_tag`, as `cpython-313`, which names the
+    /// bytecode files.
+    #[serde(default)]
+    pub cache_tag: String,
+    /// Whether the GIL is disabled.
+    #[serde(default)]
+    pub free_threaded: bool,
+    /// `sys.platform` and the machine, as `linux x86_64`.
+    #[serde(default)]
+    pub platform: String,
+    /// The request that chose the interpreter and its source, as `3.13
+    /// from .python-version`, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
+impl Interpreter {
+    /// What a resolution found.
+    pub fn from_resolved(resolved: &muru_provision::Resolved) -> Self {
+        Self {
+            version: resolved.probe.version.clone(),
+            tag: resolved.probe.tag(),
+            cache_tag: resolved.probe.cache_tag.clone(),
+            free_threaded: resolved.probe.free_threaded,
+            platform: format!("{} {}", resolved.probe.platform, resolved.probe.machine),
+            request: resolved
+                .request()
+                .map(|request| format!("{} from {}", request.text, request.source.as_str())),
+        }
+    }
+
+    /// A short description, as `3.13.9, cp313, free-threaded`.
+    pub fn describe(&self) -> String {
+        let mut text = format!("{}, {}", self.version, self.tag);
+
+        if self.free_threaded {
+            text.push_str(", free-threaded");
+        }
+
+        text
+    }
+}
+
+impl PartialEq for Interpreter {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Interpreter {}
 
 /// Section 9.9: a release that runs an HTTP server of its own instead
 /// of Muru workers, started from a command and routed to as an upstream.

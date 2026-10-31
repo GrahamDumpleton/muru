@@ -7,6 +7,7 @@
 //! threads is guarded by a lock or is immutable.
 
 mod asgi;
+mod gc;
 mod link;
 mod memory;
 mod pool;
@@ -229,7 +230,7 @@ fn serve(
 
 /// The worker being served, for the functions the runtime library calls
 /// from its threads.
-static SERVING: std::sync::Mutex<std::sync::Weak<pool::Shared>> =
+pub(crate) static SERVING: std::sync::Mutex<std::sync::Weak<pool::Shared>> =
     std::sync::Mutex::new(std::sync::Weak::new());
 
 /// Section 7.6: the event loop's heartbeat, which the loop stall
@@ -294,6 +295,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
     m.add_function(wrap_pyfunction!(requests, m)?)?;
     m.add_function(wrap_pyfunction!(loop_beat, m)?)?;
+    m.add_function(wrap_pyfunction!(gc::gc_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(gc::gc_stats, m)?)?;
     m.add_class::<wsgi::Input>()?;
     m.add_class::<wsgi::StartResponse>()?;
     m.add_class::<wsgi::FileWrapper>()?;

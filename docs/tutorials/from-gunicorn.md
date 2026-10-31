@@ -23,12 +23,13 @@ with requests running, and retire gunicorn without a request failing.
 
 ## The deployment you have
 
-Make a project with Flask, gunicorn and Muru's runtime library:
+Make a project with Flask and gunicorn; Muru's runtime library is
+provided by `muructl` itself:
 
 ```
 mkdir legacy && cd legacy
 uv init --bare
-uv add flask gunicorn muru
+uv add flask gunicorn
 ```
 
 Save this as `legacy.py`:

@@ -367,7 +367,9 @@ def snapshot(action: str, top: int) -> dict[str, Any]:
 def memory(tracing: bool, duration: float, top: int, keep: str = "") -> dict[str, Any]:
     """Report the worker's memory, the gc's state and the most common objects.
 
-    With `tracing`, tracemalloc runs for `duration` seconds and the sites
+    The gc's state is its counts and statistics, and the collections the
+    runtime timed since the worker started, by generation. With
+    `tracing`, tracemalloc runs for `duration` seconds and the sites
     that allocated most in that time are reported too. With `keep`, a
     snapshot is taken, compared with or dropped (see `snapshot`) instead.
     """
@@ -376,7 +378,11 @@ def memory(tracing: bool, duration: float, top: int, keep: str = "") -> dict[str
 
     result: dict[str, Any] = {
         "memory": _native.memory_usage(),
-        "gc": {"counts": list(gc.get_count()), "collections": gc.get_stats()},
+        "gc": {
+            "counts": list(gc.get_count()),
+            "collections": gc.get_stats(),
+            "pauses": _native.gc_stats(),
+        },
         "objects": Counter(type(item).__qualname__ for item in gc.get_objects()).most_common(top),
     }
 

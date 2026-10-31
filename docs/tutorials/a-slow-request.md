@@ -27,7 +27,7 @@ where its time goes.
 ```
 mkdir reports && cd reports
 uv init --bare
-uv add muru
+uv venv
 ```
 
 Save this as `report.py`:

@@ -23,6 +23,8 @@ pub struct Watch {
     directories: Vec<PathBuf>,
     include: GlobSet,
     exclude: GlobSet,
+    /// Files watched whatever the patterns and directories say.
+    files: Vec<PathBuf>,
 }
 
 type Snapshot = HashMap<PathBuf, (SystemTime, u64)>;
@@ -38,7 +40,15 @@ impl Watch {
             directories,
             include: globs(include)?,
             exclude: globs(&[exclude, &EDITOR_FILES.map(str::to_owned)].concat())?,
+            files: Vec::new(),
         })
+    }
+
+    /// Also watch these files, whatever the patterns and directories say
+    /// (section 9.8: the lock, the manifest and uv's pin).
+    pub fn with_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.files = files;
+        self
     }
 
     /// The directories watched.
@@ -46,11 +56,21 @@ impl Watch {
         &self.directories
     }
 
-    /// Poll every `interval` and send each file that changed, appeared or
-    /// disappeared, until the receiver is dropped.
-    pub async fn run(self, interval: Duration, changes: mpsc::Sender<PathBuf>) {
-        let mut previous = self.snapshot();
+    /// Take the baseline now, then return the task that polls every
+    /// `interval` and sends each file that changed, appeared or
+    /// disappeared since, until the receiver is dropped. The baseline is
+    /// taken here rather than when the task first runs, so a change made
+    /// once the caller has announced the watch is never folded into it.
+    pub fn start(
+        self,
+        interval: Duration,
+        changes: mpsc::Sender<PathBuf>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let previous = self.snapshot();
+        self.run(previous, interval, changes)
+    }
 
+    async fn run(self, mut previous: Snapshot, interval: Duration, changes: mpsc::Sender<PathBuf>) {
         loop {
             tokio::time::sleep(interval).await;
             let current = self.snapshot();
@@ -94,6 +114,17 @@ impl Watch {
 
                 let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 files.insert(entry.path().to_path_buf(), (modified, metadata.len()));
+            }
+        }
+
+        for file in &self.files {
+            let Ok(metadata) = std::fs::metadata(file) else {
+                continue;
+            };
+
+            if metadata.is_file() {
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                files.insert(file.clone(), (modified, metadata.len()));
             }
         }
 
@@ -179,6 +210,34 @@ mod tests {
             names
         };
         assert_eq!(names, ["app.py", "pkg/views.py"]);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_change_made_before_the_task_first_runs_is_reported() {
+        let directory =
+            std::env::temp_dir().join(format!("muru-watch-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("mkdir");
+        let lock = directory.join("uv.lock");
+        std::fs::write(&lock, "version = 1\n").expect("write");
+        let watch = Watch::new(vec![directory.clone()], &["**/*.py".to_owned()], &[])
+            .expect("globs")
+            .with_files(vec![lock.clone()]);
+        let (sender, mut receiver) = mpsc::channel(8);
+
+        // The baseline is taken by start, so a change between it and the
+        // task's first poll is a change.
+
+        let task = watch.start(Duration::from_millis(20), sender);
+        std::fs::write(&lock, "version = 1\n# changed\n").expect("write");
+        let polling = tokio::spawn(task);
+
+        let reported = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("a change within the timeout");
+        assert_eq!(reported, Some(lock));
+        polling.abort();
         let _ = std::fs::remove_dir_all(&directory);
     }
 
