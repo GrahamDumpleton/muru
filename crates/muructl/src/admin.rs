@@ -123,12 +123,25 @@ impl SocketArgs {
     }
 
     /// The socket to connect to (design specification section 13.8): as
-    /// given, else a development run's from this project, else the
-    /// daemon's when it listens, else the one run listening; several runs
-    /// and no daemon are named, so one can be chosen.
+    /// given, else a muructl serve's in its run directory, else a
+    /// development run's from this project, else the daemon's when it
+    /// listens, else the one run listening; several runs and no daemon
+    /// are named, so one can be chosen.
     pub fn socket(&self) -> anyhow::Result<PathBuf> {
         if let Some(socket) = &self.socket {
             return Ok(socket.clone());
+        }
+
+        // Section 13.9: inside a container, the serve that runs there.
+
+        let serve_dir = std::env::var_os("MURU_RUN_DIR").map_or_else(
+            || PathBuf::from(crate::serve::DEFAULT_RUN_DIR),
+            PathBuf::from,
+        );
+        let serve_socket = serve_dir.join(crate::serve::ADMIN_SOCKET);
+
+        if serve_dir.join("serve.json").is_file() && serve_socket.exists() {
+            return Ok(serve_socket);
         }
 
         let locations = self.locations.resolve();

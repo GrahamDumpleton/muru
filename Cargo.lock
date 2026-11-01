@@ -1434,8 +1434,13 @@ version = "0.1.0-alpha.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "globset",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ignore",
  "libc",
  "muru-common",

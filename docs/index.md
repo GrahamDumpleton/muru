@@ -21,11 +21,12 @@ daemon serves applications on one node: releases with blue/green
 switches, canaries with gates, traffic policies, previews, rollback and
 drains, virtual hosts with TLS, worker groups that scale, overlays and
 schedules, uploads, mounts, upstreams, client classes, metrics, logs,
-events and a dashboard, declared in files or on the command line. Both
-are tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI. Still to come are a production command for containers and
-Kubernetes, container releases, ACME certificates, HTTP/3, OpenTelemetry
-export, several edge processes and more than one node. The
+events and a dashboard, declared in files or on the command line.
+`muructl serve` runs one application in a container, with probes,
+metrics and logs on standard output. All are tested with plain WSGI and
+ASGI, Flask, Django, Starlette and FastAPI. Still to come are Kubernetes
+sizing and shutdown, container releases, ACME certificates, HTTP/3,
+OpenTelemetry export, several edge processes and more than one node. The
 [tutorial](tutorials/first-wsgi-app.md) is the place to start, the
 [how-to guides](howto/index.md) cover each feature and the
 [roadmap](project/roadmap.md) says what comes next. Run

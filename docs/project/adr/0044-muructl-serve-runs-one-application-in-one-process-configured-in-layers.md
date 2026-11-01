@@ -86,7 +86,8 @@ layers, with the probes and metrics on an admin port open by default.
   not on it. Operations that change the process are only on the admin
   socket, reached by `docker exec` or `kubectl exec`, so the platform's
   exec permission is their access control. `muructl probe` asks the
-  probes' questions over the socket for a Docker `HEALTHCHECK`.
+  probes' questions over a socket in the run directory for a Docker
+  `HEALTHCHECK`.
 
 - **Logs** go to standard output through one relay, as ADR 0043 sets
   out, in text by default or JSON with `--log-format json`.

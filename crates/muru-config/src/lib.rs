@@ -4214,6 +4214,140 @@ impl RunSettings {
     }
 }
 
+/// The `[tool.muru.serve]` table (`[serve]` in muru.toml), and the file
+/// `MURU_SERVE_CONFIG` names: how `muructl serve` runs the application in
+/// a container (section 13.9). A key is a flag of the command in snake
+/// case, taking the flag's value; a list key takes the values the flag
+/// would be repeated with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeSettings {
+    /// The application as module:callable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    /// Where the application is served, IP:PORT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// Where the probes and metrics are served, IP:PORT or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_listen: Option<String>,
+    /// Whether `/status` is served on the admin port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_status: Option<bool>,
+    /// The workers ready in every mount for `/readyz` to pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_ready: Option<u32>,
+    /// The interface the entrypoint speaks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// Whether the entrypoint is a factory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory: Option<bool>,
+    /// Worker processes, or `auto` for the CPU count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<Count>,
+    /// Threads per WSGI worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
+    /// An ASGI worker's sync pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_threads: Option<u32>,
+    /// Requests an ASGI worker's event loop takes at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    /// auto, true or false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preload: Option<String>,
+    /// The module providing the lifecycle hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<String>,
+    /// Timeouts as NAME=DURATION.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Vec<String>>,
+    /// The largest request body accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<String>,
+    /// Requests a worker serves before it is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<String>,
+    /// The memory policy as KEY=VALUE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Vec<String>>,
+    /// Connections open at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u64>,
+    /// Connections one client may have open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_client: Option<u64>,
+    /// Requests one connection may carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_connection: Option<u64>,
+    /// Directories of files as PREFIX=DIR.
+    #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
+    pub static_dirs: Option<Vec<String>>,
+    /// Whether responses are compressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<bool>,
+    /// on, errors or off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log: Option<String>,
+    /// Paths left out of the access log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log_exclude: Option<Vec<String>>,
+    /// How slow a request is to count as an error for `access_log = "errors"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow: Option<String>,
+    /// text or json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_format: Option<String>,
+    /// Whether every line carries the full UTC time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamps: Option<bool>,
+    /// The interpreter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+    /// Where everything written at run time goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_dir: Option<String>,
+    /// The most request bodies spooled to disk at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spool_quota: Option<String>,
+    /// The proxies whose forwarding headers are applied: addresses, CIDR
+    /// ranges, or loopback, private and unix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_proxy: Option<Vec<String>>,
+}
+
+/// A count given as a number or as a word such as `auto`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Count {
+    /// A number.
+    Number(u64),
+    /// A word.
+    Named(String),
+}
+
+impl std::fmt::Display for Count {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Number(number) => write!(formatter, "{number}"),
+            Self::Named(name) => formatter.write_str(name),
+        }
+    }
+}
+
+/// Read the file `MURU_SERVE_CONFIG` or `--config` names, which holds the
+/// serve table's keys at its top level (section 13.9).
+pub fn load_serve_file(path: &Path) -> Result<ServeSettings, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 /// The `[tool.muru]` table: defaults an application ships with (section
 /// 6.8). Every field is optional; what a command line or a release
 /// definition sets takes precedence.
@@ -4332,6 +4466,10 @@ pub struct ToolMuru {
     /// daemon ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunSettings>,
+    /// How `muructl serve` runs the project in a container (section
+    /// 13.9), which the daemon and `muructl run` ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<ServeSettings>,
     /// When and how the environment is built (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Build>,

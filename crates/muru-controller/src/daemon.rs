@@ -1626,7 +1626,7 @@ fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::
 /// The [proxy] table as the snapshot carries it, with the defaults of
 /// section 4.7 filled in: the four common header types, recursive
 /// resolution, and the configured headers kept.
-pub(crate) fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
+pub fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
     let headers = if proxy.headers.is_empty() {
         muru_config::DEFAULT_PROXY_HEADERS
             .iter()

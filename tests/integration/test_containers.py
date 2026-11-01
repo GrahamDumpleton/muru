@@ -1,9 +1,10 @@
-"""Muru as a container's main process (design specification sections 6.10
-and 13.3), in a container built from the working tree. PID 1 is muructl's
-built-in init, so what a killed worker leaves behind is collected and no
-zombie remains, and `docker stop` means shutdown: a request in flight
+"""Muru as a container's main process (design specification sections 6.10,
+13.3 and 13.9), in a container built from the working tree. PID 1 is
+muructl's built-in init, so what a killed worker leaves behind is collected
+and no zombie remains, and `docker stop` means shutdown: a request in flight
 completes, the container exits 0 inside the budget. Both hold for `muructl
-run --allow-public` and for the daemon.
+serve` and for the daemon, and serve runs under an arbitrary user ID with a
+read-only root filesystem, answering its probes from inside.
 
 The image takes minutes to build the first time and is cached after; the
 suite carries the requires_docker marker and runs with `just test-docker`."""
@@ -164,7 +165,9 @@ def container(image: str, request: pytest.FixtureRequest) -> Iterator[Callable[.
 
     started: list[Container] = []
 
-    def start(*command: str, env: dict[str, str] | None = None) -> Container:
+    def start(
+        *command: str, env: dict[str, str] | None = None, options: tuple[str, ...] = ()
+    ) -> Container:
         name = f"muru-test-{request.node.name[:40]}-{len(started)}".replace("[", "-").replace(
             "]", ""
         )
@@ -180,6 +183,7 @@ def container(image: str, request: pytest.FixtureRequest) -> Iterator[Callable[.
                 "-p",
                 "127.0.0.1::8080",
                 *environment,
+                *options,
                 image,
                 *command,
             ],
@@ -215,16 +219,13 @@ def wait_until_serving(container: Container) -> None:
         time.sleep(0.2)
 
 
-def test_muructl_run_is_pid_1_with_the_init_and_leaves_no_zombie(
+def test_muructl_serve_is_pid_1_with_the_init_and_leaves_no_zombie(
     container: Callable[..., Container],
 ) -> None:
     instance = container(
         "muructl",
-        "run",
+        "serve",
         "plain_wsgi:application",
-        "--allow-public",
-        "--bind",
-        "0.0.0.0:8080",
         "--processes",
         "1",
         "--threads",
@@ -253,14 +254,13 @@ def test_muructl_run_is_pid_1_with_the_init_and_leaves_no_zombie(
     assert instance.get("/").status == 200
 
 
-def test_docker_stop_lets_a_request_finish_under_run(container: Callable[..., Container]) -> None:
+def test_docker_stop_lets_a_request_finish_under_serve(
+    container: Callable[..., Container],
+) -> None:
     instance = container(
         "muructl",
-        "run",
+        "serve",
         "plain_wsgi:application",
-        "--allow-public",
-        "--bind",
-        "0.0.0.0:8080",
         "--processes",
         "1",
         "--threads",
@@ -329,11 +329,8 @@ def test_docker_stop_drains_the_daemon(container: Callable[..., Container]) -> N
 def test_the_init_can_be_turned_off(container: Callable[..., Container]) -> None:
     instance = container(
         "muructl",
-        "run",
+        "serve",
         "plain_wsgi:application",
-        "--allow-public",
-        "--bind",
-        "0.0.0.0:8080",
         "--processes",
         "1",
         env={"MURU_NO_INIT": "1"},
@@ -348,3 +345,65 @@ def test_the_init_can_be_turned_off(container: Callable[..., Container]) -> None
     elapsed, code = instance.stop()
     assert code == 0, instance.logs()
     assert elapsed < 9, elapsed
+
+
+def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
+    container: Callable[..., Container],
+) -> None:
+    instance = container(
+        "muructl",
+        "serve",
+        "plain_wsgi:application",
+        "--processes",
+        "1",
+        options=(
+            "--user",
+            "1000770000:0",
+            "--read-only",
+            "--tmpfs",
+            "/run/muru:mode=0770,gid=0",
+            "--tmpfs",
+            "/tmp",
+        ),
+    )
+    wait_until_serving(instance)
+
+    # The probes answer inside the container, and a command reaches the
+    # serve through the run directory.
+
+    ready = instance.exec("muructl", "probe", "ready", check=False)
+    assert ready.returncode == 0, ready.stdout + instance.logs()
+    status = instance.exec("muructl", "status", check=False)
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert instance.exec("python3", "-c", "import os; print(os.getuid())").stdout.strip() == (
+        "1000770000"
+    )
+    elapsed, code = instance.stop()
+    assert code == 0, instance.logs()
+    assert elapsed < 9, elapsed
+
+
+def test_serve_without_a_writable_run_directory_says_what_it_needs(
+    image: str,
+) -> None:
+    completed = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "1000770000:0",
+            "--read-only",
+            image,
+            "muructl",
+            "serve",
+            "plain_wsgi:application",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert completed.returncode != 0
+    output = completed.stdout + completed.stderr
+    assert "/run/muru cannot be written" in output, output
