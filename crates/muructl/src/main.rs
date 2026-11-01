@@ -16,6 +16,7 @@ mod mcp;
 mod provision;
 mod pstats;
 mod run_admin;
+mod skill;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -238,7 +239,7 @@ enum Command {
     Websockets(admin::WebSocketsArgs),
 
     /// Serve muructl's operations to a coding agent over the Model Context
-    /// Protocol.
+    /// Protocol, and keep the skill a project carries for the agent.
     Mcp {
         #[command(subcommand)]
         command: mcp::McpCommand,

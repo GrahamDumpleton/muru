@@ -13,6 +13,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from support import server as support
@@ -63,8 +64,11 @@ class Session:
 
 
 @contextmanager
-def session(daemon: Daemon, *options: str) -> Iterator[tuple[Session, dict[str, Any]]]:
-    """Start `muructl mcp serve` against the daemon and initialize it."""
+def session(
+    daemon: Daemon, *options: str, cwd: Path | None = None
+) -> Iterator[tuple[Session, dict[str, Any]]]:
+    """Start `muructl mcp serve` against the daemon, from `cwd` (the
+    project it serves), and initialize it."""
 
     muructl = support.muructl_path()
     assert muructl is not None
@@ -74,6 +78,7 @@ def session(daemon: Daemon, *options: str) -> Iterator[tuple[Session, dict[str, 
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        cwd=cwd,
     )
     client = Session(process)
 
@@ -149,3 +154,53 @@ def test_the_docs_tool_returns_the_user_guide(daemon: Daemon) -> None:
 
         failed, text = client.call("docs", page="json-output")
         assert not failed and text.startswith("# JSON output")
+
+
+def skill(project: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run a `muructl mcp skill` command in a project directory."""
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    return subprocess.run(
+        [str(muructl), "mcp", "skill", *arguments], cwd=project, capture_output=True, text=True
+    )
+
+
+def test_the_skill_installs_into_the_project_and_reports_its_state(tmp_path: Path) -> None:
+    missing = skill(tmp_path, "status", "--json")
+    assert missing.returncode == 1
+    assert json.loads(missing.stdout)["state"] == "missing"
+
+    installed = skill(tmp_path, "install")
+    assert installed.returncode == 0, installed.stderr
+    path = tmp_path / ".claude" / "skills" / "muru" / "SKILL.md"
+    assert path.read_text() == skill(tmp_path, "print").stdout
+    assert path.read_text().startswith("---\nname: muru\n")
+
+    current = skill(tmp_path, "status")
+    assert current.returncode == 0 and "matches" in current.stdout
+
+    # An older or edited copy is out of date, and install puts it right.
+
+    path.write_text(path.read_text().replace("Developing with Muru", "Old"))
+    assert json.loads(skill(tmp_path, "status", "--json").stdout)["state"] == "out_of_date"
+    skill(tmp_path, "install")
+    assert skill(tmp_path, "status").returncode == 0
+
+    other = skill(tmp_path, "install", "--dir", "agents")
+    assert other.returncode == 0 and (tmp_path / "agents" / "muru" / "SKILL.md").exists()
+
+
+def test_the_server_says_when_the_project_s_skill_is_missing(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    with session(daemon, cwd=tmp_path) as (client, initialized):
+        assert "muructl mcp skill install" in initialized["instructions"]
+        failed, text = client.call("skill_status")
+        assert not failed and json.loads(text)["state"] == "missing"
+
+    skill(tmp_path, "install")
+
+    with session(daemon, cwd=tmp_path) as (client, initialized):
+        assert "muructl mcp skill install" not in initialized["instructions"]
+        assert json.loads(client.call("skill_status")[1])["state"] == "current"

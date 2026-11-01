@@ -30,6 +30,13 @@ pub enum McpCommand {
     /// a coding agent: tools that operate the daemon as muructl's
     /// commands do, and the user guide.
     Serve(ServeArgs),
+
+    /// The skill a project carries for coding agents: print it, install or
+    /// update it in the project, or check the project's copy.
+    Skill {
+        #[command(subcommand)]
+        command: crate::skill::SkillCommand,
+    },
 }
 
 /// What `mcp serve` takes.
@@ -56,6 +63,7 @@ pub struct ServeArgs {
 pub async fn run(command: McpCommand) -> anyhow::Result<()> {
     match command {
         McpCommand::Serve(args) => serve(args).await,
+        McpCommand::Skill { command } => crate::skill::run(command),
     }
 }
 
@@ -92,6 +100,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         connect: Arc::new(args.socket.as_arguments()),
         muructl,
         read_only: args.read_only,
+        skill: crate::skill::status(std::path::Path::new(crate::skill::DEFAULT_DIR)),
     };
 
     // With --up, a daemon is started when none answers, its output kept
@@ -126,6 +135,8 @@ struct Server {
     connect: Arc<Vec<String>>,
     muructl: PathBuf,
     read_only: bool,
+    /// How the project's copy of the skill compared at start.
+    skill: Value,
 }
 
 impl Server {
@@ -180,6 +191,15 @@ impl Server {
 
         if self.read_only {
             text.push_str("\n\nThis server is read-only: it offers no tool that changes anything.");
+        }
+
+        // A project whose skill is missing or older than this muructl's
+        // hears about it once, with the command that fixes it.
+
+        if self.skill["state"] != "current" {
+            text.push_str("\n\nThe Muru skill: ");
+            text.push_str(&crate::skill::describe(&self.skill));
+            text.push('.');
         }
 
         text
@@ -248,6 +268,7 @@ impl ServerHandler for Server {
 
         let result = match spec.name {
             "docs" => docs(&arguments),
+            "skill_status" => skill_status(),
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
                     let result = self.command(command).await;
@@ -379,6 +400,15 @@ fn finish(name: &str, arguments: &JsonObject, result: CallToolResult) -> CallToo
 
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&value).unwrap_or(printed),
+    )])
+}
+
+/// The skill_status tool: how the project's copy of the skill compares
+/// with this muructl's now, as `muructl mcp skill status --json` prints it.
+fn skill_status() -> CallToolResult {
+    let report = crate::skill::status(std::path::Path::new(crate::skill::DEFAULT_DIR));
+    CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
     )])
 }
 
@@ -605,6 +635,14 @@ fn specs() -> Vec<Spec> {
             description: "The Muru user guide: without a page, the list of pages (tutorials, howto, explanation, reference); with one, its Markdown.",
             changes: false,
             properties: json!({"page": {"type": "string", "description": "A page name from the list, such as howto/deploy"}}),
+            required: &[],
+            command: |_| Ok(Vec::new()),
+        },
+        Spec {
+            name: "skill_status",
+            description: "Whether the project's Muru skill (.claude/skills/muru/SKILL.md) matches this muructl's: current, missing or out_of_date; `muructl mcp skill install` writes or updates it.",
+            changes: false,
+            properties: json!({}),
             required: &[],
             command: |_| Ok(Vec::new()),
         },

@@ -21,6 +21,7 @@ ones it names.
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `overlay_preview` | reads | `muructl overlay preview` | `name` |
+| `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
 | `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true) |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |

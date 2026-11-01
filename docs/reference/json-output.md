@@ -86,6 +86,7 @@ $ muructl release show shop@r9 --json
 | `muructl config diff` | The report, as `apply` prints it |
 | `muructl config export` | The desired state as a JSON document rather than TOML |
 | `muructl config show` | `document` (TOML), with `--effective` also `attributions` and `layers`, and where it came from: `version`, `node`, `time_unix_ms`, `state_version` |
+| `muructl mcp skill status` | How the project's copy of the skill compares: `path`, `state` (`current`, `missing` or `out_of_date`), `version` and `installed_version` |
 | `muructl secret list` | `{"store": ..., "keys": [...]}`; values are never shown |
 | `muructl events` | `{"events": [...]}`, each with `sequence`, `time_unix_ms`, `type`, `subject`, `level`, `message`; with `--follow`, one event per line |
 | `muructl logs` | One line per log line: a release's output as `{"app", "release", "line"}`, the access log (`--access`) as the records it keeps |

@@ -106,6 +106,28 @@ Whoever launches the server has the access the admin socket gives, which
 for a developer's own user daemon is everything. Do not point an agent at a
 shared system daemon unless that is intended.
 
+## The skill
+
+The tools let an agent operate Muru; the skill teaches it what a release
+is, what each operation does to traffic, the development loop, and what to
+check after each step. It is embedded in `muructl`, matches its version,
+and lives in the project, so it travels with the code:
+
+```
+muructl mcp skill install          # writes .claude/skills/muru/SKILL.md
+muructl mcp skill install --dir .agents/skills    # another client's skills directory
+muructl mcp skill status           # current, missing or out of date; exits 1 unless current
+muructl mcp skill print            # the skill on standard output
+```
+
+Commit the skill with the project. After upgrading `muructl`, run `install`
+again; `status` in a `just` recipe or CI says when that is due. The MCP
+server checks too: when the project's copy is missing or differs from the
+`muructl` serving it, the instructions it gives the agent at the start of
+a session say so and name the command, and the `skill_status` tool answers
+the same question at any time. The skill works through the MCP tools when
+the agent has them and through `muructl --json` when it does not.
+
 ## Without MCP
 
 An agent with a shell can run `muructl` directly. Add `--json` to any
