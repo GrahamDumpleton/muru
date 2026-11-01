@@ -23,6 +23,7 @@ from muru._context import Context, context
 
 __all__ = [
     "Context",
+    "HandoffNotEnabled",
     "RequestTimeout",
     "__version__",
     "context",
@@ -59,6 +60,16 @@ class RequestTimeout(BaseException):
     catch ``Exception`` to log and carry on do not swallow it: the request
     is over. Code that must clean up uses ``finally`` or catches this class
     by name. Outside Muru it is never raised.
+    """
+
+
+class HandoffNotEnabled(RuntimeError):
+    """Raised by a handoff the request's mount does not enable.
+
+    A WSGI application hands requests to ASGI only with
+    ``handoff = "asgi"`` in its configuration, and an ASGI application
+    hands them to WSGI only with ``handoff = "wsgi"``. The message names
+    the setting to add.
     """
 
 

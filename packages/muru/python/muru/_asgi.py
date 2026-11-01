@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-__all__ = ["Lifespan", "LifespanFailed", "Loop", "heartbeat", "runner"]
+__all__ = ["Lifespan", "LifespanFailed", "Loop", "heartbeat", "runner", "start_handoff"]
 
 ASGIApp = Callable[[MutableMapping[str, Any], Any, Any], Awaitable[None]]
 
@@ -241,6 +241,31 @@ class Lifespan:
             print(f"muru: lifespan shutdown of {self.name} failed: {error}", file=sys.stderr)
 
 
+async def _serve(app: ASGIApp, scope: MutableMapping[str, Any], channel: Any) -> None:
+    """Run one request's application against its channel, and end it."""
+
+    async def send(message: dict[str, Any]) -> None:
+        # The channel only hands back a future when the writer is behind.
+
+        waiter = channel.send(message)
+        if waiter is not None:
+            await waiter
+
+    try:
+        await app(scope, channel.receive, send)
+    except BaseException as error:
+        # A failed request never ends the worker. A task the soft
+        # timeout cancelled (section 7.6) fails the response as a
+        # timeout, and the traceback shows where it waited.
+
+        detail = "".join(traceback.format_exception(error))
+        sys.stderr.write(detail)
+        sys.stderr.flush()
+        channel.fail(detail)
+    else:
+        channel.finish()
+
+
 def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, Any], None]:
     """Return the callable the extension schedules on the loop for each request.
 
@@ -251,30 +276,20 @@ def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, An
 
     event_loop = loop.loop
 
-    async def serve(scope: MutableMapping[str, Any], channel: Any) -> None:
-        async def send(message: dict[str, Any]) -> None:
-            # The channel only hands back a future when the writer is behind.
-
-            waiter = channel.send(message)
-            if waiter is not None:
-                await waiter
-
-        try:
-            await app(scope, channel.receive, send)
-        except BaseException as error:
-            # A failed request never ends the worker. A task the soft
-            # timeout cancelled (section 7.6) fails the response as a
-            # timeout, and the traceback shows where it waited.
-
-            detail = "".join(traceback.format_exception(error))
-            sys.stderr.write(detail)
-            sys.stderr.flush()
-            channel.fail(detail)
-        else:
-            channel.finish()
-
     def run(scope: MutableMapping[str, Any], channel: Any) -> None:
         scope["state"] = dict(state)
-        channel.started(event_loop.create_task(serve(scope, channel)))
+        channel.started(event_loop.create_task(_serve(app, scope, channel)))
 
     return run
+
+
+def start_handoff(app: ASGIApp, scope: MutableMapping[str, Any], channel: Any) -> None:
+    """Start a WSGI request handed to ``app`` (section 6.14).
+
+    Scheduled on the loop by the extension in a copy of the WSGI
+    request's context, which the task inherits. The scope's state keeps
+    what the WSGI code put there.
+    """
+
+    loop = asyncio.get_running_loop()
+    channel.started(loop.create_task(_serve(app, scope, channel)))

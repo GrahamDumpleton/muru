@@ -75,8 +75,10 @@ struct WorkerSlots {
     path: PathBuf,
     /// What the worker called itself in HELLO (wsgi or asgi), informational.
     worker_type: String,
-    /// Whether it accepts websocket scopes (section 5.6).
+    /// Whether its default mount accepts websocket scopes (section 5.6).
     websockets: bool,
+    /// The named mounts that accept websocket scopes (section 6.14).
+    websocket_mounts: Vec<String>,
     /// Requests the worker takes at once, from its HELLO: its threads for
     /// a WSGI worker, its event loop concurrency for an ASGI one.
     slots: usize,
@@ -125,12 +127,23 @@ impl WorkerSlots {
             path,
             worker_type: hello.worker_type,
             websockets: hello.websockets,
+            websocket_mounts: hello.websocket_mounts,
             slots,
             async_slots: usize::try_from(hello.async_slots).unwrap_or(usize::MAX),
             semaphore: Arc::new(Semaphore::new(slots)),
             mounts,
             grpc: hello.grpc_methods,
             idle: Mutex::new(vec![conn]),
+        }
+    }
+
+    /// Whether a request to the mount takes a WebSocket upgrade as a
+    /// websocket scope (section 6.14).
+    fn accepts_websockets(&self, mount: &str) -> bool {
+        if mount.is_empty() {
+            self.websockets
+        } else {
+            self.websocket_mounts.iter().any(|name| name == mount)
         }
     }
 
@@ -600,7 +613,7 @@ impl LinkPool {
                 permit,
                 worker: best,
                 borrowed,
-                websockets: worker.websockets,
+                websockets: worker.accepts_websockets(mount),
                 woken: None,
             });
         }

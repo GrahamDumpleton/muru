@@ -2651,6 +2651,8 @@ pub fn resolve_spec(
             .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_handoff(mount.handoff, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
         // as the defaults.
@@ -2669,6 +2671,7 @@ pub fn resolve_spec(
             threads: mount.threads,
             concurrency: mount.concurrency.map(|value| value as u32),
             max_connections: mount.max_connections.map(|value| value as u32),
+            handoff: mount.handoff,
         });
     }
 
@@ -2932,18 +2935,28 @@ pub fn resolve_spec(
 
     let commands = resolve_commands(tables.commands.unwrap_or(&table.commands))?;
 
+    let interface = match request.interface.as_str() {
+        "" => table
+            .interface
+            .or(previous.map(|previous| previous.interface))
+            .unwrap_or(muru_config::Interface::Auto),
+        given => given
+            .parse()
+            .map_err(|error: muru_config::ParseError| error.to_string())?,
+    };
+
+    // Section 6.14: the default mount's handoff, checked against the
+    // interface it hands from when that is declared.
+
+    let handoff = table
+        .handoff
+        .or_else(|| previous.and_then(|previous| previous.handoff));
+    muru_config::check_handoff(handoff, Some(interface))?;
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
-        interface: match request.interface.as_str() {
-            "" => table
-                .interface
-                .or(previous.map(|previous| previous.interface))
-                .unwrap_or(muru_config::Interface::Auto),
-            given => given
-                .parse()
-                .map_err(|error: muru_config::ParseError| error.to_string())?,
-        },
+        interface,
         python,
         processes,
         threads,
@@ -2968,6 +2981,7 @@ pub fn resolve_spec(
             .or(table.reflection)
             .or(previous.map(|previous| previous.reflection))
             .unwrap_or(false),
+        handoff,
         grpc_web_origins,
         groups: resolved_groups,
         mounts: resolved_mounts,
@@ -3880,6 +3894,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         entrypoint: request.entrypoint.clone(),
         interface: parse_optional(&request.interface)?,
         reflection: request.reflection,
+        handoff: None,
         grpc_web_origins: request.grpc_web_origins.clone(),
         factory: request.factory,
         factory_phase: parse_optional(&request.factory_phase)?,
@@ -3982,6 +3997,7 @@ fn resolve_http_spec(
         hooks: None,
         factory: None,
         reflection: false,
+        handoff: None,
         grpc_web_origins: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
@@ -4501,6 +4517,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         entrypoint: spec.entrypoint.clone(),
         interface: Some(spec.interface),
         reflection: spec.reflection.then_some(true),
+        handoff: spec.handoff,
         grpc_web_origins: spec.grpc_web_origins.clone(),
         factory: spec.factory.map(|_| true),
         factory_phase: spec.factory,
@@ -4568,6 +4585,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         threads: mount.threads,
                         concurrency: mount.concurrency.map(|value| value as usize),
                         max_connections: mount.max_connections.map(|value| value as usize),
+                        handoff: mount.handoff,
                     },
                 )
             })
@@ -4797,6 +4815,17 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "reflection",
         declared.reflection.to_string(),
         recorded.reflection.to_string(),
+    );
+    compare(
+        "handoff",
+        declared
+            .handoff
+            .map(|handoff| handoff.to_string())
+            .unwrap_or_default(),
+        recorded
+            .handoff
+            .map(|handoff| handoff.to_string())
+            .unwrap_or_default(),
     );
     compare(
         "grpc_web_origins",
@@ -5172,6 +5201,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
             if let Some(threads) = mount.threads {
                 flags.push(format!("threads {}", threads.describe()));
+            }
+
+            if let Some(handoff) = mount.handoff {
+                flags.push(format!("handoff {handoff}"));
             }
 
             let flags = if flags.is_empty() {

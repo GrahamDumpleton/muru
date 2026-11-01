@@ -1528,6 +1528,9 @@ struct Resolved {
     factory: Option<muru_config::FactoryPhase>,
     /// Whether gRPC server reflection is served (section 6.13).
     reflection: bool,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14).
+    handoff: Option<muru_config::Handoff>,
     /// The origins whose pages may call it through gRPC-Web.
     grpc_web_origins: Vec<String>,
     processes: usize,
@@ -1697,7 +1700,16 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
             .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
+        muru_config::check_handoff(mount.handoff, mount.interface)
+            .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
     }
+
+    let interface = args
+        .interface
+        .or(table.interface)
+        .unwrap_or(muru_config::Interface::Auto);
+    muru_config::check_handoff(table.handoff, Some(interface))
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 4.9: the table's static directories, a flag replacing the
     // entry with its prefix or adding one.
@@ -1721,12 +1733,10 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         python: table.python.clone(),
         build: table.build.clone(),
         local_build_when,
-        interface: args
-            .interface
-            .or(table.interface)
-            .unwrap_or(muru_config::Interface::Auto),
+        interface,
         factory,
         reflection: table.reflection.unwrap_or(false),
+        handoff: table.handoff,
         grpc_web_origins: table.grpc_web_origins.clone(),
         processes: args
             .processes
@@ -1813,6 +1823,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         interface: (resolved.interface != muru_config::Interface::Auto)
             .then_some(resolved.interface),
         reflection: resolved.reflection.then_some(true),
+        handoff: resolved.handoff,
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
         python: Some(written_interpreter(
@@ -2690,6 +2701,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         interface: resolved.interface,
         factory: resolved.factory,
         reflection: resolved.reflection,
+        handoff: resolved.handoff,
         processes: resolved.processes,
         threads: resolved.threads,
         sync_threads: resolved.sync_threads,
@@ -2728,6 +2740,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 threads: mount.threads,
                 concurrency: mount.concurrency,
                 max_connections: mount.max_connections,
+                handoff: mount.handoff,
             })
             .collect(),
         logging: resolved

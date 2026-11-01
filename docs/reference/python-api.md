@@ -88,6 +88,13 @@ swallow it; catch it by name to answer the request yourself, and use
 `finally` for clean-up. It is never raised outside Muru, or in an ASGI
 application, whose task is cancelled instead.
 
+## `muru.HandoffNotEnabled`
+
+The `RuntimeError` subclass `handoff()` raises when the request's mount
+does not enable handing requests to the other interface; its message
+names the setting to add (see [handing requests between WSGI and
+ASGI](../howto/handoff.md)).
+
 ## `muru.logging`
 
 The platform's logging defaults (the [logging guide](../howto/logging.md)

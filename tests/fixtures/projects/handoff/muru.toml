@@ -1,0 +1,8 @@
+entrypoint = "handoff:application"
+handoff = "asgi"
+threads = 2
+
+[mounts.plain]
+path = "/plain"
+entrypoint = "handoff:plain"
+interface = "wsgi"

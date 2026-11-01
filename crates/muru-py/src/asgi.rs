@@ -118,13 +118,16 @@ pub struct Channel {
 }
 
 impl Channel {
-    fn new(
+    /// The channel of one request, whose output goes to `tx` and whose
+    /// waits run on `runtime`, the link's.
+    pub(crate) fn new(
         py: Python<'_>,
         asgi: &Asgi,
         tx: mpsc::Sender<Outgoing>,
         head: &pb::RequestHead,
         shared: Arc<Shared>,
         request: u64,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             inbox: Mutex::new(Inbox {
@@ -135,7 +138,7 @@ impl Channel {
             }),
             state: Mutex::new(SendState::default()),
             tx,
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
             event_loop: asgi.event_loop.clone_ref(py),
             resolver: asgi.resolver.clone_ref(py),
             permits: Arc::new(tokio::sync::Semaphore::new(INBOX_CAPACITY)),
@@ -150,6 +153,12 @@ impl Channel {
             task: Mutex::new(None),
             timed_out: AtomicBool::new(false),
         }
+    }
+
+    /// Fail the request because the WSGI code that handed it off raised
+    /// afterwards (section 6.14).
+    pub(crate) fn fail_handoff(&self, py: Python<'_>, detail: String) {
+        self.fail(py, detail);
     }
 
     /// Whether the application has accepted the WebSocket.
@@ -1195,7 +1204,7 @@ fn validate_headers(headers: &Bound<'_, PyAny>) -> PyResult<Vec<(Vec<u8>, Vec<u8
 }
 
 /// Build the http, websocket or grpc scope (Appendix D.2) from the request head.
-fn build_scope<'py>(
+pub(crate) fn build_scope<'py>(
     py: Python<'py>,
     head: &pb::RequestHead,
     uploads: &[RawFd],
@@ -1428,7 +1437,15 @@ pub fn start(
 
     Python::attach(|py| {
         crate::signals::GIL_WAIT.record(ready.elapsed());
-        let channel = Channel::new(py, asgi, tx, head, Arc::clone(shared), request);
+        let channel = Channel::new(
+            py,
+            asgi,
+            tx,
+            head,
+            Arc::clone(shared),
+            request,
+            tokio::runtime::Handle::current(),
+        );
         let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
         shared.request_channel(request, channel.clone().unbind());
         let scope = build_scope(py, head, uploads).map_err(|error| error.to_string())?;

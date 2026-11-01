@@ -23,11 +23,12 @@ message Hello {
   string worker_type = 2;           // wsgi or asgi
   uint32 slots = 3;                 // requests the worker runs at once
   uint32 async_slots = 4;           // requests the worker holds on its event loop at once
-  bool websockets = 5;              // accepts websocket scopes
+  bool websockets = 5;              // the default mount accepts websocket scopes
   bool files = 6;                   // accepts FILE frames
   uint32 max_message_size = 7;      // largest WebSocket message, bytes
   repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
   repeated MountPool mount_pools = 9; // mounts with slots or connections of their own (section 6.7)
+  repeated string websocket_mounts = 10; // the named mounts that accept websocket scopes (section 6.14)
 }
 
 // A mount's own slots (section 6.7). For a WSGI mount, reserved threads

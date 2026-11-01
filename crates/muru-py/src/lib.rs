@@ -8,6 +8,7 @@
 
 mod asgi;
 mod gc;
+mod handoff;
 mod link;
 mod memory;
 mod pool;
@@ -27,15 +28,17 @@ fn version() -> &'static str {
 }
 
 /// A mount as `serve` takes it: the path prefix, the application, its
-/// runner, its own threads as (reserved, max) when it has any, and for an
+/// runner, its own threads as (reserved, max) when it has any, for an
 /// ASGI mount its limits as (concurrency, connections), 0 for one it
-/// does not set.
+/// does not set, and whether its requests may be handed to the other
+/// interface (section 6.14).
 type MountArgument = (
     String,
     Py<PyAny>,
     Option<Py<PyAny>>,
     Option<(usize, usize)>,
     Option<(usize, usize)>,
+    bool,
 );
 
 /// Serve the worker link on a Unix socket until SIGTERM or SIGINT.
@@ -79,12 +82,13 @@ type MountArgument = (
 /// runner is the dispatcher of its calls. `loop_stall_timeout_ms` and
 /// `gil_stall_timeout_ms` are the stall timeouts (section 7.6): the host
 /// is told when the event loop has not run, or no thread has managed to
-/// attach to the interpreter, for that long.
+/// attach to the interpreter, for that long. `handoff` says the default
+/// mount's requests may be handed to the other interface (section 6.14).
 ///
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, gil_stall_timeout_ms=None))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, gil_stall_timeout_ms=None, handoff=false))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -111,6 +115,7 @@ fn serve(
     websocket_drain_ms: u64,
     drain_ms: u64,
     gil_stall_timeout_ms: Option<u64>,
+    handoff: bool,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -147,7 +152,7 @@ fn serve(
 
     let mut named = std::collections::HashMap::new();
 
-    for (name, app, runner, threads, limits) in mounts {
+    for (name, app, runner, threads, limits, handoff) in mounts {
         if runner.is_some() && asgi.is_none() {
             return Err(PyTypeError::new_err(format!(
                 "mount {name:?} is ASGI, so an event_loop is needed"
@@ -177,6 +182,7 @@ fn serve(
                 limits: limits
                     .filter(|&(concurrency, connections)| concurrency > 0 || connections > 0),
                 pool,
+                handoff,
             },
         );
     }
@@ -191,6 +197,7 @@ fn serve(
         soft_timeout,
     )
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    shared.handoff = handoff;
     shared.loop_stall = loop_stall_timeout_ms
         .filter(|&ms| ms > 0 && shared.asgi.is_some())
         .map(std::time::Duration::from_millis);
@@ -301,6 +308,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<wsgi::StartResponse>()?;
     m.add_class::<wsgi::FileWrapper>()?;
     m.add_class::<asgi::Channel>()?;
+    m.add_class::<handoff::WsgiToAsgi>()?;
+    m.add_class::<handoff::HandedOff>()?;
     m.add_function(wrap_pyfunction!(asgi::resolve_future, m)?)?;
     Ok(())
 }

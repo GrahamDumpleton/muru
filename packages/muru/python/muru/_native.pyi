@@ -25,6 +25,7 @@ def serve(
             Callable[[Any, Channel], None] | None,
             tuple[int, int] | None,
             tuple[int, int] | None,
+            bool,
         ]
     ] = [],
     report: int | None = None,
@@ -39,6 +40,7 @@ def serve(
     websocket_drain_ms: int = 0,
     drain_ms: int = 5000,
     gil_stall_timeout_ms: int | None = None,
+    handoff: bool = False,
 ) -> None:
     """Serve the worker link on a Unix socket until SIGTERM or SIGINT.
 
@@ -57,7 +59,9 @@ def serve(
     interrupted by raising timeout_error (muru.RequestTimeout) in its
     thread or cancelling its task. grpc_methods are the methods the gRPC
     mounts registered, as (path, mount, client streaming, server streaming)
-    tuples, which HELLO declares to the edge.
+    tuples, which HELLO declares to the edge. handoff, and the last item
+    of each mount, say whether its requests may be handed to the other
+    interface.
     """
 
 def memory_usage() -> dict[str, int] | None:
@@ -130,3 +134,24 @@ class StartResponse:
         exc_info: Any = None,
     ) -> Callable[[bytes], None]: ...
     def write(self, data: bytes) -> None: ...
+
+class WsgiToAsgi:
+    """environ["muru.wsgi_to_asgi"]: continue the request as an ASGI application."""
+
+    @property
+    def scope(self) -> dict[str, Any]: ...
+    @property
+    def is_websocket(self) -> bool: ...
+    @property
+    def handed_off(self) -> bool: ...
+    def handoff(self, app: Callable[..., Any]) -> HandedOff: ...
+
+class HandedOff:
+    """The empty response handoff() returns, also a WSGI callable returning itself."""
+
+    def __iter__(self) -> Iterator[bytes]: ...
+    def __next__(self) -> bytes: ...
+    def __call__(
+        self, environ: dict[str, Any], start_response: Callable[..., Any]
+    ) -> HandedOff: ...
+    def close(self) -> None: ...

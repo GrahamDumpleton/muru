@@ -32,6 +32,17 @@ pub enum Interface {
     Grpc,
 }
 
+/// The interface a release's or a mount's requests may be handed to
+/// (section 6.14): ASGI from a WSGI application, WSGI from an ASGI one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Handoff {
+    /// Continue the request as an ASGI application on the event loop.
+    Asgi,
+    /// Continue the request as a WSGI callable on the thread pool.
+    Wsgi,
+}
+
 /// Whether the application is imported in the host before forking (section 6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,6 +119,7 @@ words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi", Grpc => "grpc
 words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
+words!(Handoff { Asgi => "asgi", Wsgi => "wsgi" });
 
 /// What a release runs (section 9.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +410,32 @@ pub struct Mount {
     /// from the requests it runs; unbounded but by its slots when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
+    /// The interface the mount's requests may be handed to (section
+    /// 6.14); none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
+/// Section 6.14: check a handoff against the interface it hands from. A
+/// gRPC application takes none, and an application declared with the
+/// interface it names would hand a request to itself.
+pub fn check_handoff(handoff: Option<Handoff>, interface: Option<Interface>) -> Result<(), String> {
+    let Some(handoff) = handoff else {
+        return Ok(());
+    };
+
+    match (handoff, interface) {
+        (_, Some(Interface::Grpc)) => {
+            Err("handoff: a gRPC application takes no handoff".to_owned())
+        }
+        (Handoff::Asgi, Some(Interface::Asgi)) | (Handoff::Wsgi, Some(Interface::Wsgi)) => {
+            Err(format!(
+                "handoff: an application declared interface = '{handoff}' cannot hand requests to \
+             '{handoff}'; a WSGI application hands to 'asgi', an ASGI one to 'wsgi'"
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Section 6.7: check an ASGI mount's own limits. Both belong to a mount
@@ -657,6 +695,10 @@ pub struct Release {
     /// mounts register (section 6.13, default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<bool>,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14); none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
     /// The origins whose pages may call the release's gRPC methods
     /// through gRPC-Web, answered with CORS (section 6.13): scheme, host
     /// and port, or `*`; none when empty.
@@ -3354,9 +3396,10 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 22] = [
+    let worker_keys: [(&str, bool); 23] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
+        ("handoff", table.handoff.is_some()),
         ("factory", table.factory.is_some()),
         ("factory_phase", table.factory_phase.is_some()),
         ("python", table.python.is_some()),
@@ -4109,6 +4152,9 @@ pub struct ToolMuru {
     /// Serve gRPC server reflection for the registered services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<bool>,
+    /// The interface the entrypoint's requests may be handed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
     /// The origins whose pages may call the gRPC methods through
     /// gRPC-Web, or `*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -5120,6 +5166,33 @@ traffic = { classes = { ai_crawler = 'r1' } }"
             parse_muru_toml("[mounts.x]\npath = '/x'\nentrypoint = 'a:b'\nthreads = { min = 1 }\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_handoff_names_the_other_interface() {
+        let table = parse_muru_toml(
+            "handoff = 'asgi'\n\n[mounts.api]\npath = '/api'\nentrypoint = 'a:b'\n\
+             interface = 'asgi'\nhandoff = 'wsgi'\n",
+        )
+        .unwrap();
+        assert_eq!(table.handoff, Some(Handoff::Asgi));
+        assert_eq!(table.mounts["api"].handoff, Some(Handoff::Wsgi));
+        assert!(check_handoff(Some(Handoff::Asgi), Some(Interface::Wsgi)).is_ok());
+        assert!(check_handoff(Some(Handoff::Wsgi), Some(Interface::Asgi)).is_ok());
+        assert!(check_handoff(Some(Handoff::Asgi), Some(Interface::Auto)).is_ok());
+        assert!(check_handoff(Some(Handoff::Asgi), None).is_ok());
+        assert!(check_handoff(None, Some(Interface::Grpc)).is_ok());
+        assert!(
+            check_handoff(Some(Handoff::Asgi), Some(Interface::Asgi))
+                .unwrap_err()
+                .contains("a WSGI application hands to 'asgi', an ASGI one to 'wsgi'")
+        );
+        assert!(
+            check_handoff(Some(Handoff::Wsgi), Some(Interface::Grpc))
+                .unwrap_err()
+                .contains("a gRPC application takes no handoff")
+        );
+        assert!(parse_muru_toml("handoff = 'grpc'\n").is_err());
     }
 
     #[test]

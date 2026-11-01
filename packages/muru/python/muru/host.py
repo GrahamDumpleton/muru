@@ -137,6 +137,7 @@ def log(message: str) -> None:
 
 
 INTERFACES = ("auto", "wsgi", "asgi", "grpc")
+HANDOFFS = ("asgi", "wsgi")
 
 # The longest a Unix socket path may be, its NUL included: sun_path is 104
 # bytes on macOS and 108 on Linux.
@@ -463,6 +464,7 @@ class Mount:
     release: Release
     threads: tuple[int, int] | None = None
     limits: tuple[int, int] | None = None
+    handoff: str | None = None
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
@@ -556,6 +558,37 @@ class Group:
             raise argparse.ArgumentTypeError(f"{text!r} is not a valid worker group")
 
         return cls(name, processes, threads, sync_threads, concurrency)
+
+
+def parse_mount_handoff(text: str) -> tuple[str, str]:
+    """Parse NAME=INTERFACE, the interface a mount's requests may be handed to."""
+
+    name, _, interface = text.partition("=")
+
+    if not name or interface not in HANDOFFS:
+        raise argparse.ArgumentTypeError(f"{text!r} is not NAME=asgi or NAME=wsgi")
+
+    return name, interface
+
+
+def check_handoff(owner: str, handoff: str | None, interface: str | None) -> None:
+    """Section 6.14: refuse a handoff to the interface the application speaks.
+
+    A WSGI application hands requests to ASGI and an ASGI one to WSGI; a
+    gRPC application takes none. Checked once the interface is settled.
+    """
+
+    if handoff is None or interface is None:
+        return
+
+    if interface == "grpc":
+        raise ValueError(f"{owner}: a gRPC application takes no handoff")
+
+    if interface == handoff:
+        raise ValueError(
+            f"{owner} is {interface_name(interface)}, so handoff = {handoff!r} would hand its "
+            f"requests to itself; a WSGI application hands to 'asgi', an ASGI one to 'wsgi'"
+        )
 
 
 def parse_group_mounts(text: str) -> tuple[str, tuple[str, ...]]:
@@ -774,10 +807,12 @@ class Host:
         gil_stall_timeout: float = 30.0,
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
+        handoff: str | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
         self.reflection = reflection
+        self.handoff = handoff
         self.socket_dir = socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
@@ -1227,8 +1262,23 @@ class Host:
                         f"{interface_name(mounted.resolved)}"
                     )
 
-            any_asgi = release.resolved in ("asgi", "grpc") or any(
-                mounted.resolved in ("asgi", "grpc") for _, _, mounted, _ in realised
+            # Section 6.14: a handoff is checked against the interface it
+            # hands from, and a WSGI application that hands to ASGI needs
+            # the loop as much as an ASGI one.
+
+            handoffs = {mount.name: mount.handoff for mount in mounts}
+            check_handoff("the release", self.handoff, release.resolved)
+
+            for name, _, mounted, _ in realised:
+                check_handoff(f"mount {name}", handoffs[name], mounted.resolved)
+
+            any_asgi = (
+                release.resolved in ("asgi", "grpc")
+                or self.handoff == "asgi"
+                or any(
+                    mounted.resolved in ("asgi", "grpc") or handoffs[name] == "asgi"
+                    for name, _, mounted, _ in realised
+                )
             )
 
             for name, _, mounted, own in realised:
@@ -1260,7 +1310,7 @@ class Host:
 
             lifespans: list[_asgi.Lifespan] = []
             served_mounts: list[
-                tuple[str, Any, Any, tuple[int, int] | None, tuple[int, int] | None]
+                tuple[str, Any, Any, tuple[int, int] | None, tuple[int, int] | None, bool]
             ] = []
 
             # Section 6.13: a gRPC application is served by a dispatcher on
@@ -1286,15 +1336,19 @@ class Host:
                         mounted_app, group.threads if own is None else own[0]
                     )
                     runner = _asgi.runner(dispatcher, loop, {})
-                    served_mounts.append((name, dispatcher, runner, own, None))
+                    served_mounts.append((name, dispatcher, runner, own, None, False))
                 elif loop is not None and mounted.resolved == "asgi":
                     mounted_lifespan = _asgi.Lifespan(mounted_app, loop, mounted.spec)
                     mounted_lifespan.startup()
                     lifespans.append(mounted_lifespan)
                     runner = _asgi.runner(mounted_app, loop, mounted_lifespan.state)
-                    served_mounts.append((name, mounted_app, runner, None, limits[name]))
+                    served_mounts.append(
+                        (name, mounted_app, runner, None, limits[name], handoffs[name] is not None)
+                    )
                 else:
-                    served_mounts.append((name, mounted_app, None, own, None))
+                    served_mounts.append(
+                        (name, mounted_app, None, own, None, handoffs[name] is not None)
+                    )
 
             if grpc_servers and self.reflection:
                 from muru import _grpc
@@ -1404,6 +1458,7 @@ class Host:
                     slots=group.threads if loop is None else group.concurrency,
                 ),
                 grpc_methods=grpc_methods,
+                handoff=self.handoff is not None,
                 **asgi_arguments,
                 **timeout_arguments,
             )
@@ -3443,6 +3498,20 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="a group the release is ready without; its workers join as each listens",
     )
     parser.add_argument(
+        "--handoff",
+        choices=HANDOFFS,
+        default=None,
+        help="the interface the default mount's requests may be handed to",
+    )
+    parser.add_argument(
+        "--mount-handoff",
+        action="append",
+        default=[],
+        type=parse_mount_handoff,
+        metavar="NAME=INTERFACE",
+        help="the interface a named mount's requests may be handed to",
+    )
+    parser.add_argument(
         "--group-mounts",
         action="append",
         default=[],
@@ -3679,6 +3748,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--mount: {error}", file=sys.stderr)
         return 2
 
+    mount_handoffs = dict(args.mount_handoff)
+    mounts = [replace(mount, handoff=mount_handoffs.get(mount.name)) for mount in mounts]
+
     # Section 11.4: the logging defaults are in place before anything of
     # the application is imported, and the workers inherit them.
 
@@ -3804,6 +3876,7 @@ def main(argv: list[str] | None = None) -> int:
             check_interval=args.memory_check_interval,
         ),
         reflection=args.reflection,
+        handoff=args.handoff,
     )
 
     if args.single:

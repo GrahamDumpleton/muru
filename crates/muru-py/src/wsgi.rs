@@ -25,6 +25,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
+use crate::handoff::{Handoff, WsgiToAsgi};
 use crate::pool::{Interrupt, Shared};
 
 /// SERVER_SOFTWARE: Muru's name and version, the version in the form
@@ -98,6 +99,10 @@ pub enum Outgoing {
         /// The worker closed it because it is stopping.
         draining: bool,
     },
+    /// The request was handed to the event loop (section 6.14): what
+    /// follows comes from the ASGI application, and the link task feeds
+    /// it the rest of the request.
+    Handoff,
     /// The request is over: the application returned and its iterable was
     /// closed. Sent explicitly, because the `start_response` object that
     /// also holds a sender can outlive the request when a framework keeps
@@ -137,6 +142,9 @@ struct HeadState {
     status: Option<(u32, String)>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     sent: bool,
+    /// The request was handed to the event loop, so whatever the WSGI
+    /// code goes on to produce is ignored (section 6.14).
+    handed_off: bool,
 }
 
 /// The `start_response` callable handed to the application, which also
@@ -163,6 +171,7 @@ impl StartResponse {
                 status: None,
                 headers: Vec::new(),
                 sent: false,
+                handed_off: false,
             }),
             sink: Sink { tx, interrupt },
             shared,
@@ -170,15 +179,26 @@ impl StartResponse {
         }
     }
 
-    fn head_sent(&self) -> bool {
+    pub(crate) fn head_sent(&self) -> bool {
         self.state.lock().expect("head state poisoned").sent
+    }
+
+    /// Ignore everything the WSGI code produces from now on: the request
+    /// has been handed to the event loop (section 6.14).
+    pub(crate) fn hand_off(&self) {
+        self.state.lock().expect("head state poisoned").handed_off = true;
+    }
+
+    /// Whether the request has been handed to the event loop.
+    pub(crate) fn handed_off(&self) -> bool {
+        self.state.lock().expect("head state poisoned").handed_off
     }
 
     /// Send the head if it has not gone yet. Fails if start_response was never called.
     fn ensure_head_sent(&self, py: Python<'_>) -> PyResult<()> {
         let mut state = self.state.lock().expect("head state poisoned");
 
-        if state.sent {
+        if state.sent || state.handed_off {
             return Ok(());
         }
 
@@ -212,6 +232,10 @@ impl StartResponse {
     }
 
     fn send_body(&self, py: Python<'_>, data: Bytes) -> PyResult<()> {
+        if self.handed_off() {
+            return Ok(());
+        }
+
         self.ensure_head_sent(py)?;
 
         if self.sink.send(py, Outgoing::Body(data)) {
@@ -315,6 +339,17 @@ impl StartResponse {
                     "start_response() exc_info must be a 3-tuple or None",
                 ));
             }
+        }
+
+        // Section 6.14: after a handoff the status and headers are
+        // ignored, and an error reported through exc_info fails the
+        // request it was handed to.
+
+        if this.handed_off() {
+            return match exc_info {
+                Some(info) => Err(PyErr::from_value(info.get_item(1)?)),
+                None => slf.getattr(intern!(py, "write")),
+            };
         }
 
         if this.head_sent() {
@@ -631,6 +666,20 @@ impl InputState {
 #[pyclass(frozen, module = "muru._native")]
 pub struct Input {
     state: Mutex<InputState>,
+}
+
+impl Input {
+    /// Take what is left of the body for the application a request is
+    /// handed to (section 6.14): the bytes read ahead and the channel
+    /// the rest arrives on. The stream is at its end afterwards.
+    pub(crate) fn take_body(&self) -> (Bytes, mpsc::Receiver<Bytes>) {
+        let mut state = self.state.lock().expect("input state poisoned");
+        let (_, ended) = mpsc::channel(1);
+        state.eof = true;
+        state.announce = None;
+        let pending = std::mem::take(&mut state.pending);
+        (pending, std::mem::replace(&mut state.rx, ended))
+    }
 }
 
 impl Input {
@@ -974,6 +1023,8 @@ fn build_environ<'py>(
 /// Run one request through the application on the current, attached
 /// thread. `request` is the request's id in the shared state and
 /// `interrupt` the soft timeout's way out of the bridge's waits.
+/// Returns whether the request was handed to the event loop (section
+/// 6.14), which then finishes it.
 #[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 pub fn run(
     py: Python<'_>,
@@ -984,22 +1035,24 @@ pub fn run(
     uploads: &[RawFd],
     body_rx: mpsc::Receiver<Bytes>,
     tx: mpsc::Sender<Outgoing>,
-    cancelled: Arc<AtomicBool>,
+    handoff: &Handoff,
     interrupt: Arc<Interrupt>,
-) {
+) -> bool {
+    let head = Arc::new(head);
     let announce = head.expect_continue.then(|| tx.clone());
     let finished = tx.clone();
+    let bridge_tx = tx.clone();
     let started = StartResponse::new(tx, Arc::clone(shared), request, Arc::clone(&interrupt));
 
     let start_response = match Bound::new(py, started) {
         Ok(start_response) => start_response,
         Err(error) => {
             error.print(py);
-            return;
+            return false;
         }
     };
 
-    if let Err(error) = run_app(
+    let result = run_app(
         py,
         shared,
         app,
@@ -1008,9 +1061,30 @@ pub fn run(
         body_rx,
         announce,
         &start_response,
-        &cancelled,
+        handoff,
+        bridge_tx,
+        request,
         Arc::clone(&interrupt),
-    ) {
+    );
+    let handed_off = start_response.get().handed_off();
+
+    // Section 6.14: after a handoff an error leaving the WSGI code fails
+    // the request it was handed to, and the ASGI application finishes
+    // the response.
+
+    if handed_off {
+        if let Err(error) = &result {
+            report(py, error);
+
+            if let Some(channel) = handoff.slot.channel() {
+                channel.fail_handoff(py, describe(py, error));
+            }
+        }
+
+        return true;
+    }
+
+    if let Err(error) = result {
         let broken_pipe = error.is_instance_of::<PyBrokenPipeError>(py);
 
         if !broken_pipe {
@@ -1047,11 +1121,13 @@ pub fn run(
             start_response.abort(py, &message, reason, describe(py, &error));
         }
     }
+
     let sink = Sink {
         tx: finished,
         interrupt,
     };
     sink.send(py, Outgoing::Finished);
+    false
 }
 
 /// A duration in seconds, as the log shows it: `2 s` or `1.5 s`.
@@ -1068,19 +1144,59 @@ pub(crate) fn describe_seconds(duration: std::time::Duration) -> String {
 #[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 fn run_app<'py>(
     py: Python<'py>,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     app: &Py<PyAny>,
-    head: &pb::RequestHead,
+    head: &Arc<pb::RequestHead>,
     uploads: &[RawFd],
     body_rx: mpsc::Receiver<Bytes>,
     announce: Option<mpsc::Sender<Outgoing>>,
     start_response: &Bound<'py, StartResponse>,
-    cancelled: &AtomicBool,
+    handoff: &Handoff,
+    tx: mpsc::Sender<Outgoing>,
+    request: u64,
     interrupt: Arc<Interrupt>,
 ) -> PyResult<()> {
-    let input = Bound::new(py, Input::new(body_rx, announce, interrupt))?;
-    let environ = build_environ(py, shared, head, uploads, input)?;
+    let input = Bound::new(py, Input::new(body_rx, announce, Arc::clone(&interrupt)))?;
+    let environ = build_environ(py, shared, head, uploads, input.clone())?;
+
+    // Section 6.14: every environ can hand its request to ASGI, and
+    // says so with an error when the mount does not enable it.
+
+    let bridge = WsgiToAsgi::new(
+        handoff,
+        Arc::clone(head),
+        uploads,
+        start_response.clone().unbind(),
+        input.unbind(),
+        Arc::clone(shared),
+        request,
+        tx,
+        interrupt,
+    );
+    environ.set_item(intern!(py, "muru.wsgi_to_asgi"), Bound::new(py, bridge)?)?;
     let result = app.bind(py).call1((environ, start_response))?;
+
+    // After a handoff the iterable is closed without being read; a list
+    // with something in it is most likely a mistake worth a debug line.
+
+    if start_response.get().handed_off() {
+        if result
+            .cast::<PyList>()
+            .is_ok_and(|items| items.iter().any(|item| item.len().unwrap_or(0) > 0))
+        {
+            tracing::debug!("a WSGI response returned after a handoff was discarded");
+        }
+
+        if let Ok(close) = result.getattr(intern!(py, "close"))
+            && let Err(error) = close.call0()
+        {
+            report(py, &error);
+        }
+
+        return Ok(());
+    }
+
+    let cancelled = handoff.cancelled.as_ref();
 
     // Section 6.5: a file the edge can send itself goes by descriptor;
     // anything else is iterated.

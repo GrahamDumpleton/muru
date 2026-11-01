@@ -73,10 +73,10 @@ muructl run app:application      # http://127.0.0.1:8080
   and hard timeouts, and Python-aware scaling.
 
 - Mix WSGI and ASGI in one process: mounts by path, each served by the
-  side it was written for. Still to come, a WSGI view will be able to hand
-  a request to an ASGI application on the event loop, which is how a WSGI
-  application will take WebSockets, and an ASGI application to hand one to
-  a WSGI callable on the thread pool.
+  side it was written for, and a WSGI view that hands a request to an ASGI
+  application on the event loop, which is how a WSGI application takes
+  WebSockets. Still to come, an ASGI application will be able to hand one
+  to a WSGI callable on the thread pool.
 
 - Reconfigure live through an API and CLI, with declarative files that
   export and apply round-trip, plus metrics, structured logs, an event

@@ -214,6 +214,9 @@ pub struct MountSpec {
     /// Threads of the mount's own; the worker's shared pool when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<muru_config::MountThreads>,
+    /// The interface the mount's requests may be handed to (section 6.14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<muru_config::Handoff>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -365,6 +368,10 @@ pub struct ReleaseSpec {
     /// Whether gRPC server reflection is served (section 6.13).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reflection: bool,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<muru_config::Handoff>,
     /// Named worker groups beside the default one.
     #[serde(default)]
     pub groups: Vec<GroupSpec>,

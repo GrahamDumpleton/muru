@@ -14,7 +14,8 @@ A release can serve several entrypoints from the same worker processes,
 and from one preload: the release's own entrypoint is the default mount
 at `/`, and named mounts take a path prefix each. Mounts can be any mix
 of WSGI and ASGI, which is the static way to run both interfaces in one
-application.
+application. To choose in code, request by request, see [handing requests
+between WSGI and ASGI](handoff.md).
 
 Mounts ship with the application in its `[tool.muru]` table:
 

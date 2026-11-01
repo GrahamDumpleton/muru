@@ -124,12 +124,16 @@ WebSocket protocol itself and only passes whole messages to the worker, so
 a WSGI view hands the upgrade to an ASGI application and Muru provides a
 small one for the common case.
 
-**From WSGI to ASGI.** On a worker with an event loop, the environ carries
-`muru.wsgi_to_asgi`. Its absence is the feature test. The object holds the
-ASGI scope the request would be given, says whether the request is a
-WebSocket upgrade, and has a `handoff` method that continues the request as
-an ASGI application on the loop and returns at once. The view then returns,
-and its thread goes back to the pool.
+Each direction is enabled in the configuration: `handoff = "asgi"` on a
+WSGI application, `handoff = "wsgi"` on an ASGI one. The setting is what
+gives a WSGI worker its event loop, or an ASGI worker its threads, and
+without it a handoff raises an error that names the setting.
+
+**From WSGI to ASGI.** The environ carries `muru.wsgi_to_asgi`. The object
+holds the ASGI scope the request would be given, says whether the request
+is a WebSocket upgrade, and has a `handoff` method that continues the
+request as an ASGI application on the loop and returns at once. The view
+then returns, and its thread goes back to the pool.
 
 ```python
 from muru.asgi import websocket
@@ -147,8 +151,8 @@ class Chat:
 
 
 def application(environ, start_response):
-    bridge = environ.get("muru.wsgi_to_asgi")
-    if bridge is None or not bridge.is_websocket:
+    bridge = environ["muru.wsgi_to_asgi"]
+    if not bridge.is_websocket:
         start_response("426 Upgrade Required", [("Content-Type", "text/plain")])
         return [b"websocket required\n"]
 
