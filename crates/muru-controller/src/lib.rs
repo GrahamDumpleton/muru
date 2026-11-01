@@ -9,6 +9,7 @@ pub mod api;
 pub mod budget;
 pub mod client;
 pub mod clients;
+pub mod commands;
 pub mod config;
 pub mod daemon;
 pub mod dashboard;

@@ -184,6 +184,76 @@ impl Server {
         failure(message)
     }
 
+    /// The run_command tool. A secret input given as a value is refused,
+    /// so a secret never passes through the agent; the command's output
+    /// comes back with its exit status, as an error when that is not 0.
+    async fn run_command(&self, arguments: &JsonObject) -> CallToolResult {
+        let command = match (specs()
+            .into_iter()
+            .find(|spec| spec.name == "run_command")
+            .expect("the run_command tool")
+            .command)(arguments)
+        {
+            Ok(command) => command,
+            Err(message) => return failure(message),
+        };
+
+        let given = match pairs(arguments, "inputs") {
+            Ok(given) => given,
+            Err(message) => return failure(message),
+        };
+
+        if !given.is_empty() {
+            let listed = self.command(words(&["command", "list", &command[2]])).await;
+            let declared = listed
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .and_then(|text| serde_json::from_str::<Value>(&text.text).ok());
+
+            let secret = declared.as_ref().and_then(|declared| {
+                let inputs = declared["commands"]
+                    .as_array()?
+                    .iter()
+                    .find(|listed| listed["name"] == command[3])?["inputs"]
+                    .as_array()?
+                    .clone();
+                given.iter().find_map(|(name, _)| {
+                    inputs
+                        .iter()
+                        .any(|input| input["name"] == *name && input["secret"] == true)
+                        .then(|| name.clone())
+                })
+            });
+
+            if let Some(name) = secret {
+                return failure(format!(
+                    "the input {name} is secret: give it in secret_inputs as STORE/KEY, an entry \
+                     of one of the daemon's secret stores, so its value never passes through here"
+                ));
+            }
+        }
+
+        let mut command = command;
+        command.push("--json".to_owned());
+        command.extend(self.connect.iter().cloned());
+
+        let output = match tokio::process::Command::new(&self.muructl)
+            .args(&command)
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => return failure(format!("running muructl: {error}")),
+        };
+
+        command_result(
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
     /// The instructions the initialize response carries: what Muru's
     /// objects are, so the agent picks the right tool.
     fn instructions(&self) -> String {
@@ -228,6 +298,9 @@ by gates against the release that serves.
 - apply makes a declarative file (muru.toml) the desired state; deploy adds \
 one release.
 - An overlay is a named, temporary change to routes or settings.
+- commands lists what an application declares it can run with a release \
+(migrations, data fixes, checks); run_command runs one by name, with its \
+inputs, and returns its output and exit status.
 
 After a deploy, check the release's state and the events. When something \
 fails, read the release's logs, then debug stacks for what the workers are \
@@ -269,6 +342,7 @@ impl ServerHandler for Server {
         let result = match spec.name {
             "docs" => docs(&arguments),
             "skill_status" => skill_status(),
+            "run_command" => self.run_command(&arguments).await,
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
                     let result = self.command(command).await;
@@ -350,6 +424,26 @@ fn option(arguments: &JsonObject, key: &str, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// An argument that is an object of strings, as name and value pairs.
+fn pairs(arguments: &JsonObject, key: &str) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(format!("{key} is an object of names and values"));
+    };
+
+    object
+        .iter()
+        .map(|(name, value)| match value {
+            Value::String(text) => Ok((name.clone(), text.clone())),
+            Value::Number(number) => Ok((name.clone(), number.to_string())),
+            Value::Bool(flag) => Ok((name.clone(), flag.to_string())),
+            _ => Err(format!("{key}.{name} is not a string")),
+        })
+        .collect()
+}
+
 /// Words, all owned.
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
@@ -401,6 +495,64 @@ fn finish(name: &str, arguments: &JsonObject, result: CallToolResult) -> CallToo
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&value).unwrap_or(printed),
     )])
+}
+
+/// How many lines of a command's output a tool result keeps, the last.
+const COMMAND_OUTPUT_LINES: usize = 500;
+
+/// A command's JSON lines as one result: its output, standard error lines
+/// marked, the last lines only when there are many, then how it ended.
+/// A refusal (`{"error": ...}`) is the error's sentence.
+fn command_result(printed: &str, stderr: &str) -> CallToolResult {
+    let messages: Vec<Value> = printed
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    let Some(last) = messages.last().filter(|last| last["finished"] == true) else {
+        let message = serde_json::from_str::<Value>(printed.trim())
+            .ok()
+            .and_then(|answer| answer["error"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| stderr.trim().to_owned());
+        return failure(message);
+    };
+
+    let lines: Vec<String> = messages
+        .iter()
+        .filter(|message| message["finished"] != true)
+        .map(|message| {
+            let line = message["line"].as_str().unwrap_or_default();
+
+            if message["stderr"] == true {
+                format!("stderr: {line}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    let omitted = lines.len().saturating_sub(COMMAND_OUTPUT_LINES);
+    let exit_code = last["exit_code"].as_i64().unwrap_or(0);
+
+    let mut answer = json!({
+        "release": last["release"],
+        "output": lines[omitted..],
+        "exit_code": exit_code,
+        "message": last["message"],
+    });
+
+    if omitted > 0 {
+        answer["omitted_lines"] = json!(omitted);
+    }
+
+    let text = vec![ContentBlock::text(
+        serde_json::to_string_pretty(&answer).unwrap_or_default(),
+    )];
+
+    if exit_code == 0 {
+        CallToolResult::success(text)
+    } else {
+        CallToolResult::error(text)
+    }
 }
 
 /// The skill_status tool: how the project's copy of the skill compares
@@ -478,6 +630,20 @@ fn specs() -> Vec<Spec> {
                 Ok([
                     words(&["release", "show"]),
                     vec![needed(arguments, "release")?],
+                ]
+                .concat())
+            },
+        },
+        Spec {
+            name: "commands",
+            description: "The commands an application declares (migrations, data fixes, checks and the like), with their inputs, which are required or secret, and how each last ran.",
+            changes: false,
+            properties: json!({"target": {"type": "string", "description": "app, or app@release; the current release when only the app is named"}}),
+            required: &["target"],
+            command: |arguments| {
+                Ok([
+                    words(&["command", "list"]),
+                    vec![needed(arguments, "target")?],
                 ]
                 .concat())
             },
@@ -771,6 +937,32 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "run_command",
+            description: "Run a command the application declares, with its inputs, and return its output and exit status. Give a secret input in secret_inputs as STORE/KEY, an entry of one of the daemon's secret stores, never as a value.",
+            changes: true,
+            properties: json!({
+                "target": {"type": "string", "description": "app, or app@release; the current release when only the app is named"},
+                "name": {"type": "string", "description": "The command, as the commands tool lists it"},
+                "inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Input values by name"},
+                "secret_inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Secret inputs by name, each as STORE/KEY"},
+            }),
+            required: &["target", "name"],
+            command: |arguments| {
+                let mut command = words(&["command", "run"]);
+                command.push(needed(arguments, "target")?);
+                command.push(needed(arguments, "name")?);
+
+                for (key, option) in [("inputs", "--input"), ("secret_inputs", "--secret-input")] {
+                    for (name, value) in pairs(arguments, key)? {
+                        command.push(option.to_owned());
+                        command.push(format!("{name}={value}"));
+                    }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "restart",
             description: "Replace a release's worker (by index) with a fresh one, gracefully or at once with force; or every worker in turn with all.",
             changes: true,
@@ -969,6 +1161,30 @@ mod tests {
         );
         assert!(command("debug", json!({"what": "exec", "target": "shop"})).is_err());
         assert_eq!(
+            command(
+                "run_command",
+                json!({"target": "shop@r2", "name": "add-user", "inputs": {"username": "bob"},
+                       "secret_inputs": {"password": "local/admin"}})
+            ),
+            Ok(vec![
+                "command".into(),
+                "run".into(),
+                "shop@r2".into(),
+                "add-user".into(),
+                "--input".into(),
+                "username=bob".into(),
+                "--secret-input".into(),
+                "password=local/admin".into()
+            ])
+        );
+        assert!(
+            command(
+                "run_command",
+                json!({"target": "shop", "name": "x", "inputs": "a=b"})
+            )
+            .is_err()
+        );
+        assert_eq!(
             command("release", json!({})),
             Err("release is required".to_owned())
         );
@@ -992,6 +1208,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_command_result_keeps_the_output_and_the_ending() {
+        let printed = [
+            r#"{"release":"r1","line":"migrating","stderr":false,"finished":false}"#,
+            r#"{"release":"r1","line":"warning","stderr":true,"finished":false}"#,
+            r#"{"release":"r1","line":"","stderr":false,"finished":true,"exit_code":2,"message":"exited with status 2 after 3s"}"#,
+        ]
+        .join("\n");
+        let result = super::command_result(&printed, "");
+        assert_eq!(result.is_error, Some(true));
+
+        let text = &result.content[0].as_text().expect("text").text;
+        let answer: serde_json::Value = serde_json::from_str(text).expect("JSON");
+        assert_eq!(answer["output"], json!(["migrating", "stderr: warning"]));
+        assert_eq!(answer["exit_code"], 2);
+        assert_eq!(answer["release"], "r1");
+
+        let refused = super::command_result("{\n  \"error\": \"shop needs the input who\"\n}", "");
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(
+            refused.content[0].as_text().expect("text").text,
+            "shop needs the input who"
+        );
     }
 
     #[test]

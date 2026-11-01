@@ -149,13 +149,20 @@ def test_a_failing_gate_rolls_the_canary_back(daemon: Daemon, tmp_path: Path) ->
     )
 
     # The candidate fails a third of what it is asked, through previews
-    # that pin the failing requests to it; the baseline is fine.
+    # that pin the failing requests to it; the baseline is fine. Only the
+    # first pass checks where requests land: the gate judges on every tick
+    # and rolls back once the candidate has its 20 requests, which can be
+    # mid-loop on a slow machine, and after that a preview reaches r1.
 
     for n in range(30):
         failed = daemon.request("/error", host="shop.test", headers={"Muru-Preview": "r2"})
         assert failed.status == 500, failed.status
-        assert served_by(daemon, **{"Muru-Preview": "r2"}) == "r2"
-        assert served_by(daemon, Cookie=f"muru_id=base-{n}") in {"r1", "r2"}
+        previewed = served_by(daemon, **{"Muru-Preview": "r2"})
+        split = served_by(daemon, Cookie=f"muru_id=base-{n}")
+
+        if n == 0:
+            assert previewed == "r2", previewed
+            assert split in {"r1", "r2"}, split
 
     wait_for_rollout(daemon, "rolled_back")
     status = daemon.muructl("rollout", "status", "shop").stdout

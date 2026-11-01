@@ -81,6 +81,15 @@ Then the agent, through the tools:
    `drain` a release it no longer needs, or a `rollout` with gates when it
    wants Muru to judge the new release against the old.
 
+Steps the project repeats, such as migrating the database, loading
+fixtures or a smoke check, belong in [commands](commands.md) declared in
+`[tool.muru]`. The agent finds them with `commands` and runs them with
+`run_command`, and can declare a new one when it finds itself repeating
+a step; it is part of the next release it deploys. Give a secret input in
+`secret_inputs`, as an entry of one of the daemon's [secret
+stores](secrets.md): `run_command` refuses a secret's value, so it never
+passes through the agent.
+
 ## The tools
 
 The [MCP tools reference](../reference/mcp-tools.md) lists every tool, its
@@ -88,8 +97,9 @@ arguments and the `muructl` command it runs. Each tool runs that command
 with `--json` and returns what it prints, so the shape of a result is the
 one the [JSON output reference](../reference/json-output.md) gives, and a
 failure returns the sentence `muructl` would print, as a tool error.
-Stopping and upgrading the daemon, and running code in workers, are not
-offered as tools.
+Stopping and upgrading the daemon, running code in workers, and one-off
+commands (`muructl exec`) are not offered as tools: `run_command` runs
+only the commands an application declares.
 
 ## Limiting what the agent may do
 

@@ -36,6 +36,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[app.NAME.release.ID.groups.NAME]` | application files | worker groups |
 | `[tool.muru]` | the application's pyproject.toml or muru.toml | application-shipped defaults |
 | `[tool.muru.run]`, `[run]` | the application's pyproject.toml or muru.toml, and muru.local.toml | how `muructl run` serves the project (section 13.1): a key for each flag of the command that describes the serving, ignored by the daemon |
+| `[tool.muru.commands.NAME]`, `[app.NAME.release.ID.commands.NAME]` | the application's pyproject.toml or muru.toml, or a release's table, which replaces the source's | commands the application declares (section 9.12) |
 | `[tool.muru.build]`, `[build]` | the application's pyproject.toml or muru.toml, a release's table, and muru.local.toml (`when` only) | when and how the release's environment is built (section 8.2) |
 | `[overlay.NAME]` | application files | overlays and triggers |
 | `[[client_class]]` | daemon or application files | classification rules |
@@ -103,6 +104,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | user, group, umask, limits | application | daemon's user, none | 10.9 |
 | `[secrets.store.NAME]` (kind, command, timeout), env values with secret = { store, key } and optional as = 'file' | daemon, release | file store in the secrets directory | 10.8 |
 | bytecode | release, variant | redirect | 8.2 |
+| commands.NAME: description, run (argv with `{input}` placeholders) or call (module:function), env, timeout, exclusive; inputs.NAME: description, required, default, pattern, secret | release, `[tool.muru.commands]` | none; no timeout, not exclusive; inputs optional and not secret | 9.12 |
 
 ## C.3 Error statuses and reasons
 
@@ -134,4 +136,5 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Dashboard | dashboard.login_issued, dashboard.action |
+| Commands | command.started, command.finished, command.failed |
 | Debugging | request.soft_timeout, debug.profile, debug.trace, debug.memory, debug.exec, debug.breakpoint, debug.breakpoint_expired, debug.attached, debug.detached |

@@ -421,6 +421,7 @@ struct Service {
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
+type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
 impl Service {
     /// Why a command that manages the daemon's state is refused here.
@@ -504,6 +505,7 @@ macro_rules! needs_the_daemon {
 impl Admin for Service {
     type WatchEventsStream = EventStream;
     type TailLogsStream = LogStream;
+    type RunCommandStream = CommandStream;
 
     async fn get_status(
         &self,
@@ -693,6 +695,8 @@ impl Admin for Service {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
         deploy(pb::DeployRequest) -> pb::Release, "muructl deploy";
+        run_command(pb::RunCommandRequest) -> CommandStream, "muructl exec and muructl command run";
+        list_commands(pb::ListCommandsRequest) -> pb::ListCommandsResponse, "muructl command";
         list_releases(pb::ListReleasesRequest) -> pb::ListReleasesResponse, "muructl release";
         get_release(pb::GetReleaseRequest) -> pb::Release, "muructl release";
         wait_release(pb::WaitReleaseRequest) -> pb::Release, "muructl release wait";

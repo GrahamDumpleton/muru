@@ -760,6 +760,10 @@ pub struct Release {
     /// What maintenance mode lets through (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<Maintenance>,
+    /// Commands the application declares (section 9.12), by name: run
+    /// with the release on request, with inputs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, CommandTable>,
 }
 
 /// How a worker group is scaled (section 7.2).
@@ -3350,7 +3354,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 21] = [
+    let worker_keys: [(&str, bool); 22] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("factory", table.factory.is_some()),
@@ -3371,6 +3375,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("memory", table.memory.is_some()),
         ("accel_redirect", table.accel_redirect.is_some()),
         ("cgi_local_redirect", table.cgi_local_redirect.is_some()),
+        ("commands", !table.commands.is_empty()),
         (
             "timeouts",
             timeouts.is_some_and(|timeouts| {
@@ -4210,6 +4215,67 @@ pub struct ToolMuru {
     /// Where compiled bytecode goes under the daemon (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytecode: Option<Bytecode>,
+    /// Commands the application declares (section 9.12), by name: run
+    /// with the release on request, with inputs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, CommandTable>,
+}
+
+/// A command an application declares, the `[tool.muru.commands.NAME]` or
+/// `[app.NAME.release.ID.commands.NAME]` table (section 9.12): a program
+/// to run, or a Python callable to call, with the release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandTable {
+    /// What the command does, for `muructl command list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The program and its arguments, run without a shell, with `{name}`
+    /// where an input's value goes; `python` is the release's
+    /// interpreter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+    /// A callable as module:function, called with the inputs as keyword
+    /// arguments, instead of `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// Environment variables for this command alone, over the release's,
+    /// with `{name}` where an input's value goes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The values the command takes, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, CommandInput>,
+    /// How long it may run before it is stopped, for example 10m; no
+    /// limit when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Run one at a time for the application: a run asked for while one
+    /// is under way is refused (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive: Option<bool>,
+}
+
+/// An input a command takes (section 9.12).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandInput {
+    /// What the value is, for `muructl command list` and prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The command refuses to run without it (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// The value when none is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// A regular expression the whole value must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// The value is never shown, logged or put in an event, and may only
+    /// be used in `env` (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<bool>,
 }
 
 /// Why a project's configuration could not be read.
