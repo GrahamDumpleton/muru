@@ -40,10 +40,11 @@ configuration may still change between them.
   declared in files or on the command line.
 
 Both are tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI on regular and free-threaded Python. Still to come are uv
-provisioning of interpreters, container releases, ACME certificates,
-HTTP/3, OpenTelemetry export, several edge processes and more than one
-node; the [roadmap](docs/project/roadmap.md) lists the phases. The
+FastAPI on regular and free-threaded Python. Still to come are a
+production command for containers and Kubernetes, container releases,
+ACME certificates, HTTP/3, OpenTelemetry export, several edge processes
+and more than one node; the [roadmap](docs/project/roadmap.md) sets out
+the goals. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
 is the place to start, and the
 [documentation](https://muru.readthedocs.io/) has a guide for each
