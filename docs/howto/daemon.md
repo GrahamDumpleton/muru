@@ -295,6 +295,13 @@ made in between wait in the socket's backlog rather than being refused.
 The edge's own output goes to `edge.log` in the log directory, and each
 release's host writes to `apps/APP/RELEASE.log` there.
 
+The access log is written as JSON lines to `access.log` in the log
+directory, `muructl logs` shows or follows it and each release's output,
+and `muructl logs reopen` works with logrotate; the [logging
+guide](logging.md) has the details. The events `muructl events` shows are
+kept in the state store, and `[[events.sink]]` entries deliver them to
+webhooks; the [events guide](events.md) has the details.
+
 ## Stopping and restarting
 
 `muructl daemon stop` detaches: the daemon exits, and the edge and every
@@ -338,6 +345,17 @@ SIGTERM (and an interrupt) means `muructl daemon stop` without
 wants, unless `on_sigterm = 'shutdown'` makes it the shutdown above. In a
 container that is the default; see below.
 
+`muructl daemon run` runs it in the foreground, for a service manager or
+a terminal; SIGTERM or an interrupt detaches it the same way, and
+`muructl daemon stop --timeout` bounds how long the command waits for the
+daemon to exit. The [systemd
+guide](systemd.md) has the unit and what it does. Commands find the
+daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
+development run started from the current directory, else the daemon's
+socket in the runtime directory, else the one development run listening;
+with several runs and no daemon the command names them, so one can be
+chosen with `--socket`. `muructl status` says which was found.
+
 ## In a container
 
 `muructl daemon run` or `muructl run --allow-public` can be a container's
@@ -362,41 +380,11 @@ container that keeps its hosts across a daemon restart of its own.
 ## Upgrading
 
 Installing a new version of Muru changes nothing until `muructl daemon
-upgrade`. The daemon then re-executes itself from the installed `muructl`
-(the one its command name finds on the `PATH`, or the path it was started
-with), keeping its process id and its children, and the new version takes
-the hosts and the edge over from their records, exactly as a restarted
-daemon does. It then starts a new edge from its own version on the same
-listening sockets, gives it the routing in force, and tells the old edge
-to stop accepting: that edge finishes the requests in flight, closes its
-idle keep-alive connections (with GOAWAY on HTTP/2) and exits. No
-connection is refused and no request fails in between; WebSocket
-connections still open on the old edge are closed when it exits. The
-command waits until the upgraded daemon answers with its new edge and
-prints the versions and process ids involved. The daemon checks that the
-installed binary runs before it commits, and the `daemon.upgraded` and
-`edge.replaced` events record what happened.
-
-Releases keep the runtime library they started with; a new release picks
-up the installed one. Under systemd the service's main process is
-unchanged by an upgrade, so no unit restart is involved.
-`muructl daemon run` runs it in the foreground, for a service manager or
-a terminal; SIGTERM or an interrupt detaches it the same way, and
-`muructl daemon stop --timeout` bounds how long the command waits for the
-daemon to exit. The [systemd
-guide](systemd.md) has the unit and what it does. Commands find the
-daemon through its admin socket: `--socket` or `MURU_SOCKET`, else a
-development run started from the current directory, else the daemon's
-socket in the runtime directory, else the one development run listening;
-with several runs and no daemon the command names them, so one can be
-chosen with `--socket`. `muructl status` says which was found.
-
-The access log is written as JSON lines to `access.log` in the log
-directory, `muructl logs` shows or follows it and each release's output,
-and `muructl logs reopen` works with logrotate; the [logging
-guide](logging.md) has the details. The events `muructl events` shows are
-kept in the state store, and `[[events.sink]]` entries deliver them to
-webhooks; the [events guide](events.md) has the details.
+upgrade`, which re-executes the daemon from the installed `muructl`,
+keeping its process id and its children, and replaces the edge without
+refusing a connection. Releases keep the runtime library they started
+with until a new release replaces them. [Upgrading Muru](upgrading.md)
+covers the command, development runs, the daemon and releases.
 
 ## Reloading the configuration
 

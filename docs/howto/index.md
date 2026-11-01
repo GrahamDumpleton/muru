@@ -2,14 +2,6 @@
 
 Recipes for specific tasks, assuming you already know the basics.
 
-Still to be written:
-
-- Migrating from mod_wsgi, gunicorn and uvicorn.
-- Containers and images.
-- OpenTelemetry export.
-- Database migrations during overlapping releases.
-- Upgrading Muru.
-
 ```{toctree}
 :maxdepth: 1
 
@@ -52,4 +44,5 @@ events
 systemd
 dashboard
 coding-agents
+upgrading
 ```
