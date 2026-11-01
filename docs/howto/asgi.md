@@ -5,7 +5,7 @@
 
 Muru serves ASGI over HTTP and WebSockets, in development mode and
 under the daemon, with the `pathsend` and `zerocopysend` file extensions ([file hints](file-hints.md)).
-Response trailers are not served yet. WebSockets over HTTP/2 (extended
+Response trailers are not served, except on [gRPC](grpc.md) calls. WebSockets over HTTP/2 (extended
 CONNECT) are accepted but not yet covered by the test suite.
 ```
 
