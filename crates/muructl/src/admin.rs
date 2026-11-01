@@ -105,6 +105,23 @@ pub struct SocketArgs {
 }
 
 impl SocketArgs {
+    /// The same options, for a muructl command run on this one's behalf,
+    /// which then reaches the same daemon.
+    pub fn as_arguments(&self) -> Vec<String> {
+        let mut arguments = self
+            .socket
+            .iter()
+            .flat_map(|socket| ["--socket".to_owned(), socket.display().to_string()])
+            .collect::<Vec<_>>();
+        arguments.extend(self.locations.as_arguments());
+        arguments
+    }
+
+    /// The location options alone, for `muructl up`.
+    pub fn location_arguments(&self) -> Vec<String> {
+        self.locations.as_arguments()
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a development run's from this project, else the
     /// daemon's when it listens, else the one run listening; several runs

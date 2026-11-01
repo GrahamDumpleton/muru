@@ -27,6 +27,7 @@ muru-edge = { workspace = true }
 muru-proto = { workspace = true }
 muru-provision = { workspace = true }
 rcgen = { workspace = true }
+rmcp = { workspace = true }
 rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod init;
+mod mcp;
 mod provision;
 mod pstats;
 mod run_admin;
@@ -235,6 +236,13 @@ enum Command {
     /// Show the WebSockets open now: how many by endpoint, or each one
     /// with --list.
     Websockets(admin::WebSocketsArgs),
+
+    /// Serve muructl's operations to a coding agent over the Model Context
+    /// Protocol.
+    Mcp {
+        #[command(subcommand)]
+        command: mcp::McpCommand,
+    },
 
     /// Serve a directory of files with no configuration,
     /// for a built front end or a documentation build.
@@ -939,6 +947,7 @@ fn main() -> anyhow::Result<()> {
             runtime.block_on(admin::metrics(socket, output.json))
         }
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
+        Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),

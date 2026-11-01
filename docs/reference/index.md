@@ -25,5 +25,6 @@ wsgi-environ
 asgi-scope
 errors
 json-output
+mcp-tools
 python-api
 ```
