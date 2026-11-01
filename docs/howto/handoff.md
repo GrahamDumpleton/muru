@@ -164,8 +164,10 @@ The `ws` object passed to each call has:
 
 An exception from a call is logged and closes the socket with 1011,
 after which `on_disconnect` is called. When a worker stops, its open
-sockets are closed with 1001. The adapter runs under any ASGI server
-too, on a thread pool of its own, or on `executor` when one is given.
+sockets are closed with 1001. In a worker whose own entrypoint is ASGI,
+the calls run on the event loop's pool for synchronous code, sized by
+`sync_threads`. The adapter runs under any ASGI server too, on a thread
+pool of its own, or on `executor` when one is given.
 
 ## Applications with a lifespan
 

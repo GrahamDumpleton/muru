@@ -142,15 +142,21 @@ _own_pool: concurrent.futures.ThreadPoolExecutor | None = None
 _own_pool_lock = threading.Lock()
 
 
-def _default_executor() -> concurrent.futures.Executor:
-    """Return the worker's thread pool under Muru, else a pool of the adapter's own."""
+def _default_executor() -> concurrent.futures.Executor | None:
+    """Return where the callbacks run when the handler names no executor.
+
+    Under Muru, the worker's application threads when its default mount
+    is WSGI, and otherwise the loop's pool for synchronous code (None),
+    since an ASGI worker's application threads are one unless it hands
+    requests to WSGI. Under any other server, a pool of the adapter's own.
+    """
 
     global _own_pool
 
-    from muru import _asgi
+    from muru import _asgi, context
 
     if _asgi.current_loop() is not None:
-        return _WorkerPool()
+        return _WorkerPool() if context().interface == "wsgi" else None
 
     with _own_pool_lock:
         if _own_pool is None:
@@ -172,9 +178,10 @@ class Handler:
     ``handler`` provides any of ``on_connect``, ``on_receive`` and
     ``on_disconnect``. The socket is accepted with ``subprotocol`` when
     the client offered it, and with the extra response ``headers``.
-    ``executor`` runs the callbacks; by default the worker's application
-    threads under Muru, and a thread pool of the adapter's own under any
-    other server. An exception from a callback closes the socket with
+    ``executor`` runs the callbacks; by default, under Muru, the worker's
+    application threads when its default mount is WSGI and the loop's
+    pool for synchronous code otherwise, and a thread pool of the
+    adapter's own under any other server. An exception from a callback closes the socket with
     1011.
     """
 
@@ -199,7 +206,7 @@ class Handler:
             )
 
         loop = asyncio.get_running_loop()
-        executor = self.executor or _default_executor()
+        executor = self.executor if self.executor is not None else _default_executor()
 
         connect = await receive()
 

@@ -393,3 +393,61 @@ def test_an_asgi_mount_without_the_setting_raises(server: support.Server) -> Non
     started = server.get("/api/started")
     assert started.status == 200
     assert started.body == b"the request cannot be handed off once its response has started"
+
+
+ASGI_RELEASE = """
+import threading
+
+from muru.asgi import websocket
+
+
+def legacy(environ, start_response):
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    body = environ["wsgi.input"].read()
+    return [f"wsgi {threading.current_thread().name} {body.decode()}".encode()]
+
+
+class Echo:
+    def on_receive(self, ws, message):
+        ws.send(threading.current_thread().name)
+
+
+echo = websocket.Handler(Echo())
+
+
+async def application(scope, receive, send):
+    if scope["type"] == "websocket":
+        return await echo(scope, receive, send)
+
+    if scope["type"] != "http":
+        return
+
+    return scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy)
+"""
+
+
+def test_an_asgi_release_hands_requests_to_its_threads(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text(ASGI_RELEASE)
+    (project / "muru.toml").write_text(
+        'entrypoint = "app:application"\nhandoff = "wsgi"\nthreads = 2\n'
+    )
+    instance = support.start(str(project), workers=None, threads=None, chdir=None)
+
+    try:
+        response = instance.post("/anything", b"payload")
+        assert response.status == 200, response.body
+        assert response.body.startswith(b"wsgi muru-app-")
+        assert response.body.endswith(b" payload")
+
+        # The WebSocket adapter in an ASGI worker runs on the loop's pool
+        # for synchronous code.
+
+        with connect(f"ws://127.0.0.1:{instance.port}/ws", open_timeout=10) as socket_:
+            socket_.send("which")
+            assert str(socket_.recv(timeout=10)).startswith("muru-sync")
+    finally:
+        instance.stop()
+
+    assert "with 1 worker" in instance.log()

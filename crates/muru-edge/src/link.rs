@@ -731,10 +731,13 @@ impl LinkPool {
 /// How many requests a worker takes at once: on its threads when it has
 /// them, otherwise on its event loop.
 fn capacity(hello: &pb::Hello) -> usize {
-    let declared = if hello.slots > 0 {
-        hello.slots
-    } else {
+    // The default mount's side: an ASGI worker that hands requests to WSGI
+    // declares threads as well, which are the other side (section 6.14).
+
+    let declared = if hello.worker_type == "asgi" || hello.slots == 0 {
         hello.async_slots
+    } else {
+        hello.slots
     };
 
     usize::try_from(declared).unwrap_or(usize::MAX).max(1)
