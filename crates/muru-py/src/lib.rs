@@ -240,6 +240,22 @@ fn serve(
 pub(crate) static SERVING: std::sync::Mutex<std::sync::Weak<pool::Shared>> =
     std::sync::Mutex::new(std::sync::Weak::new());
 
+/// Run `job` with no arguments on the worker's shared application thread
+/// pool, in a fresh context as a request is (section 6.14: the WebSocket
+/// adapter's callbacks). Returns False when no worker is serving here.
+#[pyfunction]
+fn submit(job: Py<PyAny>) -> bool {
+    let Some(shared) = SERVING.lock().expect("serving poisoned").upgrade() else {
+        return false;
+    };
+
+    shared.pool.spawn(Box::new(move |py| {
+        if let Err(error) = job.bind(py).call0() {
+            wsgi::report(py, &error);
+        }
+    }))
+}
+
 /// Section 7.6: the event loop's heartbeat, which the loop stall
 /// watchdog waits for.
 #[pyfunction]
@@ -302,6 +318,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
     m.add_function(wrap_pyfunction!(requests, m)?)?;
     m.add_function(wrap_pyfunction!(loop_beat, m)?)?;
+    m.add_function(wrap_pyfunction!(submit, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_callback, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_stats, m)?)?;
     m.add_class::<wsgi::Input>()?;

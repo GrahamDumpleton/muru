@@ -12,11 +12,13 @@ import asyncio
 import contextvars
 import json
 import os
+import threading
 from collections.abc import Callable, Iterable
 from typing import Any
 
 import muru
 from muru import HandoffNotEnabled
+from muru.asgi import websocket
 
 request_value: contextvars.ContextVar[str] = contextvars.ContextVar("request_value", default="")
 
@@ -106,6 +108,48 @@ async def with_lifespan(
     await send({"type": "http.response.body", "body": json.dumps(details).encode()})
 
 
+speaker: contextvars.ContextVar[str] = contextvars.ContextVar("speaker", default="nobody")
+
+
+class Chat:
+    """Broadcast each message to every socket, prefixed with its sender's name."""
+
+    def __init__(self) -> None:
+        self.sockets: set[websocket.Socket] = set()
+        self.joined = 0
+
+    def on_connect(self, ws: websocket.Socket) -> None:
+        self.joined += 1
+        speaker.set(f"user{self.joined}")
+        self.sockets.add(ws)
+        ws.send(f"welcome {speaker.get()} on {ws.subprotocol}")
+
+    def on_receive(self, ws: websocket.Socket, message: str | bytes) -> None:
+        if message == "boom":
+            raise ValueError("boom")
+
+        if message == "thread":
+            ws.send(threading.current_thread().name)
+            return
+
+        if message == "bye":
+            ws.close(4001, "asked to")
+            return
+
+        for peer in list(self.sockets):
+            try:
+                peer.send(f"{speaker.get()}: {message!s}")
+            except websocket.ConnectionClosed:
+                self.sockets.discard(peer)
+
+    def on_disconnect(self, ws: websocket.Socket, code: int, reason: str) -> None:
+        self.sockets.discard(ws)
+        print(f"chat: {speaker.get()} disconnected with {code} {reason}", flush=True)
+
+
+chat = websocket.Handler(Chat(), subprotocol="chat")
+
+
 async def answer() -> int:
     return 42
 
@@ -125,6 +169,9 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
         bridge.scope["state"]["greeting"] = "hello from wsgi"
         return bridge.handoff(echo)
+
+    if path == "/chat":
+        return bridge.handoff(chat)
 
     if path == "/ws-decline":
         return respond(start_response, "403 Forbidden", f"declined {bridge.is_websocket}\n")

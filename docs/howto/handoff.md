@@ -4,8 +4,9 @@
 :class: note
 
 Handing a WSGI request, or a WebSocket upgrade, to an ASGI application
-with `handoff = "asgi"`, the lifespan of an application requests are
-handed to, `muru.loop()` and `muru.request_id()`.
+with `handoff = "asgi"`, the WebSocket adapter, the lifespan of an
+application requests are handed to, `muru.loop()` and
+`muru.request_id()`.
 ```
 
 [Mounts](mounts.md) choose between a WSGI and an ASGI application by
@@ -76,6 +77,80 @@ body as the answer to its upgrade.
 An HTTP request can be handed off too, after the WSGI code has read some
 of its body: the application receives the rest, as it arrives. The
 request's context variables are copied to the application's task.
+
+## WebSockets as callbacks
+
+`muru.asgi.websocket.Handler` is an ASGI application that runs a
+WebSocket's events as calls on an object, on the worker's application
+threads, so a WSGI application handles WebSockets in ordinary
+synchronous code:
+
+```python
+from muru.asgi import websocket
+
+
+class Chat:
+    def __init__(self):
+        self.sockets = set()
+
+    def on_connect(self, ws):
+        self.sockets.add(ws)
+
+    def on_receive(self, ws, message):
+        for peer in list(self.sockets):
+            try:
+                peer.send(message)
+            except websocket.ConnectionClosed:
+                self.sockets.discard(peer)
+
+    def on_disconnect(self, ws, code, reason):
+        self.sockets.discard(ws)
+
+
+chat = websocket.Handler(Chat(), subprotocol="chat")
+
+
+def application(environ, start_response):
+    bridge = environ["muru.wsgi_to_asgi"]
+
+    if not bridge.is_websocket:
+        start_response("426 Upgrade Required", [("Content-Type", "text/plain")])
+        return [b"websocket required\n"]
+
+    return bridge.handoff(chat)
+```
+
+`Handler(handler, subprotocol=None, headers=None, executor=None)`
+accepts the socket, with `subprotocol` when the client offered it and
+`headers` added to the response, then calls:
+
+| Method | When |
+| --- | --- |
+| `on_connect(ws)` | Once the socket is accepted |
+| `on_receive(ws, message)` | For each message: a `str` for text, `bytes` for binary |
+| `on_disconnect(ws, code, reason)` | When the socket has closed, from either end |
+
+Each is optional. The calls for one socket run one at a time and in
+order, and the next message is not delivered until the current call
+returns, so a call must not wait for another message on its own socket.
+Different sockets run at once. Every call for a socket runs in the same
+context, so a context variable set in `on_connect` is seen in the calls
+after it, whichever thread runs them. An open socket that is waiting
+for a message holds no thread.
+
+The `ws` object passed to each call has:
+
+| Attribute | Meaning |
+| --- | --- |
+| `send(data)` | Send a text message for a `str`, binary for `bytes`. Callable from any thread, so a call on one socket can send to others; it waits only while the client is slow to read. Raises `websocket.ConnectionClosed` once the socket has closed |
+| `close(code=1000, reason="")` | Close the socket |
+| `subprotocol` | The subprotocol it was accepted with, or `None` |
+| `closed` | Whether it has closed |
+
+An exception from a call is logged and closes the socket with 1011,
+after which `on_disconnect` is called. When a worker stops, its open
+sockets are closed with 1001. The adapter runs under any ASGI server
+too, on a thread pool of its own, or on `executor` when one is given.
 
 ## Applications with a lifespan
 

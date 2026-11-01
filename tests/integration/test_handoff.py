@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from support import server as support
 from support.daemon import Daemon, start_daemon
-from websockets.exceptions import InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import connect
 
 HANDOFF = support.ROOT / "tests" / "fixtures" / "projects" / "handoff"
@@ -267,3 +267,56 @@ def test_a_registered_application_shuts_down_with_its_worker() -> None:
         instance.stop()
 
     assert "with_lifespan: shutdown" in instance.log()
+
+
+def test_the_websocket_adapter_runs_callbacks_on_threads(server: support.Server) -> None:
+    url = f"ws://127.0.0.1:{server.port}/chat"
+    server.mark_log()
+
+    with (
+        connect(url, open_timeout=10, subprotocols=["chat"]) as first,  # type: ignore[list-item]
+        connect(url, open_timeout=10, subprotocols=["chat"]) as second,  # type: ignore[list-item]
+    ):
+        assert first.subprotocol == "chat"
+        welcome = str(first.recv(timeout=10))
+        assert welcome.startswith("welcome user") and welcome.endswith(" on chat")
+        name = welcome.split()[1]
+        second.recv(timeout=10)
+
+        # A value set in on_connect is there in later calls, and a send
+        # from one socket's callback reaches the others.
+
+        first.send("hello")
+        assert first.recv(timeout=10) == f"{name}: hello"
+        assert second.recv(timeout=10) == f"{name}: hello"
+
+        # The callbacks run on the worker's application threads.
+
+        first.send("thread")
+        assert not str(first.recv(timeout=10)).startswith("muru-websocket")
+
+    assert server.wait_for_log(f"chat: {name} disconnected with 1000")
+
+
+def test_the_websocket_adapter_closes_on_an_exception(server: support.Server) -> None:
+    server.mark_log()
+
+    with connect(f"ws://127.0.0.1:{server.port}/chat", open_timeout=10) as socket_:
+        socket_.recv(timeout=10)
+        socket_.send("boom")
+
+        with pytest.raises(ConnectionClosed) as closed:
+            socket_.recv(timeout=10)
+
+    assert closed.value.rcvd is not None and closed.value.rcvd.code == 1011
+    assert server.wait_for_log("ValueError: boom")
+    assert server.wait_for_log("disconnected with 1011 internal error")
+
+    with connect(f"ws://127.0.0.1:{server.port}/chat", open_timeout=10) as socket_:
+        socket_.recv(timeout=10)
+        socket_.send("bye")
+
+        with pytest.raises(ConnectionClosed) as closed:
+            socket_.recv(timeout=10)
+
+    assert closed.value.rcvd is not None and closed.value.rcvd.code == 4001

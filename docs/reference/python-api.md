@@ -110,6 +110,13 @@ Runs the lifespan of an ASGI application that requests are
 [handed to](../howto/handoff.md#applications-with-a-lifespan) but no
 mount serves, and returns the application.
 
+## `muru.asgi.websocket`
+
+`Handler`, `Socket` and `ConnectionClosed`: the WebSocket adapter, an ASGI
+application that runs a socket's events as calls on an object, on
+application threads (see [WebSockets as
+callbacks](../howto/handoff.md#websockets-as-callbacks)).
+
 ## `muru.HandoffNotEnabled`
 
 The `RuntimeError` subclass `handoff()` raises when the request's mount
