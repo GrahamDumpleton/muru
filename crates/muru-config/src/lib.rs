@@ -528,15 +528,27 @@ impl MountThreads {
 pub fn check_mount_threads(
     threads: Option<MountThreads>,
     interface: Option<Interface>,
+    handoff: Option<Handoff>,
 ) -> Result<(), String> {
     let Some(threads) = threads else {
         return Ok(());
     };
 
+    // Section 6.14: an ASGI mount's threads run the requests it hands to
+    // WSGI.
+
+    let hands_to_wsgi = handoff == Some(Handoff::Wsgi);
+
     match (threads, interface) {
-        (_, Some(Interface::Asgi)) => {
-            Err("threads: an ASGI mount runs on the event loop and has no threads".to_owned())
-        }
+        (MountThreads::Borrowing(_), Some(Interface::Asgi)) if hands_to_wsgi => Err(
+            "threads: an ASGI mount's threads are a fixed pool, a number, not reserved and max"
+                .to_owned(),
+        ),
+        (_, Some(Interface::Asgi)) if !hands_to_wsgi => Err(
+            "threads: an ASGI mount runs on the event loop and has threads only for the \
+             requests it hands to WSGI, with handoff = 'wsgi'"
+                .to_owned(),
+        ),
         (MountThreads::Borrowing(_), Some(Interface::Grpc)) => Err(
             "threads: a gRPC mount's threads are a fixed pool, a number, not reserved and max"
                 .to_owned(),
@@ -5151,17 +5163,24 @@ traffic = { classes = { ai_crawler = 'r1' } }"
         assert_eq!((fixed.reserved(), fixed.max()), (4, 4));
         assert_eq!((borrowing.reserved(), borrowing.max()), (2, 6));
         assert_eq!(borrowing.describe(), "{ reserved = 2, max = 6 }");
-        assert!(check_mount_threads(Some(borrowing), Some(Interface::Wsgi)).is_ok());
-        assert!(check_mount_threads(Some(fixed), Some(Interface::Grpc)).is_ok());
-        assert!(check_mount_threads(Some(borrowing), Some(Interface::Grpc)).is_err());
-        assert!(check_mount_threads(Some(fixed), Some(Interface::Asgi)).is_err());
-        assert!(check_mount_threads(Some(MountThreads::Fixed(0)), None).is_err());
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Wsgi), None).is_ok());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Grpc), None).is_ok());
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Grpc), None).is_err());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Asgi), None).is_err());
+        assert!(
+            check_mount_threads(Some(fixed), Some(Interface::Asgi), Some(Handoff::Wsgi)).is_ok()
+        );
+        assert!(
+            check_mount_threads(Some(borrowing), Some(Interface::Asgi), Some(Handoff::Wsgi))
+                .is_err()
+        );
+        assert!(check_mount_threads(Some(MountThreads::Fixed(0)), None, None).is_err());
 
         let reserving_none = MountThreads::Borrowing(BorrowedThreads {
             reserved: 0,
             max: 2,
         });
-        assert!(check_mount_threads(Some(reserving_none), None).is_ok());
+        assert!(check_mount_threads(Some(reserving_none), None, None).is_ok());
         assert!(
             parse_muru_toml("[mounts.x]\npath = '/x'\nentrypoint = 'a:b'\nthreads = { min = 1 }\n")
                 .is_err()

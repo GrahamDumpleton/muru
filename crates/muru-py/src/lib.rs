@@ -165,8 +165,11 @@ fn serve(
             )));
         }
 
+        // A WSGI mount's reserved threads, or the threads an ASGI mount's
+        // handoffs to WSGI run on (section 6.14), are a pool of its own.
+
         let pool = match threads {
-            Some((reserved, _)) if reserved > 0 && runner.is_none() => Some(Arc::new(
+            Some((reserved, _)) if reserved > 0 && (runner.is_none() || handoff) => Some(Arc::new(
                 pool::Pool::start(&format!("muru-app-{name}"), reserved)
                     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
             )),
@@ -327,6 +330,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<asgi::Channel>()?;
     m.add_class::<handoff::WsgiToAsgi>()?;
     m.add_class::<handoff::HandedOff>()?;
+    m.add_class::<handoff::AsgiToWsgi>()?;
     m.add_function(wrap_pyfunction!(asgi::resolve_future, m)?)?;
     Ok(())
 }

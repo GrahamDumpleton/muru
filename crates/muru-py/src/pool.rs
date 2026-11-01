@@ -440,28 +440,38 @@ impl Shared {
         names
     }
 
-    /// The mounts' own threads and limits, for HELLO (section 6.7).
+    /// The mounts' own threads and limits, for HELLO (section 6.7). An
+    /// ASGI mount's threads are those its handoffs to WSGI run on
+    /// (section 6.14).
     pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
         let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
 
         self.mounts
             .iter()
-            .filter_map(|(name, mount)| match (mount.threads, mount.limits) {
-                (Some((reserved, max)), _) => Some(muru_proto::worker::v1::MountPool {
+            .filter_map(|(name, mount)| {
+                let handoff_threads = match (mount.handoff, &mount.runner, mount.threads) {
+                    (true, Some(_), Some((threads, _))) => threads,
+                    _ => 0,
+                };
+
+                let own = mount.threads.filter(|_| handoff_threads == 0);
+
+                let (reserved, max, connections) = match (own, mount.limits) {
+                    (Some((reserved, max)), _) => (reserved, max, 0),
+                    (None, Some((concurrency, connections))) => {
+                        (concurrency, concurrency, connections)
+                    }
+                    (None, None) if handoff_threads > 0 => (0, 0, 0),
+                    (None, None) => return None,
+                };
+
+                Some(muru_proto::worker::v1::MountPool {
                     mount: name.clone(),
                     reserved: clamp(reserved),
                     max: clamp(max),
-                    connections: 0,
-                }),
-                (None, Some((concurrency, connections))) => {
-                    Some(muru_proto::worker::v1::MountPool {
-                        mount: name.clone(),
-                        reserved: clamp(concurrency),
-                        max: clamp(concurrency),
-                        connections: clamp(connections),
-                    })
-                }
-                (None, None) => None,
+                    connections: clamp(connections),
+                    handoff_threads: clamp(handoff_threads),
+                })
             })
             .collect()
     }
@@ -743,6 +753,20 @@ impl Shared {
         info.thread = None;
         info.native = None;
         info.channel = Some(channel);
+    }
+
+    /// An ASGI request has been handed to the thread pool (section 6.14):
+    /// the soft timeout interrupts the thread that picks it up, not the
+    /// task.
+    pub fn request_handed_to_thread(&self, id: u64) {
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .get_mut(&id)
+        {
+            info.channel = None;
+        }
     }
 
     /// Note which Python thread serves a request: the calling one.

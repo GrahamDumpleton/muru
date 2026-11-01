@@ -45,8 +45,12 @@ pub mod kind {
     /// whose descriptor is attached to the frame (protobuf `FileHint`),
     /// worker to edge (section 5.7). The END flag ends the body with it.
     pub const FILE: u8 = 11;
-    // Kinds 10 and 12 are reserved for INFORMATIONAL and DETACH (design
-    // specification section 5.2).
+    /// The request was handed to the other side of the worker (protobuf
+    /// `Detach`), worker to edge, before any of the response (section
+    /// 6.14).
+    pub const DETACH: u8 = 12;
+    // Kind 10 is reserved for INFORMATIONAL (design specification
+    // section 5.2).
 }
 
 /// Frame flags.

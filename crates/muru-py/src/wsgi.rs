@@ -103,10 +103,14 @@ pub enum Outgoing {
         /// The worker closed it because it is stopping.
         draining: bool,
     },
-    /// The request was handed to the event loop (section 6.14): what
-    /// follows comes from the ASGI application, and the link task feeds
-    /// it the rest of the request.
-    Handoff,
+    /// The request was handed to the other side of the worker (section
+    /// 6.14): the event loop when `to_loop`, else the thread pool. What
+    /// follows comes from the application it was handed to, and the edge
+    /// is told with a DETACH frame.
+    Handoff {
+        /// Handed to the event loop rather than to the thread pool.
+        to_loop: bool,
+    },
     /// The request is over: the application returned and its iterable was
     /// closed. Sent explicitly, because the `start_response` object that
     /// also holds a sender can outlive the request when a framework keeps
@@ -117,16 +121,16 @@ pub enum Outgoing {
 
 /// Sends output to the coalescing task, detaching from the interpreter only
 /// when the channel is full.
-struct Sink {
-    tx: mpsc::Sender<Outgoing>,
-    interrupt: Arc<Interrupt>,
+pub(crate) struct Sink {
+    pub(crate) tx: mpsc::Sender<Outgoing>,
+    pub(crate) interrupt: Arc<Interrupt>,
 }
 
 impl Sink {
     /// Send an item, waiting for room. An interrupted wait drops the item
     /// and reports success, so the thread returns to Python, where the
     /// timeout exception is waiting.
-    fn send(&self, py: Python<'_>, item: Outgoing) -> bool {
+    pub(crate) fn send(&self, py: Python<'_>, item: Outgoing) -> bool {
         match self.tx.try_send(item) {
             Ok(()) => true,
             Err(TrySendError::Full(item)) => {
@@ -1178,6 +1182,12 @@ fn run_app<'py>(
         interrupt,
     );
     environ.set_item(intern!(py, "muru.wsgi_to_asgi"), Bound::new(py, bridge)?)?;
+
+    // Section 6.14: a request handed from ASGI brings its scope's state.
+
+    if let Some(state) = &handoff.state {
+        environ.set_item(intern!(py, "muru.state"), state.bind(py))?;
+    }
 
     // Section 6.9: muru.request_id() reads a context variable, set in
     // the context the request runs in, which a handoff copies.

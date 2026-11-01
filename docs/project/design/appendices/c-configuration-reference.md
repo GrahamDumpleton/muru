@@ -55,7 +55,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | tools.uv, tools.uv_version, tools.uv_config, tools.python_downloads, tools.python_install_dir, tools.offline, tools.wheel_dir | daemon | the lookup order, the tested range, none, automatic, STATE/python, false, none | 8.4 |
 | preload | release | auto (preload with the import check, falling back to per-worker imports) | 6.1, 6.2 |
 | processes, threads, sync_threads | release, group, mount | 2, 8 for WSGI, 1 loop for ASGI | 6.4 |
-| threads on a mount: a number for a pool of its own, or `{ reserved, max }` to borrow the shared pool's threads beyond the reserved ones | mount (WSGI, and a number on gRPC) | the worker's shared pool | 6.7, 6.13 |
+| threads on a mount: a number for a pool of its own, or `{ reserved, max }` to borrow the shared pool's threads beyond the reserved ones | mount (WSGI, and a number on gRPC and on ASGI with handoff = 'wsgi') | the worker's shared pool | 6.7, 6.13, 6.14 |
 | hooks | release | none | 6.3 |
 | kind, profile, command, cwd, bind, instances, readiness (path, timeout), stop_signal | release | workers, none, none, source, unix, 1, none and 60s, the profile's | 9.9 |
 | paths, mounts, optional | group | none, all mounts, false | 7.1 |

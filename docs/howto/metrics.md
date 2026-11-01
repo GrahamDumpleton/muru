@@ -61,6 +61,7 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_websocket_duration_seconds` | histogram | app, release, group | how long WebSockets stayed open, in buckets from a second to a day |
 | `muru_rate_limited_total` | counter | limit, client_class, action | requests a [rate limit](client-classes.md) refused (`rejected`), held (`delayed`) or only counted (`logged`) |
 | `muru_upload_spool_bytes` | gauge | app | bytes the edge holds for each application's [uploads](uploads.md) in progress |
+| `muru_handoffs_total` | counter | app, release, group, to | requests the worker [handed](handoff.md) from WSGI to ASGI (`to` is `asgi`) or from ASGI to WSGI (`wsgi`); such a request is marked `handoff` in the [access log](logging.md) |
 | `muru_auth_requests_total` | counter | result | [authentication sub-requests](auth-subrequests.md) by result: `allowed`, `cached`, `denied` or `unavailable` |
 | `muru_queue_depth` | gauge | app, release, group | requests waiting for a slot |
 | `muru_slots_busy` | gauge | app, release, group | slots handling a request or holding an open WebSocket |

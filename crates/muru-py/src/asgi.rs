@@ -64,6 +64,14 @@ struct Inbox {
     closed: bool,
     /// How a WebSocket ended, for the disconnect message.
     close: (u16, String),
+    /// The request was handed to WSGI (section 6.14): the body goes to
+    /// `forward` from now on, which wsgi.input reads, until its end drops
+    /// it.
+    handed_off: bool,
+    forward: Option<mpsc::Sender<Bytes>>,
+    /// The last of the body has been delivered, to the queue or the
+    /// application, so a handoff passes nothing more on.
+    body_ended: bool,
 }
 
 /// What the application has sent so far.
@@ -115,6 +123,9 @@ pub struct Channel {
     task: Mutex<Option<Py<PyAny>>>,
     /// The soft timeout has cancelled the task.
     timed_out: AtomicBool,
+    /// Set when the client goes away, for the WSGI callable a request
+    /// is handed to (section 6.14).
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Channel {
@@ -135,6 +146,9 @@ impl Channel {
                 waiter: None,
                 closed: false,
                 close: (1005, String::new()),
+                handed_off: false,
+                forward: None,
+                body_ended: false,
             }),
             state: Mutex::new(SendState::default()),
             tx,
@@ -152,7 +166,75 @@ impl Channel {
             request,
             task: Mutex::new(None),
             timed_out: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The request's output stream.
+    pub(crate) fn sender(&self) -> mpsc::Sender<Outgoing> {
+        self.tx.clone()
+    }
+
+    /// Whether the request was handed to WSGI.
+    pub(crate) fn handed_to_wsgi(&self) -> bool {
+        self.inbox.lock().expect("inbox poisoned").handed_off
+    }
+
+    /// Whether anything of the response has been sent.
+    pub(crate) fn response_started(&self) -> bool {
+        self.state.lock().expect("send state poisoned").head_sent
+    }
+
+    /// Hand the request body to WSGI (section 6.14): what the application
+    /// has not received goes to the returned channel, which wsgi.input
+    /// reads, followed by the rest as it arrives. Returns the channel and
+    /// the flag set when the client goes away.
+    pub(crate) fn hand_to_wsgi(&self) -> (mpsc::Receiver<Bytes>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel(INBOX_CAPACITY + 1);
+        let mut inbox = self.inbox.lock().expect("inbox poisoned");
+        let mut drained = 0;
+        let mut ended = inbox.closed || inbox.body_ended;
+
+        while let Some(message) = inbox.queue.pop_front() {
+            drained += 1;
+
+            if let Message::Body { data, more } = message {
+                if !data.is_empty() {
+                    let _ = tx.try_send(data);
+                }
+
+                ended |= !more;
+            }
+        }
+
+        inbox.handed_off = true;
+        inbox.forward = (!ended).then_some(tx);
+
+        if inbox.closed {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+
+        drop(inbox);
+        self.permits.add_permits(drained);
+        (rx, Arc::clone(&self.cancelled))
+    }
+
+    /// The channel the body goes to after a handoff, while it is open.
+    fn forward_sender(&self) -> Option<mpsc::Sender<Bytes>> {
+        self.inbox.lock().expect("inbox poisoned").forward.clone()
+    }
+
+    /// Pass a body chunk to the WSGI callable the request was handed to.
+    async fn forward(&self, tx: mpsc::Sender<Bytes>, data: Bytes, more: bool) -> bool {
+        if !data.is_empty() {
+            let _ = tx.send(data).await;
+        }
+
+        if !more {
+            self.inbox.lock().expect("inbox poisoned").forward = None;
+        }
+
+        true
     }
 
     /// Fail the request because the WSGI code that handed it off raised
@@ -217,6 +299,10 @@ impl Channel {
     /// Returns false once the response is complete, when nothing more is
     /// delivered and the caller only drains the link.
     pub async fn deliver(&self, data: Bytes, more: bool) -> bool {
+        if let Some(tx) = self.forward_sender() {
+            return self.forward(tx, data, more).await;
+        }
+
         // Wait for room, unless the response ends first.
 
         let permit = tokio::select! {
@@ -232,10 +318,19 @@ impl Channel {
             return false;
         };
 
-        // The permit is returned by receive() when the chunk leaves the queue.
+        // The permit is returned by receive() when the chunk leaves the
+        // queue. A handoff to WSGI meanwhile takes the chunk instead.
 
         permit.forget();
-        self.push(Message::Body { data, more });
+
+        if let Some(Message::Body { data, more }) = self.push(Message::Body { data, more }) {
+            self.permits.add_permits(1);
+
+            if let Some(tx) = self.forward_sender() {
+                return self.forward(tx, data, more).await;
+            }
+        }
+
         true
     }
 
@@ -282,6 +377,11 @@ impl Channel {
             return;
         }
 
+        if inbox.handed_off {
+            self.cancelled.store(true, Ordering::Relaxed);
+            inbox.forward = None;
+        }
+
         inbox.closed = true;
         inbox.close = (code, reason.to_owned());
 
@@ -304,8 +404,17 @@ impl Channel {
     }
 
     /// Queue a message, or hand it straight to a waiting `receive()`.
-    fn push(&self, message: Message) {
+    /// Gives the message back when the request has been handed to WSGI.
+    fn push(&self, message: Message) -> Option<Message> {
         let mut inbox = self.inbox.lock().expect("inbox poisoned");
+
+        if inbox.handed_off {
+            return Some(message);
+        }
+
+        if let Message::Body { more: false, .. } = message {
+            inbox.body_ended = true;
+        }
 
         match inbox.waiter.take() {
             Some(waiter) => {
@@ -319,6 +428,8 @@ impl Channel {
             }
             None => inbox.queue.push_back(message),
         }
+
+        None
     }
 
     /// Complete a waiting future on the loop's thread.
@@ -686,6 +797,12 @@ impl Channel {
     /// chunk, then `http.disconnect` once the client has gone or the
     /// response is complete.
     fn receive(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.handed_to_wsgi() {
+            return Err(PyRuntimeError::new_err(
+                "receive() called after the request was handed to WSGI",
+            ));
+        }
+
         // The application is reading: the client may send the body it is
         // holding back (section 5.5).
 
@@ -724,6 +841,12 @@ impl Channel {
     /// Take one response message. Returns None when it was queued, or a
     /// future to await when the writer is behind.
     fn send(&self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Option<Py<PyAny>>> {
+        if self.handed_to_wsgi() {
+            return Err(PyRuntimeError::new_err(
+                "send() called after the request was handed to WSGI",
+            ));
+        }
+
         let kind = message
             .get_item("type")?
             .ok_or_else(|| PyTypeError::new_err("ASGI message has no type"))?
@@ -887,6 +1010,12 @@ impl Channel {
     /// started, or never finished, is an error the edge reports; a
     /// WebSocket left open is closed, and one never accepted is declined.
     fn finish(&self, py: Python<'_>) {
+        // Section 6.14: a request handed to WSGI is finished there.
+
+        if self.handed_to_wsgi() {
+            return;
+        }
+
         let state = self.state.lock().expect("send state poisoned");
         let (head_sent, body_ended) = (state.head_sent, state.body_ended);
         let (accepted, closed) = (state.accepted, state.closed);
@@ -926,6 +1055,10 @@ impl Channel {
     /// shown by the edge in development mode when no output had reached
     /// it.
     fn fail(&self, py: Python<'_>, detail: String) {
+        if self.handed_to_wsgi() {
+            return;
+        }
+
         let state = self.state.lock().expect("send state poisoned");
         let (body_ended, accepted, closed) = (state.body_ended, state.accepted, state.closed);
         drop(state);
@@ -1420,18 +1553,64 @@ pub(crate) fn build_scope<'py>(
     Ok(scope)
 }
 
+/// What a request's scope offers for handing it to WSGI (section 6.14).
+pub struct Offer {
+    /// The request's mount has `handoff = "wsgi"`.
+    pub enabled: bool,
+    /// The mount's own threads for handoffs, else the shared pool's.
+    pub pool: Option<Arc<crate::pool::Pool>>,
+    /// The soft timeout's way into the bridge waits of the WSGI side.
+    pub interrupt: Arc<crate::pool::Interrupt>,
+}
+
+/// Put the `asgi_to_wsgi` object among the scope's Muru extensions.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
+fn add_handoff(
+    py: Python<'_>,
+    scope: &Bound<'_, PyDict>,
+    shared: &Arc<Shared>,
+    head: &Arc<pb::RequestHead>,
+    uploads: &[RawFd],
+    channel: &Bound<'_, Channel>,
+    request: u64,
+    offer: Offer,
+) -> PyResult<()> {
+    let state = scope
+        .get_item("state")?
+        .ok_or_else(|| PyRuntimeError::new_err("the scope has no state"))?
+        .cast_into::<PyDict>()?;
+    let bridge = crate::handoff::AsgiToWsgi::new(
+        offer.enabled,
+        Arc::clone(head),
+        uploads,
+        state.unbind(),
+        channel.clone().unbind(),
+        Arc::clone(shared),
+        request,
+        offer.interrupt,
+        offer.pool,
+    );
+    let muru = scope
+        .get_item("extensions")?
+        .and_then(|extensions| extensions.get_item("muru").ok())
+        .ok_or_else(|| PyRuntimeError::new_err("the scope has no Muru extensions"))?;
+    muru.set_item("asgi_to_wsgi", Bound::new(py, bridge)?)
+}
+
 /// Start a request on the event loop: build its scope and channel and
 /// schedule the runner. `request` is the request's id in the shared
 /// state. Fails when the loop is gone, which means the worker is
 /// stopping.
+#[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
 pub fn start(
     shared: &Arc<Shared>,
     asgi: &Asgi,
     runner: &Py<PyAny>,
-    head: &pb::RequestHead,
+    head: &Arc<pb::RequestHead>,
     uploads: &[RawFd],
     tx: mpsc::Sender<Outgoing>,
     request: u64,
+    offer: Offer,
 ) -> Result<Py<Channel>, String> {
     let ready = std::time::Instant::now();
 
@@ -1449,6 +1628,14 @@ pub fn start(
         let channel = Bound::new(py, channel).map_err(|error| error.to_string())?;
         shared.request_channel(request, channel.clone().unbind());
         let scope = build_scope(py, head, uploads).map_err(|error| error.to_string())?;
+
+        // Section 6.14: every http scope can hand its request to WSGI, and
+        // says so with an error when the mount does not enable it.
+
+        if head.scope == pb::Scope::Http as i32 {
+            add_handoff(py, &scope, shared, head, uploads, &channel, request, offer)
+                .map_err(|error| error.to_string())?;
+        }
 
         asgi.event_loop
             .bind(py)

@@ -821,7 +821,7 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
     let hello = pb::Hello {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
         worker_type: if default_is_asgi { "asgi" } else { "wsgi" }.to_owned(),
-        slots: if default_is_asgi {
+        slots: if default_is_asgi && !shared.handoff {
             0
         } else {
             u32::try_from(shared.threads).unwrap_or(u32::MAX)
@@ -968,7 +968,7 @@ async fn handle_request(
         return Ok(None);
     };
 
-    if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner) {
+    if let (Some(asgi), Some(runner)) = (&shared.asgi, mount.runner.clone()) {
         return handle_asgi_request(
             reader,
             writer,
@@ -978,6 +978,7 @@ async fn handle_request(
             shared,
             asgi,
             runner,
+            &mount,
         )
         .await;
     }
@@ -1008,6 +1009,7 @@ async fn handle_request(
         slot: Arc::clone(&slot),
         runtime: tokio::runtime::Handle::current(),
         cancelled: Arc::clone(&cancelled),
+        state: None,
     };
     let worker_shared = Arc::clone(shared);
     let queued = pool.spawn(Box::new(move |py| {
@@ -1047,8 +1049,9 @@ async fn handle_request(
 
     if websocket {
         match out_rx.recv().await {
-            Some(Outgoing::Handoff) => {
+            Some(Outgoing::Handoff { .. }) => {
                 let channel = slot.channel().expect("a handoff sets the channel first");
+                write_detach(writer, true).await?;
                 return handle_websocket(
                     reader, writer, out_rx, shared, channel, &done, request_id,
                 )
@@ -1183,20 +1186,30 @@ async fn handle_asgi_request(
     shared: &Arc<Shared>,
     asgi: &asgi::Asgi,
     runner: Arc<Py<PyAny>>,
+    mount: &crate::pool::Mount,
 ) -> io::Result<Option<frame::Frame>> {
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(32);
     let done = tokio::sync::Notify::new();
 
     // The task starts on the loop now; the channel is how the two sides
     // of this function reach it. The uploads stay open until this
-    // function returns, when the request has ended.
+    // function returns, when the request has ended, which for a request
+    // handed to WSGI is after its WSGI response.
 
-    let (request_id, _interrupt) = shared.request_started(&head);
+    let head = Arc::new(head);
+    let (request_id, interrupt) = shared.request_started(&head);
     shared.request_outgoing(request_id, out_tx.clone());
     let fds: Vec<RawFd> = uploads.iter().map(AsRawFd::as_raw_fd).collect();
     let _uploads = uploads;
+    let offer = asgi::Offer {
+        enabled: mount.handoff,
+        pool: mount.pool.clone(),
+        interrupt,
+    };
 
-    let channel = match asgi::start(shared, asgi, &runner, &head, &fds, out_tx, request_id) {
+    let channel = match asgi::start(
+        shared, asgi, &runner, &head, &fds, out_tx, request_id, offer,
+    ) {
         Ok(channel) => channel,
         Err(error) => {
             shared.request_finished(request_id);
@@ -1601,9 +1614,11 @@ async fn write_response_after(
             (None, None) => Some(rx.recv().await),
         };
 
-        // Section 6.14: the marker of a handoff carries nothing to write.
+        // Section 6.14: a handoff tells the edge which side the request
+        // is on now, before anything of the response.
 
-        if matches!(item, Some(Some(Outgoing::Handoff))) {
+        if let Some(Some(Outgoing::Handoff { to_loop })) = item {
+            write_detach(writer, to_loop).await?;
             continue;
         }
 
@@ -1820,7 +1835,7 @@ async fn write_response_after(
                 deadline = None;
             }
             Some(Some(Outgoing::Finished)) => unreachable!("mapped to the end of output above"),
-            Some(Some(Outgoing::Handoff)) => unreachable!("skipped above"),
+            Some(Some(Outgoing::Handoff { .. })) => unreachable!("written above"),
             Some(Some(Outgoing::Continue)) => {
                 // The application is reading the body. The edge may pass
                 // that on as 100 Continue (section 5.5); after the response
@@ -1893,6 +1908,20 @@ async fn write_response_after(
 }
 
 /// End a WebSocket from the worker's side (section 5.6).
+/// Tell the edge a request moved to the event loop, or to the thread
+/// pool (section 6.14).
+async fn write_detach(writer: &mut Writer, to_loop: bool) -> io::Result<()> {
+    let target = if to_loop {
+        pb::detach::Target::Loop
+    } else {
+        pb::detach::Target::Threads
+    };
+    let detach = pb::Detach {
+        target: target as i32,
+    };
+    frame::write(writer, kind::DETACH, 0, detach.encode_to_vec().into()).await
+}
+
 async fn write_close(
     writer: &mut Writer,
     code: u16,

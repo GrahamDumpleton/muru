@@ -117,7 +117,8 @@ mount can run more than one request at once.
 
 On a [gRPC mount](grpc.md), `threads` is a number: the threads its
 synchronous handlers run on. An ASGI mount runs on the event loop and
-takes no `threads`.
+takes `threads`, as a number, only with `handoff = "wsgi"`: the threads
+the requests it [hands to WSGI](handoff.md#from-asgi-to-wsgi) run on.
 
 ## Limits of an ASGI mount's own
 

@@ -83,20 +83,22 @@ Chosen option: a setting per direction, with the keys always present.
 
 - **Counting.** The edge keeps, for each worker, a count for its threads
   and one for its event loop, each bounded by what HELLO declares, and a
-  request is dispatched against the side its mount runs on. When it is
-  handed across, the worker sends DETACH and the edge moves the request
-  to the other count. A request is never refused or held at that point,
-  since it is already running: if the other count is full, the request
-  takes its place anyway and the count is over by one, and the edge
-  dispatches nothing new against that count until it is back within its
-  bound. A WebSocket accepted on the loop already gives its request
-  slot back, as it does today, so a WebSocket handoff needs no DETACH.
+  request is dispatched against its mount's own slots, else the side the
+  default mount runs on, as before. When it is handed across, the worker
+  sends DETACH, before anything of the response, and the edge moves the
+  request to the other count, or an ASGI mount's handoff threads. A
+  request is never refused or held at that point, since it is already
+  running: if the other count is full, the request takes its place
+  anyway and the count is over by one, and the next place that frees
+  there goes to it before any request not yet dispatched. A WebSocket
+  handed to ASGI then gives its slot back when it is accepted, as any
+  accepted socket does.
 
 - **Waiting for a thread.** A request handed to WSGI while every thread
-  is busy waits in the worker, in order, until a thread frees or its
-  deadline passes, when it is answered 503 with reason `queue_full`. The
-  count rule above keeps that wait to the handoffs made while the
-  threads were full. A request handed to ASGI never waits; the loop
+  is busy waits in the worker, in order, for a thread; one a thread takes
+  after its deadline is answered 503 with reason `queue_full`. The count
+  rule above keeps that wait to the handoffs made while the threads were
+  full. A request handed to ASGI never waits; the loop
   takes any number of tasks.
 
 - **Lifespan.** `muru.asgi.register(app)` never starts an event loop;

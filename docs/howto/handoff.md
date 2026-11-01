@@ -4,7 +4,8 @@
 :class: note
 
 Handing a WSGI request, or a WebSocket upgrade, to an ASGI application
-with `handoff = "asgi"`, the WebSocket adapter, the lifespan of an
+with `handoff = "asgi"`, and an ASGI request to a WSGI callable with
+`handoff = "wsgi"`; the WebSocket adapter, the lifespan of an
 application requests are handed to, `muru.loop()` and
 `muru.request_id()`.
 ```
@@ -36,6 +37,20 @@ A WSGI application hands requests to `"asgi"`. With the setting, the
 worker runs an event loop for the applications its requests are handed
 to, and WebSocket upgrades to that application's paths reach it as
 WebSockets. Without it, an upgrade is an ordinary request.
+
+An ASGI application hands requests to `"wsgi"`, and the setting gives
+the worker application threads to run them on: the release's `threads`
+for its own entrypoint, or, on a mount, `threads` as a number for a pool
+of the mount's own, else the release's threads:
+
+```toml
+[mounts.api]
+path = "/api"
+entrypoint = "shop.api:app"
+interface = "asgi"
+handoff = "wsgi"
+threads = 4
+```
 
 ## From WSGI to ASGI
 
@@ -195,6 +210,44 @@ def application(environ, start_response):
 `muru.request_id()` returns the id of the request being served, on
 either side of a handoff.
 
+## From ASGI to WSGI
+
+On an HTTP request, the scope's Muru extensions carry `asgi_to_wsgi`.
+Its `handoff(app)` continues the request as `app`, a WSGI callable, on an
+application thread, and returns `None`, so the coroutine hands off and
+returns in one statement:
+
+```python
+async def app(scope, receive, send):
+    if scope["type"] == "http" and scope["path"].startswith("/legacy/"):
+        return scope["extensions"]["muru"]["asgi_to_wsgi"].handoff(legacy_wsgi_app)
+    ...
+```
+
+The callable gets an ordinary environ for the request, with the body the
+coroutine has not received in `wsgi.input`, arriving as the client sends
+it, and the scope's state as `environ["muru.state"]`. It runs in a copy
+of the coroutine's context. `handoff()` raises `RuntimeError` once the
+coroutine has sent anything, and after it the coroutine must not call
+`receive()` or `send()` again, which raise. `handed_off` says whether
+the request has been handed off.
+
+When every thread is busy, a request handed over waits in the worker, in
+turn, for one. If its deadline has passed by the time a thread takes it,
+it is answered 503 with reason `queue_full`.
+
+## How handoffs are counted
+
+A request handed across counts against the side it was handed to: the
+worker's threads, or the threads of the mount's own, for a handoff to
+WSGI, and its event loop for a handoff to ASGI. Its place on the side it
+came from is free for another request at once. When the side it moves
+to is full, the request goes ahead anyway and takes the next place that
+frees there. The access log marks a request handed across with
+`handoff=asgi` or `handoff=wsgi`, and `muru_handoffs_total` counts them
+in the [metrics](metrics.md). A [mount](mounts.md) is the better tool
+when the choice can be made by path.
+
 ## Inside a framework
 
 After a handoff, Muru ignores the status, headers and body the WSGI side
@@ -228,6 +281,10 @@ message names the setting to add:
 muru.HandoffNotEnabled: mount admin does not enable handing requests to ASGI;
 set handoff = "asgi" on the mount
 ```
+
+An ASGI application without `handoff = "wsgi"` likewise gets
+`asgi_to_wsgi` in its scope, whose `handoff()` raises with the setting
+to add.
 
 A worker does not start when a handoff names the interface its
 application already speaks, such as `handoff = "asgi"` on an ASGI

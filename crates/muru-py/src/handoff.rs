@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::asgi::{self, Channel};
-use crate::pool::{Interrupt, Shared};
-use crate::wsgi::{Input, Outgoing, StartResponse};
+use crate::pool::{Interrupt, Pool, Shared};
+use crate::wsgi::{Input, Outgoing, Sink, StartResponse};
 
 /// One WSGI request's link to its handoff: the channel, once the request
 /// has been handed off, and the uploads it keeps open until the request
@@ -58,6 +58,9 @@ pub struct Handoff {
     pub runtime: tokio::runtime::Handle,
     /// Set by the link when the edge gives up on the request.
     pub cancelled: Arc<AtomicBool>,
+    /// The scope state of a request handed from ASGI, for
+    /// `environ["muru.state"]`.
+    pub state: Option<Py<PyDict>>,
 }
 
 /// `environ["muru.wsgi_to_asgi"]`: continue this request as an ASGI
@@ -123,32 +126,10 @@ impl WsgiToAsgi {
         Ok(built)
     }
 
-    fn not_enabled(&self, py: Python<'_>) -> PyErr {
-        let message = if self.head.mount.is_empty() {
-            "this application does not enable handing requests to ASGI; set handoff = \"asgi\" \
-             in its [tool.muru] table or its release's table"
-                .to_owned()
-        } else {
-            format!(
-                "mount {} does not enable handing requests to ASGI; set handoff = \"asgi\" on \
-                 the mount",
-                self.head.mount
-            )
-        };
-
-        match py
-            .import(intern!(py, "muru"))
-            .and_then(|muru| muru.getattr(intern!(py, "HandoffNotEnabled")))
-        {
-            Ok(class) => PyErr::from_type(class.cast_into().expect("an exception class"), message),
-            Err(error) => error,
-        }
-    }
-
     /// Put the marker on the request's output stream, ahead of anything
     /// the ASGI application sends.
     fn send_marker(&self, py: Python<'_>) -> bool {
-        match self.tx.try_send(Outgoing::Handoff) {
+        match self.tx.try_send(Outgoing::Handoff { to_loop: true }) {
             Ok(()) => true,
             Err(TrySendError::Full(item)) => {
                 let tx = &self.tx;
@@ -212,7 +193,7 @@ impl WsgiToAsgi {
     /// empty response the WSGI callable returns.
     fn handoff(&self, py: Python<'_>, app: Bound<'_, PyAny>) -> PyResult<HandedOff> {
         if !self.enabled {
-            return Err(self.not_enabled(py));
+            return Err(not_enabled(py, &self.head.mount, "ASGI", "asgi"));
         }
 
         if self.slot.channel.get().is_some() {
@@ -285,6 +266,203 @@ impl WsgiToAsgi {
         )?;
 
         Ok(HandedOff)
+    }
+}
+
+/// `muru.HandoffNotEnabled`, naming the setting the request's mount needs
+/// to hand requests to `interface`.
+fn not_enabled(py: Python<'_>, mount: &str, interface: &str, setting: &str) -> PyErr {
+    let message = if mount.is_empty() {
+        format!(
+            "this application does not enable handing requests to {interface}; set handoff = \
+             \"{setting}\" in its [tool.muru] table or its release's table"
+        )
+    } else {
+        format!(
+            "mount {mount} does not enable handing requests to {interface}; set handoff = \
+             \"{setting}\" on the mount"
+        )
+    };
+
+    match py
+        .import(intern!(py, "muru"))
+        .and_then(|muru| muru.getattr(intern!(py, "HandoffNotEnabled")))
+    {
+        Ok(class) => PyErr::from_type(class.cast_into().expect("an exception class"), message),
+        Err(error) => error,
+    }
+}
+
+/// `scope["extensions"]["muru"]["asgi_to_wsgi"]` on an http scope:
+/// continue this request as a WSGI callable on the thread pool.
+#[pyclass(frozen, module = "muru._native")]
+pub struct AsgiToWsgi {
+    enabled: bool,
+    head: Arc<pb::RequestHead>,
+    uploads: Vec<RawFd>,
+    /// The scope's state, which the WSGI callable sees as `muru.state`.
+    state: Py<PyDict>,
+    channel: Py<Channel>,
+    shared: Arc<Shared>,
+    request: u64,
+    interrupt: Arc<Interrupt>,
+    /// The mount's own threads for handoffs, else the shared pool's.
+    pool: Option<Arc<Pool>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl AsgiToWsgi {
+    #[allow(clippy::too_many_arguments)] // one call site; each argument is a distinct part of the request
+    pub fn new(
+        enabled: bool,
+        head: Arc<pb::RequestHead>,
+        uploads: &[RawFd],
+        state: Py<PyDict>,
+        channel: Py<Channel>,
+        shared: Arc<Shared>,
+        request: u64,
+        interrupt: Arc<Interrupt>,
+        pool: Option<Arc<Pool>>,
+    ) -> Self {
+        Self {
+            enabled,
+            head,
+            uploads: uploads.to_vec(),
+            state,
+            channel,
+            shared,
+            request,
+            interrupt,
+            pool,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+/// Whether a request's deadline, in milliseconds since the epoch, has
+/// passed; a request without one has none to pass.
+fn past_deadline(deadline_unix_ms: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    deadline_unix_ms != 0 && now >= deadline_unix_ms
+}
+
+#[pymethods]
+impl AsgiToWsgi {
+    /// Whether the request has been handed off.
+    #[getter]
+    fn handed_off(&self) -> bool {
+        self.channel.get().handed_to_wsgi()
+    }
+
+    /// Continue the request as the WSGI callable `app` on an application
+    /// thread. Returns None, so `return bridge.handoff(app)` ends the
+    /// coroutine, which must not use receive or send again.
+    fn handoff(&self, py: Python<'_>, app: Bound<'_, PyAny>) -> PyResult<()> {
+        if !self.enabled {
+            return Err(not_enabled(py, &self.head.mount, "WSGI", "wsgi"));
+        }
+
+        let channel = self.channel.get();
+
+        if channel.handed_to_wsgi() {
+            return Err(PyRuntimeError::new_err(
+                "the request has already been handed off",
+            ));
+        }
+
+        if channel.response_started() {
+            return Err(PyRuntimeError::new_err(
+                "the request cannot be handed off once its response has started",
+            ));
+        }
+
+        // The callable runs in a copy of the coroutine's context.
+
+        let context = py
+            .import(intern!(py, "contextvars"))?
+            .call_method0(intern!(py, "copy_context"))?
+            .unbind();
+        let (body, cancelled) = channel.hand_to_wsgi();
+        self.shared.request_handed_to_thread(self.request);
+
+        let app = app.unbind();
+        let head = (*self.head).clone();
+        let uploads = self.uploads.clone();
+        let state = self.state.clone_ref(py);
+        let shared = Arc::clone(&self.shared);
+        let request = self.request;
+        let interrupt = Arc::clone(&self.interrupt);
+        let tx = channel.sender();
+        let runtime = self.runtime.clone();
+        let pool = self.pool.clone();
+
+        let job: crate::pool::Job = Box::new(move |py| {
+            let sink = Sink {
+                tx: tx.clone(),
+                interrupt: Arc::clone(&interrupt),
+            };
+
+            // Section 6.14: a request that waited for a thread past its
+            // deadline is answered 503 queue_full.
+
+            if past_deadline(head.deadline_unix_ms) {
+                sink.send(
+                    py,
+                    Outgoing::Abort {
+                        error: "the request waited past its deadline for an application thread"
+                            .to_owned(),
+                        reason: "queue_full".to_owned(),
+                        detail: String::new(),
+                    },
+                );
+                sink.send(py, Outgoing::Finished);
+                return;
+            }
+
+            if !sink.send(py, Outgoing::Handoff { to_loop: false }) {
+                return;
+            }
+
+            shared.request_on_this_thread(request);
+            let offer = Handoff {
+                enabled: false,
+                slot: Arc::new(Slot::default()),
+                runtime,
+                cancelled,
+                state: Some(state),
+            };
+
+            // SAFETY: the thread is attached; a successful PyContext_Enter
+            // is paired with PyContext_Exit on this thread, and the context
+            // outlives both.
+
+            let entered = unsafe { pyo3::ffi::PyContext_Enter(context.as_ptr()) == 0 };
+
+            if !entered {
+                PyErr::fetch(py).print(py);
+            }
+
+            crate::wsgi::run(
+                py, &shared, request, &app, head, &uploads, body, tx, &offer, interrupt,
+            );
+
+            if entered && unsafe { pyo3::ffi::PyContext_Exit(context.as_ptr()) } != 0 {
+                PyErr::fetch(py).print(py);
+            }
+        });
+
+        let queued = match &pool {
+            Some(own) => own.spawn(job),
+            None => self.shared.pool.spawn(job),
+        };
+
+        if !queued {
+            return Err(PyRuntimeError::new_err("the worker is shutting down"));
+        }
+
+        Ok(())
     }
 }
 

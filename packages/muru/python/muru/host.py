@@ -465,6 +465,7 @@ class Mount:
     threads: tuple[int, int] | None = None
     limits: tuple[int, int] | None = None
     handoff: str | None = None
+    handoff_threads: int | None = None
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
@@ -560,15 +561,25 @@ class Group:
         return cls(name, processes, threads, sync_threads, concurrency)
 
 
-def parse_mount_handoff(text: str) -> tuple[str, str]:
-    """Parse NAME=INTERFACE, the interface a mount's requests may be handed to."""
+def parse_mount_handoff(text: str) -> tuple[str, tuple[str, int | None]]:
+    """Parse NAME=INTERFACE[,THREADS]: where a mount's requests may be handed.
 
-    name, _, interface = text.partition("=")
+    THREADS, for an ASGI mount handing to WSGI, is a pool of its own for
+    the requests it hands over.
+    """
 
-    if not name or interface not in HANDOFFS:
-        raise argparse.ArgumentTypeError(f"{text!r} is not NAME=asgi or NAME=wsgi")
+    name, _, value = text.partition("=")
+    interface, _, count = value.partition(",")
 
-    return name, interface
+    try:
+        threads = int(count) if count else None
+    except ValueError:
+        threads = 0
+
+    if not name or interface not in HANDOFFS or (threads is not None and threads < 1):
+        raise argparse.ArgumentTypeError(f"{text!r} is not NAME=asgi or NAME=wsgi[,THREADS]")
+
+    return name, (interface, threads)
 
 
 def check_handoff(owner: str, handoff: str | None, interface: str | None) -> None:
@@ -1249,8 +1260,21 @@ class Host:
             # any of them is ASGI, started after the fork, with lifespan
             # startup for each ASGI application before the worker is ready.
 
+            # An ASGI mount's threads are those its handoffs to WSGI run on
+            # (section 6.14), declared apart from its limits.
+
             realised = [
-                (mount.name, mount.release.realise(), mount.release, mount.threads)
+                (
+                    mount.name,
+                    mount.release.realise(),
+                    mount.release,
+                    mount.threads
+                    or (
+                        (mount.handoff_threads, mount.handoff_threads)
+                        if mount.handoff_threads
+                        else None
+                    ),
+                )
                 for mount in mounts
             ]
             limits = {mount.name: mount.limits for mount in mounts}
@@ -1282,20 +1306,30 @@ class Host:
             )
 
             for name, _, mounted, own in realised:
-                if own is not None and mounted.resolved == "asgi":
+                if own is not None and mounted.resolved == "asgi" and handoffs[name] != "wsgi":
                     raise ValueError(
-                        f"mount {name}: an ASGI mount runs on the event loop and has no threads"
+                        f"mount {name}: an ASGI mount runs on the event loop and has threads "
+                        "only for the requests it hands to WSGI, with handoff = 'wsgi'"
+                    )
+
+                if own is not None and mounted.resolved == "asgi" and own[0] != own[1]:
+                    raise ValueError(
+                        f"mount {name}: an ASGI mount's threads are a fixed pool, a number"
                     )
 
             # Section 6.5: the shared pool serves a WSGI default mount and
-            # every WSGI mount that has no threads of its own or borrows.
+            # every WSGI mount that has no threads of its own or borrows;
+            # section 6.14: and the requests an ASGI application without
+            # threads of its own hands to WSGI.
 
             shared_threads = (
                 group.threads
                 if release.resolved not in ("asgi", "grpc")
+                or self.handoff == "wsgi"
                 or any(
-                    mounted.resolved not in ("asgi", "grpc") and (own is None or own[0] < own[1])
-                    for _, _, mounted, own in realised
+                    (mounted.resolved not in ("asgi", "grpc") and (own is None or own[0] < own[1]))
+                    or (mounted.resolved == "asgi" and handoffs[name] == "wsgi" and own is None)
+                    for name, _, mounted, own in realised
                 )
                 else 1
             )
@@ -1343,7 +1377,7 @@ class Host:
                     lifespans.append(mounted_lifespan)
                     runner = _asgi.runner(mounted_app, loop, mounted_lifespan.state)
                     served_mounts.append(
-                        (name, mounted_app, runner, None, limits[name], handoffs[name] is not None)
+                        (name, mounted_app, runner, own, limits[name], handoffs[name] is not None)
                     )
                 else:
                     served_mounts.append(
@@ -3755,7 +3789,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     mount_handoffs = dict(args.mount_handoff)
-    mounts = [replace(mount, handoff=mount_handoffs.get(mount.name)) for mount in mounts]
+    mounts = [
+        replace(
+            mount,
+            handoff=mount_handoffs[mount.name][0],
+            handoff_threads=mount_handoffs[mount.name][1],
+        )
+        if mount.name in mount_handoffs
+        else mount
+        for mount in mounts
+    ]
 
     # Section 11.4: the logging defaults are in place before anything of
     # the application is imported, and the workers inherit them.

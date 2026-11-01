@@ -381,7 +381,10 @@ def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, An
     event_loop = loop.loop
 
     def run(scope: MutableMapping[str, Any], channel: Any) -> None:
-        scope["state"] = dict(state)
+        # The state is filled in place: a handoff to WSGI holds the same
+        # dictionary for environ["muru.state"].
+
+        scope["state"].update(state)
         channel.started(event_loop.create_task(_serve(app, scope, channel)))
 
     return run

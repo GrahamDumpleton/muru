@@ -2649,7 +2649,7 @@ pub fn resolve_spec(
             .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
-        muru_config::check_mount_threads(mount.threads, mount.interface)
+        muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
             .map_err(|error| format!("mount {name}: {error}"))?;
         muru_config::check_handoff(mount.handoff, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;

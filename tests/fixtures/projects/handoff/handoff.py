@@ -13,6 +13,7 @@ import contextvars
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -220,6 +221,67 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         return respond(start_response, "200 OK", f"loop {result}\n")
 
     return respond(start_response, "200 OK", f"wsgi {bridge.handed_off}\n")
+
+
+def legacy(environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:
+    """The WSGI side of a request an ASGI application handed over."""
+
+    if environ["PATH_INFO"] == "/slow":
+        time.sleep(0.5)
+
+    details = {
+        "state": environ["muru.state"],
+        "rest": environ["wsgi.input"].read().decode(),
+        "script_name": environ["SCRIPT_NAME"],
+        "path_info": environ["PATH_INFO"],
+        "request_id": muru.request_id(),
+        "context": request_value.get(),
+        "thread": threading.current_thread().name,
+    }
+    start_response("200 OK", [("Content-Type", "application/json")])
+    return [json.dumps(details).encode()]
+
+
+async def api(scope: dict[str, Any], receive: Callable[..., Any], send: Callable[..., Any]) -> None:
+    """An ASGI mount that hands some of its requests to WSGI."""
+
+    if scope["type"] == "lifespan":
+        return
+
+    bridge = scope["extensions"]["muru"]["asgi_to_wsgi"]
+    path = scope["path"].removeprefix(scope["root_path"])
+
+    async def answer(status: int, text: str) -> None:
+        await send({"type": "http.response.start", "status": status, "headers": []})
+        await send({"type": "http.response.body", "body": text.encode()})
+
+    if path == "/started":
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        try:
+            bridge.handoff(legacy)
+        except RuntimeError as error:
+            await send({"type": "http.response.body", "body": str(error).encode()})
+
+        return
+
+    try:
+        if path == "/legacy":
+            first = await receive()
+            scope["state"]["first"] = first.get("body", b"").decode()
+            request_value.set("set in asgi")
+            bridge.handoff(legacy)
+
+            try:
+                await receive()
+            except RuntimeError as error:
+                print(f"after handoff: {error}", flush=True)
+
+            return
+
+        return bridge.handoff(legacy)
+    except HandoffNotEnabled as error:
+        await answer(409, f"{type(error).__name__}: {error}\n")
 
 
 def plain(environ: dict[str, Any], start_response: Callable[..., Any]) -> Iterable[bytes]:

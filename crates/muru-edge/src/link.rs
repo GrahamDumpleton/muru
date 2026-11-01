@@ -85,7 +85,13 @@ struct WorkerSlots {
     /// Requests its event loop holds at once, from its HELLO; 0 for a
     /// worker with no loop.
     async_slots: usize,
+    /// Its default mount runs on the event loop.
+    default_async: bool,
+    /// The default mount's side: its threads, or its loop's concurrency.
     semaphore: Arc<Semaphore>,
+    /// The other side, which requests handed across count against
+    /// (section 6.14); none when the worker declares no slots there.
+    other: Option<Arc<Semaphore>>,
     /// Section 6.7: the mounts with threads of their own, by name.
     mounts: HashMap<String, MountSlots>,
     /// The gRPC methods its mounts registered, from HELLO (section 6.13).
@@ -102,6 +108,9 @@ struct MountSlots {
     own: Option<Arc<Semaphore>>,
     allowance: Option<Arc<Semaphore>>,
     connections: Option<Arc<Semaphore>>,
+    /// The threads of its own that an ASGI mount's handoffs to WSGI run
+    /// on (section 6.14).
+    handoff: Option<Arc<Semaphore>>,
 }
 
 impl WorkerSlots {
@@ -114,17 +123,33 @@ impl WorkerSlots {
                 let reserved = usize::try_from(pool.reserved).unwrap_or(usize::MAX);
                 let max = usize::try_from(pool.max).unwrap_or(usize::MAX);
                 let connections = usize::try_from(pool.connections).unwrap_or(usize::MAX);
+                let handoff = usize::try_from(pool.handoff_threads).unwrap_or(usize::MAX);
                 let slots = MountSlots {
                     reserved,
                     own: (max > 0).then(|| Arc::new(Semaphore::new(reserved))),
                     allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
                     connections: (connections > 0).then(|| Arc::new(Semaphore::new(connections))),
+                    handoff: (handoff > 0).then(|| Arc::new(Semaphore::new(handoff))),
                 };
                 (pool.mount.clone(), slots)
             })
             .collect();
+
+        // Section 6.14: the default mount's side is the shared count; the
+        // other side is the one requests handed across move to.
+
+        let default_async = hello.worker_type == "asgi";
+        let other = usize::try_from(if default_async {
+            hello.slots
+        } else {
+            hello.async_slots
+        })
+        .unwrap_or(usize::MAX);
+
         Self {
             path,
+            default_async,
+            other: (other > 0).then(|| Arc::new(Semaphore::new(other))),
             worker_type: hello.worker_type,
             websockets: hello.websockets,
             websocket_mounts: hello.websocket_mounts,
@@ -134,6 +159,26 @@ impl WorkerSlots {
             mounts,
             grpc: hello.grpc_methods,
             idle: Mutex::new(vec![conn]),
+        }
+    }
+
+    /// The count a request to the mount moves to when it is handed to the
+    /// event loop or to the threads (section 6.14): the mount's own
+    /// handoff threads, else the worker's side.
+    fn side(&self, to_loop: bool, mount: &str) -> Option<Arc<Semaphore>> {
+        if !to_loop
+            && let Some(handoff) = self
+                .mounts
+                .get(mount)
+                .and_then(|slots| slots.handoff.as_ref())
+        {
+            return Some(Arc::clone(handoff));
+        }
+
+        if to_loop == self.default_async {
+            Some(Arc::clone(&self.semaphore))
+        } else {
+            self.other.clone()
         }
     }
 
@@ -252,6 +297,10 @@ pub(crate) struct Slot {
     permit: Option<OwnedSemaphorePermit>,
     allowance: Option<OwnedSemaphorePermit>,
     connection: Option<OwnedSemaphorePermit>,
+    /// A request handed to a side that was full waits for its place
+    /// there, ahead of requests not yet dispatched (section 6.14).
+    moving: Option<tokio::task::JoinHandle<()>>,
+    moved: Option<Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>>,
 }
 
 impl Slot {
@@ -264,6 +313,8 @@ impl Slot {
             permit: Some(permit),
             allowance,
             connection,
+            moving: None,
+            moved: None,
         }
     }
 
@@ -274,7 +325,56 @@ impl Slot {
         if self.connection.is_some() {
             self.permit = None;
             self.allowance = None;
+            self.stop_moving();
         }
+    }
+
+    /// Section 6.14: the request was handed across, so it counts against
+    /// `target` now. A request already running is never held back: when
+    /// `target` is full the request takes its place anyway, the count is
+    /// over by one, and the place is taken as soon as one frees, before
+    /// any request not yet dispatched gets it.
+    fn detach(&mut self, target: &Arc<Semaphore>) {
+        if self
+            .permit
+            .as_ref()
+            .is_some_and(|permit| Arc::ptr_eq(permit.semaphore(), target))
+        {
+            return;
+        }
+
+        self.permit = None;
+        self.allowance = None;
+        self.stop_moving();
+
+        match Arc::clone(target).try_acquire_owned() {
+            Ok(permit) => self.permit = Some(permit),
+            Err(_) => {
+                let moved = Arc::new(std::sync::Mutex::new(None));
+                let into = Arc::clone(&moved);
+                let target = Arc::clone(target);
+                self.moving = Some(tokio::spawn(async move {
+                    if let Ok(permit) = target.acquire_owned().await {
+                        *into.lock().expect("slot poisoned") = Some(permit);
+                    }
+                }));
+                self.moved = Some(moved);
+            }
+        }
+    }
+
+    fn stop_moving(&mut self) {
+        if let Some(moving) = self.moving.take() {
+            moving.abort();
+        }
+
+        self.moved = None;
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.stop_moving();
     }
 }
 
@@ -753,6 +853,20 @@ impl Return {
         self.report(&mut state);
     }
 
+    /// Section 6.14: the worker handed the request to its event loop, or
+    /// to its threads, so the request counts there.
+    fn detach(&self, to_loop: bool, mount: &str) {
+        let Some(target) = self.pool.workers[self.worker].side(to_loop, mount) else {
+            return;
+        };
+
+        let mut state = self.state.lock().expect("return state poisoned");
+
+        if let Some(slot) = state.permit.as_mut() {
+            slot.detach(&target);
+        }
+    }
+
     /// Section 6.7: the worker accepted the WebSocket, so its hold on the
     /// worker becomes a place among the mount's open sockets where the
     /// mount bounds them.
@@ -1116,6 +1230,7 @@ impl Recording {
                 redirects: context.hops.clone(),
                 client_class: context.client_class.to_string(),
                 websocket: None,
+                handoff: None,
             },
             started: Instant::now(),
         }
@@ -1660,6 +1775,8 @@ async fn handle_inner(
         },
     }
 
+    let request_mount = head.mount.clone();
+
     let response = loop {
         let next = match tokio::time::timeout_at(deadline.into(), frame::read(&mut reader)).await {
             Ok(next) => next,
@@ -1679,6 +1796,23 @@ async fn handle_inner(
 
         match next {
             Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
+            Ok(Some(next)) if next.kind == kind::DETACH => {
+                // Section 6.14: the request was handed across in the
+                // worker, so it counts on the other side now.
+
+                let detach = pb::Detach::decode(next.payload).unwrap_or_default();
+                let to_loop = detach.target == pb::detach::Target::Loop as i32;
+                back.detach(to_loop, &request_mount);
+
+                if let Some(recording) = failing
+                    .recording
+                    .lock()
+                    .expect("recording poisoned")
+                    .as_mut()
+                {
+                    recording.record.handoff = Some(if to_loop { "asgi" } else { "wsgi" });
+                }
+            }
             Ok(Some(next)) if next.kind == kind::RESPONSE => {
                 if back.client_stalled.load(Ordering::Relaxed) {
                     // The client stopped sending its body; what the worker
@@ -2184,6 +2318,9 @@ impl Failing<'_> {
                 "mount_not_loaded",
                 description,
             ),
+            "queue_full" => {
+                Problem::new(StatusCode::SERVICE_UNAVAILABLE, "queue_full", description)
+            }
             _ => Problem::new(StatusCode::BAD_GATEWAY, "worker_crashed", description),
         };
 
@@ -2675,7 +2812,9 @@ mod tests {
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
 
-    use super::{Kept, LinkPool};
+    use tokio::sync::Semaphore;
+
+    use super::{Kept, LinkPool, Slot};
 
     /// A worker that answers HELLO on every connection and counts them.
     fn fake_worker(path: &Path) -> Arc<AtomicUsize> {
@@ -2710,6 +2849,40 @@ mod tests {
         });
 
         accepted
+    }
+
+    #[tokio::test]
+    async fn a_request_handed_across_moves_its_slot() {
+        let threads = Arc::new(Semaphore::new(1));
+        let event_loop = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&threads).try_acquire_owned().unwrap();
+        let mut slot = Slot::new(permit, None, None);
+
+        // With room on the other side, the slot moves at once and the
+        // thread is given back.
+
+        slot.detach(&event_loop);
+        assert_eq!(threads.available_permits(), 1);
+        assert_eq!(event_loop.available_permits(), 0);
+
+        // Moving to the side it is on changes nothing.
+
+        slot.detach(&event_loop);
+        assert_eq!(event_loop.available_permits(), 0);
+
+        // With the other side full, the request goes over its bound and
+        // takes the next place that frees there.
+
+        let busy = Arc::clone(&threads).try_acquire_owned().unwrap();
+        slot.detach(&threads);
+        assert_eq!(event_loop.available_permits(), 1);
+        assert_eq!(threads.available_permits(), 0);
+        drop(busy);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(threads.available_permits(), 0, "the moved request took it");
+
+        drop(slot);
+        assert_eq!(threads.available_permits(), 1);
     }
 
     #[tokio::test]

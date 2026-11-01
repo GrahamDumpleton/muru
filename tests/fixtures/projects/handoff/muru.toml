@@ -7,3 +7,15 @@ threads = 2
 path = "/plain"
 entrypoint = "handoff:plain"
 interface = "wsgi"
+
+[mounts.api]
+path = "/api"
+entrypoint = "handoff:api"
+interface = "asgi"
+handoff = "wsgi"
+threads = 1
+
+[mounts.asyncplain]
+path = "/async-plain"
+entrypoint = "handoff:api"
+interface = "asgi"

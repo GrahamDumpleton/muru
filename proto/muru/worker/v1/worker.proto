@@ -20,8 +20,8 @@ service Worker {
 // version.
 message Hello {
   string protocol_version = 1;
-  string worker_type = 2;           // wsgi or asgi
-  uint32 slots = 3;                 // requests the worker runs at once
+  string worker_type = 2;           // wsgi or asgi: the side the default mount runs on
+  uint32 slots = 3;                 // requests the worker runs at once on its shared thread pool
   uint32 async_slots = 4;           // requests the worker holds on its event loop at once
   bool websockets = 5;              // the default mount accepts websocket scopes
   bool files = 6;                   // accepts FILE frames
@@ -37,12 +37,14 @@ message Hello {
 // For an ASGI mount, reserved and max are both its concurrency, or 0 for
 // one that shares the worker's slots, and connections bounds the open
 // WebSockets it holds apart from the requests it runs, 0 for no bound of
-// its own.
+// its own; handoff_threads are the threads of its own that requests it
+// hands to WSGI run on, 0 when they use the shared pool (section 6.14).
 message MountPool {
   string mount = 1;
   uint32 reserved = 2;
   uint32 max = 3;
   uint32 connections = 4;
+  uint32 handoff_threads = 5;
 }
 
 // A gRPC method a worker serves (section 6.13). A path ending in / is a
@@ -193,9 +195,9 @@ message Abort {
   string reason = 1;
 }
 
-// Payload of a DETACH frame, worker to edge: the request moved to the
-// other side of the worker, so the edge counts its connection against the
-// other bound (section 6.14).
+// Payload of a DETACH frame, worker to edge, sent before anything of the
+// response: the request moved to the other side of the worker, so the
+// edge counts it against the other bound (section 6.14).
 message Detach {
   enum Target {
     TARGET_LOOP = 0;                // now held on the event loop: async slots

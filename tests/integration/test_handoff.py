@@ -13,6 +13,7 @@ from __future__ import annotations
 import http.client
 import json
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -320,3 +321,75 @@ def test_the_websocket_adapter_closes_on_an_exception(server: support.Server) ->
             socket_.recv(timeout=10)
 
     assert closed.value.rcvd is not None and closed.value.rcvd.code == 4001
+
+
+def test_an_asgi_request_continues_as_wsgi(server: support.Server) -> None:
+    server.mark_log()
+
+    # A body large enough to arrive in pieces: the coroutine reads the
+    # first, and the WSGI callable the rest.
+
+    sent = "".join(f"{index:07d}\n" for index in range(100_000))
+    connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+
+    try:
+        connection.request("POST", "/api/legacy", body=sent.encode())
+        response = connection.getresponse()
+        body = response.read()
+        assert response.status == 200, body
+        details = json.loads(body)
+    finally:
+        connection.close()
+
+    # The WSGI callable gets the body the coroutine left, its state, its
+    # context and the request's id, on one of the mount's own threads.
+
+    assert 0 < len(details["state"]["first"]) < len(sent)
+    assert details["state"]["first"] + details["rest"] == sent
+
+    # A body the coroutine read to its end leaves wsgi.input empty.
+
+    whole = server.post("/api/legacy", b"hello")
+    assert json.loads(whole.body)["rest"] == ""
+    assert (details["script_name"], details["path_info"]) == ("/api", "/legacy")
+    assert details["context"] == "set in asgi"
+    assert details["request_id"] == response.getheader("x-request-id")
+    assert details["thread"].startswith("muru-app-api")
+    assert server.wait_for_log(
+        "after handoff: receive() called after the request was handed to WSGI"
+    )
+    assert server.wait_for_log("handoff=wsgi")
+
+
+def test_handoffs_to_wsgi_wait_for_a_thread_in_turn(server: support.Server) -> None:
+    # The mount has one thread of its own, so two slow handoffs take turns.
+
+    started = time.monotonic()
+    results: list[int] = []
+
+    def fetch() -> None:
+        results.append(server.get("/api/slow").status)
+
+    threads = [threading.Thread(target=fetch) for _ in range(2)]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    assert results == [200, 200]
+    assert time.monotonic() - started >= 1.0
+
+
+def test_an_asgi_mount_without_the_setting_raises(server: support.Server) -> None:
+    response = server.get("/async-plain/x")
+    assert response.status == 409
+    assert response.body == (
+        b"HandoffNotEnabled: mount asyncplain does not enable handing requests to WSGI; "
+        b'set handoff = "wsgi" on the mount\n'
+    )
+
+    started = server.get("/api/started")
+    assert started.status == 200
+    assert started.body == b"the request cannot be handed off once its response has started"

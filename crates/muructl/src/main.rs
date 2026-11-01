@@ -1698,7 +1698,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     for (name, mount) in &table.mounts {
         muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
             .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
-        muru_config::check_mount_threads(mount.threads, mount.interface)
+        muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
         muru_config::check_handoff(mount.handoff, mount.interface)
             .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;

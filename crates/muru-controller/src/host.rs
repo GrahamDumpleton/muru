@@ -703,7 +703,14 @@ impl HostProcess {
                 mount.interface.as_str()
             );
 
-            if let Some(threads) = mount.threads {
+            // Section 6.14: a declared ASGI mount's threads are those its
+            // handoffs to WSGI run on, passed with the handoff.
+
+            let handoff_threads = mount
+                .threads
+                .filter(|_| mount.interface == muru_config::Interface::Asgi);
+
+            if let Some(threads) = mount.threads.filter(|_| handoff_threads.is_none()) {
                 text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
             } else if mount.concurrency.is_some() || mount.max_connections.is_some() {
                 text.push_str(&format!(
@@ -716,9 +723,14 @@ impl HostProcess {
             command.arg("--mount").arg(text);
 
             if let Some(handoff) = mount.handoff {
-                command
-                    .arg("--mount-handoff")
-                    .arg(format!("{}={}", mount.name, handoff.as_str()));
+                let threads = handoff_threads
+                    .map(|threads| format!(",{}", threads.max()))
+                    .unwrap_or_default();
+                command.arg("--mount-handoff").arg(format!(
+                    "{}={}{threads}",
+                    mount.name,
+                    handoff.as_str()
+                ));
             }
         }
 
