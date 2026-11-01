@@ -200,15 +200,17 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     tokio::spawn(async move {
         while reopen.recv().await.is_some() {
             match access_log.reopen() {
-                Ok(()) => eprintln!("muru: edge reopened the access log"),
-                Err(error) => eprintln!("muru: edge could not reopen the access log: {error}"),
+                Ok(()) => muru_common::muru_eprintln!("edge reopened the access log"),
+                Err(error) => {
+                    muru_common::muru_eprintln!("edge could not reopen the access log: {error}")
+                }
             }
         }
     });
 
     let mut serving = tokio::spawn(edge.run());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    eprintln!("muru: edge serving {listen} (pid {})", std::process::id());
+    muru_common::muru_eprintln!("edge serving {listen} (pid {})", std::process::id());
     let outcome = tokio::select! {
         served = &mut serving => {
             // Section 13.3: the accept loops end when the daemon has the
@@ -239,7 +241,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
 
     if outcome.is_ok() {
         let grace = limits.current().request_deadline;
-        eprintln!("muru: edge draining (pid {})", std::process::id());
+        muru_common::muru_eprintln!("edge draining (pid {})", std::process::id());
 
         if !drainer.drain(grace).await {
             eprintln!(
@@ -519,7 +521,7 @@ impl EdgeControl for Control {
             tokio::time::sleep(delay).await;
         }
 
-        eprintln!("muru: edge draining (pid {})", std::process::id());
+        muru_common::muru_eprintln!("edge draining (pid {})", std::process::id());
         let finished = self.drainer.drain(grace).await;
 
         if !finished {

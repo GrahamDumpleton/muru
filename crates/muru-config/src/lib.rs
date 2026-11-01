@@ -1035,7 +1035,8 @@ pub struct SecretRef {
 }
 
 /// The `[logs]` table of the daemon's file (section 11.3): how the
-/// daemon rotates the log files it and its processes write.
+/// daemon rotates the log files it and its processes write, and whether
+/// its standard streams carry the time (section 11.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Logs {
@@ -1055,6 +1056,12 @@ pub struct Logs {
     /// How archives are compressed: `zstd` (the default), `gzip` or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compress: Option<String>,
+    /// Put the full UTC time in front of every line the daemon writes to
+    /// standard output and standard error, as `--timestamps` does, for a
+    /// supervisor that stamps nothing (section 11.8). Files always carry
+    /// the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamps: Option<bool>,
 }
 
 /// The `[shutdown]` table of the daemon's file (section 13.3): what
@@ -4142,6 +4149,9 @@ pub struct RunSettings {
     /// Whether responses are compressed; `false` is `--no-compression`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<bool>,
+    /// Whether every line on the terminal carries the full UTC time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamps: Option<bool>,
 }
 
 impl RunSettings {
@@ -4169,6 +4179,7 @@ impl RunSettings {
             slow: over.slow.clone().or_else(|| self.slow.clone()),
             dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
             compression: over.compression.or(self.compression),
+            timestamps: over.timestamps.or(self.timestamps),
         }
     }
 

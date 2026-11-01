@@ -12,6 +12,7 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod init;
+mod log_format;
 mod mcp;
 mod provision;
 mod pstats;
@@ -56,7 +57,6 @@ struct Cli {
 enum Command {
     /// Run an application with an embedded controller and edge (development mode).
     Run(Box<RunArgs>),
-
     /// Build a project's environment from uv.lock and provide the runtime library, then exit.
     Build(Box<provision::BuildArgs>),
 
@@ -528,6 +528,16 @@ struct RunArgs {
     #[arg(long)]
     no_compression: bool,
 
+    /// Put the full UTC time in front of every line on the terminal.
+    /// Access log lines carry the request's time either way.
+    #[arg(long)]
+    timestamps: bool,
+
+    /// Leave the time off application lines when the project's run table
+    /// turns timestamps on.
+    #[arg(long)]
+    no_timestamps: bool,
+
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
     /// dashboard unless asked for), but this is still not the supported
@@ -816,8 +826,8 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_writer(|| log_format::Routed)
+        .event_format(log_format::Layout)
         .init();
     let cli = Cli::parse();
 
@@ -1431,6 +1441,8 @@ struct Serving {
     /// The dashboard's address, off, or none for the default.
     dashboard: Option<String>,
     compression: bool,
+    /// Whether every line on the terminal carries the full time.
+    timestamps: bool,
     /// The muru.local.toml read, when there was one.
     local: Option<PathBuf>,
 }
@@ -1509,6 +1521,8 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.dashboard.clone()),
             compression: !args.no_compression && settings.compression != Some(false),
+            timestamps: !args.no_timestamps
+                && (args.timestamps || settings.timestamps == Some(true)),
             local,
         })
     }
@@ -2018,7 +2032,7 @@ async fn host_control(
     match muru_controller::host::HostControl::connect(&host.control_path()).await {
         Ok((control, messages)) => (Some(control), messages),
         Err(error) => {
-            println!("muru: no control connection to the host: {error:#}");
+            muru_common::muru_println!("no control connection to the host: {error:#}");
             let (_sender, receiver) = tokio::sync::mpsc::channel(1);
             std::mem::forget(_sender);
             (None, receiver)
@@ -2600,6 +2614,7 @@ fn written_interpreter(python: &Path, project: &Path) -> String {
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut resolved = resolve(&args)?;
+    muru_common::log::show_timestamps(resolved.serving.timestamps);
     let development = !args.allow_public;
 
     if !args.bind.ip.is_loopback() && development {
@@ -2642,7 +2657,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     if let Some(source) = &resolved.source {
-        println!("muru: using [tool.muru] from {}", source.display());
+        muru_common::muru_println!("using [tool.muru] from {}", source.display());
     }
 
     // Section 8.2: run is build under the build mode, then serve. A
@@ -2676,7 +2691,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             | muru_provision::Chosen::ActiveVirtualenv
             | muru_provision::Chosen::ProjectVirtualenv
     ) {
-        println!("muru: {}", python.describe());
+        muru_common::muru_println!("{}", python.describe());
     }
 
     // Section 8.3: the runtime library, from the environment when it
@@ -2686,20 +2701,20 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let library = provision::runtime(&python.probe).await?;
 
     for note in &library.notes {
-        println!("muru: {note}");
+        muru_common::muru_println!("{note}");
     }
 
-    println!("muru: {}", library.describe());
+    muru_common::muru_println!("{}", library.describe());
 
     // Section 13.1: the local file is said once, and so is a .gitignore
     // that would let it be committed.
 
     if let Some(local) = &resolved.serving.local {
-        println!("muru: using [run] from {}", local.display());
+        muru_common::muru_println!("using [run] from {}", local.display());
 
         if !gitignore_covers(&resolved.project, muru_config::LOCAL_FILE) {
-            println!(
-                "muru: {} is not covered by the project's .gitignore; add it, since the file is for this machine alone",
+            muru_common::muru_println!(
+                "{} is not covered by the project's .gitignore; add it, since the file is for this machine alone",
                 muru_config::LOCAL_FILE
             );
         }
@@ -2709,6 +2724,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // --tls-cert or an unwritable cache fails with nothing to clean up.
 
     let tls = tls(&args, &resolved.serving, &resolved.project)?;
+
     let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&resolved.serving);
@@ -2844,6 +2860,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
     );
+
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -2929,8 +2946,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         )
     };
 
-    println!(
-        "muru: serving {} on {addresses} with {}",
+    muru_common::muru_println!(
+        "serving {} on {addresses} with {}",
         resolved.entrypoint,
         workers(
             resolved.processes,
@@ -2939,8 +2956,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     );
 
     for (name, group) in &resolved.groups {
-        println!(
-            "muru: group {name} serves {} with {}{}",
+        muru_common::muru_println!(
+            "group {name} serves {} with {}{}",
             group_serves(group),
             workers(
                 group.processes.unwrap_or(resolved.processes),
@@ -2955,20 +2972,20 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     for (name, mount) in &resolved.mounts {
-        println!("muru: mount {name} {}", mount_serves(mount));
+        muru_common::muru_println!("mount {name} {}", mount_serves(mount));
     }
 
     for entry in &static_paths {
-        println!(
-            "muru: static {}/ from {}",
+        muru_common::muru_println!(
+            "static {}/ from {}",
             entry.prefix.trim_end_matches('/'),
             entry.route.directory.display()
         );
     }
 
     if development {
-        println!(
-            "muru: development mode: error pages show tracebacks, nothing is persisted{} and only \
+        muru_common::muru_println!(
+            "development mode: error pages show tracebacks, nothing is persisted{} and only \
              loopback is served; production runs under the daemon (muructl daemon start)",
             if resolved.serving.reload {
                 ", the run reloads on change"
@@ -2977,16 +2994,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             }
         );
     } else {
-        println!(
-            "muru: --allow-public: development behaviours are off, but muructl run is not the \
+        muru_common::muru_println!(
+            "--allow-public: development behaviours are off, but muructl run is not the \
              supported way to run in production; that is the daemon (muructl daemon start)"
         );
     }
 
     if let Some(tls) = &tls {
         match (&tls.development, &resolved.serving.tls_cert) {
-            (Some(certificate), _) => println!("{}", certificate.describe()),
-            (None, Some(path)) => println!("muru: TLS certificate from {}", path.display()),
+            (Some(certificate), _) => {
+                for line in certificate.describe().lines() {
+                    muru_common::muru_println!("{}", line.trim_start_matches("muru: "));
+                }
+            }
+            (None, Some(path)) => {
+                muru_common::muru_println!("TLS certificate from {}", path.display())
+            }
             (None, None) => {}
         }
     }
@@ -3023,10 +3046,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .await
         {
             Ok(address) => {
-                println!("muru: dashboard on http://{address}/");
+                muru_common::muru_println!("dashboard on http://{address}/");
                 dashboard_address = Some(address);
             }
-            Err(error) => println!("muru: no dashboard: {error:#}"),
+            Err(error) => muru_common::muru_println!("no dashboard: {error:#}"),
         }
     }
 
@@ -3042,11 +3065,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .project
         .canonicalize()
         .unwrap_or_else(|_| resolved.project.clone());
+
     let registration =
         match run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project) {
             Ok(registration) => Some(registration),
             Err(error) => {
-                println!("muru: no admin socket: {error:#}");
+                muru_common::muru_println!("no admin socket: {error:#}");
                 None
             }
         };
@@ -3078,10 +3102,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
         match run_admin::serve(state, admin_stop_rx).await {
             Ok(serving) => {
-                println!("muru: admin socket {}", registration.socket.display());
+                muru_common::muru_println!("admin socket {}", registration.socket.display());
                 tokio::spawn(serving);
             }
-            Err(error) => println!("muru: no admin socket: {error:#}"),
+            Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
         }
     }
 
@@ -3136,8 +3160,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         // change made after the line below is seen.
 
         let watching = watch.start(WATCH_INTERVAL, changed_tx);
-        println!(
-            "muru: watching {watched} for changes to {}{except}",
+        muru_common::muru_println!(
+            "watching {watched} for changes to {}{except}",
             include.join(", ")
         );
         tokio::spawn(watching);
@@ -3196,12 +3220,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 host_link.lock().expect("host link poisoned").acknowledge(version);
                             }
                             Err(error) => {
-                                println!("muru: the workers could not be reconnected: {error:#}");
+                                muru_common::muru_println!("the workers could not be reconnected: {error:#}");
                             }
                         }
                     }
                     muru_controller::host::HostMessage::Event { kind, message, .. } => {
-                        println!("muru: {kind}: {message}");
+                        muru_common::muru_println!("{kind}: {message}");
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
@@ -3212,7 +3236,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             Some(path) = changed.recv() => {
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
-                println!("muru: reloading, {} changed", describe(&paths));
+                muru_common::muru_println!("reloading, {} changed", describe(&paths));
 
                 // Section 8.2: a change to the lock, or to what names the
                 // interpreter, builds before the new release starts; the
@@ -3237,12 +3261,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             Ok(python) => match provision::runtime(&python.probe).await {
                                 Ok(library) => Some((python, library)),
                                 Err(error) => {
-                                    println!("muru: {error:#}; release r{} keeps serving", current.release);
+                                    muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
                                     None
                                 }
                             },
                             Err(error) => {
-                                println!("muru: {error:#}; release r{} keeps serving", current.release);
+                                muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
                                 None
                             }
                         };
@@ -3252,7 +3276,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         };
 
                         for note in &library.notes {
-                            println!("muru: {note}");
+                            muru_common::muru_println!("{note}");
                         }
 
                         spec.python = python.python.clone();
@@ -3260,7 +3284,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        println!("muru: {error:#}; release r{} keeps serving", current.release);
+                        muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
                         continue;
                     }
                 }
@@ -3271,7 +3295,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
-                            println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
+                            muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                             break;
                         }
                     };
@@ -3300,13 +3324,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 match connected {
                                     Ok(connected) => pools.replace(connected),
                                     Err(error) => {
-                                        println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
+                                        muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                         next.stop(stop_budget).await;
                                         break;
                                     }
                                 }
 
-                                println!("muru: switched to release r{release}");
+                                muru_common::muru_println!("switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop(stop_budget));
@@ -3316,7 +3340,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 break;
                             }
                             Err(error) => {
-                                println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
+                                muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                 next.stop(stop_budget).await;
                                 break;
                             }
@@ -3327,7 +3351,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
                             let mut paths = vec![path];
                             settle(&mut changed, &mut paths).await;
-                            println!("muru: {} changed again, restarting the reload", describe(&paths));
+                            muru_common::muru_println!("{} changed again, restarting the reload", describe(&paths));
                             next.stop(stop_budget).await;
                         }
                     }

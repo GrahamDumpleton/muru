@@ -43,6 +43,7 @@ const HTMX_SSE: &[u8] = include_bytes!("../static/sse.js");
 const UPLOT_JS: &[u8] = include_bytes!("../static/uPlot.iife.min.js");
 const UPLOT_CSS: &[u8] = include_bytes!("../static/uPlot.min.css");
 const CHARTS_JS: &[u8] = include_bytes!("../static/charts.js");
+const TIMES_JS: &[u8] = include_bytes!("../static/times.js");
 
 /// A response body: whole, or a stream for Server-Sent Events.
 type Body = UnsyncBoxBody<Bytes, Infallible>;
@@ -77,7 +78,30 @@ pub struct Data {
     /// The WebSockets open now.
     pub websockets: WebSocketsView,
     /// Recent log lines, oldest first.
-    pub logs: Vec<String>,
+    pub logs: Vec<LogLine>,
+}
+
+/// A log line with the time it starts with split off (section 11.8):
+/// the page shows the time as the viewer's local clock, with the full
+/// UTC time on hover.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LogLine {
+    /// The full UTC time, or empty for a line written without one.
+    pub time: String,
+    /// The rest of the line.
+    pub text: String,
+}
+
+impl LogLine {
+    /// Split a line as a log file holds it.
+    pub fn parse(line: &str) -> Self {
+        let (time, text) = muru_common::log::split_time(line);
+
+        Self {
+            time: time.unwrap_or_default().to_owned(),
+            text: text.to_owned(),
+        }
+    }
 }
 
 /// Figures for the last minute, already formatted.
@@ -160,7 +184,8 @@ pub struct Worker {
 /// One recent request, already formatted.
 #[derive(Debug, Clone)]
 pub struct RequestRow {
-    /// Wall clock time, HH:MM:SS.
+    /// When the request arrived, in full UTC; the page shows the viewer's
+    /// local clock.
     pub time: String,
     /// The status code.
     pub status: u16,
@@ -381,7 +406,8 @@ pub struct RouteRow {
 /// One recent request under the daemon, already formatted.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct NodeRequestRow {
-    /// Wall clock time, HH:MM:SS.
+    /// When the request arrived, in full UTC; the page shows the viewer's
+    /// local clock.
     pub time: String,
     /// The status code.
     pub status: u16,
@@ -416,7 +442,8 @@ pub struct NodeRequestRow {
 pub struct EventRow {
     /// The sequence number.
     pub sequence: u64,
-    /// Wall clock time, HH:MM:SS.
+    /// When the request arrived, in full UTC; the page shows the viewer's
+    /// local clock.
     pub time: String,
     /// info, notice, warning or error.
     pub level: String,
@@ -436,7 +463,7 @@ pub struct LogPanel {
     /// The release.
     pub release: String,
     /// The last lines, oldest first.
-    pub lines: Vec<String>,
+    pub lines: Vec<LogLine>,
 }
 
 /// An uptime as `1h 2m`, `3m 4s` or `5s`.
@@ -674,6 +701,7 @@ fn asset_path(path: &str) -> Option<Response<Body>> {
         "/static/uplot.min.js" => asset(UPLOT_JS, "text/javascript"),
         "/static/uplot.min.css" => asset(UPLOT_CSS, "text/css"),
         "/static/charts.js" => asset(CHARTS_JS, "text/javascript"),
+        "/static/times.js" => asset(TIMES_JS, "text/javascript"),
         _ => return None,
     })
 }

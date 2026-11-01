@@ -48,6 +48,7 @@ import random
 import selectors
 import signal
 import socket
+import stat
 import sys
 import threading
 import time
@@ -122,6 +123,38 @@ READ_SIZE = 65536
 _in_worker = False
 
 
+# Whether standard error is a regular file, decided once per process: a
+# worker forks from the host, and its standard error is a pipe.
+
+_stamped: tuple[int, bool] | None = None
+
+
+def stamp() -> str:
+    """Return the time to put in front of a line, or nothing (section 11.8).
+
+    A line written to a file carries the full time, RFC 3339 in UTC with
+    milliseconds, as a daemon's release log does. A line written to a pipe
+    does not: under muructl run and muructl serve the reader adds it when
+    asked, and a worker's lines are timed by the host that relays them.
+    """
+
+    global _stamped
+
+    if _stamped is None or _stamped[0] != os.getpid():
+        try:
+            regular = stat.S_ISREG(os.fstat(2).st_mode)
+        except OSError:
+            regular = False
+
+        _stamped = (os.getpid(), regular)
+
+    if not _stamped[1]:
+        return ""
+
+    now = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int(now * 1000) % 1000:03d}Z "
+
+
 def log(message: str) -> None:
     """Write one line to standard error, prefixed so it can be told from application output."""
 
@@ -131,7 +164,7 @@ def log(message: str) -> None:
     # lost then must not stop the host from stopping its workers.
 
     try:
-        print(f"{prefix}{message}", file=sys.stderr, flush=True)
+        print(f"{stamp()}{prefix}{message}", file=sys.stderr, flush=True)
     except OSError:
         pass
 
@@ -433,15 +466,18 @@ class WorkerOutput:
 
         self.pending += data
         *lines, self.pending = self.pending.split(b"\n")
+        when = stamp()
+
         for line in lines:
-            sys.stderr.write(self.tag + line.decode("utf-8", "replace") + "\n")
+            sys.stderr.write(when + self.tag + line.decode("utf-8", "replace") + "\n")
+
         sys.stderr.flush()
 
     def flush(self) -> None:
         """Write a final partial line, if any."""
 
         if self.pending:
-            sys.stderr.write(self.tag + self.pending.decode("utf-8", "replace") + "\n")
+            sys.stderr.write(stamp() + self.tag + self.pending.decode("utf-8", "replace") + "\n")
             sys.stderr.flush()
             self.pending = b""
 

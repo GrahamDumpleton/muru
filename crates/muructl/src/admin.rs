@@ -255,6 +255,12 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "NAME")]
     user: Option<String>,
 
+    /// Put the full UTC time in front of every line on standard output
+    /// and standard error, for a supervisor that stamps nothing; instead
+    /// of the [logs] table's timestamps. Log files always carry the time.
+    #[arg(long)]
+    timestamps: bool,
+
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// version it ran before.
     #[arg(long, hide = true, value_name = "VERSION")]
@@ -301,6 +307,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         &overrides,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    muru_common::log::show_timestamps(args.timestamps || settings.timestamps);
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -5626,6 +5633,10 @@ pub struct LogsArgs {
     #[arg(long)]
     json: bool,
 
+    /// Leave off the UTC time each line starts with.
+    #[arg(long)]
+    no_timestamps: bool,
+
     #[command(flatten)]
     socket: SocketArgs,
 }
@@ -5679,9 +5690,13 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
         let line = line.map_err(explain)?;
 
         match (args.access, args.json) {
-            (true, false) => println!("{}", format_access_line(&line.line)),
+            (true, false) => println!("{}", format_access_line(&line.line, !args.no_timestamps)),
             (false, true) => println!("{}", serde_json::to_string(&line)?),
-            _ => println!("{}", line.line),
+            (true, true) => println!("{}", line.line),
+            (false, false) if args.no_timestamps => {
+                println!("{}", muru_common::log::split_time(&line.line).1);
+            }
+            (false, false) => println!("{}", line.line),
         }
     }
 
@@ -5712,9 +5727,10 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
 }
 
 /// An access log record as the compact line a development run prints,
-/// with the release, host, group and mount when the record names them.
-/// A line that is not a record is printed as it is.
-fn format_access_line(line: &str) -> String {
+/// with the release, host, group and mount when the record names them,
+/// starting with the record's full time unless `timed` is false. A line
+/// that is not a record is printed as it is.
+fn format_access_line(line: &str, timed: bool) -> String {
     let Ok(serde_json::Value::Object(record)) = serde_json::from_str::<serde_json::Value>(line)
     else {
         return line.to_owned();
@@ -5727,8 +5743,12 @@ fn format_access_line(line: &str) -> String {
     };
     let bytes =
         muru_edge::access::format_bytes(record.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0));
-    let time = text("time");
-    let clock = time.get(11..23).unwrap_or(time);
+
+    let time = if timed {
+        format!("{} ", text("time"))
+    } else {
+        String::new()
+    };
     let total = Duration::from_secs_f64(number("total_ms") / 1000.0);
 
     let total = if record.get("websocket").is_some_and(|v| !v.is_null()) {
@@ -5737,7 +5757,7 @@ fn format_access_line(line: &str) -> String {
         muru_edge::access::format_duration(total)
     };
     let mut out = format!(
-        "{clock} {} {} {} {bytes} {total}",
+        "{time}{} {} {} {bytes} {total}",
         number("status") as u64,
         text("method"),
         text("target"),

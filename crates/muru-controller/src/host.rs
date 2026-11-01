@@ -4,9 +4,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
+use muru_common::log::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -1310,12 +1311,18 @@ fn listening(socket: &Path) -> bool {
 async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
     let mut lines = BufReader::new(stream).lines();
 
+    let out = if to_stderr {
+        Stream::Stderr
+    } else {
+        Stream::Stdout
+    };
+
+    // Section 11.8: the time is when the line arrived here, put in front
+    // when the terminal asks for it with --timestamps.
+
     while let Ok(Some(line)) = lines.next_line().await {
-        if to_stderr {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
-        }
-        logs.push(line);
+        let time = SystemTime::now();
+        muru_common::log::relayed(out, time, &line);
+        logs.push(time, &line);
     }
 }

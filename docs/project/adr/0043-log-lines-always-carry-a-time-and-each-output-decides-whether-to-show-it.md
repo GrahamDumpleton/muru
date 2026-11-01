@@ -73,8 +73,11 @@ to show it.
   every line. Access lines keep their time: the short clock on a
   terminal, the full form otherwise.
 
-- **Files** Muru writes always carry the full form, with no setting to
-  leave it out. The access log file is JSON lines only.
+- **Files** always carry the full form, with no setting to leave it out.
+  A process decides by what its stream is: a regular file (a release's
+  log, `edge.log`, `daemon.log`, or output redirected to a file) is
+  stamped, a terminal or a pipe is not. The access log file is JSON
+  lines only.
 
 - **JSON records** carry the time as a `time` field, never as a prefix, in
   every kind of record.

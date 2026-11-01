@@ -52,6 +52,9 @@ pub struct NodeSettings {
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
     pub rotation: Option<crate::rotation::Policy>,
+    /// Whether the daemon's standard streams carry the time (`[logs]
+    /// timestamps`, section 11.8).
+    pub timestamps: bool,
     /// Section 13.3: what SIGTERM means, and how a shutdown runs.
     pub shutdown: crate::shutdown::Policy,
     /// The service user named by the `[daemon]` table or `--user`
@@ -157,6 +160,11 @@ impl NodeSettings {
             overlay_webhook,
             secrets,
             rotation,
+            timestamps: document
+                .logs
+                .as_ref()
+                .and_then(|logs| logs.timestamps)
+                .unwrap_or(false),
             shutdown,
             service_user: overrides
                 .user

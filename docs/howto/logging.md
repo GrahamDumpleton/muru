@@ -37,7 +37,9 @@ muru.worker[1].stdout: starting import of catalogue
 
 Lines from the host itself carry `muru.host[PID]:`, and lines from muructl
 start with `muru:`. Python's `logging` goes to standard error by default
-and so arrives tagged; nothing needs configuring.
+and so arrives tagged; nothing needs configuring. On the terminal these
+lines have no time in front; [times on log lines](#times-on-log-lines)
+says where they do and how to ask for one.
 
 ## Python logging
 
@@ -63,7 +65,7 @@ loggers = { urllib3 = "WARNING" }
 | Key | Default | Effect |
 | --- | --- | --- |
 | `level` | `WARNING`, Python's own | the root logger's level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
-| `format` | `standard` | `standard` writes `LEVEL logger: message`; `json` writes one object per record with the time, level, logger, message, application, release, group and worker, and the exception when there is one; anything else is a `logging` format string |
+| `format` | `standard` | `standard` writes `LEVEL logger: message`, with no time since Muru adds one where the output wants it; `json` writes one object per record with the time, level, logger, message, application, release, group and worker, and the exception when there is one; anything else is a `logging` format string |
 | `capture_warnings` | `false` | route `warnings.warn` through the `py.warnings` logger |
 | `loggers` | none | levels for named loggers |
 
@@ -89,10 +91,13 @@ logging.config.dictConfig(muru.logging.default_config())
 05:42:22.849 500 GET /error 334B 7.8ms queue=0.0ms app=0.0ms reason=app_error worker=0 id=01M5P6WZC1740HFT2N80MAV4YV
 ```
 
-Time, status, method, target, response size, total time, time spent
-waiting for a worker thread, time in the application, the reason when Muru
-generated the response, the worker, and the request id that the
-`X-Request-ID` response header and the error page carry too.
+The time the request arrived, status, method, target, response size,
+total time, time spent waiting for a worker thread, time in the
+application, the reason when Muru generated the response, the worker,
+and the request id that the `X-Request-ID` response header and the error
+page carry too. On a terminal the time is your local clock; when the
+output goes to a pipe or a file, or with `--timestamps`, it is the full
+UTC time, as in `2026-11-02T05:42:22.836Z 200 GET /hello ...`.
 
 A WebSocket has two lines with the same request id. The first is written
 when the application accepts it, with the 101 and the handshake's time;
@@ -156,6 +161,43 @@ closing line, where it holds `event` (`closed`), `by`, `code`, `close`
 and its `bytes` what was sent to the client. The compact line shows the group, the mount and
 the class (as `class=`) only when they are not `default`.
 
+## Times on log lines
+
+Every line gets a time when it is written, and where the line goes
+decides whether the time is shown:
+
+| Where lines go | Application and Muru lines | Access log lines |
+| --- | --- | --- |
+| A terminal | no time | your local clock, `05:42:22.836` |
+| A pipe, such as a container runtime or a supervisor collecting the output | no time, since the collector stamps each line itself | the full UTC time |
+| A file: the daemon's log directory, or output redirected with `>` | the full UTC time | the `time` field of each JSON line |
+
+The full time is RFC 3339 in UTC with milliseconds,
+`2026-11-02T05:42:22.836Z`, which sorts as text and reads the same on
+every machine. A JSON record carries it in its `time` field, never in
+front of the line.
+
+`--timestamps` on `muructl run` or `muructl daemon run` puts the full time
+in front of every line on the terminal or the pipe too, for a supervisor
+that adds none:
+
+```
+$ muructl run app:application --timestamps
+2026-11-02T05:42:22.410Z muru: serving app:application on http://127.0.0.1:8080 with 1 worker of 4 threads
+2026-11-02T05:42:22.836Z muru.worker[0]: WARNING demo: warned
+2026-11-02T05:42:22.840Z 200 GET /hello 18B 0.7ms queue=0.2ms app=0.3ms worker=0 id=01M5P6WZBK740HFT2N80MAV4YV
+```
+
+`timestamps = true` in the project's [run table](run-settings.md) does the
+same for every run of a checkout, and `--no-timestamps` turns it off for
+one. For the daemon, `timestamps = true` in its `[logs]` table does it,
+read when the daemon starts. Files carry the time whatever is set.
+
+An access line's time is when the request arrived, and any other line's
+is when Muru received it, so the access line of a slow request can carry
+an earlier time than lines written before it. An application that puts
+`%(asctime)s` in its own logging format gets two times in a file.
+
 ## Under the daemon
 
 The daemon writes everything to its log directory (`~/.local/state/muru/logs`
@@ -169,6 +211,8 @@ or `--log-dir`):
 | `edge.log` | the edge process's own output |
 | `daemon.log` | the daemon's output when started with `muructl daemon start` |
 
+Every line in these files starts with the full UTC time.
+
 `muructl logs APP` shows the last hundred lines of the application's
 current release, `muructl logs APP@RELEASE` a particular release's, and
 `muructl logs --access` the access log as compact lines (`--json` for the
@@ -177,11 +221,14 @@ records as written). `--lines N` changes how many lines come first and
 
 ```
 $ muructl logs shop --follow
-muru.host[4242]: release ready: 2 workers listening
-muru.worker[0].stdout: shop: served /catalogue
+2026-11-02T05:42:22.840Z muru.host[4242]: release ready: 2 workers listening
+2026-11-02T05:42:23.102Z muru.worker[0].stdout: shop: served /catalogue
 $ muructl logs --access --lines 1
-22:57:57.191 200 GET /catalogue 118B 1.2ms release=shop@r1 host=127.0.0.1 queue=0.1ms app=0.9ms worker=1 id=01M5P6WZBK740HFT2N80MAV4YV
+2026-11-02T05:42:23.101Z 200 GET /catalogue 118B 1.2ms release=shop@r1 host=127.0.0.1 queue=0.1ms app=0.9ms worker=1 id=01M5P6WZBK740HFT2N80MAV4YV
 ```
+
+`--no-timestamps` leaves the times off. The same command against a
+development run shows the run's lines with their times as well.
 
 ## Rotation
 

@@ -35,7 +35,7 @@ def worker_records(output: str) -> list[dict[str, Any]]:
 
     records = []
 
-    for line in output.splitlines():
+    for line in support.untimed(output).splitlines():
         prefix, separator, rest = line.partition(": ")
 
         if separator and prefix.startswith("muru.worker[") and rest.startswith("{"):

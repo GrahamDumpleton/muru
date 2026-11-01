@@ -112,8 +112,12 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
         # other number in the start-up lines from matching.
 
         assert server.get("/missing").status == 404
-        assert server.wait_for_log(" 404 GET /missing ")
-        assert not re.search(r"^\d\d:\d\d:\d\d\.\d{3} 200 ", server.log(), re.MULTILINE)
+        assert server.wait_for_log("404 GET /missing ")
+        assert not re.search(
+            r"^(?:\d{4}-\d\d-\d\dT)?\d\d:\d\d:\d\d\.\d{3}Z? 200 ",
+            server.timed_log(),
+            re.MULTILINE,
+        )
     finally:
         server.stop()
 

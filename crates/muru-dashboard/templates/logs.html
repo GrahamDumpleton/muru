@@ -1,3 +1,3 @@
 <h2>Logs</h2>
-<pre>{% for line in data.logs %}{{ line }}
+<pre>{% for line in data.logs %}{% if !line.time.is_empty() %}<time datetime="{{ line.time }}">{{ line.time }}</time> {% endif %}{{ line.text }}
 {% endfor %}</pre>
