@@ -70,5 +70,6 @@ MURU_* variables cannot be overridden by application or release settings.
 | MURU_NO_INIT | set to 1, muructl as a container's PID 1 runs the command itself instead of forking the built-in init (section 6.10), for images that bring tini or use `docker run --init` |
 | NO_COLOR | disable coloured output |
 | MURU_STATE_DIR, MURU_RUN_DIR, MURU_LOG_DIR, MURU_CACHE_DIR | override file locations (section 13.8) |
+| MURU_SERVE_CONFIG, MURU_SERVE_* | muructl serve's configuration file and one variable per setting, the flag's name in upper snake case (section 13.9) |
 | STATE_DIRECTORY, RUNTIME_DIRECTORY, LOGS_DIRECTORY, CACHE_DIRECTORY, CONFIGURATION_DIRECTORY | set by systemd from the unit's directory settings and used when present |
 | XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR, XDG_CACHE_HOME | user-mode defaults on Linux |
