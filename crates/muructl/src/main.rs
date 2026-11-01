@@ -12,9 +12,11 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod init;
+mod mcp;
 mod provision;
 mod pstats;
 mod run_admin;
+mod skill;
 mod watch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -110,6 +112,9 @@ enum Command {
 
         #[command(flatten)]
         socket: admin::SocketArgs,
+
+        #[command(flatten)]
+        output: admin::JsonArgs,
     },
 
     /// Take a release out of traffic and stop it.
@@ -119,6 +124,9 @@ enum Command {
 
         #[command(flatten)]
         socket: admin::SocketArgs,
+
+        #[command(flatten)]
+        output: admin::JsonArgs,
     },
 
     /// Run and control rollouts: canaries with gates, and blue/green.
@@ -158,6 +166,9 @@ enum Command {
     Status {
         #[command(flatten)]
         socket: admin::SocketArgs,
+
+        #[command(flatten)]
+        output: admin::JsonArgs,
     },
 
     /// Apply declarative configuration from a file or a directory of files.
@@ -205,6 +216,9 @@ enum Command {
 
         #[command(flatten)]
         socket: admin::SocketArgs,
+
+        #[command(flatten)]
+        output: admin::JsonArgs,
     },
 
     /// Show or follow a release's output or the access log, or reopen
@@ -215,11 +229,21 @@ enum Command {
     Metrics {
         #[command(flatten)]
         socket: admin::SocketArgs,
+
+        #[command(flatten)]
+        output: admin::JsonArgs,
     },
 
     /// Show the WebSockets open now: how many by endpoint, or each one
     /// with --list.
     Websockets(admin::WebSocketsArgs),
+
+    /// Serve muructl's operations to a coding agent over the Model Context
+    /// Protocol, and keep the skill a project carries for the agent.
+    Mcp {
+        #[command(subcommand)]
+        command: mcp::McpCommand,
+    },
 
     /// Serve a directory of files with no configuration,
     /// for a built front end or a documentation build.
@@ -790,8 +814,9 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let json = asks_for_json(std::env::args_os());
 
-    match cli.command {
+    let result = match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
         Command::Build(args) => runtime.block_on(provision::build(*args)),
         Command::Check(args) => runtime.block_on(check(*args)),
@@ -805,11 +830,15 @@ fn main() -> anyhow::Result<()> {
                     timeout,
                     socket,
                 } => admin::daemon_stop(socket, shutdown, timeout).await,
-                admin::DaemonCommand::Reload { socket } => admin::daemon_reload(socket).await,
+                admin::DaemonCommand::Reload { socket, output } => {
+                    admin::daemon_reload(socket, output.json).await
+                }
                 admin::DaemonCommand::Upgrade { timeout, socket } => {
                     admin::daemon_upgrade(socket, timeout).await
                 }
-                admin::DaemonCommand::Status { socket } => admin::daemon_status(socket).await,
+                admin::DaemonCommand::Status { socket, output } => {
+                    admin::daemon_status(socket, output.json).await
+                }
             }
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
@@ -820,43 +849,60 @@ fn main() -> anyhow::Result<()> {
         Command::Deploy(args) => runtime.block_on(admin::deploy(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
-                admin::AppCommand::List { socket } => admin::app_list(socket).await,
+                admin::AppCommand::List { socket, output } => {
+                    admin::app_list(socket, output.json).await
+                }
             }
         }),
         Command::Release { command } => runtime.block_on(async move {
             match command {
-                admin::ReleaseCommand::List { app, socket } => {
-                    admin::release_list(app, socket).await
-                }
-                admin::ReleaseCommand::Show { release, socket } => {
-                    admin::release_show(release, socket).await
-                }
+                admin::ReleaseCommand::List {
+                    app,
+                    socket,
+                    output,
+                } => admin::release_list(app, socket, output.json).await,
+                admin::ReleaseCommand::Show {
+                    release,
+                    socket,
+                    output,
+                } => admin::release_show(release, socket, output.json).await,
                 admin::ReleaseCommand::Wait {
                     release,
                     states,
                     timeout,
                     socket,
-                } => admin::release_wait(release, states, timeout, socket).await,
+                    output,
+                } => admin::release_wait(release, states, timeout, socket, output.json).await,
             }
         }),
         Command::Host {
-            command: admin::HostCommand::List { socket },
-        } => runtime.block_on(admin::host_list(socket)),
+            command: admin::HostCommand::List { socket, output },
+        } => runtime.block_on(admin::host_list(socket, output.json)),
         Command::Route {
-            command: admin::RouteCommand::List { socket },
-        } => runtime.block_on(admin::route_list(socket)),
+            command: admin::RouteCommand::List { socket, output },
+        } => runtime.block_on(admin::route_list(socket, output.json)),
         Command::Upstream {
-            command: admin::UpstreamCommand::List { socket },
-        } => runtime.block_on(admin::upstream_list(socket)),
-        Command::Rollback { app, socket } => runtime.block_on(admin::rollback(app, socket)),
-        Command::Drain { release, socket } => runtime.block_on(admin::drain(release, socket)),
+            command: admin::UpstreamCommand::List { socket, output },
+        } => runtime.block_on(admin::upstream_list(socket, output.json)),
+        Command::Rollback {
+            app,
+            socket,
+            output,
+        } => runtime.block_on(admin::rollback(app, socket, output.json)),
+        Command::Drain {
+            release,
+            socket,
+            output,
+        } => runtime.block_on(admin::drain(release, socket, output.json)),
         Command::Rollout { command } => runtime.block_on(admin::rollout(command)),
         Command::Scale(args) => runtime.block_on(admin::scale(args)),
         Command::Restart(args) => runtime.block_on(admin::restart(args)),
         Command::Maintenance { command } => runtime.block_on(admin::maintenance(command)),
         Command::Dashboard { command } => runtime.block_on(admin::dashboard(command)),
         Command::Overlay { command } => runtime.block_on(admin::overlay(command)),
-        Command::Status { socket } => runtime.block_on(admin::daemon_status(socket)),
+        Command::Status { socket, output } => {
+            runtime.block_on(admin::daemon_status(socket, output.json))
+        }
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
         Command::Config { command } => match command {
             admin::ConfigCommand::Export {
@@ -876,7 +922,8 @@ fn main() -> anyhow::Result<()> {
                 app,
                 effective,
                 socket,
-            } => runtime.block_on(admin::config_show(app, effective, socket)),
+                output,
+            } => runtime.block_on(admin::config_show(app, effective, socket, output.json)),
             admin::ConfigCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
@@ -885,21 +932,49 @@ fn main() -> anyhow::Result<()> {
             follow,
             after,
             socket,
-        } => runtime.block_on(admin::events(follow, after, socket)),
+            output,
+        } => runtime.block_on(admin::events(follow, after, socket, output.json)),
         Command::Logs(args) => runtime.block_on(async move {
             match args.command.clone() {
-                Some(admin::LogsCommand::Reopen { workers, socket }) => {
-                    admin::logs_reopen(workers, socket).await
-                }
+                Some(admin::LogsCommand::Reopen {
+                    workers,
+                    socket,
+                    output,
+                }) => admin::logs_reopen(workers, socket, output.json).await,
                 None => admin::logs(args).await,
             }
         }),
-        Command::Metrics { socket } => runtime.block_on(admin::metrics(socket)),
+        Command::Metrics { socket, output } => {
+            runtime.block_on(admin::metrics(socket, output.json))
+        }
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
+        Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
+    };
+
+    // A command asked for JSON fails in JSON too: the sentence muructl
+    // would print, on standard output, with the same exit status.
+
+    match result {
+        Err(error) if json => {
+            let failure = serde_json::json!({ "error": format!("{error:#}") });
+            println!("{}", serde_json::to_string_pretty(&failure)?);
+            std::process::exit(1)
+        }
+        other => other,
     }
+}
+
+/// Whether the command line gives --json, before any `--` that ends the
+/// options. Only commands that print JSON take the flag, so a command line
+/// clap accepted with it is one that asked for JSON.
+fn asks_for_json(arguments: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    arguments
+        .skip(1)
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--json")
 }
 
 /// Run a command whose result is an exit code (section 10.4: 0 for no
@@ -3299,5 +3374,62 @@ mod tests {
         }
 
         assert!(found.is_empty(), "{}", found.join("\n"));
+    }
+
+    #[test]
+    fn json_is_asked_for_only_before_the_end_of_options() {
+        let line = |words: &[&str]| {
+            words
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(super::asks_for_json(
+            line(&["muructl", "status", "--json"]).into_iter()
+        ));
+        assert!(!super::asks_for_json(
+            line(&["muructl", "status"]).into_iter()
+        ));
+        assert!(!super::asks_for_json(
+            line(&["muructl", "debug", "exec", "app", "--", "--json"]).into_iter()
+        ));
+    }
+
+    /// Every command that takes --json, as `muructl app list`.
+    fn commands_with_json(command: &clap::Command, path: &str, found: &mut Vec<String>) {
+        if command
+            .get_arguments()
+            .any(|argument| argument.get_id() == "json")
+        {
+            found.push(path.to_owned());
+        }
+
+        for sub in command.get_subcommands() {
+            commands_with_json(sub, &format!("{path} {}", sub.get_name()), found);
+        }
+    }
+
+    #[test]
+    fn the_json_reference_lists_every_command_with_json() {
+        let mut found = Vec::new();
+        commands_with_json(&Cli::command(), "muructl", &mut found);
+        found.sort();
+
+        // The table's first column names each command in backticks.
+
+        let page = include_str!("../../../docs/reference/json-output.md");
+        let mut listed: Vec<String> = page
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `muructl "))
+            .filter_map(|rest| rest.split_once('`'))
+            .map(|(command, _)| format!("muructl {command}"))
+            .collect();
+        listed.sort();
+
+        assert_eq!(
+            listed, found,
+            "docs/reference/json-output.md and the commands disagree"
+        );
     }
 }

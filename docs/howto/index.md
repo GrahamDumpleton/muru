@@ -51,4 +51,5 @@ metrics
 events
 systemd
 dashboard
+coding-agents
 ```

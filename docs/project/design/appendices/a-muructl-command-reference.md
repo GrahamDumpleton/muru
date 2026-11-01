@@ -9,7 +9,7 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output, --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
+Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output (the admin API's answer with its field names, JSON lines for streams, and `{"error": ...}` on failure, as the JSON output reference lists), --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
 
 | Group | Command | What it does | Section |
 | --- | --- | --- | --- |
@@ -23,6 +23,8 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Daemon | muructl daemon upgrade | Re-exec from the installed binary and replace edges | 13.4 |
 | Daemon | muructl daemon backup, restore | Save or load the state store | 13.5 |
 | Daemon | muructl up | Ensure a daemon is running for the current user or project | 13.2 |
+| Agents | muructl mcp serve | Serve the daemon's operations to a coding agent over MCP on standard input and output; each tool runs the matching command with --json. Flags: --up, --read-only, --allow TOOL,..., and the socket and location flags | 10.11 |
+| Agents | muructl mcp skill print, install, status | The skill a project carries for coding agents, embedded in muructl: print it, write or update it as muru/SKILL.md in the skills directory (--dir, default .claude/skills), or check the project's copy (exit 1 when missing or different) | 10.11 |
 | Daemon | muructl edge run | Internal, started by the daemon | 2.3 |
 | Configuration | muructl apply -f FILE or DIR | Apply declarative configuration. Flags: --dry-run, --check, --json, --save-plan FILE, --plan FILE, --prune | 10.4 |
 | Configuration | muructl config export | Export desired state. Flags: --app, --split, --full, --all-releases, --resolve-rollouts, --redact, --param, --format | 10.4 |

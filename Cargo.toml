@@ -66,6 +66,7 @@ pyo3 = { version = "0.30", features = ["extension-module"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 regex = "1"
 ring = "0.17"
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-io"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }

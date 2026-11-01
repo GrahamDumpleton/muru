@@ -83,6 +83,14 @@ impl LocationArgs {
     }
 }
 
+/// Whether a command prints the daemon's answer as JSON instead of text.
+#[derive(Args, Clone, Copy, Default)]
+pub struct JsonArgs {
+    /// Print the answer as JSON, with the admin API's field names.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// How to reach a daemon or a development run: its admin socket.
 #[derive(Args, Clone, Default)]
 pub struct SocketArgs {
@@ -97,6 +105,23 @@ pub struct SocketArgs {
 }
 
 impl SocketArgs {
+    /// The same options, for a muructl command run on this one's behalf,
+    /// which then reaches the same daemon.
+    pub fn as_arguments(&self) -> Vec<String> {
+        let mut arguments = self
+            .socket
+            .iter()
+            .flat_map(|socket| ["--socket".to_owned(), socket.display().to_string()])
+            .collect::<Vec<_>>();
+        arguments.extend(self.locations.as_arguments());
+        arguments
+    }
+
+    /// The location options alone, for `muructl up`.
+    pub fn location_arguments(&self) -> Vec<String> {
+        self.locations.as_arguments()
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a development run's from this project, else the
     /// daemon's when it listens, else the one run listening; several runs
@@ -176,6 +201,9 @@ pub enum DaemonCommand {
     Reload {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Re-execute the daemon from the installed muructl and replace the
@@ -195,6 +223,9 @@ pub enum DaemonCommand {
     Status {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -767,6 +798,9 @@ pub enum LoggingCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -1285,6 +1319,7 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
         reset,
         worker,
         socket,
+        output,
     } = command;
 
     if reset {
@@ -1296,6 +1331,10 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             serde_json::json!({"reset": true}),
         )
         .await?;
+
+        if output.json {
+            return print_answer(&[debug_json(&response)]);
+        }
 
         for answer in &response.workers {
             match parse_result(answer) {
@@ -1325,6 +1364,10 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // With --json, one debug answer for each logger set, as one array.
+
+    let mut answers = Vec::new();
+
     for setting in levels {
         let (name, level) = setting.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("{setting:?} is not NAME=LEVEL, for example myapp=DEBUG")
@@ -1335,6 +1378,11 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
             "duration_s": duration.map(|duration| duration.as_secs_f64()),
         });
         let response = ask(&socket, &target, "logging", worker, args).await?;
+
+        if output.json {
+            answers.push(debug_json(&response));
+            continue;
+        }
 
         for answer in &response.workers {
             match parse_result(answer) {
@@ -1355,6 +1403,10 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
                 ),
             }
         }
+    }
+
+    if output.json {
+        return print_answer(&answers);
     }
 
     Ok(())
@@ -1427,6 +1479,15 @@ fn parse_result(answer: &pb::WorkerDebug) -> Option<serde_json::Value> {
 }
 
 fn print_json(response: &pb::DebugResponse) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&debug_json(response)).unwrap_or_default()
+    );
+}
+
+/// A debug answer as JSON: the release, and each worker's answer with its
+/// result parsed.
+fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
     let workers: Vec<serde_json::Value> = response
         .workers
         .iter()
@@ -1440,14 +1501,10 @@ fn print_json(response: &pb::DebugResponse) {
             })
         })
         .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "release": response.release,
-            "workers": workers,
-        }))
-        .unwrap_or_default()
-    );
+    serde_json::json!({
+        "release": response.release,
+        "workers": workers,
+    })
 }
 
 fn print_status(response: &pb::DebugResponse) {
@@ -1681,15 +1738,123 @@ fn print_inspect(response: &pb::DebugResponse) {
 }
 
 /// Print the node's metrics as Prometheus text.
-pub async fn metrics(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn metrics(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
     let text = client
         .get_metrics(pb::GetMetricsRequest {})
         .await?
         .into_inner()
         .text;
+
+    if json {
+        return print_answer(&serde_json::json!({ "samples": metric_samples(&text) }));
+    }
+
     print!("{text}");
     Ok(())
+}
+
+/// The samples of a Prometheus text exposition as JSON objects: each with
+/// its metric name, the type its family declares, its labels and its
+/// value. A value JSON cannot hold (NaN, +Inf, -Inf) is kept as text.
+pub fn metric_samples(text: &str) -> Vec<serde_json::Value> {
+    let mut types = std::collections::HashMap::new();
+    let mut samples = Vec::new();
+
+    for line in text.lines().map(str::trim) {
+        if let Some(declared) = line.strip_prefix("# TYPE ") {
+            if let Some((family, kind)) = declared.split_once(' ') {
+                types.insert(family.to_owned(), kind.trim().to_owned());
+            }
+
+            continue;
+        }
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((name, labels, rest)) = split_sample(line) else {
+            continue;
+        };
+        let value = rest.split_whitespace().next().unwrap_or_default();
+        let value = value
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map_or_else(|| serde_json::Value::from(value), serde_json::Value::Number);
+
+        // A histogram's or summary's series belong to the family their
+        // suffix names.
+
+        let family = ["_bucket", "_sum", "_count", "_total"]
+            .iter()
+            .find_map(|suffix| {
+                name.strip_suffix(suffix)
+                    .filter(|base| types.contains_key(*base))
+            })
+            .unwrap_or(name);
+
+        samples.push(serde_json::json!({
+            "name": name,
+            "type": types.get(family).map_or("untyped", String::as_str),
+            "labels": labels,
+            "value": value,
+        }));
+    }
+
+    samples
+}
+
+/// A sample line's metric name, its labels, and what follows them (the
+/// value and an optional timestamp).
+fn split_sample(line: &str) -> Option<(&str, serde_json::Map<String, serde_json::Value>, &str)> {
+    let Some(open) = line.find('{') else {
+        let (name, rest) = line.split_once(char::is_whitespace)?;
+        return Some((name, serde_json::Map::new(), rest));
+    };
+    let name = &line[..open];
+    let mut labels = serde_json::Map::new();
+    let mut chars = line[open + 1..].char_indices();
+
+    // Label values are quoted, with \\, \" and \n escaped.
+
+    loop {
+        let (start, first) = chars
+            .by_ref()
+            .find(|(_, c)| !c.is_whitespace() && *c != ',')?;
+
+        if first == '}' {
+            let rest = &line[open + 1 + start + 1..];
+            return Some((name, labels, rest));
+        }
+
+        let mut key = String::from(first);
+
+        for (_, c) in chars.by_ref() {
+            if c == '=' {
+                break;
+            }
+
+            key.push(c);
+        }
+
+        chars.by_ref().find(|(_, c)| *c == '"')?;
+        let mut value = String::new();
+
+        while let Some((_, c)) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => match chars.next()?.1 {
+                    'n' => value.push('\n'),
+                    other => value.push(other),
+                },
+                other => value.push(other),
+            }
+        }
+
+        labels.insert(key.trim().to_owned(), serde_json::Value::from(value));
+    }
 }
 
 /// What `muructl websockets` shows.
@@ -1709,6 +1874,9 @@ pub struct WebSocketsArgs {
 
     #[command(flatten)]
     pub socket: SocketArgs,
+
+    #[command(flatten)]
+    pub output: JsonArgs,
 }
 
 /// Show the WebSockets open now: counted by endpoint, where segments
@@ -1723,6 +1891,10 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
         .await
         .map_err(explain)?
         .into_inner();
+
+    if args.output.json {
+        return print_answer(&list);
+    }
 
     if list.open == 0 {
         println!("no WebSockets open");
@@ -1780,24 +1952,33 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
 }
 
 /// Re-read the daemon's configuration file.
-pub async fn daemon_reload(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn daemon_reload(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
     let response = client
         .reload_config(pb::ReloadConfigRequest {})
         .await
         .map_err(|status| anyhow::anyhow!("{}", status.message()))?
         .into_inner();
+
+    if json {
+        return print_answer(&response);
+    }
+
     println!("muru: {}", response.message);
     Ok(())
 }
 
 /// Show the daemon's status.
-pub async fn daemon_status(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
     let status = client
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
+
+    if json {
+        return print_answer(&status);
+    }
 
     // A development run says what it runs and from where; it has no
     // state directory, edge process or budget of its own.
@@ -2038,6 +2219,9 @@ pub struct DeployArgs {
     #[command(flatten)]
     socket: SocketArgs,
 
+    #[command(flatten)]
+    output: JsonArgs,
+
     /// The command of a managed server, after `--`, with `{bind}` where
     /// it takes its address; without `{bind}` the profile adds the
     /// server's own flags.
@@ -2108,6 +2292,9 @@ pub enum SecretCommand {
 
         #[command(flatten)]
         locations: LocationArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Remove a key from a file store.
@@ -2129,7 +2316,9 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
         SecretCommand::Set {
             store, locations, ..
         }
-        | SecretCommand::List { store, locations }
+        | SecretCommand::List {
+            store, locations, ..
+        }
         | SecretCommand::Remove {
             store, locations, ..
         } => (store.clone(), locations.resolve()),
@@ -2186,7 +2375,7 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
             }
             println!("muru: secret {store}/{key} set");
         }
-        SecretCommand::List { .. } => {
+        SecretCommand::List { output, .. } => {
             let mut keys: Vec<String> = match std::fs::read_dir(&directory) {
                 Ok(entries) => entries
                     .flatten()
@@ -2200,6 +2389,13 @@ pub async fn secret(command: SecretCommand) -> anyhow::Result<()> {
             };
 
             keys.sort();
+
+            // The store is read here rather than asked of the daemon, so
+            // its JSON is the store's name and keys.
+
+            if output.json {
+                return print_answer(&serde_json::json!({ "store": store, "keys": keys }));
+            }
 
             if keys.is_empty() {
                 println!("no secrets in {store}");
@@ -2405,6 +2601,10 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<()> {
     };
     let release = client.deploy(request).await.map_err(explain)?.into_inner();
 
+    if args.output.json {
+        return print_answer(&release);
+    }
+
     if args.no_wait {
         println!(
             "muru: release {}@{} recorded ({})",
@@ -2494,6 +2694,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Move all of the application's traffic to a release now and drain
@@ -2509,6 +2712,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Show the rollouts, of one application or of all.
@@ -2523,6 +2729,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Hold the application's rollout at its current step.
@@ -2532,6 +2741,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Continue a paused rollout, or approve its next step.
@@ -2541,6 +2753,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Give the candidate all the traffic now and end the rollout.
@@ -2555,6 +2770,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Take the candidate out of traffic now and end the rollout.
@@ -2564,6 +2782,9 @@ pub enum RolloutCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -2621,6 +2842,9 @@ pub struct ScaleArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// The `muructl scale` subcommands.
@@ -2636,6 +2860,9 @@ pub enum ScaleCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -2678,6 +2905,9 @@ pub struct RestartArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// How long `restart` waits for a replacement to serve and the old
@@ -2747,6 +2977,11 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         anyhow::bail!("{release} has no serving worker{group}");
     }
 
+    // With --json, one object for each worker replaced, printed together
+    // at the end.
+
+    let mut replaced = Vec::new();
+
     for (index, pid) in chosen {
         let response = ask(
             &args.socket,
@@ -2766,14 +3001,35 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
             .and_then(|result| result["new_pid"].as_u64())
             .unwrap_or_default();
         let how = if args.force { ", killed at once" } else { "" };
-        println!("muru: worker {index} (pid {pid}) is being replaced by pid {new_pid}{how}");
 
-        if args.no_wait {
-            continue;
+        if !args.output.json {
+            println!("muru: worker {index} (pid {pid}) is being replaced by pid {new_pid}{how}");
         }
 
-        let served_by = wait_restarted(&args, index, pid).await?;
-        println!("muru: worker {index} is served by pid {served_by}; pid {pid} has stopped");
+        let served_by = match args.no_wait {
+            true => None,
+            false => Some(wait_restarted(&args, index, pid).await?),
+        };
+
+        match (args.output.json, served_by) {
+            (true, _) => replaced.push(serde_json::json!({
+                "index": index,
+                "pid": pid,
+                "new_pid": new_pid,
+                "forced": args.force,
+                "served_by": served_by,
+            })),
+            (false, Some(served_by)) => {
+                println!(
+                    "muru: worker {index} is served by pid {served_by}; pid {pid} has stopped"
+                );
+            }
+            (false, None) => {}
+        }
+    }
+
+    if args.output.json {
+        return print_answer(&serde_json::json!({ "release": release, "workers": replaced }));
     }
 
     Ok(())
@@ -2821,7 +3077,12 @@ async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow:
 
 /// Pin or release a group's count, or show the autoscaler's state.
 pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
-    if let Some(ScaleCommand::Status { target, socket }) = args.command {
+    if let Some(ScaleCommand::Status {
+        target,
+        socket,
+        output,
+    }) = args.command
+    {
         let (app, release) = split_target(&target)?;
         let mut client = client::connect(&socket.socket()?).await?;
         let status = client
@@ -2832,6 +3093,11 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
             .await
             .map_err(explain)?
             .into_inner();
+
+        if output.json {
+            return print_answer(&status);
+        }
+
         print_scale_status(&status);
         return Ok(());
     }
@@ -2871,6 +3137,10 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
         .await
         .map_err(explain)?
         .into_inner();
+
+    if args.output.json {
+        return print_answer(&status);
+    }
 
     if let Some(floor) = args.min_workers {
         println!(
@@ -3014,6 +3284,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             wait,
             override_freeze,
             socket,
+            output,
         } => {
             let (app, id) = split_release(&release)?;
             let mut client = client::connect(&socket.socket()?).await?;
@@ -3041,6 +3312,17 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            // With --json, the rollout as it finished when waited for,
+            // else as it started.
+
+            if output.json {
+                return match wait {
+                    true => print_answer(&wait_rollout(&mut client, app, &rollout.id).await?),
+                    false => print_answer(&rollout),
+                };
+            }
+
             println!(
                 "muru: rollout {} of {}@{} started against {}: {}",
                 rollout.id, rollout.app, rollout.candidate, rollout.baseline, rollout.message
@@ -3060,6 +3342,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             release,
             override_freeze,
             socket,
+            output,
         } => {
             let (app, id) = split_release(&release)?;
             let mut client = client::connect(&socket.socket()?).await?;
@@ -3072,13 +3355,23 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            if output.json {
+                return print_answer(&release);
+            }
+
             println!(
                 "muru: release {}@{} is {} and serving",
                 release.app, release.id, release.state
             );
             Ok(())
         }
-        RolloutCommand::Status { app, wait, socket } => {
+        RolloutCommand::Status {
+            app,
+            wait,
+            socket,
+            output,
+        } => {
             let mut client = client::connect(&socket.socket()?).await?;
 
             if wait {
@@ -3086,6 +3379,11 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                     anyhow::bail!("--wait needs an application");
                 };
                 let finished = wait_rollout(&mut client, &app, "").await?;
+
+                if output.json {
+                    return print_answer(&finished);
+                }
+
                 println!(
                     "muru: rollout {} {}: {}",
                     finished.id, finished.state, finished.message
@@ -3093,14 +3391,19 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let rollouts = client
+            let answer = client
                 .list_rollouts(pb::ListRolloutsRequest {
                     app: app.unwrap_or_default(),
                 })
                 .await
                 .map_err(explain)?
-                .into_inner()
-                .rollouts;
+                .into_inner();
+
+            if output.json {
+                return print_answer(&answer);
+            }
+
+            let rollouts = answer.rollouts;
 
             if rollouts.is_empty() {
                 println!("no rollouts");
@@ -3127,7 +3430,11 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
 
             Ok(())
         }
-        RolloutCommand::Pause { app, socket } => {
+        RolloutCommand::Pause {
+            app,
+            socket,
+            output,
+        } => {
             let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .pause_rollout(pb::RolloutControlRequest {
@@ -3137,13 +3444,22 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            if output.json {
+                return print_answer(&rollout);
+            }
+
             println!(
                 "muru: rollout {} {}: {}",
                 rollout.id, rollout.state, rollout.message
             );
             Ok(())
         }
-        RolloutCommand::Resume { app, socket } => {
+        RolloutCommand::Resume {
+            app,
+            socket,
+            output,
+        } => {
             let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .resume_rollout(pb::RolloutControlRequest {
@@ -3153,6 +3469,11 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            if output.json {
+                return print_answer(&rollout);
+            }
+
             println!(
                 "muru: rollout {} {}: {}",
                 rollout.id, rollout.state, rollout.message
@@ -3163,6 +3484,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             app,
             override_freeze,
             socket,
+            output,
         } => {
             let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
@@ -3173,13 +3495,22 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            if output.json {
+                return print_answer(&rollout);
+            }
+
             println!(
                 "muru: rollout {} {}: {}",
                 rollout.id, rollout.state, rollout.message
             );
             Ok(())
         }
-        RolloutCommand::Abort { app, socket } => {
+        RolloutCommand::Abort {
+            app,
+            socket,
+            output,
+        } => {
             let mut client = client::connect(&socket.socket()?).await?;
             let rollout = client
                 .abort_rollout(pb::RolloutControlRequest {
@@ -3189,6 +3520,11 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            if output.json {
+                return print_answer(&rollout);
+            }
+
             println!(
                 "muru: rollout {} {}: {}",
                 rollout.id, rollout.state, rollout.message
@@ -3239,17 +3575,22 @@ pub enum AppCommand {
     List {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// List applications.
-pub async fn app_list(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
-    let apps = client
-        .list_apps(pb::ListAppsRequest {})
-        .await?
-        .into_inner()
-        .apps;
+    let answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    let apps = answer.apps;
 
     if apps.is_empty() {
         println!("no applications");
@@ -3299,6 +3640,9 @@ pub enum OverlayCommand {
     List {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Apply an overlay now, until ended, or for a time.
@@ -3321,6 +3665,9 @@ pub enum OverlayCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Stop applying an overlay; one its schedule activated stays ended
@@ -3331,6 +3678,9 @@ pub enum OverlayCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// What activating an overlay now would change.
@@ -3340,6 +3690,9 @@ pub enum OverlayCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Fold an active overlay's changes into the base configuration and
@@ -3350,20 +3703,33 @@ pub enum OverlayCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// List, activate, end, preview or promote overlays.
 pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
-    let (name, action, until, socket) = match command {
-        OverlayCommand::List { socket } => return list_overlays(&socket).await,
-        OverlayCommand::Preview { name, socket } => {
+    let (name, action, until, socket, json) = match command {
+        OverlayCommand::List { socket, output } => {
+            return list_overlays(&socket, output.json).await;
+        }
+        OverlayCommand::Preview {
+            name,
+            socket,
+            output,
+        } => {
             let mut client = client::connect(&socket.socket()?).await?;
             let preview = client
                 .preview_overlay(pb::PreviewOverlayRequest { name: name.clone() })
                 .await
                 .map_err(explain)?
                 .into_inner();
+
+            if output.json {
+                return print_answer(&preview);
+            }
 
             if preview.changes.is_empty() {
                 println!("muru: activating overlay {name} would change nothing now");
@@ -3381,6 +3747,7 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
             until,
             timezone,
             socket,
+            output,
         } => {
             let until = match (duration, until) {
                 (Some(duration), _) => Some(now_unix_ms() + duration.as_millis() as u64),
@@ -3392,10 +3759,18 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
                 (None, None) => None,
             };
 
-            (name, "activate", until, socket)
+            (name, "activate", until, socket, output.json)
         }
-        OverlayCommand::End { name, socket } => (name, "end", None, socket),
-        OverlayCommand::Promote { name, socket } => (name, "promote", None, socket),
+        OverlayCommand::End {
+            name,
+            socket,
+            output,
+        } => (name, "end", None, socket, output.json),
+        OverlayCommand::Promote {
+            name,
+            socket,
+            output,
+        } => (name, "promote", None, socket, output.json),
     };
 
     let mut client = client::connect(&socket.socket()?).await?;
@@ -3408,6 +3783,11 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&response);
+    }
+
     println!(
         "muru: overlay {name} {}{}",
         response.message,
@@ -3418,14 +3798,19 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_overlays(socket: &SocketArgs) -> anyhow::Result<()> {
+async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
-    let overlays = client
+    let answer = client
         .list_overlays(pb::ListOverlaysRequest {})
         .await
         .map_err(explain)?
-        .into_inner()
-        .overlays;
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    let overlays = answer.overlays;
 
     if overlays.is_empty() {
         println!("muru: no overlays are declared");
@@ -3475,6 +3860,9 @@ pub enum MaintenanceCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Serve the application as usual again.
@@ -3484,14 +3872,25 @@ pub enum MaintenanceCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// Turn maintenance mode on or off.
 pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
-    let (app, on, socket) = match command {
-        MaintenanceCommand::On { app, socket } => (app, true, socket),
-        MaintenanceCommand::Off { app, socket } => (app, false, socket),
+    let (app, on, socket, json) = match command {
+        MaintenanceCommand::On {
+            app,
+            socket,
+            output,
+        } => (app, true, socket, output.json),
+        MaintenanceCommand::Off {
+            app,
+            socket,
+            output,
+        } => (app, false, socket, output.json),
     };
 
     let mut client = client::connect(&socket.socket()?).await?;
@@ -3500,6 +3899,10 @@ pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&status);
+    }
 
     if status.on {
         println!(
@@ -3536,6 +3939,9 @@ pub enum DashboardCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -3546,6 +3952,7 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
         token,
         url,
         socket,
+        output,
     } = command;
     let mut client = client::connect(&socket.socket()?).await?;
     let link = client
@@ -3553,6 +3960,10 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
         .await
         .map_err(explain)?
         .into_inner();
+
+    if output.json {
+        return print_answer(&link);
+    }
 
     if token {
         println!("{}", link.token);
@@ -3581,17 +3992,25 @@ pub enum HostCommand {
     List {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// List virtual hosts.
-pub async fn host_list(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
-    let hosts = client
+    let answer = client
         .list_hosts(pb::ListHostsRequest {})
         .await?
-        .into_inner()
-        .hosts;
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    let hosts = answer.hosts;
 
     if hosts.is_empty() {
         println!("no virtual hosts");
@@ -3633,17 +4052,25 @@ pub enum UpstreamCommand {
     List {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// List HTTP upstreams.
-pub async fn upstream_list(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
-    let upstreams = client
+    let answer = client
         .list_upstreams(pb::ListUpstreamsRequest {})
         .await?
-        .into_inner()
-        .upstreams;
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    let upstreams = answer.upstreams;
 
     if upstreams.is_empty() {
         println!("no upstreams");
@@ -3684,17 +4111,25 @@ pub enum RouteCommand {
     List {
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// List routes.
-pub async fn route_list(socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
-    let routes = client
+    let answer = client
         .list_routes(pb::ListRoutesRequest {})
         .await?
-        .into_inner()
-        .routes;
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    let routes = answer.routes;
 
     if routes.is_empty() {
         println!("no routes");
@@ -3805,6 +4240,9 @@ pub enum ReleaseCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Show a release: its source and settings, and the mounts and
@@ -3815,6 +4253,9 @@ pub enum ReleaseCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Wait until a release reaches a state.
@@ -3832,19 +4273,31 @@ pub enum ReleaseCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 /// List releases.
-pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn release_list(
+    app: Option<String>,
+    socket: SocketArgs,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
-    let releases = client
+    let answer = client
         .list_releases(pb::ListReleasesRequest {
             app: app.unwrap_or_default(),
         })
         .await?
-        .into_inner()
-        .releases;
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    let releases = answer.releases;
 
     if releases.is_empty() {
         println!("no releases");
@@ -3879,7 +4332,7 @@ pub async fn release_list(app: Option<String>, socket: SocketArgs) -> anyhow::Re
 }
 
 /// Show one release.
-pub async fn release_show(release: String, socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.socket()?).await?;
     let release = client
@@ -3890,6 +4343,10 @@ pub async fn release_show(release: String, socket: SocketArgs) -> anyhow::Result
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&release);
+    }
 
     for (key, value) in release_details(&release) {
         println!("{key:<12} {value}");
@@ -4179,6 +4636,7 @@ pub async fn release_wait(
     states: Vec<String>,
     timeout: u64,
     socket: SocketArgs,
+    json: bool,
 ) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.socket()?).await?;
@@ -4193,6 +4651,10 @@ pub async fn release_wait(
         .map_err(explain)?
         .into_inner();
 
+    if json {
+        return print_answer(&release);
+    }
+
     println!(
         "muru: release {}@{} is {}",
         release.app, release.id, release.state
@@ -4206,13 +4668,17 @@ pub async fn release_wait(
 }
 
 /// Roll an application back to its previous release.
-pub async fn rollback(app: String, socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn rollback(app: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
     let release = client
         .rollback(pb::RollbackRequest { app })
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&release);
+    }
 
     println!(
         "muru: rolled back to {}@{} ({})",
@@ -4222,7 +4688,7 @@ pub async fn rollback(app: String, socket: SocketArgs) -> anyhow::Result<()> {
 }
 
 /// Drain a release.
-pub async fn drain(release: String, socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn drain(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.socket()?).await?;
     let release = client
@@ -4233,6 +4699,10 @@ pub async fn drain(release: String, socket: SocketArgs) -> anyhow::Result<()> {
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&release);
+    }
 
     println!(
         "muru: release {}@{} is {}",
@@ -4287,7 +4757,7 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
         .into_inner();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+        print_answer(&report)?;
     } else {
         print_report(&report, args.dry_run);
     }
@@ -4333,6 +4803,9 @@ pub enum ConfigCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 
     /// Compare a file, or a directory of files, with desired state.
@@ -4395,6 +4868,7 @@ pub async fn config_show(
     app: Option<String>,
     effective: bool,
     socket: SocketArgs,
+    json: bool,
 ) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
     let export = client
@@ -4407,6 +4881,10 @@ pub async fn config_show(
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&export);
+    }
 
     if !effective {
         print!("{}", export.document);
@@ -4461,7 +4939,7 @@ pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyho
         .into_inner();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+        print_answer(&report)?;
     } else {
         print_report(&report, true);
     }
@@ -4696,22 +5174,6 @@ fn exit_code(report: &pb::ConfigReport, planning: bool) -> i32 {
     0
 }
 
-fn report_json(report: &pb::ConfigReport) -> serde_json::Value {
-    serde_json::json!({
-        "errors": report.errors,
-        "warnings": report.warnings,
-        "notes": report.notes,
-        "changes": report.changes.iter().map(|change| serde_json::json!({
-            "action": change.action,
-            "subject": change.subject,
-            "detail": change.detail,
-            "outcome": change.outcome,
-        })).collect::<Vec<_>>(),
-        "unchanged": report.unchanged,
-        "applied": report.applied,
-    })
-}
-
 /// The time now, as Unix milliseconds.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -4737,23 +5199,33 @@ fn format_time(unix_ms: u64) -> String {
 }
 
 /// Show or follow the events.
-pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn events(
+    follow: bool,
+    after: u64,
+    socket: SocketArgs,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
 
     if !follow {
-        let events = client
+        let answer = client
             .list_events(pb::ListEventsRequest { after, limit: 200 })
             .await
             .map_err(explain)?
-            .into_inner()
-            .events;
+            .into_inner();
 
-        for event in events {
+        if json {
+            return print_answer(&answer);
+        }
+
+        for event in answer.events {
             println!("{}", format_event(&event));
         }
 
         return Ok(());
     }
+
+    // Followed, each event is a line of its own: JSON lines with --json.
 
     let mut stream = client
         .watch_events(pb::WatchEventsRequest { after })
@@ -4762,7 +5234,13 @@ pub async fn events(follow: bool, after: u64, socket: SocketArgs) -> anyhow::Res
         .into_inner();
 
     while let Some(event) = stream.next().await {
-        println!("{}", format_event(&event?));
+        let event = event?;
+
+        if json {
+            println!("{}", serde_json::to_string(&event)?);
+        } else {
+            println!("{}", format_event(&event));
+        }
     }
 
     Ok(())
@@ -4793,8 +5271,9 @@ pub struct LogsArgs {
     #[arg(long)]
     access: bool,
 
-    /// Print access log records as the JSON lines they are kept as.
-    #[arg(long, requires = "access")]
+    /// Print each line as JSON: a release's output as the admin API's
+    /// log lines, access log records as the JSON lines they are kept as.
+    #[arg(long)]
     json: bool,
 
     #[command(flatten)]
@@ -4813,6 +5292,9 @@ pub enum LogsCommand {
 
         #[command(flatten)]
         socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -4840,13 +5322,16 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
         .map_err(explain)?
         .into_inner();
 
-    while let Some(line) = stream.next().await {
-        let line = line.map_err(explain)?.line;
+    // Access log records are kept as JSON lines already; a release's
+    // output becomes JSON lines of the admin API's log lines.
 
-        if args.access && !args.json {
-            println!("{}", format_access_line(&line));
-        } else {
-            println!("{line}");
+    while let Some(line) = stream.next().await {
+        let line = line.map_err(explain)?;
+
+        match (args.access, args.json) {
+            (true, false) => println!("{}", format_access_line(&line.line)),
+            (false, true) => println!("{}", serde_json::to_string(&line)?),
+            _ => println!("{}", line.line),
         }
     }
 
@@ -4854,13 +5339,18 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
 }
 
 /// Reopen every log file after an external rotation.
-pub async fn logs_reopen(workers: bool, socket: SocketArgs) -> anyhow::Result<()> {
+pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
     let reopened = client
         .reopen_logs(pb::ReopenLogsRequest { workers })
         .await
         .map_err(explain)?
         .into_inner();
+
+    if json {
+        return print_answer(&reopened);
+    }
+
     println!(
         "muru: reopened the log files: {}{} host{}{}",
         if reopened.edge { "the edge and " } else { "" },
@@ -4977,6 +5467,13 @@ fn or_dash(text: &str) -> &str {
     if text.is_empty() { "-" } else { text }
 }
 
+/// Print an answer as indented JSON, with the admin API's field names:
+/// what `--json` prints.
+pub fn print_answer<T: serde::Serialize>(answer: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(answer)?);
+    Ok(())
+}
+
 /// A gRPC status as a plain sentence.
 fn explain(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
@@ -4997,4 +5494,43 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metric_samples;
+
+    #[test]
+    fn metric_samples_carry_names_types_labels_and_values() {
+        let text = "\
+# HELP muru_requests_total Requests answered.
+# TYPE muru_requests_total counter
+muru_requests_total{app=\"shop\",status=\"200\"} 42
+# TYPE muru_request_seconds histogram
+muru_request_seconds_bucket{le=\"+Inf\"} 7
+muru_request_seconds_count 7
+up 1 1700000000000
+";
+        let samples = metric_samples(text);
+
+        assert_eq!(samples.len(), 4);
+        assert_eq!(samples[0]["name"], "muru_requests_total");
+        assert_eq!(samples[0]["type"], "counter");
+        assert_eq!(samples[0]["labels"]["status"], "200");
+        assert_eq!(samples[0]["value"], 42.0);
+        assert_eq!(samples[1]["type"], "histogram");
+        assert_eq!(samples[1]["labels"]["le"], "+Inf");
+        assert_eq!(samples[2]["type"], "histogram");
+        assert_eq!(samples[3]["type"], "untyped");
+        assert_eq!(samples[3]["value"], 1.0);
+    }
+
+    #[test]
+    fn label_values_unescape_and_values_json_cannot_hold_stay_text() {
+        let samples = metric_samples("odd{path=\"a\\\"b\\\\c\\nd\",x=\"1\"} NaN\n");
+
+        assert_eq!(samples[0]["labels"]["path"], "a\"b\\c\nd");
+        assert_eq!(samples[0]["labels"]["x"], "1");
+        assert_eq!(samples[0]["value"], "NaN");
+    }
 }
