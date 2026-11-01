@@ -300,7 +300,7 @@ mod tests {
         let list = directory.path().join("ai.txt");
         std::fs::write(&list, "# AI crawlers\nGPTBot\n\n  ClaudeBot  \n").unwrap();
         let classes = vec![ClientClass {
-            name: "ai_crawler".to_owned(),
+            name: "ai-crawler".to_owned(),
             user_agent: vec!["CCBot".to_owned()],
             user_agent_list: Some("ai.txt".to_owned()),
             ..ClientClass::default()
@@ -342,7 +342,7 @@ mod tests {
                 ..ClientClass::default()
             },
             ClientClass {
-                name: "ai_crawler".to_owned(),
+                name: "ai-crawler".to_owned(),
                 user_agent_list: Some("ai.txt".to_owned()),
                 ..ClientClass::default()
             },
@@ -379,7 +379,7 @@ mod tests {
             name: "muru_rate_limited_total".to_owned(),
             labels: vec![
                 ("limit".to_owned(), "crawlers".to_owned()),
-                ("client_class".to_owned(), "ai_crawler".to_owned()),
+                ("client_class".to_owned(), "ai-crawler".to_owned()),
                 ("action".to_owned(), action.to_owned()),
             ],
             value,

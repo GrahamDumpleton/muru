@@ -23,17 +23,17 @@ request that matches none is class `default`.
 
 ```toml
 [[client_class]]
-name = 'search_bot_verified'
+name = 'search-bot-verified'
 user_agent = ['Googlebot', 'bingbot', 'DuckDuckBot', 'Applebot']
 verify = 'dns'
 verify_domains = ['googlebot.com', 'google.com', 'search.msn.com', 'duckduckgo.com', 'applebot.apple.com']
 
 [[client_class]]
-name = 'ai_crawler'
+name = 'ai-crawler'
 user_agent_list = 'lists/ai-crawlers.txt'
 
 [[client_class]]
-name = 'unverified_bot'
+name = 'unverified-bot'
 user_agent = ['bot', 'crawler', 'spider', 'Googlebot']
 
 [[client_class]]
@@ -58,8 +58,8 @@ matches when any of them does; `user_agent`, `user_agent_regex` and
 `user_agent_list` together are one input. The client's address is the
 one a [trusted proxy](behind-a-proxy.md) forwarded, so a CDN's verdict
 header, say `headers = { 'X-Bot-Score' = '^[0-2]?[0-9]$' }`, classifies
-what reaches you through it. Class names are lower case letters, digits,
-`_` and `-`.
+what reaches you through it. Class names are lowercase letters, digits
+and hyphens, up to 63 characters.
 
 JA4 is FoxIO's fingerprint of how a client opens a TLS connection, such
 as `t13d1516h2_8daaf6152771_b186095e22b6`: it names the TLS library a
@@ -86,7 +86,7 @@ reverse-resolve to a name that is, or ends in, one of `verify_domains`,
 and that name must resolve back to the address. A lookup never holds a
 request. The first request from an address starts one, and until it has
 confirmed the address the rule does not match, so the request falls
-through to the later rules, the `unverified_bot` above for instance.
+through to the later rules, the `unverified-bot` above for instance.
 Confirmed names are remembered for 24 hours and failures for an hour.
 
 List files hold one entry a line; blank lines and lines starting with
@@ -126,7 +126,7 @@ app = 'shop'
 host = 'shop'
 path = '/'
 static = '/srv/shop/snapshot'
-match = { client_class = ['ai_crawler', 'unverified_bot'] }
+match = { client_class = ['ai-crawler', 'unverified-bot'] }
 ```
 
 A longer path still wins over a shorter one, whatever the classes: with
@@ -142,7 +142,7 @@ and the split:
 [[route]]
 host = 'shop'
 app = 'shop'
-traffic = { classes = { ai_crawler = 'r41' } }
+traffic = { classes = { ai-crawler = 'r41' } }
 ```
 
 The release stays running while a policy names it. A value of
@@ -155,14 +155,14 @@ The group's workers then carry the crawlers' load and nothing else:
 
 ```toml
 [app.shop.release.r42.groups.crawlers]
-match = { client_class = ['ai_crawler'] }
+match = { client_class = ['ai-crawler'] }
 processes = 1
 threads = 4
 ```
 
 `muructl apply` refuses a class that is not defined; `default` always
 is. `muructl route list` shows the classes a
-route is for, as `[for ai_crawler]`, and the releases its policy gives
+route is for, as `[for ai-crawler]`, and the releases its policy gives
 classes.
 
 An [overlay](overlays.md) can give a class a route for a while, such as
@@ -176,7 +176,7 @@ a token bucket for each key, and hosts and routes name the limits their requests
 
 ```toml
 [rate_limit.crawlers]
-match = { client_class = ['ai_crawler', 'unverified_bot'] }
+match = { client_class = ['ai-crawler', 'unverified-bot'] }
 key = 'address'
 rate = '2/s'
 burst = 10
@@ -259,10 +259,10 @@ is refused, and a list file must be an absolute path:
 
 ```toml
 [[client_class]]
-name = 'ai_crawler'
+name = 'ai-crawler'
 user_agent_list = '/srv/shop/lists/ai-crawlers.txt'
 
 [rate_limit.crawlers]
-match = { client_class = ['ai_crawler'] }
+match = { client_class = ['ai-crawler'] }
 rate = '2/s'
 ```

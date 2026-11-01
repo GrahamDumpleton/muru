@@ -19,7 +19,7 @@ from support.daemon import Daemon, start_daemon
 
 CLASSES = """
 [[client_class]]
-name = 'ai_crawler'
+name = 'ai-crawler'
 user_agent = ['GPTBot']
 
 [[client_class]]
@@ -64,7 +64,7 @@ threads = 2
         f"""[app.site.release.r1]
 {release}
 [app.site.release.r1.groups.crawlers]
-match = {{ client_class = ['ai_crawler'] }}
+match = {{ client_class = ['ai-crawler'] }}
 processes = 1
 
 [app.site.release.r1.groups.hot]
@@ -82,7 +82,7 @@ default = true
 name = 'root'
 host = 'site'
 app = 'site'
-traffic = {{ classes = {{ ai_crawler = 'r1' }} }}
+traffic = {{ classes = {{ ai-crawler = 'r1' }} }}
 
 [[route]]
 host = 'site'
@@ -127,7 +127,7 @@ def test_routes_policies_and_groups_take_a_class(tmp_path: Path) -> None:
         assert seen(daemon, "/") == {"class": "default", "release": "r2", "group": "default"}
         crawler = {"User-Agent": "Mozilla/5.0 GPTBot/1.2"}
         assert seen(daemon, "/", crawler) == {
-            "class": "ai_crawler",
+            "class": "ai-crawler",
             "release": "r1",
             "group": "crawlers",
         }
@@ -139,7 +139,7 @@ def test_routes_policies_and_groups_take_a_class(tmp_path: Path) -> None:
         assert partner.status == 200 and partner.body == b"archived\n"
 
         listed = daemon.muructl("route", "list").stdout
-        assert "site (ai_crawler to r1)" in listed, listed
+        assert "site (ai-crawler to r1)" in listed, listed
         assert "[for partner]" in listed, listed
 
         # A class the daemon's file does not define is refused, as is a
@@ -172,7 +172,7 @@ def test_an_overlay_gives_a_class_a_route_while_active(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     surge = f"""
 [overlay.crawler-surge]
-routes.root.client_routes = {{ ai_crawler = {{ target = {{ static = '{archive}' }} }} }}
+routes.root.client_routes = {{ ai-crawler = {{ target = {{ static = '{archive}' }} }} }}
 """
     crawler = {"User-Agent": "GPTBot/1.2"}
 
@@ -186,7 +186,7 @@ routes.root.client_routes = {{ ai_crawler = {{ target = {{ static = '{archive}' 
         daemon.muructl("release", "wait", "site@r1", "--timeout", "60")
 
         preview = daemon.muructl("overlay", "preview", "crawler-surge").stdout
-        assert f"route root: client_routes.ai_crawler (none) -> static {archive}" in preview
+        assert f"route root: client_routes.ai-crawler (none) -> static {archive}" in preview
 
         # While the overlay is active crawlers take the snapshot, and
         # everyone else the route as it was.
@@ -196,7 +196,7 @@ routes.root.client_routes = {{ ai_crawler = {{ target = {{ static = '{archive}' 
         assert seen(daemon, "/")["release"] == "r2"
         shown = daemon.muructl("config", "show", "--effective").stdout
         assert (
-            f"route root: client_routes.ai_crawler = static {archive} (overlay crawler-surge)"
+            f"route root: client_routes.ai-crawler = static {archive} (overlay crawler-surge)"
             in shown
         ), shown
 
@@ -208,7 +208,7 @@ routes.root.client_routes = {{ ai_crawler = {{ target = {{ static = '{archive}' 
         daemon.muructl("overlay", "activate", "crawler-surge")
         assert "promoted" in daemon.muructl("overlay", "promote", "crawler-surge").stdout
         assert crawled() == b"archived\n"
-        assert "[for ai_crawler]" in daemon.muructl("route", "list").stdout
+        assert "[for ai-crawler]" in daemon.muructl("route", "list").stdout
 
         refused = daemon.muructl(
             "apply",

@@ -5523,7 +5523,7 @@ mod tests {
         let source = source_dir();
         let store = store_with_shop(&source);
         let defined = Defined {
-            client_classes: vec!["partner".to_owned(), "ai_crawler".to_owned()],
+            client_classes: vec!["partner".to_owned(), "ai-crawler".to_owned()],
             ..Defined::default()
         };
         let routes = |extra: &str| {
@@ -5531,7 +5531,7 @@ mod tests {
                 "[host.shop]\nnames = ['shop.example.com']\n\
                  [[route]]\nhost = 'shop'\napp = 'shop'\n\
                  [[route]]\nhost = 'shop'\napp = 'shop'\nmatch = {{ client_class = ['partner'] }}\n\
-                 traffic = {{ classes = {{ ai_crawler = 'r1' }} }}\n{extra}"
+                 traffic = {{ classes = {{ ai-crawler = 'r1' }} }}\n{extra}"
             )
         };
 

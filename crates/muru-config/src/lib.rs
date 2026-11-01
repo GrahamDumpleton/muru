@@ -1772,20 +1772,14 @@ pub fn check_client_match(matches: Option<&ClientMatch>) -> Result<(), String> {
     Ok(())
 }
 
-/// A client class or rate limit name: lower case letters, digits, `_`
-/// and `-`, as `ai_crawler` or `crawlers`.
+/// A client class or rate limit name, a name as section 3.2 has it, as
+/// `ai-crawler` or `crawlers`.
 fn check_policy_name(key: &str, name: &str) -> Result<(), String> {
-    let valid = !name.is_empty()
-        && name.len() <= 64
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
-        });
-
-    if valid {
+    if valid_name(name) {
         Ok(())
     } else {
         Err(format!(
-            "{key}: {name:?} must be lower case letters, digits, _ and -"
+            "{key}: {name:?} is not a valid name: lowercase letters, digits and hyphens, up to 63 characters"
         ))
     }
 }
@@ -4645,7 +4639,7 @@ mod tests {
         .is_ok());
         assert!(check_overlay(
             "crawler-surge",
-            &overlay("routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }")
+            &overlay("routes.shop-root.client_routes = { ai-crawler = { target = { static = '/srv/shop/snapshot' } } }")
         )
         .is_ok());
         assert!(check_overlay(
@@ -4774,11 +4768,11 @@ mod tests {
         assert_eq!((settings.ipv4_prefix, settings.ipv6_prefix), (32, 64));
 
         let limit: RateLimit = toml::from_str(
-            "rate = '2/s'\nburst = 10\nkey = ['client_class', 'header:x-api-key']\naction = 'delay'\nmax_delay = '500ms'\nmatch = { client_class = ['ai_crawler'] }",
+            "rate = '2/s'\nburst = 10\nkey = ['client_class', 'header:x-api-key']\naction = 'delay'\nmax_delay = '500ms'\nmatch = { client_class = ['ai-crawler'] }",
         )
         .unwrap();
         let settings = check_rate_limit("crawlers", &limit).unwrap();
-        assert_eq!(settings.classes, vec!["ai_crawler".to_owned()]);
+        assert_eq!(settings.classes, vec!["ai-crawler".to_owned()]);
         assert_eq!(settings.key.len(), 2);
         assert_eq!(settings.max_delay, std::time::Duration::from_millis(500));
 
@@ -4795,6 +4789,7 @@ mod tests {
         }
 
         assert!(check_rate_limit("Crawlers", &RateLimit::default()).is_err());
+        assert!(check_rate_limit("ai_crawler", &RateLimit::default()).is_err());
     }
 
     #[test]
@@ -4868,13 +4863,13 @@ mod tests {
         let route = |keys: &str| upload_route(keys);
         assert_eq!(route("").key(), "/");
         assert_eq!(
-            route("match = { client_class = ['partner', 'ai_crawler', 'partner'] }").key(),
-            "/ client_class=ai_crawler,partner"
+            route("match = { client_class = ['partner', 'ai-crawler', 'partner'] }").key(),
+            "/ client_class=ai-crawler,partner"
         );
         assert!(
             check_route_policies(&route(
                 "match = { client_class = ['default'] }
-traffic = { classes = { ai_crawler = 'r1' } }"
+traffic = { classes = { ai-crawler = 'r1' } }"
             ))
             .is_ok()
         );

@@ -2713,7 +2713,7 @@ mod tests {
     fn client_classes_pick_routes_releases_and_groups() {
         let mut snapshot = split_snapshot(true, "");
         snapshot.routes[0].traffic.as_mut().unwrap().classes =
-            [("ai_crawler".to_owned(), "r2".to_owned())]
+            [("ai-crawler".to_owned(), "r2".to_owned())]
                 .into_iter()
                 .collect();
         snapshot.routes[0].traffic.as_mut().unwrap().shares[0].weight = 0;
@@ -2732,7 +2732,7 @@ mod tests {
             },
             pb::Group {
                 name: "crawlers".to_owned(),
-                client_classes: vec!["ai_crawler".to_owned()],
+                client_classes: vec!["ai-crawler".to_owned()],
                 ..Default::default()
             },
         ];
@@ -2753,7 +2753,7 @@ mod tests {
         // gives r2 nothing.
 
         assert_eq!(at("/", "default").1, "r1");
-        assert_eq!(at("/", "ai_crawler").1, "r2");
+        assert_eq!(at("/", "ai-crawler").1, "r2");
 
         // A group for a class takes its requests on every path, ahead of
         // a group for the path; others keep to the path's group.
@@ -2769,8 +2769,8 @@ mod tests {
             .unwrap()
             .block_on(Routing::from_snapshot(&snapshot, None))
             .unwrap();
-        assert_eq!(placed(&routing, "/status", "ai_crawler").2, "crawlers");
-        assert_eq!(placed(&routing, "/", "ai_crawler").2, "crawlers");
+        assert_eq!(placed(&routing, "/status", "ai-crawler").2, "crawlers");
+        assert_eq!(placed(&routing, "/", "ai-crawler").2, "crawlers");
     }
 
     #[test]
