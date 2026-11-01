@@ -8,11 +8,14 @@ handoff, so its attempt raises HandoffNotEnabled.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json
+import os
 from collections.abc import Callable, Iterable
 from typing import Any
 
+import muru
 from muru import HandoffNotEnabled
 
 request_value: contextvars.ContextVar[str] = contextvars.ContextVar("request_value", default="")
@@ -70,6 +73,43 @@ async def echo(
             await send({"type": "websocket.send", "bytes": message["bytes"]})
 
 
+async def with_lifespan(
+    scope: dict[str, Any], receive: Callable[..., Any], send: Callable[..., Any]
+) -> None:
+    """Fill the lifespan state at startup; answer a request with its state and request id."""
+
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+
+            if message["type"] == "lifespan.startup":
+                scope["state"]["started_in"] = os.getpid()
+                await send({"type": "lifespan.startup.complete"})
+            else:
+                print("with_lifespan: shutdown", flush=True)
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    await receive()
+    details = {
+        "state": scope["state"],
+        "request_id": muru.request_id(),
+        "pid": os.getpid(),
+    }
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": json.dumps(details).encode()})
+
+
+async def answer() -> int:
+    return 42
+
+
 def respond(start_response: Callable[..., Any], status: str, text: str) -> Iterable[bytes]:
     start_response(status, [("Content-Type", "text/plain")])
     return [text.encode()]
@@ -121,6 +161,16 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
             print(f"second handoff: {error}", flush=True)
 
         return []
+
+    if path == "/registered":
+        bridge.scope["state"]["from_wsgi"] = muru.request_id()
+        return bridge.handoff(with_lifespan)
+
+    if path == "/loop":
+        loop = muru.loop()
+        assert loop is not None
+        result = asyncio.run_coroutine_threadsafe(answer(), loop).result(5)
+        return respond(start_response, "200 OK", f"loop {result}\n")
 
     return respond(start_response, "200 OK", f"wsgi {bridge.handed_off}\n")
 

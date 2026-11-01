@@ -4,7 +4,8 @@
 :class: note
 
 Handing a WSGI request, or a WebSocket upgrade, to an ASGI application
-with `handoff = "asgi"`.
+with `handoff = "asgi"`, the lifespan of an application requests are
+handed to, `muru.loop()` and `muru.request_id()`.
 ```
 
 [Mounts](mounts.md) choose between a WSGI and an ASGI application by
@@ -75,6 +76,49 @@ body as the answer to its upgrade.
 An HTTP request can be handed off too, after the WSGI code has read some
 of its body: the application receives the rest, as it arrives. The
 request's context variables are copied to the application's task.
+
+## Applications with a lifespan
+
+An application that requests are handed to, rather than served by a
+mount, gets no lifespan startup or shutdown of its own. Register one
+that needs them from a `post_fork` hook:
+
+```python
+# hooks.py, named by hooks = "hooks"
+import muru.asgi
+
+from chat.asgi import app
+
+
+def post_fork(context):
+    muru.asgi.register(app)
+```
+
+Each worker runs the application's startup once its event loop is
+running, before it takes requests, and a failed startup fails the
+worker. Its shutdown runs when the worker stops, after the requests in
+flight. The state its startup fills is in the scope of every request
+handed to it, beside what the WSGI code put in `scope["state"]`. A
+worker without an event loop, one with no `handoff = "asgi"` and no
+ASGI mount, does not start when an application is registered.
+
+## Reaching the event loop
+
+`muru.loop()` returns the worker's event loop, so WSGI code can run a
+coroutine on it and wait for the result:
+
+```python
+import asyncio
+import muru
+
+
+def application(environ, start_response):
+    result = asyncio.run_coroutine_threadsafe(fetch_quote(), muru.loop()).result(5)
+    ...
+```
+
+`muru.request_id()` returns the id of the request being served, on
+either side of a handoff.
 
 ## Inside a framework
 

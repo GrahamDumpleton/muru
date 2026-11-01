@@ -99,8 +99,11 @@ Chosen option: a setting per direction, with the keys always present.
   threads were full. A request handed to ASGI never waits; the loop
   takes any number of tasks.
 
-- **Lifespan.** `muru.asgi.register(app)` raises when the worker has no
-  event loop, rather than starting one; the setting is what starts it.
+- **Lifespan.** `muru.asgi.register(app)` never starts an event loop;
+  the setting is what starts it. A registration from post_fork, which
+  runs before the loop, waits for the loop, and a worker with a
+  registration but no loop fails to start with an error naming the
+  application.
 
 ### Consequences
 

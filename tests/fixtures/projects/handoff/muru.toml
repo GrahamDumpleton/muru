@@ -1,5 +1,6 @@
 entrypoint = "handoff:application"
 handoff = "asgi"
+hooks = "handoff_hooks"
 threads = 2
 
 [mounts.plain]

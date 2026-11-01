@@ -21,6 +21,7 @@ use pyo3::exceptions::{
 };
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
@@ -38,6 +39,9 @@ static SERVER_SOFTWARE: LazyLock<String> = LazyLock::new(|| {
         .replace("-rc.", "rc");
     format!("muru/{version}")
 });
+
+/// The `muru._context._request_id` context variable (section 6.9).
+static REQUEST_ID: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// One item of application output on its way to the coalescing task.
 pub enum Outgoing {
@@ -1174,6 +1178,18 @@ fn run_app<'py>(
         interrupt,
     );
     environ.set_item(intern!(py, "muru.wsgi_to_asgi"), Bound::new(py, bridge)?)?;
+
+    // Section 6.9: muru.request_id() reads a context variable, set in
+    // the context the request runs in, which a handoff copies.
+
+    REQUEST_ID
+        .get_or_try_init(py, || {
+            py.import(intern!(py, "muru._context"))?
+                .getattr(intern!(py, "_request_id"))
+                .map(Bound::unbind)
+        })?
+        .bind(py)
+        .call_method1(intern!(py, "set"), (&head.request_id,))?;
     let result = app.bind(py).call1((environ, start_response))?;
 
     // After a handoff the iterable is closed without being read; a list

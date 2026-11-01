@@ -217,3 +217,53 @@ handoff = "wsgi"
     refused = daemon.muructl("apply", "-f", str(config), check=False)
     assert refused.returncode == 1
     assert "(handoff wsgi)" in refused.stdout, refused.stdout
+
+
+def test_a_registered_application_has_its_lifespan(server: support.Server) -> None:
+    response = server.get("/registered")
+    assert response.status == 200, response.body
+    details = json.loads(response.body)
+
+    # Its startup ran in this worker, and the request id is the request's
+    # on both sides of the handoff.
+
+    assert details["state"]["started_in"] == details["pid"]
+    assert details["state"]["from_wsgi"] == details["request_id"]
+    assert details["request_id"] == response.header("x-request-id")
+
+
+def test_wsgi_code_reaches_the_loop(server: support.Server) -> None:
+    response = server.get("/loop")
+    assert (response.status, response.body) == (200, b"loop 42\n")
+
+
+def test_registering_without_a_loop_fails_the_worker(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text(
+        "def application(environ, start_response):\n    return []\n"
+        "async def other(scope, receive, send):\n    pass\n"
+    )
+    (project / "hooks.py").write_text(
+        "import muru.asgi\nfrom app import other\n\n"
+        "def post_fork(context):\n    muru.asgi.register(other)\n"
+    )
+    (project / "muru.toml").write_text('entrypoint = "app:application"\nhooks = "hooks"\n')
+
+    with pytest.raises(RuntimeError) as failed:
+        support.start(str(project), workers=None, threads=None, chdir=None)
+
+    assert "muru.asgi.register() was given app:other, but this worker has no event loop" in str(
+        failed.value
+    )
+
+
+def test_a_registered_application_shuts_down_with_its_worker() -> None:
+    instance = support.start(str(HANDOFF), workers=None, threads=None, chdir=None)
+
+    try:
+        assert instance.get("/registered").status == 200
+    finally:
+        instance.stop()
+
+    assert "with_lifespan: shutdown" in instance.log()

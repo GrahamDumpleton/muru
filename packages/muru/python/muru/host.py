@@ -1359,6 +1359,10 @@ class Host:
                 method for name, server in grpc_servers for method in server.listing(name)
             ]
 
+            # Section 6.14: applications registered for their lifespan,
+            # most likely from post_fork, start now the loop runs.
+
+            _asgi.start_registered(loop)
             hooks.call("on_ready", context)
         except Exception as error:
             log(f"worker {index} failed to start: {error.__class__.__name__}: {error}")
@@ -1371,6 +1375,8 @@ class Host:
 
         def on_exit() -> None:
             """Run lifespan shutdown for every ASGI application and the hook, then stop the loop."""
+
+            _asgi.stop_registered()
 
             for mounted_lifespan in lifespans:
                 mounted_lifespan.shutdown()

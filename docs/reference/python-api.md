@@ -88,6 +88,28 @@ swallow it; catch it by name to answer the request yourself, and use
 `finally` for clean-up. It is never raised outside Muru, or in an ASGI
 application, whose task is cancelled instead.
 
+## `muru.request_id()`
+
+The id of the request being served, the same 26-character ULID as the
+`X-Request-ID` response header and `muru.request_id` in the environ, or
+`None` outside a request and outside Muru. It is a context variable, so
+it follows a request into the tasks it starts and across a
+[handoff](../howto/handoff.md).
+
+## `muru.loop()`
+
+The worker's event loop, for code on an application thread that
+schedules work on it with `call_soon_threadsafe` or
+`asyncio.run_coroutine_threadsafe`. A worker has one when it serves an
+ASGI application or hands requests to one; otherwise, in the host and
+outside Muru, it is `None`.
+
+## `muru.asgi.register()`
+
+Runs the lifespan of an ASGI application that requests are
+[handed to](../howto/handoff.md#applications-with-a-lifespan) but no
+mount serves, and returns the application.
+
 ## `muru.HandoffNotEnabled`
 
 The `RuntimeError` subclass `handoff()` raises when the request's mount
