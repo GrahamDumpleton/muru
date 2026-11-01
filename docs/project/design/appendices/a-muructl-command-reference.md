@@ -9,20 +9,21 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output, --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
+Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output (the admin API's answer with its field names, JSON lines for streams, and `{"error": ...}` on failure, as the JSON output reference lists), --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
 
 | Group | Command | What it does | Section |
 | --- | --- | --- | --- |
 | Development | muructl run [ENTRYPOINT or PATH] | Run with an embedded controller and edge. Flags: --interface, --factory, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --timeout, --max-body-size, --dashboard, --bind, --port, --allow-public, --https, --https-only, --https-port, --tls-cert, --tls-key, --host, --access-log, --access-log-exclude, --slow, --single, --reload, --reload-dir, --reload-include, --reload-exclude, --static, --build [MODE] (auto, always or never; a bare --build is always), --print-config | 13.1 |
 | Development | muructl build [PATH] | Resolve the interpreter, build the environment from the lock, install the runtime library, exit. Flags: --deployment, --deps-only, --target DIR, --runtime-dir DIR, --python, --extra, --group, --no-runtime | 8.2 |
 | Development | muructl check [PATH or RELEASE] | Load in a throwaway host and validate what build prepared: entrypoint, hooks, mounts, configuration, interpreter requirement, runtime library and bytecode cache; no side effects. Flags: --strict, --env-file; --image in an image build (section 8.6) | 6.8 |
-| Development | muructl exec RELEASE -- COMMAND | One-off command with the release's interpreter, environment, user and directory | 6.8 |
 | Daemon | muructl daemon run | Run the daemon in the foreground. Flags: --listen, and the location flags --config, --state-dir, --run-dir, --log-dir, --cache-dir and --system (section 13.8) | 13.3 |
 | Daemon | muructl daemon start, stop, restart, status, reload | Background daemon without a service manager. start takes the flags of daemon run; stop takes --shutdown and --timeout; reload re-reads the configuration file | 13.3 |
 | Daemon | muructl daemon reload | Re-read the daemon configuration file (also SIGHUP) | 10.3 |
 | Daemon | muructl daemon upgrade | Re-exec from the installed binary and replace edges | 13.4 |
 | Daemon | muructl daemon backup, restore | Save or load the state store | 13.5 |
 | Daemon | muructl up | Ensure a daemon is running for the current user or project | 13.2 |
+| Agents | muructl mcp serve | Serve the daemon's operations to a coding agent over MCP on standard input and output; each tool runs the matching command with --json. Flags: --up, --read-only, --allow TOOL,..., and the socket and location flags | 10.11 |
+| Agents | muructl mcp skill print, install, status | The skill a project carries for coding agents, embedded in muructl: print it, write or update it as muru/SKILL.md in the skills directory (--dir, default .claude/skills), or check the project's copy (exit 1 when missing or different) | 10.11 |
 | Daemon | muructl edge run | Internal, started by the daemon | 2.3 |
 | Configuration | muructl apply -f FILE or DIR | Apply declarative configuration. Flags: --dry-run, --check, --json, --save-plan FILE, --plan FILE, --prune | 10.4 |
 | Configuration | muructl config export | Export desired state. Flags: --app, --split, --full, --all-releases, --resolve-rollouts, --redact, --param, --format | 10.4 |
@@ -33,6 +34,9 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Applications | muructl release create, list, show, delete, wait | Manage releases and wait for states | 9.1 |
 | Applications | muructl deploy APP PATH or IMAGE | Create a release and apply the default strategy. Flags: --entrypoint, --interface, --python, --processes, --threads, --sync-threads, --concurrency, --preload, --hooks, --factory, --release, --no-wait, --retain, --retain-workers, --fresh (take nothing from the previous release, section 3.3), --static (a directory of the release's own files, section 4.9), --build MODE, --build-extra, --build-group (the build table for this deploy, section 8.2) | 9.2 |
 | Applications | muructl reload APP | New release from the current source | 9.8 |
+| Applications | muructl command list APP[@RELEASE] | The commands the release declares, with their inputs and each one's last run | 9.12 |
+| Applications | muructl command run APP[@RELEASE] NAME | Run a declared command with its inputs, exiting with its status; a required input not given is asked for on a terminal. Flags: --input NAME=VALUE, --secret-input NAME=STORE/KEY, --input-stdin NAME, --json | 9.12 |
+| Applications | muructl exec APP[@RELEASE] -- COMMAND | Run a one-off command with the release's interpreter, environment, user and source directory, its output streamed, exiting with its status. Flags: --json | 9.12 |
 | Traffic | muructl host create, list, show, delete | Manage virtual hosts | 4.3 |
 | Traffic | muructl route set, list, show, delete | Manage routes and traffic splits | 4.5 |
 | Traffic | muructl upstream create, list, show, delete | Manage HTTP upstreams | 4.13 |

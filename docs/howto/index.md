@@ -2,14 +2,6 @@
 
 Recipes for specific tasks, assuming you already know the basics.
 
-Still to be written:
-
-- Migrating from mod_wsgi, gunicorn and uvicorn.
-- Containers and images.
-- OpenTelemetry export.
-- Database migrations during overlapping releases.
-- Upgrading Muru.
-
 ```{toctree}
 :maxdepth: 1
 
@@ -19,6 +11,8 @@ starlette-and-fastapi
 run-settings
 interpreters
 daemon
+commands
+migrations
 secrets
 users
 virtual-hosts
@@ -28,6 +22,7 @@ behind-a-proxy
 worker-groups
 scaling
 mounts
+handoff
 grpc
 https
 static-files
@@ -51,4 +46,6 @@ metrics
 events
 systemd
 dashboard
+coding-agents
+upgrading
 ```

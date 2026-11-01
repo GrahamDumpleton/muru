@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
 
 use crate::model::{
-    App, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms,
+    App, CommandRun, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, now_unix_ms,
 };
 
 /// Why a store operation failed.
@@ -120,13 +120,24 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS command_runs (
+    app TEXT NOT NULL,
+    command TEXT NOT NULL,
+    release TEXT NOT NULL,
+    started_unix_ms INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    exit_code INTEGER NOT NULL,
+    ok INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (app, command)
+);
 ";
 
 /// How many events are kept.
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// The store.
 pub struct Store {
@@ -151,8 +162,9 @@ impl Store {
         // applications in maintenance mode (section 4.12), version 6 the
         // HTTP upstreams, version 7 overlays and their state (section
         // 9.10), version 8 the client classes and rate limits of applied
-        // files (sections 4.14 and 4.15) and version 9 the application's
-        // priority (section 7.4), added to an older table here.
+        // files (sections 4.14 and 4.15), version 9 the application's
+        // priority (section 7.4), added to an older table here, and
+        // version 10 the last run of each command (section 9.12).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -372,6 +384,7 @@ impl Store {
         self.with(|connection| {
             connection.execute("DELETE FROM releases WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM command_runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -949,6 +962,61 @@ impl Store {
         })
     }
 
+    /// Record a run of an application's command, replacing the one
+    /// before (section 9.12).
+    pub fn record_command_run(
+        &self,
+        app: &str,
+        command: &str,
+        run: &CommandRun,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO command_runs (app, command, release, started_unix_ms, duration_ms, \
+                 exit_code, ok, message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(app, command) DO UPDATE SET release = excluded.release, \
+                 started_unix_ms = excluded.started_unix_ms, duration_ms = excluded.duration_ms, \
+                 exit_code = excluded.exit_code, ok = excluded.ok, message = excluded.message",
+                params![
+                    app,
+                    command,
+                    run.release,
+                    run.started_unix_ms as i64,
+                    run.duration_ms as i64,
+                    run.exit_code,
+                    run.ok,
+                    run.message
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The last run of each of an application's commands, by name.
+    pub fn command_runs(&self, app: &str) -> Result<Vec<(String, CommandRun)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT command, release, started_unix_ms, duration_ms, exit_code, ok, message \
+                 FROM command_runs WHERE app = ?1 ORDER BY command",
+            )?;
+            let rows = statement.query_map(params![app], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CommandRun {
+                        release: row.get(1)?,
+                        started_unix_ms: row.get::<_, i64>(2)? as u64,
+                        duration_ms: row.get::<_, i64>(3)? as u64,
+                        exit_code: row.get(4)?,
+                        ok: row.get(5)?,
+                        message: row.get(6)?,
+                    },
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
     /// Events after a sequence number, oldest first, up to `limit`.
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>, StoreError> {
         self.with(|connection| {
@@ -1072,6 +1140,7 @@ mod tests {
             hooks: None,
             factory: None,
             reflection: false,
+            handoff: None,
             grpc_web_origins: Vec::new(),
             groups: Vec::new(),
             mounts: Vec::new(),
@@ -1095,6 +1164,7 @@ mod tests {
             interpreter: None,
             build: crate::model::BuildSpec::default(),
             bytecode: crate::model::BytecodeSpec::default(),
+            commands: Vec::new(),
         }
     }
 
@@ -1119,6 +1189,46 @@ mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn the_last_run_of_each_command_is_kept() {
+        let store = Store::in_memory().unwrap();
+        let run = |release: &str, exit_code: i32| CommandRun {
+            release: release.to_owned(),
+            started_unix_ms: 1_000,
+            duration_ms: 20,
+            exit_code,
+            ok: exit_code == 0,
+            message: format!("exited with status {exit_code} after 20ms"),
+        };
+
+        store
+            .record_command_run("shop", "migrate", &run("r1", 1))
+            .unwrap();
+        store
+            .record_command_run("shop", "migrate", &run("r2", 0))
+            .unwrap();
+        store
+            .record_command_run("shop", "backup", &run("r2", 0))
+            .unwrap();
+        store
+            .record_command_run("blog", "migrate", &run("r1", 0))
+            .unwrap();
+
+        let runs = store.command_runs("shop").unwrap();
+        assert_eq!(
+            runs,
+            vec![
+                ("backup".to_owned(), run("r2", 0)),
+                ("migrate".to_owned(), run("r2", 0))
+            ]
+        );
+
+        store.ensure_app("shop").unwrap();
+        store.delete_app("shop").unwrap();
+        assert!(store.command_runs("shop").unwrap().is_empty());
+        assert_eq!(store.command_runs("blog").unwrap().len(), 1);
     }
 
     #[test]

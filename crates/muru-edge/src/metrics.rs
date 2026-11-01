@@ -139,6 +139,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests a rate limit refused, delayed or only logged, by limit, client class and action.",
     },
     Family {
+        name: "muru_handoffs_total",
+        kind: Kind::Counter,
+        help: "Requests handed between WSGI and ASGI in the worker, by application, release, group and the interface handed to.",
+    },
+    Family {
         name: "muru_auth_requests_total",
         kind: Kind::Counter,
         help: "Authentication sub-requests, by result: allowed, cached, denied or unavailable.",
@@ -469,6 +474,9 @@ struct Inner {
     rate_limited: BTreeMap<(String, String, String), u64>,
     /// TLS handshakes by listener and result (section 4.3).
     tls_handshakes: BTreeMap<(String, &'static str), u64>,
+    /// Requests handed across in the worker, by group and the interface
+    /// they were handed to (section 6.14).
+    handoffs: BTreeMap<(DurationKey, &'static str), u64>,
 }
 
 /// The request metrics of one edge, fed by the access log as each request
@@ -532,6 +540,13 @@ impl Metrics {
 
         if record.retried {
             *inner.retries.entry(by_group.clone()).or_default() += 1;
+        }
+
+        if let Some(handoff) = record.handoff {
+            *inner
+                .handoffs
+                .entry((by_group.clone(), handoff))
+                .or_default() += 1;
         }
 
         let durations = inner.durations.entry(by_group).or_default();
@@ -675,6 +690,16 @@ impl Metrics {
                 &key.labels(),
                 &mut samples,
             );
+        }
+
+        for ((key, to), count) in &inner.handoffs {
+            let mut labels = key.labels();
+            labels.push(("to".to_owned(), (*to).to_owned()));
+            samples.push(Sample {
+                name: "muru_handoffs_total".to_owned(),
+                labels,
+                value: *count as f64,
+            });
         }
 
         for (result, count) in &inner.auth {
@@ -1079,6 +1104,7 @@ mod tests {
             redirects: Vec::new(),
             client_class: "default".to_owned(),
             websocket: None,
+            handoff: None,
         }
     }
 

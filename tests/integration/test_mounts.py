@@ -265,7 +265,7 @@ def test_invalid_mounts_are_refused(daemon: Daemon, tmp_path: Path) -> None:
         (
             "[app.shop.release.r1.mounts.x]\npath = '/x'\nentrypoint = 'a:b'\n"
             "interface = 'asgi'\nthreads = 2\n",
-            "an ASGI mount runs on the event loop and has no threads",
+            "an ASGI mount runs on the event loop and has threads only for the requests it hands",
         ),
         (
             "[app.shop.release.r1.mounts.x]\npath = '/x'\nentrypoint = 'a:b'\n"

@@ -155,3 +155,15 @@ limits = { nofile = 65536, memory = '4GiB', cpu = 2.0 }     # cgroup limits on L
 ## 10.10 Atomic apply
 
 An apply (and every API mutation touching several objects) is validated as a whole and either lands entirely or not at all, producing one new desired-state version. The reconciler then compiles one snapshot for the resulting state. So a change that adds a host, a route and a release cannot leave a route pointing at a host that does not exist, even if the daemon restarts in the middle of the apply.
+
+## 10.11 An MCP server for coding agents
+
+`muructl mcp serve` gives a coding agent the daemon's operations as tools over the Model Context Protocol, on standard input and output, so an agent can deploy each change as a release, test it, read what Muru observes and roll back or drain (ADR 0039). A project lists it in its MCP configuration (`.mcp.json` for Claude Code) as `muructl mcp serve`, with `--up` to start the user daemon when none answers.
+
+- Each tool runs the matching muructl command with `--json` against the same daemon, with the server's `--socket` and location options, and returns what it prints; a command that fails makes the tool return its error's sentence as a tool error. Results therefore have the shapes of the JSON output reference, which every command that reports something shares (`--json` prints the admin API's answer with its field names, JSON lines for streams, `{"error": ...}` on failure).
+- The tools are few and shaped like tasks: status, list (one kind of object), release, commands, events, logs, debug (status, stacks, tasks, memory, inspect), scale status, config (show, diff), metrics, websockets and overlay preview read; deploy, promote, rollback, drain, rollout, scale, run command, restart, overlay, maintenance, apply, log level, reopen logs and reload config change things. Stopping, shutting down or upgrading the daemon, running code in workers and one-off commands are not offered; run command runs only what an application declares (section 9.12), and refuses a secret input given as a value, which must name a secret store entry instead. A docs tool returns pages of the user guide embedded in the binary.
+- Streams become bounded snapshots: events after a sequence number, the last lines of a log.
+- `--read-only` leaves out every tool that changes something; `--allow TOOL,...` keeps only those named. Both are enforced by the server, since the protocol's read-only and destructive annotations, which every tool carries, are advisory.
+- The initialize response's instructions carry a short model of Muru's objects (application, release, traffic, rollout, overlay, apply against deploy, and that only the reconciler acts).
+- Whoever launches the server has the admin socket's access; for a developer's user daemon that is the intent. Remote agents, and applications acting on their own instance, wait on the TCP admin listener and its access model (section 10.6), with a streamable HTTP transport.
+- A skill the project carries, printed and installed by `muructl mcp skill`, teaches what the tools cannot: the development loop, what each operation does to traffic, and what to check after each.

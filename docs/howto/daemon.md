@@ -295,6 +295,13 @@ made in between wait in the socket's backlog rather than being refused.
 The edge's own output goes to `edge.log` in the log directory, and each
 release's host writes to `apps/APP/RELEASE.log` there.
 
+The access log is written as JSON lines to `access.log` in the log
+directory, `muructl logs` shows or follows it and each release's output,
+and `muructl logs reopen` works with logrotate; the [logging
+guide](logging.md) has the details. The events `muructl events` shows are
+kept in the state store, and `[[events.sink]]` entries deliver them to
+webhooks; the [events guide](events.md) has the details.
+
 ## Stopping and restarting
 
 `muructl daemon stop` detaches: the daemon exits, and the edge and every
@@ -338,48 +345,6 @@ SIGTERM (and an interrupt) means `muructl daemon stop` without
 wants, unless `on_sigterm = 'shutdown'` makes it the shutdown above. In a
 container that is the default; see below.
 
-## In a container
-
-`muructl daemon run` or `muructl run --allow-public` can be a container's
-main process. When muructl finds itself PID 1 it starts as an init of its
-own, as `tini` would: PID 1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1,
-SIGUSR2 and SIGQUIT to the command, which runs as its child, collects
-every process that exits, so nothing in the container stays a zombie,
-and exits with the command's status when the command exits. An image
-that uses `tini` or `docker run --init` sets `MURU_NO_INIT=1`, and the
-command runs as PID 1 itself.
-
-Under the init, and for a daemon that is PID 1 itself, SIGTERM means
-shutdown rather than detach: when PID 1 exits the kernel kills every
-other process in the container, so detaching would kill the edge and
-every worker mid-request. `docker stop` therefore drains and stops
-everything inside the budget above, whose default of eight seconds is
-under the ten `docker stop` allows, and the container exits 0. `muructl
-run` as the main process bounds its stop by the same budget. A
-`[shutdown]` table with `on_sigterm = 'detach'` turns that off, for a
-container that keeps its hosts across a daemon restart of its own.
-
-## Upgrading
-
-Installing a new version of Muru changes nothing until `muructl daemon
-upgrade`. The daemon then re-executes itself from the installed `muructl`
-(the one its command name finds on the `PATH`, or the path it was started
-with), keeping its process id and its children, and the new version takes
-the hosts and the edge over from their records, exactly as a restarted
-daemon does. It then starts a new edge from its own version on the same
-listening sockets, gives it the routing in force, and tells the old edge
-to stop accepting: that edge finishes the requests in flight, closes its
-idle keep-alive connections (with GOAWAY on HTTP/2) and exits. No
-connection is refused and no request fails in between; WebSocket
-connections still open on the old edge are closed when it exits. The
-command waits until the upgraded daemon answers with its new edge and
-prints the versions and process ids involved. The daemon checks that the
-installed binary runs before it commits, and the `daemon.upgraded` and
-`edge.replaced` events record what happened.
-
-Releases keep the runtime library they started with; a new release picks
-up the installed one. Under systemd the service's main process is
-unchanged by an upgrade, so no unit restart is involved.
 `muructl daemon run` runs it in the foreground, for a service manager or
 a terminal; SIGTERM or an interrupt detaches it the same way, and
 `muructl daemon stop --timeout` bounds how long the command waits for the
@@ -391,12 +356,41 @@ socket in the runtime directory, else the one development run listening;
 with several runs and no daemon the command names them, so one can be
 chosen with `--socket`. `muructl status` says which was found.
 
-The access log is written as JSON lines to `access.log` in the log
-directory, `muructl logs` shows or follows it and each release's output,
-and `muructl logs reopen` works with logrotate; the [logging
-guide](logging.md) has the details. The events `muructl events` shows are
-kept in the state store, and `[[events.sink]]` entries deliver them to
-webhooks; the [events guide](events.md) has the details.
+## In a container
+
+`muructl daemon run` can be a container's main process. When muructl
+finds itself PID 1 it starts as an init of its own, as `tini` would: PID
+1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2 and SIGQUIT to the
+daemon, which runs as its child, collects every process that exits, so
+nothing in the container stays a zombie, and exits with the daemon's
+status when the daemon exits. An image that uses `tini` or `docker run
+--init` sets `MURU_NO_INIT=1`, and the daemon runs as PID 1 itself.
+
+Under the init, and for a daemon that is PID 1 itself, SIGTERM means
+shutdown rather than detach: when PID 1 exits the kernel kills every
+other process in the container, so detaching would kill the edge and
+every worker mid-request. `docker stop` therefore drains and stops
+everything inside the budget above, whose default of eight seconds is
+under the ten `docker stop` allows, and the container exits 0. A
+`[shutdown]` table with `on_sigterm = 'detach'` turns that off, for a
+container that keeps its hosts across a daemon restart of its own.
+
+The daemon listens on `127.0.0.1:8080` unless told otherwise, so in a
+container it takes `--listen 0.0.0.0:8080` or a `[[listener]]` entry,
+and its applications and logs are in the locations above, so a volume
+for the state store keeps the deployed releases across a restart of the
+container. A command that runs one application in a container, with its
+configuration from the image and its logs on standard output, is
+planned.
+
+## Upgrading
+
+Installing a new version of Muru changes nothing until `muructl daemon
+upgrade`, which re-executes the daemon from the installed `muructl`,
+keeping its process id and its children, and replaces the edge without
+refusing a connection. Releases keep the runtime library they started
+with until a new release replaces them. [Upgrading Muru](upgrading.md)
+covers the command, development runs, the daemon and releases.
 
 ## Reloading the configuration
 

@@ -110,7 +110,14 @@ async def scope_report(scope: Scope, receive: Receive, send: Send) -> None:
     details["scope"]["raw_path"] = scope["raw_path"].decode("latin-1")
     details["scope"]["query_string"] = scope["query_string"].decode("latin-1")
 
-    await respond(send, 200, json.dumps(details).encode(), "application/json")
+    # Objects in the extensions, such as the handoff object, by type name.
+
+    await respond(
+        send,
+        200,
+        json.dumps(details, default=lambda value: type(value).__name__).encode(),
+        "application/json",
+    )
 
 
 async def stream(query: dict[str, str], send: Send) -> None:

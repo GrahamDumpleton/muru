@@ -18,7 +18,8 @@ Send = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def jsonable(value: Any) -> Any:
-    """Make a scope value JSON-friendly: bytes as latin-1 text, pairs as lists."""
+    """Make a scope value JSON-friendly: bytes as latin-1 text, pairs as lists,
+    and an object, such as the handoff, as its type's name."""
 
     if isinstance(value, bytes):
         return value.decode("latin-1")
@@ -26,7 +27,9 @@ def jsonable(value: Any) -> Any:
         return [jsonable(item) for item in value]
     if isinstance(value, dict):
         return {key: jsonable(item) for key, item in value.items()}
-    return value
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    return type(value).__name__
 
 
 async def reply(

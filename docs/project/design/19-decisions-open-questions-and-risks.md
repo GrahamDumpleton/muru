@@ -18,7 +18,7 @@ specification is maintained.
 | Edge to worker protocol | Own framing with protobuf payloads over Unix sockets, one request per pooled connection (ADR 0021, superseding ADR 0001). gRPC remains for the control plane and admin API |
 | Worker link server | Rust inside the extension, started after fork. No grpcio anywhere in the worker |
 | Application threads | A fixed pool of long-lived threads with persistent Python thread states, each request in a fresh contextvars context (ADR 0022) |
-| WSGI and ASGI in one worker | Requests handed across per request in either direction: the muru.wsgi_to_asgi environ key and the asgi_to_wsgi scope extension, with lifespan registration and a WebSocket adapter under muru.asgi (ADR 0023) |
+| WSGI and ASGI in one worker | Requests handed across per request in either direction: the muru.wsgi_to_asgi environ key and the asgi_to_wsgi scope extension, with lifespan registration and a WebSocket adapter under muru.asgi, each direction enabled by a handoff setting (ADR 0023, ADR 0042) |
 | Preload | auto by default everywhere: preload with an import check, falling back to per-worker imports when the import left sockets, threads, child processes or event loops behind (sections 6.1 and 6.2) |
 | Releases | Immutable. Configuration changes are new releases |
 | Provisioning | One procedure, muructl build, called by muructl run, the daemon's Building state and the image build stage. Install from locks, never resolve. One knob, build.when: auto builds what is missing and leaves what exists alone, always builds on every start and lock change, never builds nothing; the same key in development and under the daemon. A missing interpreter is installed only where an environment would be built (ADR 0036) |
@@ -46,6 +46,8 @@ specification is maintained.
 | Retries | A request is sent again only when no worker has read it: a worker that cannot be connected to or closes its connection before the head is written is skipped for another. Nothing is sent again after a worker has read the head, whatever the method (ADR 0032) |
 | Worker liveness | Native, in every worker: a thread attaches to the interpreter every 500 ms and the worker reports to its host every second; either quiet for gil_stall_timeout (30 s) replaces the worker as the hard timeout does. HTTP liveness probes stay opt-in for application failures (ADR 0031) |
 | Worker group routing | A group's `match` takes `client_class`, `host` and `method` lists, never headers, which are a client class; groups rank by how many lists they give, then by prefix length. An optional group's requests wait as for a group at zero workers and never fall through to the default group. A group's `mounts` subset is served by its workers but imported by the host, with the default mount always served (ADR 0033) |
+| Coding agents | An MCP server in muructl (`muructl mcp serve`, stdio, rmcp) whose tools run muructl's own commands with `--json`, so every result has the shape the CLI prints; task-shaped tools, `--read-only` and `--allow` enforced by the server, local only until the TCP admin listener (section 10.11, ADR 0039) |
+| Commands | Declared by the application under `[tool.muru.commands]`, fixed with the release, with checked inputs (secret ones only in the environment, and over MCP only as secret store references); run by the daemon with the settings it starts the release's host with, streamed through the admin API, ended with their caller; `muructl exec` for one-off commands (section 9.12, ADRs 0040 and 0041) |
 
 ## 19.2 Open questions
 

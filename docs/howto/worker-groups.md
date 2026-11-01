@@ -76,7 +76,7 @@ match = { host = ["partner.example.com"] }
 threads = 4
 
 [groups.crawlers]
-match = { client_class = ["ai_crawler"] }
+match = { client_class = ["ai-crawler"] }
 processes = 1
 ```
 

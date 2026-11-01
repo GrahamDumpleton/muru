@@ -25,7 +25,7 @@ specification is maintained.
 | wsgi.multithread, wsgi.multiprocess, wsgi.run_once | section 6.5 |
 | wsgi.input_terminated | always True |
 | wsgi.file_wrapper | the muru._native.FileWrapper class: block iteration, descriptor passing when the wrapper is returned as the iterable (section 6.5) |
-| muru.wsgi_to_asgi | the handoff object of section 6.14, present when the worker has an event loop |
+| muru.wsgi_to_asgi | the handoff object of section 6.14; its handoff() raises muru.HandoffNotEnabled unless the mount has handoff = 'asgi' |
 | muru.state | the ASGI scope state of a request handed from ASGI to WSGI (section 6.14) |
 | muru.request_id, muru.release, muru.group, muru.mount | request and placement |
 | muru.proxy_addr | original peer when behind trusted proxies |
@@ -43,13 +43,13 @@ specification is maintained.
 
 ## D.2 ASGI scope
 
-Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path, query_string, root_path, headers, client, server, state), with root_path set to the trusted prefix plus the mount path. Muru values are under scope['extensions']['muru'] with the same names as the muru.* environ keys, plus asgi_to_wsgi, the handoff object of section 6.14, on http scopes. Supported extensions: http.response.trailers, http.response.pathsend and http.response.zerocopysend (file hints), and tls.
+Standard ASGI 3.0 keys (type, asgi, http_version, method, scheme, path, raw_path, query_string, root_path, headers, client, server, state), with root_path set to the trusted prefix plus the mount path. Muru values are under scope['extensions']['muru'] with the same names as the muru.* environ keys, plus asgi_to_wsgi, the handoff object of section 6.14, on http scopes; its handoff() raises muru.HandoffNotEnabled unless the mount has handoff = 'wsgi'. Supported extensions: http.response.pathsend and http.response.zerocopysend (file hints), and tls.
 
 ## D.3 Environment variables set by Muru
 
 | Variable | Meaning |
 | --- | --- |
-| MURU_APP, MURU_RELEASE | application and release |
+| MURU_APP, MURU_RELEASE | application and release, also for a command run with the release (section 9.12) |
 | MURU_GROUP, MURU_WORKER_ID | worker group and worker id, set after fork |
 | MURU_RELEASE_DIR, MURU_RUN_DIR | release source (also the working directory) and run directory |
 | MURU_INTERFACE, MURU_PROCESSES, MURU_THREADS | default mount interface and process model |

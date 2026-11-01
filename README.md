@@ -40,10 +40,11 @@ configuration may still change between them.
   declared in files or on the command line.
 
 Both are tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI on regular and free-threaded Python. Still to come are uv
-provisioning of interpreters, container releases, ACME certificates,
-HTTP/3, OpenTelemetry export, several edge processes and more than one
-node; the [roadmap](docs/project/roadmap.md) lists the phases. The
+FastAPI on regular and free-threaded Python. Still to come are a
+production command for containers and Kubernetes, container releases,
+ACME certificates, HTTP/3, OpenTelemetry export, several edge processes
+and more than one node; the [roadmap](docs/project/roadmap.md) sets out
+the goals. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
 is the place to start, and the
 [documentation](https://muru.readthedocs.io/) has a guide for each
@@ -72,10 +73,10 @@ muructl run app:application      # http://127.0.0.1:8080
   and hard timeouts, and Python-aware scaling.
 
 - Mix WSGI and ASGI in one process: mounts by path, each served by the
-  side it was written for. Still to come, a WSGI view will be able to hand
-  a request to an ASGI application on the event loop, which is how a WSGI
-  application will take WebSockets, and an ASGI application to hand one to
-  a WSGI callable on the thread pool.
+  side it was written for, and requests handed across in code, a WSGI
+  view to an ASGI application on the event loop, which is how a WSGI
+  application takes WebSockets, and an ASGI application to a WSGI
+  callable on the thread pool.
 
 - Reconfigure live through an API and CLI, with declarative files that
   export and apply round-trip, plus metrics, structured logs, an event

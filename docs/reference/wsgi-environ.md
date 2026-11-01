@@ -40,6 +40,8 @@ it adds.
 
 | Key | Value |
 | --- | --- |
+| `muru.wsgi_to_asgi` | The [handoff](../howto/handoff.md) object: `scope`, `is_websocket`, `handoff(app)` and `handed_off`. Its `handoff()` raises `muru.HandoffNotEnabled` unless the mount has `handoff = "asgi"` |
+| `muru.state` | Only on a request an ASGI application [handed over](../howto/handoff.md#from-asgi-to-wsgi): the scope's `state` |
 | `muru.request_id` | The request id, a 26-character ULID. The same value is in the `X-Request-ID` response header, the access log line and the error page |
 | `muru.max_body_size` | The body limit in force, in bytes: 100 MB in development, 10 MB with `--allow-public`, or what `--max-body-size` set |
 | `muru.uploads` | Present only on an [upload route](../howto/uploads.md) whose request brought files: their descriptions, which `muru.uploads.files(environ)` turns into upload objects |

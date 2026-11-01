@@ -231,8 +231,8 @@ with `--fix`; the formatters keep what it inserts.
   subsections so section numbers stay stable.
 
 - Track pending work as GitHub issues, never in files. Every bug, planned
-  piece of work, part of a phase still to come and future idea has an
-  issue in this repository; a change a workshop needs is an issue in
+  piece of work, step of a roadmap goal still to come and future idea has
+  an issue in this repository; a change a workshop needs is an issue in
   GrahamDumpleton/muru-workshops, marked as blocked by the Muru issue it
   waits on. When work is found or deferred, open an issue in the same
   step instead of noting it in `scratch/`, a code comment or a document.
@@ -245,11 +245,23 @@ with `--fix`; the formatters keep what it inserts.
   true to the work, since it is how the maintainer decides what comes next.
   Every open issue of both repositories is on it (issues in this
   repository are added automatically; add a workshops issue with
-  `gh project item-add`), with Priority, Phase and Size set and Order
-  where it ranks against its neighbours. The maintainer moves issues to
-  Next; take the Next issue with the lowest Order, move it to In Progress
+  `gh project item-add`), with Priority, Goal and Size set and Order
+  where it ranks against its neighbours. Goal places the issue in the
+  [roadmap](docs/project/roadmap.md): one of its major goals (Containers,
+  Production readiness, Beyond one node), Smaller feature, Housekeeping
+  (bugs, flaky tests, workshop follow-ups) or Idea. Each step of a major
+  goal is a parent issue labelled `tracking`, with the step's issues as
+  its sub-issues; add an issue that belongs to a step as a sub-issue of
+  it. The maintainer moves issues to Next; take the Next issue with the
+  lowest Order, never a `tracking` issue, move it to In Progress
   when its branch is made, and let `Closes #N` move it to In Review and
-  Done. When work changes an issue's size, priority or what blocks it,
+  Done. The one exception to the maintainer choosing what goes to Next
+  is a problem in the tests or their harness rather than in Muru, a
+  flaky test above all: label it `testing` (with `bug` as well while
+  the cause is unknown) and, when it is small, put it straight into Next
+  with Goal Housekeeping, Priority P1 and an Order ahead of the rest, so
+  it is fixed in the next piece of work instead of waiting in Backlog;
+  a branch for other work may carry it. When work changes an issue's size, priority or what blocks it,
   update the issue and its fields in the same step. `gh project field-list
   1 --owner GrahamDumpleton` gives the field and option ids that
   `gh project item-edit` needs.

@@ -126,8 +126,11 @@ threads were busy but its CPU was not, which is what waiting on a
 database looks like. More threads per worker would carry the same load
 with fewer processes, and the daemon suggests it for the next release
 rather than changing a running one. On a slower machine the clients can
-arrive over more than one decision, and the group grows to five in
-steps, each with its own event.
+arrive over more than one decision, and the group grows in steps, each
+with its own event. It can also stop at four workers, the eight threads
+the load needs, with none in hand: between one client's requests a
+worker's slots can be free for a moment, and the group is short only
+when it stays short for the whole window.
 
 ## Take the load away
 

@@ -214,6 +214,9 @@ pub struct MountSpec {
     /// Threads of the mount's own; the worker's shared pool when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<muru_config::MountThreads>,
+    /// The interface the mount's requests may be handed to (section 6.14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<muru_config::Handoff>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -365,6 +368,10 @@ pub struct ReleaseSpec {
     /// Whether gRPC server reflection is served (section 6.13).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reflection: bool,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<muru_config::Handoff>,
     /// Named worker groups beside the default one.
     #[serde(default)]
     pub groups: Vec<GroupSpec>,
@@ -442,6 +449,80 @@ pub struct ReleaseSpec {
     /// Section 8.2: where compiled bytecode goes.
     #[serde(default)]
     pub bytecode: BytecodeSpec,
+    /// Section 9.12: the commands the application declares, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<CommandSpec>,
+}
+
+/// Section 9.12: a command the application declares, resolved and
+/// checked from its table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSpec {
+    /// Its name, a valid name.
+    pub name: String,
+    /// What it does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// The program and its arguments, with `{input}` placeholders; empty
+    /// for a callable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+    /// The callable as module:function, called with the inputs as
+    /// keyword arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// Its own environment variables, with `{input}` placeholders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+    /// The inputs it takes, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<CommandInputSpec>,
+    /// How long it may run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// One run at a time for the application.
+    #[serde(default)]
+    pub exclusive: bool,
+}
+
+/// Section 9.12: how a run of a command went, kept for the last run of
+/// each of an application's commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRun {
+    /// The release it ran with.
+    pub release: String,
+    /// When it started.
+    pub started_unix_ms: u64,
+    /// How long it took.
+    pub duration_ms: u64,
+    /// Its exit status, or 128 plus the signal that killed it.
+    pub exit_code: i32,
+    /// Whether it succeeded.
+    pub ok: bool,
+    /// How it ended.
+    pub message: String,
+}
+
+/// Section 9.12: an input a command takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInputSpec {
+    /// Its name: letters, digits and underscores.
+    pub name: String,
+    /// What the value is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Whether a run needs it.
+    #[serde(default)]
+    pub required: bool,
+    /// The value when none is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// A regular expression the whole value must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Never shown, logged or put in an event.
+    #[serde(default)]
+    pub secret: bool,
 }
 
 /// Section 3.3: where each of a release's settings came from, by key:
@@ -1197,30 +1278,10 @@ pub struct OverlayState {
     pub until_unix_ms: Option<u64>,
 }
 
-/// Check a name against section 3.2: lowercase letters, digits and
-/// hyphens, up to 63 characters.
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 63
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-}
+// The name rules live with the configuration they check, so muructl run
+// applies the same ones as the daemon.
 
-/// Whether a string is an environment variable name: letters, digits and
-/// underscores, not starting with a digit.
-pub fn valid_env_name(name: &str) -> bool {
-    let mut characters = name.chars();
-
-    match characters.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-
-    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+pub use muru_config::{valid_env_name, valid_name};
 
 /// Now, as Unix milliseconds.
 pub fn now_unix_ms() -> u64 {
@@ -1240,15 +1301,5 @@ mod tests {
         }
 
         assert!("running".parse::<ReleaseState>().is_err());
-    }
-
-    #[test]
-    fn names_follow_the_rules() {
-        assert!(valid_name("shop"));
-        assert!(valid_name("shop-2"));
-        assert!(!valid_name("Shop"));
-        assert!(!valid_name("-shop"));
-        assert!(!valid_name(""));
-        assert!(!valid_name("a".repeat(64).as_str()));
     }
 }

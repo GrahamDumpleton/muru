@@ -501,6 +501,7 @@ fn plan_app(
             error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
             error_override: table.error_override.as_ref(),
             maintenance: table.maintenance.as_ref(),
+            commands: (!table.commands.is_empty()).then_some(&table.commands),
             declared: true,
         };
 
@@ -2237,9 +2238,214 @@ pub struct Tables<'a> {
     pub error_override: Option<&'a muru_config::ErrorOverride>,
     /// Maintenance exemptions (section 4.12).
     pub maintenance: Option<&'a muru_config::Maintenance>,
+    /// Commands (section 9.12).
+    pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
     /// Whether the request is a declared release's table rather than a
     /// deploy's flags, which names its layer (section 3.3).
     pub declared: bool,
+}
+
+/// A worker group's match as the edge compares it (ADR 0033).
+pub struct GroupMatchSpec {
+    /// The client classes it takes, every class when empty.
+    pub client_class: Vec<String>,
+    /// The hosts it takes, normalised, every host when empty.
+    pub host: Vec<String>,
+    /// The methods it takes, in upper case, every method when empty.
+    pub method: Vec<String>,
+}
+
+/// Check a worker group's name and the names its match gives (ADR
+/// 0033): hosts are compared as the host tables hold them, with no
+/// wildcard, and methods in upper case. muructl run checks a project's
+/// groups with this too, so a project that runs there deploys.
+pub fn group_match(name: &str, group: &muru_config::Group) -> Result<GroupMatchSpec, String> {
+    muru_config::check_group_name(name)?;
+    muru_config::check_group_match(group.matches.as_ref())
+        .map_err(|error| format!("worker group {name}: {error}"))?;
+    let matches = group.matches.clone().unwrap_or_default();
+    let mut host = Vec::new();
+
+    for given in &matches.host {
+        let normalised = muru_edge::routing::normalise(given);
+
+        if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
+            return Err(format!(
+                "worker group {name}: match.host {given:?} is not a host name"
+            ));
+        }
+
+        host.push(normalised);
+    }
+
+    let mut method = Vec::new();
+
+    for given in &matches.method {
+        let token = given.trim().to_ascii_uppercase();
+
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err(format!(
+                "worker group {name}: match.method {given:?} is not a method"
+            ));
+        }
+
+        method.push(token);
+    }
+
+    Ok(GroupMatchSpec {
+        client_class: matches.client_class,
+        host,
+        method,
+    })
+}
+
+/// Check a release's worker groups and mounts as their tables give them
+/// (sections 6.7 and 7.1, ADR 0033): each on its own, then against each
+/// other. muructl run checks a project's tables with this too, so a
+/// project that runs there deploys; the checks that need the release's
+/// other settings stay with resolving them.
+pub fn check_groups_and_mounts(
+    groups: &BTreeMap<String, muru_config::Group>,
+    mounts: &BTreeMap<String, muru_config::Mount>,
+) -> Result<(), String> {
+    let mut matched = Vec::new();
+
+    for (name, group) in groups {
+        let spec = group_match(name, group)?;
+
+        if group.paths.is_empty() && group.matches.is_none() {
+            return Err(format!("worker group {name} has no paths and no match"));
+        }
+
+        if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
+            return Err(format!(
+                "worker group {name}: {path:?} does not start with /"
+            ));
+        }
+
+        if group.processes == Some(0) {
+            return Err(format!("worker group {name} has no processes"));
+        }
+
+        if group
+            .scaling
+            .as_ref()
+            .is_some_and(|scaling| scaling.host_idle_timeout.is_some())
+        {
+            return Err(format!(
+                "worker group {name}: host_idle_timeout belongs in the release's own scaling table"
+            ));
+        }
+
+        muru_config::check_group_timeouts(group.timeouts.as_ref())
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+        matched.push((name, group, spec));
+    }
+
+    // Two groups asking the same of the same path cannot be ordered, so
+    // they are refused; groups asking different things of a path are
+    // ranked by how much they ask.
+
+    for (index, (name, group, spec)) in matched.iter().enumerate() {
+        for (other_name, other, other_spec) in &matched[index + 1..] {
+            let overlap = |mine: &[String], theirs: &[String]| {
+                (mine.is_empty() && theirs.is_empty())
+                    || mine.iter().any(|value| theirs.contains(value))
+            };
+            let shared = group_prefixes(&group.paths)
+                .into_iter()
+                .find(|prefix| group_prefixes(&other.paths).contains(prefix));
+
+            if let Some(path) = shared
+                && overlap(&spec.client_class, &other_spec.client_class)
+                && overlap(&spec.host, &other_spec.host)
+                && overlap(&spec.method, &other_spec.method)
+            {
+                return Err(format!(
+                    "worker groups {name} and {other_name} ask the same of {path}"
+                ));
+            }
+        }
+    }
+
+    // Each mount has a name, a path below / and an entrypoint, and no two
+    // share a path; a gRPC mount is reached by service name, not path.
+
+    let mut paths: Vec<(&String, String)> = Vec::new();
+
+    for (name, mount) in mounts {
+        muru_config::check_mount_name(name)?;
+        let grpc = mount.interface == Some(muru_config::Interface::Grpc);
+
+        if grpc && !mount.path.is_empty() {
+            return Err(format!(
+                "mount {name}: a gRPC mount has no path; its calls are matched by service name"
+            ));
+        }
+
+        if !grpc && (!mount.path.starts_with('/') || mount.path == "/") {
+            return Err(format!(
+                "mount {name}: {:?} is not a path below /",
+                mount.path
+            ));
+        }
+
+        if mount.entrypoint.is_empty() || !mount.entrypoint.contains(':') {
+            return Err(format!(
+                "mount {name}: the entrypoint must be module:callable"
+            ));
+        }
+
+        let path = mount.path.trim_end_matches('/').to_owned();
+
+        if !grpc && paths.iter().any(|(_, other)| *other == path) {
+            return Err(format!("mount {name}: another mount has the path {path}"));
+        }
+
+        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_handoff(mount.handoff, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        paths.push((name, path));
+    }
+
+    // A group's workers serve the mounts it lists and the default mount;
+    // its paths must lie within them, so a request it claims never
+    // reaches a worker without the request's mount.
+
+    for (name, group, _) in &matched {
+        if group.mounts.is_empty() {
+            continue;
+        }
+
+        for mount in &group.mounts {
+            if !mounts.contains_key(mount) {
+                return Err(format!("worker group {name}: no mount named {mount}"));
+            }
+        }
+
+        for (mount, path) in &paths {
+            if group.mounts.contains(mount) || path.is_empty() {
+                continue;
+            }
+
+            for prefix in group_prefixes(&group.paths) {
+                let under = |path: &str, prefix: &str| {
+                    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
+                };
+
+                if under(path, &prefix) || under(&prefix, path) {
+                    return Err(format!(
+                        "worker group {name}: its path {prefix} reaches mount {mount} at {path}, which it does not serve"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// A group's paths as the edge matches them: prefixes without their
@@ -2418,81 +2624,27 @@ pub fn resolve_spec(
         .or(table.concurrency.map(|value| value as u32))
         .or(previous.map(|previous| previous.concurrency))
         .unwrap_or(1000);
+    let groups = groups.unwrap_or(&table.groups);
+    let mounts = mounts.unwrap_or(&table.mounts);
+    check_groups_and_mounts(groups, mounts)?;
     let mut resolved_groups = Vec::new();
 
-    for (name, group) in groups.unwrap_or(&table.groups) {
-        if !crate::model::valid_name(name) || name == "default" {
-            return Err(format!("{name:?} is not a valid worker group name"));
-        }
-
-        muru_config::check_group_match(group.matches.as_ref())
-            .map_err(|error| format!("worker group {name}: {error}"))?;
-        let matches = group.matches.clone().unwrap_or_default();
-        let client_class = matches.client_class;
-
-        // ADR 0033: hosts are compared as the host tables hold them, with
-        // no wildcard, and methods in upper case.
-
-        let mut host = Vec::new();
-
-        for given in &matches.host {
-            let normalised = muru_edge::routing::normalise(given);
-
-            if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
-                return Err(format!(
-                    "worker group {name}: match.host {given:?} is not a host name"
-                ));
-            }
-
-            host.push(normalised);
-        }
-
-        let mut method = Vec::new();
-
-        for given in &matches.method {
-            let token = given.trim().to_ascii_uppercase();
-
-            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-                return Err(format!(
-                    "worker group {name}: match.method {given:?} is not a method"
-                ));
-            }
-
-            method.push(token);
-        }
-
-        if group.paths.is_empty() && group.matches.is_none() {
-            return Err(format!("worker group {name} has no paths and no match"));
-        }
-
-        if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
-            return Err(format!(
-                "worker group {name}: {path:?} does not start with /"
-            ));
-        }
-
-        if group.processes == Some(0) {
-            return Err(format!("worker group {name} has no processes"));
-        }
-
+    for (name, group) in groups {
+        let GroupMatchSpec {
+            client_class,
+            host,
+            method,
+        } = group_match(name, group)?;
         let (group_scaling, group_processes) = resolve_scaling(
             group.scaling.as_ref(),
             group.processes.map_or(processes, |value| value as u32),
             &format!("worker group {name}: scaling"),
         )?;
 
-        if group_scaling.host_idle_timeout_ms.is_some() {
-            return Err(format!(
-                "worker group {name}: host_idle_timeout belongs in the release's own scaling table"
-            ));
-        }
-
         // Section 7.1: the group's own timeouts, checked against the
         // release's once those are resolved below, and its memory policy,
         // resolved over the release's there too.
 
-        muru_config::check_group_timeouts(group.timeouts.as_ref())
-            .map_err(|error| format!("worker group {name}: {error}"))?;
         let own = group.timeouts.clone().unwrap_or_default();
         let parse = |text: Option<&String>, key: &str| {
             parse_ms(text, key).map_err(|error| format!("worker group {name}: timeouts.{error}"))
@@ -2525,36 +2677,8 @@ pub fn resolve_spec(
         });
     }
 
-    // ADR 0033: two groups asking the same of the same path cannot be
-    // ordered, so they are refused; groups asking different things of a
-    // path are ranked by how much they ask.
-
-    for (index, group) in resolved_groups.iter().enumerate() {
-        for other in &resolved_groups[index + 1..] {
-            let overlap = |mine: &[String], theirs: &[String]| {
-                (mine.is_empty() && theirs.is_empty())
-                    || mine.iter().any(|value| theirs.contains(value))
-            };
-            let shared = group_prefixes(&group.paths)
-                .into_iter()
-                .find(|prefix| group_prefixes(&other.paths).contains(prefix));
-
-            if let Some(path) = shared
-                && overlap(&group.client_class, &other.client_class)
-                && overlap(&group.host, &other.host)
-                && overlap(&group.method, &other.method)
-            {
-                return Err(format!(
-                    "worker groups {} and {} ask the same of {path}",
-                    group.name, other.name
-                ));
-            }
-        }
-    }
-
     // Section 6.7: mounts from the declaration, else the source's own
-    // table; each has a name, a path below / and an entrypoint, and no
-    // two share a path.
+    // table, as checked above.
 
     let mut resolved_mounts: Vec<MountSpec> = Vec::new();
     let accel_redirect = request
@@ -2600,40 +2724,8 @@ pub fn resolve_spec(
     };
     muru_config::check_origins(&grpc_web_origins)?;
 
-    for (name, mount) in mounts.unwrap_or(&table.mounts) {
-        if !crate::model::valid_name(name) {
-            return Err(format!("{name:?} is not a valid mount name"));
-        }
-
-        // Section 6.13: a gRPC mount is reached by service name, not path.
-
-        let grpc = mount.interface == Some(muru_config::Interface::Grpc);
-
-        if grpc && !mount.path.is_empty() {
-            return Err(format!(
-                "mount {name}: a gRPC mount has no path; its calls are matched by service name"
-            ));
-        }
-
-        if !grpc && (!mount.path.starts_with('/') || mount.path == "/") {
-            return Err(format!(
-                "mount {name}: {:?} is not a path below /",
-                mount.path
-            ));
-        }
-
-        if mount.entrypoint.is_empty() || !mount.entrypoint.contains(':') {
-            return Err(format!(
-                "mount {name}: the entrypoint must be module:callable"
-            ));
-        }
-
+    for (name, mount) in mounts {
         let path = mount.path.trim_end_matches('/').to_owned();
-
-        if !grpc && resolved_mounts.iter().any(|other| other.path == path) {
-            return Err(format!("mount {name}: another mount has the path {path}"));
-        }
-
         let mount_roots = mount
             .sendfile_roots
             .clone()
@@ -2643,10 +2735,6 @@ pub fn resolve_spec(
             .clone()
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
-            .map_err(|error| format!("mount {name}: {error}"))?;
-        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
-            .map_err(|error| format!("mount {name}: {error}"))?;
-        muru_config::check_mount_threads(mount.threads, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
@@ -2666,45 +2754,8 @@ pub fn resolve_spec(
             threads: mount.threads,
             concurrency: mount.concurrency.map(|value| value as u32),
             max_connections: mount.max_connections.map(|value| value as u32),
+            handoff: mount.handoff,
         });
-    }
-
-    // ADR 0033: a group's workers serve the mounts it lists and the
-    // default mount; its paths must lie within them, so a request it
-    // claims never reaches a worker without the request's mount.
-
-    for group in &resolved_groups {
-        if group.mounts.is_empty() {
-            continue;
-        }
-
-        for name in &group.mounts {
-            if !resolved_mounts.iter().any(|mount| &mount.name == name) {
-                return Err(format!(
-                    "worker group {}: no mount named {name}",
-                    group.name
-                ));
-            }
-        }
-
-        for mount in &resolved_mounts {
-            if group.mounts.contains(&mount.name) || mount.path.is_empty() {
-                continue;
-            }
-
-            for prefix in group_prefixes(&group.paths) {
-                let under = |path: &str, prefix: &str| {
-                    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
-                };
-
-                if under(&mount.path, &prefix) || under(&prefix, &mount.path) {
-                    return Err(format!(
-                        "worker group {}: its path {prefix} reaches mount {} at {}, which it does not serve",
-                        group.name, mount.name, mount.path
-                    ));
-                }
-            }
-        }
     }
 
     // Section 4.9: the release's own directories of files, by path: the
@@ -2873,7 +2924,6 @@ pub fn resolve_spec(
             .map_err(|error| format!("worker group {}: {error}", group.name))?;
 
         if let Some(table) = groups
-            .unwrap_or(&table.groups)
             .get(&group.name)
             .and_then(|declared| declared.memory.as_ref())
         {
@@ -2903,16 +2953,12 @@ pub fn resolve_spec(
     let (scaling, processes) =
         resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
 
-    if scaling.host_idle_timeout_ms.is_some()
-        && let Some(group) = resolved_groups
+    check_idle_host(
+        &scaling,
+        resolved_groups
             .iter()
-            .find(|group: &&GroupSpec| group.scaling.is_static() || group.scaling.min_workers > 0)
-    {
-        return Err(format!(
-            "scaling.host_idle_timeout needs every worker group to scale to zero, and worker group {} keeps workers",
-            group.name
-        ));
-    }
+            .map(|group| (group.name.as_str(), &group.scaling)),
+    )?;
 
     let (error_pages, error_override, maintenance) = resolve_error_tables(
         tables,
@@ -2924,18 +2970,33 @@ pub fn resolve_spec(
 
     let layers = resolve_layers(request, &table, previous, tables.declared, &source);
 
+    // Section 9.12: commands from the declaration, else the source's own
+    // table.
+
+    let commands = resolve_commands(tables.commands.unwrap_or(&table.commands))?;
+
+    let interface = match request.interface.as_str() {
+        "" => table
+            .interface
+            .or(previous.map(|previous| previous.interface))
+            .unwrap_or(muru_config::Interface::Auto),
+        given => given
+            .parse()
+            .map_err(|error: muru_config::ParseError| error.to_string())?,
+    };
+
+    // Section 6.14: the default mount's handoff, checked against the
+    // interface it hands from when that is declared.
+
+    let handoff = table
+        .handoff
+        .or_else(|| previous.and_then(|previous| previous.handoff));
+    muru_config::check_handoff(handoff, Some(interface))?;
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
-        interface: match request.interface.as_str() {
-            "" => table
-                .interface
-                .or(previous.map(|previous| previous.interface))
-                .unwrap_or(muru_config::Interface::Auto),
-            given => given
-                .parse()
-                .map_err(|error: muru_config::ParseError| error.to_string())?,
-        },
+        interface,
         python,
         processes,
         threads,
@@ -2960,6 +3021,7 @@ pub fn resolve_spec(
             .or(table.reflection)
             .or(previous.map(|previous| previous.reflection))
             .unwrap_or(false),
+        handoff,
         grpc_web_origins,
         groups: resolved_groups,
         mounts: resolved_mounts,
@@ -2989,7 +3051,199 @@ pub fn resolve_spec(
         interpreter,
         build,
         bytecode,
+        commands,
     })
+}
+
+/// Section 9.12: a release's commands from their tables, checked: a
+/// valid name, `run` or `call` but not both, a timeout that parses, and
+/// inputs with names Python accepts as keywords, patterns that compile,
+/// no default where one is required or secret, and every placeholder an
+/// input, a secret one only in `env`, where no command line shows it.
+fn resolve_commands(
+    tables: &BTreeMap<String, muru_config::CommandTable>,
+) -> Result<Vec<crate::model::CommandSpec>, String> {
+    let mut commands = Vec::with_capacity(tables.len());
+
+    for (name, table) in tables {
+        let what = format!("commands.{name}");
+
+        if !valid_name(name) {
+            return Err(format!(
+                "{what}: a command's name is lowercase letters, digits and hyphens"
+            ));
+        }
+
+        let call = match (&table.call, table.run.is_empty()) {
+            (Some(_), false) => return Err(format!("{what}: give run or call, not both")),
+            (None, true) => {
+                return Err(format!(
+                    "{what}: give run, a program and its arguments, or call, a module:function"
+                ));
+            }
+            (Some(call), true) => {
+                let well_formed = call.split_once(':').is_some_and(|(module, function)| {
+                    [module, function].iter().all(|part| {
+                        !part.is_empty() && part.split('.').all(crate::model::valid_env_name)
+                    })
+                });
+
+                if !well_formed {
+                    return Err(format!(
+                        "{what}: call = {call:?} is not module:function, such as shop.ops:backup"
+                    ));
+                }
+
+                Some(call.clone())
+            }
+            (None, false) => None,
+        };
+
+        let mut inputs = Vec::with_capacity(table.inputs.len());
+
+        for (input, spec) in &table.inputs {
+            let what = format!("{what}.inputs.{input}");
+
+            if !crate::model::valid_env_name(input) {
+                return Err(format!(
+                    "{what}: an input's name is letters, digits and underscores, not starting with a digit"
+                ));
+            }
+
+            let required = spec.required.unwrap_or(false);
+            let secret = spec.secret.unwrap_or(false);
+
+            if spec.default.is_some() && (required || secret) {
+                return Err(format!(
+                    "{what}: a {} input has no default",
+                    if secret { "secret" } else { "required" }
+                ));
+            }
+
+            if let Some(pattern) = &spec.pattern {
+                let anchored = regex::Regex::new(&format!("^(?:{pattern})$"))
+                    .map_err(|error| format!("{what}: pattern: {error}"))?;
+
+                if let Some(default) = &spec.default
+                    && !anchored.is_match(default)
+                {
+                    return Err(format!(
+                        "{what}: the default {default:?} does not match the pattern"
+                    ));
+                }
+            }
+
+            inputs.push(crate::model::CommandInputSpec {
+                name: input.clone(),
+                description: spec.description.clone().unwrap_or_default(),
+                required,
+                default: spec.default.clone(),
+                pattern: spec.pattern.clone(),
+                secret,
+            });
+        }
+
+        // Every placeholder names an input; a secret's value goes only
+        // into the environment.
+
+        let input = |name: &str| inputs.iter().find(|input| input.name == name);
+
+        for argument in &table.run {
+            for placeholder in crate::commands::placeholders(argument)
+                .map_err(|error| format!("{what}: run: {error}"))?
+            {
+                match input(&placeholder) {
+                    None => return Err(format!("{what}: run: {{{placeholder}}} names no input")),
+                    Some(input) if input.secret => {
+                        return Err(format!(
+                            "{what}: run: the secret input {placeholder} goes in env, where no command line shows it"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        for (variable, value) in &table.env {
+            if !crate::model::valid_env_name(variable) || variable.starts_with("MURU_") {
+                return Err(format!(
+                    "{what}: env: {variable} is not a variable name a command can set"
+                ));
+            }
+
+            for placeholder in crate::commands::placeholders(value)
+                .map_err(|error| format!("{what}: env.{variable}: {error}"))?
+            {
+                if input(&placeholder).is_none() {
+                    return Err(format!(
+                        "{what}: env.{variable}: {{{placeholder}}} names no input"
+                    ));
+                }
+            }
+        }
+
+        let timeout_ms = table
+            .timeout
+            .as_deref()
+            .map(muru_config::parse_duration)
+            .transpose()
+            .map_err(|error| format!("{what}: timeout: {error}"))?
+            .map(|timeout| timeout.as_millis() as u64);
+
+        commands.push(crate::model::CommandSpec {
+            name: name.clone(),
+            description: table.description.clone().unwrap_or_default(),
+            run: table.run.clone(),
+            call,
+            env: table.env.clone().into_iter().collect(),
+            inputs,
+            timeout_ms,
+            exclusive: table.exclusive.unwrap_or(false),
+        });
+    }
+
+    Ok(commands)
+}
+
+/// Section 9.12: the commands of a release as the tables they came from,
+/// for an export.
+fn commands_table_from(
+    commands: &[crate::model::CommandSpec],
+) -> BTreeMap<String, muru_config::CommandTable> {
+    commands
+        .iter()
+        .map(|command| {
+            let table = muru_config::CommandTable {
+                description: (!command.description.is_empty()).then(|| command.description.clone()),
+                run: command.run.clone(),
+                call: command.call.clone(),
+                env: command.env.iter().cloned().collect(),
+                inputs: command
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        (
+                            input.name.clone(),
+                            muru_config::CommandInput {
+                                description: (!input.description.is_empty())
+                                    .then(|| input.description.clone()),
+                                required: input.required.then_some(true),
+                                default: input.default.clone(),
+                                pattern: input.pattern.clone(),
+                                secret: input.secret.then_some(true),
+                            },
+                        )
+                    })
+                    .collect(),
+                timeout: command
+                    .timeout_ms
+                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                exclusive: command.exclusive.then_some(true),
+            };
+
+            (command.name.clone(), table)
+        })
+        .collect()
 }
 
 /// Section 8.2: the build settings for a release, and whether the daemon
@@ -3555,9 +3809,7 @@ fn resolve_env_specs(
     }
 
     for entry in request {
-        if !crate::model::valid_env_name(&entry.name) {
-            return Err(format!("env: {:?} is not a variable name", entry.name));
-        }
+        muru_config::check_env_name(&entry.name)?;
 
         if entry.secret_store.is_empty() != entry.secret_key.is_empty() {
             return Err(format!(
@@ -3680,6 +3932,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         entrypoint: request.entrypoint.clone(),
         interface: parse_optional(&request.interface)?,
         reflection: request.reflection,
+        handoff: None,
         grpc_web_origins: request.grpc_web_origins.clone(),
         factory: request.factory,
         factory_phase: parse_optional(&request.factory_phase)?,
@@ -3716,6 +3969,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         error_pages: BTreeMap::new(),
         error_override: None,
         maintenance: None,
+        commands: BTreeMap::new(),
     })
 }
 
@@ -3781,6 +4035,7 @@ fn resolve_http_spec(
         hooks: None,
         factory: None,
         reflection: false,
+        handoff: None,
         grpc_web_origins: Vec::new(),
         groups: Vec::new(),
         mounts: Vec::new(),
@@ -3816,7 +4071,53 @@ fn resolve_http_spec(
         interpreter: None,
         build: crate::model::BuildSpec::default(),
         bytecode: crate::model::BytecodeSpec::default(),
+        commands: Vec::new(),
     })
+}
+
+/// Sections 7.2 and 7.4: check a release's scaling tables, its own and
+/// its worker groups', as resolving them would. muructl run, which does
+/// not scale, checks a project's with this, so a project that runs
+/// there deploys.
+pub fn check_scaling(
+    release: Option<&muru_config::Scaling>,
+    groups: &BTreeMap<String, muru_config::Group>,
+    processes: u32,
+) -> Result<(), String> {
+    let (scaling, _) = resolve_scaling(release, processes, "scaling")?;
+    let mut resolved = Vec::new();
+
+    for (name, group) in groups {
+        let (group_scaling, _) = resolve_scaling(
+            group.scaling.as_ref(),
+            group.processes.map_or(processes, |value| value as u32),
+            &format!("worker group {name}: scaling"),
+        )?;
+        resolved.push((name.as_str(), group_scaling));
+    }
+
+    check_idle_host(
+        &scaling,
+        resolved.iter().map(|(name, scaling)| (*name, scaling)),
+    )
+}
+
+/// Section 7.4: a host that stops when idle needs every worker group to
+/// scale to zero.
+fn check_idle_host<'a>(
+    scaling: &ScalingSpec,
+    mut groups: impl Iterator<Item = (&'a str, &'a ScalingSpec)>,
+) -> Result<(), String> {
+    if scaling.host_idle_timeout_ms.is_some()
+        && let Some((name, _)) =
+            groups.find(|(_, scaling)| scaling.is_static() || scaling.min_workers > 0)
+    {
+        return Err(format!(
+            "scaling.host_idle_timeout needs every worker group to scale to zero, and worker group {name} keeps workers"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Section 7.2 and 7.4: a scaling table resolved against the defaults of
@@ -4038,9 +4339,7 @@ fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
 
 /// One variable of an `[env]` table as the spec records it.
 fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvSpec, String> {
-    if !crate::model::valid_env_name(name) {
-        return Err(format!("env: {name:?} is not a variable name"));
-    }
+    muru_config::check_env_name(name)?;
 
     Ok(match value {
         muru_config::EnvValue::Plain(text) => EnvSpec {
@@ -4299,6 +4598,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         entrypoint: spec.entrypoint.clone(),
         interface: Some(spec.interface),
         reflection: spec.reflection.then_some(true),
+        handoff: spec.handoff,
         grpc_web_origins: spec.grpc_web_origins.clone(),
         factory: spec.factory.map(|_| true),
         factory_phase: spec.factory,
@@ -4366,6 +4666,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         threads: mount.threads,
                         concurrency: mount.concurrency.map(|value| value as usize),
                         max_connections: mount.max_connections.map(|value| value as usize),
+                        handoff: mount.handoff,
                     },
                 )
             })
@@ -4428,6 +4729,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         error_pages: spec.error_pages.clone(),
         error_override: spec.error_override.clone(),
         maintenance: spec.maintenance.clone(),
+        commands: commands_table_from(&spec.commands),
     }
 }
 
@@ -4586,9 +4888,25 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         recorded.hooks.clone().unwrap_or_default(),
     );
     compare(
+        "commands",
+        serde_json::to_string(&declared.commands).unwrap_or_default(),
+        serde_json::to_string(&recorded.commands).unwrap_or_default(),
+    );
+    compare(
         "reflection",
         declared.reflection.to_string(),
         recorded.reflection.to_string(),
+    );
+    compare(
+        "handoff",
+        declared
+            .handoff
+            .map(|handoff| handoff.to_string())
+            .unwrap_or_default(),
+        recorded
+            .handoff
+            .map(|handoff| handoff.to_string())
+            .unwrap_or_default(),
     );
     compare(
         "grpc_web_origins",
@@ -4966,6 +5284,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
                 flags.push(format!("threads {}", threads.describe()));
             }
 
+            if let Some(handoff) = mount.handoff {
+                flags.push(format!("handoff {handoff}"));
+            }
+
             let flags = if flags.is_empty() {
                 String::new()
             } else {
@@ -5268,7 +5590,7 @@ mod tests {
         let source = source_dir();
         let store = store_with_shop(&source);
         let defined = Defined {
-            client_classes: vec!["partner".to_owned(), "ai_crawler".to_owned()],
+            client_classes: vec!["partner".to_owned(), "ai-crawler".to_owned()],
             ..Defined::default()
         };
         let routes = |extra: &str| {
@@ -5276,7 +5598,7 @@ mod tests {
                 "[host.shop]\nnames = ['shop.example.com']\n\
                  [[route]]\nhost = 'shop'\napp = 'shop'\n\
                  [[route]]\nhost = 'shop'\napp = 'shop'\nmatch = {{ client_class = ['partner'] }}\n\
-                 traffic = {{ classes = {{ ai_crawler = 'r1' }} }}\n{extra}"
+                 traffic = {{ classes = {{ ai-crawler = 'r1' }} }}\n{extra}"
             )
         };
 
@@ -5492,6 +5814,74 @@ mod tests {
                 1
             )
             .contains("host_idle_timeout needs min_workers = 0")
+        );
+    }
+
+    #[test]
+    fn commands_are_checked_as_they_are_resolved() {
+        let table = |text: &str| {
+            toml::from_str::<BTreeMap<String, muru_config::CommandTable>>(text).unwrap()
+        };
+        let resolved = |text: &str| resolve_commands(&table(text));
+        let refused = |text: &str| resolved(text).unwrap_err();
+
+        let commands = resolved(
+            r#"
+            [migrate]
+            description = "Apply migrations"
+            run = ["python", "manage.py", "migrate"]
+            timeout = "10m"
+            exclusive = true
+
+            [add-user]
+            run = ["python", "manage.py", "createsuperuser", "--username", "{username}"]
+            env = { DJANGO_SUPERUSER_PASSWORD = "{password}" }
+            inputs.username = { required = true, pattern = "[a-z]+" }
+            inputs.password = { required = true, secret = true }
+
+            [backup]
+            call = "shop.ops:backup"
+            inputs.target = { default = "s3://backups" }
+            "#,
+        )
+        .unwrap();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, ["add-user", "backup", "migrate"]);
+        assert_eq!(commands[2].timeout_ms, Some(600_000));
+        assert!(commands[2].exclusive);
+        assert_eq!(commands[1].call.as_deref(), Some("shop.ops:backup"));
+
+        // They export as the tables they came from.
+
+        let exported = commands_table_from(&commands);
+        assert_eq!(resolve_commands(&exported).unwrap(), commands);
+
+        assert!(refused("[Migrate]\nrun = ['x']").contains("lowercase letters"));
+        assert!(refused("[m]\nrun = ['x']\ncall = 'a:b'").contains("not both"));
+        assert!(refused("[m]\ndescription = 'nothing'").contains("give run"));
+        assert!(refused("[m]\ncall = 'shop.ops'").contains("is not module:function"));
+        assert!(refused("[m]\nrun = ['x']\ntimeout = 'soon'").contains("timeout"));
+        assert!(refused("[m]\nrun = ['x', '{who}']").contains("{who} names no input"));
+        assert!(
+            refused("[m]\nrun = ['x', '{pw}']\ninputs.pw = { secret = true }")
+                .contains("the secret input pw goes in env")
+        );
+        assert!(
+            refused("[m]\nrun = ['x']\ninputs.n = { required = true, default = 'a' }")
+                .contains("a required input has no default")
+        );
+        assert!(
+            refused("[m]\nrun = ['x']\ninputs.n = { pattern = '[0-9]+', default = 'a' }")
+                .contains("does not match the pattern")
+        );
+        assert!(refused("[m]\nrun = ['x']\ninputs.n = { pattern = '(' }").contains("pattern"));
+        assert!(refused("[m]\nrun = ['x']\ninputs.2n = {}").contains("letters, digits"));
+        assert!(
+            refused("[m]\nrun = ['x']\nenv = { MURU_APP = 'x' }")
+                .contains("not a variable name a command can set")
         );
     }
 }

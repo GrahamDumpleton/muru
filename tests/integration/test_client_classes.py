@@ -32,7 +32,7 @@ verify = 'dns'
 verify_domains = ['localhost']
 
 [[client_class]]
-name = 'ai_crawler'
+name = 'ai-crawler'
 user_agent_list = 'lists/ai.txt'
 
 [[client_class]]
@@ -49,7 +49,7 @@ addresses = ['127.0.0.1']
 cookies = { tier = '^gold$' }
 
 [rate_limit.crawlers]
-match = { client_class = ['ai_crawler'] }
+match = { client_class = ['ai-crawler'] }
 rate = '1/m'
 burst = 2
 headers = true
@@ -188,7 +188,7 @@ mode = 'limited'
 
 
 def test_the_first_rule_that_matches_names_the_class(site: Site) -> None:
-    assert site.seen("/", {"User-Agent": "Mozilla/5.0 GPTBot/1.1"})["class"] == "ai_crawler"
+    assert site.seen("/", {"User-Agent": "Mozilla/5.0 GPTBot/1.1"})["class"] == "ai-crawler"
     assert site.seen("/", {"X-Bot-Score": "5"})["class"] == "scored"
     assert site.seen("/", {"X-Bot-Score": "57"})["class"] == "default"
     assert site.seen("/", {"Cookie": "a=1; tier=gold"})["class"] == "partner"
@@ -197,7 +197,7 @@ def test_the_first_rule_that_matches_names_the_class(site: Site) -> None:
     # An ASGI application finds it in the scope, with the route's mode.
 
     assert site.seen("/asgi/", {"User-Agent": "GPTBot"}) == {
-        "class": "ai_crawler",
+        "class": "ai-crawler",
         "mode": "limited",
         "method": "GET",
     }
@@ -227,7 +227,7 @@ def test_a_rate_limit_refuses_with_retry_after_and_its_fields(site: Site) -> Non
 
     assert eventually(lambda: "ratelimit.enforcing" in site.daemon.events())
     assert (
-        'muru_rate_limited_total{limit="crawlers",client_class="ai_crawler",action="rejected"} 1'
+        'muru_rate_limited_total{limit="crawlers",client_class="ai-crawler",action="rejected"} 1'
         in site.metrics()
     )
 
@@ -267,13 +267,13 @@ def test_methods_are_refused_and_the_mode_reaches_the_application(site: Site) ->
 def test_requests_are_counted_by_class(site: Site) -> None:
     site.seen("/", {"User-Agent": "GPTBot"})
     text = site.metrics()
-    assert 'client_class="ai_crawler"' in text
+    assert 'client_class="ai-crawler"' in text
     assert 'status="2xx",client_class="default"}' in text
 
 
 def test_a_changed_list_is_read_again(site: Site) -> None:
     (site.base / "lists" / "ai.txt").write_text("CCBot\n")
-    assert eventually(lambda: site.seen("/", {"User-Agent": "CCBot"})["class"] == "ai_crawler")
+    assert eventually(lambda: site.seen("/", {"User-Agent": "CCBot"})["class"] == "ai-crawler")
     assert site.seen("/", {"User-Agent": "GPTBot"})["class"] == "default"
     assert "client_class.list_reloaded" in site.daemon.events()
 
@@ -317,7 +317,7 @@ def test_an_applied_file_defines_classes_and_limits(site: Site) -> None:
 name = 'applied'
 user_agent_list = '{listed}'
 
-[rate_limit.applied_limit]
+[rate_limit.applied-limit]
 match = {{ client_class = ['applied'] }}
 rate = '1/m'
 burst = 1
@@ -326,7 +326,7 @@ burst = 1
 host = 'site'
 path = '/applied/'
 app = 'clients'
-rate_limits = ['applied_limit']
+rate_limits = ['applied-limit']
 """
     )
     applied = site.daemon.muructl("apply", "-f", str(tables))
@@ -340,7 +340,7 @@ rate_limits = ['applied_limit']
     assert site.request("/applied/", bot).status == 429
 
     exported = site.daemon.muructl("config", "export").stdout
-    assert 'name = "applied"' in exported and "[rate_limit.applied_limit]" in exported
+    assert 'name = "applied"' in exported and "[rate_limit.applied-limit]" in exported
 
     # A name the daemon's file defines is refused.
 

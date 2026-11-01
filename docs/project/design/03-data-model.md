@@ -47,7 +47,7 @@ erDiagram
 | Edge pool | edge/pools/public | listeners, processes, threads | Yes |
 | Event sink | events/sinks/... | kind, endpoint, filters | Yes |
 | Overlay | overlays/nightly-backup | partial configuration, trigger, preconditions, warm-up, latch, advisory, priority | Yes |
-| Client class | client-classes/ai_crawler | ordered match rules, lists, verification | Yes |
+| Client class | client-classes/ai-crawler | ordered match rules, lists, verification | Yes |
 | Rate limit | rate-limits/crawlers | match, key, rate, burst, action | Yes |
 | Variant | part of a release | interpreter, environment build, environment variables, worker groups | No, as part of the release |
 

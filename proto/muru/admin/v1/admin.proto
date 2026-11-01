@@ -107,6 +107,16 @@ service Admin {
   rpc ListOverlays(ListOverlaysRequest) returns (ListOverlaysResponse);
   rpc ControlOverlay(ControlOverlayRequest) returns (ControlOverlayResponse);
   rpc PreviewOverlay(PreviewOverlayRequest) returns (PreviewOverlayResponse);
+
+  // Section 9.12: a command run with a release's interpreter,
+  // environment, user and source directory, its output streamed as it
+  // is written and its exit status last: one the application declares,
+  // by name, or a one-off command. The Exec of appendix B.
+  rpc RunCommand(RunCommandRequest) returns (stream CommandOutput);
+
+  // Section 9.12: the commands a release declares, with their inputs
+  // and the application's last run of each.
+  rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
 }
 
 message GetStatusRequest {}
@@ -740,6 +750,67 @@ message LogLine {
   string app = 1;
   string release = 2;
   string line = 3;
+}
+
+message RunCommandRequest {
+  string app = 1;
+  string release = 2;               // empty: the application's current release
+  repeated string argv = 3;         // a one-off command and its arguments, run without a shell
+  string name = 4;                  // or a command the release declares
+  map<string, string> inputs = 5;   // the declared command's inputs, by name
+  map<string, string> secret_inputs = 6;  // inputs taken from a secret store, as STORE/KEY
+}
+
+message ListCommandsRequest {
+  string app = 1;
+  string release = 2;               // empty: the application's current release
+}
+
+message ListCommandsResponse {
+  string app = 1;
+  string release = 2;
+  repeated CommandInfo commands = 3;
+}
+
+// A command a release declares.
+message CommandInfo {
+  string name = 1;
+  string description = 2;
+  repeated string run = 3;          // the program and its arguments, with {input} placeholders
+  string call = 4;                  // or the callable, as module:function
+  repeated CommandInputInfo inputs = 5;
+  string timeout = 6;               // empty: no limit
+  bool exclusive = 7;               // one run at a time for the application
+  CommandRun last_run = 8;          // the application's last run of it, if any
+}
+
+message CommandInputInfo {
+  string name = 1;
+  string description = 2;
+  bool required = 3;
+  string default = 4;
+  string pattern = 5;
+  bool secret = 6;
+}
+
+// A run of a declared command.
+message CommandRun {
+  string release = 1;
+  uint64 started_unix_ms = 2;
+  uint64 duration_ms = 3;
+  int32 exit_code = 4;
+  bool ok = 5;
+  string message = 6;               // how it ended
+}
+
+// A line of a command's output, or, last, how it ended.
+message CommandOutput {
+  string release = 1;               // the release it runs with
+  string line = 2;                  // a line of output, without its newline
+  bool stderr = 3;                  // the line came from standard error
+  bool finished = 4;                // the last message: the command has ended
+  int32 exit_code = 5;              // on the last message: its exit status, 128 + the signal when killed
+  string message = 6;               // on the last message: how it ended, as a sentence
 }
 
 message ReopenLogsRequest {

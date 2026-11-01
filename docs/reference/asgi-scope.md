@@ -41,6 +41,7 @@ names as the `muru.*` keys of the [WSGI environ](wsgi-environ.md):
 | Key | Value |
 | --- | --- |
 | `request_id` | The request identifier, also in `X-Request-ID` and the access log |
+| `asgi_to_wsgi` | On `http` scopes: the [handoff](../howto/handoff.md#from-asgi-to-wsgi) object, with `handoff(app)` and `handed_off`. Its `handoff()` raises `muru.HandoffNotEnabled` unless the mount has `handoff = "wsgi"` |
 | `max_body_size` | The body size limit in force, in bytes |
 | `uploads` | Only on an [upload route](../howto/uploads.md) whose request brought files: their descriptions, which `muru.uploads.files(scope)` turns into upload objects |
 | `deadline` | When the edge gives up on the request and answers 504 `deadline`, in seconds since the epoch, as `time.time()` counts them; see [timeouts](../howto/timeouts.md) |

@@ -32,6 +32,17 @@ pub enum Interface {
     Grpc,
 }
 
+/// The interface a release's or a mount's requests may be handed to
+/// (section 6.14): ASGI from a WSGI application, WSGI from an ASGI one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Handoff {
+    /// Continue the request as an ASGI application on the event loop.
+    Asgi,
+    /// Continue the request as a WSGI callable on the thread pool.
+    Wsgi,
+}
+
 /// Whether the application is imported in the host before forking (section 6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,6 +119,7 @@ words!(Interface { Auto => "auto", Wsgi => "wsgi", Asgi => "asgi", Grpc => "grpc
 words!(Preload { Auto => "auto", True => "true", False => "false" });
 words!(Measure { Uss => "uss", Pss => "pss", Rss => "rss" });
 words!(FactoryPhase { Worker => "worker", Host => "host" });
+words!(Handoff { Asgi => "asgi", Wsgi => "wsgi" });
 
 /// What a release runs (section 9.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +410,92 @@ pub struct Mount {
     /// from the requests it runs; unbounded but by its slots when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
+    /// The interface the mount's requests may be handed to (section
+    /// 6.14); none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
+/// Check a name against section 3.2: lowercase letters, digits and
+/// hyphens, up to 63 characters.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+/// Whether a string is an environment variable name: letters, digits and
+/// underscores, not starting with a digit.
+pub fn valid_env_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+
+    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Section 6.7: check a mount's name, a name as section 3.2 has it.
+pub fn check_mount_name(name: &str) -> Result<(), String> {
+    if valid_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?} is not a valid mount name: lowercase letters, digits and hyphens, up to 63 characters"
+        ))
+    }
+}
+
+/// Section 7.1: check a worker group's name, a name as section 3.2 has
+/// it and not `default`, the release's own group.
+pub fn check_group_name(name: &str) -> Result<(), String> {
+    if valid_name(name) && name != "default" {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?} is not a valid worker group name: lowercase letters, digits and hyphens, up to 63 characters, and not default"
+        ))
+    }
+}
+
+/// Section 10.8: check the name of an environment variable a release
+/// sets.
+pub fn check_env_name(name: &str) -> Result<(), String> {
+    if valid_env_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "env: {name:?} is not a variable name: letters, digits and underscores, not starting with a digit"
+        ))
+    }
+}
+
+/// Section 6.14: check a handoff against the interface it hands from. A
+/// gRPC application takes none, and an application declared with the
+/// interface it names would hand a request to itself.
+pub fn check_handoff(handoff: Option<Handoff>, interface: Option<Interface>) -> Result<(), String> {
+    let Some(handoff) = handoff else {
+        return Ok(());
+    };
+
+    match (handoff, interface) {
+        (_, Some(Interface::Grpc)) => {
+            Err("handoff: a gRPC application takes no handoff".to_owned())
+        }
+        (Handoff::Asgi, Some(Interface::Asgi)) | (Handoff::Wsgi, Some(Interface::Wsgi)) => {
+            Err(format!(
+                "handoff: an application declared interface = '{handoff}' cannot hand requests to \
+             '{handoff}'; a WSGI application hands to 'asgi', an ASGI one to 'wsgi'"
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Section 6.7: check an ASGI mount's own limits. Both belong to a mount
@@ -490,15 +588,27 @@ impl MountThreads {
 pub fn check_mount_threads(
     threads: Option<MountThreads>,
     interface: Option<Interface>,
+    handoff: Option<Handoff>,
 ) -> Result<(), String> {
     let Some(threads) = threads else {
         return Ok(());
     };
 
+    // Section 6.14: an ASGI mount's threads run the requests it hands to
+    // WSGI.
+
+    let hands_to_wsgi = handoff == Some(Handoff::Wsgi);
+
     match (threads, interface) {
-        (_, Some(Interface::Asgi)) => {
-            Err("threads: an ASGI mount runs on the event loop and has no threads".to_owned())
-        }
+        (MountThreads::Borrowing(_), Some(Interface::Asgi)) if hands_to_wsgi => Err(
+            "threads: an ASGI mount's threads are a fixed pool, a number, not reserved and max"
+                .to_owned(),
+        ),
+        (_, Some(Interface::Asgi)) if !hands_to_wsgi => Err(
+            "threads: an ASGI mount runs on the event loop and has threads only for the \
+             requests it hands to WSGI, with handoff = 'wsgi'"
+                .to_owned(),
+        ),
         (MountThreads::Borrowing(_), Some(Interface::Grpc)) => Err(
             "threads: a gRPC mount's threads are a fixed pool, a number, not reserved and max"
                 .to_owned(),
@@ -657,6 +767,10 @@ pub struct Release {
     /// mounts register (section 6.13, default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<bool>,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14); none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
     /// The origins whose pages may call the release's gRPC methods
     /// through gRPC-Web, answered with CORS (section 6.13): scheme, host
     /// and port, or `*`; none when empty.
@@ -760,6 +874,10 @@ pub struct Release {
     /// What maintenance mode lets through (section 4.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<Maintenance>,
+    /// Commands the application declares (section 9.12), by name: run
+    /// with the release on request, with inputs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, CommandTable>,
 }
 
 /// How a worker group is scaled (section 7.2).
@@ -1654,20 +1772,14 @@ pub fn check_client_match(matches: Option<&ClientMatch>) -> Result<(), String> {
     Ok(())
 }
 
-/// A client class or rate limit name: lower case letters, digits, `_`
-/// and `-`, as `ai_crawler` or `crawlers`.
+/// A client class or rate limit name, a name as section 3.2 has it, as
+/// `ai-crawler` or `crawlers`.
 fn check_policy_name(key: &str, name: &str) -> Result<(), String> {
-    let valid = !name.is_empty()
-        && name.len() <= 64
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
-        });
-
-    if valid {
+    if valid_name(name) {
         Ok(())
     } else {
         Err(format!(
-            "{key}: {name:?} must be lower case letters, digits, _ and -"
+            "{key}: {name:?} is not a valid name: lowercase letters, digits and hyphens, up to 63 characters"
         ))
     }
 }
@@ -3350,9 +3462,10 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 21] = [
+    let worker_keys: [(&str, bool); 23] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
+        ("handoff", table.handoff.is_some()),
         ("factory", table.factory.is_some()),
         ("factory_phase", table.factory_phase.is_some()),
         ("python", table.python.is_some()),
@@ -3371,6 +3484,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("memory", table.memory.is_some()),
         ("accel_redirect", table.accel_redirect.is_some()),
         ("cgi_local_redirect", table.cgi_local_redirect.is_some()),
+        ("commands", !table.commands.is_empty()),
         (
             "timeouts",
             timeouts.is_some_and(|timeouts| {
@@ -4104,6 +4218,9 @@ pub struct ToolMuru {
     /// Serve gRPC server reflection for the registered services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<bool>,
+    /// The interface the entrypoint's requests may be handed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
     /// The origins whose pages may call the gRPC methods through
     /// gRPC-Web, or `*`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4210,6 +4327,67 @@ pub struct ToolMuru {
     /// Where compiled bytecode goes under the daemon (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytecode: Option<Bytecode>,
+    /// Commands the application declares (section 9.12), by name: run
+    /// with the release on request, with inputs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, CommandTable>,
+}
+
+/// A command an application declares, the `[tool.muru.commands.NAME]` or
+/// `[app.NAME.release.ID.commands.NAME]` table (section 9.12): a program
+/// to run, or a Python callable to call, with the release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandTable {
+    /// What the command does, for `muructl command list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The program and its arguments, run without a shell, with `{name}`
+    /// where an input's value goes; `python` is the release's
+    /// interpreter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+    /// A callable as module:function, called with the inputs as keyword
+    /// arguments, instead of `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// Environment variables for this command alone, over the release's,
+    /// with `{name}` where an input's value goes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The values the command takes, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, CommandInput>,
+    /// How long it may run before it is stopped, for example 10m; no
+    /// limit when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Run one at a time for the application: a run asked for while one
+    /// is under way is refused (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive: Option<bool>,
+}
+
+/// An input a command takes (section 9.12).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandInput {
+    /// What the value is, for `muructl command list` and prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The command refuses to run without it (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// The value when none is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// A regular expression the whole value must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// The value is never shown, logged or put in an event, and may only
+    /// be used in `env` (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<bool>,
 }
 
 /// Why a project's configuration could not be read.
@@ -4381,6 +4559,25 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn names_follow_the_rules() {
+        assert!(valid_name("shop"));
+        assert!(valid_name("shop-2"));
+        assert!(!valid_name("Shop"));
+        assert!(!valid_name("-shop"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("a".repeat(64).as_str()));
+
+        assert!(check_mount_name("api-v2").is_ok());
+        assert!(check_mount_name("async_plain").is_err());
+        assert!(check_group_name("reports").is_ok());
+        assert!(check_group_name("default").is_err());
+        assert!(check_group_name("Reports").is_err());
+        assert!(check_env_name("_SHOP_2").is_ok());
+        assert!(check_env_name("2SHOP").is_err());
+        assert!(check_env_name("SHOP-URL").is_err());
+    }
+
     fn upload_route(keys: &str) -> Route {
         toml::from_str(&format!("host = 'shop'\napp = 'shop'\n{keys}")).unwrap()
     }
@@ -4442,7 +4639,7 @@ mod tests {
         .is_ok());
         assert!(check_overlay(
             "crawler-surge",
-            &overlay("routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }")
+            &overlay("routes.shop-root.client_routes = { ai-crawler = { target = { static = '/srv/shop/snapshot' } } }")
         )
         .is_ok());
         assert!(check_overlay(
@@ -4571,11 +4768,11 @@ mod tests {
         assert_eq!((settings.ipv4_prefix, settings.ipv6_prefix), (32, 64));
 
         let limit: RateLimit = toml::from_str(
-            "rate = '2/s'\nburst = 10\nkey = ['client_class', 'header:x-api-key']\naction = 'delay'\nmax_delay = '500ms'\nmatch = { client_class = ['ai_crawler'] }",
+            "rate = '2/s'\nburst = 10\nkey = ['client_class', 'header:x-api-key']\naction = 'delay'\nmax_delay = '500ms'\nmatch = { client_class = ['ai-crawler'] }",
         )
         .unwrap();
         let settings = check_rate_limit("crawlers", &limit).unwrap();
-        assert_eq!(settings.classes, vec!["ai_crawler".to_owned()]);
+        assert_eq!(settings.classes, vec!["ai-crawler".to_owned()]);
         assert_eq!(settings.key.len(), 2);
         assert_eq!(settings.max_delay, std::time::Duration::from_millis(500));
 
@@ -4592,6 +4789,7 @@ mod tests {
         }
 
         assert!(check_rate_limit("Crawlers", &RateLimit::default()).is_err());
+        assert!(check_rate_limit("ai_crawler", &RateLimit::default()).is_err());
     }
 
     #[test]
@@ -4665,13 +4863,13 @@ mod tests {
         let route = |keys: &str| upload_route(keys);
         assert_eq!(route("").key(), "/");
         assert_eq!(
-            route("match = { client_class = ['partner', 'ai_crawler', 'partner'] }").key(),
-            "/ client_class=ai_crawler,partner"
+            route("match = { client_class = ['partner', 'ai-crawler', 'partner'] }").key(),
+            "/ client_class=ai-crawler,partner"
         );
         assert!(
             check_route_policies(&route(
                 "match = { client_class = ['default'] }
-traffic = { classes = { ai_crawler = 'r1' } }"
+traffic = { classes = { ai-crawler = 'r1' } }"
             ))
             .is_ok()
         );
@@ -5039,21 +5237,55 @@ traffic = { classes = { ai_crawler = 'r1' } }"
         assert_eq!((fixed.reserved(), fixed.max()), (4, 4));
         assert_eq!((borrowing.reserved(), borrowing.max()), (2, 6));
         assert_eq!(borrowing.describe(), "{ reserved = 2, max = 6 }");
-        assert!(check_mount_threads(Some(borrowing), Some(Interface::Wsgi)).is_ok());
-        assert!(check_mount_threads(Some(fixed), Some(Interface::Grpc)).is_ok());
-        assert!(check_mount_threads(Some(borrowing), Some(Interface::Grpc)).is_err());
-        assert!(check_mount_threads(Some(fixed), Some(Interface::Asgi)).is_err());
-        assert!(check_mount_threads(Some(MountThreads::Fixed(0)), None).is_err());
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Wsgi), None).is_ok());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Grpc), None).is_ok());
+        assert!(check_mount_threads(Some(borrowing), Some(Interface::Grpc), None).is_err());
+        assert!(check_mount_threads(Some(fixed), Some(Interface::Asgi), None).is_err());
+        assert!(
+            check_mount_threads(Some(fixed), Some(Interface::Asgi), Some(Handoff::Wsgi)).is_ok()
+        );
+        assert!(
+            check_mount_threads(Some(borrowing), Some(Interface::Asgi), Some(Handoff::Wsgi))
+                .is_err()
+        );
+        assert!(check_mount_threads(Some(MountThreads::Fixed(0)), None, None).is_err());
 
         let reserving_none = MountThreads::Borrowing(BorrowedThreads {
             reserved: 0,
             max: 2,
         });
-        assert!(check_mount_threads(Some(reserving_none), None).is_ok());
+        assert!(check_mount_threads(Some(reserving_none), None, None).is_ok());
         assert!(
             parse_muru_toml("[mounts.x]\npath = '/x'\nentrypoint = 'a:b'\nthreads = { min = 1 }\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_handoff_names_the_other_interface() {
+        let table = parse_muru_toml(
+            "handoff = 'asgi'\n\n[mounts.api]\npath = '/api'\nentrypoint = 'a:b'\n\
+             interface = 'asgi'\nhandoff = 'wsgi'\n",
+        )
+        .unwrap();
+        assert_eq!(table.handoff, Some(Handoff::Asgi));
+        assert_eq!(table.mounts["api"].handoff, Some(Handoff::Wsgi));
+        assert!(check_handoff(Some(Handoff::Asgi), Some(Interface::Wsgi)).is_ok());
+        assert!(check_handoff(Some(Handoff::Wsgi), Some(Interface::Asgi)).is_ok());
+        assert!(check_handoff(Some(Handoff::Asgi), Some(Interface::Auto)).is_ok());
+        assert!(check_handoff(Some(Handoff::Asgi), None).is_ok());
+        assert!(check_handoff(None, Some(Interface::Grpc)).is_ok());
+        assert!(
+            check_handoff(Some(Handoff::Asgi), Some(Interface::Asgi))
+                .unwrap_err()
+                .contains("a WSGI application hands to 'asgi', an ASGI one to 'wsgi'")
+        );
+        assert!(
+            check_handoff(Some(Handoff::Wsgi), Some(Interface::Grpc))
+                .unwrap_err()
+                .contains("a gRPC application takes no handoff")
+        );
+        assert!(parse_muru_toml("handoff = 'grpc'\n").is_err());
     }
 
     #[test]

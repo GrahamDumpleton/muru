@@ -62,5 +62,5 @@ def test_ctrl_c_answers_no_request_as_a_crash() -> None:
     # Once the edge has stopped accepting, a client gets a refused or
     # reset connection, never an answer that blames the worker.
 
-    assert not failures, (outcomes, failures)
+    assert not failures, (outcomes, failures, server.log())
     assert len(re.findall(r"received SIG\w+, stopping", server.log())) == 1, server.log()
