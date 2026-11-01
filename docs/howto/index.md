@@ -11,6 +11,8 @@ starlette-and-fastapi
 run-settings
 interpreters
 daemon
+commands
+migrations
 secrets
 users
 virtual-hosts

@@ -222,4 +222,5 @@ databases, caches and queues. Muru cannot make that safe. A change to
 shared state has to work with both releases: a database migration that
 adds before it removes (expand, deploy, then contract in a later
 release), and cache entries and message formats that both releases can
-read.
+read. The guide to [database migrations](../howto/migrations.md) shows
+the steps, run with the release they belong to.

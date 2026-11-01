@@ -134,4 +134,5 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |
 | Dashboard | dashboard.login_issued, dashboard.action |
+| Commands | command.started, command.finished, command.failed |
 | Debugging | request.soft_timeout, debug.profile, debug.trace, debug.memory, debug.exec, debug.breakpoint, debug.breakpoint_expired, debug.attached, debug.detached |

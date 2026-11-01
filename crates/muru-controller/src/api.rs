@@ -61,6 +61,7 @@ struct Service {
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
 type LogStream = Pin<Box<dyn Stream<Item = Result<pb::LogLine, Status>> + Send>>;
+type CommandStream = Pin<Box<dyn Stream<Item = Result<pb::CommandOutput, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Admin for Service {
@@ -500,6 +501,45 @@ impl Admin for Service {
                 line,
             })
         });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type RunCommandStream = CommandStream;
+
+    async fn run_command(
+        &self,
+        request: Request<pb::RunCommandRequest>,
+    ) -> Result<Response<CommandStream>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+
+        if request.argv.is_empty() {
+            return Err(Status::invalid_argument("name the command to run"));
+        }
+
+        // Section 9.12: the daemon resolves what the release runs with,
+        // then the command runs here, outside the daemon's loop, for as
+        // long as it takes.
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::PrepareCommand {
+                app: request.app.clone(),
+                id: release,
+                argv: request.argv,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let prepared = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+
+        let output = crate::commands::run(prepared, self.handle.events.clone());
+        let stream =
+            tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(output), Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 

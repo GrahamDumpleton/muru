@@ -276,3 +276,14 @@ liveness = { path = '/healthz', interval = '30s', failures = 3 }
 - They can target internal-only paths, so a health endpoint need not be public. A health URL for an external load balancer is simply an ordinary route.
 - Probes have their own short timeouts and never count toward the churn budget. Probe results are visible in the dashboard and muructl release show, and failures are events.
 - Managed HTTP server releases (section 9.9) use the same readiness and liveness settings, probed over HTTP. Future gRPC mounts would use the standard grpc.health.v1 service.
+
+## 9.12 Commands
+
+A command is a process run with a release: its interpreter, its environment with secrets delivered, its user and its source directory as the working directory, exactly as the release's host has them (ADR 0040). `muructl exec APP[@RELEASE] -- COMMAND` runs a one-off command, with the application's current release when none is named, and is how a migration is run as a deliberate step (section 9.7).
+
+- **Who runs it.** The daemon resolves the release's settings with the code that starts its host, and the admin API's `RunCommand` starts the process and streams its output. The release need not be running: a held, retained, drained or stopped release, or one scaled to zero, runs commands as well. A release that builds its environment must have built it, by starting once; a managed HTTP server's release (section 9.9) has no interpreter and runs none.
+- **What it sees.** The release's environment, then the interpreter's directory first on PATH, VIRTUAL_ENV when that is a virtual environment, the runtime library first on PYTHONPATH (section 8.3), bytecode as the host writes it (section 8.2), and MURU_APP, MURU_RELEASE and MURU_RELEASE_DIR. A program named `python` or `python3` is the release's interpreter. The command is an argument vector run without a shell, with standard input closed and no terminal.
+- **Output and status.** Standard output and standard error stream to the caller as lines, in the order written, and are appended to the release's log prefixed `[command exec]`. The last message carries the exit status, or 128 plus the signal that killed the command, and muructl exits with it.
+- **Ending.** The command runs in a session of its own. When the caller goes away, the session gets SIGTERM and, ten seconds later, SIGKILL; the command's end is recorded as stopped.
+- **Records.** `command.started`, `command.finished` (exit status 0) and `command.failed` events, with the subject `app@release`, name the command and say how it ended and after how long.
+- **Access.** Whoever can reach the admin socket can run a command, as they can deploy. The MCP server does not offer one-off commands (section 10.11), and a development run (section 13.1) runs none.

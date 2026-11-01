@@ -47,6 +47,7 @@ specification is maintained.
 | Worker liveness | Native, in every worker: a thread attaches to the interpreter every 500 ms and the worker reports to its host every second; either quiet for gil_stall_timeout (30 s) replaces the worker as the hard timeout does. HTTP liveness probes stay opt-in for application failures (ADR 0031) |
 | Worker group routing | A group's `match` takes `client_class`, `host` and `method` lists, never headers, which are a client class; groups rank by how many lists they give, then by prefix length. An optional group's requests wait as for a group at zero workers and never fall through to the default group. A group's `mounts` subset is served by its workers but imported by the host, with the default mount always served (ADR 0033) |
 | Coding agents | An MCP server in muructl (`muructl mcp serve`, stdio, rmcp) whose tools run muructl's own commands with `--json`, so every result has the shape the CLI prints; task-shaped tools, `--read-only` and `--allow` enforced by the server, local only until the TCP admin listener (section 10.11, ADR 0039) |
+| Commands | Run by the daemon with the settings it starts the release's host with, streamed through the admin API, ended with their caller; `muructl exec` for one-off commands (section 9.12, ADR 0040) |
 
 ## 19.2 Open questions
 

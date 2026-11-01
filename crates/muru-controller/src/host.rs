@@ -1205,6 +1205,15 @@ pub(crate) fn own_session(command: &mut Command, identity: Option<Identity>) {
     own_session_std(command.as_std_mut(), identity);
 }
 
+/// Send a signal to the session a process leads, which `own_session`
+/// gave it. Returns whether it was delivered.
+pub(crate) fn signal_group(pid: u32, signal: i32) -> bool {
+    // SAFETY: kill with the negated pid of a process this one started in
+    // a session of its own, whose process group has the same id.
+
+    unsafe { libc::kill(-(pid as libc::pid_t), signal) == 0 }
+}
+
 /// `own_session` for a standard library command, as a build runs.
 pub(crate) fn own_session_std(command: &mut std::process::Command, identity: Option<Identity>) {
     use std::os::unix::process::CommandExt;

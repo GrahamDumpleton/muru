@@ -52,7 +52,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |
 | SetMaintenance | POST /v1/apps/{app}:maintenance | maintenance mode |
-| Exec | POST /v1/apps/{app}/releases/{release}:exec | one-off command, streamed output |
+| RunCommand | POST /v1/apps/{app}/releases/{release}:exec | a command run with the release (9.12), output streamed and the exit status last |
 | TailLogs | GET /v1/apps/{app}/releases/{release}/logs | stream logs |
 | ReopenLogs | POST /v1/logs:reopen | reopen log files, optionally in workers |
 | GetMetrics | GET /metrics | the Prometheus text exposition (11.1) |

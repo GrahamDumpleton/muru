@@ -63,6 +63,9 @@ enum Command {
     /// Load an application in a throwaway host and report what would fail, without serving.
     Check(Box<CheckArgs>),
 
+    /// Run a one-off command with a release's interpreter, environment, user and source directory.
+    Exec(admin::RunExecArgs),
+
     /// Run or control the daemon.
     Daemon {
         #[command(subcommand)]
@@ -949,6 +952,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
+        Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),

@@ -107,6 +107,11 @@ service Admin {
   rpc ListOverlays(ListOverlaysRequest) returns (ListOverlaysResponse);
   rpc ControlOverlay(ControlOverlayRequest) returns (ControlOverlayResponse);
   rpc PreviewOverlay(PreviewOverlayRequest) returns (PreviewOverlayResponse);
+
+  // Section 9.12: a command run with a release's interpreter,
+  // environment, user and source directory, its output streamed as it
+  // is written and its exit status last. The Exec of appendix B.
+  rpc RunCommand(RunCommandRequest) returns (stream CommandOutput);
 }
 
 message GetStatusRequest {}
@@ -740,6 +745,22 @@ message LogLine {
   string app = 1;
   string release = 2;
   string line = 3;
+}
+
+message RunCommandRequest {
+  string app = 1;
+  string release = 2;               // empty: the application's current release
+  repeated string argv = 3;         // the command and its arguments, run without a shell
+}
+
+// A line of a command's output, or, last, how it ended.
+message CommandOutput {
+  string release = 1;               // the release it runs with
+  string line = 2;                  // a line of output, without its newline
+  bool stderr = 3;                  // the line came from standard error
+  bool finished = 4;                // the last message: the command has ended
+  int32 exit_code = 5;              // on the last message: its exit status, 128 + the signal when killed
+  string message = 6;               // on the last message: how it ended, as a sentence
 }
 
 message ReopenLogsRequest {

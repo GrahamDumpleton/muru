@@ -5246,6 +5246,93 @@ pub async fn events(
     Ok(())
 }
 
+/// What `muructl exec` takes: a release and the command to run with it.
+#[derive(Args)]
+pub struct RunExecArgs {
+    /// The application, or app@release; the current release when only
+    /// the application is named.
+    #[arg(value_name = "APP[@RELEASE]")]
+    target: String,
+
+    /// The command and its arguments, after `--`, run without a shell;
+    /// `python` is the release's interpreter.
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    command: Vec<String>,
+
+    /// Print each line of output, and how the command ended, as JSON
+    /// lines of the admin API's command output.
+    #[arg(long)]
+    json: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// Run a one-off command with a release and exit with its status.
+pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
+    let (app, release) = target_release(&args.target)?;
+    let request = pb::RunCommandRequest {
+        app,
+        release,
+        argv: args.command,
+    };
+
+    run_command(request, &args.socket, args.json).await
+}
+
+/// The application and release a target names: app@release, or the
+/// application alone for its current release.
+fn target_release(target: &str) -> anyhow::Result<(String, String)> {
+    if target.contains('@') {
+        let (app, release) = split_release(target)?;
+        Ok((app.to_owned(), release.to_owned()))
+    } else {
+        Ok((target.to_owned(), String::new()))
+    }
+}
+
+/// Run a command through the daemon, printing its output as it arrives,
+/// standard error to standard error, and return its exit status. A
+/// command that fails says how on standard error, as muructl's other
+/// errors do.
+async fn run_command(
+    request: pb::RunCommandRequest,
+    socket: &SocketArgs,
+    json: bool,
+) -> anyhow::Result<i32> {
+    use std::io::Write as _;
+
+    let mut client = client::connect(&socket.socket()?).await?;
+    let mut stream = client
+        .run_command(request)
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    while let Some(output) = stream.next().await {
+        let output = output.map_err(explain)?;
+
+        if json {
+            println!("{}", serde_json::to_string(&output)?);
+        } else if output.finished {
+            if output.exit_code != 0 {
+                eprintln!("muru: the command {}", output.message);
+            }
+        } else if output.stderr {
+            eprintln!("{}", output.line);
+        } else {
+            println!("{}", output.line);
+        }
+
+        if output.finished {
+            std::io::stdout().flush()?;
+            return Ok(output.exit_code);
+        }
+    }
+
+    anyhow::bail!("the daemon stopped answering before the command ended")
+}
+
 /// What `muructl logs` takes: a release's output, or the access log,
 /// shown or followed; or `logs reopen` after an external rotation.
 #[derive(Args, Clone)]

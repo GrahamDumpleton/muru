@@ -356,6 +356,17 @@ pub enum Command {
         /// Answered with each worker's reply, or why none could be asked.
         done: oneshot::Sender<Result<Vec<WorkerReply>, String>>,
     },
+    /// Resolve what a command runs with from its release (section 9.12).
+    PrepareCommand {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The program and its arguments.
+        argv: Vec<String>,
+        /// Answered with the command ready to start, or why it cannot be.
+        done: oneshot::Sender<Result<crate::commands::Prepared, String>>,
+    },
     /// Activate, end or promote an overlay (section 9.10).
     Overlay {
         /// The overlay.
@@ -3518,6 +3529,14 @@ impl Daemon {
             Command::HostMessage { app, id, message } => {
                 self.host_message(&app, &id, message).await;
             }
+            Command::PrepareCommand {
+                app,
+                id,
+                argv,
+                done,
+            } => {
+                let _ = done.send(self.prepare_command(&app, &id, argv).await);
+            }
             Command::Debug {
                 app,
                 id,
@@ -3878,6 +3897,124 @@ impl Daemon {
             .map_err(|error| error.to_string())
     }
 
+    /// Section 8.2: redirected bytecode goes to a directory of the
+    /// release's own, writable by its user and removed with it;
+    /// precompiled bytecode in the source is used where it is.
+    fn pycache_prefix(
+        &self,
+        app: &str,
+        id: &str,
+        spec: &ReleaseSpec,
+        identity: Option<crate::host::Identity>,
+    ) -> Option<PathBuf> {
+        if spec.bytecode.effective() != muru_config::Bytecode::Redirect {
+            return None;
+        }
+
+        let prefix =
+            crate::provision::Provisioning::pycache_dir(&self.locations.state.path, app, id);
+
+        match std::fs::create_dir_all(&prefix) {
+            Ok(()) => {
+                if let Some(identity) = identity {
+                    let _ =
+                        std::os::unix::fs::chown(&prefix, Some(identity.uid), Some(identity.gid));
+                }
+
+                Some(prefix)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "creating {} failed; bytecode is left to Python", prefix.display());
+                None
+            }
+        }
+    }
+
+    /// Section 9.12: what a command of a release runs with: the release's
+    /// interpreter, environment with its secrets resolved, user and
+    /// source directory, as its host has them.
+    async fn prepare_command(
+        &mut self,
+        app: &str,
+        id: &str,
+        argv: Vec<String>,
+    ) -> Result<crate::commands::Prepared, String> {
+        let release = self
+            .store
+            .release(app, id)
+            .map_err(|error| error.to_string())?;
+        let spec = &release.spec;
+        let subject = format!("{app}@{id}");
+
+        if argv.is_empty() {
+            return Err("no command was given".to_owned());
+        }
+
+        if spec.http.is_some() {
+            return Err(format!(
+                "{subject} runs an HTTP server rather than workers, so it has no interpreter to run a command with"
+            ));
+        }
+
+        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let identity = self.resolve_identity(app, &subject)?;
+        let env = resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await?;
+
+        if let Some(identity) = identity {
+            self.own_release_dirs(identity, &run_dir, app, id)?;
+        }
+
+        // A release that builds its environment has it once it has
+        // started; a command does not build one.
+
+        let python = if spec.build.builds {
+            let python = crate::provision::Provisioning::environment_dir(
+                &self.locations.state.path,
+                app,
+                id,
+            )
+            .join("bin")
+            .join("python");
+
+            if !python.is_file() {
+                return Err(format!(
+                    "{subject} has no environment built yet; start the release before running a command with it"
+                ));
+            }
+
+            python
+        } else {
+            spec.python.clone()
+        };
+
+        let library = self.runtime_library(&python).await?;
+        let pycache = self.pycache_prefix(app, id, spec, identity);
+        let env = crate::commands::environment(
+            env,
+            &crate::commands::Interpreter {
+                python: &python,
+                runtime: library.pythonpath.as_deref(),
+                pycache: pycache.as_deref(),
+                no_bytecode: spec.bytecode.effective() == muru_config::Bytecode::Off,
+            },
+            app,
+            id,
+            &spec.source,
+        );
+
+        Ok(crate::commands::Prepared {
+            app: app.to_owned(),
+            release: id.to_owned(),
+            label: "exec".to_owned(),
+            argv: crate::commands::with_interpreter(argv, &python),
+            env,
+            cwd: spec.source.clone(),
+            identity,
+            log: self.host_log(app, id),
+            timeout: None,
+        })
+    }
+
     /// Start a release's host and wait until every worker listens
     /// (pending or stopped to starting and warming; or failed). The
     /// caller marks the release ready once the edge has it, with
@@ -3996,38 +4133,7 @@ impl Daemon {
                 .emit("release.state_changed", &subject, level, note);
         }
 
-        // Section 8.2: redirected bytecode goes to a directory of the
-        // release's own, writable by its user and removed with it;
-        // precompiled bytecode in the source is used where it is.
-
-        let pycache_prefix = match spec.bytecode.effective() {
-            muru_config::Bytecode::Redirect => {
-                let prefix = crate::provision::Provisioning::pycache_dir(
-                    &self.locations.state.path,
-                    app,
-                    id,
-                );
-
-                match std::fs::create_dir_all(&prefix) {
-                    Ok(()) => {
-                        if let Some(identity) = identity {
-                            let _ = std::os::unix::fs::chown(
-                                &prefix,
-                                Some(identity.uid),
-                                Some(identity.gid),
-                            );
-                        }
-
-                        Some(prefix)
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "creating {} failed; bytecode is left to Python", prefix.display());
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        let pycache_prefix = self.pycache_prefix(app, id, spec, identity);
 
         let host_spec = HostSpec {
             python,
