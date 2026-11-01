@@ -416,6 +416,66 @@ pub struct Mount {
     pub handoff: Option<Handoff>,
 }
 
+/// Check a name against section 3.2: lowercase letters, digits and
+/// hyphens, up to 63 characters.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+/// Whether a string is an environment variable name: letters, digits and
+/// underscores, not starting with a digit.
+pub fn valid_env_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+
+    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Section 6.7: check a mount's name, a name as section 3.2 has it.
+pub fn check_mount_name(name: &str) -> Result<(), String> {
+    if valid_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?} is not a valid mount name: lowercase letters, digits and hyphens, up to 63 characters"
+        ))
+    }
+}
+
+/// Section 7.1: check a worker group's name, a name as section 3.2 has
+/// it and not `default`, the release's own group.
+pub fn check_group_name(name: &str) -> Result<(), String> {
+    if valid_name(name) && name != "default" {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?} is not a valid worker group name: lowercase letters, digits and hyphens, up to 63 characters, and not default"
+        ))
+    }
+}
+
+/// Section 10.8: check the name of an environment variable a release
+/// sets.
+pub fn check_env_name(name: &str) -> Result<(), String> {
+    if valid_env_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "env: {name:?} is not a variable name: letters, digits and underscores, not starting with a digit"
+        ))
+    }
+}
+
 /// Section 6.14: check a handoff against the interface it hands from. A
 /// gRPC application takes none, and an application declared with the
 /// interface it names would hand a request to itself.
@@ -4504,6 +4564,25 @@ pub fn parse_pyproject(text: &str) -> Result<Option<ToolMuru>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_follow_the_rules() {
+        assert!(valid_name("shop"));
+        assert!(valid_name("shop-2"));
+        assert!(!valid_name("Shop"));
+        assert!(!valid_name("-shop"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("a".repeat(64).as_str()));
+
+        assert!(check_mount_name("api-v2").is_ok());
+        assert!(check_mount_name("async_plain").is_err());
+        assert!(check_group_name("reports").is_ok());
+        assert!(check_group_name("default").is_err());
+        assert!(check_group_name("Reports").is_err());
+        assert!(check_env_name("_SHOP_2").is_ok());
+        assert!(check_env_name("2SHOP").is_err());
+        assert!(check_env_name("SHOP-URL").is_err());
+    }
 
     fn upload_route(keys: &str) -> Route {
         toml::from_str(&format!("host = 'shop'\napp = 'shop'\n{keys}")).unwrap()

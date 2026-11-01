@@ -2245,6 +2245,60 @@ pub struct Tables<'a> {
     pub declared: bool,
 }
 
+/// A worker group's match as the edge compares it (ADR 0033).
+pub struct GroupMatchSpec {
+    /// The client classes it takes, every class when empty.
+    pub client_class: Vec<String>,
+    /// The hosts it takes, normalised, every host when empty.
+    pub host: Vec<String>,
+    /// The methods it takes, in upper case, every method when empty.
+    pub method: Vec<String>,
+}
+
+/// Check a worker group's name and the names its match gives (ADR
+/// 0033): hosts are compared as the host tables hold them, with no
+/// wildcard, and methods in upper case. muructl run checks a project's
+/// groups with this too, so a project that runs there deploys.
+pub fn group_match(name: &str, group: &muru_config::Group) -> Result<GroupMatchSpec, String> {
+    muru_config::check_group_name(name)?;
+    muru_config::check_group_match(group.matches.as_ref())
+        .map_err(|error| format!("worker group {name}: {error}"))?;
+    let matches = group.matches.clone().unwrap_or_default();
+    let mut host = Vec::new();
+
+    for given in &matches.host {
+        let normalised = muru_edge::routing::normalise(given);
+
+        if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
+            return Err(format!(
+                "worker group {name}: match.host {given:?} is not a host name"
+            ));
+        }
+
+        host.push(normalised);
+    }
+
+    let mut method = Vec::new();
+
+    for given in &matches.method {
+        let token = given.trim().to_ascii_uppercase();
+
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err(format!(
+                "worker group {name}: match.method {given:?} is not a method"
+            ));
+        }
+
+        method.push(token);
+    }
+
+    Ok(GroupMatchSpec {
+        client_class: matches.client_class,
+        host,
+        method,
+    })
+}
+
 /// A group's paths as the edge matches them: prefixes without their
 /// `*`, and `/` alone for a group that claims every path.
 fn group_prefixes(paths: &[String]) -> Vec<String> {
@@ -2424,45 +2478,11 @@ pub fn resolve_spec(
     let mut resolved_groups = Vec::new();
 
     for (name, group) in groups.unwrap_or(&table.groups) {
-        if !crate::model::valid_name(name) || name == "default" {
-            return Err(format!("{name:?} is not a valid worker group name"));
-        }
-
-        muru_config::check_group_match(group.matches.as_ref())
-            .map_err(|error| format!("worker group {name}: {error}"))?;
-        let matches = group.matches.clone().unwrap_or_default();
-        let client_class = matches.client_class;
-
-        // ADR 0033: hosts are compared as the host tables hold them, with
-        // no wildcard, and methods in upper case.
-
-        let mut host = Vec::new();
-
-        for given in &matches.host {
-            let normalised = muru_edge::routing::normalise(given);
-
-            if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
-                return Err(format!(
-                    "worker group {name}: match.host {given:?} is not a host name"
-                ));
-            }
-
-            host.push(normalised);
-        }
-
-        let mut method = Vec::new();
-
-        for given in &matches.method {
-            let token = given.trim().to_ascii_uppercase();
-
-            if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-                return Err(format!(
-                    "worker group {name}: match.method {given:?} is not a method"
-                ));
-            }
-
-            method.push(token);
-        }
+        let GroupMatchSpec {
+            client_class,
+            host,
+            method,
+        } = group_match(name, group)?;
 
         if group.paths.is_empty() && group.matches.is_none() {
             return Err(format!("worker group {name} has no paths and no match"));
@@ -2604,9 +2624,7 @@ pub fn resolve_spec(
     muru_config::check_origins(&grpc_web_origins)?;
 
     for (name, mount) in mounts.unwrap_or(&table.mounts) {
-        if !crate::model::valid_name(name) {
-            return Err(format!("{name:?} is not a valid mount name"));
-        }
+        muru_config::check_mount_name(name)?;
 
         // Section 6.13: a gRPC mount is reached by service name, not path.
 
@@ -3769,9 +3787,7 @@ fn resolve_env_specs(
     }
 
     for entry in request {
-        if !crate::model::valid_env_name(&entry.name) {
-            return Err(format!("env: {:?} is not a variable name", entry.name));
-        }
+        muru_config::check_env_name(&entry.name)?;
 
         if entry.secret_store.is_empty() != entry.secret_key.is_empty() {
             return Err(format!(
@@ -4256,9 +4272,7 @@ fn parse_or<T: std::str::FromStr<Err = muru_config::ParseError>>(
 
 /// One variable of an `[env]` table as the spec records it.
 fn env_spec_from_table(name: &str, value: &muru_config::EnvValue) -> Result<EnvSpec, String> {
-    if !crate::model::valid_env_name(name) {
-        return Err(format!("env: {name:?} is not a variable name"));
-    }
+    muru_config::check_env_name(name)?;
 
     Ok(match value {
         muru_config::EnvValue::Plain(text) => EnvSpec {

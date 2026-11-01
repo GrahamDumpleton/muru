@@ -1695,7 +1695,22 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     };
     muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
 
+    // Section 3.2: groups, mounts and variables are named as the daemon
+    // requires, so a project that runs here deploys.
+
+    for (name, group) in &table.groups {
+        muru_controller::config::group_match(name, group)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups] {error}"))?;
+    }
+
+    for name in table.env.keys() {
+        muru_config::check_env_name(name)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    }
+
     for (name, mount) in &table.mounts {
+        muru_config::check_mount_name(name)
+            .map_err(|error| anyhow::anyhow!("[tool.muru.mounts] {error}"))?;
         muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
             .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
         muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
