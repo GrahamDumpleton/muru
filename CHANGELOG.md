@@ -9,6 +9,47 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a14 (2026-11-01)
+
+### Added
+
+- Added handing a request from a WSGI application to an ASGI one in the
+  same worker, enabled with `handoff = "asgi"`: `environ["muru.wsgi_to_asgi"]`
+  continues an HTTP request, or a WebSocket upgrade, as an ASGI application,
+  and raises `muru.HandoffNotEnabled` without the setting. ([#91](https://github.com/GrahamDumpleton/muru/issues/91))
+- Added commands an application declares in `[tool.muru.commands]`, such as a migration, a backup or creating an account, each a program or a Python callable with checked inputs, including secret ones taken from a secret store. `muructl command list` shows them with each one's last run, `muructl command run` runs one with a release, and coding agents get `commands` and `run_command` MCP tools. ([#96](https://github.com/GrahamDumpleton/muru/issues/96))
+- Added `muructl exec`, which runs a one-off command, such as a database migration, with a release's interpreter, environment, secrets, user and source directory, streaming its output and exiting with its status. A new how-to guide covers database migrations while two releases share a database. ([#122](https://github.com/GrahamDumpleton/muru/issues/122))
+- Added `muructl mcp serve`, a Model Context Protocol server that gives a coding agent the daemon's operations as tools: status, lists, releases, events, logs, worker stacks and the other debug views, metrics, deploy, promote, rollback, drain, rollouts, scaling, restarts, overlays, maintenance, apply and log levels, plus the user guide. Each tool runs the matching `muructl` command with `--json`; `--read-only` and `--allow` limit what the agent may change, and `--up` starts the daemon when none answers. The coding agents guide describes the development loop. ([#197](https://github.com/GrahamDumpleton/muru/issues/197))
+- Added `--json` to every `muructl` command that reports something: status, the lists, releases, rollouts, overlays, scaling, events, logs, metrics, WebSockets, and what deploy, rollback, drain, restart, maintenance and the other changes did. The output is the admin API's answer with its field names, streams print JSON lines, and a failure prints `{"error": ...}` with the same exit status; the JSON output reference lists each command's shape. ([#254](https://github.com/GrahamDumpleton/muru/issues/254))
+- Added `muructl mcp skill`, which prints, installs or checks a skill for coding agents that teaches the development loop under Muru: what releases and traffic are, what deploy, promote, rollback, drain and rollouts do, and what to check after each. The skill is embedded in `muructl` and versioned with it; `install` writes it to `.claude/skills/muru/SKILL.md` (or another directory with `--dir`), `status` says whether the project's copy is current, and the MCP server tells the agent when it is out of date. ([#255](https://github.com/GrahamDumpleton/muru/issues/255))
+- Added handing a request from an ASGI application to a WSGI callable on
+  the worker's threads, enabled with `handoff = "wsgi"`, which also lets an
+  ASGI mount have `threads` of its own for it. The access log marks a
+  request handed across, and `muru_handoffs_total` counts them. ([#273](https://github.com/GrahamDumpleton/muru/issues/273))
+- Added `muru.asgi.register()`, which runs the lifespan of an ASGI
+  application that requests are handed to, `muru.loop()`, the worker's
+  event loop for WSGI code, and `muru.request_id()`, the id of the request
+  being served. ([#274](https://github.com/GrahamDumpleton/muru/issues/274))
+- Added `muru.asgi.websocket.Handler`, an ASGI application that runs a
+  WebSocket's connect, message and disconnect events as calls on an object,
+  on application threads, so a WSGI application handles WebSockets in
+  synchronous code. ([#275](https://github.com/GrahamDumpleton/muru/issues/275))
+
+### Changed
+
+- Client class and rate limit names follow the same rule as every other name: lowercase letters, digits and hyphens, up to 63 characters, with no hyphen at either end. Names with underscores, such as `ai_crawler`, are refused; rename them, for example to `ai-crawler`. ([#281](https://github.com/GrahamDumpleton/muru/issues/281))
+
+### Fixed
+
+- Fixed a race in which a request accepted just as the edge began to drain, on Ctrl-C, `docker stop` or an edge replacement, could reach a worker that was already stopping and be answered 502; the drain now waits until the edge has stopped accepting. ([#241](https://github.com/GrahamDumpleton/muru/issues/241))
+- `muructl run` and `muructl check` now refuse the mount, worker group and environment variable names the daemon refuses, and check a group's `match` the same way, so a project that runs in development no longer fails its first deploy over a name such as `async_plain`, and a group named `default` is refused when the project is read rather than when the host starts. ([#280](https://github.com/GrahamDumpleton/muru/issues/280))
+- `muructl run` and `muructl check` now make the daemon's checks of a project's worker groups, mounts, scaling tables, `max_requests` and file hint keys: a group without paths or match, groups asking the same of one path, a group naming a missing mount, a mount path not below `/`, an entrypoint that is not `module:callable`, two mounts at one path or a scaling table that does not resolve fails there as it would fail a deploy. ([#282](https://github.com/GrahamDumpleton/muru/issues/282))
+
+### Documentation
+
+- Added explanation pages on releases and traffic policies and on how scaling decides, a how-to guide for upgrading Muru, and a reference page for the supported platforms and Python versions. ([#259](https://github.com/GrahamDumpleton/muru/issues/259))
+
+
 ## 0.1.0a13 (2026-10-31)
 
 ### Added

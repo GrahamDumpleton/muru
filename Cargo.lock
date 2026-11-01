@@ -1260,11 +1260,11 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muru-common"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 
 [[package]]
 name = "muru-config"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "jiff",
  "regex",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "muru-controller"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "muru-dashboard"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "anyhow",
  "askama",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "muru-edge"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "muru-proto"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "bytes",
  "libc",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "muru-provision"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "bytes",
  "http",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "muru-py"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "bytes",
  "libc",
@@ -1416,15 +1416,15 @@ dependencies = [
 
 [[package]]
 name = "muru-supervisor"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 
 [[package]]
 name = "muru-testkit"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 
 [[package]]
 name = "muructl"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
