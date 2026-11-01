@@ -14,8 +14,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::set_var("PROTOC_INCLUDE", &include);
     }
 
+    // The admin messages serialize as JSON with their own field names, so
+    // muructl's --json output, the MCP server and the API share one shape.
+    // Their one map is ordered, so the JSON comes out the same each time.
+
     tonic_prost_build::configure()
         .bytes(".muru.worker.v1")
+        .type_attribute(".muru.admin.v1", "#[derive(serde::Serialize)]")
+        .btree_map(".muru.admin.v1")
         .compile_protos(
             &[
                 "../../proto/muru/worker/v1/worker.proto",

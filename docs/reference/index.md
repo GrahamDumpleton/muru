@@ -24,5 +24,6 @@ Still to be written, as their generators are built:
 wsgi-environ
 asgi-scope
 errors
+json-output
 python-api
 ```

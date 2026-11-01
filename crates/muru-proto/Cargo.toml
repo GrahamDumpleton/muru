@@ -13,6 +13,7 @@ publish.workspace = true
 bytes = { workspace = true }
 libc = { workspace = true }
 prost = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

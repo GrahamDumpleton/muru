@@ -196,6 +196,14 @@ taken up between the steps of the major goals, in no fixed order.
   uWSGI profile for managed servers
   ([#95](https://github.com/GrahamDumpleton/muru/issues/95)).
 
+- **Coding agents:** `--json` on every command that reports something
+  ([#254](https://github.com/GrahamDumpleton/muru/issues/254)), an MCP
+  server in `muructl` so an agent can run the daemon, deploy each change
+  as a release, test it and read what Muru observes
+  ([#197](https://github.com/GrahamDumpleton/muru/issues/197)), and a
+  skill the project carries that teaches the agent how
+  ([#255](https://github.com/GrahamDumpleton/muru/issues/255)).
+
 ## Ideas
 
 Ideas recorded for later evaluation, from
@@ -203,7 +211,7 @@ Ideas recorded for later evaluation, from
 each an issue so that nothing foreseen is lost: among them traffic
 capture and replay, shadow traffic, predictive scaling, resumable
 uploads, sub-interpreters, the PROXY protocol, an admin client for
-applications, an MCP server for coding agents, and builds without uv.
+applications, and builds without uv.
 They are not committed work until taken up.
 
 ## How work is tracked

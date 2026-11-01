@@ -9,7 +9,7 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output, --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
+Commands that act on a running system use the admin API (Appendix B). Common flags: --socket (or MURU_SOCKET) or --server to choose the daemon, --json for machine-readable output (the admin API's answer with its field names, JSON lines for streams, and `{"error": ...}` on failure, as the JSON output reference lists), --yes to skip confirmation. Releases are addressed as app@release; muructl release wait takes --state and --timeout.
 
 | Group | Command | What it does | Section |
 | --- | --- | --- | --- |
