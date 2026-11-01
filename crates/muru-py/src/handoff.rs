@@ -448,6 +448,8 @@ impl AsgiToWsgi {
                 py, &shared, request, &app, head, &uploads, body, tx, &offer, interrupt,
             );
 
+            // SAFETY: as above; this is the exit paired with the enter.
+
             if entered && unsafe { pyo3::ffi::PyContext_Exit(context.as_ptr()) } != 0 {
                 PyErr::fetch(py).print(py);
             }
