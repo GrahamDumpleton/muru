@@ -737,6 +737,14 @@ impl Edge {
     }
 }
 
+/// A listener's accept loop as a drain sees it: the listener, and a share
+/// of the edge's connection count held until the listener is closed.
+/// Fields drop in order, so the listener closes first.
+struct Accepting {
+    listener: TcpListener,
+    _token: Arc<()>,
+}
+
 /// Accept connections on one listener, completing the TLS handshake first
 /// when it has an acceptor, and serve each on its own task, until the
 /// edge drains: the listener is then dropped, and whatever waits in its
@@ -751,13 +759,23 @@ async fn accept(
     let mut draining = shared.draining.subscribe();
     let admission = Arc::clone(&shared.admission[index]);
 
+    // The loop counts as a connection while it runs, so a drain waits for
+    // it to see the drain: a connection accepted as the drain begins is
+    // counted before the loop lets go, and the drain returns only once
+    // the listener is closed. The listener is dropped before the token.
+
+    let accepting = Accepting {
+        listener,
+        _token: Arc::clone(&shared.connections),
+    };
+
     loop {
         if *draining.borrow() == Phase::Draining {
             return Ok(());
         }
 
         let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+            accepted = accepting.listener.accept() => accepted?,
             _ = draining.wait_for(|phase| *phase == Phase::Draining) => return Ok(()),
         };
         let _ = stream.set_nodelay(true);
@@ -2102,4 +2120,81 @@ pub(crate) fn close_after(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Config, Edge, Limits, access, compression, errors, occasions, proxy};
+
+    /// An edge on a free loopback port with no workers.
+    async fn bare_edge() -> Edge {
+        Edge::bind(Config {
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            app: String::new(),
+            release: String::new(),
+            sockets: Vec::new(),
+            groups: Vec::new(),
+            mounts: Vec::new(),
+            static_dirs: Vec::new(),
+            accel_redirect: false,
+            cgi_local_redirect: false,
+            sendfile: Arc::default(),
+            grpc_web_origins: Vec::new(),
+            errors: Arc::new(errors::ErrorPolicy::default()),
+            development: false,
+            occasions: occasions::Setting::Calendar,
+            access_log: access::Config {
+                destination: access::Destination::Off,
+                ..access::Config::default()
+            },
+            limits: Limits::default(),
+            compression: compression::Compression::off(),
+            trust: proxy::Trust::loopback(),
+            https: None,
+            spool: None,
+            rate_buckets: None,
+        })
+        .await
+        .expect("binding the edge")
+    }
+
+    /// The accept loop counts as a connection while it runs, so a drain
+    /// waits for it to notice: a connection accepted as the drain begins
+    /// is counted before the loop lets go, and once the drain returns the
+    /// edge no longer accepts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drain_waits_for_the_accept_loop() {
+        let edge = bare_edge().await;
+        let address = edge.local_addr();
+        let drainer = edge.drainer();
+        let shared = Arc::clone(&drainer.shared);
+        let running = tokio::spawn(edge.run());
+
+        // The edge's own share, and the running loop's.
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        while Arc::strong_count(&shared.connections) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the accept loop never counted itself"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            drainer.drain(Duration::from_secs(5)).await,
+            "the drain timed out"
+        );
+        assert_eq!(Arc::strong_count(&shared.connections), 1);
+
+        let refused = tokio::net::TcpStream::connect(address).await.is_err();
+        assert!(refused, "the edge still accepted after the drain returned");
+
+        running.await.expect("the edge task").expect("the edge run");
+    }
 }
