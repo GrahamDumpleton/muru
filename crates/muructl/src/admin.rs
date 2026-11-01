@@ -5275,9 +5275,272 @@ pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
         app,
         release,
         argv: args.command,
+        ..Default::default()
     };
 
     run_command(request, &args.socket, args.json).await
+}
+
+/// The `muructl command` subcommands.
+#[derive(Subcommand)]
+pub enum CommandCommand {
+    /// List the commands a release declares, with their inputs and each
+    /// one's last run.
+    List {
+        /// The application, or app@release; the current release when
+        /// only the application is named.
+        #[arg(value_name = "APP[@RELEASE]")]
+        target: String,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+
+    /// Run a command the release declares, with its inputs, and exit with
+    /// its status.
+    Run(Box<CommandRunArgs>),
+}
+
+/// What `muructl command run` takes.
+#[derive(Args)]
+pub struct CommandRunArgs {
+    /// The application, or app@release; the current release when only
+    /// the application is named.
+    #[arg(value_name = "APP[@RELEASE]")]
+    target: String,
+
+    /// The command's name.
+    name: String,
+
+    /// An input's value.
+    #[arg(long = "input", value_name = "NAME=VALUE", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+
+    /// An input's value from one of the daemon's secret stores, so it
+    /// never passes through this command.
+    #[arg(long = "secret-input", value_name = "NAME=STORE/KEY", value_parser = parse_input)]
+    secret_inputs: Vec<(String, String)>,
+
+    /// An input whose value is read from standard input.
+    #[arg(long, value_name = "NAME")]
+    input_stdin: Option<String>,
+
+    /// Print each line of output, and how the command ended, as JSON
+    /// lines of the admin API's command output.
+    #[arg(long)]
+    json: bool,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+}
+
+/// Parse NAME=VALUE for --input and --secret-input.
+fn parse_input(text: &str) -> Result<(String, String), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=VALUE"))?;
+
+    if !muru_controller::model::valid_env_name(name) {
+        return Err(format!("{name:?} is not an input name"));
+    }
+
+    Ok((name.to_owned(), value.to_owned()))
+}
+
+/// List the commands a release declares.
+pub async fn command_list(target: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+    let (app, release) = target_release(&target)?;
+    let mut client = client::connect(&socket.socket()?).await?;
+    let listed = client
+        .list_commands(pb::ListCommandsRequest { app, release })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if json {
+        return print_answer(&listed);
+    }
+
+    println!("{}@{}", listed.app, listed.release);
+
+    if listed.commands.is_empty() {
+        println!("  declares no commands");
+    }
+
+    for command in &listed.commands {
+        println!();
+
+        if command.description.is_empty() {
+            println!("{}", command.name);
+        } else {
+            println!("{}: {}", command.name, command.description);
+        }
+
+        if command.call.is_empty() {
+            println!("  run: {}", command.run.join(" "));
+        } else {
+            println!("  call: {}", command.call);
+        }
+
+        for input in &command.inputs {
+            let mut notes = Vec::new();
+
+            if input.required {
+                notes.push("required".to_owned());
+            }
+
+            if input.secret {
+                notes.push("secret".to_owned());
+            }
+
+            if !input.default.is_empty() {
+                notes.push(format!("default {}", input.default));
+            }
+
+            if !input.pattern.is_empty() {
+                notes.push(format!("matching {}", input.pattern));
+            }
+
+            let notes = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes.join(", "))
+            };
+
+            let description = if input.description.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", input.description)
+            };
+            println!("  input {}{notes}{description}", input.name);
+        }
+
+        let mut limits = Vec::new();
+
+        if !command.timeout.is_empty() {
+            limits.push(format!("timeout {}", command.timeout));
+        }
+
+        if command.exclusive {
+            limits.push("one run at a time".to_owned());
+        }
+
+        if !limits.is_empty() {
+            println!("  {}", limits.join(", "));
+        }
+
+        if let Some(run) = &command.last_run {
+            println!(
+                "  last run: {} with {}, {}",
+                format_time(run.started_unix_ms),
+                run.release,
+                run.message
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a declared command and exit with its status. A required input
+/// not given is asked for when standard input is a terminal, a secret one
+/// without echo; otherwise the daemon refuses the run and says which.
+pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
+    use std::io::{IsTerminal as _, Read as _};
+
+    let (app, release) = target_release(&args.target)?;
+    let mut inputs: std::collections::BTreeMap<String, String> = args.inputs.into_iter().collect();
+    let secret_inputs: std::collections::BTreeMap<String, String> =
+        args.secret_inputs.into_iter().collect();
+
+    if let Some(name) = &args.input_stdin {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .context("reading the input from standard input")?;
+        inputs.insert(
+            name.clone(),
+            value.trim_end_matches(['\n', '\r']).to_owned(),
+        );
+    } else if std::io::stdin().is_terminal() && !args.json {
+        let mut client = client::connect(&args.socket.socket()?).await?;
+        let listed = client
+            .list_commands(pb::ListCommandsRequest {
+                app: app.clone(),
+                release: release.clone(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+        let declared = listed
+            .commands
+            .iter()
+            .find(|command| command.name == args.name);
+
+        for input in declared
+            .map(|command| &command.inputs[..])
+            .unwrap_or_default()
+        {
+            if input.required
+                && !inputs.contains_key(&input.name)
+                && !secret_inputs.contains_key(&input.name)
+            {
+                let value = prompt(&input.name, &input.description, input.secret)?;
+                inputs.insert(input.name.clone(), value);
+            }
+        }
+    }
+
+    let request = pb::RunCommandRequest {
+        app,
+        release,
+        name: args.name,
+        inputs,
+        secret_inputs,
+        ..Default::default()
+    };
+
+    run_command(request, &args.socket, args.json).await
+}
+
+/// Ask for an input's value on the terminal, without echo for a secret
+/// one.
+fn prompt(name: &str, description: &str, secret: bool) -> anyhow::Result<String> {
+    use std::io::Write as _;
+
+    let label = if description.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} ({description})")
+    };
+    eprint!("{label}: ");
+    std::io::stderr().flush()?;
+
+    // stty acts on the terminal standard input is, which it inherits.
+
+    let echo = |on: bool| {
+        std::process::Command::new("stty")
+            .arg(if on { "echo" } else { "-echo" })
+            .status()
+    };
+
+    if secret {
+        echo(false).context("turning off the terminal's echo")?;
+    }
+
+    let mut value = String::new();
+    let read = std::io::stdin().read_line(&mut value);
+
+    if secret {
+        let _ = echo(true);
+        eprintln!();
+    }
+
+    read.context("reading the input")?;
+    Ok(value.trim_end_matches(['\n', '\r']).to_owned())
 }
 
 /// The application and release a target names: app@release, or the

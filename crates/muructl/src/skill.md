@@ -39,6 +39,7 @@ with a non-zero exit status when it fails.
 | Drain | `drain` | `drain APP@RELEASE` | Leaves the release; its workers stop once their requests finish |
 | Canary | `rollout` with `canary` | `rollout canary APP@RELEASE --steps 10,50` | Shifts in steps; each step's gates (error rate, latency, worker faults) promote or roll back on their own |
 | Apply | `apply` | `apply --file muru.toml` | Whatever the file declares: a new release in it deploys as `deploy` does |
+| Run a command | `run_command` | `command run APP NAME --input K=V` | None; runs a command the release declares (a migration, a data fix, a check) with the release's interpreter and settings |
 
 `deploy` adds one release; `apply` makes a declarative file the whole
 desired state. Use `apply` when the project has a `muru.toml`, `deploy`
@@ -73,6 +74,8 @@ for a quick release of the working tree.
    - `release` for the release's settings as the daemon resolved them.
 
 5. Fix, and deploy again. Each deploy is the next release (`r2`, `r3`, ...).
+   Run the project's declared steps, such as a migration, with
+   `run_command`; `commands` lists them and their inputs.
 
 6. Clean up: `rollback` when a release made things worse, `drain` a
    release that is no longer needed.
@@ -93,6 +96,9 @@ for a quick release of the working tree.
 - After `apply`: the report's `errors` are empty and `changes` lists what
   happened; with `dry_run`, what would.
 
+- After `run_command`: `exit_code` is 0; otherwise `output` holds what the
+  command printed, standard error lines marked `stderr:`.
+
 ## Things to know
 
 - A release's errors reach the client as pages Muru generates, with a
@@ -105,6 +111,12 @@ for a quick release of the working tree.
 
 - `docs` returns pages of the user guide by name; start with the list it
   gives without a page.
+
+- A step worth repeating (a migration, loading fixtures, a smoke check)
+  can be declared as a command in the project's `[tool.muru.commands]`
+  table, with its inputs; it can be run from the next release deployed.
+  `docs` with `howto/commands` describes the table. Give a secret input
+  in `secret_inputs` as `STORE/KEY`, never as a value.
 
 - Do not stop, upgrade or reconfigure the daemon unless asked: other
   applications may share it.

@@ -362,8 +362,8 @@ pub enum Command {
         app: String,
         /// The release.
         id: String,
-        /// The program and its arguments.
-        argv: Vec<String>,
+        /// What to run.
+        request: crate::commands::CommandRequest,
         /// Answered with the command ready to start, or why it cannot be.
         done: oneshot::Sender<Result<crate::commands::Prepared, String>>,
     },
@@ -3532,10 +3532,10 @@ impl Daemon {
             Command::PrepareCommand {
                 app,
                 id,
-                argv,
+                request,
                 done,
             } => {
-                let _ = done.send(self.prepare_command(&app, &id, argv).await);
+                let _ = done.send(self.prepare_command(&app, &id, request).await);
             }
             Command::Debug {
                 app,
@@ -3932,13 +3932,16 @@ impl Daemon {
 
     /// Section 9.12: what a command of a release runs with: the release's
     /// interpreter, environment with its secrets resolved, user and
-    /// source directory, as its host has them.
+    /// source directory, as its host has them; for a declared command,
+    /// its inputs checked and put in place.
     async fn prepare_command(
         &mut self,
         app: &str,
         id: &str,
-        argv: Vec<String>,
+        request: crate::commands::CommandRequest,
     ) -> Result<crate::commands::Prepared, String> {
+        use crate::commands::CommandRequest;
+
         let release = self
             .store
             .release(app, id)
@@ -3946,15 +3949,31 @@ impl Daemon {
         let spec = &release.spec;
         let subject = format!("{app}@{id}");
 
-        if argv.is_empty() {
-            return Err("no command was given".to_owned());
-        }
-
         if spec.http.is_some() {
             return Err(format!(
                 "{subject} runs an HTTP server rather than workers, so it has no interpreter to run a command with"
             ));
         }
+
+        // The request first, so a bad name or input refuses the run
+        // before any secret of the release is read.
+
+        let declared = match &request {
+            CommandRequest::OneOff(argv) if argv.is_empty() => {
+                return Err("no command was given".to_owned());
+            }
+            CommandRequest::OneOff(_) => None,
+            CommandRequest::Declared {
+                name,
+                inputs,
+                secret_inputs,
+            } => {
+                let command = crate::commands::find(&spec.commands, name, &subject)?;
+                let given = self.given_inputs(inputs, secret_inputs).await?;
+                let values = crate::commands::input_values(command, &given)?;
+                Some((command.clone(), given, values))
+            }
+        };
 
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let identity = self.resolve_identity(app, &subject)?;
@@ -4002,17 +4021,64 @@ impl Daemon {
             &spec.source,
         );
 
-        Ok(crate::commands::Prepared {
+        let prepared = crate::commands::Prepared {
             app: app.to_owned(),
             release: id.to_owned(),
             label: "exec".to_owned(),
-            argv: crate::commands::with_interpreter(argv, &python),
+            argv: Vec::new(),
             env,
             cwd: spec.source.clone(),
             identity,
             log: self.host_log(app, id),
             timeout: None,
-        })
+            declared: None,
+            exclusive: false,
+            inputs: String::new(),
+        };
+
+        match (declared, request) {
+            (Some((command, given, values)), _) => {
+                crate::commands::declared(prepared, &command, &given, &values, &python)
+            }
+            (None, CommandRequest::OneOff(argv)) => Ok(crate::commands::Prepared {
+                argv: crate::commands::with_interpreter(argv, &python),
+                ..prepared
+            }),
+            (None, CommandRequest::Declared { .. }) => {
+                unreachable!("a declared command was found above")
+            }
+        }
+    }
+
+    /// Section 9.12: the inputs a run gives, with those named as secret
+    /// store entries (STORE/KEY) resolved here, so their values never
+    /// pass through the caller.
+    async fn given_inputs(
+        &self,
+        inputs: &BTreeMap<String, String>,
+        secret_inputs: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let mut given = inputs.clone();
+
+        for (input, reference) in secret_inputs {
+            if given.contains_key(input) {
+                return Err(format!("the input {input} is given twice"));
+            }
+
+            let Some((store_name, key)) = reference.split_once('/') else {
+                return Err(format!(
+                    "the input {input} names {reference:?}, which is not STORE/KEY"
+                ));
+            };
+            let store = self
+                .secrets
+                .iter()
+                .find(|store| store.name == store_name)
+                .ok_or_else(|| format!("the input {input}: no secret store named {store_name}"))?;
+            given.insert(input.clone(), store.resolve(key).await?);
+        }
+
+        Ok(given)
     }
 
     /// Start a release's host and wait until every worker listens

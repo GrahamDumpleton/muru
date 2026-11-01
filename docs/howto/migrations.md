@@ -4,8 +4,8 @@ A deploy runs the new release beside the old one until the new one is
 ready, and a canary, a split or a sticky grace keeps both serving for
 longer. All that time both releases use the same database, so a schema
 change has to work with the code of both. This guide covers changing a
-schema in steps that keep it so, and running each step with
-[`muructl exec`](commands.md).
+schema in steps that keep it so, and running each step as a
+[command](commands.md) with the release it belongs to.
 
 ## Expand, deploy, contract
 
@@ -32,13 +32,24 @@ releases, such as adding a table or an index, need only the first step.
 
 ## Running the migration
 
+Declare the migration as a command, so it is run the same way every time,
+one at a time:
+
+```toml
+[tool.muru.commands.migrate]
+description = "Apply database migrations"
+run = ["python", "manage.py", "migrate", "--noinput"]
+timeout = "30m"
+exclusive = true
+```
+
 Run a migration with the release whose code it belongs to, so it uses
 that release's migration files and settings. With the expand step in the
 new release, hold the release, migrate with it, then move traffic:
 
 ```
 muructl deploy shop . --hold
-muructl exec shop@r8 -- python manage.py migrate --noinput
+muructl command run shop@r8 migrate
 muructl rollout bluegreen shop@r8
 ```
 
@@ -47,7 +58,9 @@ the schema changes and nothing reaches them until it is promoted. For a
 [canary](rollouts.md), start the rollout after the migration in the same
 way.
 
-With Alembic, or any tool the environment installs, the same applies:
+With Alembic, or any tool the environment installs, the same applies,
+with `run = ["alembic", "upgrade", "head"]`. `muructl exec` runs a
+migration command that is not declared, once:
 
 ```
 muructl exec shop@r8 -- alembic upgrade head
@@ -58,11 +71,12 @@ use, once it serves and the release before it is gone, its retention
 window over or drained:
 
 ```
-muructl exec shop -- python manage.py migrate --noinput
+muructl command run shop migrate
 ```
 
-`muructl exec` exits with the migration's status, so a script or CI job
-that deploys can stop at a failed migration before it moves any traffic.
+`muructl command run` exits with the migration's status, so a script or
+CI job that deploys can stop at a failed migration before it moves any
+traffic.
 
 ## Rolling back
 

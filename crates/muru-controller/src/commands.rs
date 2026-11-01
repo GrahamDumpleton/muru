@@ -3,9 +3,11 @@
 //! output streams to the caller and into the release's log, and whose end
 //! is recorded as an event.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use muru_proto::admin::v1 as pb;
@@ -15,10 +17,47 @@ use tokio::sync::mpsc;
 
 use crate::events::Events;
 use crate::host::Identity;
+use crate::model::{CommandRun, CommandSpec, now_unix_ms};
+use crate::store::Store;
 
 /// How long a command told to stop, at its timeout or when its caller
 /// goes away, gets before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// What a caller asks to run.
+#[derive(Debug, Clone)]
+pub enum CommandRequest {
+    /// A one-off command: the program and its arguments.
+    OneOff(Vec<String>),
+    /// A command the release declares, with its inputs.
+    Declared {
+        /// Its name.
+        name: String,
+        /// Input values given.
+        inputs: BTreeMap<String, String>,
+        /// Inputs taken from a secret store, as STORE/KEY.
+        secret_inputs: BTreeMap<String, String>,
+    },
+}
+
+/// The declared commands running now that run one at a time, by
+/// application and name.
+static EXCLUSIVE: LazyLock<Mutex<BTreeSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+/// A claim on an exclusive command, given up when dropped.
+struct Claim(Option<(String, String)>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            EXCLUSIVE
+                .lock()
+                .expect("exclusive commands poisoned")
+                .remove(&key);
+        }
+    }
+}
 
 /// A command ready to start: everything the daemon resolved from the
 /// release, so starting it needs nothing more from the daemon.
@@ -43,6 +82,13 @@ pub struct Prepared {
     pub log: PathBuf,
     /// How long it may run before it is stopped; no limit when absent.
     pub timeout: Option<Duration>,
+    /// The declared command's name, whose last run is recorded; none for
+    /// a one-off command.
+    pub declared: Option<String>,
+    /// Whether it runs one at a time for the application.
+    pub exclusive: bool,
+    /// Its inputs as its events show them.
+    pub inputs: String,
 }
 
 impl Prepared {
@@ -142,6 +188,242 @@ pub fn with_interpreter(mut argv: Vec<String>, python: &Path) -> Vec<String> {
     argv
 }
 
+/// The declared command of that name, or why there is none.
+pub fn find<'a>(
+    commands: &'a [CommandSpec],
+    name: &str,
+    subject: &str,
+) -> Result<&'a CommandSpec, String> {
+    commands
+        .iter()
+        .find(|command| command.name == name)
+        .ok_or_else(|| {
+            let names: Vec<&str> = commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect();
+
+            let declared = if names.is_empty() {
+                "it declares none".to_owned()
+            } else {
+                format!("it declares {}", names.join(", "))
+            };
+            format!("{subject} has no command named {name}; {declared}")
+        })
+}
+
+/// A declared command ready to start, from what every command of the
+/// release runs with: its program with the inputs in place, or the
+/// runtime library's runner calling its callable with them as keyword
+/// arguments (those given or with a default, in MURU_COMMAND_INPUTS),
+/// then its own variables over the release's and MURU_COMMAND.
+pub fn declared(
+    prepared: Prepared,
+    command: &CommandSpec,
+    given: &BTreeMap<String, String>,
+    values: &BTreeMap<String, String>,
+    python: &Path,
+) -> Result<Prepared, String> {
+    let mut env = prepared.env.clone();
+
+    let argv = match &command.call {
+        Some(target) => {
+            let keywords: BTreeMap<&String, &String> = values
+                .iter()
+                .filter(|(name, _)| {
+                    given.contains_key(*name)
+                        || command
+                            .inputs
+                            .iter()
+                            .any(|input| &input.name == *name && input.default.is_some())
+                })
+                .collect();
+            env.push((
+                "MURU_COMMAND_INPUTS".to_owned(),
+                serde_json::to_string(&keywords).map_err(|error| error.to_string())?,
+            ));
+            vec![
+                python.display().to_string(),
+                "-m".to_owned(),
+                "muru._command".to_owned(),
+                target.clone(),
+            ]
+        }
+        None => with_interpreter(
+            command
+                .run
+                .iter()
+                .map(|argument| substitute(argument, values))
+                .collect::<Result<_, _>>()?,
+            python,
+        ),
+    };
+
+    for (variable, template) in &command.env {
+        let value = substitute(template, values)?;
+        env.retain(|(name, _)| name != variable);
+        env.push((variable.clone(), value));
+    }
+
+    env.push(("MURU_COMMAND".to_owned(), command.name.clone()));
+
+    Ok(Prepared {
+        label: command.name.clone(),
+        argv,
+        env,
+        timeout: command.timeout_ms.map(Duration::from_millis),
+        declared: Some(command.name.clone()),
+        exclusive: command.exclusive,
+        inputs: describe_inputs(command, values),
+        ..prepared
+    })
+}
+
+/// The inputs a template names, in order: `{name}` is an input, `{{`
+/// and `}}` are literal braces, and anything else in braces is refused.
+pub fn placeholders(template: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    expand(template, |name| {
+        names.push(name.to_owned());
+        Ok(String::new())
+    })?;
+    Ok(names)
+}
+
+/// The template with each `{name}` replaced by the input's value.
+pub fn substitute(template: &str, values: &BTreeMap<String, String>) -> Result<String, String> {
+    expand(template, |name| {
+        values
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("{{{name}}} names no input"))
+    })
+}
+
+/// Walk a template, replacing each placeholder with what `value` gives.
+fn expand(
+    template: &str,
+    mut value: impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(at) = rest.find(['{', '}']) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+
+        if let Some(after) = tail.strip_prefix("{{") {
+            out.push('{');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("}}") {
+            out.push('}');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix('{') {
+            let Some(end) = after.find('}') else {
+                return Err(format!(
+                    "{template:?} has a {{ with no }}; write {{{{ for a brace"
+                ));
+            };
+            let name = &after[..end];
+
+            if !crate::model::valid_env_name(name) {
+                return Err(format!(
+                    "{template:?} has {{{name}}}, which is not an input name; write {{{{ for a brace"
+                ));
+            }
+
+            out.push_str(&value(name)?);
+            rest = &after[end + 1..];
+        } else {
+            return Err(format!(
+                "{template:?} has a }} with no {{; write }}}} for a brace"
+            ));
+        }
+    }
+
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The value of each input for a run: those given, checked against the
+/// declaration, then the defaults. An input that is not declared, a
+/// required one missing or a value that does not match its pattern is
+/// refused, naming the input but never a secret's value.
+pub fn input_values(
+    command: &CommandSpec,
+    given: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if let Some(unknown) = given
+        .keys()
+        .find(|name| !command.inputs.iter().any(|input| &input.name == *name))
+    {
+        let known: Vec<&str> = command
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect();
+
+        let known = if known.is_empty() {
+            "it takes none".to_owned()
+        } else {
+            format!("it takes {}", known.join(", "))
+        };
+        return Err(format!(
+            "{} has no input named {unknown}; {known}",
+            command.name
+        ));
+    }
+
+    let mut values = BTreeMap::new();
+
+    for input in &command.inputs {
+        let Some(value) = given.get(&input.name).or(input.default.as_ref()) else {
+            if input.required {
+                return Err(format!("{} needs the input {}", command.name, input.name));
+            }
+
+            values.insert(input.name.clone(), String::new());
+            continue;
+        };
+
+        if let Some(pattern) = &input.pattern {
+            let anchored = regex::Regex::new(&format!("^(?:{pattern})$"))
+                .map_err(|error| format!("{}: input {}: {error}", command.name, input.name))?;
+
+            if !anchored.is_match(value) {
+                let shown = if input.secret {
+                    "the value given".to_owned()
+                } else {
+                    format!("{value:?}")
+                };
+                return Err(format!(
+                    "{} input {}: {shown} does not match {pattern}",
+                    command.name, input.name
+                ));
+            }
+        }
+
+        values.insert(input.name.clone(), value.clone());
+    }
+
+    Ok(values)
+}
+
+/// The inputs as an event shows them: each name with its value, a
+/// secret's as `***`.
+pub fn describe_inputs(command: &CommandSpec, values: &BTreeMap<String, String>) -> String {
+    command
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let value = values.get(&input.name)?;
+            let shown = if input.secret { "***" } else { value.as_str() };
+            Some(format!("{}={shown}", input.name))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// How a command ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ending {
@@ -155,17 +437,53 @@ struct Ending {
 
 /// Start the command and stream what it writes. The receiver yields a
 /// message per line of output and a last one saying how it ended; when
-/// the receiver is dropped the command is stopped, as at its timeout.
-pub fn run(prepared: Prepared, events: Events) -> mpsc::Receiver<pb::CommandOutput> {
+/// the receiver is dropped the command is stopped, as at its timeout. An
+/// exclusive command already running for the application is refused.
+pub fn run(
+    prepared: Prepared,
+    events: Events,
+    store: Arc<Store>,
+) -> Result<mpsc::Receiver<pb::CommandOutput>, String> {
+    let claim = match (&prepared.declared, prepared.exclusive) {
+        (Some(name), true) => {
+            let key = (prepared.app.clone(), name.clone());
+
+            if !EXCLUSIVE
+                .lock()
+                .expect("exclusive commands poisoned")
+                .insert(key.clone())
+            {
+                return Err(format!(
+                    "{name} runs one at a time for {}, and a run is under way",
+                    prepared.app
+                ));
+            }
+
+            Claim(Some(key))
+        }
+        _ => Claim(None),
+    };
+
     let (sender, receiver) = mpsc::channel(256);
-    tokio::spawn(supervise(prepared, events, sender));
-    receiver
+
+    tokio::spawn(async move {
+        supervise(prepared, events, store, sender).await;
+        drop(claim);
+    });
+
+    Ok(receiver)
 }
 
 /// Run the command to its end, relaying its output and recording it.
-async fn supervise(prepared: Prepared, events: Events, sender: mpsc::Sender<pb::CommandOutput>) {
+async fn supervise(
+    prepared: Prepared,
+    events: Events,
+    store: Arc<Store>,
+    sender: mpsc::Sender<pb::CommandOutput>,
+) {
     let subject = prepared.subject();
     let started = Instant::now();
+    let started_unix_ms = now_unix_ms();
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -207,11 +525,17 @@ async fn supervise(prepared: Prepared, events: Events, sender: mpsc::Sender<pb::
     };
 
     let pid = child.id().unwrap_or(0);
+
+    let with = if prepared.inputs.is_empty() {
+        String::new()
+    } else {
+        format!(", with {}", prepared.inputs)
+    };
     events.emit(
         "command.started",
         &subject,
         "info",
-        &format!("{}: started (pid {pid})", prepared.label),
+        &format!("{}: started (pid {pid}){with}", prepared.label),
     );
 
     // Both streams arrive as lines on one channel, in the order written.
@@ -291,7 +615,8 @@ async fn supervise(prepared: Prepared, events: Events, sender: mpsc::Sender<pb::
         }
     }
 
-    let ending = ending(child.wait().await, stopped, started.elapsed());
+    let took = started.elapsed();
+    let ending = ending(child.wait().await, stopped, took);
 
     if let Some(log) = log.as_mut() {
         let _ = writeln!(log, "[command {}] {}", prepared.label, ending.message);
@@ -308,6 +633,21 @@ async fn supervise(prepared: Prepared, events: Events, sender: mpsc::Sender<pb::
         level,
         &format!("{}: {}", prepared.label, ending.message),
     );
+
+    if let Some(name) = &prepared.declared {
+        let run = CommandRun {
+            release: prepared.release.clone(),
+            started_unix_ms,
+            duration_ms: took.as_millis() as u64,
+            exit_code: ending.code,
+            ok: ending.ok,
+            message: ending.message.clone(),
+        };
+
+        if let Err(error) = store.record_command_run(&prepared.app, name, &run) {
+            tracing::warn!(%error, "recording the run of {name} failed");
+        }
+    }
 
     if !caller_gone {
         let _ = sender.send(finished(&prepared, &ending)).await;
@@ -435,7 +775,14 @@ mod tests {
             identity: None,
             log,
             timeout: None,
+            declared: None,
+            exclusive: false,
+            inputs: String::new(),
         }
+    }
+
+    fn store() -> Arc<Store> {
+        Arc::new(Store::in_memory().expect("a store"))
     }
 
     async fn collect(mut receiver: mpsc::Receiver<pb::CommandOutput>) -> Vec<pb::CommandOutput> {
@@ -521,6 +868,193 @@ mod tests {
         );
     }
 
+    fn declared() -> CommandSpec {
+        let input = |name: &str| crate::model::CommandInputSpec {
+            name: name.to_owned(),
+            description: String::new(),
+            required: false,
+            default: None,
+            pattern: None,
+            secret: false,
+        };
+
+        CommandSpec {
+            name: "add-user".to_owned(),
+            description: String::new(),
+            run: vec!["add".to_owned(), "{username}".to_owned()],
+            call: None,
+            env: Vec::new(),
+            inputs: vec![
+                crate::model::CommandInputSpec {
+                    required: true,
+                    pattern: Some("[a-z]+".to_owned()),
+                    ..input("username")
+                },
+                crate::model::CommandInputSpec {
+                    default: Some("staff".to_owned()),
+                    ..input("role")
+                },
+                crate::model::CommandInputSpec {
+                    secret: true,
+                    pattern: Some("\\S{8,}".to_owned()),
+                    ..input("password")
+                },
+                input("note"),
+            ],
+            timeout_ms: None,
+            exclusive: false,
+        }
+    }
+
+    #[test]
+    fn placeholders_name_inputs_and_doubled_braces_are_braces() {
+        assert_eq!(
+            placeholders("--user={username} {{literal}} {role}"),
+            Ok(vec!["username".to_owned(), "role".to_owned()])
+        );
+
+        let values = BTreeMap::from([("username".to_owned(), "bob".to_owned())]);
+        assert_eq!(
+            substitute("--user={username} {{x}}", &values),
+            Ok("--user=bob {x}".to_owned())
+        );
+        assert!(
+            substitute("{missing}", &values)
+                .unwrap_err()
+                .contains("names no input")
+        );
+        assert!(placeholders("{unclosed").unwrap_err().contains("no }"));
+        assert!(placeholders("stray }").unwrap_err().contains("no {"));
+        assert!(
+            placeholders("{not a name}")
+                .unwrap_err()
+                .contains("not an input name")
+        );
+    }
+
+    #[test]
+    fn inputs_are_checked_against_the_declaration() {
+        let command = declared();
+        let given = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        let values = input_values(&command, &given(&[("username", "bob")])).expect("valid");
+        assert_eq!(values["role"], "staff");
+        assert_eq!(values["note"], "");
+
+        assert_eq!(
+            input_values(&command, &given(&[])),
+            Err("add-user needs the input username".to_owned())
+        );
+        assert!(
+            input_values(&command, &given(&[("username", "Bob1")]))
+                .unwrap_err()
+                .contains("\"Bob1\" does not match")
+        );
+        assert!(
+            input_values(&command, &given(&[("username", "bob"), ("colour", "red")]))
+                .unwrap_err()
+                .contains("no input named colour; it takes username, role, password, note")
+        );
+
+        // A secret's value is never repeated, in an error or an event.
+
+        let short = input_values(
+            &command,
+            &given(&[("username", "bob"), ("password", "hunter2")]),
+        )
+        .unwrap_err();
+        assert!(!short.contains("hunter2"), "{short}");
+
+        let values = input_values(
+            &command,
+            &given(&[("username", "bob"), ("password", "correct horse")]),
+        );
+        assert!(values.is_err(), "a space is not \\S");
+
+        let values = input_values(
+            &command,
+            &given(&[("username", "bob"), ("password", "correcthorse")]),
+        )
+        .expect("valid");
+        assert_eq!(
+            describe_inputs(&command, &values),
+            "username=bob, role=staff, password=***, note="
+        );
+    }
+
+    #[test]
+    fn a_declared_command_gets_its_inputs_in_place() {
+        let python = Path::new("/srv/env/bin/python");
+        let base = || {
+            let mut base = prepared(&[], PathBuf::from("/dev/null"));
+            base.env = vec![("PASSWORD".to_owned(), "from-the-release".to_owned())];
+            base
+        };
+        let mut command = declared();
+        command.run = vec![
+            "python".to_owned(),
+            "add.py".to_owned(),
+            "--user={username}".to_owned(),
+        ];
+        command.env = vec![("PASSWORD".to_owned(), "{password}".to_owned())];
+        command.timeout_ms = Some(5_000);
+        let given = BTreeMap::from([
+            ("username".to_owned(), "bob".to_owned()),
+            ("password".to_owned(), "correcthorse".to_owned()),
+        ]);
+        let values = input_values(&command, &given).expect("valid");
+
+        let ready = super::declared(base(), &command, &given, &values, python).expect("ready");
+        assert_eq!(ready.argv, ["/srv/env/bin/python", "add.py", "--user=bob"]);
+        assert_eq!(ready.label, "add-user");
+        assert_eq!(ready.declared.as_deref(), Some("add-user"));
+        assert_eq!(ready.timeout, Some(Duration::from_secs(5)));
+        assert!(
+            ready
+                .env
+                .contains(&("PASSWORD".to_owned(), "correcthorse".to_owned()))
+        );
+        assert!(
+            !ready
+                .env
+                .iter()
+                .any(|(_, value)| value == "from-the-release")
+        );
+        assert!(
+            ready
+                .env
+                .contains(&("MURU_COMMAND".to_owned(), "add-user".to_owned()))
+        );
+        assert!(ready.inputs.contains("password=***"), "{}", ready.inputs);
+
+        // A callable gets the inputs given or defaulted, as JSON.
+
+        command.run = Vec::new();
+        command.call = Some("shop.ops:add".to_owned());
+        let ready = super::declared(base(), &command, &given, &values, python).expect("ready");
+        assert_eq!(
+            ready.argv,
+            ["/srv/env/bin/python", "-m", "muru._command", "shop.ops:add"]
+        );
+        let inputs = ready
+            .env
+            .iter()
+            .find(|(name, _)| name == "MURU_COMMAND_INPUTS")
+            .map(|(_, value)| {
+                serde_json::from_str::<BTreeMap<String, String>>(value).expect("JSON")
+            })
+            .expect("the inputs");
+        assert_eq!(
+            inputs.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["password", "role", "username"]
+        );
+    }
+
     #[test]
     fn an_ending_says_how_and_after_how_long() {
         let took = Duration::from_millis(125_400);
@@ -558,14 +1092,17 @@ mod tests {
     async fn output_streams_in_lines_and_the_end_comes_last() {
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("r1.log");
-        let events = Events::new(Arc::new(crate::store::Store::in_memory().expect("a store")));
+        let store = store();
+        let events = Events::new(store.clone());
         let receiver = run(
             prepared(
                 &["sh", "-c", "echo $GREETING; echo oops >&2; exit 2"],
                 log.clone(),
             ),
             events.clone(),
-        );
+            store,
+        )
+        .expect("started");
         let messages = collect(receiver).await;
 
         let lines: Vec<(bool, &str)> = messages
@@ -592,10 +1129,11 @@ mod tests {
     #[tokio::test]
     async fn a_command_past_its_timeout_is_stopped() {
         let dir = tempfile::tempdir().expect("a directory");
-        let events = Events::new(Arc::new(crate::store::Store::in_memory().expect("a store")));
+        let store = store();
+        let events = Events::new(store.clone());
         let mut command = prepared(&["sleep", "30"], dir.path().join("r1.log"));
         command.timeout = Some(Duration::from_millis(200));
-        let messages = collect(run(command, events)).await;
+        let messages = collect(run(command, events, store).expect("started")).await;
 
         let last = messages.last().expect("a last message");
         assert!(last.finished);
@@ -610,11 +1148,16 @@ mod tests {
     #[tokio::test]
     async fn a_program_that_is_not_found_ends_with_127() {
         let dir = tempfile::tempdir().expect("a directory");
-        let events = Events::new(Arc::new(crate::store::Store::in_memory().expect("a store")));
-        let messages = collect(run(
-            prepared(&["no-such-program-anywhere"], dir.path().join("r1.log")),
-            events,
-        ))
+        let store = store();
+        let events = Events::new(store.clone());
+        let messages = collect(
+            run(
+                prepared(&["no-such-program-anywhere"], dir.path().join("r1.log")),
+                events,
+                store,
+            )
+            .expect("started"),
+        )
         .await;
 
         assert_eq!(messages.len(), 1);

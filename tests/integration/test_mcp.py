@@ -56,10 +56,10 @@ class Session:
     def tools(self) -> dict[str, dict[str, Any]]:
         return {tool["name"]: tool for tool in self.request("tools/list")["tools"]}
 
-    def call(self, name: str, **arguments: Any) -> tuple[bool, str]:
+    def call(self, tool: str, /, **arguments: Any) -> tuple[bool, str]:
         """Call a tool: whether it failed, and the text it returned."""
 
-        result = self.request("tools/call", {"name": name, "arguments": arguments})
+        result = self.request("tools/call", {"name": tool, "arguments": arguments})
         return bool(result.get("isError")), result["content"][0]["text"]
 
 
@@ -204,3 +204,63 @@ def test_the_server_says_when_the_project_s_skill_is_missing(
     with session(daemon, cwd=tmp_path) as (client, initialized):
         assert "muructl mcp skill install" not in initialized["instructions"]
         assert json.loads(client.call("skill_status")[1])["state"] == "current"
+
+
+COMMANDS_PROJECT = """
+[project]
+name = "ops"
+version = "0.1.0"
+
+[tool.muru]
+entrypoint = "app:application"
+processes = 1
+
+[tool.muru.commands.greet]
+run = ["python", "-c", "import os, sys; print('hello', sys.argv[1], os.environ['WORD'])", "{who}"]
+env = { WORD = "{word}" }
+inputs.who = { required = true }
+inputs.word = { secret = true }
+
+[tool.muru.commands.fail]
+run = ["python", "-c", "import sys; print('failing', file=sys.stderr); sys.exit(3)"]
+"""
+
+
+def test_declared_commands_run_through_the_tools(daemon: Daemon, tmp_path: Path) -> None:
+    project = tmp_path / "ops"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(COMMANDS_PROJECT)
+    (project / "app.py").write_text(
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [])\n"
+        "    return [b'ok']\n"
+    )
+    assert daemon.deploy("ops", project) == "muru: release ops@r1 is ready and serving"
+
+    with session(daemon) as (client, initialized):
+        assert "run_command" in initialized["instructions"]
+
+        failed, text = client.call("commands", target="ops")
+        assert not failed, text
+        names = [command["name"] for command in json.loads(text)["commands"]]
+        assert names == ["fail", "greet"]
+
+        failed, text = client.call("run_command", target="ops", name="greet", inputs={"who": "bob"})
+        assert not failed, text
+        ran = json.loads(text)
+        assert (ran["output"], ran["exit_code"], ran["release"]) == (["hello bob "], 0, "r1")
+
+        # A secret input given as a value is refused before anything runs.
+
+        failed, text = client.call(
+            "run_command", target="ops", name="greet", inputs={"who": "bob", "word": "x"}
+        )
+        assert failed and "the input word is secret" in text, text
+
+        failed, text = client.call("run_command", target="ops", name="fail")
+        assert failed, text
+        ran = json.loads(text)
+        assert ran["output"] == ["stderr: failing"] and ran["exit_code"] == 3, ran
+
+        failed, text = client.call("run_command", target="ops", name="greet")
+        assert failed and "greet needs the input who" in text, text

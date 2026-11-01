@@ -1292,6 +1292,7 @@ dependencies = [
  "muru-edge",
  "muru-proto",
  "muru-provision",
+ "regex",
  "ring",
  "rusqlite",
  "serde",

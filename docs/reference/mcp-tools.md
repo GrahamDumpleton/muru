@@ -13,6 +13,7 @@ ones it names.
 | `status` | reads | `muructl status` | none |
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
+| `commands` | reads | `muructl command list` | `target` |
 | `events` | reads | `muructl events` | `after` (a sequence number) |
 | `logs` | reads | `muructl logs`, the lines returned as an array | `target`, `lines` (default 100, at most 1000), `access` |
 | `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect` | `what`, `target`, `worker` |
@@ -29,6 +30,7 @@ ones it names.
 | `drain` | changes | `muructl drain` | `release` |
 | `rollout` | changes | `muructl rollout canary`, `pause`, `resume`, `promote` or `abort` | `action`, `release` (canary), `app` (the others), `steps`, `hold` |
 | `scale` | changes | `muructl scale` | `target`, `group`, `processes`, `unpin` |
+| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code` and `message`, as a tool error when the exit status is not 0 | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app`, `on` |
@@ -39,4 +41,8 @@ ones it names.
 
 Every tool is annotated for the client as reading or changing things, and
 none reaches beyond the daemon. Stopping, shutting down and upgrading the
-daemon, and `debug exec` and `debug attach`, are not offered.
+daemon, `muructl exec`, and `debug exec` and `debug attach`, are not
+offered: `run_command` runs only what an application declares.
+`run_command` refuses a secret input given in `inputs`, so a secret's
+value never passes through the agent; give it in `secret_inputs` as an
+entry of one of the daemon's [secret stores](../howto/secrets.md).

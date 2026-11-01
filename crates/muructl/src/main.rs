@@ -66,6 +66,13 @@ enum Command {
     /// Run a one-off command with a release's interpreter, environment, user and source directory.
     Exec(admin::RunExecArgs),
 
+    /// List or run the commands an application declares.
+    #[command(name = "command")]
+    Commands {
+        #[command(subcommand)]
+        command: admin::CommandCommand,
+    },
+
     /// Run or control the daemon.
     Daemon {
         #[command(subcommand)]
@@ -953,6 +960,17 @@ fn main() -> anyhow::Result<()> {
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
+        Command::Commands {
+            command:
+                admin::CommandCommand::List {
+                    target,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::command_list(target, socket, output.json)),
+        Command::Commands {
+            command: admin::CommandCommand::Run(args),
+        } => exit_with(runtime, admin::command_run(*args)),
         Command::Edge {
             command: edge::EdgeCommand::Run(args),
         } => runtime.block_on(edge::run(*args)),
@@ -1846,6 +1864,8 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
                 }
             })
         },
+        // The source's own [tool.muru] table carries its commands.
+        commands: std::collections::BTreeMap::new(),
     };
     let document = Document {
         listener: listeners,

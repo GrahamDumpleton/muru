@@ -695,7 +695,8 @@ impl Admin for Service {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
         deploy(pb::DeployRequest) -> pb::Release, "muructl deploy";
-        run_command(pb::RunCommandRequest) -> CommandStream, "muructl exec";
+        run_command(pb::RunCommandRequest) -> CommandStream, "muructl exec and muructl command run";
+        list_commands(pb::ListCommandsRequest) -> pb::ListCommandsResponse, "muructl command";
         list_releases(pb::ListReleasesRequest) -> pb::ListReleasesResponse, "muructl release";
         get_release(pb::GetReleaseRequest) -> pb::Release, "muructl release";
         wait_release(pb::WaitReleaseRequest) -> pb::Release, "muructl release wait";

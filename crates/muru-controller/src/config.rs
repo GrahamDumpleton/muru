@@ -501,6 +501,7 @@ fn plan_app(
             error_pages: (!table.error_pages.is_empty()).then_some(&table.error_pages),
             error_override: table.error_override.as_ref(),
             maintenance: table.maintenance.as_ref(),
+            commands: (!table.commands.is_empty()).then_some(&table.commands),
             declared: true,
         };
 
@@ -2237,6 +2238,8 @@ pub struct Tables<'a> {
     pub error_override: Option<&'a muru_config::ErrorOverride>,
     /// Maintenance exemptions (section 4.12).
     pub maintenance: Option<&'a muru_config::Maintenance>,
+    /// Commands (section 9.12).
+    pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
     /// Whether the request is a declared release's table rather than a
     /// deploy's flags, which names its layer (section 3.3).
     pub declared: bool,
@@ -2924,6 +2927,11 @@ pub fn resolve_spec(
 
     let layers = resolve_layers(request, &table, previous, tables.declared, &source);
 
+    // Section 9.12: commands from the declaration, else the source's own
+    // table.
+
+    let commands = resolve_commands(tables.commands.unwrap_or(&table.commands))?;
+
     Ok(ReleaseSpec {
         source,
         entrypoint,
@@ -2989,7 +2997,199 @@ pub fn resolve_spec(
         interpreter,
         build,
         bytecode,
+        commands,
     })
+}
+
+/// Section 9.12: a release's commands from their tables, checked: a
+/// valid name, `run` or `call` but not both, a timeout that parses, and
+/// inputs with names Python accepts as keywords, patterns that compile,
+/// no default where one is required or secret, and every placeholder an
+/// input, a secret one only in `env`, where no command line shows it.
+fn resolve_commands(
+    tables: &BTreeMap<String, muru_config::CommandTable>,
+) -> Result<Vec<crate::model::CommandSpec>, String> {
+    let mut commands = Vec::with_capacity(tables.len());
+
+    for (name, table) in tables {
+        let what = format!("commands.{name}");
+
+        if !valid_name(name) {
+            return Err(format!(
+                "{what}: a command's name is lowercase letters, digits and hyphens"
+            ));
+        }
+
+        let call = match (&table.call, table.run.is_empty()) {
+            (Some(_), false) => return Err(format!("{what}: give run or call, not both")),
+            (None, true) => {
+                return Err(format!(
+                    "{what}: give run, a program and its arguments, or call, a module:function"
+                ));
+            }
+            (Some(call), true) => {
+                let well_formed = call.split_once(':').is_some_and(|(module, function)| {
+                    [module, function].iter().all(|part| {
+                        !part.is_empty() && part.split('.').all(crate::model::valid_env_name)
+                    })
+                });
+
+                if !well_formed {
+                    return Err(format!(
+                        "{what}: call = {call:?} is not module:function, such as shop.ops:backup"
+                    ));
+                }
+
+                Some(call.clone())
+            }
+            (None, false) => None,
+        };
+
+        let mut inputs = Vec::with_capacity(table.inputs.len());
+
+        for (input, spec) in &table.inputs {
+            let what = format!("{what}.inputs.{input}");
+
+            if !crate::model::valid_env_name(input) {
+                return Err(format!(
+                    "{what}: an input's name is letters, digits and underscores, not starting with a digit"
+                ));
+            }
+
+            let required = spec.required.unwrap_or(false);
+            let secret = spec.secret.unwrap_or(false);
+
+            if spec.default.is_some() && (required || secret) {
+                return Err(format!(
+                    "{what}: a {} input has no default",
+                    if secret { "secret" } else { "required" }
+                ));
+            }
+
+            if let Some(pattern) = &spec.pattern {
+                let anchored = regex::Regex::new(&format!("^(?:{pattern})$"))
+                    .map_err(|error| format!("{what}: pattern: {error}"))?;
+
+                if let Some(default) = &spec.default
+                    && !anchored.is_match(default)
+                {
+                    return Err(format!(
+                        "{what}: the default {default:?} does not match the pattern"
+                    ));
+                }
+            }
+
+            inputs.push(crate::model::CommandInputSpec {
+                name: input.clone(),
+                description: spec.description.clone().unwrap_or_default(),
+                required,
+                default: spec.default.clone(),
+                pattern: spec.pattern.clone(),
+                secret,
+            });
+        }
+
+        // Every placeholder names an input; a secret's value goes only
+        // into the environment.
+
+        let input = |name: &str| inputs.iter().find(|input| input.name == name);
+
+        for argument in &table.run {
+            for placeholder in crate::commands::placeholders(argument)
+                .map_err(|error| format!("{what}: run: {error}"))?
+            {
+                match input(&placeholder) {
+                    None => return Err(format!("{what}: run: {{{placeholder}}} names no input")),
+                    Some(input) if input.secret => {
+                        return Err(format!(
+                            "{what}: run: the secret input {placeholder} goes in env, where no command line shows it"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        for (variable, value) in &table.env {
+            if !crate::model::valid_env_name(variable) || variable.starts_with("MURU_") {
+                return Err(format!(
+                    "{what}: env: {variable} is not a variable name a command can set"
+                ));
+            }
+
+            for placeholder in crate::commands::placeholders(value)
+                .map_err(|error| format!("{what}: env.{variable}: {error}"))?
+            {
+                if input(&placeholder).is_none() {
+                    return Err(format!(
+                        "{what}: env.{variable}: {{{placeholder}}} names no input"
+                    ));
+                }
+            }
+        }
+
+        let timeout_ms = table
+            .timeout
+            .as_deref()
+            .map(muru_config::parse_duration)
+            .transpose()
+            .map_err(|error| format!("{what}: timeout: {error}"))?
+            .map(|timeout| timeout.as_millis() as u64);
+
+        commands.push(crate::model::CommandSpec {
+            name: name.clone(),
+            description: table.description.clone().unwrap_or_default(),
+            run: table.run.clone(),
+            call,
+            env: table.env.clone().into_iter().collect(),
+            inputs,
+            timeout_ms,
+            exclusive: table.exclusive.unwrap_or(false),
+        });
+    }
+
+    Ok(commands)
+}
+
+/// Section 9.12: the commands of a release as the tables they came from,
+/// for an export.
+fn commands_table_from(
+    commands: &[crate::model::CommandSpec],
+) -> BTreeMap<String, muru_config::CommandTable> {
+    commands
+        .iter()
+        .map(|command| {
+            let table = muru_config::CommandTable {
+                description: (!command.description.is_empty()).then(|| command.description.clone()),
+                run: command.run.clone(),
+                call: command.call.clone(),
+                env: command.env.iter().cloned().collect(),
+                inputs: command
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        (
+                            input.name.clone(),
+                            muru_config::CommandInput {
+                                description: (!input.description.is_empty())
+                                    .then(|| input.description.clone()),
+                                required: input.required.then_some(true),
+                                default: input.default.clone(),
+                                pattern: input.pattern.clone(),
+                                secret: input.secret.then_some(true),
+                            },
+                        )
+                    })
+                    .collect(),
+                timeout: command
+                    .timeout_ms
+                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                exclusive: command.exclusive.then_some(true),
+            };
+
+            (command.name.clone(), table)
+        })
+        .collect()
 }
 
 /// Section 8.2: the build settings for a release, and whether the daemon
@@ -3716,6 +3916,7 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
         error_pages: BTreeMap::new(),
         error_override: None,
         maintenance: None,
+        commands: BTreeMap::new(),
     })
 }
 
@@ -3816,6 +4017,7 @@ fn resolve_http_spec(
         interpreter: None,
         build: crate::model::BuildSpec::default(),
         bytecode: crate::model::BytecodeSpec::default(),
+        commands: Vec::new(),
     })
 }
 
@@ -4428,6 +4630,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         error_pages: spec.error_pages.clone(),
         error_override: spec.error_override.clone(),
         maintenance: spec.maintenance.clone(),
+        commands: commands_table_from(&spec.commands),
     }
 }
 
@@ -4584,6 +4787,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "hooks",
         declared.hooks.clone().unwrap_or_default(),
         recorded.hooks.clone().unwrap_or_default(),
+    );
+    compare(
+        "commands",
+        serde_json::to_string(&declared.commands).unwrap_or_default(),
+        serde_json::to_string(&recorded.commands).unwrap_or_default(),
     );
     compare(
         "reflection",
@@ -5492,6 +5700,74 @@ mod tests {
                 1
             )
             .contains("host_idle_timeout needs min_workers = 0")
+        );
+    }
+
+    #[test]
+    fn commands_are_checked_as_they_are_resolved() {
+        let table = |text: &str| {
+            toml::from_str::<BTreeMap<String, muru_config::CommandTable>>(text).unwrap()
+        };
+        let resolved = |text: &str| resolve_commands(&table(text));
+        let refused = |text: &str| resolved(text).unwrap_err();
+
+        let commands = resolved(
+            r#"
+            [migrate]
+            description = "Apply migrations"
+            run = ["python", "manage.py", "migrate"]
+            timeout = "10m"
+            exclusive = true
+
+            [add-user]
+            run = ["python", "manage.py", "createsuperuser", "--username", "{username}"]
+            env = { DJANGO_SUPERUSER_PASSWORD = "{password}" }
+            inputs.username = { required = true, pattern = "[a-z]+" }
+            inputs.password = { required = true, secret = true }
+
+            [backup]
+            call = "shop.ops:backup"
+            inputs.target = { default = "s3://backups" }
+            "#,
+        )
+        .unwrap();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, ["add-user", "backup", "migrate"]);
+        assert_eq!(commands[2].timeout_ms, Some(600_000));
+        assert!(commands[2].exclusive);
+        assert_eq!(commands[1].call.as_deref(), Some("shop.ops:backup"));
+
+        // They export as the tables they came from.
+
+        let exported = commands_table_from(&commands);
+        assert_eq!(resolve_commands(&exported).unwrap(), commands);
+
+        assert!(refused("[Migrate]\nrun = ['x']").contains("lowercase letters"));
+        assert!(refused("[m]\nrun = ['x']\ncall = 'a:b'").contains("not both"));
+        assert!(refused("[m]\ndescription = 'nothing'").contains("give run"));
+        assert!(refused("[m]\ncall = 'shop.ops'").contains("is not module:function"));
+        assert!(refused("[m]\nrun = ['x']\ntimeout = 'soon'").contains("timeout"));
+        assert!(refused("[m]\nrun = ['x', '{who}']").contains("{who} names no input"));
+        assert!(
+            refused("[m]\nrun = ['x', '{pw}']\ninputs.pw = { secret = true }")
+                .contains("the secret input pw goes in env")
+        );
+        assert!(
+            refused("[m]\nrun = ['x']\ninputs.n = { required = true, default = 'a' }")
+                .contains("a required input has no default")
+        );
+        assert!(
+            refused("[m]\nrun = ['x']\ninputs.n = { pattern = '[0-9]+', default = 'a' }")
+                .contains("does not match the pattern")
+        );
+        assert!(refused("[m]\nrun = ['x']\ninputs.n = { pattern = '(' }").contains("pattern"));
+        assert!(refused("[m]\nrun = ['x']\ninputs.2n = {}").contains("letters, digits"));
+        assert!(
+            refused("[m]\nrun = ['x']\nenv = { MURU_APP = 'x' }")
+                .contains("not a variable name a command can set")
         );
     }
 }

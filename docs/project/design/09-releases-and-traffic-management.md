@@ -279,11 +279,33 @@ liveness = { path = '/healthz', interval = '30s', failures = 3 }
 
 ## 9.12 Commands
 
-A command is a process run with a release: its interpreter, its environment with secrets delivered, its user and its source directory as the working directory, exactly as the release's host has them (ADR 0040). `muructl exec APP[@RELEASE] -- COMMAND` runs a one-off command, with the application's current release when none is named, and is how a migration is run as a deliberate step (section 9.7).
+A command is a process run with a release: its interpreter, its environment with secrets delivered, its user and its source directory as the working directory, exactly as the release's host has them (ADR 0040). An application declares the commands it needs run, by name and with the inputs each takes, and `muructl command run APP[@RELEASE] NAME` runs one, so a migration, a backup or creating an account is a step anyone operating the application, a deploy script or a coding agent runs the same way (ADR 0041). `muructl exec APP[@RELEASE] -- COMMAND` runs a one-off command. Either runs with the application's current release when none is named, and is how a migration is run as a deliberate step (section 9.7).
+
+```toml
+[tool.muru.commands.add-user]
+description = 'Create an administrator'
+run = ['python', 'manage.py', 'createsuperuser', '--noinput', '--username', '{username}']
+env = { DJANGO_SUPERUSER_PASSWORD = '{password}' }
+inputs.username = { required = true, pattern = '[a-z][a-z0-9_]*' }
+inputs.password = { required = true, secret = true }
+
+[tool.muru.commands.backup]
+call = 'shop.ops:backup'
+inputs.target = { default = 's3://backups/shop' }
+timeout = '1h'
+exclusive = true
+```
+
+- **Declaration.** `[tool.muru.commands.NAME]` in the project file, or a declared release's `commands` table, which replaces the source's. A command has `run`, an argument vector, or `call`, a `module:function`; `description`, `env`, `inputs`, `timeout` (none by default) and `exclusive`. The commands are resolved and checked when the release is created and fixed with it, like every other setting, so a new or changed command takes effect with the next release and each release runs its own code's commands. `muructl config export` writes them back as the release's table.
+- **Inputs.** Each input may be `required`, have a `default` (not with required or secret), a `pattern` the whole value matches, a `description`, and be `secret`. `{name}` in an argument or an `env` value is replaced by the value, `{{` and `}}` are braces, and every placeholder must name an input. A secret input may appear only in `env`, since a process's arguments are visible to other users of the machine. An input given that the command does not declare, a required one missing or a value that fails its pattern refuses the run before anything starts; the refusal names the input but never a secret's value. An input neither given nor defaulted is empty.
+- **Secret inputs from stores.** A run may give an input as `STORE/KEY`, an entry of one of the daemon's secret stores (section 10.8), which the daemon resolves itself, so the value never passes through the caller. muructl also prompts for a missing required input on a terminal, without echo for a secret one, and reads one from standard input with `--input-stdin`.
+- **Callables.** A `call` command runs `python -m muru._command module:function` with the release's interpreter, the inputs in MURU_COMMAND_INPUTS as a JSON object, which the runner removes from the environment before the call, given or defaulted ones only, as keyword arguments. A coroutine function is awaited. An integer it returns is the exit status; anything else is 0, and an uncaught exception exits 1 with its traceback.
+- **Exclusive commands** run one at a time per application and command: a run asked for while one is under way is refused, and the claim ends with the process.
+- **Last runs.** The store keeps the last run of each of an application's commands (the release, start, duration, exit status and ending), which `muructl command list` shows with the declarations.
 
 - **Who runs it.** The daemon resolves the release's settings with the code that starts its host, and the admin API's `RunCommand` starts the process and streams its output. The release need not be running: a held, retained, drained or stopped release, or one scaled to zero, runs commands as well. A release that builds its environment must have built it, by starting once; a managed HTTP server's release (section 9.9) has no interpreter and runs none.
-- **What it sees.** The release's environment, then the interpreter's directory first on PATH, VIRTUAL_ENV when that is a virtual environment, the runtime library first on PYTHONPATH (section 8.3), bytecode as the host writes it (section 8.2), and MURU_APP, MURU_RELEASE and MURU_RELEASE_DIR. A program named `python` or `python3` is the release's interpreter. The command is an argument vector run without a shell, with standard input closed and no terminal.
-- **Output and status.** Standard output and standard error stream to the caller as lines, in the order written, and are appended to the release's log prefixed `[command exec]`. The last message carries the exit status, or 128 plus the signal that killed the command, and muructl exits with it.
-- **Ending.** The command runs in a session of its own. When the caller goes away, the session gets SIGTERM and, ten seconds later, SIGKILL; the command's end is recorded as stopped.
-- **Records.** `command.started`, `command.finished` (exit status 0) and `command.failed` events, with the subject `app@release`, name the command and say how it ended and after how long.
-- **Access.** Whoever can reach the admin socket can run a command, as they can deploy. The MCP server does not offer one-off commands (section 10.11), and a development run (section 13.1) runs none.
+- **What it sees.** The release's environment, then the interpreter's directory first on PATH, VIRTUAL_ENV when that is a virtual environment, the runtime library first on PYTHONPATH (section 8.3), bytecode as the host writes it (section 8.2), a declared command's own `env` over all of these, and MURU_APP, MURU_RELEASE and MURU_RELEASE_DIR, with MURU_COMMAND naming a declared command. A program named `python` or `python3` is the release's interpreter. The command is an argument vector run without a shell, with standard input closed and no terminal.
+- **Output and status.** Standard output and standard error stream to the caller as lines, in the order written, and are appended to the release's log prefixed `[command NAME]` (`[command exec]` for a one-off command). The last message carries the exit status, or 128 plus the signal that killed the command, and muructl exits with it.
+- **Ending.** The command runs in a session of its own. When the caller goes away, or a declared command outlives its timeout, the session gets SIGTERM and, ten seconds later, SIGKILL; the command's end is recorded as stopped, with why.
+- **Records.** `command.started` (with the inputs, a secret's value as `***`), `command.finished` (exit status 0) and `command.failed` events, with the subject `app@release`, name the command and say how it ended and after how long.
+- **Access.** Whoever can reach the admin socket can run a command, as they can deploy. The MCP server offers listing and running declared commands, refusing a secret input given as a value, and does not offer one-off commands (section 10.11). A development run (section 13.1) runs none. Gates that run a command at a point in a release's life (before its workers fork, before a promotion), the dashboard and scheduled runs are later work.
