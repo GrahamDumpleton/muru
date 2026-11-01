@@ -3229,10 +3229,15 @@ impl Daemon {
         }
 
         let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
+            tracing::info!("release {app}@{id} could not be re-adopted: no readable host record");
             return false;
         };
 
         if !command_mentions(record.pid, &run_dir) {
+            tracing::info!(
+                pid = record.pid,
+                "release {app}@{id} could not be re-adopted: no process of its host has the pid"
+            );
             return false;
         }
 
