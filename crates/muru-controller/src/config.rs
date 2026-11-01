@@ -2299,6 +2299,155 @@ pub fn group_match(name: &str, group: &muru_config::Group) -> Result<GroupMatchS
     })
 }
 
+/// Check a release's worker groups and mounts as their tables give them
+/// (sections 6.7 and 7.1, ADR 0033): each on its own, then against each
+/// other. muructl run checks a project's tables with this too, so a
+/// project that runs there deploys; the checks that need the release's
+/// other settings stay with resolving them.
+pub fn check_groups_and_mounts(
+    groups: &BTreeMap<String, muru_config::Group>,
+    mounts: &BTreeMap<String, muru_config::Mount>,
+) -> Result<(), String> {
+    let mut matched = Vec::new();
+
+    for (name, group) in groups {
+        let spec = group_match(name, group)?;
+
+        if group.paths.is_empty() && group.matches.is_none() {
+            return Err(format!("worker group {name} has no paths and no match"));
+        }
+
+        if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
+            return Err(format!(
+                "worker group {name}: {path:?} does not start with /"
+            ));
+        }
+
+        if group.processes == Some(0) {
+            return Err(format!("worker group {name} has no processes"));
+        }
+
+        if group
+            .scaling
+            .as_ref()
+            .is_some_and(|scaling| scaling.host_idle_timeout.is_some())
+        {
+            return Err(format!(
+                "worker group {name}: host_idle_timeout belongs in the release's own scaling table"
+            ));
+        }
+
+        muru_config::check_group_timeouts(group.timeouts.as_ref())
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+        matched.push((name, group, spec));
+    }
+
+    // Two groups asking the same of the same path cannot be ordered, so
+    // they are refused; groups asking different things of a path are
+    // ranked by how much they ask.
+
+    for (index, (name, group, spec)) in matched.iter().enumerate() {
+        for (other_name, other, other_spec) in &matched[index + 1..] {
+            let overlap = |mine: &[String], theirs: &[String]| {
+                (mine.is_empty() && theirs.is_empty())
+                    || mine.iter().any(|value| theirs.contains(value))
+            };
+            let shared = group_prefixes(&group.paths)
+                .into_iter()
+                .find(|prefix| group_prefixes(&other.paths).contains(prefix));
+
+            if let Some(path) = shared
+                && overlap(&spec.client_class, &other_spec.client_class)
+                && overlap(&spec.host, &other_spec.host)
+                && overlap(&spec.method, &other_spec.method)
+            {
+                return Err(format!(
+                    "worker groups {name} and {other_name} ask the same of {path}"
+                ));
+            }
+        }
+    }
+
+    // Each mount has a name, a path below / and an entrypoint, and no two
+    // share a path; a gRPC mount is reached by service name, not path.
+
+    let mut paths: Vec<(&String, String)> = Vec::new();
+
+    for (name, mount) in mounts {
+        muru_config::check_mount_name(name)?;
+        let grpc = mount.interface == Some(muru_config::Interface::Grpc);
+
+        if grpc && !mount.path.is_empty() {
+            return Err(format!(
+                "mount {name}: a gRPC mount has no path; its calls are matched by service name"
+            ));
+        }
+
+        if !grpc && (!mount.path.starts_with('/') || mount.path == "/") {
+            return Err(format!(
+                "mount {name}: {:?} is not a path below /",
+                mount.path
+            ));
+        }
+
+        if mount.entrypoint.is_empty() || !mount.entrypoint.contains(':') {
+            return Err(format!(
+                "mount {name}: the entrypoint must be module:callable"
+            ));
+        }
+
+        let path = mount.path.trim_end_matches('/').to_owned();
+
+        if !grpc && paths.iter().any(|(_, other)| *other == path) {
+            return Err(format!("mount {name}: another mount has the path {path}"));
+        }
+
+        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        muru_config::check_handoff(mount.handoff, mount.interface)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+        paths.push((name, path));
+    }
+
+    // A group's workers serve the mounts it lists and the default mount;
+    // its paths must lie within them, so a request it claims never
+    // reaches a worker without the request's mount.
+
+    for (name, group, _) in &matched {
+        if group.mounts.is_empty() {
+            continue;
+        }
+
+        for mount in &group.mounts {
+            if !mounts.contains_key(mount) {
+                return Err(format!("worker group {name}: no mount named {mount}"));
+            }
+        }
+
+        for (mount, path) in &paths {
+            if group.mounts.contains(mount) || path.is_empty() {
+                continue;
+            }
+
+            for prefix in group_prefixes(&group.paths) {
+                let under = |path: &str, prefix: &str| {
+                    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
+                };
+
+                if under(path, &prefix) || under(&prefix, path) {
+                    return Err(format!(
+                        "worker group {name}: its path {prefix} reaches mount {mount} at {path}, which it does not serve"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// A group's paths as the edge matches them: prefixes without their
 /// `*`, and `/` alone for a group that claims every path.
 fn group_prefixes(paths: &[String]) -> Vec<String> {
@@ -2475,47 +2624,27 @@ pub fn resolve_spec(
         .or(table.concurrency.map(|value| value as u32))
         .or(previous.map(|previous| previous.concurrency))
         .unwrap_or(1000);
+    let groups = groups.unwrap_or(&table.groups);
+    let mounts = mounts.unwrap_or(&table.mounts);
+    check_groups_and_mounts(groups, mounts)?;
     let mut resolved_groups = Vec::new();
 
-    for (name, group) in groups.unwrap_or(&table.groups) {
+    for (name, group) in groups {
         let GroupMatchSpec {
             client_class,
             host,
             method,
         } = group_match(name, group)?;
-
-        if group.paths.is_empty() && group.matches.is_none() {
-            return Err(format!("worker group {name} has no paths and no match"));
-        }
-
-        if let Some(path) = group.paths.iter().find(|path| !path.starts_with('/')) {
-            return Err(format!(
-                "worker group {name}: {path:?} does not start with /"
-            ));
-        }
-
-        if group.processes == Some(0) {
-            return Err(format!("worker group {name} has no processes"));
-        }
-
         let (group_scaling, group_processes) = resolve_scaling(
             group.scaling.as_ref(),
             group.processes.map_or(processes, |value| value as u32),
             &format!("worker group {name}: scaling"),
         )?;
 
-        if group_scaling.host_idle_timeout_ms.is_some() {
-            return Err(format!(
-                "worker group {name}: host_idle_timeout belongs in the release's own scaling table"
-            ));
-        }
-
         // Section 7.1: the group's own timeouts, checked against the
         // release's once those are resolved below, and its memory policy,
         // resolved over the release's there too.
 
-        muru_config::check_group_timeouts(group.timeouts.as_ref())
-            .map_err(|error| format!("worker group {name}: {error}"))?;
         let own = group.timeouts.clone().unwrap_or_default();
         let parse = |text: Option<&String>, key: &str| {
             parse_ms(text, key).map_err(|error| format!("worker group {name}: timeouts.{error}"))
@@ -2548,36 +2677,8 @@ pub fn resolve_spec(
         });
     }
 
-    // ADR 0033: two groups asking the same of the same path cannot be
-    // ordered, so they are refused; groups asking different things of a
-    // path are ranked by how much they ask.
-
-    for (index, group) in resolved_groups.iter().enumerate() {
-        for other in &resolved_groups[index + 1..] {
-            let overlap = |mine: &[String], theirs: &[String]| {
-                (mine.is_empty() && theirs.is_empty())
-                    || mine.iter().any(|value| theirs.contains(value))
-            };
-            let shared = group_prefixes(&group.paths)
-                .into_iter()
-                .find(|prefix| group_prefixes(&other.paths).contains(prefix));
-
-            if let Some(path) = shared
-                && overlap(&group.client_class, &other.client_class)
-                && overlap(&group.host, &other.host)
-                && overlap(&group.method, &other.method)
-            {
-                return Err(format!(
-                    "worker groups {} and {} ask the same of {path}",
-                    group.name, other.name
-                ));
-            }
-        }
-    }
-
     // Section 6.7: mounts from the declaration, else the source's own
-    // table; each has a name, a path below / and an entrypoint, and no
-    // two share a path.
+    // table, as checked above.
 
     let mut resolved_mounts: Vec<MountSpec> = Vec::new();
     let accel_redirect = request
@@ -2623,38 +2724,8 @@ pub fn resolve_spec(
     };
     muru_config::check_origins(&grpc_web_origins)?;
 
-    for (name, mount) in mounts.unwrap_or(&table.mounts) {
-        muru_config::check_mount_name(name)?;
-
-        // Section 6.13: a gRPC mount is reached by service name, not path.
-
-        let grpc = mount.interface == Some(muru_config::Interface::Grpc);
-
-        if grpc && !mount.path.is_empty() {
-            return Err(format!(
-                "mount {name}: a gRPC mount has no path; its calls are matched by service name"
-            ));
-        }
-
-        if !grpc && (!mount.path.starts_with('/') || mount.path == "/") {
-            return Err(format!(
-                "mount {name}: {:?} is not a path below /",
-                mount.path
-            ));
-        }
-
-        if mount.entrypoint.is_empty() || !mount.entrypoint.contains(':') {
-            return Err(format!(
-                "mount {name}: the entrypoint must be module:callable"
-            ));
-        }
-
+    for (name, mount) in mounts {
         let path = mount.path.trim_end_matches('/').to_owned();
-
-        if !grpc && resolved_mounts.iter().any(|other| other.path == path) {
-            return Err(format!("mount {name}: another mount has the path {path}"));
-        }
-
         let mount_roots = mount
             .sendfile_roots
             .clone()
@@ -2664,12 +2735,6 @@ pub fn resolve_spec(
             .clone()
             .or_else(|| sendfile_header.clone());
         muru_config::check_sendfile(&mount_roots, mount_header.as_deref())
-            .map_err(|error| format!("mount {name}: {error}"))?;
-        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
-            .map_err(|error| format!("mount {name}: {error}"))?;
-        muru_config::check_mount_threads(mount.threads, mount.interface, mount.handoff)
-            .map_err(|error| format!("mount {name}: {error}"))?;
-        muru_config::check_handoff(mount.handoff, mount.interface)
             .map_err(|error| format!("mount {name}: {error}"))?;
 
         // Section 4.10: a mount's redirect settings, with the release's
@@ -2691,44 +2756,6 @@ pub fn resolve_spec(
             max_connections: mount.max_connections.map(|value| value as u32),
             handoff: mount.handoff,
         });
-    }
-
-    // ADR 0033: a group's workers serve the mounts it lists and the
-    // default mount; its paths must lie within them, so a request it
-    // claims never reaches a worker without the request's mount.
-
-    for group in &resolved_groups {
-        if group.mounts.is_empty() {
-            continue;
-        }
-
-        for name in &group.mounts {
-            if !resolved_mounts.iter().any(|mount| &mount.name == name) {
-                return Err(format!(
-                    "worker group {}: no mount named {name}",
-                    group.name
-                ));
-            }
-        }
-
-        for mount in &resolved_mounts {
-            if group.mounts.contains(&mount.name) || mount.path.is_empty() {
-                continue;
-            }
-
-            for prefix in group_prefixes(&group.paths) {
-                let under = |path: &str, prefix: &str| {
-                    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
-                };
-
-                if under(&mount.path, &prefix) || under(&prefix, &mount.path) {
-                    return Err(format!(
-                        "worker group {}: its path {prefix} reaches mount {} at {}, which it does not serve",
-                        group.name, mount.name, mount.path
-                    ));
-                }
-            }
-        }
     }
 
     // Section 4.9: the release's own directories of files, by path: the
@@ -2897,7 +2924,6 @@ pub fn resolve_spec(
             .map_err(|error| format!("worker group {}: {error}", group.name))?;
 
         if let Some(table) = groups
-            .unwrap_or(&table.groups)
             .get(&group.name)
             .and_then(|declared| declared.memory.as_ref())
         {
@@ -2927,16 +2953,12 @@ pub fn resolve_spec(
     let (scaling, processes) =
         resolve_scaling(scaling.or(table.scaling.as_ref()), processes, "scaling")?;
 
-    if scaling.host_idle_timeout_ms.is_some()
-        && let Some(group) = resolved_groups
+    check_idle_host(
+        &scaling,
+        resolved_groups
             .iter()
-            .find(|group: &&GroupSpec| group.scaling.is_static() || group.scaling.min_workers > 0)
-    {
-        return Err(format!(
-            "scaling.host_idle_timeout needs every worker group to scale to zero, and worker group {} keeps workers",
-            group.name
-        ));
-    }
+            .map(|group| (group.name.as_str(), &group.scaling)),
+    )?;
 
     let (error_pages, error_override, maintenance) = resolve_error_tables(
         tables,
@@ -4051,6 +4073,51 @@ fn resolve_http_spec(
         bytecode: crate::model::BytecodeSpec::default(),
         commands: Vec::new(),
     })
+}
+
+/// Sections 7.2 and 7.4: check a release's scaling tables, its own and
+/// its worker groups', as resolving them would. muructl run, which does
+/// not scale, checks a project's with this, so a project that runs
+/// there deploys.
+pub fn check_scaling(
+    release: Option<&muru_config::Scaling>,
+    groups: &BTreeMap<String, muru_config::Group>,
+    processes: u32,
+) -> Result<(), String> {
+    let (scaling, _) = resolve_scaling(release, processes, "scaling")?;
+    let mut resolved = Vec::new();
+
+    for (name, group) in groups {
+        let (group_scaling, _) = resolve_scaling(
+            group.scaling.as_ref(),
+            group.processes.map_or(processes, |value| value as u32),
+            &format!("worker group {name}: scaling"),
+        )?;
+        resolved.push((name.as_str(), group_scaling));
+    }
+
+    check_idle_host(
+        &scaling,
+        resolved.iter().map(|(name, scaling)| (*name, scaling)),
+    )
+}
+
+/// Section 7.4: a host that stops when idle needs every worker group to
+/// scale to zero.
+fn check_idle_host<'a>(
+    scaling: &ScalingSpec,
+    mut groups: impl Iterator<Item = (&'a str, &'a ScalingSpec)>,
+) -> Result<(), String> {
+    if scaling.host_idle_timeout_ms.is_some()
+        && let Some((name, _)) =
+            groups.find(|(_, scaling)| scaling.is_static() || scaling.min_workers > 0)
+    {
+        return Err(format!(
+            "scaling.host_idle_timeout needs every worker group to scale to zero, and worker group {name} keeps workers"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Section 7.2 and 7.4: a scaling table resolved against the defaults of
