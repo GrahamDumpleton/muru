@@ -141,11 +141,12 @@ scaling = { mode = "target", max_workers = 6, slot_utilization = 0.8 }
 ```
 
 A declared table replaces the source's `[tool.muru.scaling]`. The spare
-and target modes need `max_workers`; `min_workers` defaults to 1 and
-cannot be 0 yet; `processes` must not be over `max_workers` and is raised
-to `min_workers` when below it. In static mode the table takes no other
-key, so a key that does nothing is never written by mistake. `muructl
-config export` writes the resolved policy with every key.
+and target modes need `max_workers`; `min_workers` defaults to 1, and 0
+[scales the group to zero](#scale-to-zero) when idle; `processes` must
+not be over `max_workers` and is raised to `min_workers` when below it.
+In static mode the table takes no other key, so a key that does nothing
+is never written by mistake. `muructl config export` writes the resolved
+policy with every key.
 
 ## Scheduled capacity
 
