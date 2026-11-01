@@ -54,7 +54,6 @@ Muru is built.
 
 ```
 uv tool install muructl          # the command
-uv add muru                      # the runtime library, in your application's environment
 muructl run app:application      # http://127.0.0.1:8080
 ```
 
@@ -84,11 +83,13 @@ muructl run app:application      # http://127.0.0.1:8080
 
 ## Install
 
-Install the command line once with `uv tool install muructl` and add the
-`muru` runtime library to each application's environment with `uv add
-muru`. Both are pre-releases of the 0.1.0 line, so `pip install --pre` is
-needed where pip is used instead of uv. Pre-built wheels cover Linux and
-macOS on CPython 3.11 to 3.15, including the free-threaded builds.
+Install the command line once with `uv tool install muructl`. The `muru`
+runtime library that runs inside your application's interpreter is not a
+dependency of your project: muructl provides the copy matching its own
+version, fetching it once per interpreter. Both are pre-releases of the
+0.1.0 line, so `pip install --pre` is needed where pip is used instead of
+uv. Pre-built wheels cover Linux, including Alpine, and macOS on CPython
+3.11 to 3.15, and the free-threaded builds of 3.14 and 3.15.
 
 ## Five-minute start
 
@@ -96,7 +97,7 @@ In development:
 
 ```
 muructl run app:application --reload     # HTTP on 8080, restarts on change
-muructl run --https                      # HTTPS on 8443 with a local certificate
+muructl run --https                      # HTTPS on 8443 as well, with a local certificate
 muructl run . --port auto                # the project's [tool.muru] table, free ports
 ```
 
