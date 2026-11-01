@@ -14,7 +14,8 @@ A release can serve several entrypoints from the same worker processes,
 and from one preload: the release's own entrypoint is the default mount
 at `/`, and named mounts take a path prefix each. Mounts can be any mix
 of WSGI and ASGI, which is the static way to run both interfaces in one
-application.
+application. To choose in code, request by request, see [handing requests
+between WSGI and ASGI](handoff.md).
 
 Mounts ship with the application in its `[tool.muru]` table:
 
@@ -116,7 +117,8 @@ mount can run more than one request at once.
 
 On a [gRPC mount](grpc.md), `threads` is a number: the threads its
 synchronous handlers run on. An ASGI mount runs on the event loop and
-takes no `threads`.
+takes `threads`, as a number, only with `handoff = "wsgi"`: the threads
+the requests it [hands to WSGI](handoff.md#from-asgi-to-wsgi) run on.
 
 ## Limits of an ASGI mount's own
 

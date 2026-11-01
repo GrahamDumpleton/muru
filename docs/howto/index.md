@@ -22,6 +22,7 @@ behind-a-proxy
 worker-groups
 scaling
 mounts
+handoff
 grpc
 https
 static-files

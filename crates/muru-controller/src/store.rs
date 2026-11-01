@@ -1140,6 +1140,7 @@ mod tests {
             hooks: None,
             factory: None,
             reflection: false,
+            handoff: None,
             grpc_web_origins: Vec::new(),
             groups: Vec::new(),
             mounts: Vec::new(),

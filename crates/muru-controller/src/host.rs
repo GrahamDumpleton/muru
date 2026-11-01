@@ -396,6 +396,9 @@ pub struct HostSpec {
     pub factory: Option<muru_config::FactoryPhase>,
     /// Whether gRPC server reflection is served (section 6.13).
     pub reflection: bool,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14).
+    pub handoff: Option<muru_config::Handoff>,
     /// Worker processes to fork.
     pub processes: usize,
     /// Application threads per worker.
@@ -545,6 +548,8 @@ pub struct HostMount {
     pub concurrency: Option<usize>,
     /// An ASGI mount's open WebSockets at once on each worker.
     pub max_connections: Option<usize>,
+    /// The interface the mount's requests may be handed to (section 6.14).
+    pub handoff: Option<muru_config::Handoff>,
 }
 
 /// A named worker group's sizes, as the host forks it.
@@ -681,6 +686,10 @@ impl HostProcess {
             command.arg("--reflection");
         }
 
+        if let Some(handoff) = spec.handoff {
+            command.arg("--handoff").arg(handoff.as_str());
+        }
+
         if let Some(log) = &spec.detach_to {
             command.arg("--detach").arg("--log-file").arg(log);
         }
@@ -694,7 +703,14 @@ impl HostProcess {
                 mount.interface.as_str()
             );
 
-            if let Some(threads) = mount.threads {
+            // Section 6.14: a declared ASGI mount's threads are those its
+            // handoffs to WSGI run on, passed with the handoff.
+
+            let handoff_threads = mount
+                .threads
+                .filter(|_| mount.interface == muru_config::Interface::Asgi);
+
+            if let Some(threads) = mount.threads.filter(|_| handoff_threads.is_none()) {
                 text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
             } else if mount.concurrency.is_some() || mount.max_connections.is_some() {
                 text.push_str(&format!(
@@ -705,6 +721,17 @@ impl HostProcess {
             }
 
             command.arg("--mount").arg(text);
+
+            if let Some(handoff) = mount.handoff {
+                let threads = handoff_threads
+                    .map(|threads| format!(",{}", threads.max()))
+                    .unwrap_or_default();
+                command.arg("--mount-handoff").arg(format!(
+                    "{}={}{threads}",
+                    mount.name,
+                    handoff.as_str()
+                ));
+            }
         }
 
         for group in &spec.groups {

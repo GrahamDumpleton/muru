@@ -562,7 +562,7 @@ mod tests {
         let limits = [limit(
             "reject",
             &["client_class", "header:x-key"],
-            &["ai_crawler"],
+            &["ai-crawler"],
         )];
         let start = Instant::now();
         let mut headers = HeaderMap::new();
@@ -586,7 +586,7 @@ mod tests {
         for address in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
             let outcome = buckets.check(
                 &limits,
-                "ai_crawler",
+                "ai-crawler",
                 address.parse().unwrap(),
                 &headers,
                 start,
@@ -596,7 +596,7 @@ mod tests {
 
         let outcome = buckets.check(
             &limits,
-            "ai_crawler",
+            "ai-crawler",
             "192.0.2.4".parse().unwrap(),
             &headers,
             start,

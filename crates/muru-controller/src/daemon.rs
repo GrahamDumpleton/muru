@@ -4212,6 +4212,7 @@ impl Daemon {
             interface: spec.interface,
             factory: spec.factory,
             reflection: spec.reflection,
+            handoff: spec.handoff,
             processes: spec.processes as usize,
             threads: spec.threads as usize,
             sync_threads: spec.sync_threads as usize,
@@ -4261,6 +4262,7 @@ impl Daemon {
                     threads: mount.threads,
                     concurrency: mount.concurrency.map(|value| value as usize),
                     max_connections: mount.max_connections.map(|value| value as usize),
+                    handoff: mount.handoff,
                 })
                 .collect(),
         };

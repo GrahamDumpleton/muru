@@ -1211,7 +1211,7 @@ mod tests {
         let surge = (
             "surge".to_owned(),
             overlay(
-                "routes.root = { mode = 'read-only', client_routes = { ai_crawler = { target = { static = '/srv/snapshot' } }, partner = { rate_limits = ['slow'] } } }",
+                "routes.root = { mode = 'read-only', client_routes = { ai-crawler = { target = { static = '/srv/snapshot' } }, partner = { rate_limits = ['slow'] } } }",
             ),
         );
         let partner = Route {
@@ -1229,7 +1229,7 @@ mod tests {
             preview(&surge.1, &routes, &BTreeSet::new()),
             [
                 "route root: mode (none) -> read-only",
-                "route root: client_routes.ai_crawler (none) -> static /srv/snapshot; mode read-only",
+                "route root: client_routes.ai-crawler (none) -> static /srv/snapshot; mode read-only",
                 "route root: client_routes.partner static /srv/partner -> static /srv/partner; rate limits slow",
             ]
         );
@@ -1239,12 +1239,12 @@ mod tests {
 
         let later = (
             "later".to_owned(),
-            overlay("priority = 1\nroutes.root.client_routes.ai_crawler = { mode = 'degraded' }"),
+            overlay("priority = 1\nroutes.root.client_routes.ai-crawler = { mode = 'degraded' }"),
         );
         apply_routes(&mut routes, &[&surge, &later]);
         assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].name, None);
-        assert_eq!(routes[0].classes(), ["ai_crawler"]);
+        assert_eq!(routes[0].classes(), ["ai-crawler"]);
         assert_eq!(routes[0].static_dir.as_deref(), Some("/srv/snapshot"));
         assert_eq!(routes[0].mode.as_deref(), Some("degraded"));
         assert_eq!(routes[1].name.as_deref(), Some("root"));
@@ -1255,13 +1255,13 @@ mod tests {
             surge.clone(),
             (
                 "pinned".to_owned(),
-                overlay("routes.root.client_routes.ai_crawler = { traffic = { pin = 'r1' } }"),
+                overlay("routes.root.client_routes.ai-crawler = { traffic = { pin = 'r1' } }"),
             ),
         ]);
         assert_eq!(
             conflicts(&declared),
             [
-                "overlays pinned, surge all set routes.root.client_routes.ai_crawler: give each a different priority"
+                "overlays pinned, surge all set routes.root.client_routes.ai-crawler: give each a different priority"
             ]
         );
 

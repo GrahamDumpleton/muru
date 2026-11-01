@@ -75,3 +75,7 @@ The same mechanism would serve the dashboard's mutating actions (section 10) and
 ## 20.12 PROXY protocol
 
 Accepting the PROXY protocol on a listener, for a load balancer that passes TCP through without terminating HTTP and cannot preserve the client's source address (ADR 0029). The header is not authenticated, so the design would be strict: off by default and per listener, required from the listed sources and never parsed from any other, a connection from a listed source closed without a valid header, no optional mode, v2 parsed to a size cap within the header read timeout with its extensions ignored, and the address it gives standing for the client without making that client trusted for forwarded headers.
+
+## 20.13 HTTP response trailers for ASGI
+
+Serving the ASGI HTTP trailers extension on ordinary responses: `http.response.start` with `trailers` set, then `http.response.trailers` messages after the body, sent by the worker on the END frame as a gRPC call's are, and by the edge as HTTP/2 trailers or on a chunked HTTP/1.1 response to a client that accepts them. Until then the extension is not advertised in the scope, and a trailers message is refused.

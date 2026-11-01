@@ -207,8 +207,8 @@ latch = true
 advisory = true
 
 [overlay.crawler-surge]
-routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }
-trigger = { condition = { when = "request_share{client_class='ai_crawler'} > 0.3", for = '5m', clear_when = 'request_share < 0.1', clear_for = '15m' } }
+routes.shop-root.client_routes = { ai-crawler = { target = { static = '/srv/shop/snapshot' } } }
+trigger = { condition = { when = "request_share{client_class='ai-crawler'} > 0.3", for = '5m', clear_when = 'request_share < 0.1', clear_for = '15m' } }
 ```
 
 **Triggers**

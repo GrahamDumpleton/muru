@@ -211,7 +211,7 @@ Ideas recorded for later evaluation, from
 each an issue so that nothing foreseen is lost: among them traffic
 capture and replay, shadow traffic, predictive scaling, resumable
 uploads, sub-interpreters, the PROXY protocol, an admin client for
-applications, and builds without uv.
+applications, ASGI response trailers, and builds without uv.
 They are not committed work until taken up.
 
 ## How work is tracked

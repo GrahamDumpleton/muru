@@ -214,6 +214,9 @@ pub struct MountSpec {
     /// Threads of the mount's own; the worker's shared pool when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<muru_config::MountThreads>,
+    /// The interface the mount's requests may be handed to (section 6.14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<muru_config::Handoff>,
 }
 
 /// A worker group of a release (section 7.1): its paths and sizes. The
@@ -365,6 +368,10 @@ pub struct ReleaseSpec {
     /// Whether gRPC server reflection is served (section 6.13).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reflection: bool,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<muru_config::Handoff>,
     /// Named worker groups beside the default one.
     #[serde(default)]
     pub groups: Vec<GroupSpec>,
@@ -1271,30 +1278,10 @@ pub struct OverlayState {
     pub until_unix_ms: Option<u64>,
 }
 
-/// Check a name against section 3.2: lowercase letters, digits and
-/// hyphens, up to 63 characters.
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 63
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-}
+// The name rules live with the configuration they check, so muructl run
+// applies the same ones as the daemon.
 
-/// Whether a string is an environment variable name: letters, digits and
-/// underscores, not starting with a digit.
-pub fn valid_env_name(name: &str) -> bool {
-    let mut characters = name.chars();
-
-    match characters.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-
-    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+pub use muru_config::{valid_env_name, valid_name};
 
 /// Now, as Unix milliseconds.
 pub fn now_unix_ms() -> u64 {
@@ -1314,15 +1301,5 @@ mod tests {
         }
 
         assert!("running".parse::<ReleaseState>().is_err());
-    }
-
-    #[test]
-    fn names_follow_the_rules() {
-        assert!(valid_name("shop"));
-        assert!(valid_name("shop-2"));
-        assert!(!valid_name("Shop"));
-        assert!(!valid_name("-shop"));
-        assert!(!valid_name(""));
-        assert!(!valid_name("a".repeat(64).as_str()));
     }
 }

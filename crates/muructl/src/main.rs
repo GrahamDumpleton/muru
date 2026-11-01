@@ -1528,6 +1528,9 @@ struct Resolved {
     factory: Option<muru_config::FactoryPhase>,
     /// Whether gRPC server reflection is served (section 6.13).
     reflection: bool,
+    /// The interface the default mount's requests may be handed to
+    /// (section 6.14).
+    handoff: Option<muru_config::Handoff>,
     /// The origins whose pages may call it through gRPC-Web.
     grpc_web_origins: Vec<String>,
     processes: usize,
@@ -1692,12 +1695,54 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     };
     muru_config::check_origins(&table.grpc_web_origins).map_err(|error| anyhow::anyhow!(error))?;
 
-    for (name, mount) in &table.mounts {
-        muru_config::check_mount_limits(mount.concurrency, mount.max_connections, mount.interface)
-            .map_err(|error| anyhow::anyhow!("[tool.muru.mounts.{name}] {error}"))?;
-        muru_config::check_mount_threads(mount.threads, mount.interface)
-            .map_err(|error| anyhow::anyhow!("mount {name}: {error}"))?;
+    // The project's groups, mounts, scaling and variables are checked as
+    // the daemon checks them, so a project that runs here deploys.
+
+    muru_controller::config::check_groups_and_mounts(&table.groups, &table.mounts)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+    let processes = args
+        .processes
+        .or(table.processes)
+        .unwrap_or(DEFAULT_PROCESSES);
+    muru_controller::config::check_scaling(table.scaling.as_ref(), &table.groups, processes as u32)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    for name in table.env.keys() {
+        muru_config::check_env_name(name)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
     }
+
+    let max_requests = args.max_requests.or(table.max_requests);
+    anyhow::ensure!(
+        max_requests != Some(0),
+        "[tool.muru] max_requests must be at least 1"
+    );
+
+    // Section 4.9: the file hint keys, the release's and each mount's
+    // over them.
+
+    muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
+    for (name, mount) in &table.mounts {
+        let roots = mount
+            .sendfile_roots
+            .as_ref()
+            .unwrap_or(&table.sendfile_roots);
+        let header = mount
+            .sendfile_header
+            .as_deref()
+            .or(table.sendfile_header.as_deref());
+        muru_config::check_sendfile(roots, header)
+            .map_err(|error| anyhow::anyhow!("[tool.muru] mount {name}: {error}"))?;
+    }
+
+    let interface = args
+        .interface
+        .or(table.interface)
+        .unwrap_or(muru_config::Interface::Auto);
+    muru_config::check_handoff(table.handoff, Some(interface))
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
     // Section 4.9: the table's static directories, a flag replacing the
     // entry with its prefix or adding one.
@@ -1721,17 +1766,12 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         python: table.python.clone(),
         build: table.build.clone(),
         local_build_when,
-        interface: args
-            .interface
-            .or(table.interface)
-            .unwrap_or(muru_config::Interface::Auto),
+        interface,
         factory,
         reflection: table.reflection.unwrap_or(false),
+        handoff: table.handoff,
         grpc_web_origins: table.grpc_web_origins.clone(),
-        processes: args
-            .processes
-            .or(table.processes)
-            .unwrap_or(DEFAULT_PROCESSES),
+        processes,
         threads: args.threads.or(table.threads).unwrap_or(DEFAULT_THREADS),
         sync_threads: args
             .sync_threads
@@ -1759,7 +1799,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         error_override: table.error_override,
         maintenance: table.maintenance,
         logging: table.logging,
-        max_requests: args.max_requests.or(table.max_requests),
+        max_requests,
         max_lifetime: match (args.max_lifetime, &table.max_lifetime) {
             (Some(lifetime), _) => Some(lifetime),
             (None, Some(text)) => Some(
@@ -1813,6 +1853,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         interface: (resolved.interface != muru_config::Interface::Auto)
             .then_some(resolved.interface),
         reflection: resolved.reflection.then_some(true),
+        handoff: resolved.handoff,
         factory: resolved.factory.map(|_| true),
         factory_phase: resolved.factory,
         python: Some(written_interpreter(
@@ -2690,6 +2731,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         interface: resolved.interface,
         factory: resolved.factory,
         reflection: resolved.reflection,
+        handoff: resolved.handoff,
         processes: resolved.processes,
         threads: resolved.threads,
         sync_threads: resolved.sync_threads,
@@ -2728,6 +2770,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 threads: mount.threads,
                 concurrency: mount.concurrency,
                 max_connections: mount.max_connections,
+                handoff: mount.handoff,
             })
             .collect(),
         logging: resolved

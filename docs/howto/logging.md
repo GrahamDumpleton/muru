@@ -132,7 +132,7 @@ A JSON line has these fields:
  "version": "HTTP/1.1", "status": 200, "reason": "", "bytes": 18, "worker": 0,
  "retried": false, "queue_ms": 0.2, "app_ms": 0.3, "total_ms": 0.7, "snapshot": 3,
  "redirects": [],
- "client_class": "default"}
+ "client_class": "default", "websocket": null, "handoff": null}
 ```
 
 `reason` is empty for responses the application produced and names the
@@ -147,7 +147,9 @@ the request went through, and `client_class` is its [client
 class](client-classes.md). `retried` is true (`retried=1` on the compact
 line) when the first worker chosen closed its connection before reading
 the request, as a worker that is stopping does, and the request was sent
-to another. `websocket` is null except on a WebSocket's
+to another. `handoff` is `asgi` or `wsgi` (`handoff=` on the compact
+line) when the worker [handed the request](handoff.md) to that interface,
+and null otherwise. `websocket` is null except on a WebSocket's
 closing line, where it holds `event` (`closed`), `by`, `code`, `close`
 (the outcome the [metrics](metrics.md) name), `received`, `sent` and
 `received_bytes`; that line's `total_ms` is how long the socket was open

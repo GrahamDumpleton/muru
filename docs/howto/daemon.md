@@ -358,24 +358,30 @@ chosen with `--socket`. `muructl status` says which was found.
 
 ## In a container
 
-`muructl daemon run` or `muructl run --allow-public` can be a container's
-main process. When muructl finds itself PID 1 it starts as an init of its
-own, as `tini` would: PID 1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1,
-SIGUSR2 and SIGQUIT to the command, which runs as its child, collects
-every process that exits, so nothing in the container stays a zombie,
-and exits with the command's status when the command exits. An image
-that uses `tini` or `docker run --init` sets `MURU_NO_INIT=1`, and the
-command runs as PID 1 itself.
+`muructl daemon run` can be a container's main process. When muructl
+finds itself PID 1 it starts as an init of its own, as `tini` would: PID
+1 forwards SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2 and SIGQUIT to the
+daemon, which runs as its child, collects every process that exits, so
+nothing in the container stays a zombie, and exits with the daemon's
+status when the daemon exits. An image that uses `tini` or `docker run
+--init` sets `MURU_NO_INIT=1`, and the daemon runs as PID 1 itself.
 
 Under the init, and for a daemon that is PID 1 itself, SIGTERM means
 shutdown rather than detach: when PID 1 exits the kernel kills every
 other process in the container, so detaching would kill the edge and
 every worker mid-request. `docker stop` therefore drains and stops
 everything inside the budget above, whose default of eight seconds is
-under the ten `docker stop` allows, and the container exits 0. `muructl
-run` as the main process bounds its stop by the same budget. A
+under the ten `docker stop` allows, and the container exits 0. A
 `[shutdown]` table with `on_sigterm = 'detach'` turns that off, for a
 container that keeps its hosts across a daemon restart of its own.
+
+The daemon listens on `127.0.0.1:8080` unless told otherwise, so in a
+container it takes `--listen 0.0.0.0:8080` or a `[[listener]]` entry,
+and its applications and logs are in the locations above, so a volume
+for the state store keeps the deployed releases across a restart of the
+container. A command that runs one application in a container, with its
+configuration from the image and its logs on standard output, is
+planned.
 
 ## Upgrading
 

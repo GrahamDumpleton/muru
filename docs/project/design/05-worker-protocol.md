@@ -19,9 +19,9 @@ The edge talks to each worker over a private link: a Unix socket the worker list
 
 - **Persistent, pooled.** The edge keeps a pool of connections per worker. A connection is opened when a request needs one and none is idle, kept open afterwards, and may be closed after an idle timeout. The two directions are independent tasks on both sides, so a response can start before the request body has been sent, and the request body keeps flowing while the response streams back.
 
-- **Bounded by what the worker declares.** The worker's HELLO states how many requests it runs at once on threads (its slots) and how many it holds on its event loop (its async slots: WebSockets and requests handed to ASGI). The edge never has more requests in flight at a worker than those bounds, and queues beyond them per worker group with queue_timeout (section 4.5). The worker enforces the same bounds by refusing extra connections. For a WSGI worker the slots are its application threads; for an ASGI worker the async slots are its configured concurrency and the slots its sync thread pool. A DETACH frame moves a connection between the two counts when a request is handed from one side to the other (section 6.14).
+- **Bounded by what the worker declares.** The worker's HELLO states how many requests it runs at once on threads (its slots) and how many it holds on its event loop (its async slots: WebSockets and requests handed to ASGI). The edge never has more requests in flight at a worker than those bounds, and queues beyond them per worker group with queue_timeout (section 4.5). The worker enforces the same bounds by refusing extra connections. The slots are the threads of its shared pool and the async slots its event loop's concurrency; a request counts against its mount's own slots, else the side the default mount runs on, which worker_type names. A DETACH frame moves a request between the two counts when it is handed from one side to the other, taking its place on the other side even when that count is full, after which that side's next free place goes to it (section 6.14).
 
-- **Capabilities, not kinds.** The edge acts only on what HELLO declares: slots, async_slots, websockets, files, max_message_size. It does not treat WSGI and ASGI workers differently. A worker that does not accept websocket scopes receives upgrade requests as ordinary http scopes.
+- **Capabilities, not kinds.** The edge acts only on what HELLO declares: slots, async_slots, websockets, files, max_message_size. It does not treat WSGI and ASGI workers differently. A mount that does not accept websocket scopes receives upgrade requests as ordinary http scopes.
 
 - **Unix sockets only** in production, one listener per worker in the release's run directory. A loopback TCP form exists for experiments. Descriptors pass over the same socket with SCM_RIGHTS (section 5.7).
 
@@ -46,13 +46,13 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | CLOSE | 9 | both | Close | Closes a WebSocket with a code and reason (section 5.6) |
 | INFORMATIONAL | 10 | worker to edge | ResponseHead | A 1xx response before the final head, for example 103 Early Hints. Phase 2 |
 | FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame (section 5.7). Phase 2 |
-| DETACH | 12 | worker to edge | Detach | The request moved from an application thread to the event loop, or back, so the edge counts the connection against async slots or slots accordingly (section 6.14). Phase 2 |
+| DETACH | 12 | worker to edge | Detach | The request moved from an application thread to the event loop, or back, so the edge counts it against async slots or slots accordingly (section 6.14) |
 
 Flags: END (0x01) on the last frame of a direction; TEXT (0x02) on a text MESSAGE; MORE (0x04) reserved for message fragments if max_message_size ever needs to be exceeded.
 
 The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
-- **Hello:** protocol_version, worker_type (wsgi or asgi, informational), slots, async_slots, websockets, files, max_message_size, and the gRPC methods the worker's mounts registered, each with its mount and whether its requests and responses stream (section 6.13), and the mounts with threads of their own, each with its reserved threads and the most requests it runs at once (section 6.7). The edge sends only its version.
+- **Hello:** protocol_version, worker_type (wsgi or asgi: the side the default mount runs on), slots, async_slots, websockets (the mounts that accept websocket scopes: ASGI mounts and WSGI mounts with handoff = 'asgi'), files, max_message_size, and the gRPC methods the worker's mounts registered, each with its mount and whether its requests and responses stream (section 6.13), and the mounts with threads of their own, each with its reserved threads and the most requests it runs at once (section 6.7), and for an ASGI mount the threads its handoffs to WSGI run on (section 6.14). The edge sends only its version.
 
 - **RequestHead:** protocol version, request id, method, scheme, raw path and query as bytes, ordered raw header pairs, resolved client, server and original proxy peers, TLS details, mount, script name, route, release, deadline, content length when declared, whether the body was buffered, the body size limit in effect, the internal redirect context, host captures, upload references, the precheck flag, the client's HTTP version, the scope (http, websocket or grpc), and whether the request borrowed a thread of the shared pool for a mount with threads of its own (section 6.7).
 
@@ -62,7 +62,7 @@ The messages, with the exact definitions in proto/muru/worker/v1/worker.proto:
 
 - **Abort:** a reason, for logs.
 
-- **Close:** a WebSocket close code (1000 when the application gave none) and reason. **FileHint:** offset and length within the attached descriptor; the END flag on the frame ends the body with the range, otherwise body frames follow it. **Detach:** which side the request moved to, defined when its frame is implemented.
+- **Close:** a WebSocket close code (1000 when the application gave none) and reason. **FileHint:** offset and length within the attached descriptor; the END flag on the frame ends the body with the range, otherwise body frames follow it. **Detach:** the side the request moved to, threads or the event loop.
 
 Phase 0 implements HELLO, REQUEST, BODY, RESPONSE, END and ABORT. The others are reserved so that kind numbers are fixed now.
 
@@ -130,7 +130,7 @@ Upgrades are accepted at the edge (HTTP/1.1 Upgrade and HTTP/2 extended CONNECT)
 
 - The edge owns the wire protocol: handshake, masking, fragment reassembly, ping and pong (section 4.18). The worker sees only whole messages.
 
-- A WebSocket counts against async_slots, not request slots, so held sockets cannot stop ordinary requests. In a WSGI worker a WebSocket is always a request handed to ASGI (section 6.14), and the DETACH frame moves its connection to the async count.
+- An accepted WebSocket gives its request slot back and counts only against its mount's open sockets, so held sockets cannot stop ordinary requests. A WebSocket on a WSGI mount is a request handed to ASGI (section 6.14); its slot is given back at accept as any other socket's, with no DETACH.
 
 - Back-pressure is per socket: a slow client stops the edge reading that connection, which blocks the application's send() for that socket and nothing else.
 

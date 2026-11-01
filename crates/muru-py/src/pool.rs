@@ -293,6 +293,8 @@ pub struct Mount {
     /// The pool of its reserved threads, for a WSGI mount that reserves
     /// any; its other requests run on the shared pool.
     pub pool: Option<Arc<Pool>>,
+    /// Its requests may be handed to the other interface (section 6.14).
+    pub handoff: bool,
 }
 
 /// The soft timeout (section 7.6): how long a request may run before it
@@ -333,6 +335,9 @@ pub struct Shared {
     pub gil_stall: Option<std::time::Duration>,
     /// The gRPC methods the mounts registered (section 6.13), for HELLO.
     pub grpc_methods: Vec<muru_proto::worker::v1::GrpcMethod>,
+    /// The default mount's requests may be handed to the other
+    /// interface (section 6.14).
+    pub handoff: bool,
     in_flight: AtomicU32,
     total: AtomicU64,
     next_id: AtomicU64,
@@ -368,6 +373,7 @@ impl Shared {
             loop_stall: None,
             gil_stall: None,
             grpc_methods: Vec::new(),
+            handoff: false,
             in_flight: AtomicU32::new(0),
             total: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
@@ -400,6 +406,7 @@ impl Shared {
                 threads: None,
                 limits: None,
                 pool: None,
+                handoff: self.handoff,
             });
         }
 
@@ -415,28 +422,56 @@ impl Shared {
         }
     }
 
-    /// The mounts' own threads and limits, for HELLO (section 6.7).
+    /// The named mounts that take WebSocket upgrades as websocket
+    /// requests, for HELLO: an ASGI mount, and a WSGI mount that may
+    /// hand its requests to ASGI (section 6.14). None without a loop.
+    pub fn websocket_mounts(&self) -> Vec<String> {
+        if self.asgi.is_none() {
+            return Vec::new();
+        }
+
+        let mut names: Vec<String> = self
+            .mounts
+            .iter()
+            .filter(|(_, mount)| mount.runner.is_some() || mount.handoff)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The mounts' own threads and limits, for HELLO (section 6.7). An
+    /// ASGI mount's threads are those its handoffs to WSGI run on
+    /// (section 6.14).
     pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
         let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
 
         self.mounts
             .iter()
-            .filter_map(|(name, mount)| match (mount.threads, mount.limits) {
-                (Some((reserved, max)), _) => Some(muru_proto::worker::v1::MountPool {
+            .filter_map(|(name, mount)| {
+                let handoff_threads = match (mount.handoff, &mount.runner, mount.threads) {
+                    (true, Some(_), Some((threads, _))) => threads,
+                    _ => 0,
+                };
+
+                let own = mount.threads.filter(|_| handoff_threads == 0);
+
+                let (reserved, max, connections) = match (own, mount.limits) {
+                    (Some((reserved, max)), _) => (reserved, max, 0),
+                    (None, Some((concurrency, connections))) => {
+                        (concurrency, concurrency, connections)
+                    }
+                    (None, None) if handoff_threads > 0 => (0, 0, 0),
+                    (None, None) => return None,
+                };
+
+                Some(muru_proto::worker::v1::MountPool {
                     mount: name.clone(),
                     reserved: clamp(reserved),
                     max: clamp(max),
-                    connections: 0,
-                }),
-                (None, Some((concurrency, connections))) => {
-                    Some(muru_proto::worker::v1::MountPool {
-                        mount: name.clone(),
-                        reserved: clamp(concurrency),
-                        max: clamp(concurrency),
-                        connections: clamp(connections),
-                    })
-                }
-                (None, None) => None,
+                    connections: clamp(connections),
+                    handoff_threads: clamp(handoff_threads),
+                })
             })
             .collect()
     }
@@ -686,6 +721,52 @@ impl Shared {
         }
 
         interrupted
+    }
+
+    /// A WSGI request has been handed to the event loop (section 6.14):
+    /// it is served by its channel's task now, not by the calling thread,
+    /// so the soft timeout cancels the task, and a timeout exception
+    /// already injected into the thread is withdrawn.
+    pub fn request_handed_to_loop(&self, id: u64, channel: Py<Channel>) {
+        let mut active = self.active.lock().expect("active requests poisoned");
+
+        let Some(info) = active.get_mut(&id) else {
+            return;
+        };
+
+        if info.timed_out
+            && let Some(thread) = info.thread
+        {
+            // SAFETY: called on the request's own thread, attached, as
+            // the handoff runs there; a null exception withdraws one.
+
+            unsafe {
+                if ffi::PyThread_get_thread_ident() as u64 == thread {
+                    ffi::PyThreadState_SetAsyncExc(
+                        thread as std::os::raw::c_long,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+
+        info.thread = None;
+        info.native = None;
+        info.channel = Some(channel);
+    }
+
+    /// An ASGI request has been handed to the thread pool (section 6.14):
+    /// the soft timeout interrupts the thread that picks it up, not the
+    /// task.
+    pub fn request_handed_to_thread(&self, id: u64) {
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .get_mut(&id)
+        {
+            info.channel = None;
+        }
     }
 
     /// Note which Python thread serves a request: the calling one.

@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from support import server as support
 from support.daemon import SHOP
 
@@ -94,3 +95,77 @@ def test_env_file_supplies_what_the_import_reads(tmp_path: Path) -> None:
     with_file = check(str(directory), "--env-file", str(env_file))
     assert with_file.returncode == 0, with_file.stdout + with_file.stderr
     assert "app:application passed" in with_file.stdout
+
+
+MOUNT = "entrypoint = 'app:application'\n"
+
+
+def assert_refused(tmp_path: Path, table: str, message: str) -> None:
+    """Check a project whose table ends with ``table``; it fails with ``message``."""
+
+    directory = tmp_path / "project"
+    directory.mkdir()
+    shutil.copy(support.FIXTURES / "plain_wsgi.py", directory / "app.py")
+    (directory / "pyproject.toml").write_text(
+        f"[tool.muru]\nentrypoint = 'app:application'\n\n{table}"
+    )
+    completed = check(str(directory))
+
+    assert completed.returncode != 0
+    assert message in completed.stderr, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("table", "message"),
+    [
+        (
+            "[tool.muru.mounts.async_plain]\npath = '/api'\nentrypoint = 'app:application'\n",
+            '"async_plain" is not a valid mount name',
+        ),
+        ("[tool.muru.groups.Reports]\npaths = ['/reports']\n", '"Reports" is not a valid worker'),
+        ("[tool.muru.groups.default]\npaths = ['/reports']\n", '"default" is not a valid worker'),
+        (
+            "[tool.muru.groups.bots]\nmatch = { client_class = ['Bots'] }\n",
+            'match.client_class: "Bots" is not a valid name',
+        ),
+        (
+            "[tool.muru.groups.posts]\nmatch = { method = ['PO ST'] }\n",
+            'match.method "PO ST" is not a method',
+        ),
+        ("[tool.muru.env]\nSHOP-URL = 'x'\n", 'env: "SHOP-URL" is not a variable name'),
+    ],
+)
+def test_names_the_daemon_refuses_are_refused(tmp_path: Path, table: str, message: str) -> None:
+    assert_refused(tmp_path, table, message)
+
+
+@pytest.mark.parametrize(
+    ("table", "message"),
+    [
+        ("[tool.muru.groups.reports]\nprocesses = 1\n", "has no paths and no match"),
+        ("[tool.muru.groups.reports]\npaths = ['reports']\n", "does not start with /"),
+        (
+            "[tool.muru.groups.one]\npaths = ['/reports']\n\n"
+            "[tool.muru.groups.two]\npaths = ['/reports']\n",
+            "worker groups one and two ask the same of /reports",
+        ),
+        (
+            "[tool.muru.groups.reports]\npaths = ['/reports']\nmounts = ['missing']\n",
+            "worker group reports: no mount named missing",
+        ),
+        (f"[tool.muru.mounts.api]\npath = '/'\n{MOUNT}", '"/" is not a path below /'),
+        (
+            "[tool.muru.mounts.api]\npath = '/api'\nentrypoint = 'app'\n",
+            "the entrypoint must be module:callable",
+        ),
+        (
+            f"[tool.muru.mounts.one]\npath = '/api'\n{MOUNT}\n"
+            f"[tool.muru.mounts.two]\npath = '/api/'\n{MOUNT}",
+            "mount two: another mount has the path /api",
+        ),
+        ("[tool.muru.scaling]\nmode = 'spare'\n", "scaling: mode spare needs max_workers"),
+        ("max_requests = 0\n", "max_requests must be at least 1"),
+    ],
+)
+def test_tables_the_daemon_refuses_are_refused(tmp_path: Path, table: str, message: str) -> None:
+    assert_refused(tmp_path, table, message)

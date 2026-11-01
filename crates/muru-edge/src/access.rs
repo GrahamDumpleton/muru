@@ -122,6 +122,9 @@ pub struct Record {
     /// time is the close, whose total is how long it was open and whose
     /// bytes are those sent to the client; none on any other record.
     pub websocket: Option<WebSocketEnd>,
+    /// The interface the worker handed the request to, `asgi` or `wsgi`
+    /// (section 6.14); none for a request served where it arrived.
+    pub handoff: Option<&'static str>,
 }
 
 /// How a WebSocket ended.
@@ -700,6 +703,10 @@ fn text_line(record: &Record) -> String {
         line.push_str(" retried=1");
     }
 
+    if let Some(handoff) = record.handoff {
+        let _ = write!(line, " handoff={handoff}");
+    }
+
     let _ = writeln!(line, " id={}", record.request_id);
     line
 }
@@ -710,7 +717,7 @@ pub fn json_line(record: &Record) -> String {
     let mut line = String::with_capacity(320);
     let _ = write!(
         line,
-        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{}}}",
+        "{{\"time\":\"{date}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z\",\"request_id\":{},\"client\":{},\"app\":{},\"release\":{},\"host\":{},\"group\":{},\"mount\":{},\"method\":{},\"target\":{},\"version\":{},\"status\":{},\"reason\":{},\"bytes\":{},\"worker\":{},\"retried\":{},\"queue_ms\":{:.3},\"app_ms\":{:.3},\"total_ms\":{:.3},\"snapshot\":{},\"redirects\":[{}],\"client_class\":{},\"websocket\":{},\"handoff\":{}}}",
         json_string(&record.request_id),
         json_string(&record.client.to_string()),
         json_string(&record.app),
@@ -751,6 +758,9 @@ pub fn json_line(record: &Record) -> String {
                 end.received_bytes
             )
         ),
+        record
+            .handoff
+            .map_or_else(|| "null".to_owned(), json_string),
     );
     line.push('\n');
     line
@@ -944,6 +954,7 @@ mod tests {
             redirects: Vec::new(),
             client_class: "default".to_owned(),
             websocket: None,
+            handoff: None,
         };
         assert!(!log.shows(&record(200, "/", Duration::from_millis(10))));
         assert!(log.shows(&record(500, "/", Duration::from_millis(10))));

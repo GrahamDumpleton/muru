@@ -17,7 +17,20 @@ from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-__all__ = ["Lifespan", "LifespanFailed", "Loop", "heartbeat", "runner"]
+from muru._context import _request_id
+
+__all__ = [
+    "Lifespan",
+    "LifespanFailed",
+    "Loop",
+    "current_loop",
+    "heartbeat",
+    "register",
+    "runner",
+    "start_handoff",
+    "start_registered",
+    "stop_registered",
+]
 
 ASGIApp = Callable[[MutableMapping[str, Any], Any, Any], Awaitable[None]]
 
@@ -75,11 +88,19 @@ class Loop:
     def start(self) -> None:
         """Start the thread and return once the loop is running."""
 
+        global _current
+
         self.thread.start()
         self.started.wait()
+        _current = self
 
     def stop(self, timeout: float = SHUTDOWN_TIMEOUT) -> None:
         """Stop the loop and wait for its thread, if it is running."""
+
+        global _current
+
+        if _current is self:
+            _current = None
 
         if not self.thread.is_alive():
             return
@@ -241,6 +262,114 @@ class Lifespan:
             print(f"muru: lifespan shutdown of {self.name} failed: {error}", file=sys.stderr)
 
 
+# Section 6.9: the worker's running loop, for muru.loop().
+
+_current: Loop | None = None
+
+
+def current_loop() -> asyncio.AbstractEventLoop | None:
+    """Return the worker's running event loop, or None."""
+
+    return _current.loop if _current is not None else None
+
+
+# Section 6.14: applications whose lifespan runs because requests are
+# handed to them. Those registered before the loop starts wait for it;
+# a started one is kept by the application's identity, with the
+# application itself, so the identity stays valid.
+
+_pending: list[ASGIApp] = []
+_registered: dict[int, Lifespan] = {}
+
+
+def describe(app: Any) -> str:
+    """Name an application for the log: its module and qualified name."""
+
+    kind = app if callable(app) and hasattr(app, "__qualname__") else type(app)
+    return f"{getattr(kind, '__module__', '?')}:{getattr(kind, '__qualname__', repr(app))}"
+
+
+def register(app: ASGIApp) -> None:
+    """Run ``app``'s lifespan in this worker: now, or once the loop starts."""
+
+    if id(app) in _registered or any(waiting is app for waiting in _pending):
+        return
+
+    if _current is None:
+        _pending.append(app)
+        return
+
+    if threading.current_thread() is _current.thread:
+        raise RuntimeError(
+            "muru.asgi.register() cannot run on the event loop; call it from a post_fork hook"
+        )
+
+    lifespan = Lifespan(app, _current, describe(app))
+    lifespan.startup()
+    _registered[id(app)] = lifespan
+
+
+def start_registered(loop: Loop | None) -> None:
+    """Run the startup of every application registered before the loop started.
+
+    Raises LifespanFailed when one fails, and ValueError when there is
+    no loop to run them on.
+    """
+
+    if not _pending:
+        return
+
+    if loop is None:
+        names = ", ".join(describe(app) for app in _pending)
+        raise ValueError(
+            f"muru.asgi.register() was given {names}, but this worker has no event loop; "
+            'set handoff = "asgi" or serve an ASGI mount'
+        )
+
+    while _pending:
+        app = _pending.pop(0)
+        lifespan = Lifespan(app, loop, describe(app))
+        lifespan.startup()
+        _registered[id(app)] = lifespan
+
+
+def stop_registered() -> None:
+    """Run the shutdown of every registered application, most recent first."""
+
+    for lifespan in reversed(list(_registered.values())):
+        lifespan.shutdown()
+
+    _registered.clear()
+
+
+async def _serve(app: ASGIApp, scope: MutableMapping[str, Any], channel: Any) -> None:
+    """Run one request's application against its channel, and end it."""
+
+    extensions = scope.get("extensions") or {}
+    _request_id.set(extensions.get("muru", {}).get("request_id"))
+
+    async def send(message: dict[str, Any]) -> None:
+        # The channel only hands back a future when the writer is behind.
+
+        waiter = channel.send(message)
+        if waiter is not None:
+            await waiter
+
+    try:
+        await app(scope, channel.receive, send)
+    except BaseException as error:
+        # A failed request never ends the worker. A task the soft
+        # timeout cancelled (section 7.6) fails the response as a
+        # timeout, and the traceback shows where it waited.
+
+        detail = "".join(traceback.format_exception(error))
+        sys.stderr.write(detail)
+        sys.stderr.flush()
+        channel.fail(detail)
+    else:
+        channel.finish()
+
+
 def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, Any], None]:
     """Return the callable the extension schedules on the loop for each request.
 
@@ -251,30 +380,31 @@ def runner(app: ASGIApp, loop: Loop, state: dict[str, Any]) -> Callable[[Any, An
 
     event_loop = loop.loop
 
-    async def serve(scope: MutableMapping[str, Any], channel: Any) -> None:
-        async def send(message: dict[str, Any]) -> None:
-            # The channel only hands back a future when the writer is behind.
-
-            waiter = channel.send(message)
-            if waiter is not None:
-                await waiter
-
-        try:
-            await app(scope, channel.receive, send)
-        except BaseException as error:
-            # A failed request never ends the worker. A task the soft
-            # timeout cancelled (section 7.6) fails the response as a
-            # timeout, and the traceback shows where it waited.
-
-            detail = "".join(traceback.format_exception(error))
-            sys.stderr.write(detail)
-            sys.stderr.flush()
-            channel.fail(detail)
-        else:
-            channel.finish()
-
     def run(scope: MutableMapping[str, Any], channel: Any) -> None:
-        scope["state"] = dict(state)
-        channel.started(event_loop.create_task(serve(scope, channel)))
+        # The state is filled in place: a handoff to WSGI holds the same
+        # dictionary for environ["muru.state"].
+
+        scope["state"].update(state)
+        channel.started(event_loop.create_task(_serve(app, scope, channel)))
 
     return run
+
+
+def start_handoff(app: ASGIApp, scope: MutableMapping[str, Any], channel: Any) -> None:
+    """Start a WSGI request handed to ``app`` (section 6.14).
+
+    Scheduled on the loop by the extension in a copy of the WSGI
+    request's context, which the task inherits. A registered
+    application's lifespan state is copied into the scope, under what
+    the WSGI code put in its state.
+    """
+
+    lifespan = _registered.get(id(app))
+
+    if lifespan is not None and lifespan.app is app:
+        state = dict(lifespan.state)
+        state.update(scope["state"])
+        scope["state"] = state
+
+    loop = asyncio.get_running_loop()
+    channel.started(loop.create_task(_serve(app, scope, channel)))

@@ -423,7 +423,7 @@ mod tests {
                 ..Default::default()
             },
             pb::ClientClass {
-                name: "ai_crawler".to_owned(),
+                name: "ai-crawler".to_owned(),
                 user_agents: vec!["GPTBot".to_owned()],
                 user_agent_regexes: vec!["^Claude".to_owned()],
                 ..Default::default()
@@ -450,9 +450,9 @@ mod tests {
         );
         assert_eq!(
             class(outside, &[("user-agent", "Mozilla gptbot/1.0")]),
-            "ai_crawler"
+            "ai-crawler"
         );
-        assert_eq!(class(outside, &[("user-agent", "ClaudeBot")]), "ai_crawler");
+        assert_eq!(class(outside, &[("user-agent", "ClaudeBot")]), "ai-crawler");
         assert_eq!(class(outside, &[("user-agent", "a ClaudeBot")]), "default");
         assert_eq!(
             class(

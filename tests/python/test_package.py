@@ -25,3 +25,13 @@ def test_native_extension_reports_the_same_version() -> None:
     assert _native.version().replace("-alpha.", "a").replace("-beta.", "b") == muru.__version__ or (
         muru.__version__ == "0+unknown"
     )
+
+
+def test_the_handoff_api_is_safe_outside_muru() -> None:
+    async def app(scope: object, receive: object, send: object) -> None:
+        pass
+
+    assert muru.loop() is None
+    assert muru.request_id() is None
+    assert muru.asgi.register(app) is app
+    assert issubclass(muru.HandoffNotEnabled, RuntimeError)

@@ -108,3 +108,10 @@ helpers were left to asgiref (section 20.9).
 Specification sections 5.1, 5.2 (DETACH, async_slots), 5.6, 6.6, 6.7, 6.9,
 6.14, 7.3, 11.1, Appendix D and 20.9. Implementation is scheduled with the
 ASGI bridge and WebSockets in phase 2.
+The feature test, `muru.wsgi_to_asgi` present when the worker has an
+event loop, and the accounting with DETACH are superseded by
+[ADR 0042](0042-handoff-is-enabled-per-direction.md): each direction is
+enabled by a `handoff` setting, the keys are always present and raise
+when their direction is not enabled, and a request handed across takes
+its place in the other count even when that count is full. The rest of
+this record stands.

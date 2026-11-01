@@ -74,7 +74,7 @@ route with the overlay's changes, and other requests carry on as before:
 
 ```toml
 [overlay.crawler-surge]
-routes.shop-root.client_routes = { ai_crawler = { target = { static = '/srv/shop/snapshot' } } }
+routes.shop-root.client_routes = { ai-crawler = { target = { static = '/srv/shop/snapshot' } } }
 ```
 
 An application's mode goes on every route of the application at once,
