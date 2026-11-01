@@ -53,12 +53,24 @@ def unavailable(reason: str) -> None:
     pytest.skip(reason)
 
 
-def free_port() -> int:
-    """Pick a port that is free right now."""
+# Ports free_port has handed out. A port is free again once its probe
+# socket closes, so two picks before either is bound can return the same
+# one, as a dashboard port and a daemon's listener once did on Linux.
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+_handed_out: set[int] = set()
+
+
+def free_port() -> int:
+    """Pick a port that is free right now and not handed out before."""
+
+    while True:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+
+        if port not in _handed_out:
+            _handed_out.add(port)
+            return port
 
 
 @dataclass
