@@ -21,16 +21,17 @@ daemon serves applications on one node: releases with blue/green
 switches, canaries with gates, traffic policies, previews, rollback and
 drains, virtual hosts with TLS, worker groups that scale, overlays and
 schedules, uploads, mounts, upstreams, client classes, metrics, logs,
-events and a dashboard, declared in files or on the command line. Both
-are tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI. Still to come are uv provisioning of interpreters, container
-releases, ACME certificates, HTTP/3, OpenTelemetry export, several edge
-processes and more than one node. The
+events and a dashboard, declared in files or on the command line.
+`muructl serve` runs one application in a container, with probes,
+metrics and logs on standard output. All are tested with plain WSGI and
+ASGI, Flask, Django, Starlette and FastAPI. Still to come are Kubernetes
+sizing and shutdown, container releases, ACME certificates, HTTP/3,
+OpenTelemetry export, several edge processes and more than one node. The
 [tutorial](tutorials/first-wsgi-app.md) is the place to start, the
 [how-to guides](howto/index.md) cover each feature and the
 [roadmap](project/roadmap.md) says what comes next. Run
-`uv tool install muructl` for the command, and add `muru` to your
-application's environment for the runtime library.
+`uv tool install muructl` for the command; it provides the `muru`
+runtime library to your application's interpreter itself.
 ```
 
 ```{admonition} A note on how Muru is built

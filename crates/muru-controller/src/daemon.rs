@@ -1626,7 +1626,7 @@ fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::
 /// The [proxy] table as the snapshot carries it, with the defaults of
 /// section 4.7 filled in: the four common header types, recursive
 /// resolution, and the configured headers kept.
-pub(crate) fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
+pub fn proxy_message(proxy: &muru_config::Proxy) -> pb::Proxy {
     let headers = if proxy.headers.is_empty() {
         muru_config::DEFAULT_PROXY_HEADERS
             .iter()
@@ -2042,7 +2042,7 @@ impl Daemon {
             .iter()
             .rev()
             .map(|record| NodeRequestRow {
-                time: clock_hms(record.started_unix_ms),
+                time: full_time(record.started_unix_ms),
                 status: record.status as u16,
                 status_class: (record.status / 100) as u16,
                 reason: if record.websocket_close.is_empty() {
@@ -2078,7 +2078,7 @@ impl Daemon {
             .into_iter()
             .map(|event| EventRow {
                 sequence: event.sequence,
-                time: clock_hms(event.time_unix_ms),
+                time: full_time(event.time_unix_ms),
                 level: event.level.to_owned(),
                 kind: event.kind,
                 subject: event.subject,
@@ -2097,7 +2097,11 @@ impl Daemon {
             logs.push(LogPanel {
                 app: app.name.clone(),
                 release: app.current.clone(),
-                lines: crate::logs::last_lines(&path, 40).await,
+                lines: crate::logs::last_lines(&path, 40)
+                    .await
+                    .iter()
+                    .map(|line| muru_dashboard::LogLine::parse(line))
+                    .collect(),
             });
         }
 
@@ -7693,6 +7697,12 @@ impl Daemon {
 }
 
 /// A Unix time as HH:MM:SS, UTC.
+/// A time in milliseconds since the epoch in the full form of section
+/// 11.8, for the dashboard to show as the viewer's local clock.
+pub(crate) fn full_time(unix_ms: u64) -> String {
+    muru_common::log::full(std::time::UNIX_EPOCH + Duration::from_millis(unix_ms))
+}
+
 pub(crate) fn clock_hms(unix_ms: u64) -> String {
     let seconds = (unix_ms / 1000) % 86_400;
     format!(

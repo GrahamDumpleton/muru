@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use muru_dashboard::{Data, History, MetricsSource, RequestRow, Sampler, Source, Summary, Worker};
 use muru_edge::Pools;
-use muru_edge::access::{AccessLog, RING_CAPACITY, Record, civil, format_bytes, format_duration};
+use muru_edge::access::{AccessLog, RING_CAPACITY, Record, format_bytes, format_duration};
 use muru_edge::metrics::pool_samples;
 
 use muru_controller::logs::Logs;
@@ -176,27 +176,24 @@ fn collect(inputs: &Inputs) -> Data {
         .iter()
         .rev()
         .take(REQUEST_ROWS)
-        .map(|record| {
-            let (_, hours, minutes, seconds, _) = civil(record.started);
-            RequestRow {
-                time: format!("{hours:02}:{minutes:02}:{seconds:02}"),
-                status: record.status,
-                status_class: record.status / 100,
-                reason: match &record.websocket {
-                    Some(end) => format!("websocket closed by {}, code {}", end.by, end.code),
-                    None => record.reason.clone(),
-                },
-                method: record.method.clone(),
-                target: record.target.clone(),
-                bytes: format_bytes(record.bytes),
-                total: format_duration(record.total),
-                queue: format_duration(record.queue),
-                application: format_duration(record.application),
-                worker: record
-                    .worker
-                    .map_or_else(|| "-".to_owned(), |worker| worker.to_string()),
-                request_id: record.request_id.clone(),
-            }
+        .map(|record| RequestRow {
+            time: muru_common::log::full(record.started),
+            status: record.status,
+            status_class: record.status / 100,
+            reason: match &record.websocket {
+                Some(end) => format!("websocket closed by {}, code {}", end.by, end.code),
+                None => record.reason.clone(),
+            },
+            method: record.method.clone(),
+            target: record.target.clone(),
+            bytes: format_bytes(record.bytes),
+            total: format_duration(record.total),
+            queue: format_duration(record.queue),
+            application: format_duration(record.application),
+            worker: record
+                .worker
+                .map_or_else(|| "-".to_owned(), |worker| worker.to_string()),
+            request_id: record.request_id.clone(),
         })
         .collect();
     Data {
@@ -215,6 +212,11 @@ fn collect(inputs: &Inputs) -> Data {
         workers,
         requests,
         websockets,
-        logs: inputs.logs.recent(LOG_LINES),
+        logs: inputs
+            .logs
+            .recent(LOG_LINES)
+            .iter()
+            .map(|line| muru_dashboard::LogLine::parse(line))
+            .collect(),
     }
 }

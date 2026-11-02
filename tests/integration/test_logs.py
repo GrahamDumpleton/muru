@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -23,6 +24,8 @@ from support import server as support
 from support.daemon import SHOP, Daemon, daemon
 
 __all__ = ["daemon"]
+
+TIMED = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ")
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
@@ -42,8 +45,15 @@ def test_release_output_is_shown_and_followed(daemon: Daemon) -> None:
 
     wait_for(lambda: "shop: served /first" in daemon.muructl("logs", "shop").stdout)
     lines = daemon.muructl("logs", "shop").stdout.splitlines()
-    assert any(line.startswith("muru.host[") for line in lines)
     assert any(line.endswith(".stdout: shop: served /first") for line in lines), lines
+
+    # The release's log file carries the full UTC time in front of every
+    # line, which muructl logs shows unless asked not to.
+
+    assert all(TIMED.match(line) for line in lines), lines
+    untimed = daemon.muructl("logs", "shop", "--no-timestamps").stdout.splitlines()
+    assert any(line.startswith("muru.host[") for line in untimed), untimed
+    assert not any(TIMED.match(line) for line in untimed), untimed
     assert len(daemon.muructl("logs", "shop@r1", "--lines", "2").stdout.splitlines()) == 2
 
     # Following prints what is written after the command started.

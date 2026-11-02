@@ -19,6 +19,7 @@ hyper = { workspace = true }
 hyper-rustls = { workspace = true }
 hyper-util = { workspace = true }
 libc = { workspace = true }
+muru-common = { workspace = true }
 muru-config = { workspace = true }
 muru-dashboard = { workspace = true }
 muru-edge = { workspace = true }

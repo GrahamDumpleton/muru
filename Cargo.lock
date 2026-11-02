@@ -1261,6 +1261,9 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "muru-common"
 version = "0.1.0-alpha.14"
+dependencies = [
+ "jiff",
+]
 
 [[package]]
 name = "muru-config"
@@ -1287,6 +1290,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
+ "muru-common",
  "muru-config",
  "muru-dashboard",
  "muru-edge",
@@ -1320,6 +1324,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "muru-common",
  "muru-config",
  "serde",
  "serde_json",
@@ -1348,6 +1353,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "multer",
+ "muru-common",
  "muru-proto",
  "percent-encoding",
  "prost",
@@ -1428,10 +1434,16 @@ version = "0.1.0-alpha.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "globset",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ignore",
  "libc",
+ "muru-common",
  "muru-config",
  "muru-controller",
  "muru-dashboard",

@@ -611,10 +611,15 @@ impl AccessLog {
                 }
             }
             None => {
-                let line = text_line(record);
-                let stderr = io::stderr();
-                let mut handle = stderr.lock();
-                let _ = handle.write_all(line.as_bytes());
+                // Section 11.8: the terminal's compact line, or under
+                // muructl serve --log-format json the record itself.
+
+                let line = if muru_common::log::json() {
+                    json_line(record).replacen('{', "{\"kind\":\"access\",", 1)
+                } else {
+                    text_line(record)
+                };
+                muru_common::log::write(muru_common::log::Stream::Stderr, line.as_bytes());
             }
         }
     }
@@ -639,12 +644,12 @@ pub fn glob_matches(pattern: &str, path: &str) -> bool {
 /// The group and mount name left out of the compact form.
 const DEFAULT: &str = "default";
 
-/// The compact terminal form: time, status, method, target, bytes and
+/// The compact form: the time (section 11.8), status, method, target, bytes and
 /// timings, then the group and mount when named, the worker and request
 /// id.
 fn text_line(record: &Record) -> String {
     let mut line = String::with_capacity(160);
-    let (_, hours, minutes, seconds, millis) = civil(record.started);
+    let time = muru_common::log::record_time(muru_common::log::Stream::Stderr, record.started);
 
     let total = if record.websocket.is_some() {
         format_lifetime(record.total)
@@ -653,7 +658,7 @@ fn text_line(record: &Record) -> String {
     };
     let _ = write!(
         line,
-        "{hours:02}:{minutes:02}:{seconds:02}.{millis:03} {} {} {} {} {total}",
+        "{time} {} {} {} {} {total}",
         record.status,
         record.method,
         record.target,

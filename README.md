@@ -39,11 +39,16 @@ configuration may still change between them.
   limits, metrics, logs, events, a dashboard and systemd integration,
   declared in files or on the command line.
 
-Both are tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI on regular and free-threaded Python. Still to come are a
-production command for containers and Kubernetes, container releases,
-ACME certificates, HTTP/3, OpenTelemetry export, several edge processes
-and more than one node; the [roadmap](docs/project/roadmap.md) sets out
+- **In a container:** `muructl serve` runs one application as the
+  container's main process, configured from the image and the
+  environment, with probes and metrics on an admin port, logs on
+  standard output and a drain on `docker stop`.
+
+All are tested with plain WSGI and ASGI, Flask, Django, Starlette and
+FastAPI on regular and free-threaded Python. Still to come are
+Kubernetes sizing and shutdown, container releases, ACME certificates,
+HTTP/3, OpenTelemetry export, several edge processes and more than one
+node; the [roadmap](docs/project/roadmap.md) sets out
 the goals. The
 [tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
 is the place to start, and the
@@ -54,7 +59,6 @@ Muru is built.
 
 ```
 uv tool install muructl          # the command
-uv add muru                      # the runtime library, in your application's environment
 muructl run app:application      # http://127.0.0.1:8080
 ```
 
@@ -84,11 +88,13 @@ muructl run app:application      # http://127.0.0.1:8080
 
 ## Install
 
-Install the command line once with `uv tool install muructl` and add the
-`muru` runtime library to each application's environment with `uv add
-muru`. Both are pre-releases of the 0.1.0 line, so `pip install --pre` is
-needed where pip is used instead of uv. Pre-built wheels cover Linux and
-macOS on CPython 3.11 to 3.15, including the free-threaded builds.
+Install the command line once with `uv tool install muructl`. The `muru`
+runtime library that runs inside your application's interpreter is not a
+dependency of your project: muructl provides the copy matching its own
+version, fetching it once per interpreter. Both are pre-releases of the
+0.1.0 line, so `pip install --pre` is needed where pip is used instead of
+uv. Pre-built wheels cover Linux, including Alpine, and macOS on CPython
+3.11 to 3.15, and the free-threaded builds of 3.14 and 3.15.
 
 ## Five-minute start
 
@@ -96,7 +102,7 @@ In development:
 
 ```
 muructl run app:application --reload     # HTTP on 8080, restarts on change
-muructl run --https                      # HTTPS on 8443 with a local certificate
+muructl run --https                      # HTTPS on 8443 as well, with a local certificate
 muructl run . --port auto                # the project's [tool.muru] table, free ports
 ```
 
@@ -108,6 +114,12 @@ muructl apply -f config/                 # applications, virtual hosts and TLS f
 muructl deploy shop . --hold             # a new release, started without traffic
 muructl rollout canary shop@r2 --wait    # traffic in steps, judged by gates, rolled back on failure
 muructl dashboard login                  # a sign-in link, when the daemon serves a dashboard
+```
+
+In a container, with probes on port 9090 and logs on standard output:
+
+```dockerfile
+CMD ["muructl", "serve", "shop.wsgi:application"]
 ```
 
 ## Contributing

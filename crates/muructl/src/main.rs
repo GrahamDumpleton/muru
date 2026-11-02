@@ -12,10 +12,13 @@ mod dashboard;
 mod devcert;
 mod edge;
 mod init;
+mod log_format;
 mod mcp;
 mod provision;
 mod pstats;
 mod run_admin;
+mod serve;
+mod serve_admin;
 mod skill;
 mod watch;
 
@@ -56,6 +59,18 @@ struct Cli {
 enum Command {
     /// Run an application with an embedded controller and edge (development mode).
     Run(Box<RunArgs>),
+
+    /// Run one application in a container: configured from the image and the environment, probes and metrics on an admin port, logs on standard output.
+    #[command(
+        after_help = "Every setting can also come from the project's [tool.muru.serve] table, a file \
+                      named by --config or MURU_SERVE_CONFIG, or an environment variable named \
+                      MURU_SERVE_ and the flag in upper snake case, such as MURU_SERVE_PROCESSES; \
+                      a flag wins over all of them, and --print-config shows where each came from."
+    )]
+    Serve(Box<serve::ServeArgs>),
+
+    /// Ask a muructl serve in this container whether it is live, ready or started, exiting 0 for yes.
+    Probe(serve::ProbeArgs),
 
     /// Build a project's environment from uv.lock and provide the runtime library, then exit.
     Build(Box<provision::BuildArgs>),
@@ -528,6 +543,16 @@ struct RunArgs {
     #[arg(long)]
     no_compression: bool,
 
+    /// Put the full UTC time in front of every line on the terminal.
+    /// Access log lines carry the request's time either way.
+    #[arg(long)]
+    timestamps: bool,
+
+    /// Leave the time off application lines when the project's run table
+    /// turns timestamps on.
+    #[arg(long)]
+    no_timestamps: bool,
+
     /// Serve an address other than loopback. Development behaviours are
     /// then off (no tracebacks in error pages, the 10MB body limit, no
     /// dashboard unless asked for), but this is still not the supported
@@ -816,10 +841,22 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_env("MURU_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_writer(|| log_format::Routed)
+        .event_format(log_format::Layout)
         .init();
     let cli = Cli::parse();
+
+    // Section 13.9: nothing muructl serve runs installs or downloads.
+
+    if matches!(cli.command, Command::Serve(_)) {
+        // SAFETY: no other thread exists yet; the runtime below is built
+        // after this, and the tracing subscriber starts none.
+
+        unsafe {
+            std::env::set_var("UV_OFFLINE", "1");
+            std::env::set_var("UV_PYTHON_DOWNLOADS", "never");
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -828,6 +865,8 @@ fn main() -> anyhow::Result<()> {
 
     let result = match cli.command {
         Command::Run(args) => runtime.block_on(run(*args)),
+        Command::Serve(args) => runtime.block_on(serve::serve(*args)),
+        Command::Probe(args) => serve::probe(args),
         Command::Build(args) => runtime.block_on(provision::build(*args)),
         Command::Check(args) => runtime.block_on(check(*args)),
         Command::ServeStatic(args) => runtime.block_on(serve_static(*args)),
@@ -1431,6 +1470,8 @@ struct Serving {
     /// The dashboard's address, off, or none for the default.
     dashboard: Option<String>,
     compression: bool,
+    /// Whether every line on the terminal carries the full time.
+    timestamps: bool,
     /// The muru.local.toml read, when there was one.
     local: Option<PathBuf>,
 }
@@ -1509,6 +1550,8 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.dashboard.clone()),
             compression: !args.no_compression && settings.compression != Some(false),
+            timestamps: !args.no_timestamps
+                && (args.timestamps || settings.timestamps == Some(true)),
             local,
         })
     }
@@ -1595,6 +1638,13 @@ const DEFAULT_SYNC_THREADS: usize = 8;
 const DEFAULT_CONCURRENCY: usize = 1000;
 
 fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
+    resolve_for(args, None)
+}
+
+/// Resolve the arguments for a development run, or with `serve` for
+/// `muructl serve` (section 13.9), which reads neither the run table nor
+/// muru.local.toml and has its own worker count when nothing sets one.
+fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Resolved> {
     let chdir = args.chdir.clone();
 
     let (entrypoint, project) = match args.app.as_deref() {
@@ -1646,7 +1696,11 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     // over the project's run table over the defaults. The table is
     // checked as the local file was when it was read.
 
-    let run_table = table.run.clone().unwrap_or_default();
+    let run_table = if serve.is_some() {
+        muru_config::RunSettings::default()
+    } else {
+        table.run.clone().unwrap_or_default()
+    };
     run_table.check().map_err(|error| {
         anyhow::anyhow!(
             "{}: [run] {error}",
@@ -1657,11 +1711,15 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
         )
     })?;
 
-    let (local, local_run, local_build_when) =
-        match muru_config::load_local(&project, source.as_deref())? {
-            Some((path, file)) => (Some(path), file.run, file.build_when),
-            None => (None, muru_config::RunSettings::default(), None),
-        };
+    let local_file = match serve {
+        Some(_) => None,
+        None => muru_config::load_local(&project, source.as_deref())?,
+    };
+
+    let (local, local_run, local_build_when) = match local_file {
+        Some((path, file)) => (Some(path), file.run, file.build_when),
+        None => (None, muru_config::RunSettings::default(), None),
+    };
 
     let serving = Serving::resolve(args, &run_table.layered(&local_run), local)?;
 
@@ -1703,7 +1761,7 @@ fn resolve(args: &RunArgs) -> anyhow::Result<Resolved> {
     let processes = args
         .processes
         .or(table.processes)
-        .unwrap_or(DEFAULT_PROCESSES);
+        .unwrap_or(serve.map_or(DEFAULT_PROCESSES, |mode| mode.default_processes));
     muru_controller::config::check_scaling(table.scaling.as_ref(), &table.groups, processes as u32)
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
 
@@ -2018,7 +2076,7 @@ async fn host_control(
     match muru_controller::host::HostControl::connect(&host.control_path()).await {
         Ok((control, messages)) => (Some(control), messages),
         Err(error) => {
-            println!("muru: no control connection to the host: {error:#}");
+            muru_common::muru_println!("no control connection to the host: {error:#}");
             let (_sender, receiver) = tokio::sync::mpsc::channel(1);
             std::mem::forget(_sender);
             (None, receiver)
@@ -2599,7 +2657,21 @@ fn written_interpreter(python: &Path, project: &Path) -> String {
 /// Development mode: one host with forked workers behind an embedded edge,
 /// replaced by a new one when --reload sees a source change.
 async fn run(args: RunArgs) -> anyhow::Result<()> {
-    let mut resolved = resolve(&args)?;
+    run_with(args, None).await
+}
+
+/// Serve as `muructl run` does, or as `muructl serve` with `serve`
+/// (section 13.9): production behaviours, one run directory, no
+/// installs, the admin port, and every line on standard output.
+async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<()> {
+    let mut resolved = resolve_for(&args, serve.as_ref())?;
+    muru_common::log::show_timestamps(resolved.serving.timestamps);
+
+    if let Some(mode) = &serve {
+        muru_common::log::one_stream(true);
+        muru_common::log::json_lines(mode.json);
+    }
+
     let development = !args.allow_public;
 
     if !args.bind.ip.is_loopback() && development {
@@ -2642,7 +2714,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     if let Some(source) = &resolved.source {
-        println!("muru: using [tool.muru] from {}", source.display());
+        muru_common::muru_println!("using [tool.muru] from {}", source.display());
     }
 
     // Section 8.2: run is build under the build mode, then serve. A
@@ -2676,30 +2748,33 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             | muru_provision::Chosen::ActiveVirtualenv
             | muru_provision::Chosen::ProjectVirtualenv
     ) {
-        println!("muru: {}", python.describe());
+        muru_common::muru_println!("{}", python.describe());
     }
 
     // Section 8.3: the runtime library, from the environment when it
     // matches, else the user cache, else fetched once; said on the
     // terminal, with the warning when a mismatched copy has to do.
 
-    let library = provision::runtime(&python.probe).await?;
+    let library = match &serve {
+        Some(mode) => serve::runtime_library(&python, &mode.runtime_dir)?,
+        None => provision::runtime(&python.probe).await?,
+    };
 
     for note in &library.notes {
-        println!("muru: {note}");
+        muru_common::muru_println!("{note}");
     }
 
-    println!("muru: {}", library.describe());
+    muru_common::muru_println!("{}", library.describe());
 
     // Section 13.1: the local file is said once, and so is a .gitignore
     // that would let it be committed.
 
     if let Some(local) = &resolved.serving.local {
-        println!("muru: using [run] from {}", local.display());
+        muru_common::muru_println!("using [run] from {}", local.display());
 
         if !gitignore_covers(&resolved.project, muru_config::LOCAL_FILE) {
-            println!(
-                "muru: {} is not covered by the project's .gitignore; add it, since the file is for this machine alone",
+            muru_common::muru_println!(
+                "{} is not covered by the project's .gitignore; add it, since the file is for this machine alone",
                 muru_config::LOCAL_FILE
             );
         }
@@ -2709,7 +2784,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // --tls-cert or an unwritable cache fails with nothing to clean up.
 
     let tls = tls(&args, &resolved.serving, &resolved.project)?;
-    let run_dir = std::env::temp_dir().join(format!("muru-{}", std::process::id()));
+
+    let run_dir = match &serve {
+        Some(mode) => {
+            serve::make_run_dir(&mode.run_dir)?;
+            mode.run_dir.join("release")
+        }
+        None => std::env::temp_dir().join(format!("muru-{}", std::process::id())),
+    };
+
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let access_log = access_log_config(&resolved.serving);
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
@@ -2844,6 +2927,29 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?,
     );
+
+    // Section 13.9: the admin port and the probe socket answer while the
+    // application loads, the startup and readiness probes failing until
+    // it is served.
+
+    let health = match &serve {
+        Some(mode) => {
+            let health = serve_admin::Health::new(mode.min_ready, mode.admin_status);
+
+            if let Some(address) = mode.admin_listen {
+                let bound = serve_admin::listen(address, std::sync::Arc::clone(&health)).await?;
+                muru_common::muru_println!("admin port on http://{bound}/");
+            }
+
+            serve_admin::listen_unix(
+                &mode.run_dir.join(serve::PROBE_SOCKET),
+                std::sync::Arc::clone(&health),
+            )?;
+            Some(health)
+        }
+        None => None,
+    };
+
     let mut current = HostProcess::start(&spec, &run_dir, 1, &logs)?;
 
     if let Err(error) = current.wait_ready(START_TIMEOUT).await {
@@ -2864,6 +2970,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .attach(control);
 
     let (http_address, https_address) = addresses(&args, &resolved.serving);
+
+    // Section 13.1: a development run listens on loopback, so a
+    // forwarding header can only come from a proxy on this machine, which
+    // is trusted without setup; muructl serve trusts the proxies it is
+    // told to (section 13.9).
+
+    let trust = serve
+        .as_ref()
+        .map_or_else(muru_edge::proxy::Trust::loopback, |mode| mode.trust.clone());
 
     let edge = match muru_edge::Edge::bind(muru_edge::Config {
         listen: http_address,
@@ -2887,12 +3002,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         } else {
             muru_edge::compression::Compression::off()
         },
-        // Section 13.1: a development run listens on loopback, so a
-        // forwarding header can only come from a proxy on this machine,
-        // which is trusted without setup.
-        trust: muru_edge::proxy::Trust::loopback(),
+        trust,
         https: tls.as_ref().map(|tls| tls.https.clone()),
-        spool: None,
+        spool: match &serve {
+            Some(mode) => Some(
+                muru_edge::uploads::Spool::new(mode.run_dir.join("spool"), Some(mode.spool_quota))
+                    .with_context(|| {
+                        format!("creating {}", mode.run_dir.join("spool").display())
+                    })?,
+            ),
+            None => None,
+        },
         rate_buckets: None,
     })
     .await
@@ -2929,8 +3049,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         )
     };
 
-    println!(
-        "muru: serving {} on {addresses} with {}",
+    muru_common::muru_println!(
+        "serving {} on {addresses} with {}",
         resolved.entrypoint,
         workers(
             resolved.processes,
@@ -2939,8 +3059,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     );
 
     for (name, group) in &resolved.groups {
-        println!(
-            "muru: group {name} serves {} with {}{}",
+        muru_common::muru_println!(
+            "group {name} serves {} with {}{}",
             group_serves(group),
             workers(
                 group.processes.unwrap_or(resolved.processes),
@@ -2955,20 +3075,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     for (name, mount) in &resolved.mounts {
-        println!("muru: mount {name} {}", mount_serves(mount));
+        muru_common::muru_println!("mount {name} {}", mount_serves(mount));
     }
 
     for entry in &static_paths {
-        println!(
-            "muru: static {}/ from {}",
+        muru_common::muru_println!(
+            "static {}/ from {}",
             entry.prefix.trim_end_matches('/'),
             entry.route.directory.display()
         );
     }
 
-    if development {
-        println!(
-            "muru: development mode: error pages show tracebacks, nothing is persisted{} and only \
+    if serve.is_some() {
+        // Section 13.9: a container's production command needs no warning.
+    } else if development {
+        muru_common::muru_println!(
+            "development mode: error pages show tracebacks, nothing is persisted{} and only \
              loopback is served; production runs under the daemon (muructl daemon start)",
             if resolved.serving.reload {
                 ", the run reloads on change"
@@ -2977,16 +3099,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             }
         );
     } else {
-        println!(
-            "muru: --allow-public: development behaviours are off, but muructl run is not the \
+        muru_common::muru_println!(
+            "--allow-public: development behaviours are off, but muructl run is not the \
              supported way to run in production; that is the daemon (muructl daemon start)"
         );
     }
 
     if let Some(tls) = &tls {
         match (&tls.development, &resolved.serving.tls_cert) {
-            (Some(certificate), _) => println!("{}", certificate.describe()),
-            (None, Some(path)) => println!("muru: TLS certificate from {}", path.display()),
+            (Some(certificate), _) => {
+                for line in certificate.describe().lines() {
+                    muru_common::muru_println!("{}", line.trim_start_matches("muru: "));
+                }
+            }
+            (None, Some(path)) => {
+                muru_common::muru_println!("TLS certificate from {}", path.display())
+            }
             (None, None) => {}
         }
     }
@@ -3023,10 +3151,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .await
         {
             Ok(address) => {
-                println!("muru: dashboard on http://{address}/");
+                muru_common::muru_println!("dashboard on http://{address}/");
                 dashboard_address = Some(address);
             }
-            Err(error) => println!("muru: no dashboard: {error:#}"),
+            Err(error) => muru_common::muru_println!("no dashboard: {error:#}"),
         }
     }
 
@@ -3042,14 +3170,24 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .project
         .canonicalize()
         .unwrap_or_else(|_| resolved.project.clone());
-    let registration =
-        match run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project) {
-            Ok(registration) => Some(registration),
-            Err(error) => {
-                println!("muru: no admin socket: {error:#}");
-                None
-            }
-        };
+
+    let registered = match &serve {
+        Some(mode) => run_admin::Registration::at(
+            &mode.run_dir.join(serve::ADMIN_SOCKET),
+            edge.local_addr(),
+            &label,
+            &project,
+        ),
+        None => run_admin::Registration::new(&runtime, edge.local_addr(), &label, &project),
+    };
+
+    let registration = match registered {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            muru_common::muru_println!("no admin socket: {error:#}");
+            None
+        }
+    };
 
     if let Some(registration) = &registration {
         let mut listeners = vec![format!("http://{}", edge.local_addr())];
@@ -3078,10 +3216,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
         match run_admin::serve(state, admin_stop_rx).await {
             Ok(serving) => {
-                println!("muru: admin socket {}", registration.socket.display());
+                muru_common::muru_println!("admin socket {}", registration.socket.display());
                 tokio::spawn(serving);
             }
-            Err(error) => println!("muru: no admin socket: {error:#}"),
+            Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
         }
     }
 
@@ -3136,13 +3274,42 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         // change made after the line below is seen.
 
         let watching = watch.start(WATCH_INTERVAL, changed_tx);
-        println!(
-            "muru: watching {watched} for changes to {}{except}",
+        muru_common::muru_println!(
+            "watching {watched} for changes to {}{except}",
             include.join(", ")
         );
         tokio::spawn(watching);
     } else {
         drop(changed_tx);
+    }
+
+    if let Some(health) = &health {
+        let required = std::iter::once(muru_edge::routing::DEFAULT_GROUP.to_owned())
+            .chain(
+                resolved
+                    .groups
+                    .iter()
+                    .filter(|(_, group)| group.optional != Some(true))
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect();
+        health.started(serve_admin::Serving {
+            pools: edge.pools(),
+            access_log: edge.access_log(),
+            connections: edge.connections(),
+            required,
+            settings: serde_json::json!({
+                "app": label,
+                "entrypoint": resolved.entrypoint,
+                "listen": edge.local_addr().to_string(),
+                "processes": resolved.processes,
+                "threads": resolved.threads,
+                "groups": resolved.groups.keys().collect::<Vec<_>>(),
+                "mounts": resolved.mounts.keys().collect::<Vec<_>>(),
+                "python": python.python.display().to_string(),
+                "runtime_library": library.version,
+            }),
+        });
     }
 
     let pools = edge.pools();
@@ -3164,6 +3331,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
             Some(message) = host_messages.recv() => {
+                if let Some(health) = &health {
+                    health.host_heard();
+                }
+
                 // Sections 7.6 and 7.7: the host replaced a worker, so
                 // the edge routes to the new socket, and the host hears
                 // that it does before it stops the old one.
@@ -3196,12 +3367,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 host_link.lock().expect("host link poisoned").acknowledge(version);
                             }
                             Err(error) => {
-                                println!("muru: the workers could not be reconnected: {error:#}");
+                                muru_common::muru_println!("the workers could not be reconnected: {error:#}");
                             }
                         }
                     }
                     muru_controller::host::HostMessage::Event { kind, message, .. } => {
-                        println!("muru: {kind}: {message}");
+                        muru_common::muru_println!("{kind}: {message}");
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
@@ -3212,7 +3383,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             Some(path) = changed.recv() => {
                 let mut paths = vec![path];
                 settle(&mut changed, &mut paths).await;
-                println!("muru: reloading, {} changed", describe(&paths));
+                muru_common::muru_println!("reloading, {} changed", describe(&paths));
 
                 // Section 8.2: a change to the lock, or to what names the
                 // interpreter, builds before the new release starts; the
@@ -3237,12 +3408,12 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             Ok(python) => match provision::runtime(&python.probe).await {
                                 Ok(library) => Some((python, library)),
                                 Err(error) => {
-                                    println!("muru: {error:#}; release r{} keeps serving", current.release);
+                                    muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
                                     None
                                 }
                             },
                             Err(error) => {
-                                println!("muru: {error:#}; release r{} keeps serving", current.release);
+                                muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
                                 None
                             }
                         };
@@ -3252,7 +3423,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         };
 
                         for note in &library.notes {
-                            println!("muru: {note}");
+                            muru_common::muru_println!("{note}");
                         }
 
                         spec.python = python.python.clone();
@@ -3260,7 +3431,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        println!("muru: {error:#}; release r{} keeps serving", current.release);
+                        muru_common::muru_println!("{error:#}; release r{} keeps serving", current.release);
                         continue;
                     }
                 }
@@ -3271,7 +3442,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     let mut next = match HostProcess::start(&spec, &run_dir, release, &logs) {
                         Ok(next) => next,
                         Err(error) => {
-                            println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
+                            muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                             break;
                         }
                     };
@@ -3300,13 +3471,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 match connected {
                                     Ok(connected) => pools.replace(connected),
                                     Err(error) => {
-                                        println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
+                                        muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                         next.stop(stop_budget).await;
                                         break;
                                     }
                                 }
 
-                                println!("muru: switched to release r{release}");
+                                muru_common::muru_println!("switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
                                 let previous = std::mem::replace(&mut current, next);
                                 tokio::spawn(previous.stop(stop_budget));
@@ -3316,7 +3487,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                                 break;
                             }
                             Err(error) => {
-                                println!("muru: release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
+                                muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
                                 next.stop(stop_budget).await;
                                 break;
                             }
@@ -3327,7 +3498,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
                             let mut paths = vec![path];
                             settle(&mut changed, &mut paths).await;
-                            println!("muru: {} changed again, restarting the reload", describe(&paths));
+                            muru_common::muru_println!("{} changed again, restarting the reload", describe(&paths));
                             next.stop(stop_budget).await;
                         }
                     }
@@ -3335,6 +3506,13 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             }
         }
     };
+
+    // Section 13.9: readiness fails first, so a platform stops sending
+    // traffic while the requests in flight finish.
+
+    if let Some(health) = &health {
+        health.stopping();
+    }
 
     // Section 13.4: the edge stops accepting and lets the requests in
     // flight finish before the host is told to stop, so no request is
@@ -3362,6 +3540,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let _ = admin_stop_tx.send(());
     drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);
+
+    if let Some(mode) = &serve {
+        let _ = std::fs::remove_file(mode.run_dir.join(serve::PROBE_SOCKET));
+    }
+
     outcome
 }
 
