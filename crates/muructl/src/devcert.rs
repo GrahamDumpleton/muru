@@ -74,10 +74,13 @@ impl DevCertificate {
 }
 
 /// The user cache directory for Muru (section 13.8): MURU_CACHE_DIR, else
-/// the platform's cache location.
+/// the platform's cache location. A relative MURU_CACHE_DIR is made
+/// absolute against the working directory, since the runtime library
+/// unpacked under it goes on the PYTHONPATH of a host that may start
+/// elsewhere (`--chdir`).
 pub fn cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = env_path("MURU_CACHE_DIR") {
-        return Ok(dir);
+        return Ok(std::path::absolute(&dir).unwrap_or(dir));
     }
 
     let home = env_path("HOME")
