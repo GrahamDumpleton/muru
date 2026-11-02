@@ -96,6 +96,8 @@ path, and open it with the trailing slash: `https://example.com/proxy/8090/`.
   `?range=24h`, the last day at one minute;
 - recent requests across every release, the last fifty events (new ones
   arriving as they happen), and the tail of each serving release's log.
+  Times are shown on your browser's local clock, with the full UTC time
+  when you hover over one.
 
 ### Looking into the workers
 

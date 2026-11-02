@@ -6,7 +6,7 @@ use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio::sync::mpsc;
@@ -35,8 +35,11 @@ impl Default for Logs {
 }
 
 impl Logs {
-    /// Keep a line, dropping the oldest when full.
-    pub fn push(&self, line: String) {
+    /// Keep a line that arrived at `time`, dropping the oldest when full.
+    /// It is kept as a log file holds it, the full time in front (section
+    /// 11.8), so readers show or hide the time as they would a file's.
+    pub fn push(&self, time: SystemTime, line: &str) {
+        let line = format!("{} {line}", muru_common::log::full(time));
         let mut lines = self.lines.lock().expect("logs poisoned");
 
         if lines.len() == CAPACITY {

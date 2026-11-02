@@ -6,7 +6,7 @@
 //! user runtime directory beside a file that names the run, which is how
 //! a command finds it without a flag.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -174,7 +174,9 @@ impl RunState {
         );
 
         match op {
-            "attach" => println!("muru: debug.attached: a debugger session opened in {whom}"),
+            "attach" => {
+                muru_common::muru_println!("debug.attached: a debugger session opened in {whom}")
+            }
             "exec" => {
                 let code: String = args
                     .get("code")
@@ -183,14 +185,14 @@ impl RunState {
                     .chars()
                     .take(200)
                     .collect();
-                println!("muru: debug.exec: ran code in {whom}: {code}");
+                muru_common::muru_println!("debug.exec: ran code in {whom}: {code}");
             }
             "profile" | "trace" | "memory" => {
                 let seconds = args
                     .get("duration_s")
                     .and_then(serde_json::Value::as_f64)
                     .unwrap_or(0.0);
-                println!("muru: debug.{op}: {op} of {whom} for {seconds} s");
+                muru_common::muru_println!("debug.{op}: {op} of {whom} for {seconds} s");
             }
             _ => {}
         }
@@ -274,8 +276,65 @@ pub fn debug_source(
     })
 }
 
+/// Workers replaced and workers gone, by metric, application, release,
+/// group and reason, counted from the host's events. A process runs one
+/// application, so one count serves it.
+static WORKER_EVENTS: Mutex<BTreeMap<WorkerEvent, u64>> = Mutex::new(BTreeMap::new());
+
+type WorkerEvent = (&'static str, String, String, String, String);
+
+/// Section 11.1: count a host's event about a worker, as the daemon
+/// counts it, when it is a replacement or an exit.
+pub fn count_worker_event(app: &str, release: &str, kind: &str, group: &str, reason: &str) {
+    let name = match kind {
+        "worker.recycled" | "worker.timeout_killed" => "muru_worker_recycles_total",
+        "worker.exited" | "worker.oom_killed" => "muru_worker_exits_total",
+        _ => return,
+    };
+
+    let group = if group.is_empty() {
+        muru_edge::routing::DEFAULT_GROUP
+    } else {
+        group
+    };
+    let reason = if reason.is_empty() { "other" } else { reason };
+    let key = (
+        name,
+        app.to_owned(),
+        release.to_owned(),
+        group.to_owned(),
+        reason.to_owned(),
+    );
+    *WORKER_EVENTS
+        .lock()
+        .expect("worker events poisoned")
+        .entry(key)
+        .or_default() += 1;
+}
+
+fn worker_event_samples() -> Vec<muru_edge::metrics::Sample> {
+    WORKER_EVENTS
+        .lock()
+        .expect("worker events poisoned")
+        .iter()
+        .map(|((name, app, release, group, reason), count)| {
+            muru_edge::metrics::Sample::new(
+                name,
+                &[
+                    ("app", app.as_str()),
+                    ("release", release.as_str()),
+                    ("group", group.as_str()),
+                    ("reason", reason.as_str()),
+                ],
+                *count as f64,
+            )
+        })
+        .collect()
+}
+
 /// The Prometheus text of a run: the edge's request metrics, the pools'
-/// and the listeners', which `/metrics` on the dashboard shows too.
+/// and the listeners', and the workers replaced and gone, which
+/// `/metrics` on the dashboard shows too.
 pub fn metrics_text(
     pools: &Pools,
     access_log: &AccessLog,
@@ -287,7 +346,8 @@ pub fn metrics_text(
         .samples()
         .into_iter()
         .chain(pool_samples(&routing))
-        .chain(connections.samples());
+        .chain(connections.samples())
+        .chain(worker_event_samples());
     render(&aggregate(samples))
 }
 
@@ -309,7 +369,9 @@ pub struct RunInfo {
 
 /// The run's place in the user runtime directory, removed when dropped.
 pub struct Registration {
-    directory: PathBuf,
+    /// The run's own directory, or none for `muructl serve`, whose socket
+    /// sits in the container's run directory.
+    directory: Option<PathBuf>,
     /// The admin socket inside it.
     pub socket: PathBuf,
 }
@@ -350,13 +412,52 @@ impl Registration {
             socket: socket.clone(),
         };
         std::fs::write(directory.join("run.json"), serde_json::to_vec(&info)?)?;
-        Ok(Self { directory, socket })
+        Ok(Self {
+            directory: Some(directory),
+            socket,
+        })
+    }
+
+    /// The admin socket of `muructl serve` at `socket`, in its run
+    /// directory (section 13.9), with the file that names the run beside
+    /// it. Only the socket and the file are removed when dropped, since
+    /// the directory is the container's volume.
+    pub fn at(
+        socket: &Path,
+        listen: SocketAddr,
+        app: &str,
+        project: &Path,
+    ) -> anyhow::Result<Self> {
+        let _ = std::fs::remove_file(socket);
+        let info = RunInfo {
+            pid: std::process::id(),
+            app: app.to_owned(),
+            project: project.to_path_buf(),
+            listen: listen.to_string(),
+            socket: socket.to_path_buf(),
+        };
+        std::fs::write(
+            socket.with_file_name("serve.json"),
+            serde_json::to_vec(&info)?,
+        )?;
+        Ok(Self {
+            directory: None,
+            socket: socket.to_path_buf(),
+        })
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
+        match &self.directory {
+            Some(directory) => {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.socket);
+                let _ = std::fs::remove_file(self.socket.with_file_name("serve.json"));
+            }
+        }
     }
 }
 

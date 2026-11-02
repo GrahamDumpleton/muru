@@ -11,7 +11,8 @@ import pytest
 from support import server as support
 
 LINE = re.compile(
-    r"^(?P<time>\d\d:\d\d:\d\d\.\d{3}) (?P<status>\d{3}) (?P<method>[A-Z]+) (?P<target>\S+) "
+    r"^(?:(?P<time>(?:\d{4}-\d\d-\d\dT)?\d\d:\d\d:\d\d\.\d{3}Z?) )?"
+    r"(?P<status>\d{3}) (?P<method>[A-Z]+) (?P<target>\S+) "
     r"(?P<bytes>\S+) (?P<total>\S+)(?P<rest>.*) id=(?P<id>[0-9A-Z]{26})$"
 )
 

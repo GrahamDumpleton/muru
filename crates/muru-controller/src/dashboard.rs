@@ -72,7 +72,7 @@ pub async fn serve(
                 Ok(event) => {
                     let _ = forward.send(EventRow {
                         sequence: event.sequence,
-                        time: crate::daemon::clock_hms(event.time_unix_ms),
+                        time: crate::daemon::full_time(event.time_unix_ms),
                         level: event.level.to_owned(),
                         kind: event.kind,
                         subject: event.subject,

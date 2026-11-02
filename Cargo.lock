@@ -1260,11 +1260,15 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muru-common"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
+dependencies = [
+ "jiff",
+ "serde_json",
+]
 
 [[package]]
 name = "muru-config"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "jiff",
  "regex",
@@ -1275,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "muru-controller"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1287,6 +1291,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
+ "muru-common",
  "muru-config",
  "muru-dashboard",
  "muru-edge",
@@ -1310,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "muru-dashboard"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "anyhow",
  "askama",
@@ -1320,6 +1325,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "muru-common",
  "muru-config",
  "serde",
  "serde_json",
@@ -1329,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "muru-edge"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1348,6 +1354,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "multer",
+ "muru-common",
  "muru-proto",
  "percent-encoding",
  "prost",
@@ -1368,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "muru-proto"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "bytes",
  "libc",
@@ -1384,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "muru-provision"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "bytes",
  "http",
@@ -1403,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "muru-py"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "bytes",
  "libc",
@@ -1416,22 +1423,28 @@ dependencies = [
 
 [[package]]
 name = "muru-supervisor"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 
 [[package]]
 name = "muru-testkit"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 
 [[package]]
 name = "muructl"
-version = "0.1.0-alpha.14"
+version = "0.1.0-alpha.15"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "globset",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ignore",
  "libc",
+ "muru-common",
  "muru-config",
  "muru-controller",
  "muru-dashboard",

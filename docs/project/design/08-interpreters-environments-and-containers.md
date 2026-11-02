@@ -194,7 +194,7 @@ container = { network = 'appnet', memory = '4GiB', cpus = 4, read_only = true, t
 - Cgroup limits come from the container settings and feed the node budget.
 - Descriptor-based file hints and uploads work unchanged. Static directories are copied out of the image into the run directory (static_from_image) or shared through a volume.
 - Production is Linux only. On macOS, Docker runs containers in a virtual machine, so for development the daemon runs in the same virtual machine or container, or releases run without containers.
-- Kubernetes is a different model (edge as a sidecar sharing an emptyDir). Muru's role there narrows to the process model, preload, timeouts and in-pod scaling.
+- Kubernetes is a different model: Muru runs as `muructl serve` in the pod's one container (section 13.9), Kubernetes owning rollouts and load balancing and Muru the process model, preload, timeouts and in-pod scaling.
 
 ## 8.6 Images
 
@@ -212,7 +212,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN pip install muructl
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN muructl build --deployment --deps-only --target /app/.venv
+RUN muructl build --deployment --deps-only --no-runtime --target /app/.venv
 COPY . .
 RUN muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
 RUN python -m compileall -q --invalidation-mode unchecked-hash /app

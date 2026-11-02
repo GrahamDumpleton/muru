@@ -25,6 +25,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
+muru-common = { workspace = true }
 mime_guess = { workspace = true }
 multer = { workspace = true }
 muru-proto = { workspace = true }

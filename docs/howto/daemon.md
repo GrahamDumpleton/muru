@@ -379,9 +379,9 @@ The daemon listens on `127.0.0.1:8080` unless told otherwise, so in a
 container it takes `--listen 0.0.0.0:8080` or a `[[listener]]` entry,
 and its applications and logs are in the locations above, so a volume
 for the state store keeps the deployed releases across a restart of the
-container. A command that runs one application in a container, with its
-configuration from the image and its logs on standard output, is
-planned.
+container. To run one application in a container, with its configuration
+from the image and its logs on standard output, use `muructl serve`
+instead; [in a container](containers.md) covers it.
 
 ## Upgrading
 

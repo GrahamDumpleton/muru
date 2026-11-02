@@ -123,12 +123,25 @@ impl SocketArgs {
     }
 
     /// The socket to connect to (design specification section 13.8): as
-    /// given, else a development run's from this project, else the
-    /// daemon's when it listens, else the one run listening; several runs
-    /// and no daemon are named, so one can be chosen.
+    /// given, else a muructl serve's in its run directory, else a
+    /// development run's from this project, else the daemon's when it
+    /// listens, else the one run listening; several runs and no daemon
+    /// are named, so one can be chosen.
     pub fn socket(&self) -> anyhow::Result<PathBuf> {
         if let Some(socket) = &self.socket {
             return Ok(socket.clone());
+        }
+
+        // Section 13.9: inside a container, the serve that runs there.
+
+        let serve_dir = std::env::var_os("MURU_RUN_DIR").map_or_else(
+            || PathBuf::from(crate::serve::DEFAULT_RUN_DIR),
+            PathBuf::from,
+        );
+        let serve_socket = serve_dir.join(crate::serve::ADMIN_SOCKET);
+
+        if serve_dir.join("serve.json").is_file() && serve_socket.exists() {
+            return Ok(serve_socket);
         }
 
         let locations = self.locations.resolve();
@@ -255,6 +268,12 @@ pub struct DaemonRunArgs {
     #[arg(long, value_name = "NAME")]
     user: Option<String>,
 
+    /// Put the full UTC time in front of every line on standard output
+    /// and standard error, for a supervisor that stamps nothing; instead
+    /// of the [logs] table's timestamps. Log files always carry the time.
+    #[arg(long)]
+    timestamps: bool,
+
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// version it ran before.
     #[arg(long, hide = true, value_name = "VERSION")]
@@ -301,6 +320,7 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         &overrides,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    muru_common::log::show_timestamps(args.timestamps || settings.timestamps);
 
     // The edge writes the access log to a file in the log directory as
     // JSON lines.
@@ -582,8 +602,11 @@ pub async fn daemon_upgrade(socket: SocketArgs, timeout: Duration) -> anyhow::Re
 /// release), one worker or all, and the output form.
 #[derive(Args)]
 pub struct DebugArgs {
-    /// The release as app@release, or an application for its current release.
-    target: String,
+    /// The release as app@release, or an application for its current
+    /// release; the one application of `muructl run` or `muructl serve`
+    /// when left out.
+    #[arg(value_name = "APP[@RELEASE]")]
+    target: Option<String>,
 
     /// One worker, by index, instead of every worker of the release.
     #[arg(long, value_name = "N")]
@@ -776,12 +799,15 @@ pub struct ExecArgs {
 pub enum LoggingCommand {
     /// Set loggers' levels in a release's workers, for a period or until reset.
     Level {
-        /// The release as app@release, or an application for its current release.
-        target: String,
+        /// The release as app@release, or an application for its current
+        /// release; the one application of `muructl run` or `muructl
+        /// serve` when left out.
+        #[arg(value_name = "APP[@RELEASE]")]
+        target: Option<String>,
 
         /// A logger and its level as NAME=LEVEL (root with an empty name,
         /// as =DEBUG). Repeatable.
-        #[arg(value_name = "NAME=LEVEL", required_unless_present = "reset")]
+        #[arg(value_name = "NAME=LEVEL", required_unless_present_any = ["reset", "target"])]
         levels: Vec<String>,
 
         /// Revert on its own after this long, for example 10m.
@@ -878,7 +904,8 @@ pub async fn debug(command: DebugCommand) -> anyhow::Result<()> {
         DebugCommand::Attach(_) => unreachable!("attach is handled above"),
     };
 
-    let response = ask(&args.socket, &args.target, op, args.worker, request).await?;
+    let target = args.target.as_deref().unwrap_or_default();
+    let response = ask(&args.socket, target, op, args.worker, request).await?;
 
     if args.json {
         print_json(&response);
@@ -917,7 +944,7 @@ async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
         None => {
             let response = ask(
                 &args.socket,
-                &args.target,
+                args.target.as_deref().unwrap_or_default(),
                 "breakpoints",
                 None,
                 serde_json::json!({}),
@@ -938,7 +965,8 @@ async fn attach(attach_args: &AttachArgs) -> anyhow::Result<()> {
     };
 
     let exchange = |op: &'static str, request: serde_json::Value| async move {
-        let response = ask(&args.socket, &args.target, op, Some(worker), request).await?;
+        let target = args.target.as_deref().unwrap_or_default();
+        let response = ask(&args.socket, target, op, Some(worker), request).await?;
         let answer = response
             .workers
             .first()
@@ -1314,13 +1342,28 @@ fn print_exec(response: &pb::DebugResponse) {
 pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
     let LoggingCommand::Level {
         target,
-        levels,
+        mut levels,
         duration,
         reset,
         worker,
         socket,
         output,
     } = command;
+
+    // With the target left out, the first NAME=LEVEL arrives in its place.
+
+    let target = match target {
+        Some(setting) if setting.contains('=') => {
+            levels.insert(0, setting);
+            String::new()
+        }
+        target => target.unwrap_or_default(),
+    };
+
+    anyhow::ensure!(
+        reset || !levels.is_empty(),
+        "give a logger and its level as NAME=LEVEL, or --reset"
+    );
 
     if reset {
         let response = ask(
@@ -2871,9 +2914,10 @@ pub enum ScaleCommand {
 #[derive(Args)]
 pub struct RestartArgs {
     /// The release as app@release, or an application for its current
-    /// release.
+    /// release; the one application of `muructl run` or `muructl serve`
+    /// when left out.
     #[arg(value_name = "APP[@RELEASE]")]
-    target: String,
+    target: Option<String>,
 
     /// The worker to restart, by the index `debug status` and the access
     /// log show.
@@ -2922,7 +2966,7 @@ const RESTART_POLL: Duration = Duration::from_millis(250);
 pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
     let status = ask(
         &args.socket,
-        &args.target,
+        args.target.as_deref().unwrap_or_default(),
         "status",
         None,
         serde_json::json!({}),
@@ -2944,8 +2988,18 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
             })
         })
         .collect();
-    let app = args.target.split('@').next().unwrap_or(&args.target);
-    let release = format!("{app}@{}", status.release);
+
+    // The release as the lines name it: app@release, or the release alone
+    // for the one application of a run, which named none.
+
+    let release = match args
+        .target
+        .as_deref()
+        .and_then(|target| target.split('@').next())
+    {
+        Some(app) => format!("{app}@{}", status.release),
+        None => status.release.clone(),
+    };
 
     let chosen: Vec<(u32, u32)> = if args.all {
         serving
@@ -2985,7 +3039,7 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
     for (index, pid) in chosen {
         let response = ask(
             &args.socket,
-            &args.target,
+            args.target.as_deref().unwrap_or_default(),
             "restart",
             Some(index),
             serde_json::json!({ "force": args.force }),
@@ -3044,7 +3098,7 @@ async fn wait_restarted(args: &RestartArgs, index: u32, old_pid: u32) -> anyhow:
         tokio::time::sleep(RESTART_POLL).await;
         let status = ask(
             &args.socket,
-            &args.target,
+            args.target.as_deref().unwrap_or_default(),
             "status",
             Some(index),
             serde_json::json!({}),
@@ -5626,6 +5680,10 @@ pub struct LogsArgs {
     #[arg(long)]
     json: bool,
 
+    /// Leave off the UTC time each line starts with.
+    #[arg(long)]
+    no_timestamps: bool,
+
     #[command(flatten)]
     socket: SocketArgs,
 }
@@ -5679,9 +5737,13 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
         let line = line.map_err(explain)?;
 
         match (args.access, args.json) {
-            (true, false) => println!("{}", format_access_line(&line.line)),
+            (true, false) => println!("{}", format_access_line(&line.line, !args.no_timestamps)),
             (false, true) => println!("{}", serde_json::to_string(&line)?),
-            _ => println!("{}", line.line),
+            (true, true) => println!("{}", line.line),
+            (false, false) if args.no_timestamps => {
+                println!("{}", muru_common::log::split_time(&line.line).1);
+            }
+            (false, false) => println!("{}", line.line),
         }
     }
 
@@ -5712,9 +5774,10 @@ pub async fn logs_reopen(workers: bool, socket: SocketArgs, json: bool) -> anyho
 }
 
 /// An access log record as the compact line a development run prints,
-/// with the release, host, group and mount when the record names them.
-/// A line that is not a record is printed as it is.
-fn format_access_line(line: &str) -> String {
+/// with the release, host, group and mount when the record names them,
+/// starting with the record's full time unless `timed` is false. A line
+/// that is not a record is printed as it is.
+fn format_access_line(line: &str, timed: bool) -> String {
     let Ok(serde_json::Value::Object(record)) = serde_json::from_str::<serde_json::Value>(line)
     else {
         return line.to_owned();
@@ -5727,8 +5790,12 @@ fn format_access_line(line: &str) -> String {
     };
     let bytes =
         muru_edge::access::format_bytes(record.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0));
-    let time = text("time");
-    let clock = time.get(11..23).unwrap_or(time);
+
+    let time = if timed {
+        format!("{} ", text("time"))
+    } else {
+        String::new()
+    };
     let total = Duration::from_secs_f64(number("total_ms") / 1000.0);
 
     let total = if record.get("websocket").is_some_and(|v| !v.is_null()) {
@@ -5737,7 +5804,7 @@ fn format_access_line(line: &str) -> String {
         muru_edge::access::format_duration(total)
     };
     let mut out = format!(
-        "{clock} {} {} {} {bytes} {total}",
+        "{time}{} {} {} {bytes} {total}",
         number("status") as u64,
         text("method"),
         text("target"),

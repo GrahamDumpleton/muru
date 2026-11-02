@@ -21,6 +21,9 @@ A development run serves the same commands: `muructl run` has an admin
 socket of its own, which a command run from the project directory finds
 without a flag, and the run's application and release are the ones its
 terminal names, so `muructl debug stacks app` reads the run's workers.
+The application can be left out, since a run serves only one:
+`muructl debug stacks` does the same, and so does `muructl serve`'s
+socket inside a container.
 `debug exec` and `debug attach` need no `debug_exec` there, since the
 person at the terminal started the workers. `muructl status` says which
 socket a command found.

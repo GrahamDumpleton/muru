@@ -48,6 +48,7 @@ import random
 import selectors
 import signal
 import socket
+import stat
 import sys
 import threading
 import time
@@ -122,6 +123,38 @@ READ_SIZE = 65536
 _in_worker = False
 
 
+# Whether standard error is a regular file, decided once per process: a
+# worker forks from the host, and its standard error is a pipe.
+
+_stamped: tuple[int, bool] | None = None
+
+
+def stamp() -> str:
+    """Return the time to put in front of a line, or nothing (section 11.8).
+
+    A line written to a file carries the full time, RFC 3339 in UTC with
+    milliseconds, as a daemon's release log does. A line written to a pipe
+    does not: under muructl run and muructl serve the reader adds it when
+    asked, and a worker's lines are timed by the host that relays them.
+    """
+
+    global _stamped
+
+    if _stamped is None or _stamped[0] != os.getpid():
+        try:
+            regular = stat.S_ISREG(os.fstat(2).st_mode)
+        except OSError:
+            regular = False
+
+        _stamped = (os.getpid(), regular)
+
+    if not _stamped[1]:
+        return ""
+
+    now = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int(now * 1000) % 1000:03d}Z "
+
+
 def log(message: str) -> None:
     """Write one line to standard error, prefixed so it can be told from application output."""
 
@@ -131,7 +164,7 @@ def log(message: str) -> None:
     # lost then must not stop the host from stopping its workers.
 
     try:
-        print(f"{prefix}{message}", file=sys.stderr, flush=True)
+        print(f"{stamp()}{prefix}{message}", file=sys.stderr, flush=True)
     except OSError:
         pass
 
@@ -433,15 +466,18 @@ class WorkerOutput:
 
         self.pending += data
         *lines, self.pending = self.pending.split(b"\n")
+        when = stamp()
+
         for line in lines:
-            sys.stderr.write(self.tag + line.decode("utf-8", "replace") + "\n")
+            sys.stderr.write(when + self.tag + line.decode("utf-8", "replace") + "\n")
+
         sys.stderr.flush()
 
     def flush(self) -> None:
         """Write a final partial line, if any."""
 
         if self.pending:
-            sys.stderr.write(self.tag + self.pending.decode("utf-8", "replace") + "\n")
+            sys.stderr.write(stamp() + self.tag + self.pending.decode("utf-8", "replace") + "\n")
             sys.stderr.flush()
             self.pending = b""
 
@@ -819,6 +855,7 @@ class Host:
         memory: MemoryPolicy | None = None,
         reflection: bool = False,
         handoff: str | None = None,
+        cgroup: str | None = None,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
@@ -843,6 +880,12 @@ class Host:
         self.memory = memory or MemoryPolicy()
         self.memory_recycles: dict[int, list[float]] = {}
         self.leak_warned: dict[int, float] = {}
+
+        # Section 13.9: the container's cgroup, whose count of processes
+        # the kernel killed for memory tells such a worker from a crash.
+
+        self.cgroup = cgroup
+        self.oom_kills = oom_kills(cgroup)
 
         # Section 6.10: whether orphaned descendants come to this process,
         # and those that have, each with when it is to be stopped.
@@ -2368,6 +2411,41 @@ class Host:
             self.check_memory(state)
             self.send_status()
 
+    def derive_hard_limit(self, budget: int) -> None:
+        """Section 13.9: a hard limit nobody set, from the container's budget.
+
+        What the host holds after preload is shared with the workers until
+        written, so it is taken off the budget once and the rest divided
+        between the workers.
+        """
+
+        from muru import _native
+
+        measured = _native.memory_usage()
+        held = measured["rss"] if measured else 0
+        share = (budget - held) // max(self.worker_count, 1)
+        policies = [self.memory, *(group.memory for group in self.groups if group.memory)]
+        unset = [policy for policy in policies if policy.hard_limit is None]
+
+        if not unset:
+            return
+
+        if share <= 0:
+            log(
+                f"the memory budget of {format_size(budget)} leaves nothing for the workers "
+                f"after the {format_size(held)} the host holds; no hard limit is derived"
+            )
+            return
+
+        for policy in unset:
+            policy.hard_limit = share
+
+        log(
+            f"worker hard limit {format_size(share)}: the memory budget of "
+            f"{format_size(budget)} less {format_size(held)} the host holds, over "
+            f"{self.worker_count} workers"
+        )
+
     def check_memory(self, state: WorkerState) -> None:
         """Section 7.7: hold a worker to the memory limits."""
 
@@ -3154,13 +3232,36 @@ class Host:
             else:
                 self.start_failures[index] = 0
 
-            self.emit(
-                "worker.exited",
-                "warning",
-                f"worker {index} (pid {pid}) exited with {describe(status)}, restarting",
-                group=self.group_of(index).name,
-                reason="crashed",
+            # Section 13.9: a SIGKILL nobody here sent, while the cgroup
+            # counts another kill for memory, is the kernel's.
+
+            kills = oom_kills(self.cgroup)
+            oom_killed = (
+                os.WIFSIGNALED(status)
+                and os.WTERMSIG(status) == signal.SIGKILL
+                and kills is not None
+                and self.oom_kills is not None
+                and kills > self.oom_kills
             )
+            self.oom_kills = kills
+
+            if oom_killed:
+                self.emit(
+                    "worker.oom_killed",
+                    "error",
+                    f"worker {index} (pid {pid}) was killed by the kernel for memory, restarting",
+                    group=self.group_of(index).name,
+                    reason="oom_killed",
+                )
+            else:
+                self.emit(
+                    "worker.exited",
+                    "warning",
+                    f"worker {index} (pid {pid}) exited with {describe(status)}, restarting",
+                    group=self.group_of(index).name,
+                    reason="crashed",
+                )
+
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
 
     def restart_due(self) -> None:
@@ -3330,6 +3431,25 @@ class Host:
                 os.unlink(self.control_path or "")
             except OSError:
                 pass
+
+
+def oom_kills(cgroup: str | None) -> int | None:
+    """Read the kernel's count of the cgroup's processes killed for memory."""
+
+    if cgroup is None:
+        return None
+
+    try:
+        with open(os.path.join(cgroup, "memory.events")) as events:
+            for line in events:
+                name, _, count = line.partition(" ")
+
+                if name == "oom_kill":
+                    return int(count)
+    except (OSError, ValueError):
+        pass
+
+    return None
 
 
 def format_size(size: int) -> str:
@@ -3718,6 +3838,20 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="SECONDS",
         help="how often a worker measures its memory",
     )
+    parser.add_argument(
+        "--memory-budget",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="the container's memory for the host and its workers, from which a hard limit "
+        "nobody set is derived",
+    )
+    parser.add_argument(
+        "--cgroup",
+        default=None,
+        metavar="DIR",
+        help="the container's cgroup directory, whose memory.events counts kills for memory",
+    )
     return parser.parse_args(argv)
 
 
@@ -3926,7 +4060,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         reflection=args.reflection,
         handoff=args.handoff,
+        cgroup=args.cgroup,
     )
+
+    if args.memory_budget is not None:
+        host.derive_hard_limit(args.memory_budget)
 
     if args.single:
         # Section 13.1: no fork, so a debugger attached to this process sees

@@ -169,6 +169,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests held on the event loops of ASGI workers.",
     },
     Family {
+        name: "muru_capacity_utilisation",
+        kind: Kind::Gauge,
+        help: "Busy worker slots over the slots, averaged over the last 30 seconds.",
+    },
+    Family {
         name: "muru_upstream_health",
         kind: Kind::Gauge,
         help: "Whether an upstream address takes requests: 1 in service, 0 unhealthy or ejected.",
@@ -801,10 +806,93 @@ fn release_key(app: &str, release: &str) -> ReleaseKey {
     }
 }
 
+/// How many seconds of samples `muru_capacity_utilisation` averages.
+const UTILISATION_WINDOW: usize = 30;
+
+/// Section 11.1: each group's busy slots over its slots, sampled every
+/// second and averaged over the last `UTILISATION_WINDOW`, a saturation
+/// signal for an autoscaler that the moment of a scrape cannot give: an
+/// I/O-bound application waiting on its database shows little CPU while
+/// its slots are full. One edge runs in a process, so one record serves.
+pub static UTILISATION: Utilisation = Utilisation {
+    windows: Mutex::new(BTreeMap::new()),
+};
+
+/// The recent busy and total slots of each group.
+pub struct Utilisation {
+    windows: Mutex<BTreeMap<GroupKey, Vec<(usize, usize)>>>,
+}
+
+/// A group by its application, release and name.
+type GroupKey = (String, String, String);
+
+impl Utilisation {
+    /// Take one second's sample of every group the routing has, and
+    /// forget the groups it no longer has.
+    pub fn sample(&self, routing: &Routing) {
+        let mut windows = self.windows.lock().expect("utilisation poisoned");
+        let mut seen = BTreeMap::new();
+
+        for pools in routing.app_pools() {
+            if pools.server().is_some() {
+                continue;
+            }
+
+            let (app, release) = pools.labels();
+
+            for (group, pool) in pools.pools() {
+                let workers = pool.workers();
+                let busy = workers.iter().map(|worker| worker.in_flight).sum();
+                let slots = workers.iter().map(|worker| worker.slots).sum();
+                let key = (app.to_owned(), release.to_owned(), group.clone());
+                let mut window = windows.remove(&key).unwrap_or_default();
+
+                if window.len() == UTILISATION_WINDOW {
+                    window.remove(0);
+                }
+
+                window.push((busy, slots));
+                seen.insert(key, window);
+            }
+        }
+
+        *windows = seen;
+    }
+
+    /// `muru_capacity_utilisation` for every group sampled.
+    pub fn samples(&self) -> Vec<Sample> {
+        let windows = self.windows.lock().expect("utilisation poisoned");
+
+        windows
+            .iter()
+            .map(|((app, release, group), window)| {
+                let busy: usize = window.iter().map(|(busy, _)| busy).sum();
+                let slots: usize = window.iter().map(|(_, slots)| slots).sum();
+
+                let ratio = if slots == 0 {
+                    0.0
+                } else {
+                    busy as f64 / slots as f64
+                };
+
+                Sample::new(
+                    "muru_capacity_utilisation",
+                    &[
+                        ("app", app.as_str()),
+                        ("release", release.as_str()),
+                        ("group", group.as_str()),
+                    ],
+                    ratio,
+                )
+            })
+            .collect()
+    }
+}
+
 /// Gauges from the worker pools of the routing tables in force: slots
 /// and queue depth per group, and the snapshot version.
 pub fn pool_samples(routing: &Routing) -> Vec<Sample> {
-    let mut samples = Vec::new();
+    let mut samples = UTILISATION.samples();
 
     for pools in routing.app_pools() {
         let (app, release) = pools.labels();

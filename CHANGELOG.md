@@ -9,6 +9,92 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a15 (2026-11-02)
+
+### Added
+
+- Added `muructl serve`, which runs one application as a container's main
+  process: the edge, controller, host and workers in one process tree,
+  production defaults, listening on `0.0.0.0:8080`, with settings from
+  `[tool.muru]`, its `[tool.muru.serve]` table, a file named by
+  `MURU_SERVE_CONFIG`, one `MURU_SERVE_*` environment variable per flag, and
+  the flags, in that order. `--print-config` shows where each setting came
+  from. Everything goes to standard output, as text or, with `--log-format
+  json`, as JSON objects, and `muructl` commands run inside the container
+  reach it through its run directory. ([#102](https://github.com/GrahamDumpleton/muru/issues/102))
+- Added the admin port of `muructl serve`, on `0.0.0.0:9090` by default:
+  `/livez`, `/readyz`, `/startupz` and `/metrics` for liveness, readiness
+  and startup probes and Prometheus, `/status` with `--admin-status`, and
+  `muructl probe ready` (or `live`, `startup`) for a health check in an image
+  with no curl. ([#103](https://github.com/GrahamDumpleton/muru/issues/103))
+- Added `--shutdown-delay` and `--shutdown-budget` to `muructl serve`
+  (`MURU_SERVE_SHUTDOWN_DELAY`, `MURU_SERVE_SHUTDOWN_BUDGET`). On SIGTERM,
+  readiness fails at once. For the delay the listener keeps accepting, with
+  every connection closing after its response. The whole stop fits inside
+  the budget, so a Kubernetes rolling update loses no requests and needs no
+  `preStop` hook. A serve table can now also set `runtime_dir`. ([#104](https://github.com/GrahamDumpleton/muru/issues/104))
+- `muructl serve` now sizes itself from the container's cgroup v2 limits.
+  `--processes auto`, the default, is the CPU limit rounded up, not the
+  node's cores. With a memory limit, each worker gets a hard limit unless
+  one is set: the limit, less headroom and what the host holds after
+  preload, divided between the workers. A worker the kernel kills for
+  memory anyway is reported as `worker.oom_killed` and counted in
+  `muru_worker_exits_total` with the reason `oom_killed`, which `muructl
+  run` and `muructl serve` now serve on `/metrics`, beside
+  `muru_worker_recycles_total`. ([#105](https://github.com/GrahamDumpleton/muru/issues/105))
+- `muructl serve` runs under an arbitrary user ID with group 0 and a
+  read-only root filesystem: everything it writes goes under one run
+  directory, `/run/muru` by default, it stops at once naming the volume it
+  needs when that cannot be written, and uploads spooled to disk are held to
+  `--spool-quota`. ([#106](https://github.com/GrahamDumpleton/muru/issues/106))
+- Under `muructl serve --log-format json`, Python logging writes JSON
+  records too. A record that is already a JSON object becomes the line's
+  object rather than a string inside another, and a traceback is gathered
+  into one record. Every JSON line carries the pod's name, namespace and
+  node, and the OpenTelemetry service and resource attributes, when they
+  are set. A log collector that splits records at newlines therefore keeps
+  each record and each traceback whole. ([#107](https://github.com/GrahamDumpleton/muru/issues/107))
+- Added `muru_capacity_utilisation`: the share of each group's worker
+  slots in use, sampled every second and averaged over 30 seconds, for an
+  autoscaler such as a Kubernetes HorizontalPodAutoscaler or KEDA. The
+  metrics guide shows how to scale on it and on the time requests wait for
+  a slot. ([#108](https://github.com/GrahamDumpleton/muru/issues/108))
+- `muructl serve` never builds an environment, installs an interpreter or
+  fetches the runtime library: it finds the interpreter in the image and the
+  runtime library in the environment or `--runtime-dir` (`/opt/muru` by
+  default), and stops naming the build step that should have provided what
+  is missing. ([#110](https://github.com/GrahamDumpleton/muru/issues/110))
+- Every Python log record now carries the request it was logged in and
+  where it was logged, as `muru_request_id`, `muru_app`, `muru_release`,
+  `muru_group` and `muru_worker`, for an application's own format. The
+  `json` log format writes the request id as `request_id`. ([#168](https://github.com/GrahamDumpleton/muru/issues/168))
+
+### Changed
+
+- Log lines now carry a time where it is wanted: every line in the daemon's
+  log files, and in output redirected to a file, starts with the full UTC
+  time (`2026-11-02T05:42:22.836Z`); `muructl logs` shows it, with
+  `--no-timestamps` to leave it off; and `muructl run --timestamps`,
+  `muructl daemon run --timestamps`, `timestamps = true` in the run table or
+  `[logs] timestamps = true` put it in front of every terminal line. The
+  access log's terminal line shows the local clock, the dashboard shows
+  times on the browser's clock with the full time on hover, and the daemon's
+  own messages read like Muru's other lines, `muru: warning: ...` with the
+  event's details in brackets. ([#93](https://github.com/GrahamDumpleton/muru/issues/93))
+- `muructl debug`, `muructl restart` and `muructl logging level` no longer
+  need an application against `muructl run` or `muructl serve`, which
+  serve only one, so `kubectl exec deploy/shop -- muructl debug stacks`
+  works as it is. ([#291](https://github.com/GrahamDumpleton/muru/issues/291))
+
+### Documentation
+
+- Added a guide to running `muructl serve` as a Kubernetes Deployment:
+  probes, a rolling update that loses no requests, a restricted security
+  context, sizing from resource limits and resizing, logs for a collector, autoscaling
+  with an HPA or KEDA, and migrations as a Job. The container guide gained
+  a Compose service. ([#119](https://github.com/GrahamDumpleton/muru/issues/119))
+
+
 ## 0.1.0a14 (2026-11-01)
 
 ### Added

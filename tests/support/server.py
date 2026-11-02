@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import signal
 import socket
 import ssl
@@ -21,6 +22,18 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "apps"
 
 LOG_TAIL_LINES = 80  # how much of the log a timed-out `wait_for_log` prints
+
+# The full UTC time a line written to a file starts with (section 11.8 of
+# the specification): muructl's output goes to a file here, so every line
+# carries one.
+
+TIMED = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ", re.MULTILINE)
+
+
+def untimed(text: str) -> str:
+    """Return text with the time each line starts with taken off."""
+
+    return TIMED.sub("", text)
 
 
 def muructl_path() -> Path | None:
@@ -188,7 +201,12 @@ class Server:
             return b"".join(chunks)
 
     def log(self) -> str:
-        """Return everything the server has written to its log so far."""
+        """Return everything the server has written to its log so far, without the times."""
+
+        return untimed(self.timed_log())
+
+    def timed_log(self) -> str:
+        """Return the log as written, each line starting with its time."""
 
         return self.log_path.read_text(errors="replace")
 
@@ -202,7 +220,7 @@ class Server:
 
         with self.log_path.open("rb") as handle:
             handle.seek(self._log_offset)
-            return handle.read().decode(errors="replace")
+            return untimed(handle.read().decode(errors="replace"))
 
     def wait_for_log(self, text: str, timeout: float = 5.0) -> bool:
         """Wait until the log written since `mark_log` contains text.

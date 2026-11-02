@@ -78,7 +78,9 @@ pub fn become_init() {
                 libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
             }
 
-            eprintln!("muru: could not start as init ({error}); running as PID 1 without one");
+            muru_common::muru_eprintln!(
+                "could not start as init ({error}); running as PID 1 without one"
+            );
         }
         0 => {
             // SAFETY: as above, in the child, which is single-threaded;

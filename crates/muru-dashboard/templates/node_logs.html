@@ -1,6 +1,6 @@
 <h2>Logs</h2>
 {% for panel in data.logs %}
 <h3>{{ panel.app }}@{{ panel.release }}</h3>
-<pre>{% for line in panel.lines %}{{ line }}
+<pre>{% for line in panel.lines %}{% if !line.time.is_empty() %}<time datetime="{{ line.time }}">{{ line.time }}</time> {% endif %}{{ line.text }}
 {% endfor %}</pre>
 {% endfor %}
