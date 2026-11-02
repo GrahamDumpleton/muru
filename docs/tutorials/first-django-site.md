@@ -1,12 +1,5 @@
 # Your first Django site
 
-```{admonition} Status
-:class: note
-
-This tutorial assumes you have done [the first tutorial](first-wsgi-app.md)
-and [deploy with the daemon and roll back](deploy-and-roll-back.md).
-```
-
 Django runs on Muru unchanged: the `wsgi.py` and `asgi.py` that
 `startproject` writes are all Muru needs. What changes is everything
 `manage.py runserver` used to do for you, static files above all.
@@ -15,6 +8,10 @@ In about twenty minutes you will make a Django project, serve it in
 development with `muructl run`, get its admin styled and log in, serve
 the same project over ASGI, and then deploy it to the daemon with
 production settings, the edge serving the static files itself.
+
+This tutorial assumes you have done [the first
+tutorial](first-wsgi-app.md) and [deploy with the daemon and roll
+back](deploy-and-roll-back.md).
 
 ## A project
 

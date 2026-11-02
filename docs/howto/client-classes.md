@@ -1,13 +1,5 @@
 # Client classes and rate limits
 
-```{admonition} Status
-:class: note
-
-Client classes, routing by class, rate limits, method restrictions and
-route site modes, under the daemon, with classes and limits declared in
-the daemon's own configuration file or in applied files.
-```
-
 The edge gives every request a client class, which the access log,
 metrics, rate limits and the application see. Classification is for
 protecting capacity and routing, not a web application firewall: a

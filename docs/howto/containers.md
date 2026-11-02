@@ -1,17 +1,5 @@
 # In a container
 
-```{admonition} Status
-:class: note
-
-`muructl serve` runs one application in one container under Docker,
-Compose, Podman or Kubernetes: configured from the image and the
-environment, with probes and metrics on an admin port, logs on standard
-output and a drain on `docker stop` or a Kubernetes rolling update.
-Workers are sized from the container's CPU and memory limits. A
-[Compose](#compose) service and [a Kubernetes Deployment](kubernetes.md)
-are shown.
-```
-
 `muructl serve` runs one application as the container's main process: the
 edge, the controller, the host and its workers, with nothing kept between
 starts. In a Dockerfile it is one line:

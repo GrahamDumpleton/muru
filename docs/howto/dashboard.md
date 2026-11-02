@@ -1,17 +1,12 @@
 # The dashboard
 
-```{admonition} Status
-:class: note
-
 A development run and the daemon each serve a dashboard on a loopback
-address with charts over the last hour or day. The daemon's needs a
-signed-in session, serves the same figures as JSON, with rollouts,
-scaling and maintenance, streams its history and events with
-Server-Sent Events, and can turn maintenance mode on and off for a
-session that may act, which can also promote, roll back and drain
-releases, pin a group's workers and restart a worker, and shows each
-running release's workers with their status, stacks, tasks and memory.
-```
+address, with the workers, requests and latency, charts over time, and
+pages for looking into each worker. The daemon's needs a signed-in
+session, serves the same figures as JSON and streams its history and
+events, and a session that may act can turn maintenance mode on and off,
+promote, roll back and drain releases, pin a group's workers and restart
+a worker.
 
 ## In development mode
 

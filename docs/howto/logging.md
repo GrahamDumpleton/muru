@@ -6,19 +6,6 @@ in a release's workers for a period, without a restart; the
 [inspecting workers guide](debugging.md) has the details.
 ```
 
-```{admonition} Status
-:class: note
-
-Development mode writes to the terminal, or a file. Under the daemon each
-release and the edge write files in the log directory, `muructl logs`
-shows or follows them, the daemon rotates and compresses them, and
-`muructl logs reopen` works with logrotate.
-Python's `logging` gets a level and format per release, and `muructl
-logging level` changes a logger's level for a period, and every record
-carries the request it was logged for. Journald and daemon-wide logging
-defaults are still to come.
-```
-
 A development run writes two kinds of lines to the terminal: what your
 application and Muru's own processes print, and one access log line per
 request. The daemon writes the same lines to files, one per release and

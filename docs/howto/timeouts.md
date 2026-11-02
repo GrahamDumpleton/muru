@@ -1,15 +1,5 @@
 # Timeouts
 
-```{admonition} Status
-:class: note
-
-The edge's timeouts, the soft timeout, which interrupts a request that
-runs too long, the hard timeout, which replaces a worker whose request
-never returns, the loop stall timeout, which replaces an ASGI worker
-whose event loop is held, and the GIL stall timeout, which replaces a
-worker in which Python has stopped running at all.
-```
-
 Every timeout has a name, a default, and a response the client sees when
 it fires. Change one with `--timeout NAME=DURATION`, repeatable, where a
 duration is `250ms`, `2s` or a bare number of seconds:

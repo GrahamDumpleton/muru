@@ -1,14 +1,5 @@
 # Authentication sub-requests
 
-```{admonition} Status
-:class: note
-
-A route's `auth` table: the handler sub-request, the allow, deny,
-redirect and fail-closed outcomes, copied headers, the decision cache,
-guarded static directories, WebSocket upgrades and upstream routes, and
-[HTTP upstreams](upstreams.md) as handlers.
-```
-
 A route can require a decision from an application before the edge
 serves it. The edge sends a short sub-request to an application path and
 goes on only when that answers 2xx. This guards what cannot decide for

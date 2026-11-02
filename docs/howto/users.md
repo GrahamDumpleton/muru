@@ -1,13 +1,8 @@
 # Per-application users
 
-```{admonition} Status
-:class: note
-
-A root daemon runs the edge and every application as a service user or
-as the user an application names, never as root unless told to. Resource
-limits through cgroups, the admin group and dropping the daemon's own
-capabilities are still to come.
-```
+A daemon that runs as root runs the edge and every application as a
+service user, or as the user an application names, and never as root
+unless told to.
 
 ## The service user
 

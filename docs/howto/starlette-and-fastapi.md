@@ -1,17 +1,12 @@
 # Starlette and FastAPI
 
-```{admonition} Status
-:class: note
-
-Both frameworks, and Django's ASGI handler, are part of Muru's own test
-suite, so what this page describes is exercised on every change. The
-examples use development mode; under the [daemon](daemon.md) the same
-entrypoint is deployed.
-```
-
 Nothing in either framework needs to know about Muru. Point `muructl run`
 at the ASGI application the framework already gives you; it is detected
 as ASGI and served on the worker's event loop.
+
+Both frameworks, and Django's ASGI handler, are part of Muru's own test
+suite. The examples use development mode; under the [daemon](daemon.md)
+the same entrypoint is deployed.
 
 ## Starlette
 

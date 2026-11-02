@@ -1,15 +1,7 @@
 # Connections and keep-alive
 
-```{admonition} Status
-:class: note
-
-Limits on open connections per listener and per client, keep-alive
-timeouts with a longer one for trusted proxies, a request limit per
-connection and the HTTP/2 stream limit, set in the daemon's `[limits]`
-table or by `muructl run` flags. Eviction of idle connections under
-pressure, the shrinking idle timeouts, per-listener settings, HTTP/2
-idle closure and Unix socket listeners are still to come.
-```
+The edge limits the connections it holds open, per listener and per
+client, and how long and how much each one may be used:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |

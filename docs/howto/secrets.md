@@ -1,14 +1,5 @@
 # Secrets
 
-```{admonition} Status
-:class: note
-
-Secret stores of the file, env and exec kinds, references from a
-release's env table, delivery as variables or files, and `muructl secret`
-for file stores. A delivered file belongs to the application's
-[user](users.md).
-```
-
 Applications need credentials, and the configuration refers to them by
 name so that exports, events, logs and dry runs never contain their
 values. A secret lives in a store the daemon's configuration file

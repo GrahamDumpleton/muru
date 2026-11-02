@@ -1,13 +1,5 @@
 # Deploy with the daemon and roll back
 
-```{admonition} Status
-:class: note
-
-This tutorial runs the daemon as your own user, with its files in your
-user directories. It assumes you have done
-[the first tutorial](first-wsgi-app.md).
-```
-
 `muructl run` is for development: it serves one application until you
 stop it. The daemon is for an application that stays up. It runs in the
 background, keeps every release you deploy in a state store, and moves
@@ -17,6 +9,10 @@ In about fifteen minutes you will start the daemon, deploy a small
 application, deploy a release that fails to start and see the one before
 it keep serving, deploy a fix, roll it back, and stop and start the daemon
 without the application noticing.
+
+This tutorial runs the daemon as your own user, with its files in your
+user directories. It assumes you have done [the first
+tutorial](first-wsgi-app.md).
 
 ## A project with releases
 

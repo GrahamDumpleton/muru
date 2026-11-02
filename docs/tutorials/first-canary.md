@@ -1,13 +1,5 @@
 # Your first canary
 
-```{admonition} Status
-:class: note
-
-This tutorial carries on from
-[deploy with the daemon and roll back](deploy-and-roll-back.md), in the
-same `site` directory with the same daemon.
-```
-
 A deploy moves all the traffic to a new release as soon as it is ready.
 That catches a release that cannot start, but not one that starts and
 then fails some of the requests it serves. A canary gives the new
@@ -20,6 +12,10 @@ In about fifteen minutes you will run a canary of a release with a bug
 and watch the daemon roll it back, then run one of a good release,
 check it yourself on the way, approve its second step and see it
 promoted.
+
+This tutorial carries on from [deploy with the daemon and roll
+back](deploy-and-roll-back.md), in the same `site` directory with the
+same daemon.
 
 ## Start where you left off
 

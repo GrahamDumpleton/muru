@@ -1,13 +1,5 @@
 # Releases and traffic policies
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented under the daemon, on one node.
-Mirroring requests to a candidate as shadow traffic, and overlays that
-activate on conditions, are still to come.
-```
-
 Under the daemon an application is never changed in place. Each deploy
 creates a release, the new release runs beside the old, and the edge
 decides for every request which of them answers it. This page explains

@@ -1,14 +1,5 @@
 # WSGI environ
 
-```{admonition} Status
-:class: note
-
-These are the keys Muru sets, in development mode and under the daemon.
-Keys still to come are listed with the rest in
-[appendix D](../project/design/appendices/d-environ-keys-scope-extensions-and-environment-variables.md)
-of the design specification.
-```
-
 Muru builds the environ in Rust from the request the edge received. The
 standard keys follow PEP 3333; this page lists how Muru fills them and what
 it adds.

@@ -1,11 +1,5 @@
 # Python API
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented.
-```
-
 The `muru` package is installed in the interpreter that runs your
 application. It is safe to import anywhere, including outside Muru and in
 tests, where every function returns development defaults.

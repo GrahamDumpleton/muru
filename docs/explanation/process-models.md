@@ -1,11 +1,5 @@
 # Process models, threads and the GIL
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented.
-```
-
 Your application runs in worker processes. This page explains how those
 processes come to exist, what runs your code inside them, and how to choose
 between processes and threads.

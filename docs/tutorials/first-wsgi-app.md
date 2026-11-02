@@ -1,17 +1,13 @@
 # Run your first WSGI app
 
-```{admonition} Status
-:class: note
-
-This tutorial covers development mode; the [daemon](../howto/daemon.md)
-guide takes an application on to production. It uses the pre-releases on
-PyPI; while Muru has only pre-releases, pip and uv
-install the newest one without being asked for `--pre`.
-```
-
 In about ten minutes you will serve a small WSGI application with
 `muructl run`, read what the terminal tells you, see what happens when the
 application fails, and try watch reload, HTTPS and the dashboard.
+
+This tutorial covers development mode; the [daemon](../howto/daemon.md)
+guide takes an application on to production. It uses the pre-releases on
+PyPI; while Muru has only pre-releases, pip and uv install the newest
+one without being asked for `--pre`.
 
 ## Install
 
@@ -185,8 +181,8 @@ on loopback only and is read-only.
   are `--access-log`, `--timeout` and `--hooks`.
 - A project can carry its settings in a `[tool.muru]` table in
   pyproject.toml, so that `muructl run` with no arguments does the right
-  thing; the [configuration reference](../project/design/appendices/c-configuration-reference.md)
-  in the design specification lists the keys.
+  thing; [settings for muructl run](../howto/run-settings.md) lists the
+  keys.
 - [Preload and fork safety](../explanation/preload.md) explains the import
   check that runs before workers are forked, and the message you will see
   when an import opens a connection too early.

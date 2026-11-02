@@ -1,16 +1,5 @@
 # HTTP upstreams
 
-```{admonition} Status
-:class: note
-
-`[upstream.NAME]` tables: routes, static fallbacks, traffic shares and
-authentication handlers that are unmanaged HTTP servers, over HTTP/1.1,
-h2c or HTTP/2 with TLS, by TCP or Unix socket, with active probes and
-passive ejection. Servers Muru starts and supervises itself are
-[managed HTTP servers](managed-servers.md). `X-Muru-Sendfile` from a
-trusted upstream is in [file hints](file-hints.md).
-```
-
 An upstream is an HTTP server Muru does not run: an existing deployment
 behind another server, a service in another language, or anything else
 that answers HTTP. A route can send its requests there instead of to an
@@ -18,6 +7,9 @@ application, and the rest of the edge works as it does for applications:
 virtual hosts, static files, internal redirects, error pages,
 compression, and traffic policies that share a route between an
 application's releases and an upstream.
+
+Servers Muru starts and supervises itself are [managed HTTP
+servers](managed-servers.md).
 
 ## Naming an upstream
 

@@ -1,15 +1,5 @@
 # Custom error pages and maintenance mode
 
-```{admonition} Status
-:class: note
-
-Custom pages by status or status and reason at the node, host, release
-and route levels, as a file, a template or an application path; the
-error override; and maintenance mode, from `muructl maintenance on` or
-the [dashboard](dashboard.md#actions), with exemptions by path, address
-and cookie.
-```
-
 When Muru answers a request itself, the response is one of the
 [built-in error pages](../reference/errors.md): negotiated between HTML,
 a problem document and plain text, with the status, the reason and the

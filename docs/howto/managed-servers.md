@@ -1,15 +1,5 @@
 # Managed HTTP servers
 
-```{admonition} Status
-:class: note
-
-Releases with `kind = 'http'`: a command Muru starts, probes, supervises
-and stops, with profiles for gunicorn, uvicorn, Granian, mod_wsgi-express
-and generic servers, routed to like an upstream so traffic policies,
-rollouts, drains and rollbacks apply to it. Instance autoscaling and
-socket activation are still to come.
-```
-
 A managed HTTP server release runs an ordinary HTTP server, such as the
 gunicorn or uvicorn an existing deployment already uses, instead of
 Muru's own workers. Muru starts the server's instances, waits until they

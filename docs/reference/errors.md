@@ -1,14 +1,5 @@
 # Error responses
 
-```{admonition} Status
-:class: note
-
-These are the responses the edge generates. Three more `503` reasons,
-`cold_start_timeout`, `release_failed` and `draining`, are still to come;
-[appendix C](../project/design/appendices/c-configuration-reference.md)
-of the design specification has the full planned list.
-```
-
 When Muru itself answers a request, rather than your application, the
 response has a status and a reason. The reason names the cause more
 precisely than the status, appears in the access log line as

@@ -24,9 +24,9 @@ runtime library provided by `muructl` itself, `muructl check`, and a
 built-in init with draining on `docker stop` for a container's main
 process, handing a request between WSGI and ASGI in code, timestamps on
 every log line and the request id on Python log records, and `--json`,
-an MCP server and a project skill for coding agents. The [changelog](changelog.md) lists what each release added,
-and each how-to guide opens with a status note saying what of its
-feature is built and what is still to come. The scope and exit criteria
+an MCP server and a project skill for coding agents. The
+[changelog](changelog.md) lists what each release added, and what is
+still to come is in the goals below and in GitHub issues. The scope and exit criteria
 of each phase are in [section 14.5](design/14-implementation-plan.md) of
 the design specification.
 

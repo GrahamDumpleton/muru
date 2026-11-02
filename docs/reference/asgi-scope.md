@@ -1,15 +1,5 @@
 # ASGI scope
 
-```{admonition} Status
-:class: note
-
-These are the keys Muru sets, in development mode and under the daemon,
-for `http` and `websocket` scopes. Keys still to come are listed with the
-rest in
-[appendix D](../project/design/appendices/d-environ-keys-scope-extensions-and-environment-variables.md)
-of the design specification.
-```
-
 Muru builds the scope in Rust from the request the edge received. The
 standard keys follow ASGI 3.0 (`spec_version` 2.4); this page lists how
 Muru fills them and what it adds.

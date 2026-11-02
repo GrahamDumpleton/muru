@@ -1,15 +1,5 @@
 # A slow request
 
-```{admonition} Status
-:class: note
-
-This tutorial runs under the daemon and assumes you have done
-[deploy with the daemon and roll back](deploy-and-roll-back.md). The same
-steps work in `muructl run`, where the soft timeout's messages appear in
-the terminal and the `muructl debug` commands find the run from the
-project directory without a flag.
-```
-
 Sooner or later an application has a request that takes far longer than
 it should. Muru has two kinds of help. A soft timeout stops a request
 that runs too long, answers the client, and records exactly where the
@@ -21,6 +11,12 @@ In about fifteen minutes you will deploy an application with a slow
 report, catch its worst case with a soft timeout, see a request in
 progress with `debug stacks`, and profile the release under load to find
 where its time goes.
+
+This tutorial runs under the daemon and assumes you have done [deploy
+with the daemon and roll back](deploy-and-roll-back.md). The same steps
+work in `muructl run`, where the soft timeout's messages appear in the
+terminal and the `muructl debug` commands find the run from the project
+directory without a flag.
 
 ## A slow report
 

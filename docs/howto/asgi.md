@@ -1,13 +1,9 @@
 # ASGI applications
 
-```{admonition} Status
-:class: note
-
-Muru serves ASGI over HTTP and WebSockets, in development mode and
-under the daemon, with the `pathsend` and `zerocopysend` file extensions ([file hints](file-hints.md)).
-Response trailers are not served, except on [gRPC](grpc.md) calls. WebSockets over HTTP/2 (extended
-CONNECT) are accepted but not yet covered by the test suite.
-```
+Muru serves ASGI applications over HTTP and WebSockets, in development
+mode and under the daemon, with the `pathsend` and `zerocopysend`
+extensions for sending files ([file hints](file-hints.md)). Response
+trailers are not sent, except on [gRPC](grpc.md) calls.
 
 Point `muructl run` at the ASGI callable, exactly as for WSGI:
 

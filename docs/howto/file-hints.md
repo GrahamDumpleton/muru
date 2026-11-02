@@ -1,14 +1,5 @@
 # File hints
 
-```{admonition} Status
-:class: note
-
-Both forms of file hint: by descriptor, for `wsgi.file_wrapper` and the
-ASGI `pathsend` and `zerocopysend` extensions, and by path, for
-`X-Muru-Sendfile` and a second header a mount names, from applications,
-trusted upstreams and managed servers.
-```
-
 A file hint hands the body of a response to the edge, which sends the
 file itself while the application thread or task is free. There are two
 forms. By descriptor, the application's own open file is passed to the
