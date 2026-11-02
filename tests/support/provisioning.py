@@ -153,9 +153,11 @@ def run_until_serving(
     *args: str,
     python: Path | None = None,
     reload: bool = False,
+    cwd: Path | None = None,
 ) -> tuple[subprocess.Popen[bytes], Path]:
-    """Start `muructl run` on the project and return the process once it
-    serves, with its log; the caller stops it with `stop`."""
+    """Start `muructl run` on the project, from `cwd` when given, and
+    return the process once it serves, with its log; the caller stops it
+    with `stop`."""
 
     log = Path(tempfile.mkstemp(prefix="muru-provisioning-", suffix=".log")[1])
     command = [str(muructl()), "run", str(directory), "--port", "auto", "--processes", "1", *args]
@@ -171,7 +173,7 @@ def run_until_serving(
 
     with log.open("wb") as handle:
         process = subprocess.Popen(
-            command, stdout=handle, stderr=subprocess.STDOUT, env=environment
+            command, stdout=handle, stderr=subprocess.STDOUT, env=environment, cwd=cwd
         )
 
     deadline = time.monotonic() + 120

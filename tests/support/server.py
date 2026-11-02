@@ -373,6 +373,12 @@ def start(
         server.stop()
         raise RuntimeError(f"{error}\n{server.log()}") from error
 
+    # muructl prints its startup lines once the listener accepts: serving,
+    # the dashboard, then the admin socket (or "no admin socket"), with only
+    # the watching line after it. Waiting for that line lets a test read
+    # the startup lines whole (issue 309).
+
+    server.wait_for_log("admin socket", timeout=10)
     return server
 
 

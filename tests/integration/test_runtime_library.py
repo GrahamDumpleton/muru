@@ -16,12 +16,12 @@ from support import provisioning as prov
 
 
 def run_until_serving(
-    directory: Path, python: Path, env: dict[str, str]
+    directory: Path, python: Path, env: dict[str, str], cwd: Path | None = None
 ) -> tuple[subprocess.Popen[bytes], str]:
     """Start muructl run on the project with that interpreter and return
     the process once it serves, with its output so far."""
 
-    process, log = prov.run_until_serving(directory, env, python=python)
+    process, log = prov.run_until_serving(directory, env, python=python, cwd=cwd)
     return process, log.read_text(errors="replace")
 
 
@@ -67,12 +67,15 @@ def test_an_environment_without_muru_gets_the_library_from_the_wheel_directory(
     finally:
         prov.stop(process)
 
-    # The second run finds it unpacked and says so without fetching.
+    # The second run finds it unpacked and says so without fetching. Its
+    # cache is named relative to where the run starts, which is not the
+    # project the host starts in, and is still found (issue 308).
 
     process, text = run_until_serving(
         prov.project(tmp_path / "project"),
         python,
-        {"MURU_OFFLINE": "1", "MURU_CACHE_DIR": str(cache)},
+        {"MURU_OFFLINE": "1", "MURU_CACHE_DIR": "cache"},
+        cwd=tmp_path,
     )
 
     try:
