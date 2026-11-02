@@ -55,6 +55,7 @@ def test_without_settings_python_defaults_hold_in_the_platform_format() -> None:
             "MURU_LOG_FORMAT": "standard",
             "root_level": "WARNING",
             "noisy_level": "NOTSET",
+            "request_id": report["request_id"],
         }
         assert server.wait_for_log("WARNING noisy: noise for /plain")
         output = server.log_since_mark()
@@ -65,13 +66,26 @@ def test_without_settings_python_defaults_hold_in_the_platform_format() -> None:
         server.stop()
 
 
+def test_every_record_carries_the_request_beside_what_the_application_passes() -> None:
+    server = support.start("logging_wsgi:application", workers=1, threads=1)
+
+    try:
+        server.mark_log()
+        report = json.loads(server.get("/tagged").body)
+        line = f"tagged {report['request_id']} 0 mine served /tagged"
+        assert server.wait_for_log(line), server.log_since_mark()
+    finally:
+        server.stop()
+
+
 def test_a_project_table_sets_level_format_loggers_and_warnings() -> None:
     server = support.start(str(LOGGER), workers=None, threads=None, chdir=None)
 
     try:
         server.mark_log()
         report = json.loads(server.get("/warn").body)
-        assert report == {"MURU_LOG_LEVEL": "INFO", "MURU_LOG_FORMAT": "json"}
+        assert report["MURU_LOG_LEVEL"] == "INFO"
+        assert report["MURU_LOG_FORMAT"] == "json"
         assert server.wait_for_log('"logger": "py.warnings"')
         records = worker_records(server.log_since_mark())
         served = next(record for record in records if record["message"] == "served /warn")
@@ -79,6 +93,7 @@ def test_a_project_table_sets_level_format_loggers_and_warnings() -> None:
         assert served["logger"] == "demo"
         assert (served["app"], served["group"], served["worker"]) == ("logger", "default", 0)
         assert served["time"].endswith("Z")
+        assert served["request_id"] == report["request_id"]
 
         # The noisy logger is raised to ERROR, and warnings are captured.
 
@@ -92,7 +107,7 @@ def test_a_project_table_sets_level_format_loggers_and_warnings() -> None:
 def test_a_deployed_release_uses_the_project_settings(daemon: Daemon) -> None:
     assert daemon.deploy("logger", LOGGER) == "muru: release logger@r1 is ready and serving"
     report = json.loads(daemon.request("/one").body)
-    assert report == {"MURU_LOG_LEVEL": "INFO", "MURU_LOG_FORMAT": "json"}
+    assert (report["MURU_LOG_LEVEL"], report["MURU_LOG_FORMAT"]) == ("INFO", "json")
     wait_for(lambda: '"message": "served /one"' in daemon.muructl("logs", "logger").stdout)
     records = worker_records(daemon.muructl("logs", "logger").stdout)
     served = next(record for record in records if record["message"] == "served /one")

@@ -65,7 +65,7 @@ loggers = { urllib3 = "WARNING" }
 | Key | Default | Effect |
 | --- | --- | --- |
 | `level` | `WARNING`, Python's own | the root logger's level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
-| `format` | `standard` | `standard` writes `LEVEL logger: message`, with no time since Muru adds one where the output wants it; `json` writes one object per record with the time, level, logger, message, application, release, group and worker, and the exception when there is one; anything else is a `logging` format string |
+| `format` | `standard` | `standard` writes `LEVEL logger: message`, with no time since Muru adds one where the output wants it; `json` writes one object per record with the time, level, logger, message, application, release, group and worker, the request id during a request, and the exception when there is one; anything else is a `logging` format string |
 | `capture_warnings` | `false` | route `warnings.warn` through the `py.warnings` logger |
 | `loggers` | none | levels for named loggers |
 
@@ -83,6 +83,27 @@ import muru
 
 logging.config.dictConfig(muru.logging.default_config())
 ```
+
+Every record carries the request it was logged in and where it was
+logged, as attributes an application's own format can use:
+
+| Attribute | Value |
+| --- | --- |
+| `muru_request_id` | the request's id, as in the [access log](#the-access-log), or `None` outside a request |
+| `muru_app` | the application |
+| `muru_release` | the release |
+| `muru_group` | the worker group |
+| `muru_worker` | the worker's index in its group, or `None` in the host |
+
+```python
+handler.setFormatter(
+    logging.Formatter("%(levelname)s [%(muru_request_id)s] %(name)s: %(message)s")
+)
+```
+
+The `muru_` prefix keeps them apart from what an application passes in
+`extra`, so a middleware that logs with `extra={"request_id": ...}` keeps
+working.
 
 ## The access log
 

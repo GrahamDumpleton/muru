@@ -49,7 +49,7 @@ The dashboard reads the same values from in-memory history. OTLP metric export i
 ## 11.4 Python logging defaults
 
 - Before importing the application, the host sets the root logger level and replaces logging.lastResort with a platform handler using the configured format (a format string or json) that writes to stderr. A lastResort handler is used only when no handler exists in a logger's hierarchy, so basicConfig and dictConfig behave exactly as without Muru.
-- Optional: request_id and Muru tags on every record, logging.captureWarnings, and a per-logger level map.
+- Every record carries the request id and the Muru tags, through a record factory installed with the defaults, as `muru_request_id`, `muru_app`, `muru_release`, `muru_group` and `muru_worker`, so an application's own format can use them; the prefix keeps them apart from an application's `extra`, which `logging` refuses to let overwrite an attribute the record already has (OpenTelemetry's logging instrumentation prefixes its own the same way). The json format writes the request id as `request_id`. Optional: logging.captureWarnings and a per-logger level map.
 - Precedence: Python default, daemon configuration, application, release, the application's own configuration, then time-limited runtime overrides (muructl logging level RELEASE --logger NAME --level DEBUG --for 15m).
 - MURU_LOG_LEVEL, MURU_LOG_FORMAT and muru.logging.default_config() let applications adopt the platform defaults explicitly.
 - The standard format has no time, because Muru adds one where the output wants it (section 11.8); the json format carries the record's creation time in its `time` field.

@@ -9,6 +9,13 @@ hierarchy, so an application that configures logging behaves exactly as
 it does without Muru. ``default_config()`` is the same defaults as a
 dictConfig dictionary, for applications that want to adopt them
 explicitly.
+
+Every record carries the request it was logged in and where it was
+logged, as ``muru_request_id``, ``muru_app``, ``muru_release``,
+``muru_group`` and ``muru_worker``, so an application's own format can
+use them (``%(muru_request_id)s``). The prefix keeps them apart from what
+an application passes in ``extra``, which ``logging`` refuses to let
+overwrite an attribute the record already has.
 """
 
 from __future__ import annotations
@@ -18,9 +25,10 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from typing import Any
 
-from muru._context import context
+from muru._context import context, request_id
 
 __all__ = ["STANDARD_FORMAT", "JsonFormatter", "default_config", "formatter"]
 
@@ -48,6 +56,11 @@ class JsonFormatter(logging.Formatter):
             "group": where.group,
             "worker": where.worker_id,
         }
+
+        current = getattr(record, "muru_request_id", None) or request_id()
+
+        if current is not None:
+            line["request_id"] = current
 
         if record.exc_info and record.exc_info[0] is not None:
             line["exception"] = self.formatException(record.exc_info)
@@ -101,6 +114,23 @@ class _FallbackHandler(logging.StreamHandler):  # type: ignore[type-arg]
         super().emit(record)
 
 
+def _tagging(factory: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:
+    """Wrap a record factory so every record carries the Muru tags."""
+
+    def tagged(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = factory(*args, **kwargs)
+        where = context()
+        record.muru_request_id = request_id()
+        record.muru_app = where.app
+        record.muru_release = where.release
+        record.muru_group = where.group
+        record.muru_worker = where.worker_id
+        return record
+
+    tagged.muru_tagging = True  # type: ignore[attr-defined]
+    return tagged
+
+
 def default_config() -> dict[str, Any]:
     """Return the platform defaults as a ``logging.config.dictConfig`` dictionary.
 
@@ -146,6 +176,12 @@ def _install(
 
     os.environ["MURU_LOG_LEVEL"] = level or "WARNING"
     os.environ["MURU_LOG_FORMAT"] = format or "standard"
+
+    factory = logging.getLogRecordFactory()
+
+    if not getattr(factory, "muru_tagging", False):
+        logging.setLogRecordFactory(_tagging(factory))
+
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(formatter(format or "standard"))
     logging.lastResort = handler
