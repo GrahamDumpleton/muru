@@ -51,6 +51,7 @@ intersphinx_mapping = {
 html_theme = "furo"
 html_title = "Muru"
 html_static_path = ["_static"]
+html_css_files = ["layout.css"]
 
 # The configuration JSON Schemas, served at schema/NAME.schema.json.
 
