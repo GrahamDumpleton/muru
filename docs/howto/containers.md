@@ -27,13 +27,13 @@ built when the container starts.
 
 ## An image
 
-The image holds the application's environment and the runtime library,
-both made when the image is built:
+The image holds `muructl`, the application's environment and the runtime
+library, all added when the image is built:
 
 ```dockerfile
 FROM python:3.13-slim AS build
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-RUN pip install --pre muructl
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install muructl
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN muructl build --deployment --deps-only --no-runtime --target /app/.venv
@@ -41,15 +41,30 @@ COPY . .
 RUN muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
 
 FROM python:3.13-slim
+COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
 COPY --from=build /app /app
 COPY --from=build /opt/muru /opt/muru
-COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
 WORKDIR /app
-RUN useradd --uid 10001 app
+RUN useradd --uid 10001 app && install -d -o 10001 -g 0 -m 0770 /run/muru
 USER 10001
 EXPOSE 8080 9090
 CMD ["muructl", "serve"]
 ```
+
+`uv tool install` installs `muructl` from PyPI into an environment of its
+own and links the command into `/usr/local/bin`. It needs no pip, picks
+the build for the base's C library, glibc or musl, and fetches a Python
+for the tool's environment when the base has none. `muructl` is a single
+executable, so the second stage copies the binary alone, and
+`COPY --from` copies the file the link points to. `uv tool install
+muructl==0.1.0a15` pins a version; the runtime library the build fetches
+is always the one matching `muructl`'s version.
+
+`/run/muru` is where `muructl serve` writes at run time, and only root
+can create it, so the image makes it for the application's user, and
+for group 0, under which OpenShift runs an arbitrary user ID. With a
+read-only root filesystem, a volume mounted there takes its place
+([files it writes](#files-it-writes)).
 
 The two `muructl build` steps install from `uv.lock` without resolving
 anything:
@@ -90,6 +105,88 @@ working directory, or in `--chdir`. Its interpreter is the first of:
 The runtime library is the environment's own `muru` when it matches
 muructl's version, or else the directory `muructl build --runtime-dir`
 filled, `/opt/muru` by default.
+
+### What muructl build runs
+
+`muructl build` runs `uv sync` and prints the command it runs. The two
+steps above run these, with `UV_PROJECT_ENVIRONMENT=/app/.venv`:
+
+```
+uv sync --frozen --no-dev --no-build --compile-bytecode --no-install-project
+uv sync --frozen --no-dev --no-build --compile-bytecode
+```
+
+| Option | From |
+| --- | --- |
+| `--frozen` | always: the environment is installed from `uv.lock` as it is, never resolved |
+| `--no-dev` | `--deployment`: the dev group is left out |
+| `--no-build` | `--deployment`, unless `source_builds = true`: no package is built from an sdist; the project itself still is |
+| `--compile-bytecode` | `--deployment`, unless `compile_bytecode = false` |
+| `--no-install-project` | `--deps-only` |
+| `--no-editable` | `--deployment` with a `--target` outside the project directory |
+| `--extra`, `--group` | the `extras` and `groups` of `[tool.muru.build]`, and the `--extra` and `--group` flags |
+| `--python` | the `python` setting of `[tool.muru]`, or the `--python` flag |
+
+Around `uv sync` it adds three things:
+
+- it stops before running uv when the project has no `uv.lock`;
+- it probes the interpreter of the environment it built, and stops if
+  Muru does not support it;
+- it fetches the runtime library for that interpreter, with its
+  published hash checked, and unpacks it into `--runtime-dir`.
+
+The daemon runs the same build for a release, so the environment in an
+image is the one a release on a server gets.
+
+uv runs in the project directory with `muructl`'s environment, so
+everything that configures `uv sync` typed by hand configures it here:
+the `[tool.uv]` table of `pyproject.toml`, a `uv.toml` beside it, and
+`UV_` environment variables. A private package index, for one, is set
+in the project, and its credentials come from the environment uv reads
+them from:
+
+```toml
+[[tool.uv.index]]
+name = "internal"
+url = "https://pypi.internal.example.com/simple"
+```
+
+```dockerfile
+RUN --mount=type=secret,id=index,env=UV_INDEX_INTERNAL_PASSWORD \
+    UV_INDEX_INTERNAL_USERNAME=build \
+    muructl build --deployment --deps-only --no-runtime --target /app/.venv
+```
+
+The password is passed to the build as a secret, which stays out of the
+image: `docker build --secret id=index,env=INDEX_PASSWORD .`. The
+runtime library still comes from PyPI, whatever index the project names;
+a build with no access to PyPI gives it a directory of wheels in
+`MURU_WHEEL_DIR`.
+
+### With uv alone
+
+For a `uv sync` option that has no setting, the build stage runs uv
+itself, and `muructl runtime install` adds the runtime library for the
+environment's interpreter:
+
+```dockerfile
+FROM python:3.13-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install muructl
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-build --compile-bytecode --no-install-project
+COPY . .
+RUN uv sync --frozen --no-dev --no-build --compile-bytecode
+RUN muructl runtime install --python /app/.venv/bin/python --target /opt/muru
+```
+
+The second stage is the same as above. `muructl runtime install` probes
+the interpreter and fetches the library as `muructl build` does, from
+PyPI, or from a directory of wheels given with `--wheel-dir` (or
+`MURU_WHEEL_DIR`). It works the same for an environment pip or Poetry
+made.
 
 ## Nothing installed at start
 
