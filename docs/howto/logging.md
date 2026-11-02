@@ -14,9 +14,9 @@ release and the edge write files in the log directory, `muructl logs`
 shows or follows them, the daemon rotates and compresses them, and
 `muructl logs reopen` works with logrotate.
 Python's `logging` gets a level and format per release, and `muructl
-logging level` changes a logger's level for a period. Journald, the
-request id on log records and daemon-wide logging defaults are still to
-come.
+logging level` changes a logger's level for a period, and every record
+carries the request it was logged for. Journald and daemon-wide logging
+defaults are still to come.
 ```
 
 A development run writes two kinds of lines to the terminal: what your

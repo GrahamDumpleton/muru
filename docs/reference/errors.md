@@ -3,8 +3,8 @@
 ```{admonition} Status
 :class: note
 
-These are the responses the edge generates today. Reasons for releases
-and rollouts arrive with those features;
+These are the responses the edge generates. Three more `503` reasons,
+`cold_start_timeout`, `release_failed` and `draining`, are still to come;
 [appendix C](../project/design/appendices/c-configuration-reference.md)
 of the design specification has the full planned list.
 ```
@@ -21,13 +21,18 @@ precisely than the status, appears in the access log line as
 | 400 | `malformed` | The request body could not be read: a broken chunked encoding, or the connection failed mid-body |
 | 400 | `upload_malformed` | An [upload route](../howto/uploads.md) received a multipart form it could not parse |
 | 401, 403, 3xx | `auth_denied` | The route's [authentication handler](../howto/auth-subrequests.md) refused or redirected the request; the response is the handler's own, unless a page for `401:auth_denied` or `403:auth_denied` is configured |
+| 404 | `no_route` | The virtual host has no route for the path, or an internal redirect named a route that does not list the redirecting application in `accept_redirects_from` (see the [internal redirects guide](../howto/internal-redirects.md)) |
+| 404 | `not_found` | A [static route](../howto/static-files.md) has no file for the path and nothing to fall back to |
+| 404 | `sendfile_missing` | The file an application named in a [file hint](../howto/file-hints.md#by-path) is not there |
 | 404 | `internal_only` | The route or mount is reachable only through an internal redirect (see the [internal redirects guide](../howto/internal-redirects.md)) |
 | 408 | `client_timeout` | The client paused for longer than the body idle timeout while sending a body |
 | 413 | `body_too_large` | The declared or actual body is over the limit in force; the page names the limit and the setting. Declared lengths are refused before the body is read. On an upload route, also a form whose fields other than files hold more than 10MB |
 | 405 | `method_not_allowed` | The route refuses the method with `answer = 'method_not_allowed'`; `Allow` names the methods left (see the [client classes guide](../howto/client-classes.md#method-restrictions-and-site-modes)) |
 | 413 | `upload_too_large`, `too_many_files` | A file of an [upload](../howto/uploads.md) is over the route's `max_file_size`, or the form has more files than its `max_files` |
+| 421 | `misdirected` | No [virtual host](../howto/virtual-hosts.md) answers to the request's name on the listener it arrived on |
 | 429 | `rate_limited` | A [rate limit](../howto/client-classes.md) of the host or route refused the request, with `Retry-After`, and the RateLimit fields when the limit sends them |
 | 500 | `app_error` | The application raised, or called `start_response` with `exc_info` after output had started. Development mode includes the traceback |
+| 500 | `sendfile_refused` | The application named a file in a [file hint](../howto/file-hints.md#by-path) outside the mount's `sendfile_roots` |
 | 500 | `redirect_loop` | The application redirected internally more than 5 times for one request |
 | 502 | `upstream_failed` | No address of the [HTTP upstream](../howto/upstreams.md) could be reached, or the one that took the request did not answer it, or a WebSocket upgrade was asked of an HTTP/2 upstream |
 | 502 | `worker_crashed` | The worker's connection ended before a response head, or it sent something invalid |
@@ -49,6 +54,10 @@ The HTTP parser answers a few things itself, before a request exists: a
 request head over the size limit, too many headers, an invalid request
 line or conflicting length headers get a `400` or `431` from the parser
 and the connection is closed. Those carry no reason and no request id.
+Nor does the answer to a connection over the listener's
+[connection limit](../howto/connections.md): a `503` with
+`Retry-After: 1` and `reason: edge_overloaded` in its plain text body,
+before the connection is closed, on a listener without TLS.
 
 ## The page
 

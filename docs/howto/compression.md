@@ -4,8 +4,9 @@
 :class: note
 
 Responses are compressed at the edge, from the daemon's `[compression]`
-table or on by default. Per-host and per-route settings, precompressed
-static variants and request decompression are still to come.
+table or on by default, and static routes serve
+[precompressed variants](static-files.md) of their files. Per-host and
+per-route settings and request decompression are still to come.
 ```
 
 The edge compresses responses on behalf of applications, so Python never

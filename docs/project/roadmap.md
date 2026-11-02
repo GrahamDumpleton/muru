@@ -22,7 +22,9 @@ The releases since have filled in and corrected what those phases built,
 and added interpreter provisioning and environment builds with uv, the
 runtime library provided by `muructl` itself, `muructl check`, and a
 built-in init with draining on `docker stop` for a container's main
-process. The [changelog](changelog.md) lists what each release added,
+process, handing a request between WSGI and ASGI in code, timestamps on
+every log line and the request id on Python log records, and `--json`,
+an MCP server and a project skill for coding agents. The [changelog](changelog.md) lists what each release added,
 and each how-to guide opens with a status note saying what of its
 feature is built and what is still to come. The scope and exit criteria
 of each phase are in [section 14.5](design/14-implementation-plan.md) of
@@ -52,6 +54,7 @@ enough for production on Docker, Compose, Podman and Kubernetes.
    persistent, a health check that needs no curl, and a clean drain on
    `docker stop`. Switching an existing Dockerfile to Muru is a one-line
    change.
+   Done in 0.1.0a15.
    Issues: [#102](https://github.com/muruhq/muru/issues/102),
    [#103](https://github.com/muruhq/muru/issues/103),
    [#106](https://github.com/muruhq/muru/issues/106),
@@ -61,7 +64,7 @@ enough for production on Docker, Compose, Podman and Kubernetes.
    admin port, a shutdown sequence that loses no requests during a
    rollout, worker counts and memory budgets sized from the pod's
    limits, logs that container log collectors keep whole, metrics for
-   autoscaling, and a guide to a Deployment.
+   autoscaling, and a guide to a Deployment. Done in 0.1.0a15.
    Issues: [#104](https://github.com/muruhq/muru/issues/104),
    [#105](https://github.com/muruhq/muru/issues/105),
    [#107](https://github.com/muruhq/muru/issues/107),
@@ -167,13 +170,14 @@ taken up between the steps of the major goals, in no fixed order.
   ([#172](https://github.com/muruhq/muru/issues/172),
   [#174](https://github.com/muruhq/muru/issues/174)), Unix
   socket listeners
-  ([#157](https://github.com/muruhq/muru/issues/157)).
+  ([#157](https://github.com/muruhq/muru/issues/157)), proxy
+  settings per listener and client certificate headers
+  ([#316](https://github.com/muruhq/muru/issues/316),
+  [#317](https://github.com/muruhq/muru/issues/317)), 100 Continue
+  over HTTP/2 ([#319](https://github.com/muruhq/muru/issues/319)).
 
-- **Logging, events and OpenTelemetry:** timestamps on every log line
-  ([#93](https://github.com/muruhq/muru/issues/93)), the request
-  id on Python log records and daemon-wide logging defaults
-  ([#168](https://github.com/muruhq/muru/issues/168),
-  [#169](https://github.com/muruhq/muru/issues/169)), log files
+- **Logging, events and OpenTelemetry:** daemon-wide logging defaults
+  ([#169](https://github.com/muruhq/muru/issues/169)), log files
   reopened on rename and a choice of what happens when output stalls
   ([#166](https://github.com/muruhq/muru/issues/166),
   [#167](https://github.com/muruhq/muru/issues/167)), event sinks
@@ -190,18 +194,8 @@ taken up between the steps of the major goals, in no fixed order.
   activation for the daemon's listeners
   ([#160](https://github.com/muruhq/muru/issues/160)).
 
-- **Applications and servers:** handing a request between WSGI and ASGI
-  in code ([#91](https://github.com/muruhq/muru/issues/91)), a
-  uWSGI profile for managed servers
+- **Applications and servers:** a uWSGI profile for managed servers
   ([#95](https://github.com/muruhq/muru/issues/95)).
-
-- **Coding agents:** `--json` on every command that reports something
-  ([#254](https://github.com/muruhq/muru/issues/254)), an MCP
-  server in `muructl` so an agent can run the daemon, deploy each change
-  as a release, test it and read what Muru observes
-  ([#197](https://github.com/muruhq/muru/issues/197)), and a
-  skill the project carries that teaches the agent how
-  ([#255](https://github.com/muruhq/muru/issues/255)).
 
 ## Ideas
 

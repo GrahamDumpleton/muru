@@ -5,9 +5,10 @@
 
 Virtual hosts with exact and single-label wildcard names, a default host,
 path-prefix routes to applications, TLS listeners with a certificate per
-host chosen by SNI, and HTTPS redirects. Regular expression names,
-host-level limits and error pages, and automatic certificates are still
-to come.
+host chosen by SNI, HTTPS redirects, and
+[error pages](error-pages.md) and [rate limits](client-classes.md) per
+host. Regular expression names, other host-level limits, and automatic
+certificates are still to come.
 ```
 
 The daemon serves several applications on one node by name. Virtual

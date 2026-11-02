@@ -5,9 +5,10 @@
 
 A Deployment of `muructl serve`: probes, a rolling update that loses no
 requests, a restricted security context, sizing from resource limits,
-logs for a collector, autoscaling and migrations. Reloading mounted
-configuration and certificates, and debugging tools for a locked-down
-pod, are still to come.
+logs for a collector, autoscaling and migrations, and `muructl`
+commands through `kubectl exec`. Reloading mounted configuration and
+certificates is still to come, as is a check that the debugging commands
+that attach to a worker work in a pod with every capability dropped.
 ```
 
 An image built as [in a container](containers.md#an-image) runs in a pod

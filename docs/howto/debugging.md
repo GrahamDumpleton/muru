@@ -339,5 +339,5 @@ the host has one to the daemon. A request travels daemon to host to
 worker, where a thread of the runtime library takes it, attaches to the
 interpreter only to answer, and sends the answer back the same way. The
 daemon never reaches into a worker process directly, which is what lets
-the same commands work on a release running as another user or, later,
-in a container.
+the same commands work on a release running as another user, and on
+an application in a container under `muructl serve`.
