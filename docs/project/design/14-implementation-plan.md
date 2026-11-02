@@ -45,7 +45,7 @@ muru/
   fuzz/                      cargo-fuzz targets
   bench/                     benchmark scenarios and scripts
   docs/                      Sphinx documentation, with the design specification in docs/project/design and decision records in docs/project/adr
-  images/                    base image Dockerfiles
+  images/                    the development and test images
   packaging/                 systemd unit, logrotate file, later deb and rpm
   noxfile.py                 Python-side sessions
   justfile                   task runner entry points

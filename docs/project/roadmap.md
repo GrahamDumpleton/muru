@@ -41,10 +41,10 @@ and a shutdown that drains in-flight requests on `docker stop`. This
 goal goes further, to integration with what container platforms expect
 of an application server: health probes, rollouts that lose no
 requests, sizing from the container's resource limits, logs that log
-collectors keep whole, locked-down security settings, and running from
-the team's own image without rebuilding it. That is more than Python
-web servers usually provide, and it is what makes running in containers
-robust enough for production on Docker, Compose, Podman and Kubernetes.
+collectors keep whole, locked-down security settings, and adding Muru
+to any image with one line. That is more than Python web servers
+usually provide, and it is what makes running in containers robust
+enough for production on Docker, Compose, Podman and Kubernetes.
 
 1. **`muructl serve` in Docker and Compose.** One application in one
    container, configured by flags, environment variables and a mounted
@@ -68,22 +68,20 @@ robust enough for production on Docker, Compose, Podman and Kubernetes.
    [#108](https://github.com/muruhq/muru/issues/108),
    [#119](https://github.com/muruhq/muru/issues/119).
 
-3. **Your own image.** Muru's pieces published as one bundle that a
-   Dockerfile adds with a single line, or that is injected at deployment
-   time (an init container, an image mount or a shared volume), so an
-   existing image runs under `muructl serve` unchanged, whatever its
-   base. Issues: [#113](https://github.com/muruhq/muru/issues/113),
-   [#142](https://github.com/muruhq/muru/issues/142).
+3. **muructl in any image.** A Dockerfile adds Muru with one line,
+   `uv tool install muructl` in the build stage, on Debian or Alpine
+   bases and with every supported Python, and the build fetches the
+   runtime library for the image's own interpreter. The container guide
+   shows the build with `muructl build` and with uv alone.
+   Issues: [#313](https://github.com/muruhq/muru/issues/313).
 
 4. **Image tooling.** `muructl check` recording what an image provides,
    a generated Dockerfile, the image contract and `muructl image check`,
-   static files prepared at build time, official base images and
-   `muructl image build`.
+   static files prepared at build time, and `muructl image build`.
    Issues: [#238](https://github.com/muruhq/muru/issues/238),
    [#115](https://github.com/muruhq/muru/issues/115),
    [#130](https://github.com/muruhq/muru/issues/130),
    [#116](https://github.com/muruhq/muru/issues/116),
-   [#129](https://github.com/muruhq/muru/issues/129),
    [#131](https://github.com/muruhq/muru/issues/131).
 
 5. **Container releases on a node.** The daemon runs a release's host
@@ -123,7 +121,8 @@ Issues: [#90](https://github.com/muruhq/muru/issues/90),
 [#144](https://github.com/muruhq/muru/issues/144),
 [#161](https://github.com/muruhq/muru/issues/161),
 [#162](https://github.com/muruhq/muru/issues/162),
-[#163](https://github.com/muruhq/muru/issues/163).
+[#163](https://github.com/muruhq/muru/issues/163),
+[#311](https://github.com/muruhq/muru/issues/311).
 
 ### Beyond one node
 
