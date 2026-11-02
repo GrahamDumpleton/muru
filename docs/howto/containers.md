@@ -6,10 +6,10 @@
 `muructl serve` runs one application in one container under Docker,
 Compose, Podman or Kubernetes: configured from the image and the
 environment, with probes and metrics on an admin port, logs on standard
-output and a drain on `docker stop`. Sizing the worker count from the
-container's limits, the pause a Kubernetes rolling update needs before
-a pod stops, and guides for Compose and a Kubernetes Deployment are
-still to come.
+output and a drain on `docker stop` or a Kubernetes rolling update.
+Workers are sized from the container's CPU and memory limits. A
+[Compose](#compose) service and [a Kubernetes Deployment](kubernetes.md)
+are shown.
 ```
 
 `muructl serve` runs one application as the container's main process: the
@@ -46,7 +46,7 @@ COPY --from=build /opt/muru /opt/muru
 COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
 WORKDIR /app
 RUN useradd --uid 10001 app
-USER app
+USER 10001
 EXPOSE 8080 9090
 CMD ["muructl", "serve"]
 ```
@@ -145,7 +145,7 @@ with where it came from, and exits.
 | `--admin-listen ADDRESS` | `0.0.0.0:9090` | where the probes and metrics are served, or `off` |
 | `--admin-status` | off | serve `/status` on the admin port too |
 | `--min-ready N` | 1 | the workers ready in every mount for `/readyz` to pass |
-| `--processes N` | `auto`, the CPU count | worker processes |
+| `--processes N` | `auto`, from the container's CPU limit | worker processes; see [sizing](#sizing-from-the-containers-limits) |
 | `--threads N` | 4 | threads per WSGI worker |
 | `--python PATH` | as above | the interpreter |
 | `--access-log WHAT` | `on` | `on`, `errors` (4xx and 5xx responses and requests slower than `--slow`) or `off` |
@@ -155,12 +155,50 @@ with where it came from, and exits.
 | `--run-dir DIR` | `/run/muru` | where everything written at run time goes (also `MURU_RUN_DIR`) |
 | `--runtime-dir DIR` | `/opt/muru` | where the image holds the runtime library |
 | `--spool-quota SIZE` | 1GB | the most request bodies spooled to disk at once |
+| `--shutdown-delay DURATION` | `0s` | how long the listener keeps accepting after SIGTERM; see [stopping](#stopping) |
+| `--shutdown-budget DURATION` | `8s` | how long the whole stop may take, the delay included |
 | `--trusted-proxy ADDRESS` | `loopback` | a proxy whose forwarding headers are applied: an address, a CIDR range, or `loopback`, `private` or `unix`, repeatable; see [behind a proxy](behind-a-proxy.md) |
 
 `--interface`, `--factory`, `--sync-threads`, `--concurrency`,
 `--preload`, `--hooks`, `--timeout`, `--max-body-size`, `--max-requests`,
 `--max-lifetime`, `--memory`, the connection limits, `--static` and
 `--no-compression` work as they do for [`muructl run`](run-settings.md).
+
+## Sizing from the container's limits
+
+On Linux, `muructl serve` reads the container's CPU and memory limits at
+start, so a container limited to 2 CPUs on a 64-core node starts 2
+workers, not 64.
+
+- **Workers.** `--processes auto`, the default, is the CPU limit rounded
+  up: `--cpus 1.5` under Docker, or `resources.limits.cpu: 1500m` in
+  Kubernetes, gives 2. With no CPU limit it is the number of CPUs the
+  container may run on.
+- **Memory.** With a memory limit, each worker gets a hard limit unless
+  one is set with `--memory hard_limit=...`. Ten percent of the limit
+  (at least 128 MiB) is left for muructl and the page cache, and so is
+  what the application holds in memory after it is imported. The rest is
+  divided between the workers. A worker that grows past its share is
+  replaced as the [memory policy](memory.md) replaces one, with no request
+  lost, before the kernel's out-of-memory killer chooses a process to
+  kill.
+- **Out-of-memory kills.** A worker the kernel kills anyway is reported
+  as a `worker.oom_killed` event and counted in `muru_worker_exits_total`
+  with the reason `oom_killed`, and the host starts another.
+
+The lines at start say what was worked out and from what, here under
+`docker run --cpus 2 --memory 1g`:
+
+```
+muru: 2 processes from cpu.max 200000 100000
+muru: memory budget 896MB (memory.max 1.0GB less 128MB)
+muru.host[11]: worker hard limit 432MB: the memory budget of 896MB less 32MB the host holds, over 2 workers
+```
+
+The limits are read once at start, so a change to them (an in-place pod
+resize) takes effect when the container restarts. On macOS, and in a
+container with no limits, the worker count is the number of CPUs and no
+memory limit is derived.
 
 ## Probes and metrics
 
@@ -219,7 +257,44 @@ collector, each with its `time`, a `kind` (`access`, `app` for the
 application's output, or `muru`), and the line's fields:
 
 ```json
-{"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"WARNING demo: warned"}
+{"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"worker 0 is ready"}
+```
+
+With it, Python logging writes [JSON records](logging.md#python-logging)
+too, unless the project names a format. Each record becomes the line's
+object, with its level, logger, message and request id as fields, and an
+exception logged with it as one `exception` field:
+
+```json
+{"time":"2026-11-02T05:42:23.104Z","kind":"app","source":"muru.worker[0]","level":"ERROR","logger":"shop.views","message":"checkout failed","request_id":"01M6CY84YP8J7V9K0QN8ABV14V","exception":"Traceback (most recent call last):\n  ...\nKeyError: 'sku'","app":"shop","release":"r1","group":"default","worker":0}
+```
+
+A traceback written to standard error rather than logged, such as one
+from an exception the application did not catch, is gathered into a
+single record too, from `Traceback (most recent call last):` to the
+exception's own line. So a log collector that splits records at newlines
+keeps each traceback whole.
+
+Each JSON line also carries the pod it came from, when the Deployment
+passes it in with the Downward API, and the OpenTelemetry service and
+resource attributes when they are set:
+
+| Variable | Field |
+| --- | --- |
+| `POD_NAME` | `pod` |
+| `POD_NAMESPACE` | `namespace` |
+| `NODE_NAME` | `node` |
+| `OTEL_SERVICE_NAME` | `service` |
+| `OTEL_RESOURCE_ATTRIBUTES` | `resource`, an object of its attributes |
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom: {fieldRef: {fieldPath: metadata.name}}
+  - name: POD_NAMESPACE
+    valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+  - name: NODE_NAME
+    valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
 ```
 
 ## Files it writes
@@ -258,20 +333,81 @@ running application work through `docker exec` or `kubectl exec`:
 docker exec shop muructl status
 docker exec shop muructl logs --access --follow
 docker exec shop muructl debug stacks
-docker exec shop muructl restart
+docker exec shop muructl restart --all
 ```
 
-Only someone who may exec into the container can use them. Commands that
+The commands that name an application or a release take the one being
+served when given none. Only someone who may exec into the container can
+use them. Commands that
 manage releases, hosts or the daemon say they need the daemon.
 
 ## Stopping
 
 muructl is the container's process 1 and runs as an init of its own, as
-`tini` would, so nothing in the container is left a zombie. SIGTERM,
-which `docker stop` and Kubernetes send, drains: `/readyz` starts failing,
-the listener closes, requests in flight finish, and the container exits
-0. A drain that runs past the platform's grace period (10 seconds for
-`docker stop`, 30 for Kubernetes) is cut short by SIGKILL, so give an
-application with long requests a longer one, with `stop_grace_period` in
-Compose or `terminationGracePeriodSeconds` in Kubernetes. An image that
+`tini` would, so nothing in the container is left a zombie. An image that
 brings `tini` or runs under `docker run --init` sets `MURU_NO_INIT=1`.
+
+SIGTERM, which `docker stop` and Kubernetes send, stops the container in
+order:
+
+1. `/readyz` starts failing at once.
+2. For `--shutdown-delay`, the listener keeps accepting and serving, with
+   every connection closing after its response (`Connection: close`,
+   GOAWAY on HTTP/2) and at once when idle, so clients reconnect to
+   another replica.
+3. The listener closes and the requests in flight finish.
+4. The workers stop, closing their WebSockets with 1001, and the
+   container exits 0.
+
+All of it fits inside `--shutdown-budget`; whatever has not finished by
+then is killed. A second SIGTERM, or a second Ctrl-C, ends the delay
+early.
+
+The delay is 0 by default, which suits Docker and Compose, where a
+stopping container stops receiving connections at once. Under Kubernetes
+a pod goes on receiving connections for a few seconds after SIGTERM,
+while the Service's endpoints and the ingress catch up, so a Deployment
+sets a delay, and a budget under its `terminationGracePeriodSeconds` (30
+seconds unless set):
+
+```yaml
+env:
+  - {name: MURU_SERVE_SHUTDOWN_DELAY, value: "5s"}
+  - {name: MURU_SERVE_SHUTDOWN_BUDGET, value: "25s"}
+```
+
+No `preStop` hook is needed. The budget is 8 seconds by default, under the
+10 that `docker stop` gives before SIGKILL; an application with long
+requests raises both the budget and the platform's grace period, with
+`stop_grace_period` in Compose or `terminationGracePeriodSeconds` in
+Kubernetes.
+
+## Compose
+
+A Compose service built from the image above:
+
+```yaml
+services:
+  shop:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      MURU_SERVE_PROCESSES: "4"
+    read_only: true
+    tmpfs: [/run/muru, /tmp]
+    healthcheck:
+      test: ["CMD", "muructl", "probe", "ready"]
+      interval: 5s
+    stop_grace_period: 10s
+```
+
+The root filesystem is read-only, with the run directory and `/tmp` as
+memory-backed mounts. The health check asks `muructl probe ready` inside
+the container, so `docker compose ps` shows the service healthy once its
+workers are ready. `docker compose exec shop muructl status` and the
+other commands of [inside the container](#inside-the-container) work as
+they do under `docker exec`. The admin port is not published here; publish
+9090 as well for a Prometheus outside the Compose network.
+
+For a Kubernetes Deployment, see [a Kubernetes
+Deployment](kubernetes.md).

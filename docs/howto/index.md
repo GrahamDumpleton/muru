@@ -12,6 +12,7 @@ run-settings
 interpreters
 daemon
 containers
+kubernetes
 commands
 migrations
 secrets

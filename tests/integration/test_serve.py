@@ -155,12 +155,60 @@ def test_serves_with_probes_and_metrics_on_the_admin_port(tmp_path: Path) -> Non
         assert status == 200
         assert "muru_requests_total" in metrics
 
+        # A request holding one of the worker's four slots shows in the
+        # utilisation, sampled every second.
+
+        sleeper = threading.Thread(target=serve.get, args=("/sleep?seconds=2.5",))
+        sleeper.start()
+        time.sleep(2)
+        metrics = serve.admin("/metrics")[1]
+        sleeper.join()
+        line = next(
+            line for line in metrics.splitlines() if line.startswith("muru_capacity_utilisation{")
+        )
+        assert 'group="default"' in line, line
+        assert 0 < float(line.rsplit(" ", 1)[1]) <= 0.25, line
+
         # /status is opt-in, and the probes are not on the application's port.
 
         assert serve.admin("/status")[0] == 404
         assert serve.get("/readyz")[1] != "ok\n"
     finally:
         assert serve.stop() == 0
+
+
+def test_sigterm_fails_readiness_and_keeps_accepting_for_the_delay(tmp_path: Path) -> None:
+    serve = start(tmp_path, "--shutdown-delay", "2s", "--shutdown-budget", "6s")
+
+    try:
+        assert serve.admin("/readyz") == (200, "ok\n")
+        signalled = time.monotonic()
+        serve.process.send_signal(signal.SIGTERM)
+
+        # Readiness fails at once, while the listener still serves, with
+        # every connection closing after its response.
+
+        deadline = time.monotonic() + 1
+
+        while serve.admin("/readyz")[0] == 200:
+            assert time.monotonic() < deadline, "readiness still passing after SIGTERM"
+            time.sleep(0.05)
+
+        connection = http.client.HTTPConnection("127.0.0.1", serve.port, timeout=10)
+
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            response.read()
+            assert response.status == 200
+            assert response.getheader("Connection") == "close"
+        finally:
+            connection.close()
+
+        assert serve.process.wait(timeout=10) == 0
+        assert 2 <= time.monotonic() - signalled < 6
+    finally:
+        serve.stop()
 
 
 def test_everything_goes_to_standard_output_without_times(tmp_path: Path) -> None:
@@ -218,12 +266,15 @@ def test_print_config_names_where_each_setting_came_from(tmp_path: Path) -> None
     assert 'processes = "1"    # command line' in output, output
 
 
-def test_json_lines_carry_their_kind_and_time(tmp_path: Path) -> None:
-    serve = start(tmp_path, "--log-format", "json")
+def test_json_lines_carry_their_kind_time_and_pod(tmp_path: Path) -> None:
+    serve = start(
+        tmp_path, "--log-format", "json", env={"POD_NAME": "shop-1", "POD_NAMESPACE": "prod"}
+    )
 
     try:
         serve.get("/")
-        serve.wait_for('"kind":"access"')
+        serve.get("/error")
+        serve.wait_for("RuntimeError: deliberate failure")
     finally:
         assert serve.stop() == 0
 
@@ -231,8 +282,33 @@ def test_json_lines_carry_their_kind_and_time(tmp_path: Path) -> None:
     kinds = {record["kind"] for record in records}
     assert {"muru", "app", "access"} <= kinds, kinds
     assert all(record["time"].endswith("Z") for record in records)
+    assert all((record["pod"], record["namespace"]) == ("shop-1", "prod") for record in records)
     host = next(record for record in records if record["kind"] == "app")
     assert host["source"].startswith("muru.host["), host
+
+    # The traceback is one record, from its first line to the exception's.
+
+    traceback = next(record for record in records if "Traceback" in record.get("message", ""))
+    assert traceback["source"] == "muru.worker[0]", traceback
+    assert traceback["message"].startswith("Traceback (most recent call last):\n")
+    assert traceback["message"].endswith("RuntimeError: deliberate failure")
+
+
+def test_python_records_in_json_are_the_records_themselves(tmp_path: Path) -> None:
+    serve = start(tmp_path, "--log-format", "json", app="logging_wsgi:application")
+
+    try:
+        serve.get("/fail")
+        serve.wait_for('"level":"ERROR"')
+    finally:
+        assert serve.stop() == 0
+
+    records = [json.loads(line) for line in serve.output().splitlines()]
+    failed = next(record for record in records if record.get("message") == "failed for /fail")
+    access = next(record for record in records if record["kind"] == "access")
+    assert failed["kind"] == "app" and failed["logger"] == "demo", failed
+    assert failed["exception"].endswith("ValueError: boom"), failed
+    assert failed["request_id"] == access["request_id"]
 
 
 def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
@@ -262,6 +338,25 @@ def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
         )
         assert status.returncode == 0, status.stdout + status.stderr
         assert "plain-wsgi" in status.stdout, status.stdout
+
+        # The commands that take an application name the one served when
+        # given none.
+
+        for command, expected in [
+            (["debug", "stacks"], "MainThread"),
+            (["logging", "level", "demo=DEBUG", "--for", "1m"], "demo"),
+            (["restart", "--worker", "0"], "worker 0"),
+        ]:
+            completed = subprocess.run(
+                [str(muructl), *command],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+            )
+            output = completed.stdout + completed.stderr
+            assert completed.returncode == 0, output
+            assert expected in output, output
     finally:
         assert serve.stop() == 0
 

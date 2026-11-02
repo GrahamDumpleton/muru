@@ -347,6 +347,40 @@ def test_the_init_can_be_turned_off(container: Callable[..., Container]) -> None
     assert elapsed < 9, elapsed
 
 
+def test_serve_sizes_itself_from_the_container_limits(
+    container: Callable[..., Container],
+) -> None:
+    instance = container(
+        "muructl",
+        "serve",
+        "plain_wsgi:application",
+        *TIMEOUTS,
+        options=("--cpus", "1.5", "--memory", "512m", "--memory-swap", "512m"),
+    )
+    wait_until_serving(instance)
+    logs = instance.logs()
+    assert "muru: 2 processes from cpu.max 150000 100000" in logs, logs
+    assert "muru: memory budget 384MB (memory.max 512MB less 128MB)" in logs, logs
+    assert "worker hard limit" in logs, logs
+
+    # A worker that takes more than the container has, at once, is killed
+    # by the kernel before its hard limit is checked; that is said, counted
+    # and the worker started again.
+
+    thread, _ = instance.request_in_the_background("/grow?mb=600")
+    wait_for(lambda: "worker.oom_killed" in instance.logs())
+    thread.join(timeout=30)
+    metrics = instance.exec(
+        "python3",
+        "-c",
+        "import urllib.request\n"
+        "print(urllib.request.urlopen('http://127.0.0.1:9090/metrics').read().decode())",
+    ).stdout
+    assert 'muru_worker_exits_total{app="plain-wsgi"' in metrics, metrics
+    assert 'reason="oom_killed"} 1' in metrics, metrics
+    wait_until_serving(instance)
+
+
 def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
     container: Callable[..., Container],
 ) -> None:

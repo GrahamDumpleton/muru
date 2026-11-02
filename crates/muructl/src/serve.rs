@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::{Args, Parser};
+use muru_controller::cgroup::Limits;
 
 /// Where everything `serve` writes goes, unless told otherwise.
 pub const DEFAULT_RUN_DIR: &str = "/run/muru";
@@ -194,6 +195,17 @@ pub struct ServeArgs {
     #[arg(long = "trusted-proxy", value_name = "ADDRESS")]
     trusted_proxy: Vec<String>,
 
+    /// How long the listener keeps accepting after SIGTERM, with
+    /// readiness failing and every connection closing after its response
+    /// (default 0s; 5s behind a Kubernetes Service).
+    #[arg(long, value_name = "DURATION")]
+    shutdown_delay: Option<String>,
+
+    /// How long the whole stop may take, the delay included; what has
+    /// not finished is killed (default 8s).
+    #[arg(long, value_name = "DURATION")]
+    shutdown_budget: Option<String>,
+
     /// Print the settings that would be used, each with where it came
     /// from, and exit.
     #[arg(long)]
@@ -246,6 +258,8 @@ const KEYS: &[(&str, Kind)] = &[
     ("runtime_dir", Kind::Text),
     ("spool_quota", Kind::Text),
     ("trusted_proxy", Kind::List),
+    ("shutdown_delay", Kind::Text),
+    ("shutdown_budget", Kind::Text),
 ];
 
 /// A setting's value.
@@ -338,6 +352,8 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("run_dir", &args.run_dir);
     text("runtime_dir", &args.runtime_dir);
     text("spool_quota", &args.spool_quota);
+    text("shutdown_delay", &args.shutdown_delay);
+    text("shutdown_budget", &args.shutdown_budget);
 
     for (key, items) in [
         ("timeout", &args.timeout),
@@ -470,6 +486,14 @@ pub struct Mode {
     pub default_processes: usize,
     /// Whose forwarding headers the edge applies.
     pub trust: muru_edge::proxy::Trust,
+    /// The delay and budget of the stop SIGTERM starts.
+    pub shutdown: muru_controller::shutdown::Policy,
+    /// The container's memory budget, for the workers' hard limits.
+    pub memory_budget: Option<u64>,
+    /// The container's cgroup directory.
+    pub cgroup: Option<PathBuf>,
+    /// What was worked out from the container's limits, a line each.
+    pub sizing: Vec<String>,
 }
 
 /// A clap parser for `muructl run`'s arguments alone, which `serve` fills
@@ -487,13 +511,20 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     muru_common::log::one_stream(true);
 
-    let result = match prepare(&args, |name| std::env::var(name).ok()) {
+    let limits = Limits::read();
+
+    let result = match prepare(&args, limits.as_ref(), |name| std::env::var(name).ok()) {
         Ok((_, mode, layered)) if args.print_config => {
             print_config(&layered, &mode);
             return Ok(());
         }
         Ok((run_args, mode, _)) => {
             muru_common::log::json_lines(mode.json);
+
+            for line in &mode.sizing {
+                muru_common::muru_println!("{line}");
+            }
+
             crate::run_with(run_args, Some(mode)).await
         }
         Err(error) => Err(error),
@@ -511,6 +542,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 /// arguments with what is `serve`'s own beside them.
 fn prepare(
     args: &ServeArgs,
+    limits: Option<&Limits>,
     read: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<(crate::RunArgs, Mode, Layered)> {
     // The project is found before its tables are read, from the argument
@@ -601,7 +633,41 @@ fn prepare(
         None => DEFAULT_SPOOL_QUOTA,
     };
 
-    let default_processes = std::thread::available_parallelism().map_or(1, usize::from);
+    // Section 13.9: the worker count and the memory budget from the
+    // container's limits, where cgroup v2 gives them, with a line for
+    // each saying what it came from.
+
+    let (default_processes, cpu_source) = match limits.and_then(Limits::processes) {
+        Some((count, source)) => (count, Some(source)),
+        None => (
+            std::thread::available_parallelism().map_or(1, usize::from),
+            None,
+        ),
+    };
+
+    let processes_set = layered.text("processes").is_some_and(|text| text != "auto")
+        || table
+            .as_ref()
+            .is_some_and(|(_, tool)| tool.processes.is_some());
+    let memory_budget = limits.and_then(Limits::memory_budget);
+    let mut sizing = Vec::new();
+
+    if let Some(source) = cpu_source
+        && !processes_set
+    {
+        sizing.push(format!("{default_processes} processes from {source}"));
+    }
+
+    if let (Some((budget, headroom)), Some(limit)) =
+        (memory_budget, limits.and_then(|limits| limits.memory_max))
+    {
+        sizing.push(format!(
+            "memory budget {} (memory.max {} less {})",
+            muru_config::format_size_approx(budget),
+            muru_config::format_size_approx(limit),
+            muru_config::format_size_approx(headroom)
+        ));
+    }
 
     let trust = match layered.list("trusted_proxy") {
         [] => muru_edge::proxy::Trust::loopback(),
@@ -615,6 +681,19 @@ fn prepare(
         }
     };
 
+    // Section 13.3: the daemon's [shutdown] table, checked the same way,
+    // always shutting down since serve is the container's main process.
+
+    let shutdown = muru_controller::shutdown::Policy::from_table(
+        Some(&muru_config::Shutdown {
+            on_sigterm: Some("shutdown".to_owned()),
+            delay: layered.text("shutdown_delay").map(str::to_owned),
+            budget: layered.text("shutdown_budget").map(str::to_owned),
+        }),
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("shutdown_{error}"))?;
+
     let mode = Mode {
         admin_listen,
         admin_status: layered.flag("admin_status"),
@@ -625,6 +704,10 @@ fn prepare(
         spool_quota,
         default_processes,
         trust,
+        shutdown,
+        memory_budget: memory_budget.map(|(budget, _)| budget),
+        cgroup: limits.map(|limits| limits.dir.clone()),
+        sizing,
     };
 
     // muructl run's arguments: production behaviours on, nothing built,
@@ -745,15 +828,20 @@ fn print_config(layered: &Layered, mode: &Mode) {
 
     println!(
         "# admin port {}, run directory {}, runtime library {}, {} lines, spool quota {} bytes, \
-         {} processes unless set",
+         {} processes unless set, {}",
         mode.admin_listen
             .map_or_else(|| "off".to_owned(), |address| address.to_string()),
         mode.run_dir.display(),
         mode.runtime_dir.display(),
         if mode.json { "json" } else { "text" },
         mode.spool_quota,
-        mode.default_processes
+        mode.default_processes,
+        mode.shutdown.describe()
     );
+
+    for line in &mode.sizing {
+        println!("# {line}");
+    }
 }
 
 /// Make the run directory, or say which volume it needs (section 13.9).
@@ -901,6 +989,8 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn parse(argv: &[&str]) -> ServeArgs {
@@ -925,7 +1015,7 @@ mod tests {
             "MURU_SERVE_TIMESTAMPS" => Some("true".to_owned()),
             _ => None,
         };
-        let (run, mode, layered) = prepare(&args, environment).expect("prepares");
+        let (run, mode, layered) = prepare(&args, None, environment).expect("prepares");
 
         assert_eq!(
             layered.values["threads"],
@@ -949,13 +1039,13 @@ mod tests {
     #[test]
     fn bad_values_are_refused_naming_the_flag() {
         let args = parse(&["app:application", "--log-format", "xml"]);
-        let Err(error) = prepare(&args, |_| None) else {
+        let Err(error) = prepare(&args, None, |_| None) else {
             panic!("--log-format xml was accepted");
         };
         assert!(error.to_string().contains("--log-format"), "{error}");
 
         let args = parse(&["app:application"]);
-        let Err(error) = prepare(&args, |name| {
+        let Err(error) = prepare(&args, None, |name| {
             (name == "MURU_SERVE_ADMIN_STATUS").then(|| "maybe".to_owned())
         }) else {
             panic!("MURU_SERVE_ADMIN_STATUS=maybe was accepted");
@@ -969,19 +1059,70 @@ mod tests {
     #[test]
     fn trusted_proxies_are_checked() {
         let args = parse(&["app:application", "--trusted-proxy", "private"]);
-        assert!(prepare(&args, |_| None).is_ok());
+        assert!(prepare(&args, None, |_| None).is_ok());
 
         let args = parse(&["app:application", "--trusted-proxy", "not-an-address"]);
-        let Err(error) = prepare(&args, |_| None) else {
+        let Err(error) = prepare(&args, None, |_| None) else {
             panic!("a bad --trusted-proxy was accepted");
         };
         assert!(error.to_string().contains("--trusted-proxy"), "{error}");
     }
 
     #[test]
+    fn the_shutdown_delay_fits_inside_its_budget() {
+        let args = parse(&["app:application"]);
+        let (_, mode, _) = prepare(&args, None, |_| None).expect("prepares");
+        assert_eq!(mode.shutdown.delay, Duration::ZERO);
+        assert_eq!(mode.shutdown.budget, Duration::from_secs(8));
+
+        let args = parse(&["app:application", "--shutdown-delay", "5s"]);
+        let (_, mode, _) = prepare(&args, None, |name| {
+            (name == "MURU_SERVE_SHUTDOWN_BUDGET").then(|| "25s".to_owned())
+        })
+        .expect("prepares");
+        assert_eq!(mode.shutdown.delay, Duration::from_secs(5));
+        assert_eq!(mode.shutdown.budget, Duration::from_secs(25));
+
+        let args = parse(&["app:application", "--shutdown-delay", "10s"]);
+        let Err(error) = prepare(&args, None, |_| None) else {
+            panic!("a delay longer than the budget was accepted");
+        };
+        assert!(error.to_string().contains("shutdown_delay"), "{error}");
+    }
+
+    #[test]
+    fn the_container_limits_size_the_workers_and_say_so() {
+        let limits = Limits {
+            dir: PathBuf::from("/sys/fs/cgroup"),
+            cpu_max: Some((150_000, 100_000)),
+            cpus: Some(64),
+            memory_max: Some(4 << 30),
+        };
+        let args = parse(&["app:application"]);
+        let (run, mode, _) = prepare(&args, Some(&limits), |_| None).expect("prepares");
+        assert_eq!(mode.default_processes, 2);
+        assert_eq!(run.processes, None);
+        assert_eq!(mode.cgroup, Some(PathBuf::from("/sys/fs/cgroup")));
+        assert_eq!(mode.memory_budget, Some((4 << 30) - (4 << 30) / 100 * 10));
+        assert_eq!(
+            mode.sizing,
+            [
+                "2 processes from cpu.max 150000 100000",
+                "memory budget 3.6GB (memory.max 4.0GB less 410MB)"
+            ]
+        );
+
+        // A worker count given says nothing of the CPU limit.
+
+        let args = parse(&["app:application", "--processes", "3"]);
+        let (_, mode, _) = prepare(&args, Some(&limits), |_| None).expect("prepares");
+        assert_eq!(mode.sizing.len(), 1);
+    }
+
+    #[test]
     fn the_admin_port_can_be_closed() {
         let args = parse(&["app:application", "--admin-listen", "off"]);
-        let (_, mode, _) = prepare(&args, |_| None).expect("prepares");
+        let (_, mode, _) = prepare(&args, None, |_| None).expect("prepares");
         assert_eq!(mode.admin_listen, None);
     }
 }

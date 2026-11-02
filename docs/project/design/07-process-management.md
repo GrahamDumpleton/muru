@@ -175,6 +175,6 @@ allocator = 'system'      # system, jemalloc or mimalloc via LD_PRELOAD when pre
 
 - Unique memory (USS) is measured by default, since preloaded pages are shared copy-on-write.
 - Over the soft limit for soft_for: the worker first runs gc.collect() and malloc_trim(0) between requests (glibc only) and re-measures, then recycles gracefully if still over. Short spikes, which may be returned to the operating system on their own, never trigger recycling.
-- Over the hard limit: removed from routing at once, replacement forked, short grace, then stopped. Cgroup or container limits remain the kernel backstop.
+- Over the hard limit: removed from routing at once, replacement forked, short grace, then stopped. Cgroup or container limits remain the kernel backstop; under muructl serve a hard limit nobody set is derived from the container's memory limit (section 13.9), so a worker is replaced before the kernel kills one.
 - Recycles are rate limited and use max_surge. Repeated recycles raise a leak warning. Per-request memory deltas identify the routes that grow memory.
 - Other recycling: max_requests and max_lifetime, both with jitter, through the same replacement path.

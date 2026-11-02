@@ -68,7 +68,9 @@ and it is told to stop after `hard_drain_grace`.
 
 A worker index recycled for memory three times within an hour raises a
 `memory.leak_suspected` warning, once an hour. Container and cgroup
-limits remain the kernel's backstop.
+limits remain the kernel's backstop. Under `muructl serve` a hard limit
+nobody set is [derived from the container's memory
+limit](containers.md#sizing-from-the-containers-limits).
 
 ## Metrics
 

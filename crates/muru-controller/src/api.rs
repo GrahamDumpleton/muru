@@ -1839,6 +1839,12 @@ impl Service {
     }
 
     fn current_release(&self, app: &str, release: &str) -> Result<String, Status> {
+        if app.is_empty() {
+            return Err(Status::invalid_argument(
+                "name the application: the daemon serves any number of them",
+            ));
+        }
+
         let release = if release.is_empty() {
             let record = self.handle.store.app(app).map_err(not_found)?;
             record.current.ok_or_else(|| {

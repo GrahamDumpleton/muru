@@ -2,12 +2,13 @@
 //! Python interpreter, watched until its workers listen, and stopped with
 //! SIGTERM (design specification sections 6.1 and 13.1).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
-use muru_common::log::Stream;
+use muru_common::log::{Gathered, Stream, Traceback};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -454,6 +455,12 @@ pub struct HostSpec {
     pub gil_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
+    /// Section 13.9: the container's memory budget, from which the host
+    /// derives each worker's hard limit when the policy sets none.
+    pub memory_budget: Option<u64>,
+    /// Section 13.9: the container's cgroup directory, whose
+    /// `memory.events` tells a worker the kernel killed for memory.
+    pub cgroup: Option<PathBuf>,
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
@@ -875,6 +882,14 @@ impl HostProcess {
 
         if let Some(bytes) = spec.memory.hard_limit {
             command.arg("--memory-hard-limit").arg(bytes.to_string());
+        }
+
+        if let Some(bytes) = spec.memory_budget {
+            command.arg("--memory-budget").arg(bytes.to_string());
+        }
+
+        if let Some(dir) = &spec.cgroup {
+            command.arg("--cgroup").arg(dir);
         }
 
         if let Some(dir) = &spec.chdir {
@@ -1318,11 +1333,117 @@ async fn relay<R: AsyncRead + Unpin>(stream: R, logs: Logs, to_stderr: bool) {
     };
 
     // Section 11.8: the time is when the line arrived here, put in front
-    // when the terminal asks for it with --timestamps.
+    // when the terminal asks for it with --timestamps. When lines are
+    // JSON records, each source's traceback is gathered and written as
+    // one record, once its exception's line is followed by something
+    // else or nothing more has come for a moment.
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut gathering: HashMap<String, Gathering> = HashMap::new();
+
+    loop {
+        // None is a moment with nothing read, which only lets stale
+        // tracebacks go.
+
+        let next = if gathering.is_empty() {
+            Some(lines.next_line().await)
+        } else {
+            tokio::time::timeout(TRACEBACK_WAIT, lines.next_line())
+                .await
+                .ok()
+        };
+
+        let line = match next {
+            None => None,
+            Some(Ok(Some(line))) => Some(line),
+            Some(_) => break,
+        };
+
+        gathering.retain(|source, gathered| {
+            let stale = gathered
+                .updated
+                .elapsed()
+                .is_ok_and(|age| age >= TRACEBACK_WAIT);
+
+            if stale {
+                write_traceback(out, source, gathered);
+            }
+
+            !stale
+        });
+
+        let Some(line) = line else {
+            continue;
+        };
+
         let time = SystemTime::now();
-        muru_common::log::relayed(out, time, &line);
         logs.push(time, &line);
+
+        if !muru_common::log::json() {
+            muru_common::log::relayed(out, time, &line);
+            continue;
+        }
+
+        let (source, message) = match line.split_once(": ") {
+            Some((source, message)) if source.starts_with("muru.") => (source, message),
+            _ => ("", line.as_str()),
+        };
+
+        if let Some(gathered) = gathering.get_mut(source) {
+            match gathered.traceback.push(message) {
+                Gathered::Kept => {
+                    gathered.updated = time;
+                    continue;
+                }
+                Gathered::Finished(text) => {
+                    muru_common::log::relayed(out, gathered.started, &tagged(source, &text));
+                    gathering.remove(source);
+                }
+            }
+        }
+
+        if Traceback::starts(message) {
+            gathering.insert(
+                source.to_owned(),
+                Gathering {
+                    started: time,
+                    updated: time,
+                    traceback: Traceback::new(message),
+                },
+            );
+            continue;
+        }
+
+        muru_common::log::relayed(out, time, &line);
+    }
+
+    for (source, gathered) in &mut gathering {
+        write_traceback(out, source, gathered);
+    }
+}
+
+/// How long a traceback waits for its next line before it is written as
+/// it is.
+const TRACEBACK_WAIT: Duration = Duration::from_millis(200);
+
+/// One source's traceback being gathered.
+struct Gathering {
+    /// When its first line arrived, the time of the record.
+    started: SystemTime,
+    /// When its last line arrived.
+    updated: SystemTime,
+    traceback: Traceback,
+}
+
+fn write_traceback(out: Stream, source: &str, gathered: &mut Gathering) {
+    let text = gathered.traceback.take();
+    muru_common::log::relayed(out, gathered.started, &tagged(source, &text));
+}
+
+/// A message with its source in front, as the host writes it.
+fn tagged(source: &str, message: &str) -> String {
+    if source.is_empty() {
+        message.to_owned()
+    } else {
+        format!("{source}: {message}")
     }
 }

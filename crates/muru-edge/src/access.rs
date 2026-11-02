@@ -615,7 +615,11 @@ impl AccessLog {
                 // muructl serve --log-format json the record itself.
 
                 let line = if muru_common::log::json() {
-                    json_line(record).replacen('{', "{\"kind\":\"access\",", 1)
+                    muru_common::log::with_identity(json_line(record).replacen(
+                        '{',
+                        "{\"kind\":\"access\",",
+                        1,
+                    ))
                 } else {
                     text_line(record)
                 };

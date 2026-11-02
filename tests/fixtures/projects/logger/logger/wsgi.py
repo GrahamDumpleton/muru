@@ -25,6 +25,7 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         {
             "MURU_LOG_LEVEL": os.environ.get("MURU_LOG_LEVEL"),
             "MURU_LOG_FORMAT": os.environ.get("MURU_LOG_FORMAT"),
+            "request_id": environ.get("muru.request_id"),
         }
     ).encode()
     start_response(

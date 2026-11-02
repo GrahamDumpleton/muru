@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod budget;
+pub mod cgroup;
 pub mod client;
 pub mod clients;
 pub mod commands;

@@ -82,6 +82,102 @@ pub fn json() -> bool {
     JSON.load(Ordering::Relaxed)
 }
 
+/// The pod's identity, for every JSON line, as fields ready to append
+/// after a record's own: `pod`, `namespace` and `node` from the Downward
+/// API variables a Deployment sets (`POD_NAME`, `POD_NAMESPACE`,
+/// `NODE_NAME`), `service` from `OTEL_SERVICE_NAME` and `resource` from
+/// `OTEL_RESOURCE_ATTRIBUTES`. Empty when none is set.
+pub fn identity() -> &'static str {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+
+    IDENTITY.get_or_init(|| identity_from(|name| std::env::var(name).ok()))
+}
+
+fn identity_from(read: impl Fn(&str) -> Option<String>) -> String {
+    let mut fields = String::new();
+
+    for (field, variable) in [
+        ("pod", "POD_NAME"),
+        ("namespace", "POD_NAMESPACE"),
+        ("node", "NODE_NAME"),
+        ("service", "OTEL_SERVICE_NAME"),
+    ] {
+        if let Some(value) = read(variable).filter(|value| !value.is_empty()) {
+            let _ = fmt::write(
+                &mut fields,
+                format_args!(",\"{field}\":{}", json_string(&value)),
+            );
+        }
+    }
+
+    // OpenTelemetry writes the attributes as key=value pairs separated by
+    // commas, each part percent-encoded.
+
+    let attributes: Vec<String> = read("OTEL_RESOURCE_ATTRIBUTES")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| {
+            format!(
+                "{}:{}",
+                json_string(&percent_decoded(key.trim())),
+                json_string(&percent_decoded(value.trim()))
+            )
+        })
+        .collect();
+
+    if !attributes.is_empty() {
+        let _ = fmt::write(
+            &mut fields,
+            format_args!(",\"resource\":{{{}}}", attributes.join(",")),
+        );
+    }
+
+    fields
+}
+
+/// Text with its `%XX` escapes decoded, as OpenTelemetry's variables are
+/// written.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+
+    while at < bytes.len() {
+        let escaped = (bytes[at] == b'%' && at + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[at + 1..at + 3]).ok())
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A JSON line with the pod's identity added after the record's own
+/// fields, before its closing brace.
+pub fn with_identity(mut line: String) -> String {
+    let fields = identity();
+
+    if !fields.is_empty()
+        && let Some(end) = line.rfind('}')
+    {
+        line.insert_str(end, fields);
+    }
+
+    line
+}
+
 /// A string as a JSON string literal, quotes included.
 pub fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -212,9 +308,10 @@ pub fn line(stream: Stream, tag: &str, message: fmt::Arguments<'_>) {
 
     if json() {
         text.push_str(&format!(
-            "{{\"time\":\"{}\",\"kind\":\"muru\",\"message\":{}}}\n",
+            "{{\"time\":\"{}\",\"kind\":\"muru\",\"message\":{}{}}}\n",
             full(SystemTime::now()),
-            json_string(&message.to_string())
+            json_string(&message.to_string()),
+            identity()
         ));
         write(stream, text.as_bytes());
         return;
@@ -247,12 +344,8 @@ pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
             _ => ("", text),
         };
 
-        out.push_str(&format!(
-            "{{\"time\":\"{}\",\"kind\":\"app\",\"source\":{},\"message\":{}}}\n",
-            full(time),
-            json_string(source),
-            json_string(message)
-        ));
+        out.push_str(&app_record(time, source, message));
+        out.push('\n');
         write(stream, out.as_bytes());
         return;
     }
@@ -265,6 +358,122 @@ pub fn relayed(stream: Stream, time: SystemTime, text: &str) {
     out.push_str(text);
     out.push('\n');
     write(stream, out.as_bytes());
+}
+
+/// The JSON record of a line of the application's output. A line that
+/// is itself a JSON object, such as a record of Python logging's json
+/// format, is the record, with Muru's fields added: its own `time` is
+/// kept, and `kind` and `source` say where it came from. Any other line is
+/// the record's `message`.
+fn app_record(time: SystemTime, source: &str, message: &str) -> String {
+    let parsed = message
+        .starts_with('{')
+        .then(|| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(message).ok())
+        .flatten();
+
+    let Some(mut object) = parsed else {
+        return format!(
+            "{{\"time\":\"{}\",\"kind\":\"app\",\"source\":{},\"message\":{}{}}}",
+            full(time),
+            json_string(source),
+            json_string(message),
+            identity()
+        );
+    };
+
+    let own_time = match object.remove("time") {
+        Some(serde_json::Value::String(text)) => text,
+        _ => full(time),
+    };
+
+    object.remove("kind");
+    object.remove("source");
+
+    let mut record = format!(
+        "{{\"time\":{},\"kind\":\"app\",\"source\":{}",
+        json_string(&own_time),
+        json_string(source)
+    );
+
+    for (key, value) in &object {
+        let _ = fmt::write(&mut record, format_args!(",{}:{value}", json_string(key)));
+    }
+
+    record.push_str(identity());
+    record.push('}');
+    record
+}
+
+/// Section 11.8: a Python traceback written to a stream arrives a line at
+/// a time, and a log collector that splits records at newlines makes a
+/// record of each. This gathers one source's traceback, from `Traceback
+/// (most recent call last):` to the exception's own line, chained
+/// exceptions included, so it can be written as one record.
+#[derive(Debug, Default)]
+pub struct Traceback {
+    lines: Vec<String>,
+    /// Whether the exception's line has arrived, so another traceback
+    /// chained to it may follow.
+    ended: bool,
+}
+
+/// What a line does to a traceback being gathered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gathered {
+    /// The line is part of the traceback.
+    Kept,
+    /// The traceback was complete and the line is not part of it: write
+    /// the traceback, then the line.
+    Finished(String),
+}
+
+impl Traceback {
+    /// Whether `message` starts a traceback.
+    pub fn starts(message: &str) -> bool {
+        message.starts_with("Traceback (most recent call last):")
+    }
+
+    /// Start gathering with the first line.
+    pub fn new(first: &str) -> Self {
+        Self {
+            lines: vec![first.to_owned()],
+            ended: false,
+        }
+    }
+
+    /// Take the next line of the same source.
+    pub fn push(&mut self, message: &str) -> Gathered {
+        // A blank line leaves the traceback as it was: the next line says
+        // whether another exception is chained to it.
+
+        if message.is_empty() {
+            self.lines.push(String::new());
+            return Gathered::Kept;
+        }
+
+        let chained = Self::starts(message)
+            || message.starts_with("During handling of the above exception")
+            || message.starts_with("The above exception was the direct cause");
+
+        if self.ended && !chained {
+            return Gathered::Finished(self.take());
+        }
+
+        let indented = message.starts_with(' ') || message.starts_with('\t');
+        self.ended = !indented && !chained;
+        self.lines.push(message.to_owned());
+        Gathered::Kept
+    }
+
+    /// The traceback gathered so far, as one message, for when no more is
+    /// coming.
+    pub fn take(&mut self) -> String {
+        while self.lines.last().is_some_and(String::is_empty) {
+            self.lines.pop();
+        }
+
+        std::mem::take(&mut self.lines).join("\n")
+    }
 }
 
 /// Write bytes that hold whole lines to `stream`, or to standard output
@@ -333,6 +542,72 @@ mod tests {
             split_time("2026-11-02 not a time at all, no"),
             (None, "2026-11-02 not a time at all, no")
         );
+    }
+
+    #[test]
+    fn the_pod_identity_comes_from_the_environment() {
+        let identity = identity_from(|name| match name {
+            "POD_NAME" => Some("shop-7d9f".to_owned()),
+            "POD_NAMESPACE" => Some("prod".to_owned()),
+            "OTEL_RESOURCE_ATTRIBUTES" => {
+                Some("deployment.environment=prod, team=a%2Cb".to_owned())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            identity,
+            ",\"pod\":\"shop-7d9f\",\"namespace\":\"prod\",\"resource\":{\"deployment.environment\":\"prod\",\"team\":\"a,b\"}"
+        );
+        assert_eq!(identity_from(|_| None), "");
+    }
+
+    #[test]
+    fn a_json_line_from_the_application_is_the_record() {
+        let time = UNIX_EPOCH + Duration::from_millis(1_793_597_342_836);
+        let record = app_record(
+            time,
+            "muru.worker[0]",
+            r#"{"time": "2026-11-02T05:29:01.000Z", "level": "ERROR", "message": "failed"}"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&record).expect("json");
+        assert_eq!(parsed["time"], "2026-11-02T05:29:01.000Z");
+        assert_eq!(parsed["kind"], "app");
+        assert_eq!(parsed["source"], "muru.worker[0]");
+        assert_eq!(parsed["level"], "ERROR");
+        assert!(record.starts_with(r#"{"time":"2026-11-02T05:29:01.000Z","kind":"app""#));
+
+        let record = app_record(time, "muru.worker[0]", "{not json");
+        let parsed: serde_json::Value = serde_json::from_str(&record).expect("json");
+        assert_eq!(parsed["message"], "{not json");
+        assert_eq!(parsed["time"], "2026-11-02T05:29:02.836Z");
+    }
+
+    #[test]
+    fn a_traceback_is_gathered_to_its_exception_with_what_is_chained() {
+        let mut traceback = Traceback::new("Traceback (most recent call last):");
+
+        for line in [
+            "  File \"app.py\", line 3, in view",
+            "    1 / 0",
+            "    ~~^~~",
+            "ZeroDivisionError: division by zero",
+            "",
+            "During handling of the above exception, another exception occurred:",
+            "",
+            "Traceback (most recent call last):",
+            "  File \"app.py\", line 5, in view",
+            "KeyError: 'sku'",
+            "",
+        ] {
+            assert_eq!(traceback.push(line), Gathered::Kept, "{line}");
+        }
+
+        let Gathered::Finished(message) = traceback.push("served /next") else {
+            panic!("the traceback did not finish");
+        };
+        assert!(message.starts_with("Traceback (most recent call last):\n  File"));
+        assert!(message.ends_with("KeyError: 'sku'"), "{message}");
+        assert_eq!(message.lines().count(), 11);
     }
 
     #[test]

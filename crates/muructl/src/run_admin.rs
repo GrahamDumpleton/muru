@@ -6,7 +6,7 @@
 //! user runtime directory beside a file that names the run, which is how
 //! a command finds it without a flag.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -276,8 +276,65 @@ pub fn debug_source(
     })
 }
 
+/// Workers replaced and workers gone, by metric, application, release,
+/// group and reason, counted from the host's events. A process runs one
+/// application, so one count serves it.
+static WORKER_EVENTS: Mutex<BTreeMap<WorkerEvent, u64>> = Mutex::new(BTreeMap::new());
+
+type WorkerEvent = (&'static str, String, String, String, String);
+
+/// Section 11.1: count a host's event about a worker, as the daemon
+/// counts it, when it is a replacement or an exit.
+pub fn count_worker_event(app: &str, release: &str, kind: &str, group: &str, reason: &str) {
+    let name = match kind {
+        "worker.recycled" | "worker.timeout_killed" => "muru_worker_recycles_total",
+        "worker.exited" | "worker.oom_killed" => "muru_worker_exits_total",
+        _ => return,
+    };
+
+    let group = if group.is_empty() {
+        muru_edge::routing::DEFAULT_GROUP
+    } else {
+        group
+    };
+    let reason = if reason.is_empty() { "other" } else { reason };
+    let key = (
+        name,
+        app.to_owned(),
+        release.to_owned(),
+        group.to_owned(),
+        reason.to_owned(),
+    );
+    *WORKER_EVENTS
+        .lock()
+        .expect("worker events poisoned")
+        .entry(key)
+        .or_default() += 1;
+}
+
+fn worker_event_samples() -> Vec<muru_edge::metrics::Sample> {
+    WORKER_EVENTS
+        .lock()
+        .expect("worker events poisoned")
+        .iter()
+        .map(|((name, app, release, group, reason), count)| {
+            muru_edge::metrics::Sample::new(
+                name,
+                &[
+                    ("app", app.as_str()),
+                    ("release", release.as_str()),
+                    ("group", group.as_str()),
+                    ("reason", reason.as_str()),
+                ],
+                *count as f64,
+            )
+        })
+        .collect()
+}
+
 /// The Prometheus text of a run: the edge's request metrics, the pools'
-/// and the listeners', which `/metrics` on the dashboard shows too.
+/// and the listeners', and the workers replaced and gone, which
+/// `/metrics` on the dashboard shows too.
 pub fn metrics_text(
     pools: &Pools,
     access_log: &AccessLog,
@@ -289,7 +346,8 @@ pub fn metrics_text(
         .samples()
         .into_iter()
         .chain(pool_samples(&routing))
-        .chain(connections.samples());
+        .chain(connections.samples())
+        .chain(worker_event_samples());
     render(&aggregate(samples))
 }
 
