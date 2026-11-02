@@ -2887,6 +2887,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         identity: None,
     };
 
+    // Section 11.8: under serve --log-format json, Python logging writes
+    // its records as JSON too, unless the project names a format, so a
+    // record and its exception reach a log collector as one object.
+
+    if serve.as_ref().is_some_and(|mode| mode.json) && spec.logging.format.is_none() {
+        spec.logging.format = Some("json".to_owned());
+    }
+
     let logs = Logs::default();
     let group_tables = resolved.groups.clone();
     let mounts = mount_paths(&resolved);

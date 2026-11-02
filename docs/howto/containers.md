@@ -256,7 +256,44 @@ collector, each with its `time`, a `kind` (`access`, `app` for the
 application's output, or `muru`), and the line's fields:
 
 ```json
-{"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"WARNING demo: warned"}
+{"time":"2026-11-02T05:42:22.836Z","kind":"app","source":"muru.worker[0]","message":"worker 0 is ready"}
+```
+
+With it, Python logging writes [JSON records](logging.md#python-logging)
+too, unless the project names a format. Each record becomes the line's
+object, with its level, logger, message and request id as fields, and an
+exception logged with it as one `exception` field:
+
+```json
+{"time":"2026-11-02T05:42:23.104Z","kind":"app","source":"muru.worker[0]","level":"ERROR","logger":"shop.views","message":"checkout failed","request_id":"01M6CY84YP8J7V9K0QN8ABV14V","exception":"Traceback (most recent call last):\n  ...\nKeyError: 'sku'","app":"shop","release":"r1","group":"default","worker":0}
+```
+
+A traceback written to standard error rather than logged, such as one
+from an exception the application did not catch, is gathered into a
+single record too, from `Traceback (most recent call last):` to the
+exception's own line. So a log collector that splits records at newlines
+keeps each traceback whole.
+
+Each JSON line also carries the pod it came from, when the Deployment
+passes it in with the Downward API, and the OpenTelemetry service and
+resource attributes when they are set:
+
+| Variable | Field |
+| --- | --- |
+| `POD_NAME` | `pod` |
+| `POD_NAMESPACE` | `namespace` |
+| `NODE_NAME` | `node` |
+| `OTEL_SERVICE_NAME` | `service` |
+| `OTEL_RESOURCE_ATTRIBUTES` | `resource`, an object of its attributes |
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom: {fieldRef: {fieldPath: metadata.name}}
+  - name: POD_NAMESPACE
+    valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+  - name: NODE_NAME
+    valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
 ```
 
 ## Files it writes

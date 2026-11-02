@@ -252,12 +252,15 @@ def test_print_config_names_where_each_setting_came_from(tmp_path: Path) -> None
     assert 'processes = "1"    # command line' in output, output
 
 
-def test_json_lines_carry_their_kind_and_time(tmp_path: Path) -> None:
-    serve = start(tmp_path, "--log-format", "json")
+def test_json_lines_carry_their_kind_time_and_pod(tmp_path: Path) -> None:
+    serve = start(
+        tmp_path, "--log-format", "json", env={"POD_NAME": "shop-1", "POD_NAMESPACE": "prod"}
+    )
 
     try:
         serve.get("/")
-        serve.wait_for('"kind":"access"')
+        serve.get("/error")
+        serve.wait_for("RuntimeError: deliberate failure")
     finally:
         assert serve.stop() == 0
 
@@ -265,8 +268,33 @@ def test_json_lines_carry_their_kind_and_time(tmp_path: Path) -> None:
     kinds = {record["kind"] for record in records}
     assert {"muru", "app", "access"} <= kinds, kinds
     assert all(record["time"].endswith("Z") for record in records)
+    assert all((record["pod"], record["namespace"]) == ("shop-1", "prod") for record in records)
     host = next(record for record in records if record["kind"] == "app")
     assert host["source"].startswith("muru.host["), host
+
+    # The traceback is one record, from its first line to the exception's.
+
+    traceback = next(record for record in records if "Traceback" in record.get("message", ""))
+    assert traceback["source"] == "muru.worker[0]", traceback
+    assert traceback["message"].startswith("Traceback (most recent call last):\n")
+    assert traceback["message"].endswith("RuntimeError: deliberate failure")
+
+
+def test_python_records_in_json_are_the_records_themselves(tmp_path: Path) -> None:
+    serve = start(tmp_path, "--log-format", "json", app="logging_wsgi:application")
+
+    try:
+        serve.get("/fail")
+        serve.wait_for('"level":"ERROR"')
+    finally:
+        assert serve.stop() == 0
+
+    records = [json.loads(line) for line in serve.output().splitlines()]
+    failed = next(record for record in records if record.get("message") == "failed for /fail")
+    access = next(record for record in records if record["kind"] == "access")
+    assert failed["kind"] == "app" and failed["logger"] == "demo", failed
+    assert failed["exception"].endswith("ValueError: boom"), failed
+    assert failed["request_id"] == access["request_id"]
 
 
 def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
