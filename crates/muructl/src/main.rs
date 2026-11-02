@@ -2871,6 +2871,8 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         loop_stall_timeout: timeouts.loop_stall,
         gil_stall_timeout: timeouts.gil_stall,
         memory: memory.clone(),
+        memory_budget: serve.as_ref().and_then(|mode| mode.memory_budget),
+        cgroup: serve.as_ref().and_then(|mode| mode.cgroup.clone()),
         env: resolved
             .env
             .iter()
@@ -3379,7 +3381,8 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, message, .. } => {
+                    muru_controller::host::HostMessage::Event { kind, message, group, reason, .. } => {
+                        run_admin::count_worker_event(&label, &format!("r{}", current.release), &kind, &group, &reason);
                         muru_common::muru_println!("{kind}: {message}");
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {

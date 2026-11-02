@@ -454,6 +454,12 @@ pub struct HostSpec {
     pub gil_stall_timeout: Duration,
     /// The memory policy for the workers (section 7.7).
     pub memory: crate::model::MemoryPolicy,
+    /// Section 13.9: the container's memory budget, from which the host
+    /// derives each worker's hard limit when the policy sets none.
+    pub memory_budget: Option<u64>,
+    /// Section 13.9: the container's cgroup directory, whose
+    /// `memory.events` tells a worker the kernel killed for memory.
+    pub cgroup: Option<PathBuf>,
     /// Environment variables for the host and its workers (section
     /// 10.8), secret values already resolved.
     pub env: Vec<(String, String)>,
@@ -875,6 +881,14 @@ impl HostProcess {
 
         if let Some(bytes) = spec.memory.hard_limit {
             command.arg("--memory-hard-limit").arg(bytes.to_string());
+        }
+
+        if let Some(bytes) = spec.memory_budget {
+            command.arg("--memory-budget").arg(bytes.to_string());
+        }
+
+        if let Some(dir) = &spec.cgroup {
+            command.arg("--cgroup").arg(dir);
         }
 
         if let Some(dir) = &spec.chdir {

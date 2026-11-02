@@ -7,8 +7,8 @@
 Compose, Podman or Kubernetes: configured from the image and the
 environment, with probes and metrics on an admin port, logs on standard
 output and a drain on `docker stop` or a Kubernetes rolling update.
-Sizing the worker count from the container's limits, and guides for
-Compose and a Kubernetes Deployment, are still to come.
+Workers are sized from the container's CPU and memory limits. Guides for
+Compose and a Kubernetes Deployment are still to come.
 ```
 
 `muructl serve` runs one application as the container's main process: the
@@ -144,7 +144,7 @@ with where it came from, and exits.
 | `--admin-listen ADDRESS` | `0.0.0.0:9090` | where the probes and metrics are served, or `off` |
 | `--admin-status` | off | serve `/status` on the admin port too |
 | `--min-ready N` | 1 | the workers ready in every mount for `/readyz` to pass |
-| `--processes N` | `auto`, the CPU count | worker processes |
+| `--processes N` | `auto`, from the container's CPU limit | worker processes; see [sizing](#sizing-from-the-containers-limits) |
 | `--threads N` | 4 | threads per WSGI worker |
 | `--python PATH` | as above | the interpreter |
 | `--access-log WHAT` | `on` | `on`, `errors` (4xx and 5xx responses and requests slower than `--slow`) or `off` |
@@ -162,6 +162,42 @@ with where it came from, and exits.
 `--preload`, `--hooks`, `--timeout`, `--max-body-size`, `--max-requests`,
 `--max-lifetime`, `--memory`, the connection limits, `--static` and
 `--no-compression` work as they do for [`muructl run`](run-settings.md).
+
+## Sizing from the container's limits
+
+On Linux, `muructl serve` reads the container's CPU and memory limits at
+start, so a container limited to 2 CPUs on a 64-core node starts 2
+workers, not 64.
+
+- **Workers.** `--processes auto`, the default, is the CPU limit rounded
+  up: `--cpus 1.5` under Docker, or `resources.limits.cpu: 1500m` in
+  Kubernetes, gives 2. With no CPU limit it is the number of CPUs the
+  container may run on.
+- **Memory.** With a memory limit, each worker gets a hard limit unless
+  one is set with `--memory hard_limit=...`. Ten percent of the limit
+  (at least 128 MiB) is left for muructl and the page cache, and so is
+  what the application holds in memory after it is imported. The rest is
+  divided between the workers. A worker that grows past its share is
+  replaced as the [memory policy](memory.md) replaces one, with no request
+  lost, before the kernel's out-of-memory killer chooses a process to
+  kill.
+- **Out-of-memory kills.** A worker the kernel kills anyway is reported
+  as a `worker.oom_killed` event and counted in `muru_worker_exits_total`
+  with the reason `oom_killed`, and the host starts another.
+
+The lines at start say what was worked out and from what, here under
+`docker run --cpus 2 --memory 1g`:
+
+```
+muru: 2 processes from cpu.max 200000 100000
+muru: memory budget 896MB (memory.max 1.0GB less 128MB)
+muru.host[11]: worker hard limit 432MB: the memory budget of 896MB less 32MB the host holds, over 2 workers
+```
+
+The limits are read once at start, so a change to them (an in-place pod
+resize) takes effect when the container restarts. On macOS, and in a
+container with no limits, the worker count is the number of CPUs and no
+memory limit is derived.
 
 ## Probes and metrics
 

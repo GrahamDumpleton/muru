@@ -4238,6 +4238,8 @@ impl Daemon {
             loop_stall_timeout: Duration::from_millis(spec.timeouts.loop_stall_timeout_ms),
             gil_stall_timeout: Duration::from_millis(spec.timeouts.gil_stall_timeout_ms),
             memory: spec.memory.clone(),
+            memory_budget: None,
+            cgroup: None,
             env,
             identity,
             groups: spec
@@ -7339,7 +7341,7 @@ impl Daemon {
                 if let Some(running) = self.running.get_mut(&key) {
                     let counts = match kind.as_str() {
                         "worker.recycled" | "worker.timeout_killed" => Some(&mut running.recycles),
-                        "worker.exited" => Some(&mut running.exits),
+                        "worker.exited" | "worker.oom_killed" => Some(&mut running.exits),
                         _ => None,
                     };
 
