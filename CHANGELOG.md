@@ -21,18 +21,18 @@ breaking changes, which are listed under each release.
   the flags, in that order. `--print-config` shows where each setting came
   from. Everything goes to standard output, as text or, with `--log-format
   json`, as JSON objects, and `muructl` commands run inside the container
-  reach it through its run directory. ([#102](https://github.com/GrahamDumpleton/muru/issues/102))
+  reach it through its run directory. ([#102](https://github.com/muruhq/muru/issues/102))
 - Added the admin port of `muructl serve`, on `0.0.0.0:9090` by default:
   `/livez`, `/readyz`, `/startupz` and `/metrics` for liveness, readiness
   and startup probes and Prometheus, `/status` with `--admin-status`, and
   `muructl probe ready` (or `live`, `startup`) for a health check in an image
-  with no curl. ([#103](https://github.com/GrahamDumpleton/muru/issues/103))
+  with no curl. ([#103](https://github.com/muruhq/muru/issues/103))
 - Added `--shutdown-delay` and `--shutdown-budget` to `muructl serve`
   (`MURU_SERVE_SHUTDOWN_DELAY`, `MURU_SERVE_SHUTDOWN_BUDGET`). On SIGTERM,
   readiness fails at once. For the delay the listener keeps accepting, with
   every connection closing after its response. The whole stop fits inside
   the budget, so a Kubernetes rolling update loses no requests and needs no
-  `preStop` hook. A serve table can now also set `runtime_dir`. ([#104](https://github.com/GrahamDumpleton/muru/issues/104))
+  `preStop` hook. A serve table can now also set `runtime_dir`. ([#104](https://github.com/muruhq/muru/issues/104))
 - `muructl serve` now sizes itself from the container's cgroup v2 limits.
   `--processes auto`, the default, is the CPU limit rounded up, not the
   node's cores. With a memory limit, each worker gets a hard limit unless
@@ -41,33 +41,33 @@ breaking changes, which are listed under each release.
   memory anyway is reported as `worker.oom_killed` and counted in
   `muru_worker_exits_total` with the reason `oom_killed`, which `muructl
   run` and `muructl serve` now serve on `/metrics`, beside
-  `muru_worker_recycles_total`. ([#105](https://github.com/GrahamDumpleton/muru/issues/105))
+  `muru_worker_recycles_total`. ([#105](https://github.com/muruhq/muru/issues/105))
 - `muructl serve` runs under an arbitrary user ID with group 0 and a
   read-only root filesystem: everything it writes goes under one run
   directory, `/run/muru` by default, it stops at once naming the volume it
   needs when that cannot be written, and uploads spooled to disk are held to
-  `--spool-quota`. ([#106](https://github.com/GrahamDumpleton/muru/issues/106))
+  `--spool-quota`. ([#106](https://github.com/muruhq/muru/issues/106))
 - Under `muructl serve --log-format json`, Python logging writes JSON
   records too. A record that is already a JSON object becomes the line's
   object rather than a string inside another, and a traceback is gathered
   into one record. Every JSON line carries the pod's name, namespace and
   node, and the OpenTelemetry service and resource attributes, when they
   are set. A log collector that splits records at newlines therefore keeps
-  each record and each traceback whole. ([#107](https://github.com/GrahamDumpleton/muru/issues/107))
+  each record and each traceback whole. ([#107](https://github.com/muruhq/muru/issues/107))
 - Added `muru_capacity_utilisation`: the share of each group's worker
   slots in use, sampled every second and averaged over 30 seconds, for an
   autoscaler such as a Kubernetes HorizontalPodAutoscaler or KEDA. The
   metrics guide shows how to scale on it and on the time requests wait for
-  a slot. ([#108](https://github.com/GrahamDumpleton/muru/issues/108))
+  a slot. ([#108](https://github.com/muruhq/muru/issues/108))
 - `muructl serve` never builds an environment, installs an interpreter or
   fetches the runtime library: it finds the interpreter in the image and the
   runtime library in the environment or `--runtime-dir` (`/opt/muru` by
   default), and stops naming the build step that should have provided what
-  is missing. ([#110](https://github.com/GrahamDumpleton/muru/issues/110))
+  is missing. ([#110](https://github.com/muruhq/muru/issues/110))
 - Every Python log record now carries the request it was logged in and
   where it was logged, as `muru_request_id`, `muru_app`, `muru_release`,
   `muru_group` and `muru_worker`, for an application's own format. The
-  `json` log format writes the request id as `request_id`. ([#168](https://github.com/GrahamDumpleton/muru/issues/168))
+  `json` log format writes the request id as `request_id`. ([#168](https://github.com/muruhq/muru/issues/168))
 
 ### Changed
 
@@ -80,11 +80,11 @@ breaking changes, which are listed under each release.
   access log's terminal line shows the local clock, the dashboard shows
   times on the browser's clock with the full time on hover, and the daemon's
   own messages read like Muru's other lines, `muru: warning: ...` with the
-  event's details in brackets. ([#93](https://github.com/GrahamDumpleton/muru/issues/93))
+  event's details in brackets. ([#93](https://github.com/muruhq/muru/issues/93))
 - `muructl debug`, `muructl restart` and `muructl logging level` no longer
   need an application against `muructl run` or `muructl serve`, which
   serve only one, so `kubectl exec deploy/shop -- muructl debug stacks`
-  works as it is. ([#291](https://github.com/GrahamDumpleton/muru/issues/291))
+  works as it is. ([#291](https://github.com/muruhq/muru/issues/291))
 
 ### Documentation
 
@@ -92,7 +92,7 @@ breaking changes, which are listed under each release.
   probes, a rolling update that loses no requests, a restricted security
   context, sizing from resource limits and resizing, logs for a collector, autoscaling
   with an HPA or KEDA, and migrations as a Job. The container guide gained
-  a Compose service. ([#119](https://github.com/GrahamDumpleton/muru/issues/119))
+  a Compose service. ([#119](https://github.com/muruhq/muru/issues/119))
 
 
 ## 0.1.0a14 (2026-11-01)
@@ -102,83 +102,83 @@ breaking changes, which are listed under each release.
 - Added handing a request from a WSGI application to an ASGI one in the
   same worker, enabled with `handoff = "asgi"`: `environ["muru.wsgi_to_asgi"]`
   continues an HTTP request, or a WebSocket upgrade, as an ASGI application,
-  and raises `muru.HandoffNotEnabled` without the setting. ([#91](https://github.com/GrahamDumpleton/muru/issues/91))
-- Added commands an application declares in `[tool.muru.commands]`, such as a migration, a backup or creating an account, each a program or a Python callable with checked inputs, including secret ones taken from a secret store. `muructl command list` shows them with each one's last run, `muructl command run` runs one with a release, and coding agents get `commands` and `run_command` MCP tools. ([#96](https://github.com/GrahamDumpleton/muru/issues/96))
-- Added `muructl exec`, which runs a one-off command, such as a database migration, with a release's interpreter, environment, secrets, user and source directory, streaming its output and exiting with its status. A new how-to guide covers database migrations while two releases share a database. ([#122](https://github.com/GrahamDumpleton/muru/issues/122))
-- Added `muructl mcp serve`, a Model Context Protocol server that gives a coding agent the daemon's operations as tools: status, lists, releases, events, logs, worker stacks and the other debug views, metrics, deploy, promote, rollback, drain, rollouts, scaling, restarts, overlays, maintenance, apply and log levels, plus the user guide. Each tool runs the matching `muructl` command with `--json`; `--read-only` and `--allow` limit what the agent may change, and `--up` starts the daemon when none answers. The coding agents guide describes the development loop. ([#197](https://github.com/GrahamDumpleton/muru/issues/197))
-- Added `--json` to every `muructl` command that reports something: status, the lists, releases, rollouts, overlays, scaling, events, logs, metrics, WebSockets, and what deploy, rollback, drain, restart, maintenance and the other changes did. The output is the admin API's answer with its field names, streams print JSON lines, and a failure prints `{"error": ...}` with the same exit status; the JSON output reference lists each command's shape. ([#254](https://github.com/GrahamDumpleton/muru/issues/254))
-- Added `muructl mcp skill`, which prints, installs or checks a skill for coding agents that teaches the development loop under Muru: what releases and traffic are, what deploy, promote, rollback, drain and rollouts do, and what to check after each. The skill is embedded in `muructl` and versioned with it; `install` writes it to `.claude/skills/muru/SKILL.md` (or another directory with `--dir`), `status` says whether the project's copy is current, and the MCP server tells the agent when it is out of date. ([#255](https://github.com/GrahamDumpleton/muru/issues/255))
+  and raises `muru.HandoffNotEnabled` without the setting. ([#91](https://github.com/muruhq/muru/issues/91))
+- Added commands an application declares in `[tool.muru.commands]`, such as a migration, a backup or creating an account, each a program or a Python callable with checked inputs, including secret ones taken from a secret store. `muructl command list` shows them with each one's last run, `muructl command run` runs one with a release, and coding agents get `commands` and `run_command` MCP tools. ([#96](https://github.com/muruhq/muru/issues/96))
+- Added `muructl exec`, which runs a one-off command, such as a database migration, with a release's interpreter, environment, secrets, user and source directory, streaming its output and exiting with its status. A new how-to guide covers database migrations while two releases share a database. ([#122](https://github.com/muruhq/muru/issues/122))
+- Added `muructl mcp serve`, a Model Context Protocol server that gives a coding agent the daemon's operations as tools: status, lists, releases, events, logs, worker stacks and the other debug views, metrics, deploy, promote, rollback, drain, rollouts, scaling, restarts, overlays, maintenance, apply and log levels, plus the user guide. Each tool runs the matching `muructl` command with `--json`; `--read-only` and `--allow` limit what the agent may change, and `--up` starts the daemon when none answers. The coding agents guide describes the development loop. ([#197](https://github.com/muruhq/muru/issues/197))
+- Added `--json` to every `muructl` command that reports something: status, the lists, releases, rollouts, overlays, scaling, events, logs, metrics, WebSockets, and what deploy, rollback, drain, restart, maintenance and the other changes did. The output is the admin API's answer with its field names, streams print JSON lines, and a failure prints `{"error": ...}` with the same exit status; the JSON output reference lists each command's shape. ([#254](https://github.com/muruhq/muru/issues/254))
+- Added `muructl mcp skill`, which prints, installs or checks a skill for coding agents that teaches the development loop under Muru: what releases and traffic are, what deploy, promote, rollback, drain and rollouts do, and what to check after each. The skill is embedded in `muructl` and versioned with it; `install` writes it to `.claude/skills/muru/SKILL.md` (or another directory with `--dir`), `status` says whether the project's copy is current, and the MCP server tells the agent when it is out of date. ([#255](https://github.com/muruhq/muru/issues/255))
 - Added handing a request from an ASGI application to a WSGI callable on
   the worker's threads, enabled with `handoff = "wsgi"`, which also lets an
   ASGI mount have `threads` of its own for it. The access log marks a
-  request handed across, and `muru_handoffs_total` counts them. ([#273](https://github.com/GrahamDumpleton/muru/issues/273))
+  request handed across, and `muru_handoffs_total` counts them. ([#273](https://github.com/muruhq/muru/issues/273))
 - Added `muru.asgi.register()`, which runs the lifespan of an ASGI
   application that requests are handed to, `muru.loop()`, the worker's
   event loop for WSGI code, and `muru.request_id()`, the id of the request
-  being served. ([#274](https://github.com/GrahamDumpleton/muru/issues/274))
+  being served. ([#274](https://github.com/muruhq/muru/issues/274))
 - Added `muru.asgi.websocket.Handler`, an ASGI application that runs a
   WebSocket's connect, message and disconnect events as calls on an object,
   on application threads, so a WSGI application handles WebSockets in
-  synchronous code. ([#275](https://github.com/GrahamDumpleton/muru/issues/275))
+  synchronous code. ([#275](https://github.com/muruhq/muru/issues/275))
 
 ### Changed
 
-- Client class and rate limit names follow the same rule as every other name: lowercase letters, digits and hyphens, up to 63 characters, with no hyphen at either end. Names with underscores, such as `ai_crawler`, are refused; rename them, for example to `ai-crawler`. ([#281](https://github.com/GrahamDumpleton/muru/issues/281))
+- Client class and rate limit names follow the same rule as every other name: lowercase letters, digits and hyphens, up to 63 characters, with no hyphen at either end. Names with underscores, such as `ai_crawler`, are refused; rename them, for example to `ai-crawler`. ([#281](https://github.com/muruhq/muru/issues/281))
 
 ### Fixed
 
-- Fixed a race in which a request accepted just as the edge began to drain, on Ctrl-C, `docker stop` or an edge replacement, could reach a worker that was already stopping and be answered 502; the drain now waits until the edge has stopped accepting. ([#241](https://github.com/GrahamDumpleton/muru/issues/241))
-- `muructl run` and `muructl check` now refuse the mount, worker group and environment variable names the daemon refuses, and check a group's `match` the same way, so a project that runs in development no longer fails its first deploy over a name such as `async_plain`, and a group named `default` is refused when the project is read rather than when the host starts. ([#280](https://github.com/GrahamDumpleton/muru/issues/280))
-- `muructl run` and `muructl check` now make the daemon's checks of a project's worker groups, mounts, scaling tables, `max_requests` and file hint keys: a group without paths or match, groups asking the same of one path, a group naming a missing mount, a mount path not below `/`, an entrypoint that is not `module:callable`, two mounts at one path or a scaling table that does not resolve fails there as it would fail a deploy. ([#282](https://github.com/GrahamDumpleton/muru/issues/282))
+- Fixed a race in which a request accepted just as the edge began to drain, on Ctrl-C, `docker stop` or an edge replacement, could reach a worker that was already stopping and be answered 502; the drain now waits until the edge has stopped accepting. ([#241](https://github.com/muruhq/muru/issues/241))
+- `muructl run` and `muructl check` now refuse the mount, worker group and environment variable names the daemon refuses, and check a group's `match` the same way, so a project that runs in development no longer fails its first deploy over a name such as `async_plain`, and a group named `default` is refused when the project is read rather than when the host starts. ([#280](https://github.com/muruhq/muru/issues/280))
+- `muructl run` and `muructl check` now make the daemon's checks of a project's worker groups, mounts, scaling tables, `max_requests` and file hint keys: a group without paths or match, groups asking the same of one path, a group naming a missing mount, a mount path not below `/`, an entrypoint that is not `module:callable`, two mounts at one path or a scaling table that does not resolve fails there as it would fail a deploy. ([#282](https://github.com/muruhq/muru/issues/282))
 
 ### Documentation
 
-- Added explanation pages on releases and traffic policies and on how scaling decides, a how-to guide for upgrading Muru, and a reference page for the supported platforms and Python versions. ([#259](https://github.com/GrahamDumpleton/muru/issues/259))
+- Added explanation pages on releases and traffic policies and on how scaling decides, a how-to guide for upgrading Muru, and a reference page for the supported platforms and Python versions. ([#259](https://github.com/muruhq/muru/issues/259))
 
 
 ## 0.1.0a13 (2026-10-31)
 
 ### Added
 
-- Added `muructl check`, which loads an application in a throwaway interpreter and reports what a run would fail on: the project's tables, the interpreter against `requires-python`, the runtime library, the entrypoint and its interface, the hooks module and the mounts, and what the import check finds, with `--strict` turning findings into failures and `--env-file` supplying settings the import reads. Nothing is built or served. ([#114](https://github.com/GrahamDumpleton/muru/issues/114))
-- Added version requests for the interpreter: `--python 3.13`, `python = "3.13"` in `[tool.muru]`, a `.python-version` file or `requires-python` name a Python that `muructl run` and `muructl deploy` resolve with uv, and every interpreter is probed before the host starts, so an unsupported one or one outside `requires-python` fails with a message naming both versions. `muructl release show` prints the resolved version and tag, and the daemon's `[tools]` table names uv, where managed interpreters go and whether they may be downloaded. ([#124](https://github.com/GrahamDumpleton/muru/issues/124))
-- The daemon builds a release's environment from `uv.lock` before it starts: a source with a lock and no `.venv` gets one of its own under the state directory, built as the release's user with uv's output in the release log, and the release is `building` meanwhile. `--build`, `--build-extra` and `--build-group` on `muructl deploy`, or the `build` table of a project or a declared release, say when and how; a Python the node lacks is downloaded first when the `[tools]` table allows it. ([#125](https://github.com/GrahamDumpleton/muru/issues/125))
-- Daemon-managed releases write their bytecode to a directory of their own under the state directory instead of the source tree, so an immutable or read-only release directory still gets a cache and cold starts stay fast; a source that already holds compiled bytecode for the interpreter is used as it is. The `bytecode` setting, `redirect`, `source` or `off`, is in the project's `[tool.muru]` table, a declared release or `--bytecode` on `muructl deploy`. ([#126](https://github.com/GrahamDumpleton/muru/issues/126))
-- The `muru` runtime library is provided by `muructl` itself and no longer has to be a dependency of the application: `muructl run` and the daemon put the copy matching their own version on the host's `PYTHONPATH`, fetching the wheel for the interpreter once into the user cache or the state directory. An environment that already has the matching `muru` is used as it is, so offline machines need no flag; `MURU_WHEEL_DIR` and `MURU_OFFLINE`, or `wheel_dir` and `offline` in the daemon's `[tools]` table, cover machines without network. `muructl runtime install` unpacks the library for an image. ([#127](https://github.com/GrahamDumpleton/muru/issues/127))
-- Added the metrics the design named and the daemon did not yet export: `muru_gil_wait_seconds` and `muru_loop_lag_seconds` histograms for each worker, `muru_worker_recycles_total` by reason and `muru_worker_exits_total` by reason, `muru_async_slots_busy` for requests held on ASGI event loops, and `muru_tls_handshakes_total` by listener and result. The metrics guide now lists every family served, including the autoscaler's `muru_workers_desired`, `muru_scaling_decisions_total` and `muru_churn_reaps_total`, and a test keeps the guide and the exposition in step. ([#138](https://github.com/GrahamDumpleton/muru/issues/138))
-- Each worker now times its garbage collections, by generation and by whether requests were in flight, and reports them with its CPU time and GIL waits: `muru_gc_collections_total`, `muru_gc_seconds_total`, `muru_gc_collected_objects_total` and the `muru_gc_pause_seconds` histogram in the metrics, a line per generation in `muructl debug memory` and the dashboard's worker view, a `gc` share in `muructl scale status`, and a diagnosis of "paused by garbage collection" when collection takes a tenth of the workers' time or more. ([#189](https://github.com/GrahamDumpleton/muru/issues/189))
-- Added `muructl build`, which builds a project's environment from `uv.lock`, probes the interpreter and provides the runtime library, and made `muructl run` a build then a serve: a project with a lock and no `.venv` is built on the first run, an existing environment is used as it is and said to be behind the lock when it is, and a change to `uv.lock`, `.python-version` or `requires-python` under reload builds before the new release starts. The build mode is `when` in `[tool.muru.build]` or `muru.local.toml`, or `--build` on the command line. ([#235](https://github.com/GrahamDumpleton/muru/issues/235))
+- Added `muructl check`, which loads an application in a throwaway interpreter and reports what a run would fail on: the project's tables, the interpreter against `requires-python`, the runtime library, the entrypoint and its interface, the hooks module and the mounts, and what the import check finds, with `--strict` turning findings into failures and `--env-file` supplying settings the import reads. Nothing is built or served. ([#114](https://github.com/muruhq/muru/issues/114))
+- Added version requests for the interpreter: `--python 3.13`, `python = "3.13"` in `[tool.muru]`, a `.python-version` file or `requires-python` name a Python that `muructl run` and `muructl deploy` resolve with uv, and every interpreter is probed before the host starts, so an unsupported one or one outside `requires-python` fails with a message naming both versions. `muructl release show` prints the resolved version and tag, and the daemon's `[tools]` table names uv, where managed interpreters go and whether they may be downloaded. ([#124](https://github.com/muruhq/muru/issues/124))
+- The daemon builds a release's environment from `uv.lock` before it starts: a source with a lock and no `.venv` gets one of its own under the state directory, built as the release's user with uv's output in the release log, and the release is `building` meanwhile. `--build`, `--build-extra` and `--build-group` on `muructl deploy`, or the `build` table of a project or a declared release, say when and how; a Python the node lacks is downloaded first when the `[tools]` table allows it. ([#125](https://github.com/muruhq/muru/issues/125))
+- Daemon-managed releases write their bytecode to a directory of their own under the state directory instead of the source tree, so an immutable or read-only release directory still gets a cache and cold starts stay fast; a source that already holds compiled bytecode for the interpreter is used as it is. The `bytecode` setting, `redirect`, `source` or `off`, is in the project's `[tool.muru]` table, a declared release or `--bytecode` on `muructl deploy`. ([#126](https://github.com/muruhq/muru/issues/126))
+- The `muru` runtime library is provided by `muructl` itself and no longer has to be a dependency of the application: `muructl run` and the daemon put the copy matching their own version on the host's `PYTHONPATH`, fetching the wheel for the interpreter once into the user cache or the state directory. An environment that already has the matching `muru` is used as it is, so offline machines need no flag; `MURU_WHEEL_DIR` and `MURU_OFFLINE`, or `wheel_dir` and `offline` in the daemon's `[tools]` table, cover machines without network. `muructl runtime install` unpacks the library for an image. ([#127](https://github.com/muruhq/muru/issues/127))
+- Added the metrics the design named and the daemon did not yet export: `muru_gil_wait_seconds` and `muru_loop_lag_seconds` histograms for each worker, `muru_worker_recycles_total` by reason and `muru_worker_exits_total` by reason, `muru_async_slots_busy` for requests held on ASGI event loops, and `muru_tls_handshakes_total` by listener and result. The metrics guide now lists every family served, including the autoscaler's `muru_workers_desired`, `muru_scaling_decisions_total` and `muru_churn_reaps_total`, and a test keeps the guide and the exposition in step. ([#138](https://github.com/muruhq/muru/issues/138))
+- Each worker now times its garbage collections, by generation and by whether requests were in flight, and reports them with its CPU time and GIL waits: `muru_gc_collections_total`, `muru_gc_seconds_total`, `muru_gc_collected_objects_total` and the `muru_gc_pause_seconds` histogram in the metrics, a line per generation in `muructl debug memory` and the dashboard's worker view, a `gc` share in `muructl scale status`, and a diagnosis of "paused by garbage collection" when collection takes a tenth of the workers' time or more. ([#189](https://github.com/muruhq/muru/issues/189))
+- Added `muructl build`, which builds a project's environment from `uv.lock`, probes the interpreter and provides the runtime library, and made `muructl run` a build then a serve: a project with a lock and no `.venv` is built on the first run, an existing environment is used as it is and said to be behind the lock when it is, and a change to `uv.lock`, `.python-version` or `requires-python` under reload builds before the new release starts. The build mode is `when` in `[tool.muru.build]` or `muru.local.toml`, or `--build` on the command line. ([#235](https://github.com/muruhq/muru/issues/235))
 
 
 ## 0.1.0a12 (2026-10-31)
 
 ### Added
 
-- When `muructl` is a container's PID 1 it starts as an init of its own, forwarding signals to the command, collecting every process that exits so none stays a zombie, and exiting with the command's status; `MURU_NO_INIT=1` leaves that to `tini` or `docker run --init`. ([#99](https://github.com/GrahamDumpleton/muru/issues/99))
-- Added the daemon file's `[shutdown]` table: `on_sigterm` says whether SIGTERM detaches the daemon or shuts everything down, which it does by default as a container's main process so `docker stop` drains; `delay` keeps the edge accepting while connections close after their response, and `budget` bounds the whole shutdown, which `muructl daemon stop --shutdown` now runs as the same sequence, stopping every host at once and the edge last. ([#100](https://github.com/GrahamDumpleton/muru/issues/100))
+- When `muructl` is a container's PID 1 it starts as an init of its own, forwarding signals to the command, collecting every process that exits so none stays a zombie, and exiting with the command's status; `MURU_NO_INIT=1` leaves that to `tini` or `docker run --init`. ([#99](https://github.com/muruhq/muru/issues/99))
+- Added the daemon file's `[shutdown]` table: `on_sigterm` says whether SIGTERM detaches the daemon or shuts everything down, which it does by default as a container's main process so `docker stop` drains; `delay` keeps the edge accepting while connections close after their response, and `budget` bounds the whole shutdown, which `muructl daemon stop --shutdown` now runs as the same sequence, stopping every host at once and the edge last. ([#100](https://github.com/muruhq/muru/issues/100))
 
 ### Changed
 
-- `muructl run` reloads on change by default in development mode, as `runserver` and `flask run` do: `--no-reload` turns it off for one run and `reload = false` in the project's run table or `muru.local.toml` for good. A `[tool.muru.run]` table in pyproject.toml (`[run]` in muru.toml) holds the settings only `muructl run` has, such as the port, HTTPS and its certificate, the extra names, the reload patterns, the access log and the dashboard, and `muru.local.toml` beside the project holds the same table for one machine; a flag wins over the local file, which wins over the project's table.\n ([#85](https://github.com/GrahamDumpleton/muru/issues/85))
-- `[dashboard] actions` is re-read by `muructl daemon reload`, which names it in what it reloaded, and a session that has the actions is refused when it tries one while the switch is off, rather than the switch being read once at start and sessions issued earlier acting on. ([#89](https://github.com/GrahamDumpleton/muru/issues/89))
-- `muructl daemon reload` and SIGHUP now apply changes to the `[[listener]]` entries (a changed set takes a new edge, as an upgrade does, with no request lost), the `[limits]` table (sent to the edge in the snapshot, for connections accepted from then on) and the `[[events.sink]]` entries (started, stopped or restarted on their cursors), and the reload names what changed and what was done about it, what is unchanged and what is still read only at start. ([#158](https://github.com/GrahamDumpleton/muru/issues/158))
-- The edge keeps its connections to the workers a snapshot leaves unchanged and connects only to the workers new to it, so an apply no longer reconnects every worker of every application on the node, and a worker that is busy or stopped at that moment is no longer reported as unreachable and replaced by a change that did not touch it. ([#207](https://github.com/GrahamDumpleton/muru/issues/207))
-- `muructl daemon reload`, SIGHUP and an apply of a file that declares the host, changed or not, read every TLS host's certificate and key files again and send the edge those that changed, so a renewal hook needs one command; files that cannot be read, or do not go together, leave the host on the certificate it had rather than serving without TLS, and the reload or apply says so. ([#222](https://github.com/GrahamDumpleton/muru/issues/222))
-- `muructl daemon reload` and SIGHUP now apply the `[secrets.store.NAME]` tables, for the next release to start, and the `[logs]` rotation policy, and the secrets and logging guides say so; before, both were read only at daemon start and neither guide said it. ([#223](https://github.com/GrahamDumpleton/muru/issues/223))
+- `muructl run` reloads on change by default in development mode, as `runserver` and `flask run` do: `--no-reload` turns it off for one run and `reload = false` in the project's run table or `muru.local.toml` for good. A `[tool.muru.run]` table in pyproject.toml (`[run]` in muru.toml) holds the settings only `muructl run` has, such as the port, HTTPS and its certificate, the extra names, the reload patterns, the access log and the dashboard, and `muru.local.toml` beside the project holds the same table for one machine; a flag wins over the local file, which wins over the project's table.\n ([#85](https://github.com/muruhq/muru/issues/85))
+- `[dashboard] actions` is re-read by `muructl daemon reload`, which names it in what it reloaded, and a session that has the actions is refused when it tries one while the switch is off, rather than the switch being read once at start and sessions issued earlier acting on. ([#89](https://github.com/muruhq/muru/issues/89))
+- `muructl daemon reload` and SIGHUP now apply changes to the `[[listener]]` entries (a changed set takes a new edge, as an upgrade does, with no request lost), the `[limits]` table (sent to the edge in the snapshot, for connections accepted from then on) and the `[[events.sink]]` entries (started, stopped or restarted on their cursors), and the reload names what changed and what was done about it, what is unchanged and what is still read only at start. ([#158](https://github.com/muruhq/muru/issues/158))
+- The edge keeps its connections to the workers a snapshot leaves unchanged and connects only to the workers new to it, so an apply no longer reconnects every worker of every application on the node, and a worker that is busy or stopped at that moment is no longer reported as unreachable and replaced by a change that did not touch it. ([#207](https://github.com/muruhq/muru/issues/207))
+- `muructl daemon reload`, SIGHUP and an apply of a file that declares the host, changed or not, read every TLS host's certificate and key files again and send the edge those that changed, so a renewal hook needs one command; files that cannot be read, or do not go together, leave the host on the certificate it had rather than serving without TLS, and the reload or apply says so. ([#222](https://github.com/muruhq/muru/issues/222))
+- `muructl daemon reload` and SIGHUP now apply the `[secrets.store.NAME]` tables, for the next release to start, and the `[logs]` rotation policy, and the secrets and logging guides say so; before, both were read only at daemon start and neither guide said it. ([#223](https://github.com/muruhq/muru/issues/223))
 
 ### Fixed
 
-- Fixed one stopped or frozen worker failing every snapshot apply, so that no routing change landed for any application until the worker was replaced. A worker that does not answer the edge within its 5 s is left out of its pool and the snapshot is applied without it; the daemon records a `worker.unreachable` event naming the worker and the reason, and replaces the worker at once. ([#88](https://github.com/GrahamDumpleton/muru/issues/88))
-- The host is now a subreaper on Linux, as specified: a process a worker started and left behind when a hard timeout or a memory policy killed it reparents to the host, is given the shutdown timeout to finish, stopped and collected, so no zombie or stray process remains, and what the workers leave running is stopped before the host exits rather than holding its pipes open. ([#101](https://github.com/GrahamDumpleton/muru/issues/101))
-- Fixed `muructl apply -f FILE` leaving a release's `sendfile_roots`, and any other path it resolves from the file's directory, relative when `FILE` was given as a relative path, which the daemon then refused as not absolute. The file's directory is made absolute before its paths are resolved. ([#201](https://github.com/GrahamDumpleton/muru/issues/201))
-- The help of `muructl debug exec` and `muructl debug attach` says they are allowed as they are under `muructl run`, and under the daemon when its `[daemon]` table sets `debug_exec`, rather than naming the daemon's table alone. ([#202](https://github.com/GrahamDumpleton/muru/issues/202))
-- Fixed a worker condemned by the hard timeout and then found stalled, by the GIL stall or loop stall timeout, keeping its other requests for the hard drain grace and the shutdown timeout, which a stalled worker can never use: a stall on a worker already being replaced gives up the requests it still holds for the edge to answer and kills it a moment later. ([#203](https://github.com/GrahamDumpleton/muru/issues/203))
-- The daemon no longer pushes a second snapshot for the host's first announcement after a deploy, which repeated the sockets it already routed by: every deploy cost an edge apply it did not need, and a worker that was busy at that moment was left out and replaced for nothing. ([#206](https://github.com/GrahamDumpleton/muru/issues/206))
-- A connection accepted by the edge just before it was replaced, by `muructl daemon upgrade`, whose first request had not yet arrived, was closed without an answer. The replaced edge now waits for that request and answers it before closing the connection. ([#220](https://github.com/GrahamDumpleton/muru/issues/220))
+- Fixed one stopped or frozen worker failing every snapshot apply, so that no routing change landed for any application until the worker was replaced. A worker that does not answer the edge within its 5 s is left out of its pool and the snapshot is applied without it; the daemon records a `worker.unreachable` event naming the worker and the reason, and replaces the worker at once. ([#88](https://github.com/muruhq/muru/issues/88))
+- The host is now a subreaper on Linux, as specified: a process a worker started and left behind when a hard timeout or a memory policy killed it reparents to the host, is given the shutdown timeout to finish, stopped and collected, so no zombie or stray process remains, and what the workers leave running is stopped before the host exits rather than holding its pipes open. ([#101](https://github.com/muruhq/muru/issues/101))
+- Fixed `muructl apply -f FILE` leaving a release's `sendfile_roots`, and any other path it resolves from the file's directory, relative when `FILE` was given as a relative path, which the daemon then refused as not absolute. The file's directory is made absolute before its paths are resolved. ([#201](https://github.com/muruhq/muru/issues/201))
+- The help of `muructl debug exec` and `muructl debug attach` says they are allowed as they are under `muructl run`, and under the daemon when its `[daemon]` table sets `debug_exec`, rather than naming the daemon's table alone. ([#202](https://github.com/muruhq/muru/issues/202))
+- Fixed a worker condemned by the hard timeout and then found stalled, by the GIL stall or loop stall timeout, keeping its other requests for the hard drain grace and the shutdown timeout, which a stalled worker can never use: a stall on a worker already being replaced gives up the requests it still holds for the edge to answer and kills it a moment later. ([#203](https://github.com/muruhq/muru/issues/203))
+- The daemon no longer pushes a second snapshot for the host's first announcement after a deploy, which repeated the sockets it already routed by: every deploy cost an edge apply it did not need, and a worker that was busy at that moment was left out and replaced for nothing. ([#206](https://github.com/muruhq/muru/issues/206))
+- A connection accepted by the edge just before it was replaced, by `muructl daemon upgrade`, whose first request had not yet arrived, was closed without an answer. The replaced edge now waits for that request and answers it before closing the connection. ([#220](https://github.com/muruhq/muru/issues/220))
 
 ### Documentation
 
-- The daemon guide lists, in one place, the tables `muructl daemon reload` applies and those read only at daemon start, the systemd guide links to it instead of repeating it, and the reload's message names the same tables. ([#221](https://github.com/GrahamDumpleton/muru/issues/221))
+- The daemon guide lists, in one place, the tables `muructl daemon reload` applies and those read only at daemon start, the systemd guide links to it instead of repeating it, and the reload's message names the same tables. ([#221](https://github.com/muruhq/muru/issues/221))
 
 
 ## 0.1.0a11 (2026-10-30)
@@ -193,9 +193,9 @@ breaking changes, which are listed under each release.
   stacks, tasks and memory pages. A command run from the project directory
   finds the run's socket without a flag, `muructl status` says which socket
   it found, and the commands that manage releases, configuration or the
-  daemon say they need the daemon. ([#68](https://github.com/GrahamDumpleton/muru/issues/68))
+  daemon say they need the daemon. ([#68](https://github.com/muruhq/muru/issues/68))
 - Added `SERVER_SOFTWARE` to the WSGI environ: `muru/` and the version, such
-  as `muru/0.1.0a11`. ([#79](https://github.com/GrahamDumpleton/muru/issues/79))
+  as `muru/0.1.0a11`. ([#79](https://github.com/muruhq/muru/issues/79))
 - An application's own static files are served by the edge in development
   and production alike: `[[tool.muru.static]]` entries in the project, or
   `--static /static/=DIR` on `muructl run` and `muructl deploy`, name a path
@@ -203,7 +203,7 @@ breaking changes, which are listed under each release.
   cache headers, conditional requests, ranges and precompressed variants
   of a static route, the application taking what no file answers. Under
   the daemon the release the request was routed to serves its own files,
-  so a canary's pages get its own assets. ([#86](https://github.com/GrahamDumpleton/muru/issues/86))
+  so a canary's pages get its own assets. ([#86](https://github.com/muruhq/muru/issues/86))
 
 ### Changed
 
@@ -212,25 +212,25 @@ breaking changes, which are listed under each release.
   proxy that mounts it under a path (jupyter-server-proxy, code-server) gets
   `SCRIPT_NAME` or `root_path` set with nothing to configure. Only their headers
   are trusted: a loopback peer keeps a client's connection share and
-  keep-alive timeout rather than a proxy's. ([#66](https://github.com/GrahamDumpleton/muru/issues/66))
+  keep-alive timeout rather than a proxy's. ([#66](https://github.com/muruhq/muru/issues/66))
 - The line `muructl run` prints on macOS about reading workers from outside
   no longer reads as an error: it says stacks and profiles come from inside
-  the workers, and that this is usual on macOS. ([#76](https://github.com/GrahamDumpleton/muru/issues/76))
+  the workers, and that this is usual on macOS. ([#76](https://github.com/muruhq/muru/issues/76))
 - A reload that fails under `muructl run` is reported as `release r3 failed
   to start: ...; release r2 keeps serving`, naming the attempt, which keeps
   its number as a failed deploy does under the daemon, so the fix after it
-  is `r4`. ([#78](https://github.com/GrahamDumpleton/muru/issues/78))
+  is `r4`. ([#78](https://github.com/muruhq/muru/issues/78))
 - A factory named without `factory = true` (or `--factory`) is refused when
   the application loads, rather than failing every request: a callable that
   takes no required arguments cannot be a WSGI or ASGI application, and the
   message names the setting. The same check refuses a callable that does not
   take the arguments its interface passes, two for WSGI and three for ASGI,
-  naming the interface to declare when it fits the other one. ([#80](https://github.com/GrahamDumpleton/muru/issues/80))
+  naming the interface to declare when it fits the other one. ([#80](https://github.com/muruhq/muru/issues/80))
 - `muructl run --reload-include` adds patterns to the default `**/*.py`
   rather than replacing it, so `--reload-include '**/*.html'` alone still
   reloads on a changed module; an exclude wins over an include, so
   `--reload-exclude '**/*.py'` watches the included patterns alone. The
-  start-up line names the directories and patterns watched. ([#83](https://github.com/GrahamDumpleton/muru/issues/83))
+  start-up line names the directories and patterns watched. ([#83](https://github.com/muruhq/muru/issues/83))
 - A deploy carries every setting a flag can set forward from the previous
   release when neither its flags nor the source's `[tool.muru]` table give
   it: timeouts, the memory policy, environment variables and secrets by
@@ -238,7 +238,7 @@ breaking changes, which are listed under each release.
   processes and threads already were, so a `--timeout soft=3s` given once
   no longer vanishes on the next plain `muructl deploy`. Tables come from
   the source alone, and `muructl deploy --fresh` ignores the previous
-  release. ([#84](https://github.com/GrahamDumpleton/muru/issues/84))
+  release. ([#84](https://github.com/muruhq/muru/issues/84))
 - A request that condemns its worker is answered at once rather than after
   the drain grace and the shutdown timeout: the hard timeout answers the
   stuck request `504 hard_timeout` when it replaces the worker, and a loop
@@ -247,7 +247,7 @@ breaking changes, which are listed under each release.
   `hard_drain_grace` to finish. A worker is silent once its next report is
   the GIL stall timeout late, rather than the moment a report is late, and
   a worker condemned by the silence check and its own stall event is
-  replaced once. ([#87](https://github.com/GrahamDumpleton/muru/issues/87))
+  replaced once. ([#87](https://github.com/muruhq/muru/issues/87))
 
 ### Fixed
 
@@ -261,42 +261,42 @@ breaking changes, which are listed under each release.
   given) rather than the current directory, and `--print-config` writes an
   interpreter inside the project, such as its `.venv`, as a relative path.
   A host's or route's error page file that does not exist is refused by the
-  apply, rather than by the edge once the snapshot reaches it. ([#64](https://github.com/GrahamDumpleton/muru/issues/64))
+  apply, rather than by the edge once the snapshot reaches it. ([#64](https://github.com/muruhq/muru/issues/64))
 - Fixed a worker's `print()` output being lost. The worker's standard output
   is now line-buffered, so each line reaches the terminal or the release log
   as it is written, and whatever is still buffered is flushed when the worker
-  exits. ([#65](https://github.com/GrahamDumpleton/muru/issues/65))
+  exits. ([#65](https://github.com/muruhq/muru/issues/65))
 - Fixed the hard timeout not firing for a request stuck in C code holding
   the GIL once a second request reached the same worker: the second
   request's arrival blocked a link thread on the interpreter, which stalled
   the worker's reports to the host. A request's lookup of its mount no
   longer touches the interpreter, and the reports come from a thread of
-  their own. ([#67](https://github.com/GrahamDumpleton/muru/issues/67))
+  their own. ([#67](https://github.com/muruhq/muru/issues/67))
 - `breakpoint()` under `muructl run` names a command that works: the line
   reads `muructl debug attach APP --worker N` with the application as the
   run calls it, and the attach opens a pdb session in the request through
-  the run's admin socket, with no `debug_exec` to set. ([#69](https://github.com/GrahamDumpleton/muru/issues/69))
+  the run's admin socket, with no `debug_exec` to set. ([#69](https://github.com/muruhq/muru/issues/69))
 - Fixed a held release of the default application, with no host declared,
   not answering a `Muru-Preview` header or cookie: the request went to the
   serving release. The `release.ready` event also says "1 worker" rather
-  than "1 workers". ([#70](https://github.com/GrahamDumpleton/muru/issues/70))
+  than "1 workers". ([#70](https://github.com/muruhq/muru/issues/70))
 - Fixed a WebSocket that had sent nothing since it connected being killed
   with 1011 when its worker stopped, after `shutdown_timeout`, rather than
-  closed with 1001 at once as a socket that had exchanged a message was. ([#71](https://github.com/GrahamDumpleton/muru/issues/71))
+  closed with 1001 at once as a socket that had exchanged a message was. ([#71](https://github.com/muruhq/muru/issues/71))
 - The development dashboard's In flight tile counts requests not yet
   answered, as `muru_requests_in_flight` does, rather than staying at 0
   while WebSockets are open, and the workers table's column is now Busy:
-  slots handling a request or holding an open WebSocket. ([#75](https://github.com/GrahamDumpleton/muru/issues/75))
+  slots handling a request or holding an open WebSocket. ([#75](https://github.com/muruhq/muru/issues/75))
 - WSGI application threads carry the runtime's names, `muru-app-0` and so
   on, in Python too, so logs and thread listings no longer call them
-  `Dummy-1`. ([#77](https://github.com/GrahamDumpleton/muru/issues/77))
+  `Dummy-1`. ([#77](https://github.com/muruhq/muru/issues/77))
 - `muru.context().release` under `muructl run` is the release the terminal
-  names, `r1` and then `r2` after a reload, rather than `dev` every time. ([#81](https://github.com/GrahamDumpleton/muru/issues/81))
+  names, `r1` and then `r2` after a reload, rather than `dev` every time. ([#81](https://github.com/muruhq/muru/issues/81))
 - Fixed a run directory too deep for the workers' socket paths, or given as
   a relative path, failing only once a release started, or after a 30 s wait
   for a daemon that never answered. `muructl daemon start` and the daemon
   refuse it at start, saying how much room an application's name has, and a
-  release's host says so too when its socket directory is too long. ([#82](https://github.com/GrahamDumpleton/muru/issues/82))
+  release's host says so too when its socket directory is too long. ([#82](https://github.com/muruhq/muru/issues/82))
 - Fixed a profile of workers read from outside, on Linux, dropping a worker
   after one failed read, which could leave it with no samples while requests
   were starting and ending: a failed read is now skipped and the worker
