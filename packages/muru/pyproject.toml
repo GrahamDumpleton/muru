@@ -30,7 +30,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/muruhq/muru"
-Documentation = "https://muru.readthedocs.io/"
+Documentation = "https://docs.muruhq.dev/"
 Repository = "https://github.com/muruhq/muru"
 Changelog = "https://github.com/muruhq/muru/blob/main/CHANGELOG.md"
 

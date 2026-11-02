@@ -7,5 +7,5 @@ contact_links:
     url: https://github.com/muruhq/muru/security/advisories/new
     about: Report security problems privately through a security advisory.
   - name: Documentation
-    url: https://muru.readthedocs.io/
+    url: https://docs.muruhq.dev/
     about: Tutorials, how-to guides, reference and the design specification.

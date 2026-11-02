@@ -38,9 +38,11 @@ Chosen option: move to the muruhq organisation, because no images were
 published yet and there were no users, so nothing outside the
 repositories needed to change. The repositories are github.com/muruhq/muru
 and github.com/muruhq/muru-workshops, images go to ghcr.io/muruhq, and
-PyPI trusted publishing names the muruhq owner. The licence stays
-Apache-2.0, as ADR 0016 decided. The project board stays under the
-personal account, where it holds the organisation's issues.
+PyPI trusted publishing names the muruhq owner. The documentation is
+served at docs.muruhq.dev, with muru.readthedocs.io redirecting there.
+The licence stays Apache-2.0, as ADR 0016 decided. The project board
+stays under the personal account, where it holds the organisation's
+issues.
 
 ### Consequences
 

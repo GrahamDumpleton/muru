@@ -1,7 +1,7 @@
 # Muru
 
 [![CI](https://github.com/muruhq/muru/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/muruhq/muru/actions/workflows/ci.yml)
-[![Documentation](https://img.shields.io/readthedocs/muru?label=docs)](https://muru.readthedocs.io/)
+[![Documentation](https://img.shields.io/readthedocs/muru?label=docs)](https://docs.muruhq.dev/)
 [![PyPI muructl](https://img.shields.io/pypi/v/muructl?label=muructl)](https://pypi.org/project/muructl/)
 [![PyPI muru](https://img.shields.io/pypi/v/muru?label=muru)](https://pypi.org/project/muru/)
 [![Python versions](https://img.shields.io/pypi/pyversions/muru)](https://pypi.org/project/muru/)
@@ -50,9 +50,9 @@ Kubernetes sizing and shutdown, container releases, ACME certificates,
 HTTP/3, OpenTelemetry export, several edge processes and more than one
 node; the [roadmap](docs/project/roadmap.md) sets out
 the goals. The
-[tutorial](https://muru.readthedocs.io/en/latest/tutorials/first-wsgi-app.html)
+[tutorial](https://docs.muruhq.dev/en/latest/tutorials/first-wsgi-app.html)
 is the place to start, and the
-[documentation](https://muru.readthedocs.io/) has a guide for each
+[documentation](https://docs.muruhq.dev/) has a guide for each
 feature. The [design specification](docs/project/design/index.md) and
 [architecture decision records](docs/project/adr/index.md) describe how
 Muru is built.
