@@ -67,6 +67,7 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_slots_busy` | gauge | app, release, group | slots handling a request or holding an open WebSocket |
 | `muru_slots_total` | gauge | app, release, group | slots across the workers: threads, or the event loop's concurrency |
 | `muru_async_slots_busy` | gauge | app, release, group | requests held on the event loops of [ASGI](asgi.md) workers, the part of `muru_slots_busy` that is not on threads |
+| `muru_capacity_utilisation` | gauge | app, release, group | busy slots over slots, sampled every second and averaged over the last 30 seconds: how saturated the group is, the signal to [autoscale](#saturation-for-an-autoscaler) on |
 | `muru_upstream_health` | gauge | upstream, address | 1 for an [upstream](upstreams.md) address in service, 0 for one its probes found unhealthy or that was ejected after failed requests |
 | `muru_workers_ready` | gauge | app, release, group | workers listening for requests (under the daemon) |
 | `muru_workers_desired` | gauge | app, release, group | workers the [autoscaler](scaling.md) is bringing the group to |
@@ -101,6 +102,23 @@ reason. The worker families carry each worker by its index, so a worker
 replaced under [recycling](recycling.md) starts its counters and
 histograms again, as `rate()` and `increase()` expect of a restarted
 target.
+
+## Saturation for an autoscaler
+
+CPU is a poor signal to scale a Python web application on: one whose
+threads all wait on its database uses little CPU while requests queue.
+How many slots are busy, and how long requests wait for one, say more:
+
+- `muru_capacity_utilisation` is the share of a group's slots in use,
+  averaged over the last 30 seconds, from 0 to 1. A sustained value near
+  1 means requests are starting to queue.
+- The `queue` phase of `muru_request_duration_seconds` is how long
+  requests waited for a slot:
+  `histogram_quantile(0.95, sum by (le) (rate(muru_request_duration_seconds_bucket{phase="queue"}[2m])))`.
+
+A Kubernetes HorizontalPodAutoscaler reads the first as a pods metric
+through the Prometheus adapter, with a target average such as `0.7`; a
+KEDA ScaledObject's Prometheus trigger can scale on either.
 
 ```
 # HELP muru_requests_total Requests completed, by status class and the reason when the edge generated the response.

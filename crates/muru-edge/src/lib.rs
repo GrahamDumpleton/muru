@@ -725,6 +725,19 @@ impl Edge {
     /// Accept connections on every listener until one fails or the edge
     /// is drained.
     pub async fn run(self) -> anyhow::Result<()> {
+        // Section 11.1: the pools' utilisation is sampled every second, for
+        // its average over the last half minute.
+
+        let pools = Arc::clone(&self.shared.pools);
+        let sampler = tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(1));
+
+            loop {
+                every.tick().await;
+                metrics::UTILISATION.sample(&pools.current());
+            }
+        });
+
         let accepting =
             self.listeners
                 .into_iter()
@@ -733,7 +746,9 @@ impl Edge {
                     accept(listener, address, acceptor, Arc::clone(&self.shared), index)
                 });
 
-        futures::future::try_join_all(accepting).await.map(|_| ())
+        let served = futures::future::try_join_all(accepting).await.map(|_| ());
+        sampler.abort();
+        served
     }
 }
 

@@ -18,7 +18,7 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 | Area | Examples |
 | --- | --- |
 | Requests | muru_requests_total by status class and reason, muru_request_duration_seconds histograms (queue, application, total), muru_requests_in_flight, muru_retries_total |
-| Capacity | muru_queue_depth, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_websocket_connections; muru_handoffs_total by the interface a request was handed to (section 6.14) |
+| Capacity | muru_queue_depth, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_capacity_utilisation (busy slots over slots, sampled every second and averaged over 30 s, the saturation signal for an autoscaler such as an HPA or KEDA, since CPU stays low while an I/O-bound application's slots are full), muru_websocket_connections; muru_handoffs_total by the interface a request was handed to (section 6.14) |
 | Workers | muru_worker_cpu_seconds_total, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds and muru_loop_lag_seconds histograms, muru_worker_recycles_total by reason, muru_worker_exits_total by reason |
 | Garbage collection | muru_gc_collections_total, muru_gc_seconds_total and muru_gc_collected_objects_total by generation, muru_gc_pause_seconds histogram by generation and by whether requests were in flight |
 | Scaling | muru_scaling_decisions_total, muru_workers_desired, muru_workers_ready, muru_churn_reaps_total |

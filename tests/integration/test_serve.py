@@ -155,6 +155,20 @@ def test_serves_with_probes_and_metrics_on_the_admin_port(tmp_path: Path) -> Non
         assert status == 200
         assert "muru_requests_total" in metrics
 
+        # A request holding one of the worker's four slots shows in the
+        # utilisation, sampled every second.
+
+        sleeper = threading.Thread(target=serve.get, args=("/sleep?seconds=2.5",))
+        sleeper.start()
+        time.sleep(2)
+        metrics = serve.admin("/metrics")[1]
+        sleeper.join()
+        line = next(
+            line for line in metrics.splitlines() if line.startswith("muru_capacity_utilisation{")
+        )
+        assert 'group="default"' in line, line
+        assert 0 < float(line.rsplit(" ", 1)[1]) <= 0.25, line
+
         # /status is opt-in, and the probes are not on the application's port.
 
         assert serve.admin("/status")[0] == 404
