@@ -106,12 +106,25 @@ Muru is developed with extensive use of AI coding agents;
 [About](project/about.md) says how, and who is behind it.
 
 ```{toctree}
-:maxdepth: 2
+:caption: Using Muru
 :hidden:
 
 tutorials/index
 howto/index
 reference/index
 explanation/index
-project/index
+project/changelog
+```
+
+```{toctree}
+:caption: Project and design
+:hidden:
+
+project/about
+project/roadmap
+project/contributing
+project/release-process
+project/security
+project/design/index
+project/adr/index
 ```
