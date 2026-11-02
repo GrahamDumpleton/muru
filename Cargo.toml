@@ -23,8 +23,8 @@ version = "0.1.0-alpha.15"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/GrahamDumpleton/muru"
-homepage = "https://github.com/GrahamDumpleton/muru"
+repository = "https://github.com/muruhq/muru"
+homepage = "https://github.com/muruhq/muru"
 authors = ["Graham Dumpleton"]
 publish = false
 

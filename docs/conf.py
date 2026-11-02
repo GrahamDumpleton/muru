@@ -52,7 +52,7 @@ html_theme = "furo"
 html_title = "Muru"
 html_static_path = ["_static"]
 html_theme_options = {
-    "source_repository": "https://github.com/GrahamDumpleton/muru/",
+    "source_repository": "https://github.com/muruhq/muru/",
     "source_branch": "main",
     "source_directory": "docs/",
 }
