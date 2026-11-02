@@ -62,6 +62,9 @@ spec:
           resources:
             requests: {cpu: "1", memory: 512Mi}
             limits: {cpu: "2", memory: 1Gi}
+          resizePolicy:
+            - {resourceName: cpu, restartPolicy: RestartContainer}
+            - {resourceName: memory, restartPolicy: RestartContainer}
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -125,12 +128,40 @@ The pieces, in turn:
   limit, so a worker that grows is replaced before the kernel kills one.
   [Sizing from the container's
   limits](containers.md#sizing-from-the-containers-limits) shows the
-  arithmetic and the lines that report it.
+  arithmetic and the lines that report it. The `resizePolicy` restarts
+  the container when its limits change; [resizing](#resizing) says why.
 - **Logs.** With `MURU_SERVE_LOG_FORMAT=json` every line on standard
   output is one JSON record, a traceback included, carrying the pod, its
   namespace and its node from the Downward API variables, which is what a
   collector such as Fluent Bit or Vector reads from the node.
   [Logs](containers.md#logs) shows the records.
+
+## Resizing
+
+`muructl serve` reads its limits when it starts. Kubernetes can change a
+running container's CPU and memory in place, through `kubectl patch
+--subresource resize` or a VerticalPodAutoscaler in its
+`InPlaceOrRecreate` mode. A container that keeps running after such a
+change goes on with the worker count and the hard limits of its old
+limits:
+
+- with more CPU, the extra goes mostly unused;
+- with more memory, workers are still replaced at the old share, so
+  their use never shows the autoscaler that more would be taken;
+- with less memory, the hard limits are above what the container now
+  has, and the kernel may kill a worker before Muru replaces it.
+
+`restartPolicy: RestartContainer` in the `resizePolicy` has the kubelet
+restart the container when the limit changes. The restart is an ordinary
+stop: readiness fails, the requests in flight finish, and the new
+container sizes itself from the new limits. The pod stays where it is,
+on the same node with the same address.
+
+A VerticalPodAutoscaler in its `Recreate` mode evicts the pod and
+creates another with the new resources, which sizes itself as any new
+pod does. A HorizontalPodAutoscaler on `muru_capacity_utilisation`, below,
+and a VerticalPodAutoscaler on CPU and memory can run together, since
+they act on different figures.
 
 ## Autoscaling
 
