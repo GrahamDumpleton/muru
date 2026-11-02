@@ -140,6 +140,16 @@ def start(
             serve.stop()
             raise RuntimeError(f"{error}\n{serve.output()}{''.join(serve.stderr)}") from error
 
+        # The listener accepts before the workers are ready, as a platform
+        # expects, so a test that reads the admin port waits for readiness.
+
+        if "--admin-listen" not in args:
+            deadline = time.monotonic() + 30
+
+            while serve.admin("/readyz")[0] != 200:
+                assert time.monotonic() < deadline, f"never ready:\n{serve.output()}"
+                time.sleep(0.05)
+
     return serve
 
 
