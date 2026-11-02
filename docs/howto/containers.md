@@ -36,7 +36,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN pip install --pre muructl
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN muructl build --deployment --deps-only --target /app/.venv
+RUN muructl build --deployment --deps-only --no-runtime --target /app/.venv
 COPY . .
 RUN muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
 
@@ -50,6 +50,33 @@ USER app
 EXPOSE 8080 9090
 CMD ["muructl", "serve"]
 ```
+
+The two `muructl build` steps install from `uv.lock` without resolving
+anything:
+
+- The first installs the dependencies alone, from `pyproject.toml` and
+  `uv.lock`, before the source is copied in, so the layer is reused for
+  as long as the dependencies stay the same. `--no-runtime` leaves the
+  runtime library to the second step.
+
+- The second installs the project itself into the same environment,
+  compiles its bytecode, and unpacks the runtime library matching
+  muructl's version and the environment's interpreter into `/opt/muru`,
+  which the second stage copies.
+
+A `.dockerignore` beside the Dockerfile keeps what the build makes, and
+what it does not need, out of the copy of the source:
+
+```
+.venv
+.git
+__pycache__
+*.pyc
+muru.local.toml
+```
+
+`.venv` matters most: without it, a virtual environment on the machine
+running the build is copied over the one the image built.
 
 With no argument, `muructl serve` finds the application the way
 `muructl run .` does, from the `[tool.muru]` table of the project in the

@@ -212,7 +212,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN pip install muructl
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN muructl build --deployment --deps-only --target /app/.venv
+RUN muructl build --deployment --deps-only --no-runtime --target /app/.venv
 COPY . .
 RUN muructl build --deployment --target /app/.venv --runtime-dir /opt/muru
 RUN python -m compileall -q --invalidation-mode unchecked-hash /app
