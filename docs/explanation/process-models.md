@@ -1,14 +1,5 @@
 # Process models, threads and the GIL
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented except handing a request across
-between WSGI and ASGI after it has started, described under
-[mixing WSGI and ASGI](#mixing-wsgi-and-asgi-in-one-application); mounts,
-which choose the side by path, are implemented.
-```
-
 Your application runs in worker processes. This page explains how those
 processes come to exist, what runs your code inside them, and how to choose
 between processes and threads.

@@ -1,13 +1,5 @@
 # HTTPS in development
 
-```{admonition} Status
-:class: note
-
-Development mode. Under the daemon, certificates belong to virtual hosts
-and TLS listeners serve them by name: see
-[virtual hosts and TLS](virtual-hosts.md).
-```
-
 ```
 muructl run app:application --https
 ```
@@ -19,6 +11,9 @@ that behaves differently behind TLS. Every flag on this page has a key in
 the project's run table, `https`, `https_only`, `https_port`, `hosts`,
 `tls_cert` and `tls_key`, so a project that is always served over TLS
 needs no flag; [settings for muructl run](run-settings.md) has the table.
+
+Under the daemon, certificates belong to virtual hosts and TLS listeners
+serve them by name: see [virtual hosts and TLS](virtual-hosts.md).
 
 ## Certificates
 

@@ -1,11 +1,5 @@
 # The worker protocol
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented, for WSGI and ASGI workers.
-```
-
 The edge and each worker talk over a private link: a Unix socket that the
 worker listens on and the edge connects to. Nothing an application does
 needs to know about it, but understanding it explains how threads,

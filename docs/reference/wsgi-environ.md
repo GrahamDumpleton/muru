@@ -1,14 +1,5 @@
 # WSGI environ
 
-```{admonition} Status
-:class: note
-
-These are the keys Muru sets, in development mode and under the daemon.
-Keys still to come are listed with the rest in
-[appendix D](../project/design/appendices/d-environ-keys-scope-extensions-and-environment-variables.md)
-of the design specification.
-```
-
 Muru builds the environ in Rust from the request the edge received. The
 standard keys follow PEP 3333; this page lists how Muru fills them and what
 it adds.
@@ -20,7 +11,7 @@ it adds.
 | `REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING` | From the request line. `SCRIPT_NAME` is the prefix a [trusted proxy](../howto/behind-a-proxy.md) stripped joined with the [mount's](../howto/mounts.md) path, empty when there is neither |
 | `SERVER_PROTOCOL` | `HTTP/1.0`, `HTTP/1.1` or `HTTP/2.0`, the client's protocol |
 | `SERVER_NAME`, `SERVER_PORT` | The listener's address and port |
-| `SERVER_SOFTWARE` | `muru/` and the version, such as `muru/0.1.0a11`, as `muru.__version__` gives it |
+| `SERVER_SOFTWARE` | `muru/` and the version, such as `muru/1.0.0`, as `muru.__version__` gives it |
 | `REMOTE_ADDR`, `REMOTE_PORT` | The client's address and port |
 | `CONTENT_TYPE`, `CONTENT_LENGTH` | From the headers. A body sent without `Content-Length` (chunked) is buffered by the edge, so `CONTENT_LENGTH` is set for it too |
 | `HTTP_*` | Every other header, upper-cased with dashes as underscores. Hop-by-hop headers (`Connection`, `Transfer-Encoding`, `Upgrade` and the others) never appear, and neither does a header whose name contains an underscore, since it could masquerade as another header's key |

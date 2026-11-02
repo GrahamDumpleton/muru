@@ -1,15 +1,5 @@
 # Mounts
 
-```{admonition} Status
-:class: note
-
-Named mounts at path prefixes, any mix of WSGI and ASGI in the same
-workers, in development mode and under the daemon, internal mounts,
-threads of a WSGI mount's own and the concurrency and connection limits
-of an ASGI mount's own, and the mounts a [worker group](worker-groups.md)
-serves. [gRPC mounts](grpc.md) have a page of their own.
-```
-
 A release can serve several entrypoints from the same worker processes,
 and from one preload: the release's own entrypoint is the default mount
 at `/`, and named mounts take a path prefix each. Mounts can be any mix

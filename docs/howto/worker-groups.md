@@ -1,16 +1,5 @@
 # Worker groups
 
-```{admonition} Status
-:class: note
-
-Named groups with their own process and thread counts, selected by path
-prefix, in development mode and under the daemon, each with its own
-scaling policy (see [scaling](scaling.md)), timeouts and memory policy,
-optional groups the release is ready without, match lists that ask a
-client class, host or method of a request beside its path, and a
-`mounts` subset a group's workers serve.
-```
-
 A release can split its paths across named worker groups, all forked from
 one host and one preload. Each group has its own processes and threads,
 which gives sizing (many threads for cheap paths, several processes for

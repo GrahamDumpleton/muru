@@ -17,110 +17,32 @@ releases that can run side by side. A new release, possibly on a different
 Python version, starts beside the old one, and traffic moves when it is
 ready. Blue/green, weighted canaries, A/B splits, previews and instant
 rollback are policy changes, not restarts. The same model runs from
-`muructl run` on a laptop to a large monolith under systemd.
+`muructl run` on a laptop, to `muructl daemon start` on a server, to
+`muructl serve` in a container.
 
-## Status
-
-Muru is in alpha: the 0.1.0 pre-releases are on PyPI, and commands and
-configuration may still change between them.
-
-- **Development mode:** `muructl run` serves a WSGI or ASGI application on
-  your machine with HTTP/1.1, HTTP/2, HTTPS and WebSockets, forked workers
-  with an import check before the fork, lifecycle hooks and ASGI lifespan,
-  watch reload, an access log and a dashboard.
-
-- **The daemon** serves applications on one node. It deploys releases
-  from source directories and moves traffic between them by blue/green
-  switch, by canary with gates, or by traffic policy with previews and
-  sticky clients, with rollback and drains. It serves virtual hosts with
-  TLS, scales worker groups, applies overlays on schedules, and has
-  uploads, mounts mixing WSGI, ASGI and gRPC, internal redirects,
-  authentication sub-requests, HTTP upstreams, client classes and rate
-  limits, metrics, logs, events, a dashboard and systemd integration,
-  declared in files or on the command line.
-
-- **In a container:** `muructl serve` runs one application as the
-  container's main process, configured from the image and the
-  environment, with probes and metrics on an admin port, logs on
-  standard output and a drain on `docker stop`.
-
-All are tested with plain WSGI and ASGI, Flask, Django, Starlette and
-FastAPI on regular and free-threaded Python. Still to come are
-Kubernetes sizing and shutdown, container releases, ACME certificates,
-HTTP/3, OpenTelemetry export, several edge processes and more than one
-node; the [roadmap](docs/project/roadmap.md) sets out
-the goals. The
-[tutorial](https://docs.muruhq.dev/en/latest/tutorials/first-wsgi-app.html)
-is the place to start, and the
-[documentation](https://docs.muruhq.dev/) has a guide for each
-feature. The [design specification](docs/project/design/index.md) and
-[architecture decision records](docs/project/adr/index.md) describe how
-Muru is built.
+- **Deploy without downtime:** releases side by side, blue/green,
+  canaries judged by gates, previews and instant rollback.
+- **Process management that understands Python:** preload with an import
+  check, worker groups, memory limits, soft and hard timeouts, scaling,
+  and free-threaded Python.
+- **No web server in front:** HTTP/1.1, HTTP/2, TLS, virtual hosts,
+  static files, uploads and compression at the edge.
+- **WSGI and ASGI together,** mounted side by side or handed across in
+  code.
+- **Made to work with AI coding agents:** an MCP server lets an agent
+  deploy each change as a release, test it, read what Muru observes when
+  something fails, and roll back.
 
 ```
-uv tool install muructl          # the command
+uv tool install muructl
 muructl run app:application      # http://127.0.0.1:8080
 ```
 
-## What it does
+Muru is in alpha: the 0.1.0 pre-releases are on PyPI, and commands and
+configuration may change between them.
 
-- Serve WSGI and ASGI applications with no separate web server in front:
-  HTTP/1.1, HTTP/2, TLS, virtual hosts, static files, uploads and internal
-  redirects are handled by the edge.
-
-- Deploy without downtime: immutable releases, draining, blue/green,
-  canaries with gates, deterministic bucketing, sticky sessions, previews and
-  rollback.
-
-- Manage Python processes: preload before fork with an import check and
-  hooks, worker groups per path, free-threaded builds, memory policies, soft
-  and hard timeouts, and Python-aware scaling.
-
-- Mix WSGI and ASGI in one process: mounts by path, each served by the
-  side it was written for, and requests handed across in code, a WSGI
-  view to an ASGI application on the event loop, which is how a WSGI
-  application takes WebSockets, and an ASGI application to a WSGI
-  callable on the thread pool.
-
-- Reconfigure live through an API and CLI, with declarative files that
-  export and apply round-trip, plus metrics, structured logs, an event
-  stream and a built-in dashboard. OpenTelemetry export is still to come.
-
-## Install
-
-Install the command line once with `uv tool install muructl`. The `muru`
-runtime library that runs inside your application's interpreter is not a
-dependency of your project: muructl provides the copy matching its own
-version, fetching it once per interpreter. Both are pre-releases of the
-0.1.0 line, so `pip install --pre` is needed where pip is used instead of
-uv. Pre-built wheels cover Linux, including Alpine, and macOS on CPython
-3.11 to 3.15, and the free-threaded builds of 3.14 and 3.15.
-
-## Five-minute start
-
-In development:
-
-```
-muructl run app:application --reload     # HTTP on 8080, restarts on change
-muructl run --https                      # HTTPS on 8443 as well, with a local certificate
-muructl run . --port auto                # the project's [tool.muru] table, free ports
-```
-
-Under the daemon:
-
-```
-muructl up && muructl deploy shop .      # a daemon with zero-downtime deploys
-muructl apply -f config/                 # applications, virtual hosts and TLS from files
-muructl deploy shop . --hold             # a new release, started without traffic
-muructl rollout canary shop@r2 --wait    # traffic in steps, judged by gates, rolled back on failure
-muructl dashboard login                  # a sign-in link, when the daemon serves a dashboard
-```
-
-In a container, with probes on port 9090 and logs on standard output:
-
-```dockerfile
-CMD ["muructl", "serve", "shop.wsgi:application"]
-```
+**[Read the documentation](https://docs.muruhq.dev/)** for the tutorials,
+a guide to each feature, and how Muru works.
 
 ## Contributing
 
@@ -129,10 +51,9 @@ describing the problem and the desired behaviour, and the maintainer
 implements accepted work. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 process and the development setup (`just doctor`, `just bootstrap`).
 
-Muru is developed with extensive use of AI coding agents, directed and
-reviewed by its creator, under a written design, decision records, tests and
-CI. People who prefer not to use or depend on AI-assisted software may find
-the project is not for them. See [About](docs/project/about.md).
+Muru is developed with extensive use of AI coding agents;
+[About](https://docs.muruhq.dev/en/latest/project/about.html) says how,
+and who is behind it.
 
 ## Licence
 

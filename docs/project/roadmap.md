@@ -22,9 +22,11 @@ The releases since have filled in and corrected what those phases built,
 and added interpreter provisioning and environment builds with uv, the
 runtime library provided by `muructl` itself, `muructl check`, and a
 built-in init with draining on `docker stop` for a container's main
-process. The [changelog](changelog.md) lists what each release added,
-and each how-to guide opens with a status note saying what of its
-feature is built and what is still to come. The scope and exit criteria
+process, handing a request between WSGI and ASGI in code, timestamps on
+every log line and the request id on Python log records, and `--json`,
+an MCP server and a project skill for coding agents. The
+[changelog](changelog.md) lists what each release added, and what is
+still to come is in the goals below and in GitHub issues. The scope and exit criteria
 of each phase are in [section 14.5](design/14-implementation-plan.md) of
 the design specification.
 
@@ -41,10 +43,10 @@ and a shutdown that drains in-flight requests on `docker stop`. This
 goal goes further, to integration with what container platforms expect
 of an application server: health probes, rollouts that lose no
 requests, sizing from the container's resource limits, logs that log
-collectors keep whole, locked-down security settings, and running from
-the team's own image without rebuilding it. That is more than Python
-web servers usually provide, and it is what makes running in containers
-robust enough for production on Docker, Compose, Podman and Kubernetes.
+collectors keep whole, locked-down security settings, and adding Muru
+to any image with one line. That is more than Python web servers
+usually provide, and it is what makes running in containers robust
+enough for production on Docker, Compose, Podman and Kubernetes.
 
 1. **`muructl serve` in Docker and Compose.** One application in one
    container, configured by flags, environment variables and a mounted
@@ -52,6 +54,7 @@ robust enough for production on Docker, Compose, Podman and Kubernetes.
    persistent, a health check that needs no curl, and a clean drain on
    `docker stop`. Switching an existing Dockerfile to Muru is a one-line
    change.
+   Done in 0.1.0a15.
    Issues: [#102](https://github.com/muruhq/muru/issues/102),
    [#103](https://github.com/muruhq/muru/issues/103),
    [#106](https://github.com/muruhq/muru/issues/106),
@@ -61,29 +64,27 @@ robust enough for production on Docker, Compose, Podman and Kubernetes.
    admin port, a shutdown sequence that loses no requests during a
    rollout, worker counts and memory budgets sized from the pod's
    limits, logs that container log collectors keep whole, metrics for
-   autoscaling, and a guide to a Deployment.
+   autoscaling, and a guide to a Deployment. Done in 0.1.0a15.
    Issues: [#104](https://github.com/muruhq/muru/issues/104),
    [#105](https://github.com/muruhq/muru/issues/105),
    [#107](https://github.com/muruhq/muru/issues/107),
    [#108](https://github.com/muruhq/muru/issues/108),
    [#119](https://github.com/muruhq/muru/issues/119).
 
-3. **Your own image.** Muru's pieces published as one bundle that a
-   Dockerfile adds with a single line, or that is injected at deployment
-   time (an init container, an image mount or a shared volume), so an
-   existing image runs under `muructl serve` unchanged, whatever its
-   base. Issues: [#113](https://github.com/muruhq/muru/issues/113),
-   [#142](https://github.com/muruhq/muru/issues/142).
+3. **muructl in any image.** A Dockerfile adds Muru with one line,
+   `uv tool install muructl` in the build stage, on Debian or Alpine
+   bases and with every supported Python, and the build fetches the
+   runtime library for the image's own interpreter. The container guide
+   shows the build with `muructl build` and with uv alone.
+   Issues: [#313](https://github.com/muruhq/muru/issues/313).
 
 4. **Image tooling.** `muructl check` recording what an image provides,
    a generated Dockerfile, the image contract and `muructl image check`,
-   static files prepared at build time, official base images and
-   `muructl image build`.
+   static files prepared at build time, and `muructl image build`.
    Issues: [#238](https://github.com/muruhq/muru/issues/238),
    [#115](https://github.com/muruhq/muru/issues/115),
    [#130](https://github.com/muruhq/muru/issues/130),
    [#116](https://github.com/muruhq/muru/issues/116),
-   [#129](https://github.com/muruhq/muru/issues/129),
    [#131](https://github.com/muruhq/muru/issues/131).
 
 5. **Container releases on a node.** The daemon runs a release's host
@@ -123,7 +124,8 @@ Issues: [#90](https://github.com/muruhq/muru/issues/90),
 [#144](https://github.com/muruhq/muru/issues/144),
 [#161](https://github.com/muruhq/muru/issues/161),
 [#162](https://github.com/muruhq/muru/issues/162),
-[#163](https://github.com/muruhq/muru/issues/163).
+[#163](https://github.com/muruhq/muru/issues/163),
+[#311](https://github.com/muruhq/muru/issues/311).
 
 ### Beyond one node
 
@@ -168,13 +170,14 @@ taken up between the steps of the major goals, in no fixed order.
   ([#172](https://github.com/muruhq/muru/issues/172),
   [#174](https://github.com/muruhq/muru/issues/174)), Unix
   socket listeners
-  ([#157](https://github.com/muruhq/muru/issues/157)).
+  ([#157](https://github.com/muruhq/muru/issues/157)), proxy
+  settings per listener and client certificate headers
+  ([#316](https://github.com/muruhq/muru/issues/316),
+  [#317](https://github.com/muruhq/muru/issues/317)), 100 Continue
+  over HTTP/2 ([#319](https://github.com/muruhq/muru/issues/319)).
 
-- **Logging, events and OpenTelemetry:** timestamps on every log line
-  ([#93](https://github.com/muruhq/muru/issues/93)), the request
-  id on Python log records and daemon-wide logging defaults
-  ([#168](https://github.com/muruhq/muru/issues/168),
-  [#169](https://github.com/muruhq/muru/issues/169)), log files
+- **Logging, events and OpenTelemetry:** daemon-wide logging defaults
+  ([#169](https://github.com/muruhq/muru/issues/169)), log files
   reopened on rename and a choice of what happens when output stalls
   ([#166](https://github.com/muruhq/muru/issues/166),
   [#167](https://github.com/muruhq/muru/issues/167)), event sinks
@@ -191,18 +194,8 @@ taken up between the steps of the major goals, in no fixed order.
   activation for the daemon's listeners
   ([#160](https://github.com/muruhq/muru/issues/160)).
 
-- **Applications and servers:** handing a request between WSGI and ASGI
-  in code ([#91](https://github.com/muruhq/muru/issues/91)), a
-  uWSGI profile for managed servers
+- **Applications and servers:** a uWSGI profile for managed servers
   ([#95](https://github.com/muruhq/muru/issues/95)).
-
-- **Coding agents:** `--json` on every command that reports something
-  ([#254](https://github.com/muruhq/muru/issues/254)), an MCP
-  server in `muructl` so an agent can run the daemon, deploy each change
-  as a release, test it and read what Muru observes
-  ([#197](https://github.com/muruhq/muru/issues/197)), and a
-  skill the project carries that teaches the agent how
-  ([#255](https://github.com/muruhq/muru/issues/255)).
 
 ## Ideas
 

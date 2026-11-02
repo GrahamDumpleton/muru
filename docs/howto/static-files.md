@@ -1,17 +1,5 @@
 # Static files
 
-```{admonition} Status
-:class: note
-
-Static routes to a directory, with index files, conditional requests,
-ranges, precompressed variants, cache headers and a fallback to an
-application or a file, an application's own directories served from
-its source in development and production alike, `muructl serve-static`,
-internal routes that only an [internal redirect](internal-redirects.md)
-reaches, and [file hints](file-hints.md) from applications. Directory
-listings and the metadata cache are still to come.
-```
-
 A route that names a directory instead of an application is served by
 the edge: Python never sees the request.
 

@@ -1,13 +1,5 @@
 # Response compression
 
-```{admonition} Status
-:class: note
-
-Responses are compressed at the edge, from the daemon's `[compression]`
-table or on by default. Per-host and per-route settings, precompressed
-static variants and request decompression are still to come.
-```
-
 The edge compresses responses on behalf of applications, so Python never
 spends time on it. A response is compressed when the client's
 `Accept-Encoding` takes one of the encodings offered, its `Content-Type`

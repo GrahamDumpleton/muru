@@ -379,7 +379,7 @@ def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
     assert gone.returncode == 1
 
 
-def test_an_unwritable_run_directory_names_the_volume_it_needs(tmp_path: Path) -> None:
+def test_an_unwritable_run_directory_says_what_fixes_it(tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("root can write anywhere")
 
@@ -393,7 +393,8 @@ def test_an_unwritable_run_directory_names_the_volume_it_needs(tmp_path: Path) -
         time.sleep(0.2)
         message = serve.output() + "".join(serve.stderr)
         assert "cannot be written" in message, message
-        assert "emptyDir" in message, message
+        assert f"cannot be written by user {os.getuid()}" in message, message
+        assert "mount a writable volume at" in message, message
     finally:
         locked.chmod(0o700)
 

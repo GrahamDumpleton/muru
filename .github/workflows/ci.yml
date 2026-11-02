@@ -27,6 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sh scripts/check-no-em-dashes.sh
       - run: uv sync --only-group dev
+      - run: uv run python scripts/check-user-docs.py
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy

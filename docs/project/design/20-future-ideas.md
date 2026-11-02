@@ -70,7 +70,7 @@ An application hosted by Muru could manage the instance it runs in: deploy and d
 
 The same mechanism would serve the dashboard's mutating actions (section 10) and TCP access in phase 5, so it should be designed once, in an ADR, before either is built.
 
-**Dependencies and timing.** The workshop case also needs container releases and base images (section 8), memory limits through cgroups, and scale to zero or shutdown on idle, all phase 4 items; a front end that itself runs in a container reaches the admin socket only through a bind mount or the phase 5 TCP listener. The client and access model fit at the end of phase 3 or the start of phase 4 so they are ready when those arrive. Until then a separate process with permission on the admin socket can drive an instance with generated stubs or the JSON gateway, which needs no change.
+**Dependencies and timing.** The workshop case also needs container releases (section 8), memory limits through cgroups, and scale to zero or shutdown on idle, all phase 4 items; a front end that itself runs in a container reaches the admin socket only through a bind mount or the phase 5 TCP listener. The client and access model fit at the end of phase 3 or the start of phase 4 so they are ready when those arrive. Until then a separate process with permission on the admin socket can drive an instance with generated stubs or the JSON gateway, which needs no change.
 
 ## 20.12 PROXY protocol
 

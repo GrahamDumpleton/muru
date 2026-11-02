@@ -200,16 +200,17 @@ container = { network = 'appnet', memory = '4GiB', cpus = 4, read_only = true, t
 
 | Level | Who builds | Muru provides |
 | --- | --- | --- |
-| Bring your own | The user, any tooling | The image contract and muructl image check |
-| Official base images | The user, FROM a Muru base | Python, uv, runtime library under /opt/muru on the path through a .pth file, non-root user, labels, per Python version, free-threaded and distroless variants |
+| Bring your own | The user, any tooling and any base | muructl installed in the build stage with uv tool install from the PyPI wheels; the runtime library for the image's interpreter, fetched by the build stage; the image contract and muructl image check |
 | Built by Muru (later) | muructl image build | A generated multi-stage Dockerfile from pyproject.toml and uv.lock, printable with muructl image dockerfile |
+
+Muru is built into the image when the image is built. There are no official base images, no muructl image and no bundle of runtime libraries to inject into an image at deployment time (ADR 0046). The build stage installs muructl with UV_TOOL_BIN_DIR=/usr/local/bin uv tool install muructl, which picks the manylinux or musllinux wheel for the base and fetches a Python for the tool when the base has none, and the final stage copies the binary alone. The build stage then fetches the runtime library for the image's own interpreter with muructl build --runtime-dir, or muructl runtime install --python PYTHON --target DIR for an environment uv sync or another tool built (section 8.3). muructl build runs uv sync in the project directory, so the project's [tool.uv] settings and UV_ environment variables apply to it.
 
 The image contract: an importable application and interpreter (found from the release setting, the dev.muru.python label, VIRTUAL_ENV, /app/.venv/bin/python or python3 on PATH, in that order), a non-root user, optionally the runtime library (from the dev.muru.runtime label, /opt/muru or the environment, section 8.3), and no required CMD or ENTRYPOINT. Nothing is built or installed when Muru runs inside a container: the build stage does it, with uv, and the runtime stage needs neither uv nor network. muructl serve forces build.when = 'never', sets UV_PYTHON_DOWNLOADS=never and UV_OFFLINE=1 for anything it might run, and fails fast when the interpreter, a package or the runtime library is missing, naming the Dockerfile line that provides it. Optional labels dev.muru.entrypoint, dev.muru.interface and dev.muru.static, and a [tool.muru] table in the image, let releases omit settings. A runtime baked into an image older than the supported protocol window fails at the probe unless runtime_source = 'daemon'.
 
 ```dockerfile
 FROM python:3.13-slim AS build
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-RUN pip install muructl
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install muructl
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN muructl build --deployment --deps-only --no-runtime --target /app/.venv
@@ -221,6 +222,6 @@ FROM python:3.13-slim
 COPY --from=build /app /app
 COPY --from=build /opt/muru /opt/muru
 COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
-RUN useradd --uid 10001 app
+RUN useradd --uid 10001 app && install -d -o 10001 -g 0 -m 0770 /run/muru
 USER app
 ```

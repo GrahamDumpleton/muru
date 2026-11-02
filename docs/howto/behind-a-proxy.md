@@ -1,14 +1,5 @@
 # Behind a load balancer or proxy
 
-```{admonition} Status
-:class: note
-
-The `[proxy]` table in the daemon's configuration file, with Forwarded,
-X-Forwarded-For, -Proto, -Host, -Port, -Prefix and X-Real-IP. Per-host
-and per-listener settings and client certificate headers are still to
-come.
-```
-
 When requests arrive through a load balancer, a CDN or another proxy, the
 peer the edge sees is the proxy, not the client. The daemon's
 configuration file names the proxies to trust and which of their headers

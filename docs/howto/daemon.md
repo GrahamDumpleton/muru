@@ -1,18 +1,11 @@
 # The daemon
 
-```{admonition} Status
-:class: note
-
 The daemon serves one or more applications on one node, each deployed
-from a source directory, with rollback, drains and an event log, through
-an edge process of its own, and it can be stopped and started again
-without interrupting traffic. Applications, releases, virtual hosts and
-routes can be declared in files and applied, exported and compared.
-This page covers starting the daemon and deploying; the other how-to
-guides cover what it does with a deployed application, from
-[rollouts](rollouts.md) to [scaling](scaling.md). Several edge processes
-and more than one node are still to come.
-```
+from a source directory, with rollback, drains and an event log, and can
+be stopped and started again without interrupting traffic. This page
+covers starting it and deploying; the other guides cover what it does
+with a deployed application, from [rollouts](rollouts.md) to
+[scaling](scaling.md).
 
 `muructl run` is for development. For an application that stays up, start
 the daemon once and deploy releases to it:

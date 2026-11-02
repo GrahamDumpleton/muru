@@ -1,17 +1,13 @@
 # Run an ASGI app with WebSockets
 
-```{admonition} Status
-:class: note
-
-This tutorial covers development mode, like
-[the first one](first-wsgi-app.md), which it assumes you have done.
-```
-
 In about ten minutes you will serve a small chat room as an ASGI
 application with `muructl run`, talk to it over WebSockets from two
 terminals, watch the sockets in the access log and the dashboard, and see
 what happens to open sockets when the server stops or reloads, and when
 there is more than one worker.
+
+This tutorial covers development mode, like [the first
+one](first-wsgi-app.md), which it assumes you have done.
 
 ## A project
 

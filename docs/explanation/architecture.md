@@ -1,13 +1,5 @@
 # Architecture
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented, on one node with one edge
-process. Several edge processes and more than one node are still to
-come; the [roadmap](../project/roadmap.md) says when.
-```
-
 Muru splits serving a Python web application into three kinds of process
 with different jobs:
 
@@ -94,8 +86,8 @@ A release is an immutable combination of application code, Python version
 and settings. Several can run side by side, each with its own host and
 workers, and traffic moves between them by policy. That is what makes
 zero-downtime deploys, canaries and instant rollback routing changes rather
-than restarts. The [releases page](../project/design/09-releases-and-traffic-management.md)
-of the design covers them.
+than restarts. [Releases and traffic](releases-and-traffic.md) explains
+how.
 
 ## What the hop between edge and worker costs
 

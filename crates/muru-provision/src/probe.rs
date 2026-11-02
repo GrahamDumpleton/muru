@@ -17,7 +17,25 @@ pub const MINIMUM: (u64, u64) = (3, 11);
 /// out of it while the interpreter's own site-packages stay on the path,
 /// so the `muru` it reports is the one the environment holds.
 const SCRIPT: &str = r#"
-import json, platform, sys
+import json, platform, re, subprocess, sys
+def libc():
+    name, version = platform.libc_ver()
+    if name == "glibc" or sys.platform != "linux":
+        return name, version
+    # musl, which platform.libc_ver() reports as nothing before Python 3.14
+    # and without its minor version since: the dynamic loader the
+    # interpreter names says which, and prints its version when run.
+    try:
+        with open(sys.executable, "rb") as handle:
+            loader = re.search(rb"/lib/ld-musl-[\w.-]+\.so\.1", handle.read(65536))
+        if loader is not None:
+            output = subprocess.run([loader.group().decode()], capture_output=True, text=True).stderr
+            found = re.search(r"Version (\d+\.\d+(?:\.\d+)?)", output)
+            return "musl", found.group(1) if found else version
+    except Exception:
+        pass
+    return name, version
+libc_name, libc_version = libc()
 try:
     from importlib.metadata import version
     muru = {"version": version("muru")}
@@ -37,8 +55,8 @@ print(json.dumps({
     "free_threaded": not getattr(sys, "_is_gil_enabled", lambda: True)(),
     "platform": sys.platform,
     "machine": platform.machine(),
-    "libc": platform.libc_ver()[0],
-    "libc_version": platform.libc_ver()[1],
+    "libc": libc_name,
+    "libc_version": libc_version,
     "mac_version": platform.mac_ver()[0],
     "prefix": sys.prefix,
     "base_prefix": sys.base_prefix,

@@ -1,22 +1,15 @@
 # Internal redirects
 
-```{admonition} Status
-:class: note
-
-Internal redirects from an application to a static route or another
-application path, internal routes and mounts, and the `X-Muru-Redirect`,
-`X-Accel-Redirect` and CGI local redirect forms; `X-Muru-Redirect` from
-a trusted [HTTP upstream](upstreams.md) too. The reverse direction is
-[upload offloading](uploads.md). A decision the edge needs before it
-serves a route, such as for a WebSocket upgrade, is an [authentication
-sub-request](auth-subrequests.md).
-```
-
 An application can hand a request back to the edge to be served from
 somewhere else: a file in a directory clients cannot reach directly, or
 another path of the same or another application. The application decides,
 for example whether the user may download the file, and the edge does the
 work, so a worker thread is not held while a large file goes out.
+
+The reverse direction, the edge receiving a body before the application
+sees the request, is [upload offloading](uploads.md). A decision the
+edge needs before it serves a route, such as for a WebSocket upgrade, is
+an [authentication sub-request](auth-subrequests.md).
 
 ## A protected download
 

@@ -1,14 +1,5 @@
 # Worker recycling
 
-```{admonition} Status
-:class: note
-
-Workers are replaced after a number of requests or a lifetime, on the
-hard timeout and over the memory limits, with the memory policy and
-timeouts settable per [worker group](worker-groups.md). Request and
-lifetime limits per group and the surge limit are still to come.
-```
-
 A worker process that has served long enough is replaced by a fresh one,
 without a request lost: the host forks the replacement on a new socket,
 tells its supervisor (the daemon, or `muructl run`) about it, waits until
@@ -38,6 +29,10 @@ max_lifetime = "2h"
 The same keys go in a declared release for `muructl apply`, and `muructl
 run --print-config` writes them. A release records its settings when it
 is created, so changing them means a new deploy.
+
+`max_requests` and `max_lifetime` apply to every worker of the release;
+the memory policy and the timeouts can also be set per [worker
+group](worker-groups.md).
 
 ## What happens
 

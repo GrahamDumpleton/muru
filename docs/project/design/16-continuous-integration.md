@@ -22,7 +22,6 @@ GitHub Actions runs every check on pull requests and main, longer suites nightly
 | security.yml | pull request, weekly | cargo-deny (licences, advisories, bans), cargo-audit, pip-audit, dependency review, CodeQL for Rust and Python |
 | release.yml | tag `v*.*.*` | build, test and publish (section 17) |
 | docs.yml | pull request | Sphinx build with warnings as errors and link check (Read the Docs builds previews separately) |
-| images.yml | release, weekly | build, test, sign and push base images |
 
 ## 16.2 Matrix for ci.yml
 

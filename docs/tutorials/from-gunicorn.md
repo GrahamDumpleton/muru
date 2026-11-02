@@ -1,14 +1,5 @@
 # From gunicorn to Muru
 
-```{admonition} Status
-:class: note
-
-This tutorial assumes you have done
-[deploy with the daemon and roll back](deploy-and-roll-back.md) and
-[your first canary](first-canary.md). The same steps work for uvicorn,
-Granian and mod_wsgi-express, each with a profile of its own.
-```
-
 An application already in production under gunicorn does not have to
 switch servers in one go. Muru can run the gunicorn command you have
 today as a release of its own, serve the application's traffic through
@@ -20,6 +11,11 @@ In about fifteen minutes you will run a small Flask application under
 gunicorn, hand that gunicorn command to the daemon, start the same
 application on Muru's workers beside it, canary from one to the other
 with requests running, and retire gunicorn without a request failing.
+
+This tutorial assumes you have done [deploy with the daemon and roll
+back](deploy-and-roll-back.md) and [your first canary](first-canary.md).
+The same steps work for uvicorn, Granian and mod_wsgi-express, each with
+a profile of its own.
 
 ## The deployment you have
 

@@ -1,14 +1,5 @@
 # Two sites on one node
 
-```{admonition} Status
-:class: note
-
-This tutorial assumes you have done
-[deploy with the daemon and roll back](deploy-and-roll-back.md). It uses
-[mkcert](https://github.com/FiloSottile/mkcert) for certificates your
-browser and `curl` trust.
-```
-
 One daemon can serve several sites, each chosen by the name a request
 asks for, over plain HTTP and HTTPS, with a certificate per site. Not
 every site has to be a Python application: the edge can serve a
@@ -20,6 +11,11 @@ shop that is a Python application, a blog that is a directory of HTML,
 and a notes site served by a separate HTTP server. Each will have its own
 name and HTTPS, the shop will send plain HTTP visitors to HTTPS, and a
 name the daemon does not know will reach none of them.
+
+This tutorial assumes you have done [deploy with the daemon and roll
+back](deploy-and-roll-back.md). It uses
+[mkcert](https://github.com/FiloSottile/mkcert) for certificates your
+browser and `curl` trust.
 
 ## The node
 

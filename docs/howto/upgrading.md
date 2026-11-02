@@ -46,8 +46,8 @@ matches and is used.
 
 ```console
 $ muructl daemon upgrade
-muru: daemon (pid 4120, version 0.1.0-alpha.12) re-executing from /usr/bin/muructl (version 0.1.0-alpha.13)
-muru: daemon upgraded to version 0.1.0-alpha.13 (pid 4120); edge pid 4133 replaced by pid 5871
+muru: daemon (pid 4120, version 1.0.0) re-executing from /usr/bin/muructl (version 1.1.0)
+muru: daemon upgraded to version 1.1.0 (pid 4120); edge pid 4133 replaced by pid 5871
 ```
 
 The daemon re-executes itself from the installed `muructl`, the one its
