@@ -51,6 +51,10 @@ intersphinx_mapping = {
 html_theme = "furo"
 html_title = "Muru"
 html_static_path = ["_static"]
+
+# The configuration JSON Schemas, served at schema/NAME.schema.json.
+
+html_extra_path = ["_extra"]
 html_theme_options = {
     "source_repository": "https://github.com/muruhq/muru/",
     "source_branch": "main",

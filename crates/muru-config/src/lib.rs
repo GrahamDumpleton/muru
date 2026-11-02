@@ -2,9 +2,10 @@
 //!
 //! Every user-visible setting is defined once, here, and the command line,
 //! configuration files and later the admin API all map onto these types
-//! (design specification sections 3.3 and 14.4). Phase 1 covers the
-//! application-shipped defaults of section 6.8: the `[tool.muru]` table in a
-//! project's pyproject.toml, or the same keys at the top of a muru.toml.
+//! (design specification sections 3.3 and 14.4): the daemon's file and
+//! applied files ([`Document`]), the `[tool.muru]` table ([`ToolMuru`]),
+//! muru.local.toml and the `muructl serve` file. [`schema`] generates the
+//! JSON Schema and the configuration reference from these types.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -12,12 +13,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod cron;
+pub mod schema;
 
 /// The interface an entrypoint speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Interface {
     /// Detect from the callable: a coroutine function or an object with an
@@ -34,7 +37,7 @@ pub enum Interface {
 
 /// The interface a release's or a mount's requests may be handed to
 /// (section 6.14): ASGI from a WSGI application, WSGI from an ASGI one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Handoff {
     /// Continue the request as an ASGI application on the event loop.
@@ -44,7 +47,7 @@ pub enum Handoff {
 }
 
 /// Whether the application is imported in the host before forking (section 6.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Preload {
     /// Preload when the import check passes, otherwise import per worker.
@@ -56,7 +59,7 @@ pub enum Preload {
 }
 
 /// How a worker's memory is measured (section 7.7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Measure {
     /// Unique set size: pages no other process shares, the default,
@@ -69,7 +72,7 @@ pub enum Measure {
 }
 
 /// When a factory entrypoint is called (section 6.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FactoryPhase {
     /// In each worker, after the post_fork hook.
@@ -122,7 +125,7 @@ words!(FactoryPhase { Worker => "worker", Host => "host" });
 words!(Handoff { Asgi => "asgi", Wsgi => "wsgi" });
 
 /// What a release runs (section 9.9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReleaseKind {
     /// Muru's own workers, from an entrypoint.
@@ -133,7 +136,7 @@ pub enum ReleaseKind {
 
 /// The server a managed HTTP release runs (section 9.9), which fixes
 /// how it binds and how it is stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerProfile {
     /// gunicorn: `--bind unix:PATH` or `--bind HOST:PORT`, stopped by TERM.
@@ -151,7 +154,7 @@ pub enum ServerProfile {
 }
 
 /// How a managed HTTP release's instances bind (section 9.9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerBind {
     /// A Unix socket per instance under the release's run directory.
@@ -175,20 +178,21 @@ pub const STOP_SIGNALS: [&str; 7] = ["TERM", "INT", "QUIT", "HUP", "USR1", "USR2
 
 /// The `readiness` table of a managed HTTP release (section 9.9): how
 /// an instance is known to be ready.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Readiness {
     /// The path probed with a GET until it answers 2xx or 3xx; without
     /// it, any HTTP response makes the instance ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// How long the instances get to become ready (default 60s).
+    /// How long the instances get to become ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "60s"))]
     pub timeout: Option<String>,
 }
 
 /// A Python logging level (section 11.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum LogLevel {
     /// Everything.
@@ -360,7 +364,7 @@ pub fn format_duration(duration: Duration) -> String {
 /// `[tool.muru.mounts.NAME]` table (section 6.7): a path served by another
 /// entrypoint in the same workers. The release's own entrypoint is the
 /// default mount at /.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
     /// The path prefix; the longest wins, on segment boundaries. A gRPC
@@ -371,32 +375,37 @@ pub struct Mount {
     pub entrypoint: String,
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub interface: Option<Interface>,
-    /// Reachable only through internal redirects (section 4.10): a
-    /// client's request for its path is answered 404 (default false).
+    /// Reachable only through internal redirects (section 4.10): a client's
+    /// request for its path is answered 404.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub internal: Option<bool>,
     /// Other applications whose internal redirects may reach the mount
     /// when it is internal; the release's own always may.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_redirects_from: Vec<String>,
     /// Treat an `X-Accel-Redirect` response header from the mount as an
-    /// internal redirect (default the release's setting, else false).
+    /// internal redirect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub accel_redirect: Option<bool>,
-    /// Treat a 200 response with a `Location` starting with `/` and no
-    /// body as an internal redirect, the CGI convention (default the
-    /// release's setting, else false).
+    /// Treat a 200 response with a `Location` starting with `/` and no body
+    /// as an internal redirect, the CGI convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the edge to serve the file (section 4.9); the
     /// release's when absent, and an empty list refuses every hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_roots: Option<Vec<String>>,
-    /// A second response header honoured as `X-Muru-Sendfile` is, such
-    /// as `X-Sendfile` (default the release's setting, else none).
+    /// A second response header honoured as `X-Muru-Sendfile` is, such as
+    /// `X-Sendfile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub sendfile_header: Option<String>,
     /// Threads of the mount's own, for a WSGI or gRPC mount; it shares
     /// the worker's pool when absent.
@@ -531,7 +540,7 @@ pub fn check_mount_limits(
 /// A mount's own threads (section 6.7): a fixed pool, `threads = 4`, or a
 /// reserved minimum that borrows threads of the shared pool up to a
 /// maximum, `threads = { reserved = 2, max = 6 }`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum MountThreads {
     /// A pool of this many threads, used by the mount alone.
@@ -541,7 +550,7 @@ pub enum MountThreads {
 }
 
 /// The table form of a mount's threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BorrowedThreads {
     /// Threads only the mount uses.
@@ -628,7 +637,7 @@ pub fn check_mount_threads(
 /// `[tool.muru.groups.NAME]` table (section 7.1): the paths it serves
 /// and its own sizes. Paths not claimed by a group go to the default
 /// group, which is the release's own settings.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     /// Path prefixes, with an optional trailing `*`; the most specific
@@ -647,21 +656,26 @@ pub struct Group {
     /// path.
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub matches: Option<GroupMatch>,
-    /// Whether the release is ready without the group's workers (ADR
-    /// 0033): its requests wait until one listens (default false).
+    /// Whether the release is ready without the group's workers (ADR 0033):
+    /// its requests wait until one listens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub optional: Option<bool>,
-    /// Worker processes.
+    /// The group's worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's, or `scaling.min_workers` when higher"))]
     pub processes: Option<usize>,
     /// Application threads per worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub threads: Option<usize>,
     /// Threads for synchronous code called from an ASGI application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub sync_threads: Option<usize>,
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
     pub concurrency: Option<usize>,
     /// How the group is scaled (sections 7.2 and 7.4); static when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -717,12 +731,13 @@ pub fn check_group_timeouts(timeouts: Option<&Timeouts>) -> Result<(), String> {
 /// the keys a deploy takes. `muructl run --print-config` writes one so a
 /// laptop setup can become a declared release, and `muructl apply` reads
 /// them.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
     /// What the release runs (section 9.9): `workers` from an entrypoint,
     /// the default, or `http`, an HTTP server started from `command`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "workers"))]
     pub kind: Option<ReleaseKind>,
     /// The server an `http` release runs: gunicorn, uvicorn, granian,
     /// mod_wsgi-express or generic.
@@ -736,13 +751,16 @@ pub struct Release {
     /// The directory an `http` release's command runs in; `source` when
     /// absent, and one of the two is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`source`"))]
     pub cwd: Option<String>,
     /// How an `http` release's instances bind: `unix` (the default) or
     /// `port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "unix"))]
     pub bind: Option<ServerBind>,
-    /// How many instances of the command an `http` release runs (default 1).
+    /// How many instances of the command an `http` release runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
     pub instances: Option<u32>,
     /// How an `http` release's instances are known to be ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -751,6 +769,7 @@ pub struct Release {
     /// TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic
     /// profile; the other profiles know their server's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the profile's, `TERM`"))]
     pub stop_signal: Option<String>,
     /// The source directory. A relative path is taken from the file's
     /// directory. Required by `muructl apply` for a `workers` release.
@@ -759,13 +778,16 @@ pub struct Release {
     /// The application as module:callable, else from the source's
     /// `[tool.muru]` table.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(extend("x-default" = "the source's `[tool.muru]`"))]
     pub entrypoint: String,
     /// The interface, when declared rather than detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub interface: Option<Interface>,
     /// Serve gRPC server reflection for the services the release's gRPC
     /// mounts register (section 6.13, default false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub reflection: Option<bool>,
     /// The interface the default mount's requests may be handed to
     /// (section 6.14); none when absent.
@@ -778,39 +800,49 @@ pub struct Release {
     pub grpc_web_origins: Vec<String>,
     /// Whether the entrypoint is a factory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub factory: Option<bool>,
     /// When a factory is called.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "worker"))]
     pub factory_phase: Option<FactoryPhase>,
     /// The interpreter: a path, or a request in uv's syntax (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "found at start"))]
     pub python: Option<String>,
     /// When and how the environment is built on the node (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Build>,
     /// Where compiled bytecode goes (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "redirect"))]
     pub bytecode: Option<Bytecode>,
-    /// Worker processes.
+    /// The default group's worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
     pub processes: Option<usize>,
     /// Application threads per worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 4))]
     pub threads: Option<usize>,
     /// Threads for synchronous code called from an ASGI application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 8))]
     pub sync_threads: Option<usize>,
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1000))]
     pub concurrency: Option<usize>,
     /// How the default group is scaled (sections 7.2 and 7.4); static
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<Scaling>,
-    /// The preload mode.
+    /// Whether the application is imported once, in the host, before the
+    /// workers are forked from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub preload: Option<Preload>,
-    /// The hooks module.
+    /// The module holding the lifecycle hooks, as a Python module name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
     /// Worker groups by name (section 7.1).
@@ -824,7 +856,7 @@ pub struct Release {
     /// directory under `muructl run`.
     #[serde(rename = "static", default, skip_serializing_if = "Vec::is_empty")]
     pub static_dirs: Vec<StaticDir>,
-    /// Logging defaults (section 11.4).
+    /// How Python logging is set up in the workers (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
     /// Requests a worker serves before it is replaced (section 7.7),
@@ -845,14 +877,16 @@ pub struct Release {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
-    /// Treat an `X-Accel-Redirect` response header as an internal
-    /// redirect (section 4.10), for the default mount and any mount that
-    /// does not say otherwise (default false).
+    /// Treat an `X-Accel-Redirect` response header as an internal redirect
+    /// (section 4.10), for the default mount and any mount that does not say
+    /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub accel_redirect: Option<bool>,
-    /// Treat a 200 response with a `Location` starting with `/` and no
-    /// body as an internal redirect, the CGI convention (default false).
+    /// Treat a 200 response with a `Location` starting with `/` and no body
+    /// as an internal redirect, the CGI convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the edge to serve the file (section 4.9), for the
@@ -881,7 +915,7 @@ pub struct Release {
 }
 
 /// How a worker group is scaled (section 7.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ScalingMode {
     /// A fixed worker count, the default.
@@ -907,63 +941,72 @@ impl ScalingMode {
 /// table (sections 7.2 and 7.4): the mode, the bounds, and the windows
 /// and budgets that keep the autoscaler from churning. The release's
 /// own table is the default group's.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Scaling {
-    /// static (the default), spare or target.
+    /// How the group is scaled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "static"))]
     pub mode: Option<ScalingMode>,
-    /// The fewest workers (default 1).
+    /// The fewest workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
     pub min_workers: Option<usize>,
     /// The most workers; required by the spare and target modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workers: Option<usize>,
-    /// Spare mode: scale out when fewer idle workers than this remain
-    /// (default 1).
+    /// Spare mode: scale out when fewer idle workers than this remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
     pub min_spare: Option<usize>,
-    /// Spare mode: scale in while more idle workers than this remain
-    /// (default the larger of 3 and a quarter of max_workers).
+    /// Spare mode: scale in while more idle workers than this remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the larger of 3 and a quarter of `max_workers`"))]
     pub max_spare: Option<usize>,
-    /// Target mode: the share of slots to keep busy, between 0 and 1
-    /// (default 0.7).
+    /// Target mode: the share of slots to keep busy, between 0 and 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0.7))]
     pub slot_utilization: Option<f64>,
     /// Target mode: scale out while the p95 queue wait is over this,
     /// for example 100ms; off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_p95: Option<String>,
-    /// How long a scale-out condition must hold (default 5s).
+    /// How long a scale-out condition must hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5s"))]
     pub scale_out_window: Option<String>,
-    /// How long every scale-in condition must hold (default 10m).
+    /// How long every scale-in condition must hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10m"))]
     pub scale_in_window: Option<String>,
-    /// No scale-in this long after a scale-out (default 5m).
+    /// No scale-in this long after a scale-out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5m"))]
     pub hold_after_growth: Option<String>,
-    /// At most one worker reaped per this interval (default 60s).
+    /// At most one worker reaped per this interval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "60s"))]
     pub reap_interval: Option<String>,
     /// A group wholly idle this long scales in without waiting for the
-    /// scale-in window (default 10m).
+    /// scale-in window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10m"))]
     pub idle_reap_after: Option<String>,
-    /// No worker younger than this is reaped (default the larger of 15m
-    /// and 30 times the measured time to ready).
+    /// No worker younger than this is reaped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the larger of 15m and 30 times the time to ready"))]
     pub min_lifetime: Option<String>,
-    /// The most workers one scale-out adds (default 4).
+    /// The most workers one scale-out adds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 4))]
     pub max_step_up: Option<usize>,
-    /// Reaps allowed per hour per release before scale-in is suspended
-    /// (default 6).
+    /// Reaps allowed per hour per release before scale-in is suspended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 6))]
     pub churn_budget: Option<usize>,
     /// Decide and report without acting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub advisory: Option<bool>,
     /// How long the release's host stays once every group has scaled to
     /// zero, after which it stops too and the next request starts it
@@ -975,36 +1018,41 @@ pub struct Scaling {
 
 /// The `[memory]` table of a release or a `[tool.muru]` table (section
 /// 7.7): the limits a worker's memory is held to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Memory {
     /// What is measured: uss (the default), pss or rss.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "uss"))]
     pub measure: Option<Measure>,
     /// Over this for soft_for, the worker reclaims and then recycles,
     /// for example 800MB; off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soft_limit: Option<String>,
-    /// How long the worker may stay over the soft limit (default 2m).
+    /// How long the worker may stay over the soft limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2m"))]
     pub soft_for: Option<String>,
-    /// Whether to collect garbage and trim the heap before recycling
-    /// over the soft limit (default true).
+    /// Whether to collect garbage and trim the heap before recycling over the
+    /// soft limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub reclaim_first: Option<bool>,
     /// Over this the worker leaves routing at once and is replaced,
-    /// for example 1200MB; off when absent.
+    /// for example 1200MB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "off; under `muructl serve` with a memory limit, a share of it"))]
     pub hard_limit: Option<String>,
-    /// How often memory is measured (default 5s).
+    /// How often memory is measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5s"))]
     pub check_interval: Option<String>,
 }
 
 /// A value in an `[env]` table (section 10.8): the text itself, or a
 /// reference to a secret in a store, delivered as the variable or, with
 /// `as = 'file'`, as a file whose path is in `NAME_FILE`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum EnvValue {
     /// The value as written.
@@ -1014,18 +1062,20 @@ pub enum EnvValue {
 }
 
 /// A secret reference in an `[env]` table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretValue {
     /// The store and key.
     pub secret: SecretRef,
-    /// `file` to deliver the value as a file instead of the variable.
+    /// How the value is delivered: `env` as the variable, or `file` as a
+    /// file only the release's user can read, whose path is in `NAME_FILE`.
     #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "env"))]
     pub deliver: Option<String>,
 }
 
 /// Which secret: a store declared in the daemon's file, and a key in it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
     /// The store's name.
@@ -1037,11 +1087,12 @@ pub struct SecretRef {
 /// The `[logs]` table of the daemon's file (section 11.3): how the
 /// daemon rotates the log files it and its processes write, and whether
 /// its standard streams carry the time (section 11.8).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Logs {
     /// `built-in` (the default) or `external`, for logrotate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "built-in"))]
     pub rotate: Option<String>,
     /// Rotate a file that reaches this size, for example 100MB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1049,24 +1100,28 @@ pub struct Logs {
     /// Rotate by the clock: `off`, `hourly`, `daily` (the default) or
     /// `weekly`, at the period's start in UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "daily"))]
     pub every: Option<String>,
-    /// Archives kept per log (default 14).
+    /// Archives kept per log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 14))]
     pub keep: Option<usize>,
     /// How archives are compressed: `zstd` (the default), `gzip` or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "zstd"))]
     pub compress: Option<String>,
     /// Put the full UTC time in front of every line the daemon writes to
     /// standard output and standard error, as `--timestamps` does, for a
     /// supervisor that stamps nothing (section 11.8). Files always carry
     /// the time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
 }
 
 /// The `[shutdown]` table of the daemon's file (section 13.3): what
 /// SIGTERM and SIGINT mean to the daemon, and how a shutdown runs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Shutdown {
     /// `shutdown`, which drains and stops every release and the edge
@@ -1074,32 +1129,36 @@ pub struct Shutdown {
     /// for the next daemon; shutdown when the daemon is a container's
     /// main process, detach otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`shutdown` as a container's main process, else `detach`"))]
     pub on_sigterm: Option<String>,
     /// How long the edge keeps accepting after the signal, closing each
     /// connection after its response so clients reconnect elsewhere, for
-    /// example 5s (default 0s).
+    /// example 5s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0s"))]
     pub delay: Option<String>,
     /// How long the whole shutdown may take, the delay, the drain, the
-    /// workers and the edge together (default 8s); what has not finished
-    /// by then is killed.
+    /// workers and the edge together; what has not finished by then is
+    /// killed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "8s"))]
     pub budget: Option<String>,
 }
 
 /// The `[daemon]` table of the daemon's file: how the daemon itself runs
 /// (ADR 0026).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Daemon {
-    /// The service user: whom a daemon that runs as root starts the edge,
-    /// and the applications that name no user of their own, as (default
-    /// `muru`). Never root.
+    /// The service user: whom a daemon that runs as root starts the edge, and
+    /// the applications that name no user of their own, as. Never root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "muru"))]
     pub user: Option<String>,
     /// Allow `muructl debug exec`, which runs code in a worker (section
     /// 11.7); off unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub debug_exec: Option<bool>,
     /// The node's budget across every application (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,7 +1167,7 @@ pub struct Daemon {
 
 /// The `[tools]` table of the daemon's file (section 8.4): uv, and how
 /// interpreters are installed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Tools {
     /// The uv to run, in place of the lookup order (`MURU_UV`, a uv
@@ -1125,16 +1184,19 @@ pub struct Tools {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uv_config: Option<String>,
     /// Whether a Python the node lacks is downloaded for a release that
-    /// requests it (default automatic).
+    /// requests it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "automatic"))]
     pub python_downloads: Option<PythonDownloads>,
-    /// Where managed interpreters go (default `python` under the state
-    /// directory); a shared read-only directory for several daemons.
+    /// Where managed interpreters go; a shared read-only directory for
+    /// several daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`python` in the state directory"))]
     pub python_install_dir: Option<String>,
     /// No network at all: nothing is downloaded, and wheels come from
     /// `wheel_dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub offline: Option<bool>,
     /// A local directory of wheels for the runtime library and for builds
     /// when offline.
@@ -1143,7 +1205,7 @@ pub struct Tools {
 }
 
 /// Whether interpreters may be downloaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PythonDownloads {
     /// Download a Python a release requests and the node lacks.
@@ -1154,7 +1216,7 @@ pub enum PythonDownloads {
 
 /// The `[daemon.budget]` table (section 7.4): what the releases on the
 /// node may hold between them. Each limit is off when omitted.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
     /// Worker processes and managed server instances.
@@ -1169,7 +1231,7 @@ pub struct Budget {
 }
 
 /// The `[secrets]` table of the daemon's file (section 10.8).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Secrets {
     /// Stores by name.
@@ -1178,7 +1240,7 @@ pub struct Secrets {
 }
 
 /// One `[secrets.store.NAME]` table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretStore {
     /// `file`, `env` or `exec`.
@@ -1187,20 +1249,22 @@ pub struct SecretStore {
     /// For a file store, the directory; the daemon's secrets directory
     /// under the store's name otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`secrets/NAME` in the state directory"))]
     pub path: Option<String>,
     /// For an exec store, the command and arguments, with `{key}` where
     /// the key goes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
-    /// For an exec store, how long the command may take (default 5s).
+    /// For an exec store, how long the command may take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5s"))]
     pub timeout: Option<String>,
 }
 
 /// The `[timeouts]` table of a release or a `[tool.muru]` table (section
 /// 7.6): the timeouts the host enforces on its workers. The edge's own
 /// timeouts are the daemon's `[limits]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
     /// How long a request may run in a worker before it is interrupted
@@ -1213,53 +1277,58 @@ pub struct Timeouts {
     /// timeout by at least 5s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_timeout: Option<String>,
-    /// How long a worker being replaced is given to finish its other
-    /// requests before it is told to stop (default 10s).
+    /// How long a worker being replaced is given to finish its other requests
+    /// before it is told to stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
     pub hard_drain_grace: Option<String>,
-    /// How long a worker told to stop is given before it is killed
-    /// (default 5s), counted from when its WebSockets are closed.
+    /// How long a worker told to stop is given before it is killed, counted
+    /// from when its WebSockets are closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5s"))]
     pub shutdown_timeout: Option<String>,
     /// How long a worker told to stop keeps its open WebSockets before it
-    /// closes them with 1001 (default 0s, at once).
+    /// closes them with 1001.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0s"))]
     pub websocket_drain_grace: Option<String>,
-    /// How long an ASGI worker's event loop may go without running
-    /// before the worker is replaced as for the hard timeout (default
-    /// 10s).
+    /// How long an ASGI worker's event loop may go without running before the
+    /// worker is replaced as for the hard timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
     pub loop_stall_timeout: Option<String>,
-    /// How long a worker may go with no thread running Python, or with
-    /// no report to its host, before it is replaced as for the hard
-    /// timeout (default 30s).
+    /// How long a worker may go with no thread running Python, or with no
+    /// report to its host, before it is replaced as for the hard timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "30s"))]
     pub gil_stall_timeout: Option<String>,
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
 /// handlers of their own do, set before the application is imported.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PythonLogging {
-    /// The root logger's level; Python's WARNING when omitted.
+    /// The root logger's level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "WARNING"))]
     pub level: Option<LogLevel>,
     /// The format of the platform handler: standard, json, or a logging
     /// format string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`standard`; `json` under `muructl serve --log-format json`"))]
     pub format: Option<String>,
     /// Whether warnings.warn goes through the py.warnings logger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub capture_warnings: Option<bool>,
     /// Levels for named loggers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loggers: BTreeMap<String, LogLevel>,
 }
 
-/// The `[logging]` table: the Python logging defaults, with the sinks
-/// and rotation of sections 11.2 and 11.3 to follow.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The `[logging]` table: how Python logging is set up in the workers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Logging {
     /// Python logging defaults.
@@ -1269,23 +1338,24 @@ pub struct Logging {
 
 /// The `[dashboard]` table (section 10.7): where the daemon serves its
 /// dashboard and JSON gateway, and whether it takes actions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Dashboard {
     /// The loopback address the dashboard is served on, such as
     /// 127.0.0.1:8090; not served when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
-    /// Whether a person signed in with `muructl dashboard login` may act
-    /// from the dashboard; read-only when false, the default.
+    /// Whether a person signed in with `muructl dashboard login` may act from
+    /// the dashboard; read-only when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub actions: bool,
 }
 
 /// The `[overlay_webhook]` table (section 9.10): where the daemon takes
 /// signed requests from monitoring and alerting systems to activate and
 /// end the overlays that declare the external trigger.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayWebhook {
     /// The address served, such as 0.0.0.0:9466.
@@ -1300,13 +1370,14 @@ pub struct OverlayWebhook {
 
 /// An `[[events.sink]]` entry (section 11.5): a webhook that receives
 /// events as signed CloudEvents requests.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventSink {
     /// The sink's name.
     pub name: String,
     /// The kind of sink; only webhook for now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "webhook"))]
     pub kind: Option<SinkKind>,
     /// Where deliveries go, an http:// or https:// URL.
     pub url: String,
@@ -1327,7 +1398,7 @@ pub struct EventSink {
 }
 
 /// The kind of an event sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SinkKind {
     /// Signed HTTP deliveries.
@@ -1337,7 +1408,7 @@ pub enum SinkKind {
 words!(SinkKind { Webhook => "webhook" });
 
 /// The `[events]` table: the sinks events are pushed to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Events {
     /// The sinks, each an `[[events.sink]]` entry.
@@ -1347,48 +1418,61 @@ pub struct Events {
 
 /// The `[limits]` table (appendix C): sizes and durations as the
 /// configuration writes them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Largest request body, for example 10MB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10MB"))]
     pub max_body_size: Option<String>,
     /// Largest request head, for example 64KB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "64KB"))]
     pub max_header_bytes: Option<String>,
     /// Most headers in a request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 100))]
     pub max_headers: Option<usize>,
     /// Time allowed for a complete request head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "30s"))]
     pub header_read_timeout: Option<String>,
     /// Time a request may wait for a worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5s"))]
     pub queue_timeout: Option<String>,
     /// Time a request may take to produce its response head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "300s"))]
     pub request_deadline: Option<String>,
     /// Time a client may pause while sending a body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "60s"))]
     pub body_idle_timeout: Option<String>,
     /// Time a worker may pause mid-response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "60s"))]
     pub response_idle_timeout: Option<String>,
     /// Open connections per listener (section 4.18).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 65536))]
     pub max_connections: Option<usize>,
     /// Open connections per client address; 0 disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 256))]
     pub max_connections_per_client: Option<usize>,
     /// Idle time before a keep-alive connection is closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "20s"))]
     pub keep_alive_timeout: Option<String>,
     /// The same for connections from trusted proxies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "75s"))]
     pub keep_alive_timeout_proxy: Option<String>,
     /// Requests served on one connection before it is closed; 0 for no
     /// limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0))]
     pub max_requests_per_connection: Option<u64>,
     /// HTTP/2 settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1400,39 +1484,45 @@ pub struct Limits {
 }
 
 /// The `[limits.http2]` table (section 4.18).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Http2Limits {
     /// Concurrent streams per connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 128))]
     pub max_concurrent_streams: Option<u32>,
 }
 
 /// The `[compression]` table (section 4.17): how the edge compresses
-/// responses. Every key is optional, with the defaults of appendix C.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// responses. Every key is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Compression {
-    /// Whether responses are compressed at all (default true).
+    /// Whether responses are compressed at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub enabled: Option<bool>,
     /// The encodings offered in preference order: br, zstd and gzip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = ["br", "zstd", "gzip"]))]
     pub encodings: Vec<String>,
     /// The smallest body worth compressing, for example 1KB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1KB"))]
     pub min_size: Option<String>,
     /// The content types compressed: exact types or a family as text/*.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = ["text/*", "application/json", "application/javascript", "application/xml", "image/svg+xml"]))]
     pub types: Vec<String>,
     /// How hard to compress: fast, default or best.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "default"))]
     pub level: Option<String>,
 }
 
 /// A listener, one of the `[[listener]]` entries (appendix C), in the
 /// daemon's own file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     /// The address, as IP:PORT.
@@ -1440,17 +1530,19 @@ pub struct Listener {
     /// Whether TLS is terminated on it, with the certificates of the
     /// virtual hosts it serves, chosen by SNI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub tls: bool,
     /// Section 6.13: on a listener without TLS, the clients that may
     /// speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or
     /// private; every client when omitted, none when empty. The others
     /// are served HTTP/1.1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "every client"))]
     pub h2c: Option<Vec<String>>,
 }
 
 /// How forwarding headers are left after they have been applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ForwardedHeaders {
     /// The configured headers stay for the application, other forwarding
@@ -1465,7 +1557,7 @@ words!(ForwardedHeaders { Keep => "keep", Consume => "consume" });
 
 /// The `[proxy]` table (section 4.7): which peers are trusted to speak
 /// for the client, and through which headers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
     /// Addresses, CIDR ranges, or the words loopback, private and unix.
@@ -1477,13 +1569,16 @@ pub struct Proxy {
     /// x-forwarded-port, x-forwarded-prefix and x-real-ip. The first four
     /// when omitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = ["forwarded", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"]))]
     pub headers: Vec<String>,
     /// Walk a chain of addresses from the right past trusted proxies to
     /// the first untrusted one, rather than take the rightmost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub recursive: Option<bool>,
     /// What becomes of the forwarding headers once applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "keep"))]
     pub forwarded_headers: Option<ForwardedHeaders>,
 }
 
@@ -1507,7 +1602,7 @@ pub const PROXY_HEADERS: [&str; 7] = [
 ];
 
 /// A virtual host, the `[host.NAME]` table (section 4.3).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Host {
     /// The names it answers to: exact names, or `*.example.com` for one
@@ -1525,14 +1620,17 @@ pub struct Host {
     pub canonical: Option<String>,
     /// Redirect plain HTTP requests to HTTPS.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub https_redirect: bool,
     /// Give the application the canonical name as SERVER_NAME rather than
     /// the name matched.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub use_canonical_name: bool,
     /// Answer requests whose host matches no virtual host, which are
     /// otherwise refused with 421.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub default: bool,
     /// Custom error pages (section 4.12), by status or status:reason.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1548,19 +1646,20 @@ pub struct Host {
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostTls {
     /// The certificate chain, leaf first. A relative path is taken from
     /// the file's directory.
     pub certificate: String,
-    /// The private key.
+    /// The private key. A relative path is taken from the file's
+    /// directory.
     pub key: String,
 }
 
 /// A route, one of the `[[route]]` entries (section 4.5): a path prefix
 /// of a virtual host to an application.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// A name for the route, unique among routes, by which overlays
@@ -1571,6 +1670,7 @@ pub struct Route {
     pub host: String,
     /// The path prefix, `/` for everything. The longest prefix wins.
     #[serde(default = "root_path")]
+    #[schemars(extend("default" = "/"))]
     pub path: String,
     /// The client classes (section 4.14) the route takes; every request
     /// without it. Among routes with the same path, one naming the
@@ -1589,9 +1689,9 @@ pub struct Route {
     /// application.
     #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
     pub static_dir: Option<String>,
-    /// The files tried, in order, when a directory is requested
-    /// (default index.html).
+    /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = ["index.html"]))]
     pub index: Vec<String>,
     /// What takes a request no file answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1599,22 +1699,25 @@ pub struct Route {
     /// The cache headers files are sent with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheTable>,
-    /// Whether a directory asked for without a trailing slash is
-    /// redirected to the slash form (default true).
+    /// Whether a directory asked for without a trailing slash is redirected
+    /// to the slash form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub redirect_slash: Option<bool>,
     /// `strict` (the default), which matches names as they are on disk,
     /// or `insensitive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "strict"))]
     pub case: Option<String>,
     /// How requests are shared between the application's releases
     /// (section 9.4); without it every request goes to the serving
     /// release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic: Option<Traffic>,
-    /// Reachable only through internal redirects (section 4.10): a
-    /// client's request for the path is answered 404 (default false).
+    /// Reachable only through internal redirects (section 4.10): a client's
+    /// request for the path is answered 404.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub internal: Option<bool>,
     /// Applications other than the route's own (or a static route's
     /// fallback) whose internal redirects may reach the route. A static
@@ -1636,6 +1739,7 @@ pub struct Route {
     /// `[limits]` value for the route (section 4.6). On an upload route
     /// it bounds the body as received, files included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_body_size` in `[limits]`"))]
     pub max_body_size: Option<String>,
     /// Section 4.11: `multipart` or `raw` makes the edge receive and store
     /// uploads before the application sees the request; off without it.
@@ -1644,20 +1748,24 @@ pub struct Route {
     /// The largest uploaded file, for example 512MB; no limit without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_size: Option<String>,
-    /// The most files in one request (100 by default).
+    /// The most files in one request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 100))]
     pub max_files: Option<u32>,
     /// The digests computed while receiving: sha256 (the default),
     /// sha384, sha512 or sha1; an empty list for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = ["sha256"]))]
     pub hash: Option<Vec<String>>,
-    /// Ask the application with the request's headers alone first, and
-    /// read the body only when it answers 2xx (false by default).
+    /// Ask the application with the request's headers alone first, and read
+    /// the body only when it answers 2xx.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub precheck: Option<bool>,
-    /// What the application's stored uploads may hold at once when a
-    /// request on the route arrives (10GB by default).
+    /// What the application's stored uploads may hold at once when a request
+    /// on the route arrives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10GB"))]
     pub spool_quota: Option<String>,
     /// The `[rate_limit.NAME]` tables applied to the route's requests
     /// (section 4.15), after the host's.
@@ -1697,7 +1805,7 @@ impl Route {
 }
 
 /// A route's method restrictions (section 4.15).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Methods {
     /// The methods refused, for example POST, PUT, PATCH and DELETE.
@@ -1706,6 +1814,7 @@ pub struct Methods {
     /// `read_only` (the default) answers 503 read_only;
     /// `method_not_allowed` answers 405 with the methods left in Allow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "read_only"))]
     pub answer: Option<String>,
 }
 
@@ -1795,7 +1904,7 @@ fn check_policy_name(key: &str, name: &str) -> Result<(), String> {
 /// when every input the rule names matches, each input matching when any
 /// of its entries does; rules are tried in order and a request that
 /// matches none is class `default`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientClass {
     /// The class's name, as logs, metrics, rate limits and applications
@@ -1804,7 +1913,7 @@ pub struct ClientClass {
     /// User-Agent substrings, compared without regard to case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_agent: Vec<String>,
-    /// User-Agent regular expressions.
+    /// Regular expressions matched against the User-Agent header.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_agent_regex: Vec<String>,
     /// A file of User-Agent substrings, one a line, relative to the
@@ -1848,7 +1957,7 @@ pub const DEFAULT_CLIENT_CLASS: &str = "default";
 /// An `[overlay.NAME]` table (section 9.10): changes to named routes and
 /// to applications, applied over the base configuration while the
 /// overlay is active, by its schedule or by hand.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Overlay {
     /// Changes to routes, by the route's `name`.
@@ -1870,10 +1979,12 @@ pub struct Overlay {
     /// Once its schedule activates it, it stays active past the window
     /// until a person ends it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub latch: Option<bool>,
     /// Its schedule only raises overlay.would_activate events; it is
     /// activated by hand only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub advisory: Option<bool>,
     /// What to start ahead of its schedule's windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1882,7 +1993,7 @@ pub struct Overlay {
 
 /// An overlay's warm-up: for `lead` before each window of its schedule,
 /// `start_release` runs, so a switch to it lands on warm workers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WarmUp {
     /// How long before the window, such as 30m.
@@ -1894,7 +2005,7 @@ pub struct WarmUp {
 }
 
 /// What an overlay changes on a route.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RouteOverlay {
     /// The site mode (section 4.15).
@@ -1903,8 +2014,10 @@ pub struct RouteOverlay {
     /// Methods refused, as the route's `methods.deny`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<Vec<String>>,
-    /// How refused methods are answered, as the route's `methods.answer`.
+    /// How refused methods are answered, with the values a route's
+    /// `methods.answer` takes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "read_only"))]
     pub answer: Option<String>,
     /// The traffic policy: a pin sends every request to one release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1927,7 +2040,7 @@ pub struct RouteOverlay {
 }
 
 /// An overlay's traffic policy for a route.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrafficOverlay {
     /// Send every request to this release of the route's application.
@@ -1940,7 +2053,7 @@ pub struct TrafficOverlay {
 
 /// What serves a route under an overlay: one of an application, a
 /// static directory or an upstream.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTarget {
     /// An application.
@@ -1955,10 +2068,11 @@ pub struct RouteTarget {
 }
 
 /// What an overlay changes on an application: its maintenance mode, and
-/// the capacity of section 7.5, for its default worker group or `group`.
+/// its scheduled capacity (section 7.5), for its default worker group or
+/// `group`.
 /// Capacity does not conflict between overlays: the highest floor and
 /// ceiling stand.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppOverlay {
     /// Maintenance mode (section 4.12) while the overlay is active.
@@ -1970,12 +2084,15 @@ pub struct AppOverlay {
     /// Methods refused on each of the application's routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<Vec<String>>,
-    /// How refused methods are answered, as a route's `methods.answer`.
+    /// How refused methods are answered, with the values a route's
+    /// `methods.answer` takes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "read_only"))]
     pub answer: Option<String>,
     /// The worker group the capacity applies to; the default group
     /// without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "default"))]
     pub group: Option<String>,
     /// The fewest workers, a floor over the group's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1986,10 +2103,12 @@ pub struct AppOverlay {
     /// `hold` keeps the group from scaling in; `normal` (the default)
     /// leaves it to the autoscaler's rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "normal"))]
     pub scale_in: Option<String>,
     /// Refuse deploys and rollouts of the application unless overridden
     /// (section 9.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub freeze_deploys: Option<bool>,
 }
 
@@ -2003,7 +2122,7 @@ impl AppOverlay {
 /// An `[[app.NAME.schedule]]` entry (section 7.5): capacity for a window,
 /// shorthand for an overlay named `APP.NAME` that sets only the floor,
 /// the ceiling, how scale-in behaves and a deploy freeze.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CapacitySchedule {
     /// The schedule's name, unique within the application.
@@ -2022,24 +2141,29 @@ pub struct CapacitySchedule {
     pub duration: Option<String>,
     /// The time zone of local times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the daemon's system time zone"))]
     pub timezone: Option<String>,
     /// The worker group; the default group without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "default"))]
     pub group: Option<String>,
-    /// The floor.
+    /// The fewest workers during the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_workers: Option<u32>,
-    /// The ceiling.
+    /// The most workers during the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workers: Option<u32>,
     /// How long before each window the floor applies, such as 30m.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_up: Option<String>,
-    /// `hold` or `normal`.
+    /// `hold` keeps the group from scaling in during the window; `normal`,
+    /// the default, leaves it to the autoscaler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "normal"))]
     pub scale_in: Option<String>,
     /// Refuse deploys and rollouts during the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub freeze_deploys: Option<bool>,
 }
 
@@ -2101,7 +2225,7 @@ impl CapacitySchedule {
 }
 
 /// When an overlay is active on its own.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayTrigger {
     /// A window in time.
@@ -2110,12 +2234,13 @@ pub struct OverlayTrigger {
     /// Whether the signed webhook of the `[overlay_webhook]` table may
     /// activate and end it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub external: Option<bool>,
 }
 
 /// A window in time: one-off, from `start` until `end` when it has one,
 /// or recurring, from each time `cron` names for `duration`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OverlaySchedule {
     /// When it starts, as a local date and time such as
@@ -2135,11 +2260,12 @@ pub struct OverlaySchedule {
     /// The time zone local times are in, such as Australia/Sydney; the
     /// daemon's own zone without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the daemon's system time zone"))]
     pub timezone: Option<String>,
 }
 
 /// What must hold for an overlay to activate.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Preconditions {
     /// A release that must be ready, as app@release, or as release when
@@ -2540,7 +2666,7 @@ pub fn check_client_class(class: &ClientClass) -> Result<(), String> {
 
 /// A `[rate_limit.NAME]` table (section 4.15): a token bucket for each
 /// key, which requests of the matching classes draw from.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
     /// Which requests draw from the buckets; all of them without it.
@@ -2549,33 +2675,39 @@ pub struct RateLimit {
     /// What a bucket is kept for: `address` (the default),
     /// `client_class`, `header:NAME`, `cookie:NAME`, or a list of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "address"))]
     pub key: Option<RateLimitKey>,
     /// How fast a bucket fills, for example 2/s, 100/m or 1000/h.
     pub rate: String,
-    /// How many requests a full bucket allows at once (the rate's count
-    /// by default).
+    /// How many requests a full bucket allows at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the rate's count"))]
     pub burst: Option<u32>,
     /// `reject` (the default) answers 429, `delay` holds the request up
     /// to `max_delay` first, `log` only counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "reject"))]
     pub action: Option<String>,
-    /// The longest a request is held under `delay` (1s by default).
+    /// The longest a request is held under `delay`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1s"))]
     pub max_delay: Option<String>,
     /// The leading bits of an IPv4 address that make the key (32).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 32))]
     pub ipv4_prefix: Option<u8>,
     /// The leading bits of an IPv6 address that make the key (64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 64))]
     pub ipv6_prefix: Option<u8>,
     /// Send the RateLimit-Policy and RateLimit fields with a 429.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub headers: Option<bool>,
 }
 
 /// The requests a rate limit or route applies to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClientMatch {
     /// Client classes (section 4.14).
@@ -2585,7 +2717,7 @@ pub struct ClientMatch {
 
 /// The requests a worker group takes for its paths (ADR 0033): every
 /// list given must name the request's class, host or method.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GroupMatch {
     /// Client classes (section 4.14).
@@ -2601,7 +2733,7 @@ pub struct GroupMatch {
 }
 
 /// One key part or several.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum RateLimitKey {
     /// A single part.
@@ -2847,7 +2979,7 @@ pub const MAX_UPLOAD_FILES: u32 = 500;
 /// A route's authentication sub-request (section 4.16): the edge sends a
 /// bodiless GET to an application path and serves the route only when
 /// that answers 2xx.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
     /// The application that decides; empty when an upstream does.
@@ -2859,9 +2991,9 @@ pub struct Auth {
     pub upstream: String,
     /// The path asked, usually of an internal mount or route.
     pub path: String,
-    /// How long the handler has, queueing included, for example 2s (the
-    /// default).
+    /// How long the handler has, queueing included, for example 2s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2s"))]
     pub timeout: Option<String>,
     /// Response headers of an allowing answer added to the request as
     /// trusted headers; a client's own copies are always removed.
@@ -2873,7 +3005,7 @@ pub struct Auth {
 }
 
 /// How long and by what an allowing decision is remembered.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthCache {
     /// How long a decision stands, for example 30s.
@@ -2886,7 +3018,7 @@ pub struct AuthCache {
 
 /// A route's traffic policy (section 9.4): the share of requests each
 /// release takes, the key requests are bucketed by, and stickiness.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Traffic {
     /// Percent of requests to each release, by id; the application's
@@ -2899,18 +3031,20 @@ pub struct Traffic {
     /// `client` (the client address). A missing header or cookie falls
     /// back to the client address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "cookie"))]
     pub hash_key: Option<String>,
-    /// Mixed into the hash, so two routes split the same users
-    /// differently; the route's host and path by default.
+    /// Mixed into the hash, so two routes split the same users differently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the route's host and path"))]
     pub salt: Option<String>,
-    /// Whether a client keeps the release it first got, through a cookie
-    /// (default false).
+    /// Whether a client keeps the release it first got, through a cookie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub sticky: Option<bool>,
     /// How long sticky clients keep a release that is leaving the route
-    /// alive, for example 10m (the default).
+    /// alive, for example 10m.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10m"))]
     pub sticky_grace: Option<String>,
     /// The release, by id, or `upstream:NAME`, that takes every request
     /// of a client class (section 4.14), ahead of stickiness and the
@@ -2921,7 +3055,7 @@ pub struct Traffic {
 
 /// A static route's fallback (section 4.9): an application, or a file
 /// within the directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Fallback {
     /// The application that takes requests no file answers.
@@ -2941,7 +3075,7 @@ pub struct Fallback {
 /// the release's source, with the application taking what no file
 /// answers. Served by `muructl run` and the daemon alike, from the
 /// release the request was routed to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StaticDir {
     /// The path prefix, such as `/static/`; the longest wins, on segment
@@ -2950,9 +3084,9 @@ pub struct StaticDir {
     pub path: String,
     /// The directory, relative to the source directory, or absolute.
     pub dir: String,
-    /// The files tried, in order, when a directory is requested
-    /// (default index.html).
+    /// The files tried, in order, when a directory is requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = ["index.html"]))]
     pub index: Vec<String>,
     /// The file served for paths with no file of their own, for a
     /// single-page application under the prefix.
@@ -2961,13 +3095,15 @@ pub struct StaticDir {
     /// The cache headers files are sent with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheTable>,
-    /// Whether a directory asked for without a trailing slash is
-    /// redirected to the slash form (default true).
+    /// Whether a directory asked for without a trailing slash is redirected
+    /// to the slash form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub redirect_slash: Option<bool>,
     /// `strict` (the default), which matches names as they are on disk,
     /// or `insensitive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "strict"))]
     pub case: Option<String>,
 }
 
@@ -3024,7 +3160,7 @@ pub fn check_static(entries: &[StaticDir]) -> Result<(), String> {
 }
 
 /// A static route's cache headers (section 4.9).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CacheTable {
     /// How long clients may keep a file, for example 1y or 1h.
@@ -3032,6 +3168,7 @@ pub struct CacheTable {
     pub max_age: Option<String>,
     /// Whether files are marked immutable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub immutable: Option<bool>,
     /// Files that get no-cache instead, by pattern on their path within
     /// the route.
@@ -3047,7 +3184,7 @@ fn root_path() -> String {
 /// table, keyed by status (`404`) or status and reason
 /// (`"503:maintenance"`). Exactly one of `file`, `template` and `path`
 /// is given.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorPage {
     /// A file sent as the body, with the content type its name implies.
@@ -3064,29 +3201,30 @@ pub struct ErrorPage {
     /// sub-request that sees `REDIRECT_STATUS` and `muru.error_reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// The content type of a template (default `text/html;
-    /// charset=utf-8`).
+    /// The content type of a template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "text/html; charset=utf-8"))]
     pub content_type: Option<String>,
 }
 
 /// Replacing an application's own error responses with error pages
 /// (section 4.12), the `error_override` table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorOverride {
-    /// The statuses replaced.
+    /// The statuses whose responses are replaced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statuses: Vec<u16>,
     /// When a listed response is replaced: `all` (the default),
     /// `empty_body`, `not_json` or `html_only`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "all"))]
     pub when: Option<String>,
 }
 
 /// What maintenance mode lets through (section 4.12), the `maintenance`
 /// table of a release.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Maintenance {
     /// Path prefixes served as usual while the application is in
@@ -3099,9 +3237,9 @@ pub struct Maintenance {
     /// A `name=value` cookie that lets a client through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bypass_cookie: Option<String>,
-    /// The `Retry-After` the maintenance page carries, for example 5m
-    /// (default 60s).
+    /// The `Retry-After` the maintenance page carries, for example 5m.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "60s"))]
     pub retry_after: Option<String>,
 }
 
@@ -3318,7 +3456,7 @@ pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
 /// An HTTP upstream (section 4.13), one of the `[upstream.NAME]` tables:
 /// an unmanaged HTTP server that routes, fallbacks, traffic shares and
 /// authentication sub-requests can target.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     /// Where the server listens: `host:port` entries, or `unix:/path`
@@ -3328,6 +3466,7 @@ pub struct Upstream {
     /// `http1` (the default), `h2c` (HTTP/2 in the clear, by prior
     /// knowledge) or `h2` (HTTP/2 over TLS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "http1"))]
     pub protocol: Option<String>,
     /// Connect with TLS; `h2` implies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3335,10 +3474,10 @@ pub struct Upstream {
     /// Active health checks and passive ejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<UpstreamHealth>,
-    /// Honour X-Muru-Redirect from the upstream, as from an application
-    /// (default false): its X-Muru-* response headers are otherwise
-    /// removed.
+    /// Honour X-Muru-Redirect from the upstream, as from an application: its
+    /// X-Muru-* response headers are otherwise removed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub trust_muru_headers: bool,
     /// Directories a path in a trusted `X-Muru-Sendfile` response header
     /// must lie in for the edge to serve the file (section 4.9); with
@@ -3349,14 +3488,14 @@ pub struct Upstream {
     /// as `X-Sendfile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sendfile_header: Option<String>,
-    /// How long a connection may take to open, for example 5s (the
-    /// default).
+    /// How long a connection may take to open, for example 5s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "5s"))]
     pub connect_timeout: Option<String>,
 }
 
 /// How an upstream's TLS connections are made.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
     /// A PEM file of the certificates trusted, by absolute path; the
@@ -3366,41 +3505,48 @@ pub struct UpstreamTls {
     /// The name the certificate must carry, sent as SNI; the address's
     /// host without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the address's host"))]
     pub server_name: Option<String>,
-    /// Check the certificate (default true).
+    /// Check the certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub verify: Option<bool>,
 }
 
 /// An upstream's health checks (section 4.13): probes of each address,
 /// and the ejection of one whose requests fail.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamHealth {
     /// The path probed with a GET, healthy on 2xx or 3xx; without it a
     /// connection that opens is healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// How often each address is probed, for example 10s (the default).
+    /// How often each address is probed, for example 10s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
     pub interval: Option<String>,
-    /// How long a probe may take, for example 2s (the default).
+    /// How long a probe may take, for example 2s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2s"))]
     pub timeout: Option<String>,
-    /// Failed probes in a row before an address is unhealthy (default 3).
+    /// Failed probes in a row before an address is unhealthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 3))]
     pub unhealthy_after: Option<u32>,
-    /// Successful probes in a row before it is healthy again (default 2).
+    /// Successful probes in a row before it is healthy again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 2))]
     pub healthy_after: Option<u32>,
-    /// Failed requests in a row before an address is ejected (default
-    /// 3); 0 never ejects.
+    /// Failed requests in a row before an address is ejected; 0 never ejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 3))]
     pub eject_after: Option<u32>,
     /// How long an ejected address is left out before a request tries it
-    /// again, for example 30s (the default); doubled each time the trial
-    /// fails, up to ten times as long.
+    /// again, for example 30s; doubled each time the trial fails, up to ten
+    /// times as long.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "30s"))]
     pub eject_for: Option<String>,
 }
 
@@ -3700,7 +3846,7 @@ pub fn check_upstream(table: &Upstream) -> Result<(), String> {
 }
 
 /// An application's table and its releases.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct App {
     /// Releases by identifier.
@@ -3712,22 +3858,26 @@ pub struct App {
     /// The user the application's hosts and workers run as, when the
     /// daemon runs as root (section 10.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the daemon's own user"))]
     pub user: Option<String>,
     /// The group, else the user's primary group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the user's primary group"))]
     pub group: Option<String>,
     /// The file creation mask, in octal, for example 027.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the daemon's own umask"))]
     pub umask: Option<String>,
     /// Which applications' scale-ups the node's budget admits first, the
-    /// highest first (section 7.4); 0 when omitted.
+    /// highest first (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0))]
     pub priority: Option<i32>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
 /// Prometheus exposition.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Metrics {
     /// The address `/metrics` is served on, an internal one such as
@@ -3740,7 +3890,7 @@ pub struct Metrics {
 /// `muructl config export` writes it (section 10.4): listeners and limits,
 /// which belong to the daemon's own file, and applications with their
 /// releases.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
     /// How the daemon itself runs (ADR 0026).
@@ -3956,7 +4106,7 @@ impl Document {
 
 /// A port of the run table (section 13.1): a number, or `auto` for a
 /// free one, as the `--port` and `--https-port` flags take it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum RunPort {
     /// A port number.
@@ -3972,18 +4122,19 @@ impl RunPort {
     }
 }
 
-/// The `[tool.muru.run]` table of pyproject.toml, `[run]` in muru.toml and
 /// The `[tool.muru.build]` table (section 8.2): when and how the
 /// release's environment is built from the lock. `when` is read by
 /// `muructl run` and the daemon alike; the rest describes the deployment
 /// flavour, which development ignores.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Build {
-    /// When an environment is built: `auto` (the default) builds a
-    /// missing one and leaves an existing one alone, `always` builds on
-    /// every start and on a lock change, `never` builds nothing.
+    /// When an environment is built: `auto` builds a missing one and
+    /// leaves an existing one alone, `always` builds on every start and on
+    /// a lock change, `never` builds nothing. `muructl serve` never builds
+    /// one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`auto`; `never` under `muructl run --allow-public`"))]
     pub when: Option<BuildWhen>,
     /// Extras the deployment environment includes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3991,17 +4142,19 @@ pub struct Build {
     /// Dependency groups beyond the defaults; dev is never included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
-    /// Allow sdists to be built on the node (default false).
+    /// Allow sdists to be built on the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub source_builds: Option<bool>,
-    /// Compile bytecode at build time (default true).
+    /// Compile bytecode at build time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub compile_bytecode: Option<bool>,
 }
 
 /// Where compiled bytecode goes for a daemon-managed release (section
 /// 8.2).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Bytecode {
     /// A writable directory of the release's own under the state
@@ -4042,7 +4195,7 @@ impl std::str::FromStr for Bytecode {
 }
 
 /// When an environment is built (section 8.2).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildWhen {
     /// Build a missing environment; leave an existing one alone at start,
@@ -4097,20 +4250,24 @@ pub struct LocalFile {
 /// project, with a key for each flag of the command that describes the
 /// serving rather than the application. The daemon ignores it. Lists add
 /// across the layers, as a list flag adds to a key.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunSettings {
     /// The HTTP port, or `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 8080))]
     pub port: Option<RunPort>,
     /// Serve HTTPS beside HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub https: Option<bool>,
     /// Serve HTTPS alone, HTTP redirecting to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub https_only: Option<bool>,
     /// The HTTPS port, or `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`8443`, or `auto` when `port` is"))]
     pub https_port: Option<RunPort>,
     /// A certificate chain to serve, relative to the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4121,8 +4278,9 @@ pub struct RunSettings {
     /// Names the development certificate covers besides localhost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
-    /// Reload on changes; on by default in development mode.
+    /// Reload on changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub reload: Option<bool>,
     /// Directories watched, relative to the project; the project when
     /// empty.
@@ -4136,21 +4294,26 @@ pub struct RunSettings {
     pub reload_exclude: Vec<String>,
     /// Where the access log goes: terminal, off, errors or a file path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "terminal"))]
     pub access_log: Option<String>,
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_exclude: Vec<String>,
     /// How long a request may take before `errors` shows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1s"))]
     pub slow: Option<String>,
     /// The dashboard's address, or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`127.0.0.1:8081`; off under `--allow-public`"))]
     pub dashboard: Option<String>,
     /// Whether responses are compressed; `false` is `--no-compression`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub compression: Option<bool>,
     /// Whether every line on the terminal carries the full UTC time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
 }
 
@@ -4219,7 +4382,7 @@ impl RunSettings {
 /// a container (section 13.9). A key is a flag of the command in snake
 /// case, taking the flag's value; a list key takes the values the flag
 /// would be repeated with.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServeSettings {
     /// The application as module:callable.
@@ -4227,45 +4390,59 @@ pub struct ServeSettings {
     pub entrypoint: Option<String>,
     /// Where the application is served, IP:PORT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0.0.0.0:8080"))]
     pub listen: Option<String>,
     /// Where the probes and metrics are served, IP:PORT or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0.0.0.0:9090"))]
     pub admin_listen: Option<String>,
     /// Whether `/status` is served on the admin port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub admin_status: Option<bool>,
-    /// The workers ready in every mount for `/readyz` to pass.
+    /// The workers ready in every worker group for `/readyz` to pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
     pub min_ready: Option<u32>,
     /// The interface the entrypoint speaks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub interface: Option<String>,
     /// Whether the entrypoint is a factory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub factory: Option<bool>,
-    /// Worker processes, or `auto` for the CPU count.
+    /// Worker processes, or `auto` for the container's CPU limit, else the
+    /// CPU count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub processes: Option<Count>,
     /// Threads per WSGI worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 4))]
     pub threads: Option<u32>,
-    /// An ASGI worker's sync pool.
+    /// Threads for synchronous code called from an ASGI application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 8))]
     pub sync_threads: Option<u32>,
     /// Requests an ASGI worker's event loop takes at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1000))]
     pub concurrency: Option<u32>,
-    /// auto, true or false.
+    /// Whether the application is imported before the workers are forked:
+    /// `auto`, `true` or `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub preload: Option<String>,
     /// The module providing the lifecycle hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<String>,
-    /// Timeouts as NAME=DURATION.
+    /// Timeouts as NAME=DURATION, as `--timeout` takes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Vec<String>>,
     /// The largest request body accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10MB"))]
     pub max_body_size: Option<String>,
     /// Requests a worker serves before it is replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4278,52 +4455,69 @@ pub struct ServeSettings {
     pub memory: Option<Vec<String>>,
     /// Connections open at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 65536))]
     pub max_connections: Option<u64>,
     /// Connections one client may have open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 256))]
     pub max_connections_per_client: Option<u64>,
     /// Requests one connection may carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0))]
     pub max_requests_per_connection: Option<u64>,
     /// Directories of files as PREFIX=DIR.
     #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
     pub static_dirs: Option<Vec<String>>,
     /// Whether responses are compressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub compression: Option<bool>,
-    /// on, errors or off.
+    /// The access log: `on` (the default), `errors` or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "on"))]
     pub access_log: Option<String>,
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_log_exclude: Option<Vec<String>>,
     /// How slow a request is to count as an error for `access_log = "errors"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1s"))]
     pub slow: Option<String>,
-    /// text or json.
+    /// The lines on standard output: `text` (the default), or `json` for a
+    /// log collector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "text"))]
     pub log_format: Option<String>,
     /// Whether every line carries the full UTC time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
-    /// The interpreter.
+    /// The interpreter: a path, or a request in uv's syntax. When absent,
+    /// `/app/.venv` if there is no `VIRTUAL_ENV` and no project `.venv`,
+    /// else the interpreter `muructl run` would find.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "found at start"))]
     pub python: Option<String>,
     /// Where everything written at run time goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "/run/muru"))]
     pub run_dir: Option<String>,
     /// Where the image holds the runtime library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "/opt/muru"))]
     pub runtime_dir: Option<String>,
     /// How long the listener keeps accepting after SIGTERM, readiness
     /// failing, with every connection closing after its response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "0s"))]
     pub shutdown_delay: Option<String>,
     /// How long the whole stop may take, the delay included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "8s"))]
     pub shutdown_budget: Option<String>,
     /// The most request bodies spooled to disk at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1GB"))]
     pub spool_quota: Option<String>,
     /// The proxies whose forwarding headers are applied: addresses, CIDR
     /// ranges, or loopback, private and unix.
@@ -4332,7 +4526,7 @@ pub struct ServeSettings {
 }
 
 /// A count given as a number or as a word such as `auto`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Count {
     /// A number.
@@ -4361,7 +4555,7 @@ pub fn load_serve_file(path: &Path) -> Result<ServeSettings, String> {
 /// The `[tool.muru]` table: defaults an application ships with (section
 /// 6.8). Every field is optional; what a command line or a release
 /// definition sets takes precedence.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolMuru {
     /// The application as module:callable.
@@ -4369,9 +4563,11 @@ pub struct ToolMuru {
     pub entrypoint: Option<String>,
     /// The interface the entrypoint speaks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub interface: Option<Interface>,
     /// Serve gRPC server reflection for the registered services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub reflection: Option<bool>,
     /// The interface the entrypoint's requests may be handed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4382,29 +4578,37 @@ pub struct ToolMuru {
     pub grpc_web_origins: Vec<String>,
     /// Whether the entrypoint is a factory returning the application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub factory: Option<bool>,
     /// When a factory is called.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "worker"))]
     pub factory_phase: Option<FactoryPhase>,
-    /// Worker processes.
+    /// The default group's worker processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`1`; under `muructl serve`, the container's CPU limit, else the CPU count"))]
     pub processes: Option<usize>,
     /// Application threads per worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 4))]
     pub threads: Option<usize>,
     /// Threads for synchronous code called from an ASGI application
     /// (section 6.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 8))]
     pub sync_threads: Option<usize>,
     /// Requests an ASGI worker's event loop takes at once (section 6.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1000))]
     pub concurrency: Option<usize>,
     /// How the default group is scaled (sections 7.2 and 7.4); static
     /// when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<Scaling>,
-    /// The preload mode.
+    /// Whether the application is imported once, in the host, before the
+    /// workers are forked from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "auto"))]
     pub preload: Option<Preload>,
     /// The module providing the lifecycle hooks (section 6.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4412,6 +4616,7 @@ pub struct ToolMuru {
     /// The interpreter: a path, or a request in uv's syntax such as
     /// "3.13", "3.14t" or ">=3.12" (section 8.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "found at start"))]
     pub python: Option<String>,
     /// Worker groups by name (section 7.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -4424,7 +4629,7 @@ pub struct ToolMuru {
     /// directory under `muructl run`.
     #[serde(rename = "static", default, skip_serializing_if = "Vec::is_empty")]
     pub static_dirs: Vec<StaticDir>,
-    /// Logging defaults (section 11.4).
+    /// How Python logging is set up in the workers (section 11.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging: Option<Logging>,
     /// Requests a worker serves before it is replaced (section 7.7).
@@ -4443,14 +4648,16 @@ pub struct ToolMuru {
     /// a secret reference resolved when the release starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
-    /// Treat an `X-Accel-Redirect` response header as an internal
-    /// redirect (section 4.10), for the default mount and any mount that
-    /// does not say otherwise (default false).
+    /// Treat an `X-Accel-Redirect` response header as an internal redirect
+    /// (section 4.10), for the default mount and any mount that does not say
+    /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub accel_redirect: Option<bool>,
-    /// Treat a 200 response with a `Location` starting with `/` and no
-    /// body as an internal redirect, the CGI convention (default false).
+    /// Treat a 200 response with a `Location` starting with `/` and no body
+    /// as an internal redirect, the CGI convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub cgi_local_redirect: Option<bool>,
     /// Directories a path in an `X-Muru-Sendfile` response header must
     /// lie in for the edge to serve the file (section 4.9), for the
@@ -4485,6 +4692,7 @@ pub struct ToolMuru {
     pub build: Option<Build>,
     /// Where compiled bytecode goes under the daemon (section 8.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "redirect"))]
     pub bytecode: Option<Bytecode>,
     /// Commands the application declares (section 9.12), by name: run
     /// with the release on request, with inputs.
@@ -4495,7 +4703,7 @@ pub struct ToolMuru {
 /// A command an application declares, the `[tool.muru.commands.NAME]` or
 /// `[app.NAME.release.ID.commands.NAME]` table (section 9.12): a program
 /// to run, or a Python callable to call, with the release.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTable {
     /// What the command does, for `muructl command list`.
@@ -4521,21 +4729,23 @@ pub struct CommandTable {
     /// limit when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
-    /// Run one at a time for the application: a run asked for while one
-    /// is under way is refused (default false).
+    /// Run one at a time for the application: a run asked for while one is
+    /// under way is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub exclusive: Option<bool>,
 }
 
 /// An input a command takes (section 9.12).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandInput {
     /// What the value is, for `muructl command list` and prompts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// The command refuses to run without it (default false).
+    /// The command refuses to run without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub required: Option<bool>,
     /// The value when none is given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4543,9 +4753,10 @@ pub struct CommandInput {
     /// A regular expression the whole value must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
-    /// The value is never shown, logged or put in an event, and may only
-    /// be used in `env` (default false).
+    /// The value is never shown, logged or put in an event, and may only be
+    /// used in `env`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
     pub secret: Option<bool>,
 }
 

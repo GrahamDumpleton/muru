@@ -1272,7 +1272,9 @@ version = "0.1.0-alpha.15"
 dependencies = [
  "jiff",
  "regex",
+ "schemars",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
 ]
