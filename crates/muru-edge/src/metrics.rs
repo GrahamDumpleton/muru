@@ -820,8 +820,11 @@ pub static UTILISATION: Utilisation = Utilisation {
 
 /// The recent busy and total slots of each group.
 pub struct Utilisation {
-    windows: Mutex<BTreeMap<(String, String, String), Vec<(usize, usize)>>>,
+    windows: Mutex<BTreeMap<GroupKey, Vec<(usize, usize)>>>,
 }
+
+/// A group by its application, release and name.
+type GroupKey = (String, String, String);
 
 impl Utilisation {
     /// Take one second's sample of every group the routing has, and
