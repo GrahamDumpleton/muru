@@ -25,6 +25,13 @@ repos:
         language: system
         types_or: [python, rust]
 
+      - id: user-docs
+        stages: [pre-commit]
+        name: user pages describe what Muru does, not what is to come
+        entry: uv run python scripts/check-user-docs.py
+        language: system
+        files: ^docs/.*\.md$
+
       - id: commit-message
         name: commit message has no agent attribution
         entry: sh scripts/check-commit-message.sh

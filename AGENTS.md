@@ -49,6 +49,15 @@ and are repeated here so that an agent needs nothing else to start work.
   every release. Text about a particular release, such as the roadmap's
   release column, names it.
 
+- The user documentation (the home page, tutorials, how-to guides,
+  reference and explanation) describes what Muru does and how to use it,
+  as a user guide would. It carries no status notes and no promises of
+  what is still to come: that lives in the roadmap and in GitHub issues.
+  A limit a user would hit is stated as it is ("response trailers are not
+  sent"), where it applies. User pages do not send readers to the design
+  specification for what they need to use Muru. `scripts/check-user-docs.py`
+  rejects status notes and future-tense phrases in those pages.
+
 ## Python code (the muru package, tests, fixtures, scripts)
 
 - Always use type hints: on all function and method parameters and return
