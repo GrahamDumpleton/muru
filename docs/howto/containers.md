@@ -57,7 +57,7 @@ the build for the base's C library, glibc or musl, and fetches a Python
 for the tool's environment when the base has none. `muructl` is a single
 executable, so the second stage copies the binary alone, and
 `COPY --from` copies the file the link points to. `uv tool install
-muructl==0.1.0a15` pins a version; the runtime library the build fetches
+muructl==1.0.0` pins a version; the runtime library the build fetches
 is always the one matching `muructl`'s version.
 
 `/run/muru` is where `muructl serve` writes at run time, and only root
@@ -197,7 +197,7 @@ runtime library stops the start with a message naming it and the build
 step that provides it:
 
 ```
-muru: error: no runtime library for /app/.venv/bin/python (cp313): build the image with muructl build --runtime-dir /opt/muru, or add muru 0.1.0a15 to the environment
+muru: error: no runtime library for /app/.venv/bin/python (cp313): build the image with muructl build --runtime-dir /opt/muru, or add muru 1.0.0 to the environment
 ```
 
 ## Settings
