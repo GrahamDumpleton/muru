@@ -844,7 +844,7 @@ fn print_config(layered: &Layered, mode: &Mode) {
     }
 }
 
-/// Make the run directory, or say which volume it needs (section 13.9).
+/// Make the run directory, or say what it needs (section 13.9).
 pub fn make_run_dir(dir: &Path) -> anyhow::Result<()> {
     let writable = std::fs::create_dir_all(dir).and_then(|()| {
         let probe = dir.join(format!(".muru-{}", std::process::id()));
@@ -853,16 +853,37 @@ pub fn make_run_dir(dir: &Path) -> anyhow::Result<()> {
     });
 
     writable.map_err(|error| {
-        anyhow::anyhow!(
-            "the run directory {} cannot be written ({error}); with a read-only root \
-             filesystem give it a writable volume, a tmpfs or an emptyDir mounted at {}, or \
-             name another with --run-dir",
-            dir.display(),
-            dir.display()
-        )
+        // SAFETY: getuid has no preconditions and cannot fail.
+
+        let uid = unsafe { libc::getuid() };
+        anyhow::anyhow!(run_dir_error(dir, &error, uid))
     })?;
     group_writable(dir);
     Ok(())
+}
+
+/// What the run directory needs, from why it could not be written: a
+/// volume on a read-only root filesystem, or, for a user who may not
+/// create it, the image line that makes it for them.
+fn run_dir_error(dir: &Path, error: &std::io::Error, uid: u32) -> String {
+    let dir = dir.display();
+
+    match error.kind() {
+        std::io::ErrorKind::ReadOnlyFilesystem => format!(
+            "the run directory {dir} cannot be written ({error}); with a read-only root \
+             filesystem give it a writable volume, a tmpfs or an emptyDir mounted at {dir}, or \
+             name another with --run-dir"
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "the run directory {dir} cannot be written by user {uid} ({error}); make it in the \
+             image for that user, with RUN install -d -o {uid} -g 0 -m 0770 {dir}, mount a \
+             writable volume at {dir}, or name another with --run-dir"
+        ),
+        _ => format!(
+            "the run directory {dir} cannot be written ({error}); mount a writable volume at \
+             {dir}, or name another with --run-dir"
+        ),
+    }
 }
 
 /// Make a directory serve creates writable by its group, which a
@@ -1124,5 +1145,25 @@ mod tests {
         let args = parse(&["app:application", "--admin-listen", "off"]);
         let (_, mode, _) = prepare(&args, None, |_| None).expect("prepares");
         assert_eq!(mode.admin_listen, None);
+    }
+
+    #[test]
+    fn the_run_directory_error_says_what_fixes_it() {
+        let dir = Path::new("/run/muru");
+
+        // A user who may not create it is given the image line, with
+        // its own user ID.
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = run_dir_error(dir, &denied, 10001);
+        assert!(message.starts_with("the run directory /run/muru cannot be written by user 10001"));
+        assert!(message.contains("RUN install -d -o 10001 -g 0 -m 0770 /run/muru"));
+
+        // A read-only root filesystem needs a volume instead.
+
+        let read_only = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        let message = run_dir_error(dir, &read_only, 10001);
+        assert!(message.contains("with a read-only root filesystem give it a writable volume"));
+        assert!(!message.contains("install -d"));
     }
 }
