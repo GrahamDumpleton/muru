@@ -7,8 +7,9 @@
 Compose, Podman or Kubernetes: configured from the image and the
 environment, with probes and metrics on an admin port, logs on standard
 output and a drain on `docker stop` or a Kubernetes rolling update.
-Workers are sized from the container's CPU and memory limits. Guides for
-Compose and a Kubernetes Deployment are still to come.
+Workers are sized from the container's CPU and memory limits. A
+[Compose](#compose) service and [a Kubernetes Deployment](kubernetes.md)
+are shown.
 ```
 
 `muructl serve` runs one application as the container's main process: the
@@ -45,7 +46,7 @@ COPY --from=build /opt/muru /opt/muru
 COPY --from=build /usr/local/bin/muructl /usr/local/bin/muructl
 WORKDIR /app
 RUN useradd --uid 10001 app
-USER app
+USER 10001
 EXPOSE 8080 9090
 CMD ["muructl", "serve"]
 ```
@@ -332,10 +333,12 @@ running application work through `docker exec` or `kubectl exec`:
 docker exec shop muructl status
 docker exec shop muructl logs --access --follow
 docker exec shop muructl debug stacks
-docker exec shop muructl restart
+docker exec shop muructl restart --all
 ```
 
-Only someone who may exec into the container can use them. Commands that
+The commands that name an application or a release take the one being
+served when given none. Only someone who may exec into the container can
+use them. Commands that
 manage releases, hosts or the daemon say they need the daemon.
 
 ## Stopping
@@ -378,3 +381,33 @@ No `preStop` hook is needed. The budget is 8 seconds by default, under the
 requests raises both the budget and the platform's grace period, with
 `stop_grace_period` in Compose or `terminationGracePeriodSeconds` in
 Kubernetes.
+
+## Compose
+
+A Compose service built from the image above:
+
+```yaml
+services:
+  shop:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      MURU_SERVE_PROCESSES: "4"
+    read_only: true
+    tmpfs: [/run/muru, /tmp]
+    healthcheck:
+      test: ["CMD", "muructl", "probe", "ready"]
+      interval: 5s
+    stop_grace_period: 10s
+```
+
+The root filesystem is read-only, with the run directory and `/tmp` as
+memory-backed mounts. The health check asks `muructl probe ready` inside
+the container, so `docker compose ps` shows the service healthy once its
+workers are ready. `docker compose exec shop muructl status` and the
+other commands of [inside the container](#inside-the-container) work as
+they do under `docker exec`. The admin port is not published here; publish
+9090 as well for a Prometheus outside the Compose network.
+
+For a Kubernetes Deployment, see [a Kubernetes
+Deployment](kubernetes.md).
