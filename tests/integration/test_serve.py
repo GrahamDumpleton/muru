@@ -163,6 +163,40 @@ def test_serves_with_probes_and_metrics_on_the_admin_port(tmp_path: Path) -> Non
         assert serve.stop() == 0
 
 
+def test_sigterm_fails_readiness_and_keeps_accepting_for_the_delay(tmp_path: Path) -> None:
+    serve = start(tmp_path, "--shutdown-delay", "2s", "--shutdown-budget", "6s")
+
+    try:
+        assert serve.admin("/readyz") == (200, "ok\n")
+        signalled = time.monotonic()
+        serve.process.send_signal(signal.SIGTERM)
+
+        # Readiness fails at once, while the listener still serves, with
+        # every connection closing after its response.
+
+        deadline = time.monotonic() + 1
+
+        while serve.admin("/readyz")[0] == 200:
+            assert time.monotonic() < deadline, "readiness still passing after SIGTERM"
+            time.sleep(0.05)
+
+        connection = http.client.HTTPConnection("127.0.0.1", serve.port, timeout=10)
+
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            response.read()
+            assert response.status == 200
+            assert response.getheader("Connection") == "close"
+        finally:
+            connection.close()
+
+        assert serve.process.wait(timeout=10) == 0
+        assert 2 <= time.monotonic() - signalled < 6
+    finally:
+        serve.stop()
+
+
 def test_everything_goes_to_standard_output_without_times(tmp_path: Path) -> None:
     import re
 

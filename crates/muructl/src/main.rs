@@ -3320,13 +3320,21 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // Ctrl-C and SIGTERM both stop the run in order: the host is told to
     // stop and its workers finish what they are serving.
 
+    let mut signalled = false;
+
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
             }
-            _ = interrupt.recv() => break Ok(()),
-            _ = terminate.recv() => break Ok(()),
+            _ = interrupt.recv() => {
+                signalled = true;
+                break Ok(());
+            }
+            _ = terminate.recv() => {
+                signalled = true;
+                break Ok(());
+            }
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
@@ -3521,7 +3529,36 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // under the grace docker stop gives, the host getting what the drain
     // leaves of it.
 
-    if muru_controller::shutdown::is_main_process() {
+    if let Some(mode) = &serve {
+        // Section 13.9: serve's stop runs its shutdown policy. After a
+        // stop signal the listener keeps accepting for the delay, with
+        // every connection closing after its response, while the
+        // platform takes the pod out of its endpoints; a second signal
+        // ends the delay. Then the drain and the host, inside the budget.
+
+        let policy = &mode.shutdown;
+        let deadline = Instant::now() + policy.budget;
+
+        if signalled && !policy.delay.is_zero() {
+            drainer.announce();
+
+            tokio::select! {
+                () = tokio::time::sleep(policy.delay) => {}
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+
+        let for_drain = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(muru_controller::shutdown::WORKERS_RESERVE);
+        drainer.drain(stop_budget.min(for_drain)).await;
+        current
+            .stop_until(
+                deadline.min(Instant::now() + stop_budget + muru_controller::host::STOP_MARGIN),
+            )
+            .await;
+    } else if muru_controller::shutdown::is_main_process() {
         let deadline = Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET;
         let for_drain = deadline
             .saturating_duration_since(Instant::now())

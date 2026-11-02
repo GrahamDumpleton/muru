@@ -194,6 +194,17 @@ pub struct ServeArgs {
     #[arg(long = "trusted-proxy", value_name = "ADDRESS")]
     trusted_proxy: Vec<String>,
 
+    /// How long the listener keeps accepting after SIGTERM, with
+    /// readiness failing and every connection closing after its response
+    /// (default 0s; 5s behind a Kubernetes Service).
+    #[arg(long, value_name = "DURATION")]
+    shutdown_delay: Option<String>,
+
+    /// How long the whole stop may take, the delay included; what has
+    /// not finished is killed (default 8s).
+    #[arg(long, value_name = "DURATION")]
+    shutdown_budget: Option<String>,
+
     /// Print the settings that would be used, each with where it came
     /// from, and exit.
     #[arg(long)]
@@ -246,6 +257,8 @@ const KEYS: &[(&str, Kind)] = &[
     ("runtime_dir", Kind::Text),
     ("spool_quota", Kind::Text),
     ("trusted_proxy", Kind::List),
+    ("shutdown_delay", Kind::Text),
+    ("shutdown_budget", Kind::Text),
 ];
 
 /// A setting's value.
@@ -338,6 +351,8 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("run_dir", &args.run_dir);
     text("runtime_dir", &args.runtime_dir);
     text("spool_quota", &args.spool_quota);
+    text("shutdown_delay", &args.shutdown_delay);
+    text("shutdown_budget", &args.shutdown_budget);
 
     for (key, items) in [
         ("timeout", &args.timeout),
@@ -470,6 +485,8 @@ pub struct Mode {
     pub default_processes: usize,
     /// Whose forwarding headers the edge applies.
     pub trust: muru_edge::proxy::Trust,
+    /// The delay and budget of the stop SIGTERM starts.
+    pub shutdown: muru_controller::shutdown::Policy,
 }
 
 /// A clap parser for `muructl run`'s arguments alone, which `serve` fills
@@ -615,6 +632,19 @@ fn prepare(
         }
     };
 
+    // Section 13.3: the daemon's [shutdown] table, checked the same way,
+    // always shutting down since serve is the container's main process.
+
+    let shutdown = muru_controller::shutdown::Policy::from_table(
+        Some(&muru_config::Shutdown {
+            on_sigterm: Some("shutdown".to_owned()),
+            delay: layered.text("shutdown_delay").map(str::to_owned),
+            budget: layered.text("shutdown_budget").map(str::to_owned),
+        }),
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("shutdown_{error}"))?;
+
     let mode = Mode {
         admin_listen,
         admin_status: layered.flag("admin_status"),
@@ -625,6 +655,7 @@ fn prepare(
         spool_quota,
         default_processes,
         trust,
+        shutdown,
     };
 
     // muructl run's arguments: production behaviours on, nothing built,
@@ -745,14 +776,15 @@ fn print_config(layered: &Layered, mode: &Mode) {
 
     println!(
         "# admin port {}, run directory {}, runtime library {}, {} lines, spool quota {} bytes, \
-         {} processes unless set",
+         {} processes unless set, {}",
         mode.admin_listen
             .map_or_else(|| "off".to_owned(), |address| address.to_string()),
         mode.run_dir.display(),
         mode.runtime_dir.display(),
         if mode.json { "json" } else { "text" },
         mode.spool_quota,
-        mode.default_processes
+        mode.default_processes,
+        mode.shutdown.describe()
     );
 }
 
@@ -901,6 +933,8 @@ pub fn probe(args: ProbeArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn parse(argv: &[&str]) -> ServeArgs {
@@ -976,6 +1010,28 @@ mod tests {
             panic!("a bad --trusted-proxy was accepted");
         };
         assert!(error.to_string().contains("--trusted-proxy"), "{error}");
+    }
+
+    #[test]
+    fn the_shutdown_delay_fits_inside_its_budget() {
+        let args = parse(&["app:application"]);
+        let (_, mode, _) = prepare(&args, |_| None).expect("prepares");
+        assert_eq!(mode.shutdown.delay, Duration::ZERO);
+        assert_eq!(mode.shutdown.budget, Duration::from_secs(8));
+
+        let args = parse(&["app:application", "--shutdown-delay", "5s"]);
+        let (_, mode, _) = prepare(&args, |name| {
+            (name == "MURU_SERVE_SHUTDOWN_BUDGET").then(|| "25s".to_owned())
+        })
+        .expect("prepares");
+        assert_eq!(mode.shutdown.delay, Duration::from_secs(5));
+        assert_eq!(mode.shutdown.budget, Duration::from_secs(25));
+
+        let args = parse(&["app:application", "--shutdown-delay", "10s"]);
+        let Err(error) = prepare(&args, |_| None) else {
+            panic!("a delay longer than the budget was accepted");
+        };
+        assert!(error.to_string().contains("shutdown_delay"), "{error}");
     }
 
     #[test]

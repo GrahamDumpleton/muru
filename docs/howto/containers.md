@@ -6,10 +6,9 @@
 `muructl serve` runs one application in one container under Docker,
 Compose, Podman or Kubernetes: configured from the image and the
 environment, with probes and metrics on an admin port, logs on standard
-output and a drain on `docker stop`. Sizing the worker count from the
-container's limits, the pause a Kubernetes rolling update needs before
-a pod stops, and guides for Compose and a Kubernetes Deployment are
-still to come.
+output and a drain on `docker stop` or a Kubernetes rolling update.
+Sizing the worker count from the container's limits, and guides for
+Compose and a Kubernetes Deployment, are still to come.
 ```
 
 `muructl serve` runs one application as the container's main process: the
@@ -155,6 +154,8 @@ with where it came from, and exits.
 | `--run-dir DIR` | `/run/muru` | where everything written at run time goes (also `MURU_RUN_DIR`) |
 | `--runtime-dir DIR` | `/opt/muru` | where the image holds the runtime library |
 | `--spool-quota SIZE` | 1GB | the most request bodies spooled to disk at once |
+| `--shutdown-delay DURATION` | `0s` | how long the listener keeps accepting after SIGTERM; see [stopping](#stopping) |
+| `--shutdown-budget DURATION` | `8s` | how long the whole stop may take, the delay included |
 | `--trusted-proxy ADDRESS` | `loopback` | a proxy whose forwarding headers are applied: an address, a CIDR range, or `loopback`, `private` or `unix`, repeatable; see [behind a proxy](behind-a-proxy.md) |
 
 `--interface`, `--factory`, `--sync-threads`, `--concurrency`,
@@ -267,11 +268,40 @@ manage releases, hosts or the daemon say they need the daemon.
 ## Stopping
 
 muructl is the container's process 1 and runs as an init of its own, as
-`tini` would, so nothing in the container is left a zombie. SIGTERM,
-which `docker stop` and Kubernetes send, drains: `/readyz` starts failing,
-the listener closes, requests in flight finish, and the container exits
-0. A drain that runs past the platform's grace period (10 seconds for
-`docker stop`, 30 for Kubernetes) is cut short by SIGKILL, so give an
-application with long requests a longer one, with `stop_grace_period` in
-Compose or `terminationGracePeriodSeconds` in Kubernetes. An image that
+`tini` would, so nothing in the container is left a zombie. An image that
 brings `tini` or runs under `docker run --init` sets `MURU_NO_INIT=1`.
+
+SIGTERM, which `docker stop` and Kubernetes send, stops the container in
+order:
+
+1. `/readyz` starts failing at once.
+2. For `--shutdown-delay`, the listener keeps accepting and serving, with
+   every connection closing after its response (`Connection: close`,
+   GOAWAY on HTTP/2) and at once when idle, so clients reconnect to
+   another replica.
+3. The listener closes and the requests in flight finish.
+4. The workers stop, closing their WebSockets with 1001, and the
+   container exits 0.
+
+All of it fits inside `--shutdown-budget`; whatever has not finished by
+then is killed. A second SIGTERM, or a second Ctrl-C, ends the delay
+early.
+
+The delay is 0 by default, which suits Docker and Compose, where a
+stopping container stops receiving connections at once. Under Kubernetes
+a pod goes on receiving connections for a few seconds after SIGTERM,
+while the Service's endpoints and the ingress catch up, so a Deployment
+sets a delay, and a budget under its `terminationGracePeriodSeconds` (30
+seconds unless set):
+
+```yaml
+env:
+  - {name: MURU_SERVE_SHUTDOWN_DELAY, value: "5s"}
+  - {name: MURU_SERVE_SHUTDOWN_BUDGET, value: "25s"}
+```
+
+No `preStop` hook is needed. The budget is 8 seconds by default, under the
+10 that `docker stop` gives before SIGKILL; an application with long
+requests raises both the budget and the platform's grace period, with
+`stop_grace_period` in Compose or `terminationGracePeriodSeconds` in
+Kubernetes.

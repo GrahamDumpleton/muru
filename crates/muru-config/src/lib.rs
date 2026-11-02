@@ -4312,6 +4312,16 @@ pub struct ServeSettings {
     /// Where everything written at run time goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_dir: Option<String>,
+    /// Where the image holds the runtime library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_dir: Option<String>,
+    /// How long the listener keeps accepting after SIGTERM, readiness
+    /// failing, with every connection closing after its response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_delay: Option<String>,
+    /// How long the whole stop may take, the delay included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_budget: Option<String>,
     /// The most request bodies spooled to disk at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spool_quota: Option<String>,
