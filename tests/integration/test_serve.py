@@ -338,6 +338,25 @@ def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
         )
         assert status.returncode == 0, status.stdout + status.stderr
         assert "plain-wsgi" in status.stdout, status.stdout
+
+        # The commands that take an application name the one served when
+        # given none.
+
+        for command, expected in [
+            (["debug", "stacks"], "MainThread"),
+            (["logging", "level", "demo=DEBUG", "--for", "1m"], "demo"),
+            (["restart", "--worker", "0"], "worker 0"),
+        ]:
+            completed = subprocess.run(
+                [str(muructl), *command],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+            )
+            output = completed.stdout + completed.stderr
+            assert completed.returncode == 0, output
+            assert expected in output, output
     finally:
         assert serve.stop() == 0
 
