@@ -52,44 +52,44 @@ robust enough for production on Docker, Compose, Podman and Kubernetes.
    persistent, a health check that needs no curl, and a clean drain on
    `docker stop`. Switching an existing Dockerfile to Muru is a one-line
    change.
-   Issues: [#102](https://github.com/GrahamDumpleton/muru/issues/102),
-   [#103](https://github.com/GrahamDumpleton/muru/issues/103),
-   [#106](https://github.com/GrahamDumpleton/muru/issues/106),
-   [#110](https://github.com/GrahamDumpleton/muru/issues/110).
+   Issues: [#102](https://github.com/muruhq/muru/issues/102),
+   [#103](https://github.com/muruhq/muru/issues/103),
+   [#106](https://github.com/muruhq/muru/issues/106),
+   [#110](https://github.com/muruhq/muru/issues/110).
 
 2. **Ready for Kubernetes.** Liveness, readiness and startup probes on an
    admin port, a shutdown sequence that loses no requests during a
    rollout, worker counts and memory budgets sized from the pod's
    limits, logs that container log collectors keep whole, metrics for
    autoscaling, and a guide to a Deployment.
-   Issues: [#104](https://github.com/GrahamDumpleton/muru/issues/104),
-   [#105](https://github.com/GrahamDumpleton/muru/issues/105),
-   [#107](https://github.com/GrahamDumpleton/muru/issues/107),
-   [#108](https://github.com/GrahamDumpleton/muru/issues/108),
-   [#119](https://github.com/GrahamDumpleton/muru/issues/119).
+   Issues: [#104](https://github.com/muruhq/muru/issues/104),
+   [#105](https://github.com/muruhq/muru/issues/105),
+   [#107](https://github.com/muruhq/muru/issues/107),
+   [#108](https://github.com/muruhq/muru/issues/108),
+   [#119](https://github.com/muruhq/muru/issues/119).
 
 3. **Your own image.** Muru's pieces published as one bundle that a
    Dockerfile adds with a single line, or that is injected at deployment
    time (an init container, an image mount or a shared volume), so an
    existing image runs under `muructl serve` unchanged, whatever its
-   base. Issues: [#113](https://github.com/GrahamDumpleton/muru/issues/113),
-   [#142](https://github.com/GrahamDumpleton/muru/issues/142).
+   base. Issues: [#113](https://github.com/muruhq/muru/issues/113),
+   [#142](https://github.com/muruhq/muru/issues/142).
 
 4. **Image tooling.** `muructl check` recording what an image provides,
    a generated Dockerfile, the image contract and `muructl image check`,
    static files prepared at build time, official base images and
    `muructl image build`.
-   Issues: [#238](https://github.com/GrahamDumpleton/muru/issues/238),
-   [#115](https://github.com/GrahamDumpleton/muru/issues/115),
-   [#130](https://github.com/GrahamDumpleton/muru/issues/130),
-   [#116](https://github.com/GrahamDumpleton/muru/issues/116),
-   [#129](https://github.com/GrahamDumpleton/muru/issues/129),
-   [#131](https://github.com/GrahamDumpleton/muru/issues/131).
+   Issues: [#238](https://github.com/muruhq/muru/issues/238),
+   [#115](https://github.com/muruhq/muru/issues/115),
+   [#130](https://github.com/muruhq/muru/issues/130),
+   [#116](https://github.com/muruhq/muru/issues/116),
+   [#129](https://github.com/muruhq/muru/issues/129),
+   [#131](https://github.com/muruhq/muru/issues/131).
 
 5. **Container releases on a node.** The daemon runs a release's host
    and workers in a container from an image, while the daemon and edge
    stay on the node and keep their traffic management.
-   Issue: [#128](https://github.com/GrahamDumpleton/muru/issues/128).
+   Issue: [#128](https://github.com/muruhq/muru/issues/128).
 
 Later additions to the goal: live reload of mounted configuration and
 certificates, debugging in a locked-down pod, `muructl exec` for
@@ -115,25 +115,25 @@ What a 1.0 release needs, beside the features it includes:
 
 Which of the container steps and smaller features 1.0 includes is
 decided along the way; 1.0 follows a production readiness review.
-Issues: [#90](https://github.com/GrahamDumpleton/muru/issues/90),
-[#139](https://github.com/GrahamDumpleton/muru/issues/139),
-[#140](https://github.com/GrahamDumpleton/muru/issues/140),
-[#141](https://github.com/GrahamDumpleton/muru/issues/141),
-[#143](https://github.com/GrahamDumpleton/muru/issues/143),
-[#144](https://github.com/GrahamDumpleton/muru/issues/144),
-[#161](https://github.com/GrahamDumpleton/muru/issues/161),
-[#162](https://github.com/GrahamDumpleton/muru/issues/162),
-[#163](https://github.com/GrahamDumpleton/muru/issues/163).
+Issues: [#90](https://github.com/muruhq/muru/issues/90),
+[#139](https://github.com/muruhq/muru/issues/139),
+[#140](https://github.com/muruhq/muru/issues/140),
+[#141](https://github.com/muruhq/muru/issues/141),
+[#143](https://github.com/muruhq/muru/issues/143),
+[#144](https://github.com/muruhq/muru/issues/144),
+[#161](https://github.com/muruhq/muru/issues/161),
+[#162](https://github.com/muruhq/muru/issues/162),
+[#163](https://github.com/muruhq/muru/issues/163).
 
 ### Beyond one node
 
 After 1.0: the same admin API managing several nodes, with per-node
 daemons, a central controller, edges across nodes, and TCP with mTLS
 between components.
-Issues: [#146](https://github.com/GrahamDumpleton/muru/issues/146),
-[#147](https://github.com/GrahamDumpleton/muru/issues/147),
-[#148](https://github.com/GrahamDumpleton/muru/issues/148),
-[#149](https://github.com/GrahamDumpleton/muru/issues/149).
+Issues: [#146](https://github.com/muruhq/muru/issues/146),
+[#147](https://github.com/muruhq/muru/issues/147),
+[#148](https://github.com/muruhq/muru/issues/148),
+[#149](https://github.com/muruhq/muru/issues/149).
 
 ## Smaller features
 
@@ -142,67 +142,67 @@ taken up between the steps of the major goals, in no fixed order.
 
 - **Traffic and configuration:** overlays triggered by conditions over
   Muru's own signals
-  ([#123](https://github.com/GrahamDumpleton/muru/issues/123)),
+  ([#123](https://github.com/muruhq/muru/issues/123)),
   configuration changes exported to a backup directory
-  ([#94](https://github.com/GrahamDumpleton/muru/issues/94)), per-group
+  ([#94](https://github.com/muruhq/muru/issues/94)), per-group
   recycling limits and `max_surge`
-  ([#150](https://github.com/GrahamDumpleton/muru/issues/150),
-  [#151](https://github.com/GrahamDumpleton/muru/issues/151)).
+  ([#150](https://github.com/muruhq/muru/issues/150),
+  [#151](https://github.com/muruhq/muru/issues/151)).
 
 - **Edge and HTTP:** ACME certificates
-  ([#133](https://github.com/GrahamDumpleton/muru/issues/133)), HTTP/3
-  ([#134](https://github.com/GrahamDumpleton/muru/issues/134)), several
+  ([#133](https://github.com/muruhq/muru/issues/133)), HTTP/3
+  ([#134](https://github.com/muruhq/muru/issues/134)), several
   edge processes and edge pools
-  ([#132](https://github.com/GrahamDumpleton/muru/issues/132)),
+  ([#132](https://github.com/muruhq/muru/issues/132)),
   connection handling under pressure and per listener
-  ([#154](https://github.com/GrahamDumpleton/muru/issues/154),
-  [#155](https://github.com/GrahamDumpleton/muru/issues/155),
-  [#156](https://github.com/GrahamDumpleton/muru/issues/156)),
+  ([#154](https://github.com/muruhq/muru/issues/154),
+  [#155](https://github.com/muruhq/muru/issues/155),
+  [#156](https://github.com/muruhq/muru/issues/156)),
   compression per host and route and request decompression
-  ([#152](https://github.com/GrahamDumpleton/muru/issues/152),
-  [#153](https://github.com/GrahamDumpleton/muru/issues/153)), wildcard
+  ([#152](https://github.com/muruhq/muru/issues/152),
+  [#153](https://github.com/muruhq/muru/issues/153)), wildcard
   and regular expression host names and host-level settings
-  ([#170](https://github.com/GrahamDumpleton/muru/issues/170),
-  [#171](https://github.com/GrahamDumpleton/muru/issues/171)), static
+  ([#170](https://github.com/muruhq/muru/issues/170),
+  [#171](https://github.com/muruhq/muru/issues/171)), static
   file listings and a metadata cache
-  ([#172](https://github.com/GrahamDumpleton/muru/issues/172),
-  [#174](https://github.com/GrahamDumpleton/muru/issues/174)), Unix
+  ([#172](https://github.com/muruhq/muru/issues/172),
+  [#174](https://github.com/muruhq/muru/issues/174)), Unix
   socket listeners
-  ([#157](https://github.com/GrahamDumpleton/muru/issues/157)).
+  ([#157](https://github.com/muruhq/muru/issues/157)).
 
 - **Logging, events and OpenTelemetry:** timestamps on every log line
-  ([#93](https://github.com/GrahamDumpleton/muru/issues/93)), the request
+  ([#93](https://github.com/muruhq/muru/issues/93)), the request
   id on Python log records and daemon-wide logging defaults
-  ([#168](https://github.com/GrahamDumpleton/muru/issues/168),
-  [#169](https://github.com/GrahamDumpleton/muru/issues/169)), log files
+  ([#168](https://github.com/muruhq/muru/issues/168),
+  [#169](https://github.com/muruhq/muru/issues/169)), log files
   reopened on rename and a choice of what happens when output stalls
-  ([#166](https://github.com/GrahamDumpleton/muru/issues/166),
-  [#167](https://github.com/GrahamDumpleton/muru/issues/167)), event sinks
+  ([#166](https://github.com/muruhq/muru/issues/166),
+  [#167](https://github.com/muruhq/muru/issues/167)), event sinks
   to files and through the admin API
-  ([#164](https://github.com/GrahamDumpleton/muru/issues/164),
-  [#165](https://github.com/GrahamDumpleton/muru/issues/165)), OTLP
+  ([#164](https://github.com/muruhq/muru/issues/164),
+  [#165](https://github.com/muruhq/muru/issues/165)), OTLP
   metrics, log records and request tracing
-  ([#136](https://github.com/GrahamDumpleton/muru/issues/136),
-  [#137](https://github.com/GrahamDumpleton/muru/issues/137),
-  [#135](https://github.com/GrahamDumpleton/muru/issues/135)).
+  ([#136](https://github.com/muruhq/muru/issues/136),
+  [#137](https://github.com/muruhq/muru/issues/137),
+  [#135](https://github.com/muruhq/muru/issues/135)).
 
 - **systemd:** journald as the log and event sink
-  ([#159](https://github.com/GrahamDumpleton/muru/issues/159)), socket
+  ([#159](https://github.com/muruhq/muru/issues/159)), socket
   activation for the daemon's listeners
-  ([#160](https://github.com/GrahamDumpleton/muru/issues/160)).
+  ([#160](https://github.com/muruhq/muru/issues/160)).
 
 - **Applications and servers:** handing a request between WSGI and ASGI
-  in code ([#91](https://github.com/GrahamDumpleton/muru/issues/91)), a
+  in code ([#91](https://github.com/muruhq/muru/issues/91)), a
   uWSGI profile for managed servers
-  ([#95](https://github.com/GrahamDumpleton/muru/issues/95)).
+  ([#95](https://github.com/muruhq/muru/issues/95)).
 
 - **Coding agents:** `--json` on every command that reports something
-  ([#254](https://github.com/GrahamDumpleton/muru/issues/254)), an MCP
+  ([#254](https://github.com/muruhq/muru/issues/254)), an MCP
   server in `muructl` so an agent can run the daemon, deploy each change
   as a release, test it and read what Muru observes
-  ([#197](https://github.com/GrahamDumpleton/muru/issues/197)), and a
+  ([#197](https://github.com/muruhq/muru/issues/197)), and a
   skill the project carries that teaches the agent how
-  ([#255](https://github.com/GrahamDumpleton/muru/issues/255)).
+  ([#255](https://github.com/muruhq/muru/issues/255)).
 
 ## Ideas
 
@@ -217,13 +217,13 @@ They are not committed work until taken up.
 ## How work is tracked
 
 Every piece of planned work is a
-[GitHub issue](https://github.com/GrahamDumpleton/muru/issues) in the
+[GitHub issue](https://github.com/muruhq/muru/issues) in the
 repository: bugs, the steps of each major goal, the smaller features and
 the ideas.
 
 - The [project board](https://github.com/users/GrahamDumpleton/projects/1)
   shows every open issue of Muru and of its
-  [workshops](https://github.com/GrahamDumpleton/muru-workshops) with its
+  [workshops](https://github.com/muruhq/muru-workshops) with its
   status (backlog, next, in progress, in review, done), priority, size
   and goal (one of the major goals, a smaller feature, housekeeping or an
   idea), and is the place to see what is being worked on and what comes
@@ -237,7 +237,7 @@ the ideas.
   or a Kubernetes pod, `decision` for an issue where a choice has to be
   made before work starts, and `tracking` for the issue of a goal's step.
 
-- A [milestone](https://github.com/GrahamDumpleton/muru/milestones) for
+- A [milestone](https://github.com/muruhq/muru/milestones) for
   each upcoming release collects the issues planned for it.
 
 - The specification remains the intended design. An issue says what is

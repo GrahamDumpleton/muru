@@ -1,11 +1,11 @@
 # Muru
 
-[![CI](https://github.com/GrahamDumpleton/muru/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/GrahamDumpleton/muru/actions/workflows/ci.yml)
+[![CI](https://github.com/muruhq/muru/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/muruhq/muru/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/readthedocs/muru?label=docs)](https://muru.readthedocs.io/)
 [![PyPI muructl](https://img.shields.io/pypi/v/muructl?label=muructl)](https://pypi.org/project/muructl/)
 [![PyPI muru](https://img.shields.io/pypi/v/muru?label=muru)](https://pypi.org/project/muru/)
 [![Python versions](https://img.shields.io/pypi/pyversions/muru)](https://pypi.org/project/muru/)
-[![Licence](https://img.shields.io/github/license/GrahamDumpleton/muru)](https://github.com/GrahamDumpleton/muru/blob/main/LICENSE)
+[![Licence](https://img.shields.io/github/license/muruhq/muru)](https://github.com/muruhq/muru/blob/main/LICENSE)
 
 Muru is a routing edge, control plane and Python runtime for serving WSGI and
 ASGI applications, with zero-downtime releases, traffic management and

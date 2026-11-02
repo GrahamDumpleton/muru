@@ -36,7 +36,7 @@ specification is maintained.
 | Reload | Off by default. Every reload is a new release |
 | Licence | Apache-2.0 |
 | Order of interfaces | Prove the architecture with WSGI first (phases 0 and 1). ASGI, including lifespan and WebSockets, follows in phase 2 |
-| Repository and registry | github.com/GrahamDumpleton/muru, with container images on ghcr.io/grahamdumpleton |
+| Repository and registry | github.com/muruhq/muru, with container images on ghcr.io/muruhq |
 | Dashboard | Server-rendered askama templates with htmx, Server-Sent Events and uPlot, via the JSON gateway. Built with cargo only. Minimal read-only version in muructl run from phase 1 |
 | Managed HTTP server releases | In scope for migration cutovers in phase 3: fixed instances, server profiles, full traffic management, no Python-specific features (section 9.9) |
 | Free-threading | Supported from phase 1 with the WSGI bridge, with the extension designed for it from the outset (section 6.11) |

@@ -25,10 +25,10 @@ classifiers = [
 uv = ["uv>=0.5"]
 
 [project.urls]
-Homepage = "https://github.com/GrahamDumpleton/muru"
+Homepage = "https://github.com/muruhq/muru"
 Documentation = "https://muru.readthedocs.io/"
-Repository = "https://github.com/GrahamDumpleton/muru"
-Changelog = "https://github.com/GrahamDumpleton/muru/blob/main/CHANGELOG.md"
+Repository = "https://github.com/muruhq/muru"
+Changelog = "https://github.com/muruhq/muru/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "../../crates/muructl/Cargo.toml"

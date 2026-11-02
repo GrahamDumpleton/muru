@@ -233,7 +233,7 @@ with `--fix`; the formatters keep what it inserts.
 - Track pending work as GitHub issues, never in files. Every bug, planned
   piece of work, step of a roadmap goal still to come and future idea has
   an issue in this repository; a change a workshop needs is an issue in
-  GrahamDumpleton/muru-workshops, marked as blocked by the Muru issue it
+  muruhq/muru-workshops, marked as blocked by the Muru issue it
   waits on. When work is found or deferred, open an issue in the same
   step instead of noting it in `scratch/`, a code comment or a document.
   Write it with the headings and label of the matching issue form, or a

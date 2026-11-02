@@ -19,10 +19,10 @@ Two distributions are published to PyPI from one tag, with the same version numb
 | muru wheels (PyPI) | Python sources, stubs and the PyO3 extension | version-specific wheels for each supported CPython (cp311 to cp315, cp314t and cp315t, and newer versions as they are released) for the same platforms. The stable ABI (abi3) is not used: free-threaded builds cannot use it, so version-specific wheels keep one build path for both, and allow the full C API where it helps performance |
 | sdists (PyPI) | Both distributions, buildable with a Rust toolchain | any |
 | Standalone binaries (GitHub Releases) | muructl tarballs per platform, SHA-256 checksums, SBOM (CycloneDX) | Linux and macOS |
-| Base images (GHCR) | ghcr.io/grahamdumpleton/muru-python:VERSION-pyX.Y variants (slim, free-threaded, distroless), signed with cosign keyless signatures | linux/amd64 and linux/arm64 |
+| Base images (GHCR) | ghcr.io/muruhq/muru-python:VERSION-pyX.Y variants (slim, free-threaded, distroless), signed with cosign keyless signatures | linux/amd64 and linux/arm64 |
 | Documentation | Built by Read the Docs for each tag |  |
 
-The source repository is github.com/GrahamDumpleton/muru, and images are published to the GitHub Container Registry under the same account (registry paths are lowercase). The PyPI names muru and muructl are registered, with the 0.1.0 pre-releases. The runtime library has no Python dependencies, which is what allows the daemon to install it by unpacking a wheel (section 8.3).
+The source repository is github.com/muruhq/muru, and images are published to the GitHub Container Registry under the same organisation (registry paths are lowercase). The PyPI names muru and muructl are registered, with the 0.1.0 pre-releases. The runtime library has no Python dependencies, which is what allows the daemon to install it by unpacking a wheel (section 8.3).
 
 ## 17.2 Versioning
 
