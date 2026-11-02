@@ -11,7 +11,8 @@ comments is checked by a unit test in muructl, since clap assembles it.
 Usage: check-user-text.py [FILE...]
 
 With no files, every Rust source under crates/ and every module of the
-runtime library is checked. Exits 1 when any string names one.
+runtime library is checked; named files outside those, and tests, are
+skipped. Exits 1 when any string names one.
 """
 
 from __future__ import annotations
@@ -99,6 +100,14 @@ def python_strings(text: str) -> list[tuple[int, str]]:
     ]
 
 
+def checked(name: str) -> bool:
+    """Say whether a file holds text users see: a crate's source or a runtime module, not a test."""
+
+    source = name.startswith("crates/") and name.endswith(".rs")
+    runtime = name.startswith("packages/muru/python/muru/") and name.endswith(".py")
+    return (source or runtime) and "/tests/" not in name
+
+
 def default_files() -> list[str]:
     """List the Rust sources and the runtime library's modules git knows."""
 
@@ -108,13 +117,13 @@ def default_files() -> list[str]:
         text=True,
         check=True,
     )
-    return [name for name in listed.stdout.split() if "/tests/" not in name]
+    return [name for name in listed.stdout.split() if checked(name)]
 
 
 def main(arguments: list[str]) -> int:
     """Check the files named, or every one, and say which strings name the design."""
 
-    files = [name for name in arguments if name.endswith((".rs", ".py"))] or default_files()
+    files = [name for name in arguments if checked(name)] if arguments else default_files()
     problems = []
 
     for name in files:
