@@ -389,10 +389,10 @@ The `[compression]` table: how the edge compresses responses. Every key is optio
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Whether responses are compressed at all. |
-| `encodings` | array of strings | `["br", "zstd", "gzip"]` | The encodings offered in preference order: br, zstd and gzip. |
+| `encodings` | array of strings | `["br", "zstd", "gzip"]` | The encodings offered in preference order: br, zstd and gzip. An empty list is refused; `enabled = false` turns compression off. |
 | `level` | string | `"default"` | How hard to compress: fast, default or best. |
-| `min_size` | string | `"1KB"` | The smallest body worth compressing, for example 1KB. |
-| `types` | array of strings | `["text/*", "application/json", "application/javascript", "application/xml", "image/svg+xml"]` | The content types compressed: exact types or a family as text/*. |
+| `min_size` | string | `"1KB"` | The smallest body worth compressing, for example 1KB; at least 1 byte. |
+| `types` | array of strings | `["text/*", "application/json", "application/javascript", "application/xml", "image/svg+xml"]` | The content types compressed: exact types or a family as text/*. An empty list is refused. |
 
 (config-daemon-daemon)=
 ## `[daemon]`

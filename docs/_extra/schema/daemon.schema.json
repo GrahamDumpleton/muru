@@ -549,7 +549,7 @@
             "zstd",
             "gzip"
           ],
-          "description": "The encodings offered in preference order: br, zstd and gzip.",
+          "description": "The encodings offered in preference order: br, zstd and gzip. An empty list is refused; `enabled = false` turns compression off.",
           "items": {
             "type": "string"
           },
@@ -562,7 +562,7 @@
         },
         "min_size": {
           "default": "1KB",
-          "description": "The smallest body worth compressing, for example 1KB.",
+          "description": "The smallest body worth compressing, for example 1KB; at least 1 byte.",
           "type": "string"
         },
         "types": {
@@ -573,7 +573,7 @@
             "application/xml",
             "image/svg+xml"
           ],
-          "description": "The content types compressed: exact types or a family as text/*.",
+          "description": "The content types compressed: exact types or a family as text/*. An empty list is refused.",
           "items": {
             "type": "string"
           },

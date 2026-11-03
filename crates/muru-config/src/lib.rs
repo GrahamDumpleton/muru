@@ -1512,18 +1512,21 @@ pub struct Compression {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub enabled: Option<bool>,
-    /// The encodings offered in preference order: br, zstd and gzip.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The encodings offered in preference order: br, zstd and gzip. An
+    /// empty list is refused; `enabled = false` turns compression off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = ["br", "zstd", "gzip"]))]
-    pub encodings: Vec<String>,
-    /// The smallest body worth compressing, for example 1KB.
+    pub encodings: Option<Vec<String>>,
+    /// The smallest body worth compressing, for example 1KB; at least 1
+    /// byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "1KB"))]
     pub min_size: Option<String>,
     /// The content types compressed: exact types or a family as text/*.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// An empty list is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = ["text/*", "application/json", "application/javascript", "application/xml", "image/svg+xml"]))]
-    pub types: Vec<String>,
+    pub types: Option<Vec<String>>,
     /// How hard to compress: fast, default or best.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "default"))]
@@ -2917,8 +2920,13 @@ pub const DEFAULT_SPOOL_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
 /// The upload keys other than `upload` need it, and `max_files` stays
 /// within what one request can pass to a worker.
 pub fn check_upload(route: &Route) -> Result<Option<UploadSettings>, String> {
-    if let Some(size) = &route.max_body_size {
-        parse_size(size).map_err(|error| format!("max_body_size: {error}"))?;
+    if let Some(size) = &route.max_body_size
+        && parse_size(size).map_err(|error| format!("max_body_size: {error}"))? == 0
+    {
+        return Err(
+            "max_body_size must be at least 1 byte; leave it out for the max_body_size of [limits]"
+                .to_owned(),
+        );
     }
 
     let Some(mode) = &route.upload else {
@@ -3454,10 +3462,16 @@ pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
         return Err("maintenance: bypass_cookie must be name=value".to_owned());
     }
 
-    if let Some(text) = &table.retry_after
-        && let Err(error) = parse_duration(text)
-    {
-        return Err(format!("maintenance: retry_after: {error}"));
+    // Retry-After counts whole seconds, so a shorter wait could only be
+    // sent as another.
+
+    if let Some(text) = &table.retry_after {
+        let wait =
+            parse_duration(text).map_err(|error| format!("maintenance: retry_after: {error}"))?;
+
+        if wait < Duration::from_secs(1) {
+            return Err("maintenance: retry_after must be at least 1s".to_owned());
+        }
     }
 
     Ok(())
@@ -5268,10 +5282,26 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             ("upload = 'raw'\nhash = ['md5']", "hash: \"md5\""),
             ("upload = 'raw'\nmax_file_size = 'big'", "max_file_size:"),
             ("max_body_size = 'lots'", "max_body_size:"),
+            (
+                "max_body_size = '0'",
+                "max_body_size must be at least 1 byte",
+            ),
         ] {
             let error = check_upload(&upload_route(keys)).unwrap_err();
             assert!(error.contains(expected), "{keys}: {error}");
         }
+    }
+
+    #[test]
+    fn a_retry_after_under_a_second_is_refused() {
+        let maintenance = |retry: &str| Maintenance {
+            retry_after: Some(retry.to_owned()),
+            ..Maintenance::default()
+        };
+
+        let error = check_maintenance(&maintenance("500ms")).unwrap_err();
+        assert!(error.contains("retry_after must be at least 1s"), "{error}");
+        assert!(check_maintenance(&maintenance("5m")).is_ok());
     }
 
     #[test]

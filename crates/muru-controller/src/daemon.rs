@@ -1750,18 +1750,36 @@ pub(crate) fn compression_message(
         return Ok(muru_edge::compression::Compression::default().to_message());
     };
 
+    // The snapshot's zero and empty lists stand for the defaults, so a
+    // table that writes one is refused rather than given the default.
+
     let min_size = match &table.min_size {
         Some(text) => {
-            muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))?
+            match muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))? {
+                0 => return Err("min_size must be at least 1 byte".to_owned()),
+                size => size,
+            }
         }
         None => 0,
     };
 
+    if table.encodings.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "encodings names no encoding; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    if table.types.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "types names no content type; enabled = false turns compression off".to_owned(),
+        );
+    }
+
     let message = pb::Compression {
         enabled: table.enabled.unwrap_or(true),
-        encodings: table.encodings.clone(),
+        encodings: table.encodings.clone().unwrap_or_default(),
         min_size,
-        types: table.types.clone(),
+        types: table.types.clone().unwrap_or_default(),
         level: table.level.clone().unwrap_or_default(),
     };
 
