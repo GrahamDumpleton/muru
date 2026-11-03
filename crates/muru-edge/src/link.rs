@@ -30,6 +30,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::body::{Body, Frame, Incoming};
+use muru_proto::buffers;
 use muru_proto::descriptors::FdReader;
 use muru_proto::frame::{self, flag, kind};
 use muru_proto::worker::v1 as pb;
@@ -759,6 +760,11 @@ async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
 
 async fn handshake(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
     let stream = UnixStream::connect(path).await?;
+
+    if let Err(error) = buffers::set_send_buffer(&stream) {
+        tracing::warn!(%error, "the worker link kept the system's send buffer");
+    }
+
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::with_capacity(32 * 1024, FdReader::new(read_half));
     let mut writer = write_half;
