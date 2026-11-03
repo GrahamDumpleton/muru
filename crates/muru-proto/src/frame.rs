@@ -136,11 +136,63 @@ pub async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Fra
         ));
     }
 
-    let mut payload = BytesMut::zeroed(len);
-    reader.read_exact(&mut payload).await?;
+    // The payload is read into memory that is not zeroed first, which for
+    // a large BODY frame was a second pass over every byte.
+
+    let mut payload = BytesMut::with_capacity(len);
+
+    while payload.len() < len {
+        let wanted = len - payload.len();
+
+        if reader.read_buf(&mut (&mut payload).limit(wanted)).await? == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+    }
+
     Ok(Some(Frame {
         kind: header[4],
         flags: header[5],
         payload: payload.freeze(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::BufReader;
+    use tokio::net::UnixStream;
+
+    use super::*;
+    use crate::descriptors::FdReader;
+
+    #[tokio::test]
+    async fn a_large_frame_read_in_pieces_arrives_whole_and_a_short_one_fails() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (_, mut writer) = left.into_split();
+        let (read_half, _) = right.into_split();
+        let mut reader = BufReader::with_capacity(1024, FdReader::new(read_half));
+        let payload: Bytes = (0..1_000_000u32)
+            .map(|n| n as u8)
+            .collect::<Vec<_>>()
+            .into();
+
+        let sent = payload.clone();
+        let writing = tokio::spawn(async move {
+            write(&mut writer, kind::BODY, flag::END, sent)
+                .await
+                .unwrap();
+            writer
+                .write_all(&[9, 0, 0, 0, kind::BODY, 0, 1, 2])
+                .await
+                .unwrap();
+        });
+
+        let frame = read(&mut reader).await.unwrap().expect("a frame");
+        assert_eq!((frame.kind, frame.flags), (kind::BODY, flag::END));
+        assert_eq!(frame.payload, payload);
+        writing.await.unwrap();
+
+        let short = read(&mut reader).await.unwrap_err();
+        assert_eq!(short.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(read(&mut reader).await.unwrap().is_none());
+    }
 }
