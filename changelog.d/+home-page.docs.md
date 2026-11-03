@@ -1,1 +1,0 @@
-The documentation's home page says what Muru is, why it exists and how it works, including what it offers AI coding agents, with a short start and a guide to the rest of the documentation; the README is a short introduction that points to it.
