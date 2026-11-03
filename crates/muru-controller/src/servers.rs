@@ -517,6 +517,7 @@ impl Servers {
                 | ServerProfile::Uvicorn
                 | ServerProfile::Granian
                 | ServerProfile::ModWsgiExpress
+                | ServerProfile::Uwsgi
                 | ServerProfile::Generic => "TERM",
             });
 
@@ -583,9 +584,10 @@ fn backoff(crashes: u32) -> Duration {
 /// profile's own flags appended.
 fn arguments_for(profile: ServerProfile, command: &[String], bind: &Bind) -> Vec<String> {
     let address = match (profile, bind) {
-        (ServerProfile::Uvicorn | ServerProfile::Granian, Bind::Unix(path)) => {
-            path.display().to_string()
-        }
+        (
+            ServerProfile::Uvicorn | ServerProfile::Granian | ServerProfile::Uwsgi,
+            Bind::Unix(path),
+        ) => path.display().to_string(),
         (_, bind) => bind.address(),
     };
 
@@ -612,12 +614,26 @@ fn arguments_for(profile: ServerProfile, command: &[String], bind: &Bind) -> Vec
         })
         .collect();
 
+    // uWSGI 2.0 takes TERM as a brutal reload and drops the requests in
+    // flight, so its profile has a master whose hook makes TERM a
+    // graceful stop instead, whatever the command binds with. Both flags
+    // are harmless given twice.
+
+    if profile == ServerProfile::Uwsgi {
+        arguments.extend([
+            "--master".to_owned(),
+            "--hook-master-start".to_owned(),
+            "unix_signal:15 gracefully_kill_them_all".to_owned(),
+        ]);
+    }
+
     if mentioned {
         return arguments;
     }
 
     match (profile, bind) {
         (ServerProfile::Gunicorn, _) => arguments.extend(["--bind".to_owned(), address]),
+        (ServerProfile::Uwsgi, _) => arguments.extend(["--http-socket".to_owned(), address]),
         (ServerProfile::Uvicorn | ServerProfile::Granian, Bind::Unix(_)) => {
             arguments.extend(["--uds".to_owned(), socket]);
         }
@@ -787,6 +803,46 @@ mod tests {
         assert_eq!(
             arguments_for(ServerProfile::Generic, &command(&["server"]), &port),
             command(&["server"])
+        );
+    }
+
+    #[test]
+    fn uwsgi_binds_an_http_socket_and_stops_gracefully_on_term() {
+        let unix = Bind::Unix(PathBuf::from("/run/s.sock"));
+        let port = Bind::Port(8001);
+        let graceful = [
+            "--master",
+            "--hook-master-start",
+            "unix_signal:15 gracefully_kill_them_all",
+        ];
+        assert_eq!(
+            arguments_for(
+                ServerProfile::Uwsgi,
+                &command(&["uwsgi", "--module", "app:application"]),
+                &unix
+            ),
+            command(
+                &[
+                    &["uwsgi", "--module", "app:application"][..],
+                    &graceful,
+                    &["--http-socket", "/run/s.sock"],
+                ]
+                .concat()
+            )
+        );
+        assert_eq!(
+            arguments_for(
+                ServerProfile::Uwsgi,
+                &command(&["uwsgi", "--http-socket", "{bind}", "app.ini"]),
+                &port
+            ),
+            command(
+                &[
+                    &["uwsgi", "--http-socket", "127.0.0.1:8001", "app.ini"][..],
+                    &graceful
+                ]
+                .concat()
+            )
         );
     }
 

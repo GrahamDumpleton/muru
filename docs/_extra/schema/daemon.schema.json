@@ -1924,7 +1924,7 @@
         },
         "profile": {
           "$ref": "#/$defs/ServerProfile",
-          "description": "The server an `http` release runs: gunicorn, uvicorn, granian, mod_wsgi-express or generic."
+          "description": "The server an `http` release runs: gunicorn, uvicorn, granian, mod_wsgi-express, uwsgi or generic."
         },
         "python": {
           "description": "The interpreter: a path, or a request in uv's syntax.",
@@ -2470,6 +2470,11 @@
         {
           "const": "mod_wsgi-express",
           "description": "mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM.",
+          "type": "string"
+        },
+        {
+          "const": "uwsgi",
+          "description": "uWSGI: `--http-socket PATH` or `--http-socket HOST:PORT`, with `--master` and a hook that makes TERM a graceful stop, which in uWSGI 2.0 would otherwise reload.",
           "type": "string"
         },
         {

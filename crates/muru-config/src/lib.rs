@@ -148,6 +148,10 @@ pub enum ServerProfile {
     /// mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM.
     #[serde(rename = "mod_wsgi-express")]
     ModWsgiExpress,
+    /// uWSGI: `--http-socket PATH` or `--http-socket HOST:PORT`, with
+    /// `--master` and a hook that makes TERM a graceful stop, which in
+    /// uWSGI 2.0 would otherwise reload.
+    Uwsgi,
     /// Any server: the command binds through `{bind}` and `stop_signal`
     /// says how it is stopped.
     Generic,
@@ -169,6 +173,7 @@ words!(ServerProfile {
     Uvicorn => "uvicorn",
     Granian => "granian",
     ModWsgiExpress => "mod_wsgi-express",
+    Uwsgi => "uwsgi",
     Generic => "generic",
 });
 words!(ServerBind { Unix => "unix", Port => "port" });
@@ -750,7 +755,7 @@ pub struct Release {
     #[schemars(extend("default" = "workers"))]
     pub kind: Option<ReleaseKind>,
     /// The server an `http` release runs: gunicorn, uvicorn, granian,
-    /// mod_wsgi-express or generic.
+    /// mod_wsgi-express, uwsgi or generic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ServerProfile>,
     /// The command an `http` release runs, with `{bind}` where the
@@ -3684,7 +3689,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     let Some(profile) = table.profile else {
         return Err(
             "profile: a managed HTTP release names its server: gunicorn, uvicorn, granian, \
-             mod_wsgi-express or generic"
+             mod_wsgi-express, uwsgi or generic"
                 .to_owned(),
         );
     };

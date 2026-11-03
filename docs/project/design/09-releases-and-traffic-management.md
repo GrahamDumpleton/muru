@@ -139,7 +139,7 @@ flowchart LR
 ```toml
 [app.legacy.release.r9]
 kind = 'http'
-profile = 'gunicorn'           # gunicorn, uvicorn, granian, mod_wsgi-express or generic
+profile = 'gunicorn'           # gunicorn, uvicorn, granian, mod_wsgi-express, uwsgi or generic
 command = ['gunicorn', '--workers', '4', '--bind', '{bind}', 'legacy.wsgi:application']
 cwd = '/srv/legacy'
 env = { DJANGO_SETTINGS_MODULE = 'legacy.settings' }
@@ -151,7 +151,7 @@ readiness = { path = '/healthz', timeout = '60s' }
 - **Binding:** the daemon allocates a Unix socket path or a free loopback port per instance and substitutes it for {bind} in the command, also setting MURU_HTTP_BIND (and PORT). Profiles know each server's flag for Unix sockets.
 - **Readiness:** an HTTP probe on the configured path, retried until timeout. Without a path, readiness means the socket accepts connections and answers any HTTP response.
 - **Lifecycle:** each instance is a supervised child (or container) with crash restarts and backoff. Drain stops new requests at the edge, waits for in-flight requests, then sends the profile's graceful stop signal, then SIGKILL after the grace period.
-- **Profiles** hold per-server defaults: graceful stop signal (SIGTERM for gunicorn, uvicorn and Granian, SIGINT or SIGTERM per mod_wsgi-express mode), how to bind a Unix socket, and readiness hints. generic needs these set explicitly.
+- **Profiles** hold per-server defaults: graceful stop signal (SIGTERM for gunicorn, uvicorn and Granian, SIGINT or SIGTERM per mod_wsgi-express mode), how to bind a Unix socket, and readiness hints. uwsgi binds with `--http-socket` and adds `--master` and a master-start hook that turns SIGTERM, a reload in uWSGI 2.0, into a graceful stop. generic needs these set explicitly.
 - **Traffic:** a managed HTTP release is a normal backend in traffic policies, so canaries, A/B splits, sticky sessions, previews and rollback work between it and native releases of the same application.
 - **Logs and events:** stdout and stderr are captured by the log collector, and lifecycle changes are events.
 - **Scope limits:** fixed instance counts only (no autoscaling of instances), and none of the Python-specific features (preload by Muru, worker groups, mounts, soft timeouts, memory policy, Python signals, descriptor passing). Requests are re-serialised as HTTP with the normalisation rules of section 4.13. The server's own process management stays in charge inside each instance.
