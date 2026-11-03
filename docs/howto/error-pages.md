@@ -157,7 +157,7 @@ retry_after = '5m'
 | `exempt_paths` | none | path prefixes served as usual |
 | `exempt_addresses` | none | client addresses, or CIDR ranges, served as usual; the client is the one a trusted proxy forwarded, where there is one |
 | `bypass_cookie` | none | a `name=value` cookie that lets a client through, for checking the site before turning maintenance off |
-| `retry_after` | `60s` | the `Retry-After` the page carries |
+| `retry_after` | `60s` | the `Retry-After` the page carries, in whole seconds, so at least `1s` |
 
 Static routes are served by the edge and are not affected; a static
 route's fallback application is. Internal redirects and error page

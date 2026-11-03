@@ -39,11 +39,13 @@ class Serve:
     stdout: list[str] = field(default_factory=list)
     stderr: list[str] = field(default_factory=list)
 
-    def get(self, path: str, port: int | None = None) -> tuple[int, str]:
+    def get(
+        self, path: str, port: int | None = None, headers: dict[str, str] | None = None
+    ) -> tuple[int, str]:
         connection = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=10)
 
         try:
-            connection.request("GET", path)
+            connection.request("GET", path, headers=headers or {})
             response = connection.getresponse()
             return response.status, response.read().decode()
         finally:
@@ -255,6 +257,23 @@ def test_settings_come_from_the_environment(tmp_path: Path) -> None:
         assert report["state"] == "serving"
         assert report["settings"]["threads"] == 2
         assert report["groups"]["default"]["ready"] == 1
+    finally:
+        assert serve.stop() == 0
+
+
+def test_a_named_proxy_has_the_header_types_of_the_built_in_trust(tmp_path: Path) -> None:
+    # Naming loopback as a proxy applies X-Forwarded-Prefix as the trust
+    # serve has without one does, rather than the four types of [proxy].
+
+    serve = start(tmp_path, "--trusted-proxy", "loopback")
+    headers = {"X-Forwarded-For": "203.0.113.5", "X-Forwarded-Prefix": "/shop"}
+
+    try:
+        status, body = serve.get("/info", headers=headers)
+        assert status == 200, body
+        environ = json.loads(body)["environ"]
+        assert environ["REMOTE_ADDR"] == "203.0.113.5"
+        assert environ["SCRIPT_NAME"] == "/shop"
     finally:
         assert serve.stop() == 0
 

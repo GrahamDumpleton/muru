@@ -566,6 +566,8 @@ class Group:
     loop_stall_timeout: float | None = None
     gil_stall_timeout: float | None = None
     memory: MemoryPolicy | None = None
+    max_requests: int | None = None
+    max_lifetime: float | None = None
 
     # ADR 0033: the release is ready without an optional group's workers,
     # which enter routing as each listens, and a worker of one that
@@ -701,6 +703,28 @@ def parse_group_memory(text: str) -> tuple[str, MemoryPolicy]:
         raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
 
     return name, policy
+
+
+def parse_group_recycle(text: str) -> tuple[str, dict[str, float | None]]:
+    """Parse NAME=MAX_REQUESTS,MAX_LIFETIME, a count and seconds, or off."""
+
+    form = "NAME=MAX_REQUESTS,MAX_LIFETIME"
+    name, _, values = text.partition("=")
+    parts = values.split(",")
+
+    if not name or len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    try:
+        requests = None if parts[0] == "off" else int(parts[0])
+        lifetime = None if parts[1] == "off" else float(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+    if (requests is not None and requests < 1) or (lifetime is not None and lifetime <= 0):
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    return name, {"max_requests": requests, "max_lifetime": lifetime}
 
 
 @dataclass
@@ -1008,6 +1032,8 @@ class Host:
                 else group.gil_stall_timeout
             ),
             memory=self.memory if group.memory is None else group.memory,
+            max_requests=self.max_requests if group.max_requests is None else group.max_requests,
+            max_lifetime=self.max_lifetime if group.max_lifetime is None else group.max_lifetime,
         )
 
     def group_of(self, index: int) -> Group:
@@ -1019,13 +1045,12 @@ class Host:
     def policies(self) -> bool:
         """Whether any timeout or recycling policy is on."""
 
-        return (
-            self.max_requests is not None
-            or self.max_lifetime is not None
-            or any(
-                group.hard_timeout is not None or (group.memory is not None and group.memory.active)
-                for group in self.groups
-            )
+        return any(
+            group.max_requests is not None
+            or group.max_lifetime is not None
+            or group.hard_timeout is not None
+            or (group.memory is not None and group.memory.active)
+            for group in self.groups
         )
 
     def socket_path(self, index: int) -> str:
@@ -1168,13 +1193,15 @@ class Host:
         state = WorkerState(index, pid, self.generation.get(index, 0), path, now, report_read)
         state.last_report_at = now
 
-        if self.max_requests is not None:
-            state.recycle_after_requests = self.max_requests + random.randint(
-                0, self.max_requests // 10
+        group = self.group_of(index)
+
+        if group.max_requests is not None:
+            state.recycle_after_requests = group.max_requests + random.randint(
+                0, group.max_requests // 10
             )
 
-        if self.max_lifetime is not None:
-            state.recycle_at = now + self.max_lifetime * random.uniform(1.0, 1.1)
+        if group.max_lifetime is not None:
+            state.recycle_at = now + group.max_lifetime * random.uniform(1.0, 1.1)
 
         self.states[pid] = state
         self.workers[pid] = index
@@ -2574,7 +2601,8 @@ class Host:
         ):
             self.replace(
                 state,
-                f"served {state.requests} requests (max_requests {self.max_requests})",
+                f"served {state.requests} requests "
+                f"(max_requests {self.group_of(state.index).max_requests})",
                 "worker.recycled",
                 "max_requests",
             )
@@ -2631,7 +2659,7 @@ class Host:
             elif state.recycle_at is not None and now >= state.recycle_at:
                 self.replace(
                     state,
-                    f"lived {now - state.started_at:.0f} s (max_lifetime {self.max_lifetime:g} s)",
+                    f"lived {now - state.started_at:.0f} s (max_lifetime {group.max_lifetime:g} s)",
                     "worker.recycled",
                     "max_lifetime",
                 )
@@ -3696,6 +3724,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="a named group's memory policy, limits in bytes or off; the release's without",
     )
     parser.add_argument(
+        "--group-recycle",
+        action="append",
+        default=[],
+        type=parse_group_recycle,
+        metavar="NAME=MAX_REQUESTS,MAX_LIFETIME",
+        help="a named group's max_requests and max_lifetime in seconds, or off; the release's "
+        "without",
+    )
+    parser.add_argument(
         "--mount",
         action="append",
         default=[],
@@ -4033,6 +4070,7 @@ def main(argv: list[str] | None = None) -> int:
                 group,
                 **dict(args.group_timeouts).get(group.name, {}),
                 memory=dict(args.group_memory).get(group.name),
+                **dict(args.group_recycle).get(group.name, {}),
                 optional=group.name in args.optional_group,
                 mounts=dict(args.group_mounts).get(group.name, ()),
             )

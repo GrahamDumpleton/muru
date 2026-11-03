@@ -99,8 +99,13 @@ def test_the_scaling_tutorial(tmp_path: Path) -> None:
             r".*diagnosis: I/O bound with exhausted slots"
         )
         assert re.search(exhausted, events), events
+
+        # Either rule can make the last scale-out: the shortfall, or the
+        # spare rule once a growing group has no idle worker left.
+
         status = daemon.muructl("scale", "status", "busy").stdout
-        assert re.search(r"last: scaled out to [4-8]: short by", status), status
+        last = r"last: scaled out to [4-8]: (short by|[\d.]+ idle workers, under min_spare)"
+        assert re.search(last, status), status
 
         # Without load it comes back to one worker, by both rules.
 

@@ -669,11 +669,19 @@ fn prepare(
         ));
     }
 
+    // Loopback peers' forwarding headers are applied unless proxies are
+    // named. A named proxy gets the same header types, since serve has no
+    // `headers` setting, and a proxy's connection share besides.
+
     let trust = match layered.list("trusted_proxy") {
         [] => muru_edge::proxy::Trust::loopback(),
         trusted => {
             let table = muru_config::Proxy {
                 trusted: trusted.to_vec(),
+                headers: muru_config::PROXY_HEADERS[..6]
+                    .iter()
+                    .map(|header| (*header).to_owned())
+                    .collect(),
                 ..Default::default()
             };
             muru_edge::proxy::Trust::from_snapshot(&muru_controller::daemon::proxy_message(&table))

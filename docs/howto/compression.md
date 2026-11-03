@@ -13,9 +13,9 @@ chunk with a flush after each, so event streams keep flowing.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | whether responses are compressed at all |
-| `encodings` | `['br', 'zstd', 'gzip']` | offered in this preference order; the first the client accepts is used |
-| `min_size` | `1KB` | the smallest body worth compressing |
-| `types` | `text/*`, `application/json`, `application/javascript`, `application/xml`, `image/svg+xml` | the content types compressed, exact or a family as `text/*` |
+| `encodings` | `['br', 'zstd', 'gzip']` | offered in this preference order; the first the client accepts is used. An empty list is refused: `enabled = false` turns compression off |
+| `min_size` | `1KB` | the smallest body worth compressing, at least 1 byte |
+| `types` | `text/*`, `application/json`, `application/javascript`, `application/xml`, `image/svg+xml` | the content types compressed, exact or a family as `text/*`; an empty list is refused |
 | `level` | `default` | `fast`, `default` or `best` |
 
 Under the daemon the table goes in its configuration file and `muructl

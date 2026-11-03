@@ -75,6 +75,28 @@ def test_socket_paths_carry_the_generation_of_a_replacement(tmp_path: Path) -> N
     assert instance.socket_path(0) == str(tmp_path / "worker-0.sock")
 
 
+def test_a_group_recycles_by_its_own_settings_else_the_releases(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    name, recycle = host.parse_group_recycle("api=5,off")
+    api = host.Group(name, 1, 1, 1, 1, **recycle)
+    batch = host.Group("batch", 1, 1, 1, 1)
+    instance = host.Host(
+        release,
+        str(tmp_path),
+        workers=1,
+        threads=1,
+        groups=[api, batch],
+        max_requests=100,
+        max_lifetime=60.0,
+    )
+    settled = {group.name: (group.max_requests, group.max_lifetime) for group in instance.groups}
+    assert settled == {"default": (100, 60.0), "api": (5, 60.0), "batch": (100, 60.0)}
+
+    for text in ("api=0,off", "api=5", "api=many,off", "api=off,0"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.parse_group_recycle(text)
+
+
 def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> None:
     release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
     api = host.Group("api", 1, 1, 1, 1)

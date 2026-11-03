@@ -107,6 +107,7 @@ def test_print_config_writes_the_groups() -> None:
         "paths": ["/slow/*"],
         "timeouts": {"soft_timeout": "1s"},
         "memory": {"check_interval": "1s"},
+        "max_requests": 2,
     }
     assert release["groups"]["batch"] == {"paths": ["/batch/*"], "optional": True, "processes": 1}
     assert release["groups"]["uploads"] == {
@@ -125,6 +126,24 @@ def test_a_group_has_timeouts_of_its_own(development: support.Server) -> None:
     assert json.loads(slow.body)["reason"] == "soft_timeout"
     assert served_by(development.get("/?ms=1500"))["group"] == "default"
     assert served_by(development.get("/slow/report?ms=100"))["group"] == "slow"
+
+
+def test_a_group_recycles_its_workers_by_its_own_count(development: support.Server) -> None:
+    # Section 7.7: the slow group replaces a worker after two requests;
+    # the release sets no max_requests, so the default group never does.
+
+    development.mark_log()
+
+    for _ in range(3):
+        assert served_by(development.get("/slow/report?ms=10"))["group"] == "slow"
+
+    assert development.wait_for_log("(max_requests 2)")
+
+    for _ in range(3):
+        assert served_by(development.get("/"))["group"] == "default"
+
+    replaced = [line for line in development.log_since_mark().splitlines() if "replacing" in line]
+    assert replaced and all("(max_requests 2)" in line for line in replaced), replaced
 
 
 @pytest.fixture
@@ -281,6 +300,14 @@ def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:
             "timeouts = { soft_timeout = '10s', hard_timeout = '12s' }\n",
             "worker group hot: hard_timeout must exceed soft_timeout by at least 5s",
         ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_requests = 0\n",
+            "worker group hot: max_requests must be at least 1",
+        ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_lifetime = 'soon'\n",
+            "worker group hot: max_lifetime:",
+        ),
     ]:
         config.write_text(
             f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n{table}"
@@ -303,8 +330,8 @@ def test_a_restarted_daemon_readopts_every_group(tmp_path: Path) -> None:
         second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
         try:
-            log = second.log()
-            assert "re-adopted the host" in log, f"{first.log()}\n--- second daemon\n{log}"
+            log = second.wait_for_log("re-adopted the host", "could not be re-adopted")
+            assert "re-adopted the host" in log, log
             assert served_by(second.request("/reports/x"))["group"] == "reports"
             assert served_by(second.request("/"))["group"] == "default"
         finally:

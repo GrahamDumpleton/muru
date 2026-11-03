@@ -95,6 +95,10 @@ fuzz target:
 bench *args:
     uv run --group bench python bench/run.py {{args}}
 
+# Regenerate the configuration reference and JSON Schemas from muru-config.
+reference:
+    MURU_UPDATE_REFERENCE=1 cargo test -p muru-config --test reference
+
 # Build the documentation with warnings as errors.
 docs:
     uv run sphinx-build -W --keep-going -b html docs docs/_build/html

@@ -2215,8 +2215,8 @@ pub struct DeployArgs {
     secrets: Vec<(String, String, String, bool)>,
 
     /// Run an HTTP server of this profile instead of workers: gunicorn,
-    /// uvicorn, granian, mod_wsgi-express or generic, with its command
-    /// after `--`.
+    /// uvicorn, granian, mod_wsgi-express, uwsgi or generic, with its
+    /// command after `--`.
     #[arg(long, value_name = "PROFILE")]
     server: Option<muru_config::ServerProfile>,
 

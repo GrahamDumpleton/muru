@@ -265,6 +265,14 @@ pub struct GroupSpec {
     /// release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryPolicy>,
+    /// Requests a worker of the group serves before it is replaced; the
+    /// release's when absent (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// How long a worker of the group lives before it is replaced, in
+    /// milliseconds; the release's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime_ms: Option<u64>,
 }
 
 /// A worker group's own timeouts (section 7.1): the ones a group may

@@ -34,7 +34,7 @@ The same table goes in a declared release for `muructl apply`, and
 number of bytes, with KB, MB and GB as powers of 1024.
 
 The node-wide memory budget is in [scaling](scaling.md), and a [worker
-group](worker-groups.md#timeouts-and-memory-per-group) can have limits
+group](worker-groups.md#timeouts-memory-and-recycling-per-group) can have limits
 of its own.
 
 ## What is measured

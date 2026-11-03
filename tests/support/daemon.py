@@ -213,6 +213,25 @@ class Daemon:
     def log(self) -> str:
         return self.log_path.read_text(errors="replace")
 
+    def wait_for_log(self, *texts: str, timeout: float = 20.0) -> str:
+        """Wait until the log holds one of the texts, and return it.
+
+        The admin socket answers before the daemon has re-adopted what a
+        previous one left running, so a test that reads the log for the
+        outcome waits for it. On a timeout the log is returned as it is,
+        for the test's own assertion to show.
+        """
+
+        deadline = time.monotonic() + timeout
+
+        while True:
+            log = self.log()
+
+            if any(text in log for text in texts) or time.monotonic() > deadline:
+                return log
+
+            time.sleep(0.1)
+
     def stop(self, shutdown: bool = True) -> None:
         """Stop the daemon through its API, or kill it if that fails.
 

@@ -9,6 +9,52 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a16 (2026-11-03)
+
+### Added
+
+- Added a `uwsgi` profile for managed HTTP server releases: uWSGI binds
+  with `--http-socket` and is given `--master` and a hook that makes TERM
+  a graceful stop, which in uWSGI 2.0 would otherwise reload and drop the
+  requests in flight. ([#95](https://github.com/muruhq/muru/issues/95))
+- Added `max_requests` and `max_lifetime` to a worker group's table, so a
+  group's workers can be recycled on a count or a lifetime of their own;
+  a group that sets neither takes the release's. ([#150](https://github.com/muruhq/muru/issues/150))
+- Added a configuration reference listing every key, with its type and
+  default, of the daemon's configuration, applied files, `[tool.muru]`,
+  `muru.local.toml` and the `muructl serve` file, and a JSON Schema for each
+  file for editors, both generated from the definitions `muructl` parses
+  them with. ([#262](https://github.com/muruhq/muru/issues/262))
+
+### Changed
+
+- A zero or an empty value that used to be quietly replaced by the default
+  is now refused with a message naming the key: `[compression]`'s
+  `min_size = "0"`, `encodings = []` and `types = []`, a route's
+  `max_body_size = "0"`, and a maintenance `retry_after` under one second. ([#323](https://github.com/muruhq/muru/issues/323))
+
+### Fixed
+
+- A relative `MURU_STATE_DIR`, `MURU_CACHE_DIR`, `MURU_LOG_DIR` or `MURU_CONFIG`, or the matching `--state-dir`, `--cache-dir`, `--log-dir` or `--config`, is now taken from the directory the command runs in. Before, the runtime library unpacked under it went on the host's `PYTHONPATH` as the relative path, so under the daemon, or `muructl run --chdir`, the host could not import `muru` and exited before its workers were ready. ([#308](https://github.com/muruhq/muru/issues/308))
+- On Alpine and other musl-based systems, the runtime library `muructl` fetches or unpacks is now the musllinux wheel. Before, Python 3.11 to 3.13 were taken for glibc and given the manylinux wheel, whose extension cannot load on musl, and Python 3.14 and later found no wheel at all, because `platform.libc_ver()` reports musl's version as `1`. ([#313](https://github.com/muruhq/muru/issues/313))
+- When `muructl serve` cannot create its run directory because its user may not, the error now names that user and the Dockerfile line that makes the directory for it, `RUN install -d -o UID -g 0 -m 0770 /run/muru`. Before, it gave the advice for a read-only root filesystem, which did not apply. ([#314](https://github.com/muruhq/muru/issues/314))
+- A proxy named with `muructl serve --trusted-proxy` now has the same
+  forwarding header types applied as the loopback trust serve has without
+  one, `X-Forwarded-Prefix` and `X-Forwarded-Port` included, rather than
+  only the four default types of `[proxy]`. ([#324](https://github.com/muruhq/muru/issues/324))
+
+### Documentation
+
+- The container guide installs `muructl` in the build stage with `uv tool install`, which needs no pip, and shows what `muructl build` runs, how `[tool.uv]` settings and `UV_` variables reach it, and the same build with uv alone and `muructl runtime install`. ([#247](https://github.com/muruhq/muru/issues/247))
+- The container guide's image makes `/run/muru` for its non-root user, without which `muructl serve` could not start under a plain `docker run`. ([#314](https://github.com/muruhq/muru/issues/314))
+- The documentation uses more of a wide screen: its content column grows
+  with the window, up to 76em, so wide tables such as the configuration
+  reference fit.
+- The documentation's home page says what Muru is, why it exists and how it works, including what it offers AI coding agents, with a short start and a guide to the rest of the documentation; the README is a short introduction that points to it.
+- The how-to guides are grouped by task, each with a line saying what it covers, and the documentation's sidebar separates using Muru from the project and its design.
+- The user guide's pages no longer open with a note of what is built and what is still to come: each describes what Muru does, with any limit stated where it applies, and work still to come is in the roadmap and the issue tracker. The error reference lists the reasons `no_route`, `not_found`, `misdirected`, `sendfile_missing`, `sendfile_refused` and `edge_overloaded`, which it left out.
+
+
 ## 0.1.0a15 (2026-11-02)
 
 ### Added
