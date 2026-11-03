@@ -303,8 +303,8 @@ def test_a_restarted_daemon_readopts_every_group(tmp_path: Path) -> None:
         second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
         try:
-            log = second.log()
-            assert "re-adopted the host" in log, f"{first.log()}\n--- second daemon\n{log}"
+            log = second.wait_for_log("re-adopted the host", "could not be re-adopted")
+            assert "re-adopted the host" in log, log
             assert served_by(second.request("/reports/x"))["group"] == "reports"
             assert served_by(second.request("/"))["group"] == "default"
         finally:
