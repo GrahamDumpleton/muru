@@ -55,7 +55,7 @@ muru-app-0 in worker 1:
     rows = cursor.fetchall()
 ```
 
-On Linux with Python 3.14 or later the host reads the stacks from
+On Linux with Python 3.15 or later the host reads the stacks from
 outside the worker (PEP 768), so a worker stuck in C code with the
 interpreter held, or stopped altogether, shows them at once. Elsewhere,
 on older interpreters and on macOS, where reading another process needs
@@ -63,7 +63,9 @@ root, the worker is asked. A worker asked that cannot answer in five
 seconds, because something holds the interpreter, is reported as such,
 and the host sends it SIGQUIT so that `faulthandler`, which needs no
 interpreter, writes every thread's stack to the release's log instead;
-`muructl logs APP` shows it.
+`muructl logs APP` shows it. On Linux with Python 3.14 such a worker is
+also read from outside, which there gives only each thread's innermost
+frames, up to the first call from C code; the log has the whole stacks.
 
 ## Tasks
 
