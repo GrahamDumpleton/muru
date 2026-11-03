@@ -689,6 +689,16 @@ pub struct Group {
     /// release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// Requests a worker of the group serves before it is replaced, with
+    /// jitter (section 7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
+    pub max_requests: Option<u64>,
+    /// How long a worker of the group lives before it is replaced, for
+    /// example 1h, with jitter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
+    pub max_lifetime: Option<String>,
 }
 
 /// Check a worker group's `match` table (ADR 0033): it must ask

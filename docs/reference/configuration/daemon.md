@@ -169,6 +169,8 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | --- | --- | --- | --- |
 | `concurrency` | integer | the release's | Requests an ASGI worker's event loop takes at once. |
 | `match` | table, {ref}`[app.NAME.release.ID.groups.NAME.match] <config-daemon-app-name-release-id-groups-name-match>` |  | What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path. |
+| `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
+| `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The group's own memory policy, each key the release's when absent. |
 | `mounts` | array of strings |  | The named mounts the group's workers serve, beside the default mount, which every worker serves; every mount when absent. The group's paths must lie within them. |
 | `optional` | boolean | `false` | Whether the release is ready without the group's workers: its requests wait until one listens. |

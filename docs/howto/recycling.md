@@ -30,9 +30,10 @@ The same keys go in a declared release for `muructl apply`, and `muructl
 run --print-config` writes them. A release records its settings when it
 is created, so changing them means a new deploy.
 
-`max_requests` and `max_lifetime` apply to every worker of the release;
-the memory policy and the timeouts can also be set per [worker
-group](worker-groups.md).
+A [worker group](worker-groups.md#timeouts-memory-and-recycling-per-group)
+can set `max_requests` and `max_lifetime` of its own, so a group that
+leaks is replaced more often than the rest; a group that sets neither
+takes the release's.
 
 ## What happens
 

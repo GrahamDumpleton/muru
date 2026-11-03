@@ -2837,6 +2837,26 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                     concurrency: group.concurrency.unwrap_or(resolved.concurrency),
                     timeouts: group_timeouts(name, group.timeouts.as_ref(), &timeouts)?,
                     memory: group_memory(name, group.memory.as_ref(), &memory)?,
+                    max_requests: match group.max_requests {
+                        Some(0) => anyhow::bail!(
+                            "[tool.muru.groups.{name}] max_requests must be at least 1"
+                        ),
+                        Some(count) => Some(count),
+                        None => resolved.max_requests,
+                    },
+                    max_lifetime: match &group.max_lifetime {
+                        Some(text) => {
+                            let lifetime = muru_config::parse_duration(text).map_err(|error| {
+                                anyhow::anyhow!("[tool.muru.groups.{name}] max_lifetime: {error}")
+                            })?;
+                            anyhow::ensure!(
+                                !lifetime.is_zero(),
+                                "[tool.muru.groups.{name}] max_lifetime must be longer than nothing"
+                            );
+                            Some(lifetime)
+                        }
+                        None => resolved.max_lifetime,
+                    },
                     optional: group.optional.unwrap_or(false),
                     mounts: group.mounts.clone(),
                 })

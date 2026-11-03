@@ -129,7 +129,7 @@ loop_stall_timeout = "10s"
 gil_stall_timeout = "30s"
 ```
 
-A [worker group](worker-groups.md#timeouts-and-memory-per-group) can
+A [worker group](worker-groups.md#timeouts-memory-and-recycling-per-group) can
 set the soft, hard, hard drain grace, loop stall and GIL stall timeouts
 for itself, so that a group of slow paths has long ones while the rest
 of the application keeps short ones.

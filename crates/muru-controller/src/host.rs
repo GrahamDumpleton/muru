@@ -577,6 +577,12 @@ pub struct HostGroup {
     pub timeouts: crate::model::WorkerTimeouts,
     /// The group's memory policy, resolved over the release's.
     pub memory: crate::model::MemoryPolicy,
+    /// Requests a worker serves before it is replaced, resolved over the
+    /// release's (section 7.7).
+    pub max_requests: Option<u64>,
+    /// How long a worker lives before it is replaced, resolved over the
+    /// release's.
+    pub max_lifetime: Option<Duration>,
     /// Whether the release is ready without the group's workers (ADR
     /// 0033).
     pub optional: bool,
@@ -790,6 +796,17 @@ impl HostProcess {
                     .hard_limit
                     .map_or_else(|| "off".to_owned(), |bytes| bytes.to_string()),
                 seconds(Some(memory.check_interval_ms)),
+            ));
+            command.arg("--group-recycle").arg(format!(
+                "{}={},{}",
+                group.name,
+                group
+                    .max_requests
+                    .map_or_else(|| "off".to_owned(), |count| count.to_string()),
+                group.max_lifetime.map_or_else(
+                    || "off".to_owned(),
+                    |lifetime| lifetime.as_secs_f64().to_string()
+                ),
             ));
         }
 

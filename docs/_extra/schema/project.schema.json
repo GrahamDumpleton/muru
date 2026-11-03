@@ -300,6 +300,18 @@
           "$ref": "#/$defs/GroupMatch",
           "description": "What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path."
         },
+        "max_lifetime": {
+          "description": "How long a worker of the group lives before it is replaced, for example 1h, with jitter.",
+          "type": "string",
+          "x-default": "the release's"
+        },
+        "max_requests": {
+          "description": "Requests a worker of the group serves before it is replaced, with jitter.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
         "memory": {
           "$ref": "#/$defs/Memory",
           "description": "The group's own memory policy, each key the release's when absent."

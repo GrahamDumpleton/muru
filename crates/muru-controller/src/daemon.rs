@@ -4253,6 +4253,11 @@ impl Daemon {
                     concurrency: group.concurrency as usize,
                     timeouts: group.timeouts.resolve(&spec.timeouts),
                     memory: group.memory.clone().unwrap_or_else(|| spec.memory.clone()),
+                    max_requests: group.max_requests.or(spec.max_requests),
+                    max_lifetime: group
+                        .max_lifetime_ms
+                        .or(spec.max_lifetime_ms)
+                        .map(Duration::from_millis),
                     optional: group.optional,
                     mounts: group.mounts.clone(),
                 })

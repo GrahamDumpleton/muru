@@ -2657,6 +2657,24 @@ pub fn resolve_spec(
             gil_stall_timeout_ms: parse(own.gil_stall_timeout.as_ref(), "gil_stall_timeout")?,
         };
 
+        // Section 7.7: the group's own recycling, the release's when it
+        // sets none.
+
+        if group.max_requests == Some(0) {
+            return Err(format!(
+                "worker group {name}: max_requests must be at least 1"
+            ));
+        }
+
+        let max_lifetime_ms = parse_ms(group.max_lifetime.as_ref(), "max_lifetime")
+            .map_err(|error| format!("worker group {name}: {error}"))?;
+
+        if max_lifetime_ms == Some(0) {
+            return Err(format!(
+                "worker group {name}: max_lifetime must be longer than nothing"
+            ));
+        }
+
         resolved_groups.push(GroupSpec {
             name: name.clone(),
             paths: group.paths.clone(),
@@ -2674,6 +2692,8 @@ pub fn resolve_spec(
             scaling: group_scaling,
             timeouts: group_timeouts,
             memory: None,
+            max_requests: group.max_requests,
+            max_lifetime_ms,
         });
     }
 
@@ -4637,6 +4657,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         scaling: scaling_table(&group.scaling),
                         timeouts: group.timeouts.table(),
                         memory: group.memory.as_ref().map(crate::model::MemoryPolicy::table),
+                        max_requests: group.max_requests,
+                        max_lifetime: group.max_lifetime_ms.map(format_ms),
                     },
                 )
             })

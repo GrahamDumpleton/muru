@@ -92,12 +92,13 @@ muru: group hot serves /api/status, /api/ping with 1 worker of 50 threads
 muru: group reports serves /reports/* with 6 workers of 1 thread
 ```
 
-## Timeouts and memory per group
+## Timeouts, memory and recycling per group
 
-A group can have [timeouts](timeouts.md) and a [memory
-policy](memory.md) of its own, so a group of slow report paths can be
-given a long hard timeout and a large memory limit while the rest of the
-application keeps short ones:
+A group can have [timeouts](timeouts.md), a [memory policy](memory.md)
+and [recycling](recycling.md) of its own, so a group of slow report
+paths can be given a long hard timeout and a large memory limit, and its
+workers replaced every 200 requests, while the rest of the application
+keeps short timeouts and is not recycled:
 
 ```toml
 [groups.reports]
@@ -106,11 +107,13 @@ processes = 2
 threads = 1
 timeouts = { soft_timeout = "120s", hard_timeout = "300s" }
 memory = { hard_limit = "2GB" }
+max_requests = 200
 ```
 
 Each key a group leaves out is the release's: its `timeouts` and
-`memory` tables, or the `--timeout` and `--memory` settings given on the
-command line. `shutdown_timeout` and `websocket_drain_grace` belong to
+`memory` tables and its `max_requests` and `max_lifetime`, or the
+`--timeout`, `--memory`, `--max-requests` and `--max-lifetime` settings
+given on the command line. `shutdown_timeout` and `websocket_drain_grace` belong to
 the release, since they bound how long every worker gets to stop, and a
 group may not set them. A group's hard timeout must exceed its soft
 timeout by at least five seconds, as the release's must. `muructl config

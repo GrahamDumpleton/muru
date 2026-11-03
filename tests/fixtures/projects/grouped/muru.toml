@@ -16,6 +16,7 @@ threads = 8
 paths = ["/slow/*"]
 timeouts = { soft_timeout = "1s" }
 memory = { check_interval = "1s" }
+max_requests = 2
 
 [groups.batch]
 paths = ["/batch/*"]
