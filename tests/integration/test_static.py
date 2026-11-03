@@ -139,6 +139,28 @@ def test_ranges_are_served_and_bad_ones_refused(static: Static) -> None:
     assert whole.status == 200 and len(whole.body) == 45
 
 
+def test_files_larger_than_a_chunk_are_sent_whole_and_by_range(tmp_path: Path) -> None:
+    """The edge reads a file in chunks of 256 KiB, and sends one no larger
+    than a chunk whole; a body or range across chunks arrives intact."""
+
+    chunk = 256 * 1024
+    content = bytes(range(256)) * (3 * chunk // 256) + b"tail"
+    (tmp_path / "large.bin").write_bytes(content[: 3 * chunk - 1000])
+    (tmp_path / "chunk.bin").write_bytes(content[:chunk])
+    instance = serve_static(tmp_path)
+
+    try:
+        assert instance.get("/large.bin").body == content[: 3 * chunk - 1000]
+        assert instance.get("/chunk.bin").body == content[:chunk]
+        part = instance.get("/large.bin", {"Range": f"bytes={chunk - 10}-{2 * chunk + 10}"})
+        assert part.status == 206
+        assert part.body == content[chunk - 10 : 2 * chunk + 11]
+        head = request("HEAD", instance.port, "/large.bin")
+        assert head.header("Content-Length") == str(3 * chunk - 1000) and head.body == b""
+    finally:
+        instance.stop()
+
+
 def test_precompressed_variants_are_preferred_when_accepted(static: Static) -> None:
     plain = static.get("/app.js")
     assert plain.status == 200 and plain.header("Content-Encoding") is None

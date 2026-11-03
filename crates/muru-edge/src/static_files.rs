@@ -7,6 +7,7 @@
 //! checked against the canonical name on disk, and symbolic links that
 //! leave the directory are refused.
 
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -18,16 +19,16 @@ use http::header::{
     SERVER, VARY,
 };
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, StreamBody};
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::Frame;
 use muru_proto::edge::v1 as pb;
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use crate::ResponseBody;
 use crate::compression::{Compression, Encoding};
 
-/// How big each chunk of a file body is.
-const CHUNK: usize = 64 * 1024;
+/// How big each chunk of a file body is: a file no larger is read and
+/// sent whole.
+const CHUNK: usize = 256 * 1024;
 
 /// A static route, as the snapshot describes it.
 #[derive(Debug)]
@@ -182,6 +183,9 @@ struct Found {
     relative: String,
     length: u64,
     modified: Option<SystemTime>,
+    /// The precompressed variant the client takes, looked for with the
+    /// file itself.
+    variant: Option<(PathBuf, u64, Encoding)>,
 }
 
 /// Where a request's path led.
@@ -209,20 +213,48 @@ pub async fn serve(
 
     let trailing_slash = within.ends_with('/') || within.is_empty();
 
-    // A hidden or climbing path has no file; it falls through like any
-    // other path without one.
+    // The path, the fallback file when nothing answers it, and the
+    // precompressed variants are looked for in one call on the blocking
+    // pool, since each call there is a hand-off between threads. A hidden
+    // or climbing path has no file; it falls through like any other path
+    // without one.
 
-    let resolved = match request_components(within) {
-        Some(components) => {
-            let route_for_resolve = Arc::clone(route);
-            tokio::task::spawn_blocking(move || {
-                resolve(&route_for_resolve, &components, trailing_slash)
-            })
-            .await
-            .unwrap_or(Resolved::Nothing)
-        }
-        None => Resolved::Nothing,
+    let components = request_components(within);
+
+    let accepted = if policy.enabled {
+        policy.accepted(headers.get(http::header::ACCEPT_ENCODING))
+    } else {
+        Vec::new()
     };
+    let route_for_resolve = Arc::clone(route);
+
+    let resolved = tokio::task::spawn_blocking(move || {
+        let route = &route_for_resolve;
+        let resolved = components.map_or(Resolved::Nothing, |components| {
+            resolve(route, &components, trailing_slash)
+        });
+
+        let resolved = match (resolved, &route.fallback_file) {
+            (Resolved::Nothing, Some(name)) => match request_components(name) {
+                Some(components) => match resolve(route, &components, false) {
+                    Resolved::File(found) => Resolved::File(found),
+                    _ => Resolved::Nothing,
+                },
+                None => Resolved::Nothing,
+            },
+            (resolved, _) => resolved,
+        };
+
+        match resolved {
+            Resolved::File(mut found) => {
+                found.variant = precompressed(&found.path, &accepted);
+                Resolved::File(found)
+            }
+            other => other,
+        }
+    })
+    .await
+    .unwrap_or(Resolved::Nothing);
 
     let found = match resolved {
         Resolved::File(found) => found,
@@ -236,29 +268,10 @@ pub async fn serve(
             };
             return redirect(&location);
         }
-        Resolved::Nothing => {
-            let Some(fallback) = &route.fallback_file else {
-                return Outcome::Fallback;
-            };
-            let route_for_fallback = Arc::clone(route);
-            let name = fallback.clone();
-            let fallback = tokio::task::spawn_blocking(move || {
-                let Some(components) = request_components(&name) else {
-                    return Resolved::Nothing;
-                };
-                resolve(&route_for_fallback, &components, false)
-            })
-            .await
-            .unwrap_or(Resolved::Nothing);
-
-            match fallback {
-                Resolved::File(found) => found,
-                _ => return Outcome::Fallback,
-            }
-        }
+        Resolved::Nothing => return Outcome::Fallback,
     };
 
-    respond(Some(route), method, headers, found, Some(policy)).await
+    respond(Some(route), method, headers, found).await
 }
 
 /// Why a hinted path is not served.
@@ -296,6 +309,7 @@ fn locate(candidate: &Path, roots: &[PathBuf]) -> Result<Found, Located> {
         relative: String::new(),
         length: metadata.len(),
         modified: metadata.modified().ok(),
+        variant: None,
     })
 }
 
@@ -344,7 +358,7 @@ pub async fn serve_hint(
     let status = u16::try_from(head.status).unwrap_or(500);
     let empty = HeaderMap::new();
     let conditional = if status == 200 { headers } else { &empty };
-    let mut outcome = respond(None, method, conditional, found, None).await;
+    let mut outcome = respond(None, method, conditional, found).await;
 
     if let Outcome::Served {
         response,
@@ -483,6 +497,7 @@ fn resolve(route: &StaticRoute, components: &[String], trailing_slash: bool) -> 
         relative: components.join("/"),
         length: metadata.len(),
         modified: metadata.modified().ok(),
+        variant: None,
     })
 }
 
@@ -519,7 +534,6 @@ async fn respond(
     method: &Method,
     headers: &HeaderMap,
     found: Found,
-    policy: Option<&Compression>,
 ) -> Outcome {
     let etag = etag(&found);
     let modified = found.modified.map(httpdate::fmt_http_date);
@@ -620,12 +634,7 @@ async fn respond(
         None => {}
     }
 
-    let variant = match policy {
-        Some(policy) => precompressed(&found.path, headers, policy).await,
-        None => None,
-    };
-
-    let (path, length, encoding) = match &variant {
+    let (path, length, encoding) = match &found.variant {
         Some((path, length, encoding)) => (path.clone(), *length, Some(*encoding)),
         None => (found.path.clone(), found.length, None),
     };
@@ -657,18 +666,11 @@ async fn respond(
     }
 }
 
-/// A precompressed variant of the file (`.br`, `.zst` or `.gz`) that the
-/// client accepts, in the policy's preference order, with its length.
-async fn precompressed(
-    path: &Path,
-    headers: &HeaderMap,
-    policy: &Compression,
-) -> Option<(PathBuf, u64, Encoding)> {
-    if !policy.enabled {
-        return None;
-    }
-
-    for encoding in policy.accepted(headers.get(http::header::ACCEPT_ENCODING)) {
+/// A precompressed variant of the file (`.br`, `.zst` or `.gz`) in one
+/// of the `accepted` encodings, in their order, with its length. On the
+/// blocking pool.
+fn precompressed(path: &Path, accepted: &[Encoding]) -> Option<(PathBuf, u64, Encoding)> {
+    for encoding in accepted {
         let suffix = match encoding {
             Encoding::Br => "br",
             Encoding::Zstd => "zst",
@@ -680,18 +682,21 @@ async fn precompressed(
         candidate.push(suffix);
         let candidate = PathBuf::from(candidate);
 
-        if let Ok(metadata) = tokio::fs::metadata(&candidate).await
+        if let Ok(metadata) = std::fs::metadata(&candidate)
             && metadata.is_file()
         {
-            return Some((candidate, metadata.len(), encoding));
+            return Some((candidate, metadata.len(), *encoding));
         }
     }
 
     None
 }
 
-/// The file's bytes from `start` for `length`, streamed in chunks, or an
-/// empty body for HEAD.
+/// The file's bytes from `start` for `length`, or an empty body for HEAD.
+/// The file is opened and its first chunk read in one call on the
+/// blocking pool, so a file that cannot be read is known before the
+/// response starts; a file no larger than a chunk is sent whole, and a
+/// larger one streamed, a chunk per call.
 async fn body_of(
     path: &Path,
     start: u64,
@@ -702,35 +707,61 @@ async fn body_of(
         return Ok(empty());
     }
 
-    let mut file = tokio::fs::File::open(path).await?;
+    let path = path.to_owned();
+    let (file, first) = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)?;
 
-    if start > 0 {
-        file.seek(std::io::SeekFrom::Start(start)).await?;
+        if start > 0 {
+            file.seek(std::io::SeekFrom::Start(start))?;
+        }
+
+        let first = read_chunk(&mut file, length)?;
+        Ok::<_, std::io::Error>((file, first))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    let remaining = length - first.len() as u64;
+
+    if remaining == 0 || first.is_empty() {
+        return Ok(Full::new(first)
+            .map_err(|never| match never {})
+            .boxed_unsync());
     }
 
-    let stream = futures::stream::try_unfold((file, length), |(mut file, remaining)| async move {
+    let rest = futures::stream::try_unfold((file, remaining), |(mut file, remaining)| async move {
         if remaining == 0 {
             return Ok(None);
         }
 
-        let wanted = usize::try_from(remaining.min(CHUNK as u64)).unwrap_or(CHUNK);
-        let mut buffer = vec![0u8; wanted];
-        let read = file.read(&mut buffer).await?;
+        let (file, chunk) = tokio::task::spawn_blocking(move || {
+            let chunk = read_chunk(&mut file, remaining)?;
+            Ok::<_, std::io::Error>((file, chunk))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
 
-        if read == 0 {
+        if chunk.is_empty() {
             return Ok(None);
         }
 
-        buffer.truncate(read);
-        Ok(Some((
-            Frame::data(Bytes::from(buffer)),
-            (file, remaining - read as u64),
-        )))
+        let remaining = remaining - chunk.len() as u64;
+        Ok(Some((Frame::data(chunk), (file, remaining))))
     });
+    let first = futures::stream::once(async move { Ok::<_, std::io::Error>(Frame::data(first)) });
+    let stream = futures::StreamExt::chain(first, rest);
 
     Ok(StreamBody::new(stream)
         .map_err(|error: std::io::Error| Box::new(error) as crate::BoxError)
         .boxed_unsync())
+}
+
+/// Up to a chunk of `file`, at most `remaining` bytes; empty at its end.
+fn read_chunk(file: &mut std::fs::File, remaining: u64) -> std::io::Result<Bytes> {
+    let wanted = remaining.min(CHUNK as u64);
+    let mut chunk = Vec::with_capacity(usize::try_from(wanted).unwrap_or(CHUNK));
+    file.take(wanted).read_to_end(&mut chunk)?;
+    Ok(Bytes::from(chunk))
 }
 
 /// A file that was found but could not be opened: a 404 rather than a
