@@ -2665,7 +2665,8 @@
         },
         "wheel_dir": {
           "description": "A local directory of wheels for the runtime library and for builds when offline.",
-          "type": "string"
+          "type": "string",
+          "x-default": "`MURU_WHEEL_DIR`, when set"
         }
       },
       "type": "object"

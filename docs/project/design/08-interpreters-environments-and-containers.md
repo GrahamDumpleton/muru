@@ -126,7 +126,7 @@ The runtime library is Muru's, not the application's (ADR 0037). muructl puts th
 
   2. A runtime directory for muructl's version and the interpreter's tag already exists: it is used.
 
-  3. Neither: muructl fetches the wheel, announcing it first, from PyPI with the published hash verified, or from `tools.wheel_dir`. The connection has a short timeout so a machine with no route fails in seconds, not minutes.
+  3. Neither: muructl fetches the wheel, announcing it first, from PyPI with the published hash verified, or from `tools.wheel_dir`, or `MURU_WHEEL_DIR` where the daemon's table names none, as in development. The connection has a short timeout so a machine with no route fails in seconds, not minutes.
 
   4. The fetch fails, or is not allowed, and the environment holds a `muru` of another version: it is used with a warning naming both versions, provided it speaks a protocol version muructl supports (section 5.8). Only when nothing usable exists does the release fail, naming both ways out: a wheel in `tools.wheel_dir`, or `pip install muru==VERSION` into the environment.
 

@@ -195,8 +195,8 @@ directory per interpreter tag, and goes to the network last:
 
 3. Else the wheel is fetched from PyPI, once per interpreter tag, with
    its published hash checked, or from a local directory of wheels named
-   by `MURU_WHEEL_DIR` under `muructl run` or `wheel_dir` in the daemon's
-   `[tools]` table.
+   by `MURU_WHEEL_DIR`, or under the daemon by `wheel_dir` in its `[tools]`
+   table, which wins over the variable.
 
 4. If that fails and the environment has `muru` of another version, it is
    used with a warning naming both versions.

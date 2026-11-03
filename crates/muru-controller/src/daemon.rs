@@ -3945,7 +3945,18 @@ impl Daemon {
         let tools = &self.info.provisioning.tools;
         let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
         let root = self.locations.state.path.join("runtime");
-        let wheel_dir = tools.wheel_dir.as_deref().map(PathBuf::from);
+
+        // The `[tools]` table's wheel directory, else the one the
+        // environment names, as `muructl run` takes it.
+
+        let (wheel_dir, named_by) = match tools.wheel_dir.as_deref() {
+            Some(directory) => (Some(PathBuf::from(directory)), "tools.wheel_dir"),
+            None => match muru_provision::runtime::wheel_dir_from_environment() {
+                Some(directory) => (Some(directory), muru_provision::runtime::WHEEL_DIR_VARIABLE),
+                None => (None, "tools.wheel_dir"),
+            },
+        };
+
         let options = muru_provision::runtime::Options {
             probe: &probe,
             version: &version,
@@ -3954,7 +3965,7 @@ impl Daemon {
             offline: tools.offline.unwrap_or(false),
         };
 
-        muru_provision::runtime::provide(&options, "tools.wheel_dir")
+        muru_provision::runtime::provide(&options, named_by)
             .await
             .map_err(|error| error.to_string())
     }

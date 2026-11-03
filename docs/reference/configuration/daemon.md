@@ -894,7 +894,7 @@ The `[tools]` table of the daemon's file: uv, and how interpreters are installed
 | `uv` | string |  | The uv to run, in place of the lookup order (`MURU_UV`, a uv beside muructl, uv on PATH, the managed copy). |
 | `uv_config` | string |  | A `uv.toml` passed to builds as their configuration file, for mirrors and TLS settings; the project's own `[tool.uv]` still applies. |
 | `uv_version` | string |  | The uv versions accepted, as a specifier such as `>=0.9`; the daemon reports what an older one cannot do. |
-| `wheel_dir` | string |  | A local directory of wheels for the runtime library and for builds when offline. |
+| `wheel_dir` | string | `MURU_WHEEL_DIR`, when set | A local directory of wheels for the runtime library and for builds when offline. |
 
 (config-daemon-upstream-name)=
 ## `[upstream.NAME]`

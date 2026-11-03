@@ -1249,6 +1249,7 @@ pub struct Tools {
     /// A local directory of wheels for the runtime library and for builds
     /// when offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`MURU_WHEEL_DIR`, when set"))]
     pub wheel_dir: Option<String>,
 }
 

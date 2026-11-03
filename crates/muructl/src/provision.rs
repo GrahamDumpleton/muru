@@ -9,7 +9,7 @@ use anyhow::Context;
 use clap::Subcommand;
 
 /// The setting that names a wheel directory in development.
-pub const WHEEL_DIR_VARIABLE: &str = "MURU_WHEEL_DIR";
+pub const WHEEL_DIR_VARIABLE: &str = muru_provision::runtime::WHEEL_DIR_VARIABLE;
 
 /// muructl's version as PyPI spells it.
 pub fn version() -> String {
@@ -28,9 +28,7 @@ pub fn offline() -> bool {
 
 /// The wheel directory named by `MURU_WHEEL_DIR`, if any.
 pub fn wheel_dir() -> Option<PathBuf> {
-    std::env::var_os(WHEEL_DIR_VARIABLE)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    muru_provision::runtime::wheel_dir_from_environment()
 }
 
 /// Provide the runtime library for a probed interpreter in development:
