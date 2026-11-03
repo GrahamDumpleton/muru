@@ -1,14 +1,5 @@
 # How scaling decides
 
-```{admonition} Status
-:class: note
-
-Everything on this page is implemented under the daemon, on one node.
-Scaling ahead of daily and weekly patterns learned from history, scaling
-the instances of a managed HTTP server, and scaling across nodes are
-still to come.
-```
-
 A worker group's processes are fixed unless the group has a scaling
 policy. With one, the daemon decides each second how many workers the
 group should have, and the [scaling guide](../howto/scaling.md) has the

@@ -1,14 +1,5 @@
 # Python API
 
-```{admonition} Status
-:class: note
-
-This is the runtime library's API as it exists today. The rest of the
-planned API (`muru.loop()`, `muru.asgi` and `muru.request_id()`) arrives
-with the features each belongs to; section 6.9 of the design
-specification lists them.
-```
-
 The `muru` package is installed in the interpreter that runs your
 application. It is safe to import anywhere, including outside Muru and in
 tests, where every function returns development defaults.

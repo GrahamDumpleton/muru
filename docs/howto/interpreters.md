@@ -161,7 +161,7 @@ muructl check --env-file check.env  # placeholder settings the import reads
 ```
 muru: check: [tool.muru] from pyproject.toml is valid
 muru: check: Python 3.13.9 (cp313) at .venv/bin/python (the project's .venv)
-muru: check: runtime library 0.1.0a13 from the environment
+muru: check: runtime library 1.0.0 from the environment
 muru: check: shop.wsgi:application is served as WSGI
 muru: check: hooks module shop.hooks defines on_load, on_reopen_logs
 muru: check: warning: the import of shop.db left a connected socket (fd 7, to 127.0.0.1:5432); open connections on first use, or in a post_fork hook

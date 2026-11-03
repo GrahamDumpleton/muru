@@ -420,24 +420,34 @@ def test_serve_runs_as_an_arbitrary_user_on_a_read_only_root(
 def test_serve_without_a_writable_run_directory_says_what_it_needs(
     image: str,
 ) -> None:
-    completed = subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--user",
-            "1000770000:0",
-            "--read-only",
-            image,
-            "muructl",
-            "serve",
-            "plain_wsgi:application",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    assert completed.returncode != 0
-    output = completed.stdout + completed.stderr
+    def serve(*options: str) -> str:
+        completed = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "1000770000:0",
+                *options,
+                image,
+                "muructl",
+                "serve",
+                "plain_wsgi:application",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        assert completed.returncode != 0
+        return completed.stdout + completed.stderr
+
+    # A read-only root filesystem needs a volume; a writable one that the
+    # user may not create the directory in needs the image to make it.
+
+    output = serve("--read-only")
     assert "/run/muru cannot be written" in output, output
+    assert "with a read-only root filesystem" in output, output
+    output = serve()
+    assert "/run/muru cannot be written by user 1000770000" in output, output
+    assert "RUN install -d -o 1000770000 -g 0 -m 0770 /run/muru" in output, output

@@ -1,14 +1,5 @@
 # Scaling
 
-```{admonition} Status
-:class: note
-
-The spare and target modes with their windows and churn budget, pins,
-scheduled capacity, the workers' CPU, GIL wait and event loop lag with
-a diagnosis of each group, `muructl scale status`, the node's budget
-across applications and scale to zero, under the daemon.
-```
-
 A worker group has a fixed number of processes unless it is given a
 scaling policy. With one, the daemon watches what the edge reports for the
 group each second, forks more workers when they are wanted and drains them

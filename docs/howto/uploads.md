@@ -1,19 +1,13 @@
 # Uploads
 
-```{admonition} Status
-:class: note
-
-Upload routes under the daemon: multipart forms and raw bodies stored by
-the edge, `muru.uploads` for WSGI and ASGI applications, digests, the
-limits and quotas, and the precheck. `muructl run` has no routes, so
-there uploads reach the application in the body as usual.
-```
-
 A route with `upload` set makes the edge receive the request body before
 the application sees the request, and store each file it carries. The
 application's thread or task is not held while a large file arrives, and
 the file is already on disk, with its digest computed, when the request
 reaches it.
+
+Upload routes are served under the daemon. `muructl run` has no routes,
+so there an upload reaches the application in the body as usual.
 
 ```toml
 [[route]]

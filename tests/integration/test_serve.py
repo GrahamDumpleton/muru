@@ -39,11 +39,13 @@ class Serve:
     stdout: list[str] = field(default_factory=list)
     stderr: list[str] = field(default_factory=list)
 
-    def get(self, path: str, port: int | None = None) -> tuple[int, str]:
+    def get(
+        self, path: str, port: int | None = None, headers: dict[str, str] | None = None
+    ) -> tuple[int, str]:
         connection = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=10)
 
         try:
-            connection.request("GET", path)
+            connection.request("GET", path, headers=headers or {})
             response = connection.getresponse()
             return response.status, response.read().decode()
         finally:
@@ -259,6 +261,23 @@ def test_settings_come_from_the_environment(tmp_path: Path) -> None:
         assert serve.stop() == 0
 
 
+def test_a_named_proxy_has_the_header_types_of_the_built_in_trust(tmp_path: Path) -> None:
+    # Naming loopback as a proxy applies X-Forwarded-Prefix as the trust
+    # serve has without one does, rather than the four types of [proxy].
+
+    serve = start(tmp_path, "--trusted-proxy", "loopback")
+    headers = {"X-Forwarded-For": "203.0.113.5", "X-Forwarded-Prefix": "/shop"}
+
+    try:
+        status, body = serve.get("/info", headers=headers)
+        assert status == 200, body
+        environ = json.loads(body)["environ"]
+        assert environ["REMOTE_ADDR"] == "203.0.113.5"
+        assert environ["SCRIPT_NAME"] == "/shop"
+    finally:
+        assert serve.stop() == 0
+
+
 def test_print_config_names_where_each_setting_came_from(tmp_path: Path) -> None:
     config = tmp_path / "serve.toml"
     config.write_text('access_log = "errors"\nthreads = 3\n')
@@ -379,7 +398,7 @@ def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
     assert gone.returncode == 1
 
 
-def test_an_unwritable_run_directory_names_the_volume_it_needs(tmp_path: Path) -> None:
+def test_an_unwritable_run_directory_says_what_fixes_it(tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("root can write anywhere")
 
@@ -393,7 +412,8 @@ def test_an_unwritable_run_directory_names_the_volume_it_needs(tmp_path: Path) -
         time.sleep(0.2)
         message = serve.output() + "".join(serve.stderr)
         assert "cannot be written" in message, message
-        assert "emptyDir" in message, message
+        assert f"cannot be written by user {os.getuid()}" in message, message
+        assert "mount a writable volume at" in message, message
     finally:
         locked.chmod(0o700)
 

@@ -9,7 +9,7 @@ behaviour. See the [specification index](index.md) for status and how the
 specification is maintained.
 ```
 
-User documentation is a Sphinx site hosted on Read the Docs, organised by the Diátaxis model (tutorials, how-to guides, reference, explanation). Reference pages are generated from the same definitions the code uses, so they cannot drift from the implementation.
+User documentation is a Sphinx site hosted on Read the Docs at docs.muruhq.dev, organised by the Diátaxis model (tutorials, how-to guides, reference, explanation). Reference pages are generated from the same definitions the code uses, so they cannot drift from the implementation.
 
 ## 18.1 Tooling
 

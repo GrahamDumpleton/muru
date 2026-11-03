@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR 0045
 date: 2026-10-23
 ---
 
@@ -45,3 +45,7 @@ before the first public announcement.
 ## More information
 
 Specification sections 17.1, 18.4 and 19.1.
+
+Superseded by [ADR 0045](0045-repositories-and-images-under-the-muruhq-organisation.md),
+which moves the repository and images to the muruhq organisation. The
+licence decision stands.

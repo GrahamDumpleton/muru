@@ -1,12 +1,5 @@
 # Scaling under load
 
-```{admonition} Status
-:class: note
-
-This tutorial assumes you have done
-[deploy with the daemon and roll back](deploy-and-roll-back.md).
-```
-
 A release has a fixed number of worker processes unless it is given a
 scaling policy. With one, the daemon watches how busy the release is
 every second, forks more workers when requests start to wait, and drains
@@ -18,6 +11,9 @@ In about fifteen minutes you will deploy an application with a scaling
 policy, put load on it and watch it grow, take the load away and watch it
 shrink, and then let it scale to no workers at all and wake on the next
 request.
+
+This tutorial assumes you have done [deploy with the daemon and roll
+back](deploy-and-roll-back.md).
 
 ## A slow application
 
@@ -110,8 +106,10 @@ and none fails.
 
 The diagnosis line describes the latest second. With five workers the
 group is just within capacity, so it may also read I/O bound when all
-eight clients are waiting at once. Why it grew is in the decision, which
-is an event with its reasons:
+eight clients are waiting at once. The `last:` line is the latest
+decision, which may be the spare rule's instead, `0.0 idle workers, under
+min_spare 1`, when the group ran out of idle workers on its way up. Why it
+grew is in the decisions, each an event with its reasons:
 
 ```
 muructl events

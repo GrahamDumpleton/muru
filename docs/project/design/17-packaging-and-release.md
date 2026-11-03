@@ -18,11 +18,10 @@ Two distributions are published to PyPI from one tag, with the same version numb
 | muructl wheels (PyPI) | The muructl executable (maturin, bindings = bin). Optional extra muructl[uv] adds a tested range of the uv package | py3-none for manylinux_2_28 x86_64 and aarch64, musllinux_1_2 x86_64 and aarch64, macOS arm64 and x86_64 |
 | muru wheels (PyPI) | Python sources, stubs and the PyO3 extension | version-specific wheels for each supported CPython (cp311 to cp315, cp314t and cp315t, and newer versions as they are released) for the same platforms. The stable ABI (abi3) is not used: free-threaded builds cannot use it, so version-specific wheels keep one build path for both, and allow the full C API where it helps performance |
 | sdists (PyPI) | Both distributions, buildable with a Rust toolchain | any |
-| Standalone binaries (GitHub Releases) | muructl tarballs per platform, SHA-256 checksums, SBOM (CycloneDX) | Linux and macOS |
-| Base images (GHCR) | ghcr.io/grahamdumpleton/muru-python:VERSION-pyX.Y variants (slim, free-threaded, distroless), signed with cosign keyless signatures | linux/amd64 and linux/arm64 |
+| Standalone binaries (GitHub Releases, later) | muructl tarballs per platform, SHA-256 checksums, SBOM (CycloneDX) | Linux and macOS |
 | Documentation | Built by Read the Docs for each tag |  |
 
-The source repository is github.com/GrahamDumpleton/muru, and images are published to the GitHub Container Registry under the same account (registry paths are lowercase). The PyPI names muru and muructl are registered, with the 0.1.0 pre-releases. The runtime library has no Python dependencies, which is what allows the daemon to install it by unpacking a wheel (section 8.3).
+The source repository is github.com/muruhq/muru, and any image Muru publishes goes to the GitHub Container Registry under the same organisation (registry paths are lowercase). None is published now: an image gets muructl from the wheels with uv tool install, and there are no base images, no muructl image and no bundle of runtime libraries (ADR 0046). The PyPI names muru and muructl are registered, with the 0.1.0 pre-releases. The runtime library has no Python dependencies, which is what allows the daemon to install it by unpacking a wheel (section 8.3).
 
 ## 17.2 Versioning
 
@@ -40,7 +39,6 @@ flowchart LR
   S --> A{Approval for the pypi environment}
   A --> P[Publish to PyPI with trusted publishing and attestations]
   P --> G[GitHub Release: notes from changelog, binaries, checksums, SBOM]
-  P --> I[Build, test, sign and push base images]
   P --> D[Read the Docs builds the tagged version]
 ```
 
@@ -54,5 +52,5 @@ flowchart LR
 1. Release pull request from develop to main: version bump in Cargo.toml (the only place the version is stated; the distributions, the Python package and the documentation take it from there), changelog built, documentation updated.
 2. Merge, then tag vX.Y.Z on main.
 3. Watch release.yml, approve the pypi environment once the builds and smoke tests have passed.
-4. Check the GitHub Release, images and documentation version.
+4. Check the GitHub Release and documentation version.
 5. Announce, including protocol and configuration compatibility notes.

@@ -482,5 +482,12 @@ mod tests {
             .contains("two sinks are named ops")
         );
         assert!(refused("[proxy]\ntrusted = ['not an address']\n").starts_with("[proxy]"));
+
+        // A zero or an empty list would stand for the default in the
+        // snapshot, so it is refused rather than quietly replaced.
+
+        assert!(refused("[compression]\nmin_size = '0'\n").contains("at least 1 byte"));
+        assert!(refused("[compression]\nencodings = []\n").contains("enabled = false"));
+        assert!(refused("[compression]\ntypes = []\n").contains("enabled = false"));
     }
 }

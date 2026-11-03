@@ -1,14 +1,5 @@
 # Behind a load balancer or proxy
 
-```{admonition} Status
-:class: note
-
-The `[proxy]` table in the daemon's configuration file, with Forwarded,
-X-Forwarded-For, -Proto, -Host, -Port, -Prefix and X-Real-IP. Per-host
-and per-listener settings and client certificate headers are still to
-come.
-```
-
 When requests arrive through a load balancer, a CDN or another proxy, the
 peer the edge sees is the proxy, not the client. The daemon's
 configuration file names the proxies to trust and which of their headers
@@ -26,16 +17,23 @@ Nothing is trusted by default. A forwarding header from a peer that is
 not trusted is removed before the request reaches the application, so a
 client cannot claim another address by sending X-Forwarded-For itself.
 
-`muructl run` is the exception: it trusts loopback peers for every header
-type but `x-real-ip`, with nothing to configure, since it serves loopback
-and a forwarding header can only come from a proxy on the same machine.
+`muructl run` and `muructl serve` are the exception: they trust loopback
+peers for every header type but `x-real-ip`, with nothing to configure,
+since a forwarding header from a loopback peer can only come from a proxy
+on the same machine or in the same pod.
 So an application behind jupyter-server-proxy, code-server or another
 development proxy that mounts it under a path gets `SCRIPT_NAME` (or
 `root_path`) from X-Forwarded-Prefix as it is. The same holds with
-`--allow-public`, for loopback peers only. Their headers are all it
-trusts: a loopback peer is as often a browser as a proxy, so it keeps a
+`--allow-public`, for loopback peers only. Their headers are all that is
+trusted: a loopback peer is as often a browser as a proxy, so it keeps a
 client's share of connections and keep-alive timeout rather than a
 proxy's.
+
+`muructl serve --trusted-proxy`, or `trusted_proxy` in its settings,
+names the proxies instead, loopback no longer among them unless named. A
+named proxy's headers are applied for the same header types, and it gets
+a proxy's share of connections and keep-alive timeout, since naming it
+says that it is one.
 
 `trusted` lists addresses, CIDR ranges (IPv4 or IPv6), or the words
 `loopback`, `private` (RFC 1918, unique local and link-local addresses)

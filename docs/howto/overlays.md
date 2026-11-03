@@ -1,18 +1,5 @@
 # Overlays
 
-```{admonition} Status
-:class: note
-
-Overlays activated by hand or by a one-off or recurring schedule, over
-routes and applications: site modes, method restrictions, traffic pins
-and splits, route targets, rate limits, error pages, routes for client
-classes and maintenance mode, with preconditions, warm-up, advisory and latched schedules, previews and
-promotion, the capacity and deploy freezes of
-[schedules](scaling.md#scheduled-capacity), a signed webhook for
-monitoring systems, and `config show --effective`. Overlays that activate
-on conditions are still to come.
-```
-
 An overlay is a named piece of configuration laid over the routes and
 applications while it is active. The configuration underneath never
 changes: when the overlay ends, the routes are as they were, including

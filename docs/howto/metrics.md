@@ -1,17 +1,5 @@
 # Metrics
 
-```{admonition} Status
-:class: note
-
-The daemon serves request counters and histograms, slot and queue gauges,
-the workers ready, each worker's requests, memory, CPU time, GIL waits,
-event loop lag and garbage collections, the workers recycled and exited, the autoscaler's decisions
-and reaps, and each listener's connections and TLS handshakes in the
-Prometheus text format, on a metrics listener and through `muructl
-metrics`; a development run serves the request and connection figures from
-its dashboard. OTLP export is still to come.
-```
-
 Muru counts what the edge does with each request and what the daemon
 knows about the workers, and serves the figures in the Prometheus text
 format at `/metrics`.

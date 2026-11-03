@@ -1,15 +1,5 @@
 # Virtual hosts and TLS
 
-```{admonition} Status
-:class: note
-
-Virtual hosts with exact and single-label wildcard names, a default host,
-path-prefix routes to applications, TLS listeners with a certificate per
-host chosen by SNI, and HTTPS redirects. Regular expression names,
-host-level limits and error pages, and automatic certificates are still
-to come.
-```
-
 The daemon serves several applications on one node by name. Virtual
 hosts and routes are declared in files and applied with `muructl apply`,
 alongside the applications they route to (see

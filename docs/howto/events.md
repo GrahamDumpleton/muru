@@ -1,13 +1,8 @@
 # Events and webhooks
 
-```{admonition} Status
-:class: note
-
-The daemon records every change of state as an event, `muructl events`
+The daemon records every change of state as an event. `muructl events`
 shows or follows them, and webhook sinks receive them as signed
-CloudEvents requests. OTLP, journald and file sinks, and the audit log,
-are still to come.
-```
+CloudEvents requests.
 
 ## The event stream
 

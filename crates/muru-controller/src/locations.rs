@@ -147,6 +147,14 @@ impl Locations {
             || default_cache(mode, home.as_deref()),
         );
 
+        // A relative state, config, log or cache directory is taken from
+        // where the command runs, and made absolute here: a release's host
+        // starts in the release's source, where the relative path to the
+        // runtime library under the state directory would not resolve. The
+        // run directory is refused instead (check_run_dir).
+
+        let [state, config, logs, cache] = [state, config, logs, cache].map(absolute);
+
         // A configuration directory holds the file; a file is used as is.
 
         let config = if config.path.is_dir() || config.rule == "systemd" {
@@ -246,6 +254,14 @@ fn pick(
     }
 }
 
+/// The location with its path made absolute against the working directory.
+fn absolute(location: Location) -> Location {
+    Location {
+        path: std::path::absolute(&location.path).unwrap_or(location.path),
+        rule: location.rule,
+    }
+}
+
 fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
 
@@ -342,6 +358,23 @@ mod tests {
             PathBuf::from("/tmp/run/admin.sock")
         );
         assert_eq!(locations.cache.rule, "default");
+    }
+
+    #[test]
+    fn relative_directories_are_made_absolute_but_the_run_directory_is_not() {
+        let options = Options {
+            state_dir: Some(PathBuf::from("muru/state")),
+            cache_dir: Some(PathBuf::from("muru/cache")),
+            run_dir: Some(PathBuf::from("muru/run")),
+            ..Options::default()
+        };
+        let locations = Locations::resolve(&options);
+        let here = env::current_dir().unwrap();
+
+        assert_eq!(locations.state.path, here.join("muru/state"));
+        assert_eq!(locations.cache.path, here.join("muru/cache"));
+        assert_eq!(locations.state.rule, "option");
+        assert!(locations.check_run_dir().is_err());
     }
 
     #[test]

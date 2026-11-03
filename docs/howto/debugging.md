@@ -1,16 +1,5 @@
 # Inspecting workers
 
-```{admonition} Status
-:class: note
-
-Status, stacks, tasks, inspect, logger levels, profiling, tracing,
-memory, running a snippet, a pdb session with `breakpoint()`, and the
-automatic captures, answered from inside each worker by the runtime's
-control thread, with faulthandler when a worker cannot answer, and the
-Debug Adapter Protocol for IDEs, and stacks and profiles read from
-outside the worker with PEP 768 on Linux.
-```
-
 `muructl debug` looks into the workers of a release through the daemon,
 the host and the worker's control connection, so nothing listens anywhere
 new. Each command takes a release as `app@release`, or an application for
@@ -339,5 +328,5 @@ the host has one to the daemon. A request travels daemon to host to
 worker, where a thread of the runtime library takes it, attaches to the
 interpreter only to answer, and sends the answer back the same way. The
 daemon never reaches into a worker process directly, which is what lets
-the same commands work on a release running as another user or, later,
-in a container.
+the same commands work on a release running as another user, and on
+an application in a container under `muructl serve`.

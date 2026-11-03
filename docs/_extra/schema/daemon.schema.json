@@ -1,0 +1,2964 @@
+{
+  "$defs": {
+    "App": {
+      "additionalProperties": false,
+      "description": "An application's table and its releases.",
+      "properties": {
+        "group": {
+          "description": "The group, else the user's primary group.",
+          "type": "string",
+          "x-default": "the user's primary group"
+        },
+        "priority": {
+          "default": 0,
+          "description": "Which applications' scale-ups the node's budget admits first, the highest first.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "release": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Release"
+          },
+          "default": {},
+          "description": "Releases by identifier.",
+          "type": "object"
+        },
+        "schedule": {
+          "description": "Scheduled capacity.",
+          "items": {
+            "$ref": "#/$defs/CapacitySchedule"
+          },
+          "type": "array"
+        },
+        "umask": {
+          "description": "The file creation mask, in octal, for example 027.",
+          "type": "string",
+          "x-default": "the daemon's own umask"
+        },
+        "user": {
+          "description": "The user the application's hosts and workers run as, when the daemon runs as root.",
+          "type": "string",
+          "x-default": "the daemon's own user"
+        }
+      },
+      "type": "object"
+    },
+    "AppOverlay": {
+      "additionalProperties": false,
+      "description": "What an overlay changes on an application: its maintenance mode, and its scheduled capacity, for its default worker group or `group`. Capacity does not conflict between overlays: the highest floor and ceiling stand.",
+      "properties": {
+        "answer": {
+          "default": "read_only",
+          "description": "How refused methods are answered, with the values a route's `methods.answer` takes.",
+          "type": "string"
+        },
+        "deny": {
+          "description": "Methods refused on each of the application's routes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "freeze_deploys": {
+          "default": false,
+          "description": "Refuse deploys and rollouts of the application unless overridden.",
+          "type": "boolean"
+        },
+        "group": {
+          "default": "default",
+          "description": "The worker group the capacity applies to; the default group without it.",
+          "type": "string"
+        },
+        "maintenance": {
+          "description": "Maintenance mode while the overlay is active.",
+          "type": "boolean"
+        },
+        "max_workers": {
+          "description": "The most workers, a ceiling over the group's own.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_workers": {
+          "description": "The fewest workers, a floor over the group's own.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "The site mode on each of the application's routes.",
+          "type": "string"
+        },
+        "scale_in": {
+          "default": "normal",
+          "description": "`hold` keeps the group from scaling in; `normal` (the default) leaves it to the autoscaler's rules.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Auth": {
+      "additionalProperties": false,
+      "description": "A route's authentication sub-request: the edge sends a bodiless GET to an application path and serves the route only when that answers 2xx.",
+      "properties": {
+        "app": {
+          "description": "The application that decides; empty when an upstream does.",
+          "type": "string"
+        },
+        "cache": {
+          "$ref": "#/$defs/AuthCache",
+          "description": "Remember allowing decisions for a while (off without it)."
+        },
+        "copy_headers": {
+          "description": "Response headers of an allowing answer added to the request as trusted headers; a client's own copies are always removed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "The path asked, usually of an internal mount or route.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "2s",
+          "description": "How long the handler has, queueing included, for example 2s.",
+          "type": "string"
+        },
+        "upstream": {
+          "description": "The HTTP upstream that decides, instead of an application.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "AuthCache": {
+      "additionalProperties": false,
+      "description": "How long and by what an allowing decision is remembered.",
+      "properties": {
+        "key": {
+          "description": "What a decision is keyed by: `cookie:NAME` and `header:NAME` entries. A request with none of them present is never served from the cache.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ttl": {
+          "description": "How long a decision stands, for example 30s.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ttl",
+        "key"
+      ],
+      "type": "object"
+    },
+    "BorrowedThreads": {
+      "additionalProperties": false,
+      "description": "The table form of a mount's threads.",
+      "properties": {
+        "max": {
+          "description": "The most requests the mount runs at once, on its reserved threads and borrowed ones together.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reserved": {
+          "description": "Threads only the mount uses.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "reserved",
+        "max"
+      ],
+      "type": "object"
+    },
+    "Budget": {
+      "additionalProperties": false,
+      "description": "The `[daemon.budget]` table: what the releases on the node may hold between them. Each limit is off when omitted.",
+      "properties": {
+        "cpu": {
+          "description": "CPU cores the workers use, as measured.",
+          "format": "double",
+          "type": "number"
+        },
+        "memory": {
+          "description": "Memory for the hosts and workers, as a size such as 12GB.",
+          "type": "string"
+        },
+        "workers": {
+          "description": "Worker processes and managed server instances.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Build": {
+      "additionalProperties": false,
+      "description": "The `[tool.muru.build]` table: when and how the release's environment is built from the lock. `when` is read by `muructl run` and the daemon alike; the rest describes the deployment flavour, which development ignores.",
+      "properties": {
+        "compile_bytecode": {
+          "default": true,
+          "description": "Compile bytecode at build time.",
+          "type": "boolean"
+        },
+        "extras": {
+          "description": "Extras the deployment environment includes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "groups": {
+          "description": "Dependency groups beyond the defaults; dev is never included.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "source_builds": {
+          "default": false,
+          "description": "Allow sdists to be built on the node.",
+          "type": "boolean"
+        },
+        "when": {
+          "$ref": "#/$defs/BuildWhen",
+          "description": "When an environment is built: `auto` builds a missing one and leaves an existing one alone, `always` builds on every start and on a lock change, `never` builds nothing. `muructl serve` never builds one.",
+          "x-default": "`auto`; `never` under `muructl run --allow-public`"
+        }
+      },
+      "type": "object"
+    },
+    "BuildWhen": {
+      "description": "When an environment is built.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Build a missing environment; leave an existing one alone at start, and under `muructl run` build when the lock changes.",
+          "type": "string"
+        },
+        {
+          "const": "always",
+          "description": "Build before every start too.",
+          "type": "string"
+        },
+        {
+          "const": "never",
+          "description": "Build nothing.",
+          "type": "string"
+        }
+      ]
+    },
+    "Bytecode": {
+      "description": "Where compiled bytecode goes for a daemon-managed release.",
+      "oneOf": [
+        {
+          "const": "redirect",
+          "description": "A writable directory of the release's own under the state directory, so nothing lands in the source tree (the default).",
+          "type": "string"
+        },
+        {
+          "const": "source",
+          "description": "`__pycache__` beside the source, as Python does by default; what a release with precompiled bytecode uses.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "No bytecode is written.",
+          "type": "string"
+        }
+      ]
+    },
+    "CacheTable": {
+      "additionalProperties": false,
+      "description": "A static route's cache headers.",
+      "properties": {
+        "except": {
+          "description": "Files that get no-cache instead, by pattern on their path within the route.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "immutable": {
+          "default": false,
+          "description": "Whether files are marked immutable.",
+          "type": "boolean"
+        },
+        "max_age": {
+          "description": "How long clients may keep a file, for example 1y or 1h.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "CapacitySchedule": {
+      "additionalProperties": false,
+      "description": "An `[[app.NAME.schedule]]` entry: capacity for a window, shorthand for an overlay named `APP.NAME` that sets only the floor, the ceiling, how scale-in behaves and a deploy freeze.",
+      "properties": {
+        "cron": {
+          "description": "A recurring window's start times.",
+          "type": "string"
+        },
+        "duration": {
+          "description": "A recurring window's length.",
+          "type": "string"
+        },
+        "end": {
+          "description": "A one-off window's end.",
+          "type": "string"
+        },
+        "freeze_deploys": {
+          "default": false,
+          "description": "Refuse deploys and rollouts during the window.",
+          "type": "boolean"
+        },
+        "group": {
+          "default": "default",
+          "description": "The worker group; the default group without it.",
+          "type": "string"
+        },
+        "max_workers": {
+          "description": "The most workers during the window.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_workers": {
+          "description": "The fewest workers during the window.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "The schedule's name, unique within the application.",
+          "type": "string"
+        },
+        "scale_in": {
+          "default": "normal",
+          "description": "`hold` keeps the group from scaling in during the window; `normal`, the default, leaves it to the autoscaler.",
+          "type": "string"
+        },
+        "start": {
+          "description": "A one-off window's start, as for an overlay's schedule.",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "The time zone of local times.",
+          "type": "string",
+          "x-default": "the daemon's system time zone"
+        },
+        "warm_up": {
+          "description": "How long before each window the floor applies, such as 30m.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "ClientClass": {
+      "additionalProperties": false,
+      "description": "A `[[client_class]]` rule. A request gets the class when every input the rule names matches, each input matching when any of its entries does; rules are tried in order and a request that matches none is class `default`.",
+      "properties": {
+        "address_list": {
+          "description": "A file of addresses and networks, one a line, as for `user_agent_list`.",
+          "type": "string"
+        },
+        "addresses": {
+          "description": "Client addresses and networks, such as 203.0.113.0/24.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cookies": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Cookies by name, each value matched by a regular expression.",
+          "type": "object"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Request headers by name, each value matched by a regular expression: a CDN's verdict, say.",
+          "type": "object"
+        },
+        "ja4": {
+          "description": "JA4 fingerprints of the client's TLS ClientHello, or their beginnings ending in `*`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ja4_list": {
+          "description": "A file of JA4 fingerprints, one a line, as for `user_agent_list`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The class's name, as logs, metrics, rate limits and applications see it.",
+          "type": "string"
+        },
+        "user_agent": {
+          "description": "User-Agent substrings, compared without regard to case.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "user_agent_list": {
+          "description": "A file of User-Agent substrings, one a line, relative to the configuration file's directory and read again when it changes.",
+          "type": "string"
+        },
+        "user_agent_regex": {
+          "description": "Regular expressions matched against the User-Agent header.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verify": {
+          "description": "`dns` confirms the client's address by reverse and forward lookup against `verify_domains`; until it is confirmed the rule does not match.",
+          "type": "string"
+        },
+        "verify_domains": {
+          "description": "The domains a verified name must be, or end in.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "ClientMatch": {
+      "additionalProperties": false,
+      "description": "The requests a rate limit or route applies to.",
+      "properties": {
+        "client_class": {
+          "description": "Client classes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "CommandInput": {
+      "additionalProperties": false,
+      "description": "An input a command takes.",
+      "properties": {
+        "default": {
+          "description": "The value when none is given.",
+          "type": "string"
+        },
+        "description": {
+          "description": "What the value is, for `muructl command list` and prompts.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "A regular expression the whole value must match.",
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "description": "The command refuses to run without it.",
+          "type": "boolean"
+        },
+        "secret": {
+          "default": false,
+          "description": "The value is never shown, logged or put in an event, and may only be used in `env`.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "CommandTable": {
+      "additionalProperties": false,
+      "description": "A command an application declares, the `[tool.muru.commands.NAME]` or `[app.NAME.release.ID.commands.NAME]` table: a program to run, or a Python callable to call, with the release.",
+      "properties": {
+        "call": {
+          "description": "A callable as module:function, called with the inputs as keyword arguments, instead of `run`.",
+          "type": "string"
+        },
+        "description": {
+          "description": "What the command does, for `muructl command list`.",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables for this command alone, over the release's, with `{name}` where an input's value goes.",
+          "type": "object"
+        },
+        "exclusive": {
+          "default": false,
+          "description": "Run one at a time for the application: a run asked for while one is under way is refused.",
+          "type": "boolean"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CommandInput"
+          },
+          "description": "The values the command takes, by name.",
+          "type": "object"
+        },
+        "run": {
+          "description": "The program and its arguments, run without a shell, with `{name}` where an input's value goes; `python` is the release's interpreter.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "timeout": {
+          "description": "How long it may run before it is stopped, for example 10m; no limit when absent.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Compression": {
+      "additionalProperties": false,
+      "description": "The `[compression]` table: how the edge compresses responses. Every key is optional.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether responses are compressed at all.",
+          "type": "boolean"
+        },
+        "encodings": {
+          "default": [
+            "br",
+            "zstd",
+            "gzip"
+          ],
+          "description": "The encodings offered in preference order: br, zstd and gzip. An empty list is refused; `enabled = false` turns compression off.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "level": {
+          "default": "default",
+          "description": "How hard to compress: fast, default or best.",
+          "type": "string"
+        },
+        "min_size": {
+          "default": "1KB",
+          "description": "The smallest body worth compressing, for example 1KB; at least 1 byte.",
+          "type": "string"
+        },
+        "types": {
+          "default": [
+            "text/*",
+            "application/json",
+            "application/javascript",
+            "application/xml",
+            "image/svg+xml"
+          ],
+          "description": "The content types compressed: exact types or a family as text/*. An empty list is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Daemon": {
+      "additionalProperties": false,
+      "description": "The `[daemon]` table of the daemon's file: how the daemon itself runs.",
+      "properties": {
+        "budget": {
+          "$ref": "#/$defs/Budget",
+          "description": "The node's budget across every application."
+        },
+        "debug_exec": {
+          "default": false,
+          "description": "Allow `muructl debug exec`, which runs code in a worker; off unless set.",
+          "type": "boolean"
+        },
+        "user": {
+          "default": "muru",
+          "description": "The service user: whom a daemon that runs as root starts the edge, and the applications that name no user of their own, as. Never root.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Dashboard": {
+      "additionalProperties": false,
+      "description": "The `[dashboard]` table: where the daemon serves its dashboard and JSON gateway, and whether it takes actions.",
+      "properties": {
+        "actions": {
+          "default": false,
+          "description": "Whether a person signed in with `muructl dashboard login` may act from the dashboard; read-only when false.",
+          "type": "boolean"
+        },
+        "listen": {
+          "description": "The loopback address the dashboard is served on, such as 127.0.0.1:8090; not served when omitted.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "EnvValue": {
+      "anyOf": [
+        {
+          "description": "The value as written.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/SecretValue",
+          "description": "A secret reference."
+        }
+      ],
+      "description": "A value in an `[env]` table: the text itself, or a reference to a secret in a store, delivered as the variable or, with `as = 'file'`, as a file whose path is in `NAME_FILE`."
+    },
+    "ErrorOverride": {
+      "additionalProperties": false,
+      "description": "Replacing an application's own error responses with error pages, the `error_override` table.",
+      "properties": {
+        "statuses": {
+          "description": "The statuses whose responses are replaced.",
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "when": {
+          "default": "all",
+          "description": "When a listed response is replaced: `all` (the default), `empty_body`, `not_json` or `html_only`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ErrorPage": {
+      "additionalProperties": false,
+      "description": "A custom error page: one entry of an `error_pages` table, keyed by status (`404`) or status and reason (`\"503:maintenance\"`). Exactly one of `file`, `template` and `path` is given.",
+      "properties": {
+        "content_type": {
+          "default": "text/html; charset=utf-8",
+          "description": "The content type of a template.",
+          "type": "string"
+        },
+        "file": {
+          "description": "A file sent as the body, with the content type its name implies. A release's page may be a path relative to its source directory; elsewhere the path is absolute.",
+          "type": "string"
+        },
+        "path": {
+          "description": "An application path the edge asks for the page, as an internal sub-request that sees `REDIRECT_STATUS` and `muru.error_reason`.",
+          "type": "string"
+        },
+        "template": {
+          "description": "A template the edge renders, with `{status}`, `{title}`, `{reason}`, `{description}`, `{request_id}`, `{retry_after}`, `{host}` and `{path}` filled in.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "EventSink": {
+      "additionalProperties": false,
+      "description": "An `[[events.sink]]` entry: a webhook that receives events as signed CloudEvents requests.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/SinkKind",
+          "default": "webhook",
+          "description": "The kind of sink; only webhook for now."
+        },
+        "levels": {
+          "description": "Levels delivered (info, notice, warning, error); every level when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "The sink's name.",
+          "type": "string"
+        },
+        "secret": {
+          "description": "The key deliveries are signed with.",
+          "type": "string"
+        },
+        "secret_file": {
+          "description": "A file holding the key, instead of `secret`.",
+          "type": "string"
+        },
+        "types": {
+          "description": "Event types delivered, as patterns such as `release.*`; every type when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "url": {
+          "description": "Where deliveries go, an http:// or https:// URL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "url"
+      ],
+      "type": "object"
+    },
+    "Events": {
+      "additionalProperties": false,
+      "description": "The `[events]` table: the sinks events are pushed to.",
+      "properties": {
+        "sink": {
+          "description": "The sinks, each an `[[events.sink]]` entry.",
+          "items": {
+            "$ref": "#/$defs/EventSink"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "FactoryPhase": {
+      "description": "When a factory entrypoint is called.",
+      "oneOf": [
+        {
+          "const": "worker",
+          "description": "In each worker, after the post_fork hook.",
+          "type": "string"
+        },
+        {
+          "const": "host",
+          "description": "Once in the host, during preload.",
+          "type": "string"
+        }
+      ]
+    },
+    "Fallback": {
+      "additionalProperties": false,
+      "description": "A static route's fallback: an application, or a file within the directory.",
+      "properties": {
+        "app": {
+          "description": "The application that takes requests no file answers.",
+          "type": "string"
+        },
+        "file": {
+          "description": "The file served for paths with no file of their own.",
+          "type": "string"
+        },
+        "upstream": {
+          "description": "The HTTP upstream that takes them instead.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ForwardedHeaders": {
+      "description": "How forwarding headers are left after they have been applied.",
+      "oneOf": [
+        {
+          "const": "keep",
+          "description": "The configured headers stay for the application, other forwarding headers are removed.",
+          "type": "string"
+        },
+        {
+          "const": "consume",
+          "description": "Every forwarding header is removed; the application sees only the resolved values.",
+          "type": "string"
+        }
+      ]
+    },
+    "Group": {
+      "additionalProperties": false,
+      "description": "A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NAME]` table: the paths it serves and its own sizes. Paths not claimed by a group go to the default group, which is the release's own settings.",
+      "properties": {
+        "concurrency": {
+          "description": "Requests an ASGI worker's event loop takes at once.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
+        "match": {
+          "$ref": "#/$defs/GroupMatch",
+          "description": "What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path."
+        },
+        "max_lifetime": {
+          "description": "How long a worker of the group lives before it is replaced, for example 1h, with jitter.",
+          "type": "string",
+          "x-default": "the release's"
+        },
+        "max_requests": {
+          "description": "Requests a worker of the group serves before it is replaced, with jitter.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
+        "memory": {
+          "$ref": "#/$defs/Memory",
+          "description": "The group's own memory policy, each key the release's when absent."
+        },
+        "mounts": {
+          "description": "The named mounts the group's workers serve, beside the default mount, which every worker serves; every mount when absent. The group's paths must lie within them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "optional": {
+          "default": false,
+          "description": "Whether the release is ready without the group's workers: its requests wait until one listens.",
+          "type": "boolean"
+        },
+        "paths": {
+          "description": "Path prefixes, with an optional trailing `*`; the most specific match across all groups wins.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "processes": {
+          "description": "The group's worker processes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's, or `scaling.min_workers` when higher"
+        },
+        "scaling": {
+          "$ref": "#/$defs/Scaling",
+          "description": "How the group is scaled; static when absent."
+        },
+        "sync_threads": {
+          "description": "Threads for synchronous code called from an ASGI application.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
+        "threads": {
+          "description": "Application threads per worker.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the release's"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts",
+          "description": "The group's own timeouts, each the release's when absent; `shutdown_timeout` and `websocket_drain_grace` belong to the release."
+        }
+      },
+      "type": "object"
+    },
+    "GroupMatch": {
+      "additionalProperties": false,
+      "description": "The requests a worker group takes for its paths: every list given must name the request's class, host or method.",
+      "properties": {
+        "client_class": {
+          "description": "Client classes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "host": {
+          "description": "Hosts: a virtual host's name or a name it answers to, or under `muructl run` the name the request carries.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "method": {
+          "description": "Methods, compared in upper case.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Handoff": {
+      "description": "The interface a release's or a mount's requests may be handed to: ASGI from a WSGI application, WSGI from an ASGI one.",
+      "oneOf": [
+        {
+          "const": "asgi",
+          "description": "Continue the request as an ASGI application on the event loop.",
+          "type": "string"
+        },
+        {
+          "const": "wsgi",
+          "description": "Continue the request as a WSGI callable on the thread pool.",
+          "type": "string"
+        }
+      ]
+    },
+    "Host": {
+      "additionalProperties": false,
+      "description": "A virtual host, the `[host.NAME]` table.",
+      "properties": {
+        "canonical": {
+          "description": "The name the host is known by, for `use_canonical_name`.",
+          "type": "string"
+        },
+        "default": {
+          "default": false,
+          "description": "Answer requests whose host matches no virtual host, which are otherwise refused with 421.",
+          "type": "boolean"
+        },
+        "error_override": {
+          "$ref": "#/$defs/ErrorOverride",
+          "description": "Replace the application's own error responses with error pages."
+        },
+        "error_pages": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ErrorPage"
+          },
+          "description": "Custom error pages, by status or status:reason.",
+          "type": "object"
+        },
+        "https_redirect": {
+          "default": false,
+          "description": "Redirect plain HTTP requests to HTTPS.",
+          "type": "boolean"
+        },
+        "listeners": {
+          "description": "The listener addresses it answers on; every listener when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "names": {
+          "description": "The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rate_limits": {
+          "description": "The `[rate_limit.NAME]` tables applied to every request for the host, before a route's.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tls": {
+          "$ref": "#/$defs/HostTls",
+          "description": "Its certificate and key, for TLS listeners."
+        },
+        "use_canonical_name": {
+          "default": false,
+          "description": "Give the application the canonical name as SERVER_NAME rather than the name matched.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "HostTls": {
+      "additionalProperties": false,
+      "description": "A virtual host's certificate chain and private key, as PEM files.",
+      "properties": {
+        "certificate": {
+          "description": "The certificate chain, leaf first. A relative path is taken from the file's directory.",
+          "type": "string"
+        },
+        "key": {
+          "description": "The private key. A relative path is taken from the file's directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "certificate",
+        "key"
+      ],
+      "type": "object"
+    },
+    "Http2Limits": {
+      "additionalProperties": false,
+      "description": "The `[limits.http2]` table.",
+      "properties": {
+        "max_concurrent_streams": {
+          "default": 128,
+          "description": "Concurrent streams per connection.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Interface": {
+      "description": "The interface an entrypoint speaks.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI.",
+          "type": "string"
+        },
+        {
+          "const": "wsgi",
+          "description": "PEP 3333.",
+          "type": "string"
+        },
+        {
+          "const": "asgi",
+          "description": "ASGI 3.",
+          "type": "string"
+        },
+        {
+          "const": "grpc",
+          "description": "gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to.",
+          "type": "string"
+        }
+      ]
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "description": "The `[limits]` table: sizes and durations as the configuration writes them.",
+      "properties": {
+        "body_idle_timeout": {
+          "default": "60s",
+          "description": "Time a client may pause while sending a body.",
+          "type": "string"
+        },
+        "header_read_timeout": {
+          "default": "30s",
+          "description": "Time allowed for a complete request head.",
+          "type": "string"
+        },
+        "http2": {
+          "$ref": "#/$defs/Http2Limits",
+          "description": "HTTP/2 settings."
+        },
+        "keep_alive_timeout": {
+          "default": "20s",
+          "description": "Idle time before a keep-alive connection is closed.",
+          "type": "string"
+        },
+        "keep_alive_timeout_proxy": {
+          "default": "75s",
+          "description": "The same for connections from trusted proxies.",
+          "type": "string"
+        },
+        "max_body_size": {
+          "default": "10MB",
+          "description": "Largest request body, for example 10MB.",
+          "type": "string"
+        },
+        "max_connections": {
+          "default": 65536,
+          "description": "Open connections per listener.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_connections_per_client": {
+          "default": 256,
+          "description": "Open connections per client address; 0 disables it.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_header_bytes": {
+          "default": "64KB",
+          "description": "Largest request head, for example 64KB.",
+          "type": "string"
+        },
+        "max_headers": {
+          "default": 100,
+          "description": "Most headers in a request.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_requests_per_connection": {
+          "default": 0,
+          "description": "Requests served on one connection before it is closed; 0 for no limit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queue_timeout": {
+          "default": "5s",
+          "description": "Time a request may wait for a worker.",
+          "type": "string"
+        },
+        "request_deadline": {
+          "default": "300s",
+          "description": "Time a request may take to produce its response head.",
+          "type": "string"
+        },
+        "response_idle_timeout": {
+          "default": "60s",
+          "description": "Time a worker may pause mid-response.",
+          "type": "string"
+        },
+        "spool_quota": {
+          "description": "What stored uploads may hold at once across every application; no limit without it.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Listener": {
+      "additionalProperties": false,
+      "description": "A listener, one of the `[[listener]]` entries, in the daemon's own file.",
+      "properties": {
+        "address": {
+          "description": "The address, as IP:PORT.",
+          "type": "string"
+        },
+        "h2c": {
+          "description": "On a listener without TLS, the clients that may speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or private; every client when omitted, none when empty. The others are served HTTP/1.1.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-default": "every client"
+        },
+        "tls": {
+          "default": false,
+          "description": "Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "address"
+      ],
+      "type": "object"
+    },
+    "LogLevel": {
+      "description": "A Python logging level.",
+      "oneOf": [
+        {
+          "const": "DEBUG",
+          "description": "Everything.",
+          "type": "string"
+        },
+        {
+          "const": "INFO",
+          "description": "Informational messages and above.",
+          "type": "string"
+        },
+        {
+          "const": "WARNING",
+          "description": "Python's default: warnings and above.",
+          "type": "string"
+        },
+        {
+          "const": "ERROR",
+          "description": "Errors and above.",
+          "type": "string"
+        },
+        {
+          "const": "CRITICAL",
+          "description": "Only critical messages.",
+          "type": "string"
+        }
+      ]
+    },
+    "Logging": {
+      "additionalProperties": false,
+      "description": "The `[logging]` table: how Python logging is set up in the workers.",
+      "properties": {
+        "python": {
+          "$ref": "#/$defs/PythonLogging",
+          "description": "Python logging defaults."
+        }
+      },
+      "type": "object"
+    },
+    "Logs": {
+      "additionalProperties": false,
+      "description": "The `[logs]` table of the daemon's file: how the daemon rotates the log files it and its processes write, and whether its standard streams carry the time.",
+      "properties": {
+        "compress": {
+          "default": "zstd",
+          "description": "How archives are compressed: `zstd` (the default), `gzip` or `off`.",
+          "type": "string"
+        },
+        "every": {
+          "default": "daily",
+          "description": "Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC.",
+          "type": "string"
+        },
+        "keep": {
+          "default": 14,
+          "description": "Archives kept per log.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rotate": {
+          "default": "built-in",
+          "description": "`built-in` (the default) or `external`, for logrotate.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Rotate a file that reaches this size, for example 100MB.",
+          "type": "string"
+        },
+        "timestamps": {
+          "default": false,
+          "description": "Put the full UTC time in front of every line the daemon writes to standard output and standard error, as `--timestamps` does, for a supervisor that stamps nothing. Files always carry the time.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Maintenance": {
+      "additionalProperties": false,
+      "description": "What maintenance mode lets through, the `maintenance` table of a release.",
+      "properties": {
+        "bypass_cookie": {
+          "description": "A `name=value` cookie that lets a client through.",
+          "type": "string"
+        },
+        "exempt_addresses": {
+          "description": "Client addresses, or ranges in CIDR form, served as usual.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "exempt_paths": {
+          "description": "Path prefixes served as usual while the application is in maintenance.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retry_after": {
+          "default": "60s",
+          "description": "The `Retry-After` the maintenance page carries, for example 5m.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Measure": {
+      "description": "How a worker's memory is measured.",
+      "oneOf": [
+        {
+          "const": "uss",
+          "description": "Unique set size: pages no other process shares, the default, since preloaded pages are shared copy-on-write.",
+          "type": "string"
+        },
+        {
+          "const": "pss",
+          "description": "Proportional set size: shared pages counted in proportion.",
+          "type": "string"
+        },
+        {
+          "const": "rss",
+          "description": "Resident set size: every resident page.",
+          "type": "string"
+        }
+      ]
+    },
+    "Memory": {
+      "additionalProperties": false,
+      "description": "The `[memory]` table of a release or a `[tool.muru]` table: the limits a worker's memory is held to.",
+      "properties": {
+        "check_interval": {
+          "default": "5s",
+          "description": "How often memory is measured.",
+          "type": "string"
+        },
+        "hard_limit": {
+          "description": "Over this the worker leaves routing at once and is replaced, for example 1200MB.",
+          "type": "string",
+          "x-default": "off; under `muructl serve` with a memory limit, a share of it"
+        },
+        "measure": {
+          "$ref": "#/$defs/Measure",
+          "default": "uss",
+          "description": "What is measured: uss (the default), pss or rss."
+        },
+        "reclaim_first": {
+          "default": true,
+          "description": "Whether to collect garbage and trim the heap before recycling over the soft limit.",
+          "type": "boolean"
+        },
+        "soft_for": {
+          "default": "2m",
+          "description": "How long the worker may stay over the soft limit.",
+          "type": "string"
+        },
+        "soft_limit": {
+          "description": "Over this for soft_for, the worker reclaims and then recycles, for example 800MB; off when absent.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Methods": {
+      "additionalProperties": false,
+      "description": "A route's method restrictions.",
+      "properties": {
+        "answer": {
+          "default": "read_only",
+          "description": "`read_only` (the default) answers 503 read_only; `method_not_allowed` answers 405 with the methods left in Allow.",
+          "type": "string"
+        },
+        "deny": {
+          "default": [],
+          "description": "The methods refused, for example POST, PUT, PATCH and DELETE.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Metrics": {
+      "additionalProperties": false,
+      "description": "The `[metrics]` table: where the daemon serves the Prometheus exposition.",
+      "properties": {
+        "listen": {
+          "description": "The address `/metrics` is served on, an internal one such as 127.0.0.1:9464; not served when omitted.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Mount": {
+      "additionalProperties": false,
+      "description": "A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` table: a path served by another entrypoint in the same workers. The release's own entrypoint is the default mount at /.",
+      "properties": {
+        "accel_redirect": {
+          "description": "Treat an `X-Accel-Redirect` response header from the mount as an internal redirect.",
+          "type": "boolean",
+          "x-default": "the release's"
+        },
+        "accept_redirects_from": {
+          "description": "Other applications whose internal redirects may reach the mount when it is internal; the release's own always may.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cgi_local_redirect": {
+          "description": "Treat a 200 response with a `Location` starting with `/` and no body as an internal redirect, the CGI convention.",
+          "type": "boolean",
+          "x-default": "the release's"
+        },
+        "concurrency": {
+          "description": "Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the worker's slots when absent.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entrypoint": {
+          "description": "The application as module:callable.",
+          "type": "string"
+        },
+        "handoff": {
+          "$ref": "#/$defs/Handoff",
+          "description": "The interface the mount's requests may be handed to; none when absent."
+        },
+        "interface": {
+          "$ref": "#/$defs/Interface",
+          "default": "auto",
+          "description": "The interface, when declared rather than detected."
+        },
+        "internal": {
+          "default": false,
+          "description": "Reachable only through internal redirects: a client's request for its path is answered 404.",
+          "type": "boolean"
+        },
+        "max_connections": {
+          "description": "Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; unbounded but by its slots when absent.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name.",
+          "type": "string"
+        },
+        "sendfile_header": {
+          "description": "A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`.",
+          "type": "string",
+          "x-default": "the release's"
+        },
+        "sendfile_roots": {
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-default": "the release's"
+        },
+        "threads": {
+          "$ref": "#/$defs/MountThreads",
+          "description": "Threads of the mount's own, for a WSGI or gRPC mount; it shares the worker's pool when absent."
+        }
+      },
+      "required": [
+        "entrypoint"
+      ],
+      "type": "object"
+    },
+    "MountThreads": {
+      "anyOf": [
+        {
+          "description": "A pool of this many threads, used by the mount alone.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "$ref": "#/$defs/BorrowedThreads",
+          "description": "Reserved threads, and shared ones borrowed up to a maximum."
+        }
+      ],
+      "description": "A mount's own threads: a fixed pool, `threads = 4`, or a reserved minimum that borrows threads of the shared pool up to a maximum, `threads = { reserved = 2, max = 6 }`."
+    },
+    "Overlay": {
+      "additionalProperties": false,
+      "description": "An `[overlay.NAME]` table: changes to named routes and to applications, applied over the base configuration while the overlay is active, by its schedule or by hand.",
+      "properties": {
+        "advisory": {
+          "default": false,
+          "description": "Its schedule only raises overlay.would_activate events; it is activated by hand only.",
+          "type": "boolean"
+        },
+        "apps": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AppOverlay"
+          },
+          "description": "Changes to applications, by name.",
+          "type": "object"
+        },
+        "latch": {
+          "default": false,
+          "description": "Once its schedule activates it, it stays active past the window until a person ends it.",
+          "type": "boolean"
+        },
+        "preconditions": {
+          "$ref": "#/$defs/Preconditions",
+          "description": "What must hold for the overlay to activate."
+        },
+        "priority": {
+          "description": "Which of two active overlays setting the same field wins: the higher. Overlays that would conflict must both set one.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "routes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RouteOverlay"
+          },
+          "description": "Changes to routes, by the route's `name`.",
+          "type": "object"
+        },
+        "trigger": {
+          "$ref": "#/$defs/OverlayTrigger",
+          "description": "When the overlay is active on its own; by hand only without it."
+        },
+        "warm_up": {
+          "$ref": "#/$defs/WarmUp",
+          "description": "What to start ahead of its schedule's windows."
+        }
+      },
+      "type": "object"
+    },
+    "OverlaySchedule": {
+      "additionalProperties": false,
+      "description": "A window in time: one-off, from `start` until `end` when it has one, or recurring, from each time `cron` names for `duration`.",
+      "properties": {
+        "cron": {
+          "description": "When each window starts, as a cron expression such as '0 2 * * *' (see [`cron::Cron`]).",
+          "type": "string"
+        },
+        "duration": {
+          "description": "How long each recurring window lasts, such as 1h.",
+          "type": "string"
+        },
+        "end": {
+          "description": "When it ends; it stays active until ended or promoted without it.",
+          "type": "string"
+        },
+        "start": {
+          "description": "When it starts, as a local date and time such as 2026-11-02T09:00, or with an offset.",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "The time zone local times are in, such as Australia/Sydney; the daemon's own zone without it.",
+          "type": "string",
+          "x-default": "the daemon's system time zone"
+        }
+      },
+      "type": "object"
+    },
+    "OverlayTrigger": {
+      "additionalProperties": false,
+      "description": "When an overlay is active on its own.",
+      "properties": {
+        "external": {
+          "default": false,
+          "description": "Whether the signed webhook of the `[overlay_webhook]` table may activate and end it.",
+          "type": "boolean"
+        },
+        "schedule": {
+          "$ref": "#/$defs/OverlaySchedule",
+          "description": "A window in time."
+        }
+      },
+      "type": "object"
+    },
+    "OverlayWebhook": {
+      "additionalProperties": false,
+      "description": "The `[overlay_webhook]` table: where the daemon takes signed requests from monitoring and alerting systems to activate and end the overlays that declare the external trigger.",
+      "properties": {
+        "listen": {
+          "description": "The address served, such as 0.0.0.0:9466.",
+          "type": "string"
+        },
+        "secret": {
+          "description": "The key requests are signed with.",
+          "type": "string"
+        },
+        "secret_file": {
+          "description": "A file holding the key, in place of `secret`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "listen"
+      ],
+      "type": "object"
+    },
+    "Preconditions": {
+      "additionalProperties": false,
+      "description": "What must hold for an overlay to activate.",
+      "properties": {
+        "release_ready": {
+          "description": "A release that must be ready, as app@release, or as release when the overlay changes routes of one application only.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Preload": {
+      "description": "Whether the application is imported in the host before forking.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Preload when the import check passes, otherwise import per worker.",
+          "type": "string"
+        },
+        {
+          "const": "true",
+          "description": "Preload, and fail the release when the import check does not pass.",
+          "type": "string"
+        },
+        {
+          "const": "false",
+          "description": "Import in every worker.",
+          "type": "string"
+        }
+      ]
+    },
+    "Proxy": {
+      "additionalProperties": false,
+      "description": "The `[proxy]` table: which peers are trusted to speak for the client, and through which headers.",
+      "properties": {
+        "forwarded_headers": {
+          "$ref": "#/$defs/ForwardedHeaders",
+          "default": "keep",
+          "description": "What becomes of the forwarding headers once applied."
+        },
+        "headers": {
+          "default": [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host"
+          ],
+          "description": "The header types applied from trusted peers: forwarded, x-forwarded-for, x-forwarded-proto, x-forwarded-host, x-forwarded-port, x-forwarded-prefix and x-real-ip. The first four when omitted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recursive": {
+          "default": true,
+          "description": "Walk a chain of addresses from the right past trusted proxies to the first untrusted one, rather than take the rightmost.",
+          "type": "boolean"
+        },
+        "trusted": {
+          "description": "Addresses, CIDR ranges, or the words loopback, private and unix. Nothing is trusted when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "PythonDownloads": {
+      "description": "Whether interpreters may be downloaded.",
+      "oneOf": [
+        {
+          "const": "automatic",
+          "description": "Download a Python a release requests and the node lacks.",
+          "type": "string"
+        },
+        {
+          "const": "never",
+          "description": "Never download; a request the node cannot satisfy fails the release.",
+          "type": "string"
+        }
+      ]
+    },
+    "PythonLogging": {
+      "additionalProperties": false,
+      "description": "The `[logging.python]` table: what loggers without handlers of their own do, set before the application is imported.",
+      "properties": {
+        "capture_warnings": {
+          "default": false,
+          "description": "Whether warnings.warn goes through the py.warnings logger.",
+          "type": "boolean"
+        },
+        "format": {
+          "description": "The format of the platform handler: standard, json, or a logging format string.",
+          "type": "string",
+          "x-default": "`standard`; `json` under `muructl serve --log-format json`"
+        },
+        "level": {
+          "$ref": "#/$defs/LogLevel",
+          "default": "WARNING",
+          "description": "The root logger's level."
+        },
+        "loggers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/LogLevel"
+          },
+          "description": "Levels for named loggers.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "RateLimit": {
+      "additionalProperties": false,
+      "description": "A `[rate_limit.NAME]` table: a token bucket for each key, which requests of the matching classes draw from.",
+      "properties": {
+        "action": {
+          "default": "reject",
+          "description": "`reject` (the default) answers 429, `delay` holds the request up to `max_delay` first, `log` only counts.",
+          "type": "string"
+        },
+        "burst": {
+          "description": "How many requests a full bucket allows at once.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the rate's count"
+        },
+        "headers": {
+          "default": false,
+          "description": "Send the RateLimit-Policy and RateLimit fields with a 429.",
+          "type": "boolean"
+        },
+        "ipv4_prefix": {
+          "default": 32,
+          "description": "The leading bits of an IPv4 address that make the key (32).",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ipv6_prefix": {
+          "default": 64,
+          "description": "The leading bits of an IPv6 address that make the key (64).",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "key": {
+          "$ref": "#/$defs/RateLimitKey",
+          "default": "address",
+          "description": "What a bucket is kept for: `address` (the default), `client_class`, `header:NAME`, `cookie:NAME`, or a list of them."
+        },
+        "match": {
+          "$ref": "#/$defs/ClientMatch",
+          "description": "Which requests draw from the buckets; all of them without it."
+        },
+        "max_delay": {
+          "default": "1s",
+          "description": "The longest a request is held under `delay`.",
+          "type": "string"
+        },
+        "rate": {
+          "description": "How fast a bucket fills, for example 2/s, 100/m or 1000/h.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rate"
+      ],
+      "type": "object"
+    },
+    "RateLimitKey": {
+      "anyOf": [
+        {
+          "description": "A single part.",
+          "type": "string"
+        },
+        {
+          "description": "Parts combined.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "One key part or several."
+    },
+    "Readiness": {
+      "additionalProperties": false,
+      "description": "The `readiness` table of a managed HTTP release: how an instance is known to be ready.",
+      "properties": {
+        "path": {
+          "description": "The path probed with a GET until it answers 2xx or 3xx; without it, any HTTP response makes the instance ready.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "60s",
+          "description": "How long the instances get to become ready.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Release": {
+      "additionalProperties": false,
+      "description": "A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes. `muructl run --print-config` writes one so a laptop setup can become a declared release, and `muructl apply` reads them.",
+      "properties": {
+        "accel_redirect": {
+          "default": false,
+          "description": "Treat an `X-Accel-Redirect` response header as an internal redirect, for the default mount and any mount that does not say otherwise.",
+          "type": "boolean"
+        },
+        "bind": {
+          "$ref": "#/$defs/ServerBind",
+          "default": "unix",
+          "description": "How an `http` release's instances bind: `unix` (the default) or `port`."
+        },
+        "build": {
+          "$ref": "#/$defs/Build",
+          "description": "When and how the environment is built on the node."
+        },
+        "bytecode": {
+          "$ref": "#/$defs/Bytecode",
+          "default": "redirect",
+          "description": "Where compiled bytecode goes."
+        },
+        "cgi_local_redirect": {
+          "default": false,
+          "description": "Treat a 200 response with a `Location` starting with `/` and no body as an internal redirect, the CGI convention.",
+          "type": "boolean"
+        },
+        "command": {
+          "description": "The command an `http` release runs, with `{bind}` where the server takes its address; without `{bind}` the profile adds the server's own flags.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "commands": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CommandTable"
+          },
+          "description": "Commands the application declares, by name: run with the release on request, with inputs.",
+          "type": "object"
+        },
+        "concurrency": {
+          "default": 1000,
+          "description": "Requests an ASGI worker's event loop takes at once.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwd": {
+          "description": "The directory an `http` release's command runs in; `source` when absent, and one of the two is required.",
+          "type": "string",
+          "x-default": "`source`"
+        },
+        "entrypoint": {
+          "description": "The application as module:callable, else from the source's `[tool.muru]` table.",
+          "type": "string",
+          "x-default": "the source's `[tool.muru]`"
+        },
+        "env": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EnvValue"
+          },
+          "description": "Environment variables for the workers: a value, or a secret reference resolved when the release starts.",
+          "type": "object"
+        },
+        "error_override": {
+          "$ref": "#/$defs/ErrorOverride",
+          "description": "Replace the application's own error responses with error pages."
+        },
+        "error_pages": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ErrorPage"
+          },
+          "description": "Custom error pages, by status or status:reason.",
+          "type": "object"
+        },
+        "factory": {
+          "default": false,
+          "description": "Whether the entrypoint is a factory.",
+          "type": "boolean"
+        },
+        "factory_phase": {
+          "$ref": "#/$defs/FactoryPhase",
+          "default": "worker",
+          "description": "When a factory is called."
+        },
+        "groups": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Group"
+          },
+          "description": "Worker groups by name.",
+          "type": "object"
+        },
+        "grpc_web_origins": {
+          "description": "The origins whose pages may call the release's gRPC methods through gRPC-Web, answered with CORS: scheme, host and port, or `*`; none when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "handoff": {
+          "$ref": "#/$defs/Handoff",
+          "description": "The interface the default mount's requests may be handed to; none when absent."
+        },
+        "hooks": {
+          "description": "The module holding the lifecycle hooks, as a Python module name.",
+          "type": "string"
+        },
+        "instances": {
+          "default": 1,
+          "description": "How many instances of the command an `http` release runs.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "interface": {
+          "$ref": "#/$defs/Interface",
+          "default": "auto",
+          "description": "The interface, when declared rather than detected."
+        },
+        "kind": {
+          "$ref": "#/$defs/ReleaseKind",
+          "default": "workers",
+          "description": "What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`."
+        },
+        "logging": {
+          "$ref": "#/$defs/Logging",
+          "description": "How Python logging is set up in the workers."
+        },
+        "maintenance": {
+          "$ref": "#/$defs/Maintenance",
+          "description": "What maintenance mode lets through."
+        },
+        "max_lifetime": {
+          "description": "How long a worker lives before it is replaced, for example 1h, with jitter; off when absent.",
+          "type": "string"
+        },
+        "max_requests": {
+          "description": "Requests a worker serves before it is replaced, with jitter; off when absent.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory": {
+          "$ref": "#/$defs/Memory",
+          "description": "The memory policy for the workers."
+        },
+        "mounts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Mount"
+          },
+          "description": "Mounts by name.",
+          "type": "object"
+        },
+        "preload": {
+          "$ref": "#/$defs/Preload",
+          "default": "auto",
+          "description": "Whether the application is imported once, in the host, before the workers are forked from it."
+        },
+        "processes": {
+          "default": 1,
+          "description": "The default group's worker processes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "profile": {
+          "$ref": "#/$defs/ServerProfile",
+          "description": "The server an `http` release runs: gunicorn, uvicorn, granian, mod_wsgi-express, uwsgi or generic."
+        },
+        "python": {
+          "description": "The interpreter: a path, or a request in uv's syntax.",
+          "type": "string",
+          "x-default": "found at start"
+        },
+        "readiness": {
+          "$ref": "#/$defs/Readiness",
+          "description": "How an `http` release's instances are known to be ready."
+        },
+        "reflection": {
+          "default": false,
+          "description": "Serve gRPC server reflection for the services the release's gRPC mounts register (default false).",
+          "type": "boolean"
+        },
+        "scaling": {
+          "$ref": "#/$defs/Scaling",
+          "description": "How the default group is scaled; static when absent."
+        },
+        "sendfile_header": {
+          "description": "A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one.",
+          "type": "string"
+        },
+        "sendfile_roots": {
+          "description": "Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file, for the default mount and any mount that does not say otherwise; with none every hint is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "source": {
+          "description": "The source directory. A relative path is taken from the file's directory. Required by `muructl apply` for a `workers` release.",
+          "type": "string"
+        },
+        "static": {
+          "description": "The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`.",
+          "items": {
+            "$ref": "#/$defs/StaticDir"
+          },
+          "type": "array"
+        },
+        "stop_signal": {
+          "description": "The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's.",
+          "type": "string",
+          "x-default": "the profile's, `TERM`"
+        },
+        "sync_threads": {
+          "default": 8,
+          "description": "Threads for synchronous code called from an ASGI application.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "threads": {
+          "default": 4,
+          "description": "Application threads per worker.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts",
+          "description": "The timeouts the host enforces on its workers."
+        }
+      },
+      "type": "object"
+    },
+    "ReleaseKind": {
+      "description": "What a release runs.",
+      "oneOf": [
+        {
+          "const": "workers",
+          "description": "Muru's own workers, from an entrypoint.",
+          "type": "string"
+        },
+        {
+          "const": "http",
+          "description": "An HTTP server Muru starts and supervises, from a command.",
+          "type": "string"
+        }
+      ]
+    },
+    "Route": {
+      "additionalProperties": false,
+      "description": "A route, one of the `[[route]]` entries: a path prefix of a virtual host to an application.",
+      "properties": {
+        "accept_redirects_from": {
+          "description": "Applications other than the route's own (or a static route's fallback) whose internal redirects may reach the route. A static route with no fallback needs it for any redirect to reach it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "app": {
+          "description": "The application whose serving release takes the requests; empty for a static or upstream route.",
+          "type": "string"
+        },
+        "auth": {
+          "$ref": "#/$defs/Auth",
+          "description": "An authorisation decision the edge asks an application for before it serves the route."
+        },
+        "cache": {
+          "$ref": "#/$defs/CacheTable",
+          "description": "The cache headers files are sent with."
+        },
+        "case": {
+          "default": "strict",
+          "description": "`strict` (the default), which matches names as they are on disk, or `insensitive`.",
+          "type": "string"
+        },
+        "error_override": {
+          "$ref": "#/$defs/ErrorOverride",
+          "description": "Replace the application's own error responses with error pages."
+        },
+        "error_pages": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ErrorPage"
+          },
+          "description": "Custom error pages, by status or status:reason.",
+          "type": "object"
+        },
+        "fallback": {
+          "$ref": "#/$defs/Fallback",
+          "description": "What takes a request no file answers."
+        },
+        "hash": {
+          "default": [
+            "sha256"
+          ],
+          "description": "The digests computed while receiving: sha256 (the default), sha384, sha512 or sha1; an empty list for none.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "host": {
+          "description": "The virtual host.",
+          "type": "string"
+        },
+        "index": {
+          "default": [
+            "index.html"
+          ],
+          "description": "The files tried, in order, when a directory is requested.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "internal": {
+          "default": false,
+          "description": "Reachable only through internal redirects: a client's request for the path is answered 404.",
+          "type": "boolean"
+        },
+        "match": {
+          "$ref": "#/$defs/ClientMatch",
+          "description": "The client classes the route takes; every request without it. Among routes with the same path, one naming the request's class comes first."
+        },
+        "max_body_size": {
+          "description": "The largest request body, for example 1GB, replacing the daemon's `[limits]` value for the route. On an upload route it bounds the body as received, files included.",
+          "type": "string",
+          "x-default": "`max_body_size` in `[limits]`"
+        },
+        "max_file_size": {
+          "description": "The largest uploaded file, for example 512MB; no limit without it.",
+          "type": "string"
+        },
+        "max_files": {
+          "default": 100,
+          "description": "The most files in one request.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "methods": {
+          "$ref": "#/$defs/Methods",
+          "description": "Methods the route refuses."
+        },
+        "mode": {
+          "description": "The site mode passed to the application as muru.mode, for example read-only.",
+          "type": "string"
+        },
+        "name": {
+          "description": "A name for the route, unique among routes, by which overlays change it.",
+          "type": "string"
+        },
+        "path": {
+          "default": "/",
+          "description": "The path prefix, `/` for everything. The longest prefix wins.",
+          "type": "string"
+        },
+        "precheck": {
+          "default": false,
+          "description": "Ask the application with the request's headers alone first, and read the body only when it answers 2xx.",
+          "type": "boolean"
+        },
+        "rate_limits": {
+          "description": "The `[rate_limit.NAME]` tables applied to the route's requests, after the host's.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "redirect_slash": {
+          "default": true,
+          "description": "Whether a directory asked for without a trailing slash is redirected to the slash form.",
+          "type": "boolean"
+        },
+        "spool_quota": {
+          "default": "10GB",
+          "description": "What the application's stored uploads may hold at once when a request on the route arrives.",
+          "type": "string"
+        },
+        "static": {
+          "description": "The directory served by the edge, instead of an application.",
+          "type": "string"
+        },
+        "traffic": {
+          "$ref": "#/$defs/Traffic",
+          "description": "How requests are shared between the application's releases; without it every request goes to the serving release."
+        },
+        "upload": {
+          "description": "`multipart` or `raw` makes the edge receive and store uploads before the application sees the request; off without it.",
+          "type": "string"
+        },
+        "upstream": {
+          "description": "The HTTP upstream that takes the requests, instead of an application.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "type": "object"
+    },
+    "RouteOverlay": {
+      "additionalProperties": false,
+      "description": "What an overlay changes on a route.",
+      "properties": {
+        "answer": {
+          "default": "read_only",
+          "description": "How refused methods are answered, with the values a route's `methods.answer` takes.",
+          "type": "string"
+        },
+        "client_routes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RouteOverlay"
+          },
+          "description": "Routes for client classes at the route's host and path, by class: each a copy of the route with these changes, or the route for that class already there with them.",
+          "type": "object"
+        },
+        "deny": {
+          "description": "Methods refused, as the route's `methods.deny`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "error_pages": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ErrorPage"
+          },
+          "description": "Error pages, by status or status:reason, each in place of the route's page for the same key.",
+          "type": "object"
+        },
+        "mode": {
+          "description": "The site mode.",
+          "type": "string"
+        },
+        "rate_limits": {
+          "description": "The rate limits, in place of the route's.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target": {
+          "$ref": "#/$defs/RouteTarget",
+          "description": "What serves the route instead."
+        },
+        "traffic": {
+          "$ref": "#/$defs/TrafficOverlay",
+          "description": "The traffic policy: a pin sends every request to one release."
+        }
+      },
+      "type": "object"
+    },
+    "RouteTarget": {
+      "additionalProperties": false,
+      "description": "What serves a route under an overlay: one of an application, a static directory or an upstream.",
+      "properties": {
+        "app": {
+          "description": "An application.",
+          "type": "string"
+        },
+        "static": {
+          "description": "A directory the edge serves.",
+          "type": "string"
+        },
+        "upstream": {
+          "description": "An HTTP upstream.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Scaling": {
+      "additionalProperties": false,
+      "description": "The `scaling` table of a release, a worker group or a `[tool.muru]` table: the mode, the bounds, and the windows and budgets that keep the autoscaler from churning. The release's own table is the default group's.",
+      "properties": {
+        "advisory": {
+          "default": false,
+          "description": "Decide and report without acting.",
+          "type": "boolean"
+        },
+        "churn_budget": {
+          "default": 6,
+          "description": "Reaps allowed per hour per release before scale-in is suspended.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hold_after_growth": {
+          "default": "5m",
+          "description": "No scale-in this long after a scale-out.",
+          "type": "string"
+        },
+        "host_idle_timeout": {
+          "description": "How long the release's host stays once every group has scaled to zero, after which it stops too and the next request starts it again; it stays while the release runs when omitted. In the release's own scaling table.",
+          "type": "string"
+        },
+        "idle_reap_after": {
+          "default": "10m",
+          "description": "A group wholly idle this long scales in without waiting for the scale-in window.",
+          "type": "string"
+        },
+        "max_spare": {
+          "description": "Spare mode: scale in while more idle workers than this remain.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-default": "the larger of 3 and a quarter of `max_workers`"
+        },
+        "max_step_up": {
+          "default": 4,
+          "description": "The most workers one scale-out adds.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_workers": {
+          "description": "The most workers; required by the spare and target modes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_lifetime": {
+          "description": "No worker younger than this is reaped.",
+          "type": "string",
+          "x-default": "the larger of 15m and 30 times the time to ready"
+        },
+        "min_spare": {
+          "default": 1,
+          "description": "Spare mode: scale out when fewer idle workers than this remain.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_workers": {
+          "default": 1,
+          "description": "The fewest workers.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/ScalingMode",
+          "default": "static",
+          "description": "How the group is scaled."
+        },
+        "queue_wait_p95": {
+          "description": "Target mode: scale out while the p95 queue wait is over this, for example 100ms; off when absent.",
+          "type": "string"
+        },
+        "reap_interval": {
+          "default": "60s",
+          "description": "At most one worker reaped per this interval.",
+          "type": "string"
+        },
+        "scale_in_window": {
+          "default": "10m",
+          "description": "How long every scale-in condition must hold.",
+          "type": "string"
+        },
+        "scale_out_window": {
+          "default": "5s",
+          "description": "How long a scale-out condition must hold.",
+          "type": "string"
+        },
+        "slot_utilization": {
+          "default": 0.7,
+          "description": "Target mode: the share of slots to keep busy, between 0 and 1.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "ScalingMode": {
+      "description": "How a worker group is scaled.",
+      "oneOf": [
+        {
+          "const": "static",
+          "description": "A fixed worker count, the default.",
+          "type": "string"
+        },
+        {
+          "const": "spare",
+          "description": "Keep between min_spare and max_spare idle workers, Apache-style.",
+          "type": "string"
+        },
+        {
+          "const": "target",
+          "description": "Track a slot utilization and a queue wait target.",
+          "type": "string"
+        }
+      ]
+    },
+    "SecretRef": {
+      "additionalProperties": false,
+      "description": "Which secret: a store declared in the daemon's file, and a key in it.",
+      "properties": {
+        "key": {
+          "description": "The key within the store.",
+          "type": "string"
+        },
+        "store": {
+          "description": "The store's name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "store",
+        "key"
+      ],
+      "type": "object"
+    },
+    "SecretStore": {
+      "additionalProperties": false,
+      "description": "One `[secrets.store.NAME]` table.",
+      "properties": {
+        "command": {
+          "description": "For an exec store, the command and arguments, with `{key}` where the key goes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "default": "",
+          "description": "`file`, `env` or `exec`.",
+          "type": "string"
+        },
+        "path": {
+          "description": "For a file store, the directory; the daemon's secrets directory under the store's name otherwise.",
+          "type": "string",
+          "x-default": "`secrets/NAME` in the state directory"
+        },
+        "timeout": {
+          "default": "5s",
+          "description": "For an exec store, how long the command may take.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "SecretValue": {
+      "additionalProperties": false,
+      "description": "A secret reference in an `[env]` table.",
+      "properties": {
+        "as": {
+          "default": "env",
+          "description": "How the value is delivered: `env` as the variable, or `file` as a file only the release's user can read, whose path is in `NAME_FILE`.",
+          "type": "string"
+        },
+        "secret": {
+          "$ref": "#/$defs/SecretRef",
+          "description": "The store and key."
+        }
+      },
+      "required": [
+        "secret"
+      ],
+      "type": "object"
+    },
+    "Secrets": {
+      "additionalProperties": false,
+      "description": "The `[secrets]` table of the daemon's file.",
+      "properties": {
+        "store": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SecretStore"
+          },
+          "description": "Stores by name.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ServerBind": {
+      "description": "How a managed HTTP release's instances bind.",
+      "oneOf": [
+        {
+          "const": "unix",
+          "description": "A Unix socket per instance under the release's run directory.",
+          "type": "string"
+        },
+        {
+          "const": "port",
+          "description": "A free loopback port per instance.",
+          "type": "string"
+        }
+      ]
+    },
+    "ServerProfile": {
+      "description": "The server a managed HTTP release runs, which fixes how it binds and how it is stopped.",
+      "oneOf": [
+        {
+          "const": "gunicorn",
+          "description": "gunicorn: `--bind unix:PATH` or `--bind HOST:PORT`, stopped by TERM.",
+          "type": "string"
+        },
+        {
+          "const": "uvicorn",
+          "description": "uvicorn: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM.",
+          "type": "string"
+        },
+        {
+          "const": "granian",
+          "description": "Granian: `--uds PATH` or `--host HOST --port PORT`, stopped by TERM.",
+          "type": "string"
+        },
+        {
+          "const": "mod_wsgi-express",
+          "description": "mod_wsgi-express: `--host HOST --port PORT`, stopped by TERM.",
+          "type": "string"
+        },
+        {
+          "const": "uwsgi",
+          "description": "uWSGI: `--http-socket PATH` or `--http-socket HOST:PORT`, with `--master` and a hook that makes TERM a graceful stop, which in uWSGI 2.0 would otherwise reload.",
+          "type": "string"
+        },
+        {
+          "const": "generic",
+          "description": "Any server: the command binds through `{bind}` and `stop_signal` says how it is stopped.",
+          "type": "string"
+        }
+      ]
+    },
+    "Shutdown": {
+      "additionalProperties": false,
+      "description": "The `[shutdown]` table of the daemon's file: what SIGTERM and SIGINT mean to the daemon, and how a shutdown runs.",
+      "properties": {
+        "budget": {
+          "default": "8s",
+          "description": "How long the whole shutdown may take, the delay, the drain, the workers and the edge together; what has not finished by then is killed.",
+          "type": "string"
+        },
+        "delay": {
+          "default": "0s",
+          "description": "How long the edge keeps accepting after the signal, closing each connection after its response so clients reconnect elsewhere, for example 5s.",
+          "type": "string"
+        },
+        "on_sigterm": {
+          "description": "`shutdown`, which drains and stops every release and the edge before the daemon exits, or `detach`, which leaves them serving for the next daemon; shutdown when the daemon is a container's main process, detach otherwise.",
+          "type": "string",
+          "x-default": "`shutdown` as a container's main process, else `detach`"
+        }
+      },
+      "type": "object"
+    },
+    "SinkKind": {
+      "const": "webhook",
+      "description": "The kind of an event sink.",
+      "type": "string"
+    },
+    "StaticDir": {
+      "additionalProperties": false,
+      "description": "A directory of an application's own files, an entry of the `[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]` array: a path prefix the edge serves from a directory under the release's source, with the application taking what no file answers. Served by `muructl run` and the daemon alike, from the release the request was routed to.",
+      "properties": {
+        "cache": {
+          "$ref": "#/$defs/CacheTable",
+          "description": "The cache headers files are sent with."
+        },
+        "case": {
+          "default": "strict",
+          "description": "`strict` (the default), which matches names as they are on disk, or `insensitive`.",
+          "type": "string"
+        },
+        "dir": {
+          "description": "The directory, relative to the source directory, or absolute.",
+          "type": "string"
+        },
+        "fallback": {
+          "description": "The file served for paths with no file of their own, for a single-page application under the prefix.",
+          "type": "string"
+        },
+        "index": {
+          "default": [
+            "index.html"
+          ],
+          "description": "The files tried, in order, when a directory is requested.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "The path prefix, such as `/static/`; the longest wins, on segment boundaries, and `/` is not allowed, since every path would then be looked up as a file first.",
+          "type": "string"
+        },
+        "redirect_slash": {
+          "default": true,
+          "description": "Whether a directory asked for without a trailing slash is redirected to the slash form.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "dir"
+      ],
+      "type": "object"
+    },
+    "Timeouts": {
+      "additionalProperties": false,
+      "description": "The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers. The edge's own timeouts are the daemon's `[limits]`.",
+      "properties": {
+        "gil_stall_timeout": {
+          "default": "30s",
+          "description": "How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout.",
+          "type": "string"
+        },
+        "hard_drain_grace": {
+          "default": "10s",
+          "description": "How long a worker being replaced is given to finish its other requests before it is told to stop.",
+          "type": "string"
+        },
+        "hard_timeout": {
+          "description": "How long a request may run in a worker before the worker is replaced, for example 60s; off when absent. Must exceed the soft timeout by at least 5s.",
+          "type": "string"
+        },
+        "loop_stall_timeout": {
+          "default": "10s",
+          "description": "How long an ASGI worker's event loop may go without running before the worker is replaced as for the hard timeout.",
+          "type": "string"
+        },
+        "shutdown_timeout": {
+          "default": "5s",
+          "description": "How long a worker told to stop is given before it is killed, counted from when its WebSockets are closed.",
+          "type": "string"
+        },
+        "soft_timeout": {
+          "description": "How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread, for example 30s; off when absent.",
+          "type": "string"
+        },
+        "websocket_drain_grace": {
+          "default": "0s",
+          "description": "How long a worker told to stop keeps its open WebSockets before it closes them with 1001.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Tools": {
+      "additionalProperties": false,
+      "description": "The `[tools]` table of the daemon's file: uv, and how interpreters are installed.",
+      "properties": {
+        "offline": {
+          "default": false,
+          "description": "No network at all: nothing is downloaded, and wheels come from `wheel_dir`.",
+          "type": "boolean"
+        },
+        "python_downloads": {
+          "$ref": "#/$defs/PythonDownloads",
+          "default": "automatic",
+          "description": "Whether a Python the node lacks is downloaded for a release that requests it."
+        },
+        "python_install_dir": {
+          "description": "Where managed interpreters go; a shared read-only directory for several daemons.",
+          "type": "string",
+          "x-default": "`python` in the state directory"
+        },
+        "uv": {
+          "description": "The uv to run, in place of the lookup order (`MURU_UV`, a uv beside muructl, uv on PATH, the managed copy).",
+          "type": "string"
+        },
+        "uv_config": {
+          "description": "A `uv.toml` passed to builds as their configuration file, for mirrors and TLS settings; the project's own `[tool.uv]` still applies.",
+          "type": "string"
+        },
+        "uv_version": {
+          "description": "The uv versions accepted, as a specifier such as `>=0.9`; the daemon reports what an older one cannot do.",
+          "type": "string"
+        },
+        "wheel_dir": {
+          "description": "A local directory of wheels for the runtime library and for builds when offline.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Traffic": {
+      "additionalProperties": false,
+      "description": "A route's traffic policy: the share of requests each release takes, the key requests are bucketed by, and stickiness.",
+      "properties": {
+        "classes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The release, by id, or `upstream:NAME`, that takes every request of a client class, ahead of stickiness and the split.",
+          "type": "object"
+        },
+        "hash_key": {
+          "default": "cookie",
+          "description": "What a request is bucketed by: `cookie` (the default, an anonymous id cookie the edge issues), `header:NAME`, `cookie:NAME`, or `client` (the client address). A missing header or cookie falls back to the client address.",
+          "type": "string"
+        },
+        "salt": {
+          "description": "Mixed into the hash, so two routes split the same users differently.",
+          "type": "string",
+          "x-default": "the route's host and path"
+        },
+        "split": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Percent of requests to each release, by id; the application's serving release takes the rest. A release at 0 is reached only by preview or by a sticky cookie.",
+          "type": "object"
+        },
+        "sticky": {
+          "default": false,
+          "description": "Whether a client keeps the release it first got, through a cookie.",
+          "type": "boolean"
+        },
+        "sticky_grace": {
+          "default": "10m",
+          "description": "How long sticky clients keep a release that is leaving the route alive, for example 10m.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "TrafficOverlay": {
+      "additionalProperties": false,
+      "description": "An overlay's traffic policy for a route.",
+      "properties": {
+        "pin": {
+          "description": "Send every request to this release of the route's application.",
+          "type": "string"
+        },
+        "split": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Shares by release, in place of the route's split.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "Upstream": {
+      "additionalProperties": false,
+      "description": "An HTTP upstream, one of the `[upstream.NAME]` tables: an unmanaged HTTP server that routes, fallbacks, traffic shares and authentication sub-requests can target.",
+      "properties": {
+        "addresses": {
+          "description": "Where the server listens: `host:port` entries, or `unix:/path` for a Unix socket. Requests take the addresses in turn, and one that fails is set aside for a while.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "connect_timeout": {
+          "default": "5s",
+          "description": "How long a connection may take to open, for example 5s.",
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/UpstreamHealth",
+          "description": "Active health checks and passive ejection."
+        },
+        "protocol": {
+          "default": "http1",
+          "description": "`http1` (the default), `h2c` (HTTP/2 in the clear, by prior knowledge) or `h2` (HTTP/2 over TLS).",
+          "type": "string"
+        },
+        "sendfile_header": {
+          "description": "A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`.",
+          "type": "string"
+        },
+        "sendfile_roots": {
+          "description": "Directories a path in a trusted `X-Muru-Sendfile` response header must lie in for the edge to serve the file; with none every hint is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tls": {
+          "$ref": "#/$defs/UpstreamTls",
+          "description": "Connect with TLS; `h2` implies it."
+        },
+        "trust_muru_headers": {
+          "default": false,
+          "description": "Honour X-Muru-Redirect from the upstream, as from an application: its X-Muru-* response headers are otherwise removed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "addresses"
+      ],
+      "type": "object"
+    },
+    "UpstreamHealth": {
+      "additionalProperties": false,
+      "description": "An upstream's health checks: probes of each address, and the ejection of one whose requests fail.",
+      "properties": {
+        "eject_after": {
+          "default": 3,
+          "description": "Failed requests in a row before an address is ejected; 0 never ejects.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "eject_for": {
+          "default": "30s",
+          "description": "How long an ejected address is left out before a request tries it again, for example 30s; doubled each time the trial fails, up to ten times as long.",
+          "type": "string"
+        },
+        "healthy_after": {
+          "default": 2,
+          "description": "Successful probes in a row before it is healthy again.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "interval": {
+          "default": "10s",
+          "description": "How often each address is probed, for example 10s.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The path probed with a GET, healthy on 2xx or 3xx; without it a connection that opens is healthy.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "2s",
+          "description": "How long a probe may take, for example 2s.",
+          "type": "string"
+        },
+        "unhealthy_after": {
+          "default": 3,
+          "description": "Failed probes in a row before an address is unhealthy.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "UpstreamTls": {
+      "additionalProperties": false,
+      "description": "How an upstream's TLS connections are made.",
+      "properties": {
+        "ca": {
+          "description": "A PEM file of the certificates trusted, by absolute path; the public roots without it.",
+          "type": "string"
+        },
+        "server_name": {
+          "description": "The name the certificate must carry, sent as SNI; the address's host without it.",
+          "type": "string",
+          "x-default": "the address's host"
+        },
+        "verify": {
+          "default": true,
+          "description": "Check the certificate.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "WarmUp": {
+      "additionalProperties": false,
+      "description": "An overlay's warm-up: for `lead` before each window of its schedule, `start_release` runs, so a switch to it lands on warm workers.",
+      "properties": {
+        "lead": {
+          "description": "How long before the window, such as 30m.",
+          "type": "string"
+        },
+        "start_release": {
+          "description": "The release to start, as app@release, or as release when the overlay changes routes of one application only.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lead"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://docs.muruhq.dev/en/latest/schema/daemon.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A declarative configuration file as `muructl apply` reads it and `muructl config export` writes it: listeners and limits, which belong to the daemon's own file, and applications with their releases.",
+  "properties": {
+    "app": {
+      "additionalProperties": {
+        "$ref": "#/$defs/App"
+      },
+      "default": {},
+      "description": "Applications by name.",
+      "type": "object"
+    },
+    "client_class": {
+      "description": "Client classification rules, in order, from the daemon's own file.",
+      "items": {
+        "$ref": "#/$defs/ClientClass"
+      },
+      "type": "array"
+    },
+    "compression": {
+      "$ref": "#/$defs/Compression",
+      "description": "How responses are compressed."
+    },
+    "daemon": {
+      "$ref": "#/$defs/Daemon",
+      "description": "How the daemon itself runs."
+    },
+    "dashboard": {
+      "$ref": "#/$defs/Dashboard",
+      "description": "The dashboard."
+    },
+    "error_override": {
+      "$ref": "#/$defs/ErrorOverride",
+      "description": "Replace the application's own error responses with error pages."
+    },
+    "error_pages": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ErrorPage"
+      },
+      "description": "Custom error pages, by status or status:reason.",
+      "type": "object"
+    },
+    "events": {
+      "$ref": "#/$defs/Events",
+      "description": "Event sinks."
+    },
+    "host": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Host"
+      },
+      "description": "Virtual hosts by name.",
+      "type": "object"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "description": "Limits in force everywhere."
+    },
+    "listener": {
+      "description": "Listeners.",
+      "items": {
+        "$ref": "#/$defs/Listener"
+      },
+      "type": "array"
+    },
+    "logs": {
+      "$ref": "#/$defs/Logs",
+      "description": "Log rotation."
+    },
+    "metrics": {
+      "$ref": "#/$defs/Metrics",
+      "description": "The metrics listener."
+    },
+    "overlay": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Overlay"
+      },
+      "description": "Overlays by name: partial configuration laid over the routes and applications while active.",
+      "type": "object"
+    },
+    "overlay_webhook": {
+      "$ref": "#/$defs/OverlayWebhook",
+      "description": "The overlays' external trigger."
+    },
+    "proxy": {
+      "$ref": "#/$defs/Proxy",
+      "description": "Trusted proxies and the headers taken from them."
+    },
+    "rate_limit": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RateLimit"
+      },
+      "description": "Rate limits by name, from the daemon's own file.",
+      "type": "object"
+    },
+    "route": {
+      "description": "Routes, in the order written.",
+      "items": {
+        "$ref": "#/$defs/Route"
+      },
+      "type": "array"
+    },
+    "secrets": {
+      "$ref": "#/$defs/Secrets",
+      "description": "Secret stores."
+    },
+    "shutdown": {
+      "$ref": "#/$defs/Shutdown",
+      "description": "What SIGTERM means to the daemon, and how a shutdown runs."
+    },
+    "tools": {
+      "$ref": "#/$defs/Tools",
+      "description": "uv and interpreter installs."
+    },
+    "upstream": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Upstream"
+      },
+      "description": "HTTP upstreams by name.",
+      "type": "object"
+    }
+  },
+  "title": "The daemon's configuration and applied files",
+  "type": "object"
+}

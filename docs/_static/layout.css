@@ -1,0 +1,34 @@
+/* Furo fixes the content column at 46em whatever the window's width. On
+   wide windows it grows, in steps, and the navigation sidebar gives up the
+   space; the sidebar's width keeps Furo's rule, half the window less half
+   the padded content. Below 100em Furo's own layout applies. */
+
+@media (min-width: 100em) {
+  .content {
+    width: 56em;
+  }
+
+  .sidebar-drawer {
+    width: calc(50% - 31em);
+  }
+}
+
+@media (min-width: 120em) {
+  .content {
+    width: 66em;
+  }
+
+  .sidebar-drawer {
+    width: calc(50% - 36em);
+  }
+}
+
+@media (min-width: 140em) {
+  .content {
+    width: 76em;
+  }
+
+  .sidebar-drawer {
+    width: calc(50% - 41em);
+  }
+}

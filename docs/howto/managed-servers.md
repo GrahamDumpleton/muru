@@ -1,15 +1,5 @@
 # Managed HTTP servers
 
-```{admonition} Status
-:class: note
-
-Releases with `kind = 'http'`: a command Muru starts, probes, supervises
-and stops, with profiles for gunicorn, uvicorn, Granian, mod_wsgi-express
-and generic servers, routed to like an upstream so traffic policies,
-rollouts, drains and rollbacks apply to it. Instance autoscaling and
-socket activation are still to come.
-```
-
 A managed HTTP server release runs an ordinary HTTP server, such as the
 gunicorn or uvicorn an existing deployment already uses, instead of
 Muru's own workers. Muru starts the server's instances, waits until they
@@ -38,7 +28,7 @@ readiness = { path = '/healthz', timeout = '60s' }
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `kind` | `workers` | `http` runs a server from `command` instead of workers from an entrypoint |
-| `profile` | required | `gunicorn`, `uvicorn`, `granian`, `mod_wsgi-express` or `generic`; fixes how the server binds and how it is stopped |
+| `profile` | required | `gunicorn`, `uvicorn`, `granian`, `mod_wsgi-express`, `uwsgi` or `generic`; fixes how the server binds and how it is stopped |
 | `command` | required | the server's command line; a bare name is found on `PATH`, a relative path with a directory in it is taken from `cwd` |
 | `cwd` | `source` | the directory the command runs in; one of the two is required |
 | `bind` | `unix` | `unix`, a socket per instance under the release's run directory, or `port`, a free loopback port per instance |
@@ -70,16 +60,16 @@ release's run directory, or a loopback port. The command says where the
 server takes it:
 
 - `{bind}` is replaced by the address in the server's own form: for
-  gunicorn and generic `unix:/path` or `127.0.0.1:PORT`, for uvicorn and
-  Granian the socket path or `127.0.0.1:PORT`.
+  gunicorn and generic `unix:/path` or `127.0.0.1:PORT`, for uvicorn,
+  Granian and uWSGI the socket path or `127.0.0.1:PORT`.
 - `{socket}` is replaced by the socket path and `{port}` by the port
   number, for servers with a flag of their own for each.
 - A command naming none of them gets the profile's flags appended:
   `--bind ADDRESS` for gunicorn, `--uds PATH` or
-  `--host 127.0.0.1 --port PORT` for uvicorn and Granian, and
+  `--host 127.0.0.1 --port PORT` for uvicorn and Granian,
   `--host 127.0.0.1 --port PORT` for mod_wsgi-express, which binds a
-  port only. A generic command must name `{bind}` or read the
-  environment.
+  port only, and `--http-socket ADDRESS` for uWSGI. A generic command must
+  name `{bind}` or read the environment.
 
 Every instance also has `MURU_HTTP_BIND` (the address as `unix:/path` or
 `127.0.0.1:PORT`), `PORT` when it binds a port, and `MURU_INSTANCE`, its
@@ -114,6 +104,24 @@ sends each instance the profile's stop signal (`TERM` for every profile
 unless `stop_signal` says otherwise) and kills one still there after
 `shutdown_timeout`. A superseded release is kept warm as a workers release
 is, with its instances running, so a rollback to it is instant.
+
+## uWSGI
+
+uWSGI runs with `--http-socket`, so its workers speak HTTP themselves and
+the edge is the router; `--http` would put uWSGI's own HTTP router
+process in front of them. The profile also adds `--master` and
+`--hook-master-start "unix_signal:15 gracefully_kill_them_all"` to every
+command: uWSGI 2.0 takes TERM as a reload, which drops the requests in
+flight, and the hook makes it a graceful stop that finishes them first.
+Both are harmless when the command or an ini file sets them too.
+
+```toml
+[app.legacy.release.r10]
+kind = 'http'
+profile = 'uwsgi'
+command = ['.venv/bin/uwsgi', '--module', 'legacy.wsgi:application', '--processes', '4']
+cwd = '/srv/legacy'
+```
 
 ## Requests, logs and the daemon
 

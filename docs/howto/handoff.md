@@ -1,15 +1,5 @@
 # Handing requests between WSGI and ASGI
 
-```{admonition} Status
-:class: note
-
-Handing a WSGI request, or a WebSocket upgrade, to an ASGI application
-with `handoff = "asgi"`, and an ASGI request to a WSGI callable with
-`handoff = "wsgi"`; the WebSocket adapter, the lifespan of an
-application requests are handed to, `muru.loop()` and
-`muru.request_id()`.
-```
-
 [Mounts](mounts.md) choose between a WSGI and an ASGI application by
 path. When the choice belongs in code, a request that has reached one
 can be handed to the other in the same worker. A WSGI view takes a

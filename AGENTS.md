@@ -43,6 +43,21 @@ and are repeated here so that an agent needs nothing else to start work.
   `scripts/check-user-text.py` checks string literals, and a muructl unit
   test checks the rendered help.
 
+- Examples in documentation that show a version of Muru (a command that
+  pins one, output that prints one) use 1.0.0, or 1.0.0 and 1.1.0 where
+  two are needed, not the current release, so they do not go stale with
+  every release. Text about a particular release, such as the roadmap's
+  release column, names it.
+
+- The user documentation (the home page, tutorials, how-to guides,
+  reference and explanation) describes what Muru does and how to use it,
+  as a user guide would. It carries no status notes and no promises of
+  what is still to come: that lives in the roadmap and in GitHub issues.
+  A limit a user would hit is stated as it is ("response trailers are not
+  sent"), where it applies. User pages do not send readers to the design
+  specification for what they need to use Muru. `scripts/check-user-docs.py`
+  rejects status notes and future-tense phrases in those pages.
+
 ## Python code (the muru package, tests, fixtures, scripts)
 
 - Always use type hints: on all function and method parameters and return
@@ -233,7 +248,7 @@ with `--fix`; the formatters keep what it inserts.
 - Track pending work as GitHub issues, never in files. Every bug, planned
   piece of work, step of a roadmap goal still to come and future idea has
   an issue in this repository; a change a workshop needs is an issue in
-  GrahamDumpleton/muru-workshops, marked as blocked by the Muru issue it
+  muruhq/muru-workshops, marked as blocked by the Muru issue it
   waits on. When work is found or deferred, open an issue in the same
   step instead of noting it in `scratch/`, a code comment or a document.
   Write it with the headings and label of the matching issue form, or a

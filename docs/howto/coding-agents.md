@@ -1,21 +1,16 @@
 # Coding agents
 
-```{admonition} Status
-:class: note
-
-`muructl mcp serve` gives a coding agent the daemon's operations as tools
-over the Model Context Protocol (MCP): deploying releases, moving traffic,
-reading events, logs, worker stacks and metrics, and the user guide. Every
-command that reports something also prints JSON with `--json`, for agents
-that work through a shell. Remote agents, and agents acting for an
-application on its own instance, are still to come.
-```
-
 A coding agent working on a Python web application can run it under the
 daemon on the same machine, deploy each change as a release, run the tests
 against it, and read what Muru observes when something fails: the
 release's state and events, its output and tracebacks, what each worker
 thread is doing. When it is done it rolls back or drains.
+
+`muructl mcp serve` gives a coding agent the daemon's operations as
+tools over the Model Context Protocol (MCP): deploying releases, moving
+traffic, reading events, logs, worker stacks and metrics, and the user
+guide. Every command that reports something also prints JSON with
+`--json`, for agents that work through a shell.
 
 ## Adding Muru to a project
 

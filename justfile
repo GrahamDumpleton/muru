@@ -42,6 +42,7 @@ lint: lint-text lint-rust lint-python
 lint-text:
     sh scripts/check-no-em-dashes.sh
     uv run python scripts/check-user-text.py
+    uv run python scripts/check-user-docs.py
     uv run python scripts/check-layout.py $(git ls-files --cached --others --exclude-standard '*.py' '*.rs')
 
 lint-rust:
@@ -93,6 +94,10 @@ fuzz target:
 # Performance scenarios (Linux only for representative numbers).
 bench *args:
     uv run --group bench python bench/run.py {{args}}
+
+# Regenerate the configuration reference and JSON Schemas from muru-config.
+reference:
+    MURU_UPDATE_REFERENCE=1 cargo test -p muru-config --test reference
 
 # Build the documentation with warnings as errors.
 docs:

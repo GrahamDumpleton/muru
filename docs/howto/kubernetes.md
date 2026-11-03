@@ -1,15 +1,5 @@
 # A Kubernetes Deployment
 
-```{admonition} Status
-:class: note
-
-A Deployment of `muructl serve`: probes, a rolling update that loses no
-requests, a restricted security context, sizing from resource limits,
-logs for a collector, autoscaling and migrations. Reloading mounted
-configuration and certificates, and debugging tools for a locked-down
-pod, are still to come.
-```
-
 An image built as [in a container](containers.md#an-image) runs in a pod
 as it runs under Docker. Its settings come from the environment, so the
 whole configuration is in the Deployment.

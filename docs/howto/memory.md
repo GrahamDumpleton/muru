@@ -1,16 +1,5 @@
 # Memory limits
 
-```{admonition} Status
-:class: note
-
-Soft and hard memory limits per worker, measured as USS, PSS or RSS,
-with reclaiming before a recycle and a leak warning. The node-wide
-budget is in [scaling](scaling.md), and a [worker
-group](worker-groups.md#timeouts-and-memory-per-group) can have limits
-of its own. Allocator settings and per-request memory deltas are still
-to come.
-```
-
 A worker that grows too large is replaced through the same path as
 [worker recycling](recycling.md), so no request is lost. Each worker
 measures its own memory at `check_interval` and reports it to the host,
@@ -43,6 +32,10 @@ check_interval = "5s"
 The same table goes in a declared release for `muructl apply`, and
 `muructl run --print-config` writes it. Sizes are `800MB`, `1.5GB` or a
 number of bytes, with KB, MB and GB as powers of 1024.
+
+The node-wide memory budget is in [scaling](scaling.md), and a [worker
+group](worker-groups.md#timeouts-memory-and-recycling-per-group) can have limits
+of its own.
 
 ## What is measured
 

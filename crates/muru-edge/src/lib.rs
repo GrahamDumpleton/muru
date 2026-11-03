@@ -1,12 +1,12 @@
 //! The Muru edge: listeners, TLS, virtual hosts, routing, the request pipeline, upstreams, static files and uploads.
 //!
-//! Phase 1 scope so far: an HTTP listener and an optional HTTPS listener,
-//! each speaking HTTP/1.1 and HTTP/2 (h2c by prior knowledge, h2 by ALPN
-//! over TLS), forwarding every request to one pool of workers over the
-//! worker link (design specification section 5). The request head is sent
-//! as a typed frame, the body streams behind it, and the response streams
-//! back; no HTTP is re-serialised between the edge and the application.
-//! Routing, virtual hosts and everything else arrive in phase 2 and beyond.
+//! Each listener speaks HTTP/1.1 and HTTP/2 (h2c by prior knowledge, h2
+//! by ALPN over TLS). A request is routed by virtual host and path to a
+//! pool of workers over the worker link (design specification section 5),
+//! to an upstream, or to static files. To a worker the request head is
+//! sent as a typed frame, the body streams behind it, and the response
+//! streams back; no HTTP is re-serialised between the edge and the
+//! application.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

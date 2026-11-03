@@ -31,7 +31,7 @@ with attestations, so no long-lived tokens exist. The design is in
 Releases are published only by the release workflow, using PyPI trusted
 publishing (OpenID Connect), so no API tokens exist anywhere. Both
 distributions, `muru` and `muructl`, have the workflow registered as their
-publisher on PyPI: owner `GrahamDumpleton`, repository `muru`, workflow
+publisher on PyPI: owner `muruhq`, repository `muru`, workflow
 `release.yml`, environment `pypi`. The GitHub side is the `pypi`
 environment, limited to release tags and requiring a maintainer's approval.
 
