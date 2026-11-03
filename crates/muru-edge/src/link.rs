@@ -2500,33 +2500,29 @@ impl BodyState {
 
 impl Drop for BodyState {
     /// hyper drops a body once the declared length is written, which can be
-    /// before the END frame has been read. Drain to the end in the
-    /// background so the connection can go back to the pool.
+    /// before the END frame has been read, and when the client goes away.
+    /// Drain to the end in the background so the connection can go back
+    /// to the pool, within the idle timeout, so a worker that never ends
+    /// the response costs the connection rather than a slot for good.
     fn drop(&mut self) {
         self.record();
 
-        if let Some(mut reader) = self.reader.take() {
-            let back = Arc::clone(&self.back);
-            tokio::spawn(async move {
-                loop {
-                    match frame::read(&mut reader).await {
-                        Ok(Some(next))
-                            if next.kind == kind::CONTINUE
-                                || (carries_body(&next, &mut reader) && !next.is_end()) => {}
-                        Ok(Some(next)) if next.kind == kind::BODY || next.kind == kind::END => {
-                            back.give_reader(Some(reader));
-                            back.abort_request();
-                            return;
-                        }
-                        _ => {
-                            back.give_reader(None);
-                            back.abort_request();
-                            return;
-                        }
-                    }
-                }
-            });
+        let Some(reader) = self.reader.take() else {
+            return;
+        };
+
+        // Section 5.7: a FILE frame that ended the body was the worker's
+        // last word, so a range left unsent leaves nothing to drain.
+
+        if self.file.as_ref().is_some_and(|range| range.last) {
+            self.back.give_reader(Some(reader));
+            self.back.abort_request();
+            return;
         }
+
+        let back = Arc::clone(&self.back);
+        let idle_timeout = self.idle_timeout;
+        tokio::spawn(async move { drain_response(reader, &back, idle_timeout).await });
     }
 }
 
