@@ -7,7 +7,9 @@
 use std::io;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+};
 
 /// Size of a frame header.
 pub const HEADER_LEN: usize = 6;
@@ -81,6 +83,25 @@ impl Frame {
     }
 }
 
+/// A frame's header: its type, its flags and the length of the payload
+/// that follows.
+#[derive(Debug, Clone, Copy)]
+pub struct Header {
+    /// One of the `kind` constants.
+    pub kind: u8,
+    /// A set of `flag` bits.
+    pub flags: u8,
+    /// The payload's length.
+    pub len: usize,
+}
+
+impl Header {
+    /// Whether the END flag is set.
+    pub fn is_end(&self) -> bool {
+        self.flags & flag::END != 0
+    }
+}
+
 /// Append a frame header to a buffer.
 pub fn put_header(buffer: &mut BytesMut, kind: u8, flags: u8, payload_len: usize) {
     buffer.put_u32_le(payload_len as u32);
@@ -119,6 +140,16 @@ pub async fn write<W: AsyncWrite + Unpin>(
 
 /// Read one frame. Returns `None` on a clean end of stream at a frame boundary.
 pub async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Frame>> {
+    let Some(header) = read_header(reader).await? else {
+        return Ok(None);
+    };
+
+    read_payload(reader, header).await.map(Some)
+}
+
+/// Read one frame's header, leaving its payload to be read. Returns `None`
+/// on a clean end of stream at a frame boundary.
+pub async fn read_header<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Header>> {
     let mut header = [0u8; HEADER_LEN];
 
     match reader.read_exact(&mut header).await {
@@ -136,24 +167,65 @@ pub async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Fra
         ));
     }
 
+    Ok(Some(Header {
+        kind: header[4],
+        flags: header[5],
+        len,
+    }))
+}
+
+/// Read the whole payload of the frame whose header was just read.
+pub async fn read_payload<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    header: Header,
+) -> io::Result<Frame> {
     // The payload is read into memory that is not zeroed first, which for
     // a large BODY frame was a second pass over every byte.
 
-    let mut payload = BytesMut::with_capacity(len);
+    let mut payload = BytesMut::with_capacity(header.len);
 
-    while payload.len() < len {
-        let wanted = len - payload.len();
+    while payload.len() < header.len {
+        let wanted = header.len - payload.len();
 
         if reader.read_buf(&mut (&mut payload).limit(wanted)).await? == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
     }
 
-    Ok(Some(Frame {
-        kind: header[4],
-        flags: header[5],
+    Ok(Frame {
+        kind: header.kind,
+        flags: header.flags,
         payload: payload.freeze(),
-    }))
+    })
+}
+
+/// Read what has arrived of a payload being read in pieces, at least one
+/// byte and at most `most`.
+pub async fn read_piece<R: AsyncRead + Unpin>(reader: &mut R, most: usize) -> io::Result<Bytes> {
+    let mut piece = BytesMut::with_capacity(most);
+
+    if reader.read_buf(&mut (&mut piece).limit(most)).await? == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+
+    Ok(piece.freeze())
+}
+
+/// Read and discard `len` bytes of a payload.
+pub async fn skip<R: AsyncBufRead + Unpin>(reader: &mut R, mut len: usize) -> io::Result<()> {
+    while len > 0 {
+        let available = reader.fill_buf().await?;
+
+        if available.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+
+        let used = available.len().min(len);
+        reader.consume(used);
+        len -= used;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -165,7 +237,7 @@ mod tests {
     use crate::descriptors::FdReader;
 
     #[tokio::test]
-    async fn a_large_frame_read_in_pieces_arrives_whole_and_a_short_one_fails() {
+    async fn a_payload_read_whole_in_pieces_or_skipped_arrives_intact_and_a_short_one_fails() {
         let (left, right) = UnixStream::pair().unwrap();
         let (_, mut writer) = left.into_split();
         let (read_half, _) = right.into_split();
@@ -177,7 +249,14 @@ mod tests {
 
         let sent = payload.clone();
         let writing = tokio::spawn(async move {
-            write(&mut writer, kind::BODY, flag::END, sent)
+            write(&mut writer, kind::BODY, flag::END, sent.clone())
+                .await
+                .unwrap();
+            write(&mut writer, kind::BODY, 0, sent.clone())
+                .await
+                .unwrap();
+            write(&mut writer, kind::BODY, 0, sent).await.unwrap();
+            write(&mut writer, kind::BODY, 0, "after".into())
                 .await
                 .unwrap();
             writer
@@ -189,6 +268,26 @@ mod tests {
         let frame = read(&mut reader).await.unwrap().expect("a frame");
         assert_eq!((frame.kind, frame.flags), (kind::BODY, flag::END));
         assert_eq!(frame.payload, payload);
+
+        // A payload read in pieces, and one skipped, leave the reader at
+        // the next frame.
+
+        let header = read_header(&mut reader).await.unwrap().expect("a header");
+        assert_eq!(header.len, 1_000_000);
+        let mut pieces = BytesMut::new();
+
+        while pieces.len() < header.len {
+            let piece = read_piece(&mut reader, (header.len - pieces.len()).min(65536))
+                .await
+                .unwrap();
+            assert!(!piece.is_empty() && piece.len() <= 65536);
+            pieces.extend_from_slice(&piece);
+        }
+
+        assert_eq!(pieces, payload);
+        let header = read_header(&mut reader).await.unwrap().expect("a header");
+        skip(&mut reader, header.len).await.unwrap();
+        assert_eq!(read(&mut reader).await.unwrap().unwrap().payload, "after");
         writing.await.unwrap();
 
         let short = read(&mut reader).await.unwrap_err();

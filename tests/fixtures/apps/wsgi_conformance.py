@@ -442,8 +442,14 @@ def rs_slow_chunks(environ: Environ, start_response: StartResponse) -> Iterable[
 
 
 def rs_large(environ: Environ, start_response: StartResponse) -> Iterable[bytes]:
-    size = int(query(environ).get("size", "1048576"))
-    start_response("200 OK", [("Content-Type", "application/octet-stream")])
+    params = query(environ)
+    size = int(params.get("size", "1048576"))
+    headers = [("Content-Type", "application/octet-stream")]
+
+    if params.get("declared"):
+        headers.append(("Content-Length", str(size)))
+
+    start_response("200 OK", headers)
     return [bytes(range(256)) * (size // 256) + bytes(range(size % 256))]
 
 

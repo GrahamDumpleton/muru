@@ -2011,6 +2011,7 @@ async fn handle_inner(
                 bytes: 0,
                 idle_timeout: limits.response_idle_timeout,
                 file: None,
+                piece: None,
             },
             next_chunk,
         );
@@ -2469,6 +2470,11 @@ pub(crate) async fn read_body(body: &mut Incoming, max_body_size: u64) -> Result
     Ok(data.freeze())
 }
 
+/// A BODY frame larger than this is passed on to the client in pieces of
+/// at most this size as they arrive, so writing to the client overlaps
+/// reading from the worker (section 5.4).
+const BODY_PIECE: usize = 64 * 1024;
+
 /// The response body in flight: the read half until the body ends.
 struct BodyState {
     reader: Option<Reader>,
@@ -2478,6 +2484,43 @@ struct BodyState {
     idle_timeout: Duration,
     /// A file range a FILE frame handed over, being read (section 5.7).
     file: Option<FileRange>,
+    /// A large BODY frame being passed on in pieces.
+    piece: Option<Piece>,
+}
+
+/// What is left of a large BODY frame being passed on in pieces.
+#[derive(Clone, Copy)]
+struct Piece {
+    remaining: usize,
+    /// The frame ends the body.
+    last: bool,
+}
+
+/// What the edge reads next of a response body.
+enum Next {
+    /// A frame read whole.
+    Frame(frame::Frame),
+    /// The start of a BODY frame too large to hold before passing it on.
+    Piece(Piece),
+}
+
+/// Read the next frame of a response body, or only the header of a BODY
+/// frame larger than `BODY_PIECE`.
+async fn next_frame(reader: &mut Reader) -> io::Result<Option<Next>> {
+    let Some(header) = frame::read_header(reader).await? else {
+        return Ok(None);
+    };
+
+    if header.kind == kind::BODY && header.len > BODY_PIECE {
+        return Ok(Some(Next::Piece(Piece {
+            remaining: header.len,
+            last: header.is_end(),
+        })));
+    }
+
+    frame::read_payload(reader, header)
+        .await
+        .map(|frame| Some(Next::Frame(frame)))
 }
 
 /// The range of a file the edge is sending for a FILE frame.
@@ -2513,7 +2556,7 @@ impl Drop for BodyState {
     fn drop(&mut self) {
         self.record();
 
-        let Some(reader) = self.reader.take() else {
+        let Some(mut reader) = self.reader.take() else {
             return;
         };
 
@@ -2526,9 +2569,34 @@ impl Drop for BodyState {
             return;
         }
 
+        // A large BODY frame passed on in part has the rest of it to read
+        // before the frames that follow.
+
+        let piece = self.piece.take();
         let back = Arc::clone(&self.back);
         let idle_timeout = self.idle_timeout;
-        tokio::spawn(async move { drain_response(reader, &back, idle_timeout).await });
+
+        tokio::spawn(async move {
+            if let Some(piece) = piece {
+                let skipped =
+                    tokio::time::timeout(idle_timeout, frame::skip(&mut reader, piece.remaining))
+                        .await;
+
+                if !matches!(skipped, Ok(Ok(()))) {
+                    back.give_reader(None);
+                    back.abort_request();
+                    return;
+                }
+
+                if piece.last {
+                    back.give_reader(Some(reader));
+                    back.abort_request();
+                    return;
+                }
+            }
+
+            drain_response(reader, &back, idle_timeout).await;
+        });
     }
 }
 
@@ -2573,11 +2641,53 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             }
         }
 
+        if let Some(piece) = state.piece {
+            let reader = state.reader.as_mut()?;
+            let most = piece.remaining.min(BODY_PIECE);
+            let read = tokio::time::timeout(state.idle_timeout, frame::read_piece(reader, most));
+
+            let chunk = match read.await {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(error)) => {
+                    state.piece = None;
+                    state.finish(false);
+                    return Some((Err(BoxError::from(error)), state));
+                }
+                Err(_) => {
+                    state.piece = None;
+                    state.finish(false);
+                    return Some((
+                        Err(BoxError::from("the worker stopped sending the response")),
+                        state,
+                    ));
+                }
+            };
+
+            // As with a file range, the frame's end is noticed with its
+            // last piece.
+
+            let remaining = piece.remaining - chunk.len();
+            state.bytes += chunk.len() as u64;
+            state.piece = (remaining > 0).then_some(Piece { remaining, ..piece });
+
+            if remaining == 0 && piece.last {
+                state.finish(true);
+            }
+
+            return Some((Ok(Frame::data(chunk)), state));
+        }
+
         let idle_timeout = state.idle_timeout;
         let reader = state.reader.as_mut()?;
 
-        let next = match tokio::time::timeout(idle_timeout, frame::read(reader)).await {
-            Ok(next) => next,
+        let next = match tokio::time::timeout(idle_timeout, next_frame(reader)).await {
+            Ok(Ok(Some(Next::Piece(piece)))) => {
+                state.piece = Some(piece);
+                continue;
+            }
+            Ok(Ok(Some(Next::Frame(next)))) => Ok(Some(next)),
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(error)) => Err(error),
             Err(_) => {
                 state.finish(false);
                 return Some((
