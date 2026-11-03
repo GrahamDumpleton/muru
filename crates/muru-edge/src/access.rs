@@ -13,6 +13,11 @@
 //! An override changes what is written for a period, for one application
 //! or every one and some paths or all, and lapses on its own.
 //!
+//! Lines are written by a thread of their own, fed through a bounded
+//! queue, so a slow disk or a reader of standard error that has stopped
+//! never holds up a request: the request's task only queues its line, and
+//! when the queue is full the line is dropped and counted (section 11.2).
+//!
 //! A WebSocket's request ends when the worker accepts it: its line is
 //! written then, with the handshake's time. The open socket is then kept
 //! in a list of its own, counted in its own metrics, and written as a
@@ -36,6 +41,12 @@ pub const RING_CAPACITY: usize = 1000;
 
 /// How many lines a follower may fall behind before it skips some.
 const FOLLOW_CAPACITY: usize = 1024;
+
+/// How many lines may wait for the writer before more are dropped.
+const WRITE_QUEUE: usize = 16 * 1024;
+
+/// How much the writer gathers into one write.
+const WRITE_BATCH: usize = 64 * 1024;
 
 /// Where access log lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,7 +659,8 @@ pub struct AccessLog {
     minute: Mutex<[Bucket; MINUTE]>,
     metrics: Metrics,
     started: u64,
-    file: Option<Mutex<File>>,
+    /// The writer thread's queue, unless lines go nowhere.
+    writer: Option<std::sync::mpsc::SyncSender<Message>>,
     /// The WebSockets open now, by a number of their own.
     websockets: Mutex<BTreeMap<u64, Arc<Socket>>>,
     next_websocket: AtomicU64,
@@ -676,13 +688,35 @@ fn unix_seconds(time: SystemTime) -> u64 {
 }
 
 impl AccessLog {
-    /// Prepare the log, opening the file when lines go to one.
+    /// Prepare the log, opening the file when lines go to one, and start
+    /// the thread that writes them.
     pub fn new(config: Config) -> io::Result<Self> {
-        let file = match &config.destination {
-            Destination::File(path) => Some(Mutex::new(
-                OpenOptions::new().create(true).append(true).open(path)?,
-            )),
-            _ => None,
+        let output = match &config.destination {
+            Destination::File(path) => Some(Output::File {
+                file: OpenOptions::new().create(true).append(true).open(path)?,
+                path: path.clone(),
+            }),
+            Destination::Terminal => Some(Output::Terminal),
+            Destination::Off => None,
+        };
+
+        Self::with_output(config, output)
+    }
+
+    /// Prepare the log writing to `output`, or nowhere.
+    fn with_output(config: Config, output: Option<Output>) -> io::Result<Self> {
+        let metrics = Metrics::default();
+
+        let writer = match output {
+            Some(output) => {
+                let (queue, lines) = std::sync::mpsc::sync_channel(WRITE_QUEUE);
+                let dropped = metrics.access_log_dropped();
+                std::thread::Builder::new()
+                    .name("access-log".to_owned())
+                    .spawn(move || write_lines(&lines, output, &dropped))?;
+                Some(queue)
+            }
+            None => None,
         };
 
         Ok(Self {
@@ -690,9 +724,9 @@ impl AccessLog {
             filters: RwLock::new(Filters::node(config.filter)),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             minute: Mutex::new([Bucket::default(); MINUTE]),
-            metrics: Metrics::default(),
+            metrics,
             started: unix_seconds(SystemTime::now()),
-            file,
+            writer,
             websockets: Mutex::new(BTreeMap::new()),
             next_websocket: AtomicU64::new(0),
             lines: tokio::sync::broadcast::channel(FOLLOW_CAPACITY).0,
@@ -876,14 +910,52 @@ impl AccessLog {
     /// Open the file again by name, for section 11.3: after an external
     /// rotation has renamed the file, lines go to a new one at the path.
     /// Nothing happens when lines do not go to a file.
+    ///
+    /// The writer thread reopens it after the lines queued before, so
+    /// this waits for them: call it where blocking is allowed.
     pub fn reopen(&self) -> io::Result<()> {
-        let (Destination::File(path), Some(file)) = (&self.destination, &self.file) else {
+        let (Destination::File(_), Some(writer)) = (&self.destination, &self.writer) else {
             return Ok(());
         };
 
-        let reopened = OpenOptions::new().create(true).append(true).open(path)?;
-        *file.lock().expect("access log file poisoned") = reopened;
-        Ok(())
+        let stopped = || io::Error::other("the access log's writer has stopped");
+        let (answer, answered) = std::sync::mpsc::channel();
+        writer
+            .send(Message::Reopen(answer))
+            .map_err(|_| stopped())?;
+        answered.recv().map_err(|_| stopped())?
+    }
+
+    /// Wait until every line queued so far is written, as at the end of
+    /// a run, but no longer than `within`, since a stalled destination
+    /// may never take them; call it where blocking is allowed. Whether
+    /// they were all written.
+    pub fn flush(&self, within: Duration) -> bool {
+        let Some(writer) = &self.writer else {
+            return true;
+        };
+
+        // The queue may be full of lines still to write: the request to
+        // answer waits for room, until the time is up.
+
+        let deadline = Instant::now() + within;
+        let (answer, answered) = std::sync::mpsc::channel();
+        let mut message = Message::Flush(answer);
+
+        loop {
+            match writer.try_send(message) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) if Instant::now() < deadline => {
+                    message = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
+        }
+
+        answered
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
     }
 
     /// The most recent records as JSON lines, oldest first.
@@ -913,31 +985,132 @@ impl AccessLog {
             .shows(record)
     }
 
+    /// Queue a record's line for the writer, or drop and count it when
+    /// the writer is too far behind (section 11.2).
     fn write(&self, record: &Record) {
-        match &self.file {
-            Some(file) => {
-                let line = json_line(record);
-                let mut file = file.lock().expect("access log file poisoned");
+        let Some(writer) = &self.writer else {
+            return;
+        };
 
-                if file.write_all(line.as_bytes()).is_err() {
-                    // Section 11.2: a stalled log never holds up requests.
+        // Section 11.8: a file takes JSON lines, the terminal the compact
+        // line, or under muructl serve --log-format json the record
+        // itself.
+
+        let line = match &self.destination {
+            Destination::File(_) => json_line(record),
+            _ if muru_common::log::json() => muru_common::log::with_identity(
+                json_line(record).replacen('{', "{\"kind\":\"access\",", 1),
+            ),
+            _ => text_line(record),
+        };
+
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = writer.try_send(Message::Line(line)) {
+            self.metrics.count_access_log_dropped();
+        }
+    }
+}
+
+/// What the writer thread is given.
+enum Message {
+    /// A line to write.
+    Line(String),
+    /// Open the file again by name, answering how it went.
+    Reopen(std::sync::mpsc::Sender<io::Result<()>>),
+    /// Answer once every line before this one is written.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Where the writer thread writes.
+enum Output {
+    /// Standard error, as the process's log routes it.
+    Terminal,
+    /// A file, opened for appending, and its path for reopening.
+    File { file: File, path: PathBuf },
+    /// Another output whose every write first waits for the gate, which
+    /// stands in for a stalled destination until the gate is dropped.
+    #[cfg(test)]
+    Held {
+        inner: Box<Output>,
+        gate: std::sync::mpsc::Receiver<()>,
+    },
+}
+
+impl Output {
+    /// Write what has been gathered; a destination that cannot be written
+    /// to loses the lines and stops nothing.
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        match self {
+            Self::Terminal => muru_common::log::write(muru_common::log::Stream::Stderr, bytes),
+            Self::File { file, .. } => {
+                let _ = file.write_all(bytes);
+            }
+            #[cfg(test)]
+            Self::Held { inner, gate } => {
+                let _ = gate.recv();
+                inner.write(bytes);
+            }
+        }
+    }
+
+    /// Open the file again by name (section 11.3).
+    fn reopen(&mut self) -> io::Result<()> {
+        if let Self::File { file, path } = self {
+            *file = OpenOptions::new().create(true).append(true).open(&*path)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The writer thread: gather what is waiting into one write, up to a
+/// batch, so a busy log is a few large writes rather than one a request,
+/// and say once writing resumes how many lines were dropped meanwhile.
+fn write_lines(
+    lines: &std::sync::mpsc::Receiver<Message>,
+    mut output: Output,
+    dropped: &AtomicU64,
+) {
+    let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH);
+    let mut reported = 0;
+
+    while let Ok(first) = lines.recv() {
+        let mut next = Some(first);
+
+        while let Some(message) = next.take() {
+            match message {
+                Message::Line(line) => batch.extend_from_slice(line.as_bytes()),
+                Message::Reopen(answer) => {
+                    output.write(&batch);
+                    batch.clear();
+                    let _ = answer.send(output.reopen());
+                }
+                Message::Flush(answer) => {
+                    output.write(&batch);
+                    batch.clear();
+                    let _ = answer.send(());
                 }
             }
-            None => {
-                // Section 11.8: the terminal's compact line, or under
-                // muructl serve --log-format json the record itself.
 
-                let line = if muru_common::log::json() {
-                    muru_common::log::with_identity(json_line(record).replacen(
-                        '{',
-                        "{\"kind\":\"access\",",
-                        1,
-                    ))
-                } else {
-                    text_line(record)
-                };
-                muru_common::log::write(muru_common::log::Stream::Stderr, line.as_bytes());
+            if batch.len() < WRITE_BATCH {
+                next = lines.try_recv().ok();
             }
+        }
+
+        output.write(&batch);
+        batch.clear();
+        let now = dropped.load(Ordering::Relaxed);
+
+        if now > reported {
+            muru_common::muru_eprintln!(
+                "the access log dropped {} line{} while its writer was behind",
+                now - reported,
+                if now - reported == 1 { "" } else { "s" }
+            );
+            reported = now;
         }
     }
 }
@@ -1332,6 +1505,60 @@ mod tests {
             Filters::from_snapshot(&muru_proto::edge::v1::Snapshot::default()),
             None
         );
+    }
+
+    #[test]
+    fn a_writer_that_is_behind_drops_and_counts_lines_but_holds_up_nothing() {
+        let directory = std::env::temp_dir().join(format!("muru-access-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("access.log");
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("file");
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = Output::Held {
+            inner: Box::new(Output::File {
+                file,
+                path: path.clone(),
+            }),
+            gate,
+        };
+        let config = Config {
+            destination: Destination::File(path.clone()),
+            filter: Filter::default(),
+        };
+        let log = AccessLog::with_output(config, Some(held)).expect("log");
+
+        // More lines than the queue and a batch hold, with the writer
+        // stalled: every record is taken at once, and the lines beyond
+        // what the writer took and the queue holds are dropped.
+
+        let started = Instant::now();
+        let quick = Duration::from_millis(1);
+        let total = WRITE_QUEUE + WRITE_BATCH / 10;
+
+        for _ in 0..total {
+            log.record(record("shop", 200, "/", quick));
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "nothing waited"
+        );
+        let dropped = log.metrics().access_log_dropped().load(Ordering::Relaxed) as usize;
+        assert!(dropped > 0, "nothing dropped");
+        assert_eq!(log.recent(1).len(), 1, "every record is still kept");
+
+        // Released, the writer writes what it queued, and nothing else.
+
+        drop(release);
+        assert!(log.flush(Duration::from_secs(10)));
+        let written = std::fs::read_to_string(&path).expect("log").lines().count();
+        assert_eq!(written + dropped, total);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

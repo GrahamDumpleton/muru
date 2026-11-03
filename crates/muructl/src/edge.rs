@@ -199,11 +199,20 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // renamed it.
 
     let access_log = edge.access_log();
+    let written = edge.access_log();
     let mut reopen = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     tokio::spawn(async move {
         while reopen.recv().await.is_some() {
-            match access_log.reopen() {
-                Ok(()) => muru_common::muru_eprintln!("edge reopened the access log"),
+            // The writer thread reopens the file after the lines queued
+            // before the signal, which this waits for off the runtime.
+
+            let log = Arc::clone(&access_log);
+
+            match tokio::task::spawn_blocking(move || log.reopen()).await {
+                Ok(Ok(())) => muru_common::muru_eprintln!("edge reopened the access log"),
+                Ok(Err(error)) => {
+                    muru_common::muru_eprintln!("edge could not reopen the access log: {error}")
+                }
                 Err(error) => {
                     muru_common::muru_eprintln!("edge could not reopen the access log: {error}")
                 }
@@ -254,6 +263,10 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
         }
     }
 
+    // The lines of the last requests are written before the edge exits, unless
+    // the destination has stalled.
+
+    let _ = tokio::task::spawn_blocking(move || written.flush(Duration::from_secs(2))).await;
     let _ = std::fs::remove_file(&args.control);
 
     if let Some(path) = &args.listener_socket {

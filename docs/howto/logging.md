@@ -141,6 +141,13 @@ Whatever is shown, the last thousand records are kept in memory and the
 per-second counts for the last minute, which is what the dashboard
 displays.
 
+Lines are written by a thread of the edge's own, so a slow disk, or a
+terminal or log collector that stops reading, never holds up a request.
+When the writer falls behind by more than sixteen thousand lines, the
+lines beyond that are dropped rather than waited for: the
+`muru_access_log_dropped_total` [metric](metrics.md) counts them, and
+once writing catches up the edge says how many were dropped.
+
 A JSON line has these fields:
 
 ```json

@@ -397,13 +397,20 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
         directory.display(),
         edge.local_addr()
     );
+    let written = edge.access_log();
     let mut serving = tokio::spawn(edge.run());
 
-    tokio::select! {
+    let outcome = tokio::select! {
         served = &mut serving => served.map_err(anyhow::Error::from).and_then(|result| result),
         _ = interrupt.recv() => Ok(()),
         _ = terminate.recv() => Ok(()),
-    }
+    };
+
+    // The lines of the last requests are written before it exits,
+    // unless the destination has stalled.
+
+    let _ = tokio::task::spawn_blocking(move || written.flush(Duration::from_secs(2))).await;
+    outcome
 }
 
 #[derive(Args)]
@@ -3058,6 +3065,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             return Err(explain_bind_error(error, https_address));
         }
     };
+    let written = edge.access_log();
 
     let addresses = match edge.https_addr() {
         Some(https) if resolved.serving.https_only => {
@@ -3609,6 +3617,10 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         current.stop(stop_budget).await;
     }
 
+    // The lines of the last requests are written before the run exits, unless
+    // the destination has stalled.
+
+    let _ = tokio::task::spawn_blocking(move || written.flush(Duration::from_secs(2))).await;
     let _ = admin_stop_tx.send(());
     drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);

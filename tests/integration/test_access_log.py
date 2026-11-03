@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import os
 import re
+import subprocess
+import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -69,6 +74,61 @@ def test_query_strings_are_kept(default: support.Server) -> None:
     response = default.get("/environ/get?key=PATH_INFO")
     assert default.wait_for_log(f"id={response.header('X-Request-ID')}")
     assert access_lines(default)[-1]["target"] == "/environ/get?key=PATH_INFO"
+
+
+def test_a_reader_that_stops_holds_up_no_request() -> None:
+    # Standard error is a pipe nobody reads, as a log collector that has
+    # stopped leaves it: it fills after a few hundred lines, and requests
+    # go on being answered while the lines wait or are dropped.
+
+    muructl = support.muructl_path()
+    if muructl is None:
+        support.unavailable("muructl is not built (cargo build -p muructl)")
+    if not support.extension_available():
+        support.unavailable("the muru extension is not built into this interpreter (just dev)")
+
+    port = support.free_port()
+    process = subprocess.Popen(
+        [
+            str(muructl),
+            "run",
+            "plain_wsgi:application",
+            "--bind",
+            f"127.0.0.1:{port}",
+            "--python",
+            sys.executable,
+            "--processes",
+            "1",
+            "--chdir",
+            str(support.FIXTURES),
+            "--no-reload",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=dict(os.environ),
+    )
+
+    try:
+        support.wait_for_port(port, process)
+        started = time.monotonic()
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+
+        for _ in range(2000):
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            response.read()
+            assert response.status == 200
+
+        connection.close()
+        assert time.monotonic() - started < 30
+    finally:
+        process.terminate()
+
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def test_off_writes_nothing() -> None:

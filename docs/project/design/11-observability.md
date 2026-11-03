@@ -17,7 +17,7 @@ Prometheus metrics are served by the daemon on the admin listener (/metrics on t
 
 | Area | Examples |
 | --- | --- |
-| Requests | muru_requests_total by status class and reason, muru_request_duration_seconds histograms (queue, application, total), muru_requests_in_flight, muru_retries_total |
+| Requests | muru_requests_total by status class and reason, muru_request_duration_seconds histograms (queue, application, total), muru_requests_in_flight, muru_retries_total, muru_access_log_dropped_total |
 | Capacity | muru_queue_depth, muru_slots_busy, muru_slots_total, muru_async_slots_busy, muru_capacity_utilisation (busy slots over slots, sampled every second and averaged over 30 s, the saturation signal for an autoscaler such as an HPA or KEDA, since CPU stays low while an I/O-bound application's slots are full), muru_websocket_connections; muru_handoffs_total by the interface a request was handed to (section 6.14) |
 | Workers | muru_worker_cpu_seconds_total, muru_worker_memory_bytes by kind (uss, pss, rss), muru_gil_wait_seconds and muru_loop_lag_seconds histograms, muru_worker_recycles_total by reason, muru_worker_exits_total by reason |
 | Garbage collection | muru_gc_collections_total, muru_gc_seconds_total and muru_gc_collected_objects_total by generation, muru_gc_pause_seconds histogram by generation and by whether requests were in flight |
@@ -46,7 +46,7 @@ The dashboard reads the same values from in-memory history. OTLP metric export i
 - Built-in rotation: size and time based, retention count and age, configurable backup names, background compression (gzip or zstd).
 - External rotation: logrotate renames files, then runs muructl logs reopen (or sends SIGUSR1). reopen_on_rename detects renames without a signal. copytruncate works but can lose lines. rotate = 'external' disables built-in rotation, and configurations where both would rotate a file are rejected.
 - Applications that open their own log files get an on_reopen_logs control message (muructl logs reopen --workers), whose default hook makes logging file handlers reopen on next emit.
-- Backpressure never reaches requests: the access log drops and counts records when stalled; application output uses a large drop-oldest queue by default, or blocks if configured.
+- Backpressure never reaches requests: the access log drops and counts records when stalled; application output uses a large drop-oldest queue by default, or blocks if configured. The edge's access log lines go to a writer thread of their own over a bounded queue (16k lines), which gathers what is waiting into writes of up to 64 KiB and reopens the file in order with the lines; a request's task only queues its line, and a line that finds the queue full is dropped and counted in muru_access_log_dropped_total, the writer saying how many once it has caught up. The edge and a development run wait for the queue to empty before they exit.
 
 ## 11.4 Python logging defaults
 
