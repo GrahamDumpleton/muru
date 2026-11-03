@@ -4544,8 +4544,10 @@ pub struct ServeSettings {
     #[schemars(extend("default" = "1GB"))]
     pub spool_quota: Option<String>,
     /// The proxies whose forwarding headers are applied: addresses, CIDR
-    /// ranges, or loopback, private and unix.
+    /// ranges, or loopback, private and unix. A proxy named here also gets
+    /// a proxy's share of connections and keep-alive timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "loopback peers, for their forwarding headers alone"))]
     pub trusted_proxy: Option<Vec<String>>,
 }
 

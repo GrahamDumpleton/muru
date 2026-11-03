@@ -45,4 +45,4 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `threads` | integer | `4` | Threads per WSGI worker. |
 | `timeout` | array of strings |  | Timeouts as NAME=DURATION, as `--timeout` takes them. |
 | `timestamps` | boolean | `false` | Whether every line carries the full UTC time. |
-| `trusted_proxy` | array of strings |  | The proxies whose forwarding headers are applied: addresses, CIDR ranges, or loopback, private and unix. |
+| `trusted_proxy` | array of strings | loopback peers, for their forwarding headers alone | The proxies whose forwarding headers are applied: addresses, CIDR ranges, or loopback, private and unix. A proxy named here also gets a proxy's share of connections and keep-alive timeout. |

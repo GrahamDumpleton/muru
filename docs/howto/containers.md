@@ -242,7 +242,7 @@ with where it came from, and exits.
 | `--spool-quota SIZE` | 1GB | the most request bodies spooled to disk at once |
 | `--shutdown-delay DURATION` | `0s` | how long the listener keeps accepting after SIGTERM; see [stopping](#stopping) |
 | `--shutdown-budget DURATION` | `8s` | how long the whole stop may take, the delay included |
-| `--trusted-proxy ADDRESS` | `loopback` | a proxy whose forwarding headers are applied: an address, a CIDR range, or `loopback`, `private` or `unix`, repeatable; see [behind a proxy](behind-a-proxy.md) |
+| `--trusted-proxy ADDRESS` | loopback peers' headers | a proxy whose forwarding headers are applied: an address, a CIDR range, or `loopback`, `private` or `unix`, repeatable; see [behind a proxy](behind-a-proxy.md) |
 
 `--interface`, `--factory`, `--sync-threads`, `--concurrency`,
 `--preload`, `--hooks`, `--timeout`, `--max-body-size`, `--max-requests`,

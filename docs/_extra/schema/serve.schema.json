@@ -212,11 +212,12 @@
       "type": "boolean"
     },
     "trusted_proxy": {
-      "description": "The proxies whose forwarding headers are applied: addresses, CIDR ranges, or loopback, private and unix.",
+      "description": "The proxies whose forwarding headers are applied: addresses, CIDR ranges, or loopback, private and unix. A proxy named here also gets a proxy's share of connections and keep-alive timeout.",
       "items": {
         "type": "string"
       },
-      "type": "array"
+      "type": "array",
+      "x-default": "loopback peers, for their forwarding headers alone"
     }
   },
   "title": "The muructl serve configuration file",
