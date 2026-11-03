@@ -836,6 +836,9 @@ struct Daemon {
     h2c: Vec<pb::H2cPolicy>,
     /// The `[limits]` table (section 4.6), for every snapshot.
     limits: muru_edge::Limits,
+    /// Which records the access log writes, from the `[logs]` table
+    /// (section 11.2), for every snapshot.
+    access_log: muru_edge::access::Filter,
     /// The command line's settings, laid over the file on every reload.
     overrides: crate::settings::Overrides,
     /// The event sinks delivering (section 11.5), reconciled on reload.
@@ -1169,6 +1172,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         debug_exec: settings.debug_exec,
         h2c: settings.h2c.clone(),
         limits: settings.limits.clone(),
+        access_log: settings.access_log.clone(),
         overrides: config.overrides,
         sinks,
         certificates: HashMap::new(),
@@ -2201,6 +2205,7 @@ impl Daemon {
             ),
             ("[limits]", settings.limits != self.limits),
             ("[[listener]] h2c", settings.h2c != self.h2c),
+            ("[logs] access_log", settings.access_log != self.access_log),
         ] {
             if changed {
                 report.changed(table, "the edge has it");
@@ -2215,6 +2220,7 @@ impl Daemon {
         self.error_pages = settings.error_pages;
         self.error_override = settings.error_override;
         self.limits = settings.limits;
+        self.access_log = settings.access_log;
         self.h2c = settings.h2c;
         self.client_rules = settings.client_rules;
         self.clients = clients;
@@ -2292,7 +2298,7 @@ impl Daemon {
             }
 
             report.changed(
-                "[logs]",
+                "[logs] rotation",
                 if self.rotation.is_some() {
                     "the daemon rotates on the new policy"
                 } else {
@@ -2300,7 +2306,7 @@ impl Daemon {
                 },
             );
         } else {
-            report.unchanged("[logs]");
+            report.unchanged("[logs] rotation");
         }
 
         // Section 13.3: what the next stop signal means.
@@ -4701,6 +4707,15 @@ impl Daemon {
 
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
+                // Section 11.2: the application's own access log choice,
+                // laid over the node's.
+
+                let access_log = self
+                    .store
+                    .app(name)
+                    .ok()
+                    .filter(|app| !app.access_log.is_empty())
+                    .map(|app| app.access_log.over(&self.access_log).to_message());
                 apps.push(pb::AppWorkers {
                     app: name.clone(),
                     release: id.clone(),
@@ -4711,6 +4726,7 @@ impl Daemon {
                         .map(|socket| socket.display().to_string())
                         .collect(),
                     waking_groups: running.waking_groups(),
+                    access_log,
                     grpc_web_origins: self
                         .store
                         .release(name, id)
@@ -4979,6 +4995,7 @@ impl Daemon {
             default_traffic,
             h2c: self.h2c.clone(),
             limits: Some(self.limits.to_message()),
+            access_log: Some(self.access_log.to_message()),
         }
     }
 

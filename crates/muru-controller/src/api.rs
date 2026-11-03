@@ -1551,6 +1551,10 @@ impl Service {
                 .set_app_priority(app, *priority)
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::SetAppAccessLog { app, access_log } => store
+                .set_app_access_log(app, access_log)
+                .map(|()| "set".to_owned())
+                .map_err(|error| error.to_string()),
             Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store

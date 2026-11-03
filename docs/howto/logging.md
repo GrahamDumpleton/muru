@@ -130,7 +130,9 @@ received from the client and sent to it:
 `--access-log-exclude PATTERN`, repeatable, hides requests whose path
 matches: `*` matches any run of characters and `?` one, so
 `--access-log-exclude '/static/*' --access-log-exclude '/healthz'` keeps
-assets and probes out of the terminal.
+assets and probes out of the terminal. Under the daemon the `[logs]`
+table makes the same choices, as [what the daemon's access log
+writes](#what-the-daemons-access-log-writes) describes.
 
 Whatever is shown, the last thousand records are kept in memory and the
 per-second counts for the last minute, which is what the dashboard
@@ -237,6 +239,41 @@ $ muructl logs --access --lines 1
 
 `--no-timestamps` leaves the times off. The same command against a
 development run shows the run's lines with their times as well.
+
+### What the daemon's access log writes
+
+The daemon's access log writes a line for every request unless its
+`[logs]` table says otherwise, with the keys `muructl serve` takes:
+
+```toml
+[logs]
+access_log = 'errors'                            # on (the default), errors or off
+slow = '500ms'                                   # what errors counts as slow, 1s by default
+access_log_exclude = ['/healthz', '/static/*']
+```
+
+`errors` writes 4xx and 5xx responses, requests at least `slow`, and
+WebSockets that closed other than normally or going away, and `off`
+writes nothing. A request that is not written is still counted in the
+[metrics](metrics.md) and shown among the dashboard's recent requests;
+`muructl logs --access` reads the file, so it shows only what was
+written.
+
+An application's table in an applied file can choose for that
+application's requests alone, for example to keep one noisy application
+quiet while the rest are logged:
+
+```toml
+[app.shop]
+access_log = 'off'
+```
+
+The application's `access_log` and `slow` replace the `[logs]` table's
+for its requests, and its `access_log_exclude` paths are left out as
+well as the table's. `muructl daemon reload` applies a changed `[logs]`
+table, and `muructl apply` a changed application table, to the running
+edge without restarting anything: every request completed from then on
+is written by the new choice.
 
 ## Rotation
 

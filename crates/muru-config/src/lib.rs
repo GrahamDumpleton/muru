@@ -1100,8 +1100,9 @@ pub struct SecretRef {
 }
 
 /// The `[logs]` table of the daemon's file (section 11.3): how the
-/// daemon rotates the log files it and its processes write, and whether
-/// its standard streams carry the time (section 11.8).
+/// daemon rotates the log files it and its processes write, which
+/// records the access log writes (section 11.2), and whether its
+/// standard streams carry the time (section 11.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Logs {
@@ -1132,6 +1133,38 @@ pub struct Logs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub timestamps: Option<bool>,
+    /// Which requests the access log writes: `on` (the default), `errors`
+    /// (4xx and 5xx responses, requests at least `slow`, and WebSockets
+    /// that closed other than normally or going away) or `off`. Requests
+    /// not written are still counted in the metrics and shown on the
+    /// dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "on"))]
+    pub access_log: Option<String>,
+    /// Paths whose requests the access log leaves out: `*` matches any
+    /// run of characters and `?` one, for example `/static/*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_exclude: Vec<String>,
+    /// How slow a request is to be written under `access_log = "errors"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1s"))]
+    pub slow: Option<String>,
+}
+
+/// Check the access log keys a table shares (section 11.2): the mode is
+/// `on`, `errors` or `off`, and `slow` is a duration.
+pub fn check_access_log(access_log: Option<&str>, slow: Option<&str>) -> Result<(), String> {
+    if let Some(mode) = access_log
+        && !matches!(mode, "on" | "errors" | "off")
+    {
+        return Err(format!("access_log = {mode:?} is not on, errors or off"));
+    }
+
+    if let Some(slow) = slow {
+        parse_duration(slow).map_err(|error| format!("slow: {error}"))?;
+    }
+
+    Ok(())
 }
 
 /// The `[shutdown]` table of the daemon's file (section 13.3): what
@@ -3902,6 +3935,20 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = 0))]
     pub priority: Option<i32>,
+    /// Which of the application's requests the access log writes, over
+    /// the `[logs]` table's choice: `on`, `errors` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the `[logs]` table's"))]
+    pub access_log: Option<String>,
+    /// Paths whose requests to the application the access log leaves
+    /// out, besides those the `[logs]` table names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_exclude: Vec<String>,
+    /// How slow one of the application's requests is to be written under
+    /// `access_log = "errors"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the `[logs]` table's"))]
+    pub slow: Option<String>,
 }
 
 /// The `[metrics]` table (section 11.1): where the daemon serves the
@@ -3950,7 +3997,7 @@ pub struct Document {
     /// Secret stores (section 10.8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Secrets>,
-    /// Log rotation (section 11.3).
+    /// Log rotation and the access log (sections 11.2 and 11.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<Logs>,
     /// What SIGTERM means to the daemon, and how a shutdown runs (section
@@ -4108,6 +4155,19 @@ impl Document {
             if app.priority.is_some() {
                 entry.priority = app.priority;
             }
+
+            // Section 11.2: so does the access log choice, key by key,
+            // and the paths it leaves out add up.
+
+            if app.access_log.is_some() {
+                entry.access_log = app.access_log;
+            }
+
+            if app.slow.is_some() {
+                entry.slow = app.slow;
+            }
+
+            entry.access_log_exclude.extend(app.access_log_exclude);
 
             for (id, release) in app.release {
                 if entry.release.contains_key(&id) {
@@ -5463,6 +5523,23 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         let second = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
         first.merge(second).unwrap();
         assert_eq!(first.app["shop"].release.len(), 2);
+
+        // The application's own keys come along: the access log choice
+        // key by key, its excluded paths adding up.
+
+        let quiet = Document::parse(
+            "[app.shop]\naccess_log = 'errors'\nslow = '2s'\naccess_log_exclude = ['/a']\n",
+        )
+        .unwrap();
+        first.merge(quiet).unwrap();
+        let quieter =
+            Document::parse("[app.shop]\naccess_log = 'off'\naccess_log_exclude = ['/b']\n")
+                .unwrap();
+        first.merge(quieter).unwrap();
+        let shop = &first.app["shop"];
+        assert_eq!(shop.access_log.as_deref(), Some("off"));
+        assert_eq!(shop.slow.as_deref(), Some("2s"));
+        assert_eq!(shop.access_log_exclude, ["/a", "/b"]);
 
         let again = Document::parse("[app.shop.release.r2]\nentrypoint = 'a:c'\n").unwrap();
         let error = first.merge(again).unwrap_err();

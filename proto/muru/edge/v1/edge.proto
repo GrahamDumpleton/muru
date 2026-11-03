@@ -56,6 +56,17 @@ message Snapshot {
   Traffic default_traffic = 15;         // with no host declared, the default application's policy: its rollout's share (section 9.3)
   repeated H2cPolicy h2c = 16;          // section 6.13: listeners that limit cleartext HTTP/2; every client elsewhere
   Limits limits = 17;                   // section 4.6: the limits in force; the edge keeps its current ones when absent
+  AccessLog access_log = 18;            // section 11.2: the records the access log writes; the edge keeps its current choice when absent
+}
+
+// Section 11.2: which access records are written, where the edge was
+// told to write them. A record not written is still counted and kept
+// in memory. The daemon sends the [logs] table's choice in every
+// snapshot, and an application's own on its AppWorkers entries.
+message AccessLog {
+  string mode = 1;                      // on, errors or off; on when empty
+  uint64 slow_ms = 2;                   // a request at least this slow is written under errors
+  repeated string exclude = 3;          // path patterns never written, * any run of characters and ? one
 }
 
 // Section 4.6: the limits and timeouts the edge enforces, durations in
@@ -307,6 +318,7 @@ message AppWorkers {
   repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
   repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
   repeated StaticDir static_dirs = 17;  // section 4.9: the release's own directories of files, by path prefix
+  AccessLog access_log = 18;            // section 11.2: the application's own access log choice; the snapshot's when absent
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge

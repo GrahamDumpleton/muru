@@ -4,6 +4,18 @@
       "additionalProperties": false,
       "description": "An application's table and its releases.",
       "properties": {
+        "access_log": {
+          "description": "Which of the application's requests the access log writes, over the `[logs]` table's choice: `on`, `errors` or `off`.",
+          "type": "string",
+          "x-default": "the `[logs]` table's"
+        },
+        "access_log_exclude": {
+          "description": "Paths whose requests to the application the access log leaves out, besides those the `[logs]` table names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "group": {
           "description": "The group, else the user's primary group.",
           "type": "string",
@@ -29,6 +41,11 @@
             "$ref": "#/$defs/CapacitySchedule"
           },
           "type": "array"
+        },
+        "slow": {
+          "description": "How slow one of the application's requests is to be written under `access_log = \"errors\"`.",
+          "type": "string",
+          "x-default": "the `[logs]` table's"
         },
         "umask": {
           "description": "The file creation mask, in octal, for example 027.",
@@ -1190,8 +1207,20 @@
     },
     "Logs": {
       "additionalProperties": false,
-      "description": "The `[logs]` table of the daemon's file: how the daemon rotates the log files it and its processes write, and whether its standard streams carry the time.",
+      "description": "The `[logs]` table of the daemon's file: how the daemon rotates the log files it and its processes write, which records the access log writes, and whether its standard streams carry the time.",
       "properties": {
+        "access_log": {
+          "default": "on",
+          "description": "Which requests the access log writes: `on` (the default), `errors` (4xx and 5xx responses, requests at least `slow`, and WebSockets that closed other than normally or going away) or `off`. Requests not written are still counted in the metrics and shown on the dashboard.",
+          "type": "string"
+        },
+        "access_log_exclude": {
+          "description": "Paths whose requests the access log leaves out: `*` matches any run of characters and `?` one, for example `/static/*`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "compress": {
           "default": "zstd",
           "description": "How archives are compressed: `zstd` (the default), `gzip` or `off`.",
@@ -1216,6 +1245,11 @@
         },
         "size": {
           "description": "Rotate a file that reaches this size, for example 100MB.",
+          "type": "string"
+        },
+        "slow": {
+          "default": "1s",
+          "description": "How slow a request is to be written under `access_log = \"errors\"`.",
           "type": "string"
         },
         "timestamps": {
@@ -2904,7 +2938,7 @@
     },
     "logs": {
       "$ref": "#/$defs/Logs",
-      "description": "Log rotation."
+      "description": "Log rotation and the access log."
     },
     "metrics": {
       "$ref": "#/$defs/Metrics",

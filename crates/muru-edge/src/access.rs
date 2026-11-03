@@ -6,8 +6,10 @@
 //! response head arrived) and total, and the application, release, host,
 //! group and mount that served it. Records are kept in a bounded ring in
 //! memory for the dashboard and the CLI, and written to the terminal as
-//! compact lines, to a file as JSON lines, only for errors and slow
-//! requests, or not at all.
+//! compact lines or to a file as JSON lines. A filter says which are
+//! written: all of them, only errors and slow requests, or none, less the
+//! paths it leaves out. The node has one, an application may have its
+//! own, and both change while the edge runs, from the daemon's snapshots.
 //!
 //! A WebSocket's request ends when the worker accepts it: its line is
 //! written then, with the handshake's time. The open socket is then kept
@@ -21,7 +23,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{Metrics, SocketKey};
@@ -38,13 +40,156 @@ const FOLLOW_CAPACITY: usize = 1024;
 pub enum Destination {
     /// Compact lines on standard error.
     Terminal,
-    /// Nothing is written; records are still kept in memory.
-    Off,
-    /// Compact lines on standard error for 4xx and 5xx responses and for
-    /// requests slower than the threshold.
-    Errors,
     /// JSON lines appended to a file.
     File(PathBuf),
+    /// Nowhere, whatever the filter says; records are still counted and
+    /// kept in memory.
+    Off,
+}
+
+/// Which records are written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Every record.
+    #[default]
+    On,
+    /// 4xx and 5xx responses, requests at least as slow as the threshold,
+    /// and WebSockets that closed other than normally or going away.
+    Errors,
+    /// None; records are still counted and kept in memory.
+    Off,
+}
+
+impl Mode {
+    /// The mode a configuration names: `on`, `errors` or `off`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "on" => Some(Self::On),
+            "errors" => Some(Self::Errors),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The mode's name, as the configuration writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Errors => "errors",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Which records are written: the mode, the threshold `errors` counts a
+/// request as slow from, and the paths never written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    /// Which records are written.
+    pub mode: Mode,
+    /// Requests at least this slow are written under `Mode::Errors`.
+    pub slow: Duration,
+    /// Path patterns whose requests are not written (`*` matches anything,
+    /// `?` one character); they are still kept in memory.
+    pub exclude: Vec<String>,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self {
+            mode: Mode::On,
+            slow: Duration::from_secs(1),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl Filter {
+    /// The filter a snapshot carries.
+    pub fn from_message(message: &muru_proto::edge::v1::AccessLog) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode).unwrap_or_default(),
+            slow: Duration::from_millis(message.slow_ms),
+            exclude: message.exclude.clone(),
+        }
+    }
+
+    /// The filter as a snapshot carries it.
+    pub fn to_message(&self) -> muru_proto::edge::v1::AccessLog {
+        muru_proto::edge::v1::AccessLog {
+            mode: self.mode.as_str().to_owned(),
+            slow_ms: u64::try_from(self.slow.as_millis()).unwrap_or(u64::MAX),
+            exclude: self.exclude.clone(),
+        }
+    }
+
+    /// Whether a record is written.
+    fn shows(&self, record: &Record) -> bool {
+        // A WebSocket's close is shown with the errors when it ended
+        // other than in order; its lifetime is not a slow request.
+
+        match (self.mode, &record.websocket) {
+            (Mode::Off, _) => return false,
+            (Mode::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
+                return false;
+            }
+            (Mode::Errors, None) if record.status < 400 && record.total < self.slow => {
+                return false;
+            }
+            _ => {}
+        }
+
+        let path = record.path();
+        !self
+            .exclude
+            .iter()
+            .any(|pattern| glob_matches(pattern, path))
+    }
+}
+
+/// The filters in force: the node's, and those of the applications that
+/// have their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    /// The filter for every application without its own.
+    pub node: Filter,
+    /// Applications' own filters, by name.
+    pub apps: BTreeMap<String, Filter>,
+}
+
+impl Filters {
+    /// The filters with one for the node and none of the applications'
+    /// own.
+    pub fn node(filter: Filter) -> Self {
+        Self {
+            node: filter,
+            apps: BTreeMap::new(),
+        }
+    }
+
+    /// The filters a snapshot carries, or none when it carries no
+    /// choice, which leaves the current ones in force.
+    pub fn from_snapshot(snapshot: &muru_proto::edge::v1::Snapshot) -> Option<Self> {
+        let node = snapshot.access_log.as_ref()?;
+        let apps = snapshot
+            .apps
+            .iter()
+            .filter_map(|entry| {
+                let filter = entry.access_log.as_ref()?;
+                Some((entry.app.clone(), Filter::from_message(filter)))
+            })
+            .collect();
+
+        Some(Self {
+            node: Filter::from_message(node),
+            apps,
+        })
+    }
+
+    /// The filter a record of `app` is written by.
+    pub fn for_app(&self, app: &str) -> &Filter {
+        self.apps.get(app).unwrap_or(&self.node)
+    }
 }
 
 /// Access log settings.
@@ -52,19 +197,15 @@ pub enum Destination {
 pub struct Config {
     /// Where lines go.
     pub destination: Destination,
-    /// Requests at least this slow are shown with `Destination::Errors`.
-    pub slow: Duration,
-    /// Path patterns whose requests are not written (`*` matches anything,
-    /// `?` one character); they are still kept in memory.
-    pub exclude: Vec<String>,
+    /// Which records are written until a snapshot says otherwise.
+    pub filter: Filter,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             destination: Destination::Terminal,
-            slow: Duration::from_secs(1),
-            exclude: Vec::new(),
+            filter: Filter::default(),
         }
     }
 }
@@ -337,7 +478,9 @@ pub struct Minute {
 /// The access log: a ring of recent records, per-second counters for the
 /// last minute, the request metrics, and the configured output.
 pub struct AccessLog {
-    config: Config,
+    destination: Destination,
+    /// Which records are written, swapped whole by `set_filters`.
+    filters: RwLock<Filters>,
     ring: Mutex<VecDeque<Record>>,
     minute: Mutex<[Bucket; MINUTE]>,
     metrics: Metrics,
@@ -380,7 +523,8 @@ impl AccessLog {
         };
 
         Ok(Self {
-            config,
+            destination: config.destination,
+            filters: RwLock::new(Filters::node(config.filter)),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             minute: Mutex::new([Bucket::default(); MINUTE]),
             metrics: Metrics::default(),
@@ -390,6 +534,20 @@ impl AccessLog {
             next_websocket: AtomicU64::new(0),
             lines: tokio::sync::broadcast::channel(FOLLOW_CAPACITY).0,
         })
+    }
+
+    /// The filters in force.
+    pub fn filters(&self) -> Filters {
+        self.filters
+            .read()
+            .expect("access log filters poisoned")
+            .clone()
+    }
+
+    /// Put new filters in force: every record completed from now on is
+    /// written by them.
+    pub fn set_filters(&self, filters: Filters) {
+        *self.filters.write().expect("access log filters poisoned") = filters;
     }
 
     /// The request metrics the records feed (section 11.1).
@@ -550,7 +708,7 @@ impl AccessLog {
     /// rotation has renamed the file, lines go to a new one at the path.
     /// Nothing happens when lines do not go to a file.
     pub fn reopen(&self) -> io::Result<()> {
-        let (Destination::File(path), Some(file)) = (&self.config.destination, &self.file) else {
+        let (Destination::File(path), Some(file)) = (&self.destination, &self.file) else {
             return Ok(());
         };
 
@@ -576,28 +734,15 @@ impl AccessLog {
     }
 
     fn shows(&self, record: &Record) -> bool {
-        // A WebSocket's close is shown with the errors when it ended
-        // other than in order; its lifetime is not a slow request.
-
-        match (&self.config.destination, &record.websocket) {
-            (Destination::Off, _) => return false,
-            (Destination::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
-                return false;
-            }
-            (Destination::Errors, None)
-                if record.status < 400 && record.total < self.config.slow =>
-            {
-                return false;
-            }
-            _ => {}
+        if self.destination == Destination::Off {
+            return false;
         }
 
-        let path = record.path();
-        !self
-            .config
-            .exclude
-            .iter()
-            .any(|pattern| glob_matches(pattern, path))
+        self.filters
+            .read()
+            .expect("access log filters poisoned")
+            .for_app(&record.app)
+            .shows(record)
     }
 
     fn write(&self, record: &Record) {
@@ -878,8 +1023,7 @@ mod tests {
     fn per_second_counters_sum_over_the_last_minute() {
         let log = AccessLog::new(Config {
             destination: Destination::Off,
-            slow: Duration::from_secs(1),
-            exclude: Vec::new(),
+            ..Config::default()
         })
         .expect("log");
 
@@ -931,19 +1075,12 @@ mod tests {
         assert_eq!(format_bytes(30 * 1024 * 1024), "30.0MB");
     }
 
-    #[test]
-    fn errors_mode_shows_failures_and_slow_requests() {
-        let log = AccessLog::new(Config {
-            destination: Destination::Errors,
-            slow: Duration::from_millis(500),
-            exclude: vec!["/health*".to_owned()],
-        })
-        .expect("no file to open");
-        let record = |status: u16, target: &str, total: Duration| Record {
+    fn record(app: &str, status: u16, target: &str, total: Duration) -> Record {
+        Record {
             started: SystemTime::now(),
             request_id: "id".to_owned(),
             client: "127.0.0.1".parse().expect("address"),
-            app: String::new(),
+            app: app.to_owned(),
             release: String::new(),
             host: String::new(),
             group: DEFAULT.to_owned(),
@@ -964,10 +1101,68 @@ mod tests {
             client_class: "default".to_owned(),
             websocket: None,
             handoff: None,
+        }
+    }
+
+    #[test]
+    fn errors_mode_shows_failures_and_slow_requests() {
+        let log = AccessLog::new(Config {
+            destination: Destination::Terminal,
+            filter: Filter {
+                mode: Mode::Errors,
+                slow: Duration::from_millis(500),
+                exclude: vec!["/health*".to_owned()],
+            },
+        })
+        .expect("no file to open");
+        let quick = Duration::from_millis(10);
+        let slow = Duration::from_millis(900);
+        assert!(!log.shows(&record("", 200, "/", quick)));
+        assert!(log.shows(&record("", 500, "/", quick)));
+        assert!(log.shows(&record("", 200, "/", slow)));
+        assert!(!log.shows(&record("", 500, "/healthz?x=1", slow)));
+    }
+
+    #[test]
+    fn filters_are_swapped_whole_and_an_application_may_have_its_own() {
+        let log = AccessLog::new(Config::default()).expect("no file to open");
+        let quick = Duration::from_millis(10);
+        assert!(log.shows(&record("shop", 200, "/", quick)));
+
+        // The node's filter turns lines off, and one application keeps
+        // its errors.
+
+        let errors = Filter {
+            mode: Mode::Errors,
+            ..Filter::default()
         };
-        assert!(!log.shows(&record(200, "/", Duration::from_millis(10))));
-        assert!(log.shows(&record(500, "/", Duration::from_millis(10))));
-        assert!(log.shows(&record(200, "/", Duration::from_millis(900))));
-        assert!(!log.shows(&record(500, "/healthz?x=1", Duration::from_millis(900))));
+        let mut filters = Filters::node(Filter {
+            mode: Mode::Off,
+            ..Filter::default()
+        });
+        filters.apps.insert("shop".to_owned(), errors.clone());
+        log.set_filters(filters.clone());
+        assert_eq!(log.filters(), filters);
+        assert!(!log.shows(&record("blog", 500, "/", quick)));
+        assert!(!log.shows(&record("shop", 200, "/", quick)));
+        assert!(log.shows(&record("shop", 500, "/", quick)));
+
+        // A snapshot carries the same, and one without a choice changes
+        // nothing.
+
+        let snapshot = muru_proto::edge::v1::Snapshot {
+            access_log: Some(filters.node.to_message()),
+            apps: vec![muru_proto::edge::v1::AppWorkers {
+                app: "shop".to_owned(),
+                access_log: Some(errors.to_message()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(Filters::from_snapshot(&snapshot), Some(filters));
+        assert_eq!(
+            Filters::from_snapshot(&muru_proto::edge::v1::Snapshot::default()),
+            None
+        );
     }
 }

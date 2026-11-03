@@ -338,15 +338,7 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
     } else {
         muru_edge::compression::Compression::default()
     };
-    let access_log = muru_edge::access::Config {
-        destination: match args.access_log.as_str() {
-            "terminal" => muru_edge::access::Destination::Terminal,
-            "off" => muru_edge::access::Destination::Off,
-            "errors" => muru_edge::access::Destination::Errors,
-            path => muru_edge::access::Destination::File(PathBuf::from(path)),
-        },
-        ..muru_edge::access::Config::default()
-    };
+    let access_log = access_log_config(&args.access_log, muru_edge::access::Filter::default());
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("installing the SIGINT handler")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1428,20 +1420,25 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
     limits
 }
 
-fn access_log_config(serving: &Serving) -> muru_edge::access::Config {
-    use muru_edge::access::Destination;
+/// The access log a development run's `--access-log` names: terminal,
+/// off, errors (to the terminal) or a file path, with the rest of the
+/// filter as given.
+fn access_log_config(
+    access_log: &str,
+    filter: muru_edge::access::Filter,
+) -> muru_edge::access::Config {
+    use muru_edge::access::{Config, Destination, Filter, Mode};
 
-    let destination = match serving.access_log.as_str() {
-        "terminal" => Destination::Terminal,
-        "off" => Destination::Off,
-        "errors" => Destination::Errors,
-        path => Destination::File(PathBuf::from(path)),
+    let (destination, mode) = match access_log {
+        "terminal" => (Destination::Terminal, Mode::On),
+        "off" => (Destination::Off, Mode::On),
+        "errors" => (Destination::Terminal, Mode::Errors),
+        path => (Destination::File(PathBuf::from(path)), Mode::On),
     };
 
-    muru_edge::access::Config {
+    Config {
         destination,
-        slow: serving.slow,
-        exclude: serving.access_log_exclude.clone(),
+        filter: Filter { mode, ..filter },
     }
 }
 
@@ -2794,7 +2791,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    let access_log = access_log_config(&resolved.serving);
+    let access_log = access_log_config(
+        &resolved.serving.access_log,
+        muru_edge::access::Filter {
+            slow: resolved.serving.slow,
+            exclude: resolved.serving.access_log_exclude.clone(),
+            ..muru_edge::access::Filter::default()
+        },
+    );
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;

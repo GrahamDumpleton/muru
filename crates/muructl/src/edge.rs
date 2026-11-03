@@ -123,6 +123,9 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
             .ok()
     });
 
+    // Section 11.2: which records are written comes with the first
+    // snapshot, from the daemon's [logs] table; every one until then.
+
     let access_log = muru_edge::access::Config {
         destination: match args.access_log.as_str() {
             "off" => muru_edge::access::Destination::Off,
@@ -363,6 +366,13 @@ impl EdgeControl for Control {
 
         if let Some(limits) = &snapshot.limits {
             self.limits.apply(muru_edge::Limits::from_message(limits));
+        }
+
+        // Section 11.2: so do the access log's filters, for the records
+        // completed from now on.
+
+        if let Some(filters) = muru_edge::access::Filters::from_snapshot(&snapshot) {
+            self.access_log.set_filters(filters);
         }
 
         self.resolver.replace(certificates);

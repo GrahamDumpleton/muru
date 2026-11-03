@@ -2153,6 +2153,7 @@ mod tests {
             default_traffic: None,
             compression: None,
             limits: None,
+            access_log: None,
             worker_sockets: Vec::new(),
             default_app: String::new(),
             default_release: String::new(),
