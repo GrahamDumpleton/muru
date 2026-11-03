@@ -18,7 +18,7 @@ use anyhow::Context as _;
 use muru_controller::host::{HostControl, WorkerReply};
 use muru_controller::logs::Logs;
 use muru_edge::Pools;
-use muru_edge::access::AccessLog;
+use muru_edge::access::{AccessLog, Override};
 use muru_edge::metrics::{aggregate, pool_samples, render};
 use muru_proto::admin::v1 as pb;
 use muru_proto::admin::v1::admin_server::{Admin, AdminServer};
@@ -775,6 +775,91 @@ impl Admin for Service {
                 })
                 .collect(),
             release,
+        }))
+    }
+
+    async fn override_access_log(
+        &self,
+        request: Request<pb::OverrideAccessLogRequest>,
+    ) -> Result<Response<pb::AccessLogOverrides>, Status> {
+        let request = request.into_inner();
+        self.state
+            .target(&request.app, "")
+            .map_err(Status::not_found)?;
+        let duration = Duration::from_millis(request.duration_ms);
+
+        let change = if request.reset || request.mode.is_empty() {
+            None
+        } else {
+            Some(
+                Override::requested(&request.mode, &request.app, &request.paths, duration)
+                    .map_err(Status::invalid_argument)?,
+            )
+        };
+
+        // Section 11.2: the change goes into the edge's filters at once,
+        // as the daemon's snapshot would put it, and what the daemon
+        // records as events the run prints.
+
+        let now = std::time::SystemTime::now();
+        let (put_back, overrides) = self.state.access_log.update_filters(|filters| {
+            filters.overrides.retain(|change| change.in_force(now));
+            let mut put_back = Vec::new();
+
+            if request.reset {
+                let (back, kept) = std::mem::take(&mut filters.overrides)
+                    .into_iter()
+                    .partition(|change| request.app.is_empty() || change.app == request.app);
+                filters.overrides = kept;
+                put_back = back;
+            }
+
+            if let Some(change) = &change {
+                filters.overrides.push(change.clone());
+            }
+
+            (put_back, filters.overrides.clone())
+        });
+
+        for change in &put_back {
+            muru_common::muru_println!(
+                "access_log.reverted: the change to write {} was put back",
+                change.describe()
+            );
+        }
+
+        if let Some(change) = change {
+            muru_common::muru_println!(
+                "access_log.changed: the access log writes {} for {}",
+                change.describe(),
+                muru_edge::access::format_lifetime(duration)
+            );
+
+            // The edge stops applying it at its end without being told;
+            // this takes it out and says so.
+
+            let access_log = Arc::clone(&self.state.access_log);
+
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                let ended = access_log.update_filters(|filters| {
+                    let before = filters.overrides.len();
+                    filters.overrides.retain(|kept| kept != &change);
+                    filters.overrides.len() != before
+                });
+
+                if ended {
+                    muru_common::muru_println!(
+                        "access_log.reverted: the change to write {} ended",
+                        change.describe()
+                    );
+                }
+            });
+        }
+
+        Ok(Response::new(pb::AccessLogOverrides {
+            overrides: overrides.iter().map(Override::to_admin_message).collect(),
+            reset: u32::try_from(put_back.len()).unwrap_or(u32::MAX),
         }))
     }
 

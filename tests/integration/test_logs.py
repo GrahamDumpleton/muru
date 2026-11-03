@@ -162,6 +162,25 @@ def test_what_the_access_log_writes_follows_a_reload_and_an_apply(tmp_path: Path
         wait_for(lambda: "/marker" in access_log.read_text())
         assert "/hushed" not in access_log.read_text()
         assert "/status/500" not in access_log.read_text()
+
+        # A change for a period covers the paths it names, is listed with
+        # the time it has left, and ends on its own, with an event each
+        # way.
+
+        changed = daemon.muructl(
+            "logging", "access", "off", "--app", "shop", "--path", "/status/*", "--for", "2s"
+        ).stdout
+        assert "no request of shop to /status/*, " in changed, changed
+        assert daemon.request("/status/503").status == 503
+        assert daemon.request("/marker-2").status == 200
+        wait_for(lambda: "/marker-2" in access_log.read_text())
+        assert "/status/503" not in access_log.read_text()
+        wait_for(lambda: "access_log.reverted" in daemon.events())
+        assert "access_log.changed" in daemon.events()
+        listed = daemon.muructl("logging", "access").stdout
+        assert "writes what the configuration says" in listed, listed
+        assert daemon.request("/status/503?again").status == 503
+        wait_for(lambda: "/status/503?again" in access_log.read_text())
     finally:
         daemon.stop()
 

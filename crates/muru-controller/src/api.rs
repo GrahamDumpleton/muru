@@ -247,6 +247,54 @@ impl Admin for Service {
         }))
     }
 
+    async fn override_access_log(
+        &self,
+        request: Request<pb::OverrideAccessLogRequest>,
+    ) -> Result<Response<pb::AccessLogOverrides>, Status> {
+        let request = request.into_inner();
+
+        if !request.app.is_empty() {
+            self.handle.store.app(&request.app).map_err(not_found)?;
+        }
+
+        let change = if request.reset || request.mode.is_empty() {
+            None
+        } else {
+            Some(
+                muru_edge::access::Override::requested(
+                    &request.mode,
+                    &request.app,
+                    &request.paths,
+                    Duration::from_millis(request.duration_ms),
+                )
+                .map_err(Status::invalid_argument)?,
+            )
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::OverrideAccessLog {
+                change,
+                reset: request.reset.then_some(request.app),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let (overrides, reset) = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::AccessLogOverrides {
+            overrides: overrides
+                .iter()
+                .map(muru_edge::access::Override::to_admin_message)
+                .collect(),
+            reset: u32::try_from(reset).unwrap_or(u32::MAX),
+        }))
+    }
+
     async fn deploy(
         &self,
         request: Request<pb::DeployRequest>,

@@ -253,6 +253,18 @@ pub enum Command {
         /// Where the groups' states go.
         done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
     },
+    /// Section 11.2: change which requests the access log writes for a
+    /// period, put the changes back, or list those in force.
+    OverrideAccessLog {
+        /// The change asked for, checked; none to list or reset.
+        change: Option<muru_edge::access::Override>,
+        /// Put back the changes, those for this application when it is
+        /// not empty.
+        reset: Option<String>,
+        /// Answered with the changes in force after it and how many a
+        /// reset put back.
+        done: oneshot::Sender<Result<(Vec<muru_edge::access::Override>, usize), String>>,
+    },
     /// Section 4.12: serve the maintenance page for an application, or
     /// serve it as usual again.
     SetMaintenance {
@@ -839,6 +851,9 @@ struct Daemon {
     /// Which records the access log writes, from the `[logs]` table
     /// (section 11.2), for every snapshot.
     access_log: muru_edge::access::Filter,
+    /// Changes to it for a period, the newest last (section 11.2): kept
+    /// only in memory, so a daemon that starts again has none.
+    access_overrides: Vec<muru_edge::access::Override>,
     /// The command line's settings, laid over the file on every reload.
     overrides: crate::settings::Overrides,
     /// The event sinks delivering (section 11.5), reconciled on reload.
@@ -1173,6 +1188,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         h2c: settings.h2c.clone(),
         limits: settings.limits.clone(),
         access_log: settings.access_log.clone(),
+        access_overrides: Vec::new(),
         overrides: config.overrides,
         sinks,
         certificates: HashMap::new(),
@@ -1290,6 +1306,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
+                daemon.expire_access_overrides().await;
 
                 let samples = match daemon.edge.metrics().await {
                     Ok(samples) => Some(samples),
@@ -1625,6 +1642,16 @@ fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::
     std::process::Command::new(executable)
         .args(arguments)
         .exec()
+}
+
+/// The subject of an event about a change to the access log: its
+/// application, or the logs when it covers every one.
+fn access_subject(change: &muru_edge::access::Override) -> &str {
+    if change.app.is_empty() {
+        "logs"
+    } else {
+        &change.app
+    }
 }
 
 /// The [proxy] table as the snapshot carries it, with the defaults of
@@ -3505,6 +3532,13 @@ impl Daemon {
             Command::SetMaintenance { app, on, done } => {
                 let _ = done.send(self.set_maintenance(&app, on).await);
             }
+            Command::OverrideAccessLog {
+                change,
+                reset,
+                done,
+            } => {
+                let _ = done.send(self.override_access_log(change, reset).await);
+            }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
             }
@@ -4996,6 +5030,11 @@ impl Daemon {
             h2c: self.h2c.clone(),
             limits: Some(self.limits.to_message()),
             access_log: Some(self.access_log.to_message()),
+            access_log_overrides: self
+                .access_overrides
+                .iter()
+                .map(muru_edge::access::Override::to_message)
+                .collect(),
         }
     }
 
@@ -6799,6 +6838,88 @@ impl Daemon {
 
         self.push_snapshot().await?;
         Ok(self.maintenance.get(app).copied())
+    }
+
+    /// Section 11.2: put a change to the access log in force, or put the
+    /// changes back (every one, or those for one application), and send
+    /// the edge the result; with neither, only say what is in force.
+    async fn override_access_log(
+        &mut self,
+        change: Option<muru_edge::access::Override>,
+        reset: Option<String>,
+    ) -> Result<(Vec<muru_edge::access::Override>, usize), String> {
+        self.expire_access_overrides().await;
+        let now = std::time::SystemTime::now();
+        let mut reset_count = 0;
+
+        if let Some(app) = reset {
+            let (put_back, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.access_overrides)
+                .into_iter()
+                .partition(|change| app.is_empty() || change.app == app);
+            self.access_overrides = kept;
+            reset_count = put_back.len();
+
+            for change in &put_back {
+                self.events.emit(
+                    "access_log.reverted",
+                    access_subject(change),
+                    "notice",
+                    &format!("the change to write {} was put back", change.describe()),
+                );
+            }
+        }
+
+        if let Some(change) = change {
+            let left = change.until.duration_since(now).unwrap_or_default();
+            self.events.emit(
+                "access_log.changed",
+                access_subject(&change),
+                "notice",
+                &format!(
+                    "the access log writes {} for {}",
+                    change.describe(),
+                    muru_edge::access::format_lifetime(left)
+                ),
+            );
+            self.access_overrides.push(change);
+        } else if reset_count == 0 {
+            return Ok((self.access_overrides.clone(), 0));
+        }
+
+        self.push_snapshot().await?;
+        Ok((self.access_overrides.clone(), reset_count))
+    }
+
+    /// Section 11.2: drop the changes to the access log whose period has
+    /// ended, saying so, and send the edge the rest.
+    async fn expire_access_overrides(&mut self) {
+        let now = std::time::SystemTime::now();
+
+        if self
+            .access_overrides
+            .iter()
+            .all(|change| change.in_force(now))
+        {
+            return;
+        }
+
+        let (kept, ended): (Vec<_>, Vec<_>) = std::mem::take(&mut self.access_overrides)
+            .into_iter()
+            .partition(|change| change.in_force(now));
+        self.access_overrides = kept;
+
+        for change in &ended {
+            self.events.emit(
+                "access_log.reverted",
+                access_subject(change),
+                "notice",
+                &format!("the change to write {} ended", change.describe()),
+            );
+        }
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "the edge did not take the access log back");
+        }
     }
 
     /// The autoscaler's state for each group of a running release.

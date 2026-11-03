@@ -4,6 +4,9 @@
 `muructl logging level APP NAME=LEVEL --for 10m` changes a logger's level
 in a release's workers for a period, without a restart; the
 [inspecting workers guide](debugging.md) has the details.
+`muructl logging access on --for 10m` does the same for the access log,
+as [changing it for a while](#changing-the-access-log-for-a-while)
+describes.
 ```
 
 A development run writes two kinds of lines to the terminal: what your
@@ -274,6 +277,33 @@ well as the table's. `muructl daemon reload` applies a changed `[logs]`
 table, and `muructl apply` a changed application table, to the running
 edge without restarting anything: every request completed from then on
 is written by the new choice.
+
+### Changing the access log for a while
+
+`muructl logging access` changes which requests the access log writes
+for a period, then goes back on its own, with nothing to remember to
+undo. Against the daemon it covers every application or one; against a
+development run or `muructl serve`, the one application:
+
+```
+muructl logging access on --for 10m                            # every request, for every application
+muructl logging access on --app shop --path '/api/*' --for 5m  # every request to shop's API
+muructl logging access off --app blog --for 1h                 # nothing from blog
+muructl logging access                                         # what is in force, and for how long
+muructl logging access --reset                                 # put every change back now
+```
+
+A change covers the requests of the application `--app` names, or of
+every one, whose path matches one of the `--path` patterns, or any path.
+It writes those it covers by its mode, `on`, `errors` or `off`, with the
+configured `slow`, and a change that names paths writes them even where
+`access_log_exclude` leaves them out. Where two changes cover a request,
+the newer decides. `--reset --app APP` puts back only that application's.
+
+A change takes effect at once, for every request completed from then on,
+and ends when its period does, when it is reset, or when the daemon
+starts again. The daemon records the `access_log.changed` and
+`access_log.reverted` events; a development run prints them.
 
 ## Rotation
 

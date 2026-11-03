@@ -97,6 +97,7 @@ $ muructl release show shop@r9 --json
 | `muructl metrics` | `{"samples": [...]}`, each with `name`, `type` (as its family declares, else `untyped`), `labels` and `value`; a value JSON cannot hold (`NaN`, `+Inf`) is kept as text |
 | `muructl websockets` | `open`, `endpoints` by application and pattern, and with `--list` each open `sockets` entry |
 | `muructl logging level` | One debug answer for each logger set, as an array |
+| `muructl logging access` | `overrides`, the changes in force after the command, the newest last, each with `mode`, `app`, `paths` and `until_unix_ms`, and `reset`, how many `--reset` put back |
 | `muructl debug status` | The debug answer: `{"release": ..., "workers": [...]}`, each worker with `index`, `pid`, `ok`, `error` and its `result` |
 | `muructl debug stacks` | The debug answer |
 | `muructl debug tasks` | The debug answer |

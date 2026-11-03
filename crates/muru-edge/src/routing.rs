@@ -2154,6 +2154,7 @@ mod tests {
             compression: None,
             limits: None,
             access_log: None,
+            access_log_overrides: Vec::new(),
             worker_sockets: Vec::new(),
             default_app: String::new(),
             default_release: String::new(),

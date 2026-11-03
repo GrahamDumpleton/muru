@@ -1080,6 +1080,42 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "access_log",
+            description: "Change which requests the access log writes (on, errors or off) for a duration, for one application and some paths or all, then it reverts on its own; without a mode, list the changes in force; reset puts them back.",
+            changes: true,
+            properties: json!({
+                "mode": {"type": "string", "enum": ["on", "errors", "off"]},
+                "app": {"type": "string", "description": "One application; every one when left out"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Path patterns such as [\"/api/*\"]; every path when left out"},
+                "for": {"type": "string", "description": "How long, such as 10m; needed with a mode"},
+                "reset": {"type": "boolean"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["logging", "access"]);
+
+                if let Some(mode) = arguments.get("mode").and_then(Value::as_str) {
+                    command.push(mode.to_owned());
+                }
+
+                command.extend(option(arguments, "app", "--app"));
+
+                if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+                    for path in paths.iter().filter_map(Value::as_str) {
+                        command.extend(["--path".to_owned(), path.to_owned()]);
+                    }
+                }
+
+                command.extend(option(arguments, "for", "--for"));
+
+                if flag(arguments, "reset") {
+                    command.push("--reset".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "reopen_logs",
             description: "Reopen every log file by name, after something outside Muru has renamed them; workers also runs each worker's on_reopen_logs hook.",
             changes: true,

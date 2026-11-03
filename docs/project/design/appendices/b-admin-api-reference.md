@@ -58,6 +58,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | ReopenLogs | POST /v1/logs:reopen | reopen log files, optionally in workers |
 | GetMetrics | GET /metrics | the Prometheus text exposition (11.1) |
 | SetLogLevel | POST /v1/apps/{app}/releases/{release}:loglevel | time-limited logger levels |
+| OverrideAccessLog | POST /v1/access-log:override | time-limited changes to which requests the access log writes, listed or reset |
 | DumpStacks | POST /v1/.../workers/{worker}:stacks | Python stacks |
 | WatchEvents | GET /v1/events (Server-Sent Events) | event stream from a sequence number |
 | GetStatus | GET /v1/status | daemon, edges, snapshot version |

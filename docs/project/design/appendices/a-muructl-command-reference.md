@@ -58,6 +58,7 @@ Commands that act on a running system use the admin API (Appendix B). Common fla
 | Observability | muructl logs reopen [--workers] | Reopen log files after external rotation | 11.3 |
 | Observability | muructl metrics | Print the node's metrics as Prometheus text | 11.1 |
 | Observability | muructl logging level RELEASE | Time-limited logger levels, or --reset | 11.4 |
+| Observability | muructl logging access MODE | Time-limited changes to which requests the access log writes, for an application and paths, the list of those in force, or --reset | 11.2 |
 | Observability | muructl debug stacks TARGET | Python stacks of every thread with the request each is serving, merged across workers. Flags: --worker | 11.7 |
 | Observability | muructl debug tasks TARGET | asyncio task tree and loop lag of ASGI workers | 11.7 |
 | Observability | muructl debug profile TARGET --for | Sampling profile written as collapsed stacks or pstats. Flags: --worker, --requests, --path, --format | 11.7 |

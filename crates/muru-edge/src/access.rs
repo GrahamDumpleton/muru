@@ -10,6 +10,8 @@
 //! written: all of them, only errors and slow requests, or none, less the
 //! paths it leaves out. The node has one, an application may have its
 //! own, and both change while the edge runs, from the daemon's snapshots.
+//! An override changes what is written for a period, for one application
+//! or every one and some paths or all, and lapses on its own.
 //!
 //! A WebSocket's request ends when the worker accepts it: its line is
 //! written then, with the handshake's time. The open socket is then kept
@@ -125,25 +127,149 @@ impl Filter {
 
     /// Whether a record is written.
     fn shows(&self, record: &Record) -> bool {
-        // A WebSocket's close is shown with the errors when it ended
-        // other than in order; its lifetime is not a slow request.
+        writes(self.mode, self.slow, &self.exclude, record)
+    }
+}
 
-        match (self.mode, &record.websocket) {
-            (Mode::Off, _) => return false,
-            (Mode::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
-                return false;
-            }
-            (Mode::Errors, None) if record.status < 400 && record.total < self.slow => {
-                return false;
-            }
-            _ => {}
+/// Whether a record is written under a mode, a slow threshold and the
+/// paths left out.
+fn writes(mode: Mode, slow: Duration, exclude: &[String], record: &Record) -> bool {
+    // A WebSocket's close is shown with the errors when it ended other
+    // than in order; its lifetime is not a slow request.
+
+    match (mode, &record.websocket) {
+        (Mode::Off, _) => return false,
+        (Mode::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
+            return false;
+        }
+        (Mode::Errors, None) if record.status < 400 && record.total < slow => {
+            return false;
+        }
+        _ => {}
+    }
+
+    let path = record.path();
+    !exclude.iter().any(|pattern| glob_matches(pattern, path))
+}
+
+/// A change to which records are written, for a period, over the
+/// filters: for one application or every one, and for some paths or
+/// every path. A record it covers is written by its mode, with the slow
+/// threshold of the filter it replaces; one that names paths writes them
+/// even where the filter leaves them out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Override {
+    /// Which of the records it covers are written.
+    pub mode: Mode,
+    /// The application it covers, or every one when empty.
+    pub app: String,
+    /// The path patterns it covers, or every path when empty.
+    pub paths: Vec<String>,
+    /// When it ends.
+    pub until: SystemTime,
+}
+
+impl Override {
+    /// The override a request for one asks for, from now for `duration`:
+    /// the mode is on, errors or off, and the period more than nothing.
+    pub fn requested(
+        mode: &str,
+        app: &str,
+        paths: &[String],
+        duration: Duration,
+    ) -> Result<Self, String> {
+        let mode = Mode::parse(mode).ok_or_else(|| format!("{mode:?} is not on, errors or off"))?;
+
+        if duration.is_zero() {
+            return Err("a change to the access log lasts for a period: give --for".to_owned());
         }
 
-        let path = record.path();
-        !self
-            .exclude
-            .iter()
-            .any(|pattern| glob_matches(pattern, path))
+        Ok(Self {
+            mode,
+            app: app.to_owned(),
+            paths: paths.to_vec(),
+            until: SystemTime::now() + duration,
+        })
+    }
+
+    /// What it writes, as a phrase: "only errors and slow requests of
+    /// shop to /api/*".
+    pub fn describe(&self) -> String {
+        let mut text = match self.mode {
+            Mode::On => "every request",
+            Mode::Errors => "only errors and slow requests",
+            Mode::Off => "no request",
+        }
+        .to_owned();
+
+        if !self.app.is_empty() {
+            text.push_str(&format!(" of {}", self.app));
+        }
+
+        if !self.paths.is_empty() {
+            text.push_str(&format!(" to {}", self.paths.join(", ")));
+        }
+
+        text
+    }
+
+    /// The override as the admin API reported it.
+    pub fn from_admin_message(message: &muru_proto::admin::v1::AccessLogOverride) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode).unwrap_or_default(),
+            app: message.app.clone(),
+            paths: message.paths.clone(),
+            until: UNIX_EPOCH + Duration::from_millis(message.until_unix_ms),
+        }
+    }
+
+    /// The override as the admin API reports it.
+    pub fn to_admin_message(&self) -> muru_proto::admin::v1::AccessLogOverride {
+        muru_proto::admin::v1::AccessLogOverride {
+            mode: self.mode.as_str().to_owned(),
+            app: self.app.clone(),
+            paths: self.paths.clone(),
+            until_unix_ms: self.until_unix_ms(),
+        }
+    }
+
+    /// The override a message carries.
+    pub fn from_message(message: &muru_proto::edge::v1::AccessLogOverride) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode).unwrap_or_default(),
+            app: message.app.clone(),
+            paths: message.paths.clone(),
+            until: UNIX_EPOCH + Duration::from_millis(message.until_unix_ms),
+        }
+    }
+
+    /// The override as a snapshot carries it.
+    pub fn to_message(&self) -> muru_proto::edge::v1::AccessLogOverride {
+        muru_proto::edge::v1::AccessLogOverride {
+            mode: self.mode.as_str().to_owned(),
+            app: self.app.clone(),
+            paths: self.paths.clone(),
+            until_unix_ms: self.until_unix_ms(),
+        }
+    }
+
+    /// When it ends, in Unix milliseconds.
+    pub fn until_unix_ms(&self) -> u64 {
+        self.until.duration_since(UNIX_EPOCH).map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+    }
+
+    /// Whether it is still in force at `now`.
+    pub fn in_force(&self, now: SystemTime) -> bool {
+        now < self.until
+    }
+
+    /// Whether it covers a record of `app` at `path`.
+    pub fn covers(&self, app: &str, path: &str) -> bool {
+        (self.app.is_empty() || self.app == app)
+            && (self.paths.is_empty()
+                || self.paths.iter().any(|pattern| glob_matches(pattern, path)))
     }
 }
 
@@ -155,6 +281,9 @@ pub struct Filters {
     pub node: Filter,
     /// Applications' own filters, by name.
     pub apps: BTreeMap<String, Filter>,
+    /// Changes for a period, the newest last; those past their end are
+    /// ignored.
+    pub overrides: Vec<Override>,
 }
 
 impl Filters {
@@ -164,6 +293,7 @@ impl Filters {
         Self {
             node: filter,
             apps: BTreeMap::new(),
+            overrides: Vec::new(),
         }
     }
 
@@ -183,12 +313,45 @@ impl Filters {
         Some(Self {
             node: Filter::from_message(node),
             apps,
+            overrides: snapshot
+                .access_log_overrides
+                .iter()
+                .map(Override::from_message)
+                .collect(),
         })
     }
 
-    /// The filter a record of `app` is written by.
+    /// The filter a record of `app` is written by, overrides aside.
     pub fn for_app(&self, app: &str) -> &Filter {
         self.apps.get(app).unwrap_or(&self.node)
+    }
+
+    /// Whether a record is written: by the newest override in force that
+    /// covers it, else by its application's filter.
+    fn shows(&self, record: &Record) -> bool {
+        let filter = self.for_app(&record.app);
+
+        if !self.overrides.is_empty() {
+            let now = SystemTime::now();
+            let path = record.path();
+            let covering = self
+                .overrides
+                .iter()
+                .rev()
+                .find(|change| change.in_force(now) && change.covers(&record.app, path));
+
+            if let Some(change) = covering {
+                let exclude = if change.paths.is_empty() {
+                    &filter.exclude[..]
+                } else {
+                    &[]
+                };
+
+                return writes(change.mode, filter.slow, exclude, record);
+            }
+        }
+
+        filter.shows(record)
     }
 }
 
@@ -550,6 +713,12 @@ impl AccessLog {
         *self.filters.write().expect("access log filters poisoned") = filters;
     }
 
+    /// Change the filters in force in place, as one step, and return
+    /// what `change` does.
+    pub fn update_filters<T>(&self, change: impl FnOnce(&mut Filters) -> T) -> T {
+        change(&mut self.filters.write().expect("access log filters poisoned"))
+    }
+
     /// The request metrics the records feed (section 11.1).
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
@@ -741,7 +910,6 @@ impl AccessLog {
         self.filters
             .read()
             .expect("access log filters poisoned")
-            .for_app(&record.app)
             .shows(record)
     }
 
@@ -1164,5 +1332,75 @@ mod tests {
             Filters::from_snapshot(&muru_proto::edge::v1::Snapshot::default()),
             None
         );
+    }
+
+    #[test]
+    fn the_newest_override_in_force_that_covers_a_record_decides() {
+        let log = AccessLog::new(Config {
+            destination: Destination::Terminal,
+            filter: Filter {
+                mode: Mode::Errors,
+                exclude: vec!["/api/health".to_owned()],
+                ..Filter::default()
+            },
+        })
+        .expect("no file to open");
+        let quick = Duration::from_millis(10);
+        let later = SystemTime::now() + Duration::from_secs(60);
+        let mut filters = log.filters();
+
+        // Every request of shop's API, the excluded probe among them,
+        // and nothing at all of blog's for a while; then a change that
+        // has already ended, which is ignored.
+
+        filters.overrides = vec![
+            Override {
+                mode: Mode::On,
+                app: "shop".to_owned(),
+                paths: vec!["/api/*".to_owned()],
+                until: later,
+            },
+            Override {
+                mode: Mode::Off,
+                app: "blog".to_owned(),
+                paths: Vec::new(),
+                until: later,
+            },
+            Override {
+                mode: Mode::Off,
+                app: String::new(),
+                paths: Vec::new(),
+                until: SystemTime::now() - Duration::from_secs(1),
+            },
+        ];
+        log.set_filters(filters.clone());
+        assert!(log.shows(&record("shop", 200, "/api/items", quick)));
+        assert!(log.shows(&record("shop", 200, "/api/health", quick)));
+        assert!(!log.shows(&record("shop", 200, "/home", quick)));
+        assert!(log.shows(&record("shop", 500, "/home", quick)));
+        assert!(!log.shows(&record("blog", 500, "/", quick)));
+
+        // The newest decides where two cover a record.
+
+        filters.overrides.push(Override {
+            mode: Mode::Errors,
+            app: String::new(),
+            paths: vec!["/api/*".to_owned()],
+            until: later,
+        });
+        log.set_filters(filters.clone());
+        assert!(!log.shows(&record("shop", 200, "/api/items", quick)));
+
+        assert_eq!(
+            filters.overrides[0].describe(),
+            "every request of shop to /api/*"
+        );
+        assert!(Override::requested("loud", "", &[], Duration::from_secs(1)).is_err());
+        assert!(Override::requested("on", "", &[], Duration::ZERO).is_err());
+
+        let message = filters.overrides[0].to_message();
+        assert_eq!(message.mode, "on");
+        let back = Override::from_message(&message);
+        assert_eq!(back.until_unix_ms(), filters.overrides[0].until_unix_ms());
     }
 }

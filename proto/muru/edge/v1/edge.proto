@@ -57,6 +57,7 @@ message Snapshot {
   repeated H2cPolicy h2c = 16;          // section 6.13: listeners that limit cleartext HTTP/2; every client elsewhere
   Limits limits = 17;                   // section 4.6: the limits in force; the edge keeps its current ones when absent
   AccessLog access_log = 18;            // section 11.2: the records the access log writes; the edge keeps its current choice when absent
+  repeated AccessLogOverride access_log_overrides = 19; // section 11.2: changes in force for a period, the newest last; only with access_log
 }
 
 // Section 11.2: which access records are written, where the edge was
@@ -67,6 +68,18 @@ message AccessLog {
   string mode = 1;                      // on, errors or off; on when empty
   uint64 slow_ms = 2;                   // a request at least this slow is written under errors
   repeated string exclude = 3;          // path patterns never written, * any run of characters and ? one
+}
+
+// Section 11.2: a change to which access records are written, for a
+// period, over the filters: for one application or every one, and for
+// some paths or every path. The newest in force that covers a request
+// decides for it, with the slow threshold of the filter it replaces; one
+// that names paths writes them even where the filter leaves them out.
+message AccessLogOverride {
+  string mode = 1;                      // on, errors or off
+  string app = 2;                       // every application when empty
+  repeated string paths = 3;            // path patterns, as AccessLog's exclude; every path when empty
+  uint64 until_unix_ms = 4;             // when it ends
 }
 
 // Section 4.6: the limits and timeouts the edge enforces, durations in
