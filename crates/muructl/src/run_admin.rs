@@ -621,8 +621,8 @@ impl Admin for Service {
             socket: state.socket.display().to_string(),
             listeners: state.listeners.clone(),
             started_unix_ms: state.started_unix_ms,
-            apps: 1,
-            releases: 1,
+            app_count: 1,
+            release_count: 1,
             edge_pid: std::process::id(),
             metrics: state
                 .dashboard

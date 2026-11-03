@@ -98,8 +98,8 @@ impl Admin for Service {
                 })
                 .collect(),
             started_unix_ms: info.started_unix_ms,
-            apps: apps.len() as u32,
-            releases: releases.len() as u32,
+            app_count: apps.len() as u32,
+            release_count: releases.len() as u32,
             edge_pid: info.edge_pid.load(std::sync::atomic::Ordering::Relaxed),
             metrics: info
                 .metrics
@@ -1717,6 +1717,13 @@ impl Service {
         created_rx.await.map_err(|_| STOPPING.to_owned())??;
         let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
 
+        // A release that failed says why, so the one answer an apply
+        // gives names the reason as `release show` and the events do.
+
+        if release.state == ReleaseState::Failed && !release.message.is_empty() {
+            return Ok(format!("failed: {}", release.message));
+        }
+
         let serving = self
             .handle
             .store
@@ -1725,6 +1732,7 @@ impl Service {
             .and_then(|app| app.current)
             .as_deref()
             == Some(release.id.as_str());
+
         Ok(format!(
             "{}{}",
             release.state,

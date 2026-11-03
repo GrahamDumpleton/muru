@@ -51,7 +51,7 @@ $ muructl release show shop@r9 --json
 
 | Command | Prints |
 | --- | --- |
-| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `apps`, `releases`, `edge_pid` and the rest |
+| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid` and the rest |
 | `muructl daemon status` | The same as `muructl status` |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
@@ -82,7 +82,7 @@ $ muructl release show shop@r9 --json
 | `muructl maintenance on` | `app`, `on` and `since_unix_ms` |
 | `muructl maintenance off` | `app`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |
-| `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied` |
+| `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied`. Each change has `action`, `subject`, `detail` and, once applied, `outcome`, which for a release that failed is `failed:` and the reason |
 | `muructl config diff` | The report, as `apply` prints it |
 | `muructl config export` | The desired state as a JSON document rather than TOML |
 | `muructl config show` | `document` (TOML), with `--effective` also `attributions` and `layers`, and where it came from: `version`, `node`, `time_unix_ms`, `state_version` |

@@ -133,8 +133,8 @@ message Status {
   string socket = 5;
   repeated string listeners = 6;    // addresses the edge serves
   uint64 started_unix_ms = 7;
-  uint32 apps = 8;
-  uint32 releases = 9;
+  uint32 app_count = 8;             // how many applications there are
+  uint32 release_count = 9;         // how many releases, of every application
   uint32 edge_pid = 10;             // the edge process serving the listeners
   string metrics = 11;              // the metrics listener's address, or empty
   string dashboard = 12;            // the dashboard's address, or empty

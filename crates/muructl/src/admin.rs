@@ -2184,7 +2184,10 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
 
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
-    println!("apps     {} ({} releases)", status.apps, status.releases);
+    println!(
+        "apps     {} ({} releases)",
+        status.app_count, status.release_count
+    );
     println!("websockets {} open", status.websockets);
 
     if !status.budget.is_empty() {

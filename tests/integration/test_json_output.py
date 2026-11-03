@@ -9,6 +9,8 @@ the same exit status.
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 from support.daemon import SHOP, Daemon
@@ -29,7 +31,7 @@ def test_read_commands_print_the_api_answers(daemon: Daemon) -> None:
     assert deployed["serving"] is True
 
     status = answer(daemon, "status")
-    assert status["apps"] == 1
+    assert status["app_count"] == 1
     assert f"127.0.0.1:{daemon.port}" in " ".join(status["listeners"])
 
     assert [app["name"] for app in answer(daemon, "app", "list")["apps"]] == ["shop"]
@@ -92,3 +94,17 @@ def test_a_failure_prints_its_error_as_json(daemon: Daemon) -> None:
     assert failed.returncode == 1
     error = json.loads(failed.stdout)["error"]
     assert isinstance(error, str) and error
+
+
+def test_apply_names_a_release_that_failed_and_why(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "site.toml"
+    config.write_text(
+        f"[app.broken.release.r1]\nsource = '{SHOP}'\nentrypoint = 'shop:nothing_here'\n"
+        f"python = '{sys.executable}'\n"
+    )
+    applied = daemon.muructl("apply", "-f", str(config), "--json", check=False)
+    assert applied.returncode == 1
+    report = json.loads(applied.stdout)
+    assert report["errors"] == []
+    (change,) = [change for change in report["changes"] if change["subject"] == "broken@r1"]
+    assert change["outcome"].startswith("failed: ") and len(change["outcome"]) > len("failed: ")
