@@ -29,6 +29,7 @@ use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
 
+use muru_proto::buffers;
 use muru_proto::descriptors::FdReader;
 
 use crate::asgi;
@@ -141,6 +142,14 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     let served: Result<(), BoxError> = runtime.block_on(async move {
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
+
+        // Every link connection accepted takes the listener's send buffer
+        // (section 5.1), so a large response is not carried in steps of
+        // the system's default.
+
+        if let Err(error) = buffers::set_send_buffer(&listener) {
+            eprintln!("muru: the worker link kept the system's send buffer: {error}");
+        }
 
         // The socket's directory carries the edge's group (section 10.9),
         // and the socket opens to that group whatever the umask left.

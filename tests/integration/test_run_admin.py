@@ -139,6 +139,31 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert "worker 1" in restarted and "is being replaced by pid" in restarted
         assert server.wait_for_log("muru: worker.restarted:")
 
+        # A change to what the access log writes goes into the run's edge
+        # at once and is printed as the daemon records it.
+
+        quiet = muructl(
+            runtime,
+            "logging",
+            "access",
+            "off",
+            "--path",
+            "/quiet",
+            "--for",
+            "1m",
+            cwd=support.FIXTURES,
+        ).stdout
+        assert "the access log writes no request to /quiet for 1m00s" in quiet, quiet
+        assert "  no request to /quiet, " in quiet, quiet
+        assert server.wait_for_log("muru: access_log.changed: the access log writes no request")
+        server.get("/quiet")
+        server.get("/marker")
+        assert server.wait_for_log(" GET /marker ")
+        assert " GET /quiet " not in server.log()
+        reset = muructl(runtime, "logging", "access", "--reset", cwd=support.FIXTURES).stdout
+        assert "put back 1 change to the access log" in reset, reset
+        assert "writes what the configuration says" in reset
+
         # What manages the daemon's state says it needs the daemon.
 
         refused = muructl(runtime, "deploy", "shop", ".", cwd=support.FIXTURES, check=False)

@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS command_runs (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// The store.
 pub struct Store {
@@ -163,8 +163,10 @@ impl Store {
         // HTTP upstreams, version 7 overlays and their state (section
         // 9.10), version 8 the client classes and rate limits of applied
         // files (sections 4.14 and 4.15), version 9 the application's
-        // priority (section 7.4), added to an older table here, and
-        // version 10 the last run of each command (section 9.12).
+        // priority (section 7.4), added to an older table here, version
+        // 10 the last run of each command (section 9.12), and version 11
+        // the application's own access log choice (section 11.2), added
+        // to an older table here.
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -210,7 +212,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask, priority FROM apps ORDER BY name",
+                 user, grp, umask, priority, access_log FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -224,7 +226,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask, priority FROM apps WHERE name = ?1",
+                     user, grp, umask, priority, access_log FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -265,6 +267,37 @@ impl Store {
                 "UPDATE apps SET priority = ?2, resource_version = resource_version + 1 \
                  WHERE name = ?1",
                 params![name, priority],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("application {name}")));
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Set the application's own access log choice (section 11.2); an
+    /// empty one leaves the `[logs]` table's.
+    pub fn set_app_access_log(
+        &self,
+        name: &str,
+        access_log: &crate::model::AccessLogSpec,
+    ) -> Result<(), StoreError> {
+        let encoded = if access_log.is_empty() {
+            None
+        } else {
+            Some(
+                toml::to_string(access_log)
+                    .map_err(|error| StoreError::Decode(error.to_string()))?,
+            )
+        };
+
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE apps SET access_log = ?2, resource_version = resource_version + 1 \
+                 WHERE name = ?1",
+                params![name, encoded],
             )?;
 
             if changed == 0 {
@@ -1060,11 +1093,16 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         group: row.get(6)?,
         umask: row.get(7)?,
         priority: row.get::<_, Option<i64>>(8)?.unwrap_or(0) as i32,
+        access_log: match row.get::<_, Option<String>>(9)? {
+            Some(encoded) => decode(&encoded).map_err(|error: StoreError| undecodable(9, error))?,
+            None => crate::model::AccessLogSpec::default(),
+        },
     })
 }
 
-/// Add the identity columns of version 4, and the priority of version
-/// 9, to an applications table that predates them.
+/// Add the identity columns of version 4, the priority of version 9 and
+/// the access log choice of version 11 to an applications table that
+/// predates them.
 fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection.prepare("PRAGMA table_info(apps)")?;
     let columns: Vec<String> = statement
@@ -1076,6 +1114,7 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
         ("grp", "TEXT"),
         ("umask", "TEXT"),
         ("priority", "INTEGER"),
+        ("access_log", "TEXT"),
     ] {
         if !columns.iter().any(|name| name == column) {
             connection.execute(&format!("ALTER TABLE apps ADD COLUMN {column} {kind}"), [])?;

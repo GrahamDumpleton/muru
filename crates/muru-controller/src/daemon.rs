@@ -253,6 +253,18 @@ pub enum Command {
         /// Where the groups' states go.
         done: oneshot::Sender<Result<Vec<(String, ScaleStatus)>, String>>,
     },
+    /// Section 11.2: change which requests the access log writes for a
+    /// period, put the changes back, or list those in force.
+    OverrideAccessLog {
+        /// The change asked for, checked; none to list or reset.
+        change: Option<muru_edge::access::Override>,
+        /// Put back the changes, those for this application when it is
+        /// not empty.
+        reset: Option<String>,
+        /// Answered with the changes in force after it and how many a
+        /// reset put back.
+        done: oneshot::Sender<Result<(Vec<muru_edge::access::Override>, usize), String>>,
+    },
     /// Section 4.12: serve the maintenance page for an application, or
     /// serve it as usual again.
     SetMaintenance {
@@ -523,6 +535,9 @@ pub struct Info {
     /// and release, then by mount, the default mount's under the empty
     /// name: as its host last announced them.
     pub interfaces: std::sync::Mutex<Interfaces>,
+    /// The instances of each managed server release (section 9.9), by
+    /// application and release, as the daemon last checked them.
+    pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
@@ -836,6 +851,12 @@ struct Daemon {
     h2c: Vec<pb::H2cPolicy>,
     /// The `[limits]` table (section 4.6), for every snapshot.
     limits: muru_edge::Limits,
+    /// Which records the access log writes, from the `[logs]` table
+    /// (section 11.2), for every snapshot.
+    access_log: muru_edge::access::Filter,
+    /// Changes to it for a period, the newest last (section 11.2): kept
+    /// only in memory, so a daemon that starts again has none.
+    access_overrides: Vec<muru_edge::access::Override>,
     /// The command line's settings, laid over the file on every reload.
     overrides: crate::settings::Overrides,
     /// The event sinks delivering (section 11.5), reconciled on reload.
@@ -1043,6 +1064,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: std::sync::Mutex::new(Interfaces::new()),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
     let handle = Handle {
@@ -1169,6 +1191,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         debug_exec: settings.debug_exec,
         h2c: settings.h2c.clone(),
         limits: settings.limits.clone(),
+        access_log: settings.access_log.clone(),
+        access_overrides: Vec::new(),
         overrides: config.overrides,
         sinks,
         certificates: HashMap::new(),
@@ -1286,6 +1310,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
                 daemon.rotate_logs();
+                daemon.expire_access_overrides().await;
 
                 let samples = match daemon.edge.metrics().await {
                     Ok(samples) => Some(samples),
@@ -1621,6 +1646,16 @@ fn exec_daemon(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::
     std::process::Command::new(executable)
         .args(arguments)
         .exec()
+}
+
+/// The subject of an event about a change to the access log: its
+/// application, or the logs when it covers every one.
+fn access_subject(change: &muru_edge::access::Override) -> &str {
+    if change.app.is_empty() {
+        "logs"
+    } else {
+        &change.app
+    }
 }
 
 /// The [proxy] table as the snapshot carries it, with the defaults of
@@ -2201,6 +2236,7 @@ impl Daemon {
             ),
             ("[limits]", settings.limits != self.limits),
             ("[[listener]] h2c", settings.h2c != self.h2c),
+            ("[logs] access_log", settings.access_log != self.access_log),
         ] {
             if changed {
                 report.changed(table, "the edge has it");
@@ -2215,6 +2251,7 @@ impl Daemon {
         self.error_pages = settings.error_pages;
         self.error_override = settings.error_override;
         self.limits = settings.limits;
+        self.access_log = settings.access_log;
         self.h2c = settings.h2c;
         self.client_rules = settings.client_rules;
         self.clients = clients;
@@ -2292,7 +2329,7 @@ impl Daemon {
             }
 
             report.changed(
-                "[logs]",
+                "[logs] rotation",
                 if self.rotation.is_some() {
                     "the daemon rotates on the new policy"
                 } else {
@@ -2300,7 +2337,7 @@ impl Daemon {
                 },
             );
         } else {
-            report.unchanged("[logs]");
+            report.unchanged("[logs] rotation");
         }
 
         // Section 13.3: what the next stop signal means.
@@ -3423,6 +3460,7 @@ impl Daemon {
                         ready_at: HashMap::new(),
                     },
                 );
+                self.publish_servers();
                 self.events.emit(
                     "release.adopted",
                     &subject,
@@ -3498,6 +3536,13 @@ impl Daemon {
             }
             Command::SetMaintenance { app, on, done } => {
                 let _ = done.send(self.set_maintenance(&app, on).await);
+            }
+            Command::OverrideAccessLog {
+                change,
+                reset,
+                done,
+            } => {
+                let _ = done.send(self.override_access_log(change, reset).await);
             }
             Command::Drain { app, id, done } => {
                 let _ = done.send(self.drain_release(&app, &id).await);
@@ -3905,7 +3950,18 @@ impl Daemon {
         let tools = &self.info.provisioning.tools;
         let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
         let root = self.locations.state.path.join("runtime");
-        let wheel_dir = tools.wheel_dir.as_deref().map(PathBuf::from);
+
+        // The `[tools]` table's wheel directory, else the one the
+        // environment names, as `muructl run` takes it.
+
+        let (wheel_dir, named_by) = match tools.wheel_dir.as_deref() {
+            Some(directory) => (Some(PathBuf::from(directory)), "tools.wheel_dir"),
+            None => match muru_provision::runtime::wheel_dir_from_environment() {
+                Some(directory) => (Some(directory), muru_provision::runtime::WHEEL_DIR_VARIABLE),
+                None => (None, "tools.wheel_dir"),
+            },
+        };
+
         let options = muru_provision::runtime::Options {
             probe: &probe,
             version: &version,
@@ -3914,7 +3970,7 @@ impl Daemon {
             offline: tools.offline.unwrap_or(false),
         };
 
-        muru_provision::runtime::provide(&options, "tools.wheel_dir")
+        muru_provision::runtime::provide(&options, named_by)
             .await
             .map_err(|error| error.to_string())
     }
@@ -4592,6 +4648,7 @@ impl Daemon {
                 ready_at: HashMap::new(),
             },
         );
+        self.publish_servers();
         self.set_state(
             release,
             ReleaseState::Warming,
@@ -4701,6 +4758,15 @@ impl Daemon {
 
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
+                // Section 11.2: the application's own access log choice,
+                // laid over the node's.
+
+                let access_log = self
+                    .store
+                    .app(name)
+                    .ok()
+                    .filter(|app| !app.access_log.is_empty())
+                    .map(|app| app.access_log.over(&self.access_log).to_message());
                 apps.push(pb::AppWorkers {
                     app: name.clone(),
                     release: id.clone(),
@@ -4711,6 +4777,7 @@ impl Daemon {
                         .map(|socket| socket.display().to_string())
                         .collect(),
                     waking_groups: running.waking_groups(),
+                    access_log,
                     grpc_web_origins: self
                         .store
                         .release(name, id)
@@ -4979,6 +5046,12 @@ impl Daemon {
             default_traffic,
             h2c: self.h2c.clone(),
             limits: Some(self.limits.to_message()),
+            access_log: Some(self.access_log.to_message()),
+            access_log_overrides: self
+                .access_overrides
+                .iter()
+                .map(muru_edge::access::Override::to_message)
+                .collect(),
         }
     }
 
@@ -6784,6 +6857,88 @@ impl Daemon {
         Ok(self.maintenance.get(app).copied())
     }
 
+    /// Section 11.2: put a change to the access log in force, or put the
+    /// changes back (every one, or those for one application), and send
+    /// the edge the result; with neither, only say what is in force.
+    async fn override_access_log(
+        &mut self,
+        change: Option<muru_edge::access::Override>,
+        reset: Option<String>,
+    ) -> Result<(Vec<muru_edge::access::Override>, usize), String> {
+        self.expire_access_overrides().await;
+        let now = std::time::SystemTime::now();
+        let mut reset_count = 0;
+
+        if let Some(app) = reset {
+            let (put_back, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.access_overrides)
+                .into_iter()
+                .partition(|change| app.is_empty() || change.app == app);
+            self.access_overrides = kept;
+            reset_count = put_back.len();
+
+            for change in &put_back {
+                self.events.emit(
+                    "access_log.reverted",
+                    access_subject(change),
+                    "notice",
+                    &format!("the change to write {} was put back", change.describe()),
+                );
+            }
+        }
+
+        if let Some(change) = change {
+            let left = change.until.duration_since(now).unwrap_or_default();
+            self.events.emit(
+                "access_log.changed",
+                access_subject(&change),
+                "notice",
+                &format!(
+                    "the access log writes {} for {}",
+                    change.describe(),
+                    muru_edge::access::format_lifetime(left)
+                ),
+            );
+            self.access_overrides.push(change);
+        } else if reset_count == 0 {
+            return Ok((self.access_overrides.clone(), 0));
+        }
+
+        self.push_snapshot().await?;
+        Ok((self.access_overrides.clone(), reset_count))
+    }
+
+    /// Section 11.2: drop the changes to the access log whose period has
+    /// ended, saying so, and send the edge the rest.
+    async fn expire_access_overrides(&mut self) {
+        let now = std::time::SystemTime::now();
+
+        if self
+            .access_overrides
+            .iter()
+            .all(|change| change.in_force(now))
+        {
+            return;
+        }
+
+        let (kept, ended): (Vec<_>, Vec<_>) = std::mem::take(&mut self.access_overrides)
+            .into_iter()
+            .partition(|change| change.in_force(now));
+        self.access_overrides = kept;
+
+        for change in &ended {
+            self.events.emit(
+                "access_log.reverted",
+                access_subject(change),
+                "notice",
+                &format!("the change to write {} ended", change.describe()),
+            );
+        }
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::warn!(%error, "the edge did not take the access log back");
+        }
+    }
+
     /// The autoscaler's state for each group of a running release.
     fn scale_status(&self, app: &str, id: &str) -> Result<Vec<(String, ScaleStatus)>, String> {
         let now = Instant::now();
@@ -7101,6 +7256,23 @@ impl Daemon {
                 }
             }
         }
+
+        self.publish_servers();
+    }
+
+    /// Publish each managed server release's instances, for `release
+    /// show`: on every check, so a release that stops leaves the list
+    /// within one.
+    fn publish_servers(&self) {
+        let servers = self
+            .running
+            .iter()
+            .filter_map(|(key, running)| match &running.backend {
+                Backend::Servers(servers) => Some((key.clone(), servers.record().instances)),
+                _ => None,
+            })
+            .collect();
+        *self.info.servers.lock().expect("servers poisoned") = servers;
     }
 
     /// Push a snapshot without the application's workers: its serving

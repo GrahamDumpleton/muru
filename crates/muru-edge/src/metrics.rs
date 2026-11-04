@@ -6,7 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use muru_proto::edge::v1 as pb;
@@ -107,6 +108,11 @@ pub const FAMILIES: &[Family] = &[
         name: "muru_request_retries_total",
         kind: Kind::Counter,
         help: "Requests sent again to another worker after the first closed its connection before reading them.",
+    },
+    Family {
+        name: "muru_access_log_dropped_total",
+        kind: Kind::Counter,
+        help: "Access log lines dropped because the writer had fallen behind; the requests are still counted.",
     },
     Family {
         name: "muru_requests_in_flight",
@@ -489,9 +495,22 @@ struct Inner {
 #[derive(Debug, Default)]
 pub struct Metrics {
     inner: Mutex<Inner>,
+    /// Access log lines dropped while the writer was behind, shared with
+    /// the writer so it can say how many.
+    access_log_dropped: Arc<AtomicU64>,
 }
 
 impl Metrics {
+    /// Count an access log line dropped because the writer was behind.
+    pub fn count_access_log_dropped(&self) {
+        self.access_log_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The count of dropped access log lines, for the writer.
+    pub fn access_log_dropped(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.access_log_dropped)
+    }
+
     /// Count a request the edge has taken, until `finish` with the same
     /// labels.
     pub fn begin(&self, app: &str, release: &str) {
@@ -661,6 +680,12 @@ impl Metrics {
                 value: *count as f64,
             });
         }
+
+        samples.push(Sample {
+            name: "muru_access_log_dropped_total".to_owned(),
+            labels: Vec::new(),
+            value: self.access_log_dropped.load(Ordering::Relaxed) as f64,
+        });
 
         for (key, count) in &inner.in_flight {
             samples.push(Sample {

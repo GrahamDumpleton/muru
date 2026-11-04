@@ -98,8 +98,8 @@ impl Admin for Service {
                 })
                 .collect(),
             started_unix_ms: info.started_unix_ms,
-            apps: apps.len() as u32,
-            releases: releases.len() as u32,
+            app_count: apps.len() as u32,
+            release_count: releases.len() as u32,
             edge_pid: info.edge_pid.load(std::sync::atomic::Ordering::Relaxed),
             metrics: info
                 .metrics
@@ -244,6 +244,54 @@ impl Admin for Service {
             app: request.app,
             on: since.is_some(),
             since_unix_ms: since.unwrap_or(0),
+        }))
+    }
+
+    async fn override_access_log(
+        &self,
+        request: Request<pb::OverrideAccessLogRequest>,
+    ) -> Result<Response<pb::AccessLogOverrides>, Status> {
+        let request = request.into_inner();
+
+        if !request.app.is_empty() {
+            self.handle.store.app(&request.app).map_err(not_found)?;
+        }
+
+        let change = if request.reset || request.mode.is_empty() {
+            None
+        } else {
+            Some(
+                muru_edge::access::Override::requested(
+                    &request.mode,
+                    &request.app,
+                    &request.paths,
+                    Duration::from_millis(request.duration_ms),
+                )
+                .map_err(Status::invalid_argument)?,
+            )
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::OverrideAccessLog {
+                change,
+                reset: request.reset.then_some(request.app),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let (overrides, reset) = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::AccessLogOverrides {
+            overrides: overrides
+                .iter()
+                .map(muru_edge::access::Override::to_admin_message)
+                .collect(),
+            reset: u32::try_from(reset).unwrap_or(u32::MAX),
         }))
     }
 
@@ -1551,6 +1599,10 @@ impl Service {
                 .set_app_priority(app, *priority)
                 .map(|()| "set".to_owned())
                 .map_err(|error| error.to_string()),
+            Action::SetAppAccessLog { app, access_log } => store
+                .set_app_access_log(app, access_log)
+                .map(|()| "set".to_owned())
+                .map_err(|error| error.to_string()),
             Action::Deploy { app, id, spec } => self.deploy_declared(app, id, spec).await,
             Action::RemoveRelease { app, id } => self.remove_release(app, id).await,
             Action::RemoveApp { app } => store
@@ -1665,6 +1717,13 @@ impl Service {
         created_rx.await.map_err(|_| STOPPING.to_owned())??;
         let release = done_rx.await.map_err(|_| STOPPING.to_owned())??;
 
+        // A release that failed says why, so the one answer an apply
+        // gives names the reason as `release show` and the events do.
+
+        if release.state == ReleaseState::Failed && !release.message.is_empty() {
+            return Ok(format!("failed: {}", release.message));
+        }
+
         let serving = self
             .handle
             .store
@@ -1673,6 +1732,7 @@ impl Service {
             .and_then(|app| app.current)
             .as_deref()
             == Some(release.id.as_str());
+
         Ok(format!(
             "{}{}",
             release.state,
@@ -2003,6 +2063,24 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .get(&(release.app.clone(), release.id.clone()))
         .copied()
         .unwrap_or(0) as u32;
+    let server_instances = handle
+        .info
+        .servers
+        .lock()
+        .expect("servers poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .map(|instances| {
+            instances
+                .iter()
+                .map(|instance| pb::ServerInstance {
+                    index: instance.index,
+                    pid: instance.pid,
+                    address: instance.address.clone(),
+                    started_unix_ms: instance.started_unix_ms,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let detected_for = |mount: &str| {
         detected
             .iter()
@@ -2072,6 +2150,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         environment,
         build_when: release.spec.build.when.as_str().to_owned(),
         bytecode,
+        server_instances,
         processes: release.spec.processes,
         threads: release.spec.threads,
         sync_threads: release.spec.sync_threads,

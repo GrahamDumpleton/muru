@@ -4,6 +4,9 @@
 `muructl logging level APP NAME=LEVEL --for 10m` changes a logger's level
 in a release's workers for a period, without a restart; the
 [inspecting workers guide](debugging.md) has the details.
+`muructl logging access on --for 10m` does the same for the access log,
+as [changing it for a while](#changing-the-access-log-for-a-while)
+describes.
 ```
 
 A development run writes two kinds of lines to the terminal: what your
@@ -118,23 +121,37 @@ received from the client and sent to it:
 05:47:26.402 101 GET /ws/chat/42 12kB 5m03s websocket=closed by=client code=1000 received=12 sent=40 worker=0 id=01M5P6WZD3740HFT2N80MAV4YV
 ```
 
-`--access-log` chooses where the lines go:
+`--access-log` chooses which requests get a line:
 
 | Value | Effect |
 | --- | --- |
-| `terminal` (default) | compact lines as above |
+| `on` (default) | every request |
 | `errors` | only 4xx and 5xx responses, requests slower than `--slow` (default `1s`), and WebSockets that closed other than normally or going away |
 | `off` | nothing |
-| a file path | JSON lines appended to the file, one object per request |
+
+`--access-log-file PATH` writes the lines to that file in place of the
+terminal, as JSON lines appended one object per request. The two go
+together, so `--access-log errors --access-log-file errors.jsonl` keeps
+only the requests that need attention, in a file you can read after a
+long session or a load test.
 
 `--access-log-exclude PATTERN`, repeatable, hides requests whose path
 matches: `*` matches any run of characters and `?` one, so
 `--access-log-exclude '/static/*' --access-log-exclude '/healthz'` keeps
-assets and probes out of the terminal.
+assets and probes out of the terminal. Under the daemon the `[logs]`
+table makes the same choices, as [what the daemon's access log
+writes](#what-the-daemons-access-log-writes) describes.
 
 Whatever is shown, the last thousand records are kept in memory and the
 per-second counts for the last minute, which is what the dashboard
 displays.
+
+Lines are written by a thread of the edge's own, so a slow disk, or a
+terminal or log collector that stops reading, never holds up a request.
+When the writer falls behind by more than sixteen thousand lines, the
+lines beyond that are dropped rather than waited for: the
+`muru_access_log_dropped_total` [metric](metrics.md) counts them, and
+once writing catches up the edge says how many were dropped.
 
 A JSON line has these fields:
 
@@ -237,6 +254,68 @@ $ muructl logs --access --lines 1
 
 `--no-timestamps` leaves the times off. The same command against a
 development run shows the run's lines with their times as well.
+
+### What the daemon's access log writes
+
+The daemon's access log writes a line for every request unless its
+`[logs]` table says otherwise, with the keys `muructl serve` takes:
+
+```toml
+[logs]
+access_log = 'errors'                            # on (the default), errors or off
+slow = '500ms'                                   # what errors counts as slow, 1s by default
+access_log_exclude = ['/healthz', '/static/*']
+```
+
+`errors` writes 4xx and 5xx responses, requests at least `slow`, and
+WebSockets that closed other than normally or going away, and `off`
+writes nothing. A request that is not written is still counted in the
+[metrics](metrics.md) and shown among the dashboard's recent requests;
+`muructl logs --access` reads the file, so it shows only what was
+written.
+
+An application's table in an applied file can choose for that
+application's requests alone, for example to keep one noisy application
+quiet while the rest are logged:
+
+```toml
+[app.shop]
+access_log = 'off'
+```
+
+The application's `access_log` and `slow` replace the `[logs]` table's
+for its requests, and its `access_log_exclude` paths are left out as
+well as the table's. `muructl daemon reload` applies a changed `[logs]`
+table, and `muructl apply` a changed application table, to the running
+edge without restarting anything: every request completed from then on
+is written by the new choice.
+
+### Changing the access log for a while
+
+`muructl logging access` changes which requests the access log writes
+for a period, then goes back on its own, with nothing to remember to
+undo. Against the daemon it covers every application or one; against a
+development run or `muructl serve`, the one application:
+
+```
+muructl logging access on --for 10m                            # every request, for every application
+muructl logging access on --app shop --path '/api/*' --for 5m  # every request to shop's API
+muructl logging access off --app blog --for 1h                 # nothing from blog
+muructl logging access                                         # what is in force, and for how long
+muructl logging access --reset                                 # put every change back now
+```
+
+A change covers the requests of the application `--app` names, or of
+every one, whose path matches one of the `--path` patterns, or any path.
+It writes those it covers by its mode, `on`, `errors` or `off`, with the
+configured `slow`, and a change that names paths writes them even where
+`access_log_exclude` leaves them out. Where two changes cover a request,
+the newer decides. `--reset --app APP` puts back only that application's.
+
+A change takes effect at once, for every request completed from then on,
+and ends when its period does, when it is reset, or when the daemon
+starts again. The daemon records the `access_log.changed` and
+`access_log.reverted` events; a development run prints them.
 
 ## Rotation
 

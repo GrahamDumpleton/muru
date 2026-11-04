@@ -36,6 +36,7 @@ ones it names.
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app`, `on` |
 | `apply` | changes | `muructl apply` | `file`, `dry_run` |
 | `log_level` | changes | `muructl logging level` | `target`, `levels`, `for`, `reset` |
+| `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |
 | `reload_config` | changes | `muructl daemon reload` | none |
 

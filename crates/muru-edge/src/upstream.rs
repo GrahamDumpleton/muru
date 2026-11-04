@@ -51,7 +51,8 @@ const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a probe may take when the upstream does not say.
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Idle connections kept per address, and how long one is kept.
+/// Idle connections kept per address, and how long one is kept when the
+/// server does not say for less with Keep-Alive.
 const IDLE_PER_ADDRESS: usize = 16;
 const IDLE_FOR: Duration = Duration::from_secs(60);
 
@@ -122,7 +123,8 @@ struct Address {
     text: String,
     target: Target,
     state: Mutex<State>,
-    /// HTTP/1.1 connections between requests, newest last.
+    /// HTTP/1.1 connections between requests, newest last, each with
+    /// when it stops being used.
     idle: Mutex<VecDeque<(http1::SendRequest<OutBody>, Instant)>>,
     /// The HTTP/2 connection, which multiplexes.
     h2: Mutex<Option<http2::SendRequest<OutBody>>>,
@@ -569,8 +571,9 @@ enum Sender {
     Http2(http2::SendRequest<OutBody>),
 }
 
-/// A connection ready to take a request: an idle one, else a new one.
-async fn sender_for(shared: &Shared, address: &Address) -> std::io::Result<Sender> {
+/// A connection ready to take a request: an idle one, unless `fresh`
+/// asks for a new one, else a new one.
+async fn sender_for(shared: &Shared, address: &Address, fresh: bool) -> std::io::Result<Sender> {
     if shared.protocol.is_h2() {
         let existing = address.h2.lock().expect("upstream h2 poisoned").clone();
 
@@ -595,25 +598,24 @@ async fn sender_for(shared: &Shared, address: &Address) -> std::io::Result<Sende
     }
 
     let now = Instant::now();
+    let idle = || {
+        if fresh {
+            return None;
+        }
 
-    loop {
-        let idle = address
+        address
             .idle
             .lock()
             .expect("upstream idle poisoned")
-            .pop_back();
+            .pop_back()
+    };
 
-        match idle {
-            Some((sender, since)) => {
-                if now.duration_since(since) < IDLE_FOR && !sender.is_closed() && sender.is_ready()
-                {
-                    return Ok(Sender::Http1 {
-                        sender,
-                        reused: true,
-                    });
-                }
-            }
-            None => break,
+    while let Some((sender, until)) = idle() {
+        if now < until && !sender.is_closed() && sender.is_ready() {
+            return Ok(Sender::Http1 {
+                sender,
+                reused: true,
+            });
         }
     }
 
@@ -635,9 +637,9 @@ async fn sender_for(shared: &Shared, address: &Address) -> std::io::Result<Sende
 }
 
 /// Put an HTTP/1.1 connection back for the next request, once its
-/// response is fully read.
-fn keep(address: &Address, sender: http1::SendRequest<OutBody>) {
-    if sender.is_closed() {
+/// response is fully read, for `idle_for`.
+fn keep(address: &Address, sender: http1::SendRequest<OutBody>, idle_for: Duration) {
+    if sender.is_closed() || idle_for.is_zero() {
         return;
     }
 
@@ -647,7 +649,31 @@ fn keep(address: &Address, sender: http1::SendRequest<OutBody>) {
         idle.pop_front();
     }
 
-    idle.push_back((sender, Instant::now()));
+    idle.push_back((sender, Instant::now() + idle_for));
+}
+
+/// How long a connection may sit idle before the edge stops using it: a
+/// second less than the server's Keep-Alive timeout when it sends one,
+/// since a server may close a connection at its timeout as a request
+/// arrives, and never more than `IDLE_FOR`.
+fn idle_for(headers: &HeaderMap) -> Duration {
+    let timeout = headers
+        .get_all("keep-alive")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("timeout")
+                .then(|| value.trim().parse::<u64>().ok())
+                .flatten()
+        });
+
+    match timeout {
+        Some(seconds) => Duration::from_secs(seconds.saturating_sub(1)).min(IDLE_FOR),
+        None => IDLE_FOR,
+    }
 }
 
 /// Why a request to an address did not get a response head.
@@ -657,6 +683,10 @@ enum Failure {
     Unsent(String),
     /// The request went out and the response did not come whole.
     Sent(String),
+    /// The request went out whole on a connection kept from an earlier
+    /// request, and the connection closed with nothing read back: the
+    /// server had let the connection go, which it may do at any time.
+    Dropped(String),
     /// The deadline passed first.
     Timeout,
 }
@@ -666,15 +696,17 @@ enum Failure {
 type Answer = (Response<Incoming>, Option<http1::SendRequest<OutBody>>);
 
 /// Send the request in `slot` to an address and wait for the response
-/// head. A request that was never sent goes back into the slot.
+/// head, on a new connection when `fresh`. A request that was never sent
+/// goes back into the slot.
 async fn send(
     shared: &Shared,
     address: &Address,
     slot: &mut Option<Request<OutBody>>,
     deadline: Instant,
+    fresh: bool,
 ) -> Result<Answer, Failure> {
     loop {
-        let sender = match sender_for(shared, address).await {
+        let sender = match sender_for(shared, address, fresh).await {
             Ok(sender) => sender,
             Err(error) => return Err(Failure::Unsent(error.to_string())),
         };
@@ -720,9 +752,26 @@ async fn send(
                 *slot = Some(message);
                 return Err(Failure::Unsent(error.to_string()));
             }
+            None if kept && closed_under(&error) => {
+                return Err(Failure::Dropped(error.to_string()));
+            }
             None => return Err(Failure::Sent(error.to_string())),
         }
     }
+}
+
+/// Whether a request's connection closed before anything came back: at
+/// its end, or reset by a server that had already let it go.
+fn closed_under(error: &hyper::Error) -> bool {
+    error.is_incomplete_message()
+        || std::error::Error::source(error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                )
+            })
 }
 
 /// Probe each address in turn, forever: the task ends when the upstream
@@ -823,6 +872,16 @@ enum Payload {
 }
 
 impl Payload {
+    /// The same body again, for a request sent a second time; none for
+    /// the client's stream, which is read once.
+    fn again(&self) -> Option<Self> {
+        match self {
+            Self::Empty => Some(Self::Empty),
+            Self::Buffered(data) => Some(Self::Buffered(data.clone())),
+            Self::Streamed(_) => None,
+        }
+    }
+
     fn into_body(self) -> OutBody {
         match self {
             Self::Empty => Empty::<Bytes>::new()
@@ -973,6 +1032,17 @@ pub async fn handle(
         candidates = in_order.clone();
     }
 
+    // A request that may go again if a kept connection turns out to have
+    // been closed by the server: one whose method is idempotent and whose
+    // body the edge holds whole, or has none.
+
+    let mut again = parts
+        .method
+        .is_idempotent()
+        .then(|| payload.again().map(|payload| (payload, headers.clone())))
+        .flatten();
+    let mut retried = false;
+
     let dispatched = Instant::now();
     let mut slot = Some(build_request(
         parts,
@@ -1000,7 +1070,41 @@ pub async fn handle(
             continue;
         }
 
-        match send(shared, address, &mut slot, deadline).await {
+        // Section 4.13: the server closed a kept connection as the request
+        // went out on it, so the request goes once more on a new one to
+        // the same address, and the other kept connections, idle as long,
+        // are let go.
+
+        let mut fresh = false;
+
+        let outcome = loop {
+            match send(shared, address, &mut slot, deadline, fresh).await {
+                Err(Failure::Dropped(error)) => match again.take() {
+                    Some((payload, headers)) => {
+                        tracing::debug!(
+                            upstream = %shared.name,
+                            address = %address.text,
+                            "a kept upstream connection was closed under the request ({error}); sending it again"
+                        );
+                        address.idle.lock().expect("upstream idle poisoned").clear();
+                        slot = Some(build_request(
+                            parts,
+                            shared,
+                            &host,
+                            headers,
+                            length,
+                            payload.into_body(),
+                        ));
+                        retried = true;
+                        fresh = true;
+                    }
+                    None => break Err(Failure::Sent(error)),
+                },
+                outcome => break outcome,
+            }
+        };
+
+        match outcome {
             Ok((response, sender)) => {
                 address.succeeded(&shared.name);
                 answered = Some((address, response, sender));
@@ -1015,7 +1119,7 @@ pub async fn handle(
                 address.failed(&shared.name, shared.eject_after, shared.eject_for);
                 last_error = error;
             }
-            Err(Failure::Sent(error)) => {
+            Err(Failure::Sent(error) | Failure::Dropped(error)) => {
                 tracing::warn!(
                     upstream = %shared.name,
                     address = %address.text,
@@ -1058,6 +1162,7 @@ pub async fn handle(
         recording.record.application = dispatched.elapsed();
         recording.record.status = status.as_u16();
         recording.record.mount = address.text.clone();
+        recording.record.retried = retried;
     }
 
     // Section 4.13: X-Muru headers from an upstream mean nothing unless
@@ -1147,11 +1252,12 @@ pub async fn handle(
         crate::copy_headers(headers, kept);
     }
 
+    let idle_for = idle_for(response.headers());
     let body = response.into_body();
 
     let response = if response_end {
         if let Some(sender) = sender {
-            keep(address, sender);
+            keep(address, sender, idle_for);
         }
 
         if let Some(recording) = recording.take() {
@@ -1169,6 +1275,7 @@ pub async fn handle(
                 body: Some(body),
                 address: Arc::clone(address),
                 sender,
+                idle_for,
                 recording,
                 status: status.as_u16(),
                 bytes: 0,
@@ -1372,6 +1479,8 @@ struct BodyState {
     /// The HTTP/1.1 connection, kept for the next request once the body
     /// has arrived whole.
     sender: Option<http1::SendRequest<OutBody>>,
+    /// How long the connection may then sit idle.
+    idle_for: Duration,
     recording: Option<Recording>,
     status: u16,
     bytes: u64,
@@ -1388,7 +1497,7 @@ impl BodyState {
         if let Some(sender) = self.sender.take()
             && intact
         {
-            keep(&self.address, sender);
+            keep(&self.address, sender, self.idle_for);
         }
 
         if let Some(recording) = self.recording.take() {
@@ -1440,5 +1549,26 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             state.finish(true, "");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_servers_keep_alive_timeout_bounds_how_long_a_connection_is_kept() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("keep-alive", HeaderValue::from_str(value).unwrap());
+            idle_for(&headers)
+        };
+
+        assert_eq!(idle_for(&HeaderMap::new()), IDLE_FOR);
+        assert_eq!(with("timeout=5, max=100"), Duration::from_secs(4));
+        assert_eq!(with("max=100, Timeout = 2"), Duration::from_secs(1));
+        assert_eq!(with("timeout=1"), Duration::ZERO);
+        assert_eq!(with("timeout=600"), IDLE_FOR);
+        assert_eq!(with("timeout=soon"), IDLE_FOR);
     }
 }

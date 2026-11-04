@@ -133,5 +133,5 @@ muructl serve-static dist/ --fallback index.html
 muructl serve-static site/ --index index.htm --index index.html --no-compression
 ```
 
-`--bind`, `--port` (or `auto`) and `--access-log` work as they do for
-`muructl run`.
+`--bind`, `--port` (or `auto`), `--access-log` and `--access-log-file`
+work as they do for `muructl run`.

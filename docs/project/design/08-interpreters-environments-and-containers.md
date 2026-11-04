@@ -88,7 +88,7 @@ source_builds = false    # true allows sdists to be built (uv sync without --no-
 compile_bytecode = true  # uv sync --compile-bytecode, feeds bytecode = 'source'
 ```
 
-- `auto`: a source with its own `.venv` is used as it is; a source without one and with a lock is built; a source with neither falls back to the previous release's interpreter, then `python3`, and the probe decides whether that interpreter can import the application. `always` builds even when the source has a `.venv`, for a node where the source directory is a developer's checkout. `never` is for prebuilt directories and nodes without network, and is what `offline = true` implies. `when` is the one key development reads too; the rest of the table describes the deployment flavour.
+- `auto`: a source with its own `.venv` is used as it is; a source without one and with a lock is built; a source with neither falls back to the previous release's interpreter, then `python3`, and the probe decides whether that interpreter can import the application. `always` builds even when the source has a `.venv`, for a node where the source directory is a developer's checkout. `never` is for prebuilt directories and nodes without network; with `offline = true` a build still runs and installs only what the daemon's uv cache already holds. `when` is the one key development reads too; the rest of the table describes the deployment flavour.
 
 - The build is the `Building` state of section 9.1, `muructl build --deployment --target STATE/envs/APP/RELEASE` run by the controller as the release's user (never root), with the output streamed to the release log tagged `[build]`. `release.building` opens it; `release.built` carries the duration, package count and lock hash; `release.build_failed` carries the last lines and fails the release before start-up. Variants build their own environments under STATE/envs/APP/RELEASE/VARIANT, from the same lock, since 3.14 and 3.14t cannot share one.
 
@@ -126,7 +126,7 @@ The runtime library is Muru's, not the application's (ADR 0037). muructl puts th
 
   2. A runtime directory for muructl's version and the interpreter's tag already exists: it is used.
 
-  3. Neither: muructl fetches the wheel, announcing it first, from PyPI with the published hash verified, or from `tools.wheel_dir`. The connection has a short timeout so a machine with no route fails in seconds, not minutes.
+  3. Neither: muructl fetches the wheel, announcing it first, from PyPI with the published hash verified, or from `tools.wheel_dir`, or `MURU_WHEEL_DIR` where the daemon's table names none, as in development. The connection has a short timeout so a machine with no route fails in seconds, not minutes.
 
   4. The fetch fails, or is not allowed, and the environment holds a `muru` of another version: it is used with a warning naming both versions, provided it speaks a protocol version muructl supports (section 5.8). Only when nothing usable exists does the release fail, naming both ways out: a wheel in `tools.wheel_dir`, or `pip install muru==VERSION` into the environment.
 
@@ -152,7 +152,7 @@ The runtime library is Muru's, not the application's (ADR 0037). muructl puts th
 
 - **The daemon isolates directories, not the project's configuration.** It runs builds with `UV_CACHE_DIR=STATE/uv-cache/USER` (hard links need the same file system and files the release's user can read), `UV_PYTHON_INSTALL_DIR=STATE/python`, `UV_PROJECT_ENVIRONMENT=STATE/envs/APP/RELEASE` and `UV_LINK_MODE=hardlink`. It passes `UV_CONFIG_FILE` when `tools.uv_config` names a `uv.toml` (mirrors, TLS settings) and otherwise leaves uv's configuration discovery alone, so the project's own `[tool.uv]` table (indexes, sources) applies; `UV_NO_CONFIG` discards that table, so a project on a private index could not be built under it, and it is used only for interpreter operations (`python find`, `python install`), where no project settings matter. Whether a config file layers under the project's table or replaces it is to be verified before `uv_config` is documented; if it replaces, the daemon's choices go through `UV_INDEX` and `UV_NATIVE_TLS` instead.
 
-- **Network:** `UV_OFFLINE=1` when `offline = true`, with wheels from `tools.wheel_dir` through `--find-links` and `--no-index`; `UV_PYTHON_DOWNLOADS=never` when `tools.python_downloads = 'never'`, under `muructl serve` and in container probes. `UV_NO_PROGRESS=1` and `--color never` everywhere, since the output goes to a log or a prefixed terminal.
+- **Network:** `UV_OFFLINE=1` when `offline = true`, so a build installs only from the daemon's uv cache: `uv sync --frozen` fetches the files the lock names and reads no `--find-links`, so `tools.wheel_dir` serves the runtime library alone; `UV_PYTHON_DOWNLOADS=never` when `tools.python_downloads = 'never'`, under `muructl serve` and in container probes. `UV_NO_PROGRESS=1` and `--color never` everywhere, since the output goes to a log or a prefixed terminal.
 
 - **Output** is streamed line by line, to the release log under the daemon and to the terminal under `muructl run`, with the last lines in `release.build_failed`.
 

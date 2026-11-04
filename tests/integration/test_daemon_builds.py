@@ -61,6 +61,26 @@ def test_a_source_with_a_lock_and_no_venv_is_built_before_it_starts(
     assert "--no-dev --no-build --compile-bytecode" in log
 
 
+def test_the_wheel_directory_may_come_from_the_environment(tmp_path: Path) -> None:
+    """With no `wheel_dir` in its `[tools]` table the daemon takes
+    MURU_WHEEL_DIR, as `muructl run` does, for the runtime library."""
+
+    wheels = prov.build_wheel(tmp_path, prov.muructl_version())
+    (tmp_path / "daemon").mkdir()
+    daemon = start_daemon(
+        tmp_path / "daemon",
+        config_extra="\n[tools]\noffline = true\n",
+        env={"MURU_OFFLINE": "1", "UV_NO_GROUP": "", "MURU_WHEEL_DIR": str(wheels)},
+    )
+
+    try:
+        source = prov.locked_project(tmp_path / "hello")
+        assert daemon.deploy("hello", source) == "muru: release hello@r1 is ready and serving"
+        assert daemon.get("/").status == 200
+    finally:
+        daemon.stop()
+
+
 def test_never_runs_on_what_is_there(offline_daemon: Daemon, tmp_path: Path) -> None:
     daemon = offline_daemon
     source = prov.locked_project(tmp_path / "hello")

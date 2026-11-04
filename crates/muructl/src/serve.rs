@@ -779,10 +779,8 @@ fn prepare(
     }
 
     match layered.text("access_log").unwrap_or("on") {
-        "on" => argv.extend(["--access-log".to_owned(), "terminal".to_owned()]),
-        "errors" | "off" => {
-            let what = layered.text("access_log").unwrap_or_default().to_owned();
-            argv.extend(["--access-log".to_owned(), what]);
+        what @ ("on" | "errors" | "off") => {
+            argv.extend(["--access-log".to_owned(), what.to_owned()]);
         }
         other => anyhow::bail!("--access-log {other:?} is not on, errors or off"),
     }

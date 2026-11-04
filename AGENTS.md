@@ -256,6 +256,17 @@ with `--fix`; the formatters keep what it inserts.
   since GitHub shows every line break. A pull request that finishes an
   issue says `Closes #N`.
 
+- Open an issue for every problem found along the way, not only for the
+  work in hand: a bug, something clumsy to use, a mismatch between the
+  code, the specification and the documentation, an improvement an
+  analysis turns up, a step that could not be tested. A problem that is
+  only mentioned in a report or a summary is lost, so file it when it is
+  found, without waiting to be asked, and say in the report which
+  issues were opened. When an issue cannot be created, because the call
+  is refused or blocked, keep a list of the problems still without one
+  and repeat it at the end of every report, each with its title and body
+  ready to file, until every one has an issue.
+
 - Keep the [project board](https://github.com/users/GrahamDumpleton/projects/1)
   true to the work, since it is how the maintainer decides what comes next.
   Every open issue of both repositories is on it (issues in this

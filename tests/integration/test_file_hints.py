@@ -175,6 +175,31 @@ def test_a_file_wrapper_returned_directly_passes_the_descriptor(
     assert digest(decoded) == digest(BIG)
 
 
+def test_a_client_that_leaves_during_the_range_gives_its_worker_back(
+    development: support.Server,
+) -> None:
+    """The worker sent the file's range and was done; the client goes
+    away part way through it. The worker's connection goes back to its
+    pool, so leaving more often than the release has threads still leaves
+    them all free for the next request."""
+
+    for _ in range(4):
+        client = socket.create_connection(("127.0.0.1", development.port), timeout=30)
+        client.sendall(b"GET /wrapper/big.bin HTTP/1.1\r\nHost: files\r\n\r\n")
+        assert client.recv(64).startswith(b"HTTP/1.1 200")
+
+        # Closed with the body unread, the connection is reset.
+
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        client.close()
+
+    started = time.monotonic()
+    response = request(development.port, "/wrapper/small.txt")
+    assert response.status == 200, response.body
+    assert response.body == SMALL
+    assert time.monotonic() - started < 3, "a thread was still held"
+
+
 def test_the_range_starts_at_the_position_and_covers_the_content_length(
     development: support.Server,
 ) -> None:
@@ -182,6 +207,11 @@ def test_the_range_starts_at_the_position_and_covers_the_content_length(
     assert response.status == 200
     assert response.header("Content-Length") == "5000"
     assert response.body == BIG[1000:6000]
+
+    # Across chunks: the seek is made once, ahead of the first.
+
+    spanning = development.get("/wrapper-range/big.bin?offset=1000&length=600000")
+    assert spanning.body == BIG[1000:601000]
     assert development.get("/wrapper-range/small.txt?offset=2&length=19").body == SMALL[2:]
 
 

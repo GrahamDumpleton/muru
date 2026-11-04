@@ -93,6 +93,10 @@ builds of 3.14 and 3.15.
 
 - The [tutorials](tutorials/index.md) start from your first application
   and go on to the daemon, canaries, scaling and debugging.
+- The [workshops](https://github.com/muruhq/muru-workshops) are guided
+  JupyterLab sessions that run Muru in the browser, on Binder or in
+  GitHub Codespaces, with nothing to install. They exist to exercise
+  Muru, and are also a quick way to see what it does.
 - The [how-to guides](howto/index.md) cover each feature, from
   [Flask and Django](howto/flask-and-django.md) to
   [containers](howto/containers.md) and

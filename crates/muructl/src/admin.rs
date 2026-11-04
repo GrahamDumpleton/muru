@@ -828,6 +828,38 @@ pub enum LoggingCommand {
         #[command(flatten)]
         output: JsonArgs,
     },
+    /// Change which requests the access log writes, for a period, or list
+    /// the changes in force.
+    Access {
+        /// on, errors or off; left out, the changes in force are listed.
+        #[arg(value_name = "MODE", requires = "duration")]
+        mode: Option<String>,
+
+        /// One application's requests, instead of every application's.
+        #[arg(long, value_name = "APP")]
+        app: Option<String>,
+
+        /// Only requests whose path matches (`*` matches anything, `?` one
+        /// character), written even where the configuration leaves them
+        /// out. Repeatable.
+        #[arg(long = "path", value_name = "PATTERN")]
+        paths: Vec<String>,
+
+        /// How long the change lasts, for example 10m; it then reverts on
+        /// its own.
+        #[arg(long = "for", value_name = "DURATION", value_parser = muru_config::parse_duration)]
+        duration: Option<Duration>,
+
+        /// Put the changes back: every one, or those for --app.
+        #[arg(long, conflicts_with_all = ["mode", "paths", "duration"])]
+        reset: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
 }
 
 /// Ask a release's workers something and print what came back.
@@ -1338,17 +1370,40 @@ fn print_exec(response: &pb::DebugResponse) {
     }
 }
 
-/// Change logger levels in a release's workers.
+/// Change logger levels in a release's workers, or which requests the
+/// access log writes.
 pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
-    let LoggingCommand::Level {
-        target,
-        mut levels,
-        duration,
-        reset,
-        worker,
-        socket,
-        output,
-    } = command;
+    let (target, mut levels, duration, reset, worker, socket, output) = match command {
+        LoggingCommand::Level {
+            target,
+            levels,
+            duration,
+            reset,
+            worker,
+            socket,
+            output,
+        } => (target, levels, duration, reset, worker, socket, output),
+        LoggingCommand::Access {
+            mode,
+            app,
+            paths,
+            duration,
+            reset,
+            socket,
+            output,
+        } => {
+            return access_log(AccessChange {
+                mode,
+                app,
+                paths,
+                duration,
+                reset,
+                socket,
+                json: output.json,
+            })
+            .await;
+        }
+    };
 
     // With the target left out, the first NAME=LEVEL arrives in its place.
 
@@ -1450,6 +1505,77 @@ pub async fn logging(command: LoggingCommand) -> anyhow::Result<()> {
 
     if output.json {
         return print_answer(&answers);
+    }
+
+    Ok(())
+}
+
+/// What `muructl logging access` asks for.
+struct AccessChange {
+    mode: Option<String>,
+    app: Option<String>,
+    paths: Vec<String>,
+    duration: Option<Duration>,
+    reset: bool,
+    socket: SocketArgs,
+    json: bool,
+}
+
+/// Change which requests the access log writes for a period, put the
+/// changes back, or list those in force (section 11.2).
+async fn access_log(change: AccessChange) -> anyhow::Result<()> {
+    let mut client = client::connect(&change.socket.socket()?).await?;
+    let answer = client
+        .override_access_log(pb::OverrideAccessLogRequest {
+            mode: change.mode.clone().unwrap_or_default(),
+            app: change.app.clone().unwrap_or_default(),
+            paths: change.paths.clone(),
+            duration_ms: change.duration.map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            }),
+            reset: change.reset,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if change.json {
+        return print_answer(&answer);
+    }
+
+    if change.reset {
+        println!(
+            "muru: put back {} change{} to the access log",
+            answer.reset,
+            if answer.reset == 1 { "" } else { "s" }
+        );
+    } else if let (Some(added), Some(duration)) = (answer.overrides.last(), change.duration)
+        && change.mode.is_some()
+    {
+        println!(
+            "muru: the access log writes {} for {}, then goes back on its own",
+            muru_edge::access::Override::from_admin_message(added).describe(),
+            muru_edge::access::format_lifetime(duration)
+        );
+    }
+
+    if answer.overrides.is_empty() {
+        println!("muru: the access log writes what the configuration says");
+        return Ok(());
+    }
+
+    // The newest decides where two cover a request, so it comes first.
+
+    println!("muru: changes in force, the newest first:");
+    let now = now_unix_ms();
+
+    for listed in answer.overrides.iter().rev() {
+        let left = Duration::from_millis(listed.until_unix_ms.saturating_sub(now));
+        println!(
+            "  {}, {} more",
+            muru_edge::access::Override::from_admin_message(listed).describe(),
+            muru_edge::access::format_lifetime(left)
+        );
     }
 
     Ok(())
@@ -2058,7 +2184,10 @@ pub async fn daemon_status(socket: SocketArgs, json: bool) -> anyhow::Result<()>
 
     println!("state    {}", status.state_dir);
     println!("run      {}", status.run_dir);
-    println!("apps     {} ({} releases)", status.apps, status.releases);
+    println!(
+        "apps     {} ({} releases)",
+        status.app_count, status.release_count
+    );
     println!("websockets {} open", status.websockets);
 
     if !status.budget.is_empty() {
@@ -4445,6 +4574,19 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             format!("{}, {} instances", release.profile, release.instances),
         ));
         lines.push(("command".to_owned(), release.command.join(" ")));
+
+        for instance in &release.server_instances {
+            let process = if instance.pid == 0 {
+                "waiting to start again".to_owned()
+            } else {
+                format!("pid {}", instance.pid)
+            };
+            lines.push((
+                format!("instance {}", instance.index),
+                format!("{process}, {}", instance.address),
+            ));
+        }
+
         return lines;
     }
 

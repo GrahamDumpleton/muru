@@ -66,14 +66,27 @@ impl AsyncRead for FdReader {
 
         loop {
             ready!(half.as_ref().poll_read_ready(cx))?;
-            let destination = buf.initialize_unfilled();
+
+            // SAFETY: recvmsg only writes to the memory it is given, and
+            // only the bytes it reports written are marked filled.
+
+            let destination = unsafe { buf.unfilled_mut() };
             let stream = half.as_ref();
             let outcome = stream.try_io(Interest::READABLE, || {
-                recv_message(stream.as_raw_fd(), destination, received)
+                recv_message(
+                    stream.as_raw_fd(),
+                    destination.as_mut_ptr().cast(),
+                    destination.len(),
+                    received,
+                )
             });
 
             match outcome {
                 Ok(count) => {
+                    // SAFETY: recvmsg wrote `count` bytes at the start of
+                    // the unfilled part.
+
+                    unsafe { buf.assume_init(count) };
                     buf.advance(count);
                     return Poll::Ready(Ok(()));
                 }
@@ -84,16 +97,18 @@ impl AsyncRead for FdReader {
     }
 }
 
-/// One recvmsg on `socket` into `buffer`, pushing the descriptors that
-/// arrive onto `received`.
+/// One recvmsg on `socket` into the `len` bytes at `buffer`, which need
+/// not be initialised, pushing the descriptors that arrive onto
+/// `received`.
 fn recv_message(
     socket: RawFd,
-    buffer: &mut [u8],
+    buffer: *mut u8,
+    len: usize,
     received: &mut VecDeque<OwnedFd>,
 ) -> io::Result<usize> {
     let mut iov = libc::iovec {
-        iov_base: buffer.as_mut_ptr().cast(),
-        iov_len: buffer.len(),
+        iov_base: buffer.cast(),
+        iov_len: len,
     };
     let mut control = Control([0u8; CONTROL_LEN]);
 

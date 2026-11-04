@@ -19,6 +19,7 @@ import ast
 import functools
 import linecache
 import os
+import sys
 import time
 from collections import Counter
 from typing import Any
@@ -26,6 +27,14 @@ from typing import Any
 # The nodes that have a code object of their own, and so a frame.
 
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.GeneratorExp)
+
+
+# Python 3.14's unwinder stops where C code called into Python, so a
+# request's stack read from outside loses every frame above a builtin
+# such as breakpoint(), and Rust calling the application hides the
+# runtime's own; 3.15's walks the whole chain.
+
+WHOLE = sys.version_info >= (3, 15)
 
 
 class Unreadable(Exception):

@@ -67,6 +67,15 @@ and a request that was never sent moves on with its body intact; one
 that went out in part is answered 502 `upstream_failed`. When no address
 answers at all the response is 502 `upstream_failed` too.
 
+Connections are kept between requests for 60 seconds, or a second less
+than the server's `Keep-Alive: timeout` when it sends one. A server may
+still close a kept connection just as a request goes out on it. A GET,
+HEAD, OPTIONS, TRACE, PUT or DELETE request whose body is empty, or held
+whole because it had no declared length, is then sent once more on a new
+connection to the same address, and is marked `retried` in the access log
+and counted in `muru_request_retries_total`. Any other request is
+answered 502 `upstream_failed`.
+
 ```toml
 [upstream.legacy]
 addresses = ['10.0.0.5:8080', '10.0.0.6:8080']

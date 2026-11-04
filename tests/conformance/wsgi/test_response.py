@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import http.client
+import socket
+import struct
 
 import pytest
 from support.server import Server
@@ -198,11 +200,45 @@ def test_slow_chunks_are_flushed_as_they_come(server: Server) -> None:
     assert server.get(f"{AREA}/slow-chunks").body == b"slow0-slow1-slow2-"
 
 
-@pytest.mark.parametrize("size", [0, 1, 4095, 4096, 4097, 65536, 1048576, 3000000])
-def test_large_bodies_are_intact(server: Server, size: int) -> None:
-    response = server.get(f"{AREA}/large?size={size}")
+def large(size: int) -> bytes:
+    return bytes(range(256)) * (size // 256) + bytes(range(size % 256))
+
+
+@pytest.mark.parametrize("declared", ["", "1"])
+@pytest.mark.parametrize("size", [0, 1, 4095, 4096, 4097, 65536, 65537, 1048576, 3000000])
+def test_large_bodies_are_intact(server: Server, size: int, declared: str) -> None:
+    response = server.get(f"{AREA}/large?size={size}&declared={declared}")
     assert len(response.body) == size
-    assert response.body == bytes(range(256)) * (size // 256) + bytes(range(size % 256))
+    assert response.body == large(size)
+
+
+def test_a_client_that_leaves_during_a_large_piece_leaves_the_link_clean(
+    server: Server,
+) -> None:
+    """The edge passes a large piece on as it arrives; a client that goes
+    away part way through it leaves the rest of the piece unread. The
+    worker connection is read to the end of the response before it goes
+    back to its pool, so the next requests on it are answered intact."""
+
+    for declared in ["1", "", "1", ""]:
+        client = socket.create_connection(("127.0.0.1", server.port), timeout=30)
+        client.sendall(
+            f"GET {AREA}/large?size=3000000&declared={declared} HTTP/1.1\r\n"
+            "Host: conformance\r\n\r\n".encode()
+        )
+        assert client.recv(64).startswith(b"HTTP/1.1 200")
+
+        # Closed with the body unread, the connection is reset.
+
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+
+    # More requests than the server has threads, so every connection
+    # the edge holds to a worker is used again.
+
+    for _ in range(8):
+        assert server.get(f"{AREA}/large?size=100000&declared=1").body == large(100000)
+        assert server.get(f"{AREA}/list").body == b"chunk1-chunk2-chunk3"
 
 
 def test_no_content_type_is_allowed(server: Server) -> None:

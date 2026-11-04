@@ -230,6 +230,18 @@ impl Provided {
     }
 }
 
+/// The environment variable that names a directory of wheels for the
+/// runtime library, under `muructl run` and, when its `[tools]` table
+/// names none, under the daemon.
+pub const WHEEL_DIR_VARIABLE: &str = "MURU_WHEEL_DIR";
+
+/// The wheel directory `MURU_WHEEL_DIR` names, if any.
+pub fn wheel_dir_from_environment() -> Option<std::path::PathBuf> {
+    std::env::var_os(WHEEL_DIR_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// What providing the runtime library needs.
 #[derive(Debug, Clone)]
 pub struct Options<'a> {
