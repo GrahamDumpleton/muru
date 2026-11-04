@@ -149,7 +149,10 @@ taken up between the steps of the major goals, in no fixed order.
   ([#94](https://github.com/muruhq/muru/issues/94)), per-group
   recycling limits and `max_surge`
   ([#150](https://github.com/muruhq/muru/issues/150),
-  [#151](https://github.com/muruhq/muru/issues/151)).
+  [#151](https://github.com/muruhq/muru/issues/151)), and rollouts
+  whose capacity follows traffic, with a guide to upgrading in place on
+  a host with limited memory
+  ([#321](https://github.com/muruhq/muru/issues/321)).
 
 - **Edge and HTTP:** ACME certificates
   ([#133](https://github.com/muruhq/muru/issues/133)), HTTP/3
