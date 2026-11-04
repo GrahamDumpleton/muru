@@ -4960,7 +4960,7 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         .find(|key| !matches!(key.as_str(), "run" | "build"))
     {
         return Err(format!(
-            "{key} is not a key of {LOCAL_FILE}, which holds the [run] table and [build] when only; the application's settings belong in {there}"
+            "{key} is not a key of {LOCAL_FILE}, which takes only the [run] table and the when key of [build]; the application's settings belong in {there}"
         ));
     }
 
@@ -4981,7 +4981,7 @@ pub fn parse_local(text: &str, committed: Option<&Path>) -> Result<LocalFile, St
         Some(toml::Value::Table(build)) => {
             if let Some(key) = build.keys().find(|key| key.as_str() != "when") {
                 return Err(format!(
-                    "[build] {key} is not a key {LOCAL_FILE} takes; only when is, and the rest belongs in {there}"
+                    "[build] {key} is not a key of {LOCAL_FILE}, whose [build] table takes only the when key; the rest of [build] belongs in {there}"
                 ));
             }
 
@@ -5639,7 +5639,11 @@ traffic = { classes = { ai-crawler = 'r1' } }"
             Some(Path::new("pyproject.toml")),
         )
         .unwrap_err();
-        assert!(error.contains("only when is"), "{error}");
+        assert!(
+            error.contains("[build] extras is not a key of muru.local.toml")
+                && error.contains("takes only the when key"),
+            "{error}"
+        );
         let error =
             parse_local("entrypoint = 'a:b'\n", Some(Path::new("pyproject.toml"))).unwrap_err();
         assert!(

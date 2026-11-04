@@ -4202,7 +4202,9 @@ fn resolve_scaling(
         };
 
         if *table != only_mode {
-            return Err(format!("{what}: mode static takes no other keys"));
+            return Err(format!(
+                "{what}: mode = 'static', the default, takes no other key but advisory"
+            ));
         }
 
         return Ok((
@@ -5880,7 +5882,7 @@ mod tests {
                 },
                 1
             )
-            .contains("takes no other keys")
+            .contains("takes no other key but advisory")
         );
         assert!(
             refused(
