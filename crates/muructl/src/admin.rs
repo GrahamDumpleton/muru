@@ -4574,6 +4574,19 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             format!("{}, {} instances", release.profile, release.instances),
         ));
         lines.push(("command".to_owned(), release.command.join(" ")));
+
+        for instance in &release.server_instances {
+            let process = if instance.pid == 0 {
+                "waiting to start again".to_owned()
+            } else {
+                format!("pid {}", instance.pid)
+            };
+            lines.push((
+                format!("instance {}", instance.index),
+                format!("{process}, {}", instance.address),
+            ));
+        }
+
         return lines;
     }
 

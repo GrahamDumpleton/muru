@@ -2063,6 +2063,24 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .get(&(release.app.clone(), release.id.clone()))
         .copied()
         .unwrap_or(0) as u32;
+    let server_instances = handle
+        .info
+        .servers
+        .lock()
+        .expect("servers poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .map(|instances| {
+            instances
+                .iter()
+                .map(|instance| pb::ServerInstance {
+                    index: instance.index,
+                    pid: instance.pid,
+                    address: instance.address.clone(),
+                    started_unix_ms: instance.started_unix_ms,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let detected_for = |mount: &str| {
         detected
             .iter()
@@ -2132,6 +2150,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         environment,
         build_when: release.spec.build.when.as_str().to_owned(),
         bytecode,
+        server_instances,
         processes: release.spec.processes,
         threads: release.spec.threads,
         sync_threads: release.spec.sync_threads,

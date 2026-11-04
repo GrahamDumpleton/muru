@@ -535,6 +535,9 @@ pub struct Info {
     /// and release, then by mount, the default mount's under the empty
     /// name: as its host last announced them.
     pub interfaces: std::sync::Mutex<Interfaces>,
+    /// The instances of each managed server release (section 9.9), by
+    /// application and release, as the daemon last checked them.
+    pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
     /// Section 8.4: uv as found and how it is run, from the `[tools]`
     /// table read at start.
     pub provisioning: crate::provision::Provisioning,
@@ -1061,6 +1064,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }),
         interfaces: std::sync::Mutex::new(Interfaces::new()),
         websockets: std::sync::Mutex::new(HashMap::new()),
+        servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
     });
     let handle = Handle {
@@ -3456,6 +3460,7 @@ impl Daemon {
                         ready_at: HashMap::new(),
                     },
                 );
+                self.publish_servers();
                 self.events.emit(
                     "release.adopted",
                     &subject,
@@ -4643,6 +4648,7 @@ impl Daemon {
                 ready_at: HashMap::new(),
             },
         );
+        self.publish_servers();
         self.set_state(
             release,
             ReleaseState::Warming,
@@ -7250,6 +7256,23 @@ impl Daemon {
                 }
             }
         }
+
+        self.publish_servers();
+    }
+
+    /// Publish each managed server release's instances, for `release
+    /// show`: on every check, so a release that stops leaves the list
+    /// within one.
+    fn publish_servers(&self) {
+        let servers = self
+            .running
+            .iter()
+            .filter_map(|(key, running)| match &running.backend {
+                Backend::Servers(servers) => Some((key.clone(), servers.record().instances)),
+                _ => None,
+            })
+            .collect();
+        *self.info.servers.lock().expect("servers poisoned") = servers;
     }
 
     /// Push a snapshot without the application's workers: its serving

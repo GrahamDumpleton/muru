@@ -517,6 +517,15 @@ message Release {
   string environment = 29;          // the environment the daemon built for the release, when it builds one
   string build_when = 30;           // the build mode in force: auto, always or never
   string bytecode = 31;             // where bytecode goes: redirect with its directory, source (precompiled when detected), or off
+  repeated ServerInstance server_instances = 32; // an http release's instances while it runs (section 9.9)
+}
+
+// An instance of an http release's command.
+message ServerInstance {
+  uint32 index = 1;
+  uint32 pid = 2;                   // 0 while it waits to be started again
+  string address = 3;               // where it listens, as an upstream names it
+  uint64 started_unix_ms = 4;       // when its process was started; 0 when not known
 }
 
 // A named mount of a release: a path served by another entrypoint in

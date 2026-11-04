@@ -56,7 +56,7 @@ $ muructl release show shop@r9 --json
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
 | `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
-| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups |
+| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
 | `muructl release wait` | The release once it reached a state waited for |
 | `muructl host list` | `{"hosts": [...]}` |
 | `muructl route list` | `{"routes": [...]}` |
