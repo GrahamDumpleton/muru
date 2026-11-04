@@ -52,6 +52,10 @@ service Admin {
   // edge, or serve it as usual again.
   rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
+  // Section 11.2: change which requests the access log writes for a
+  // period, put the changes back, or list those in force.
+  rpc OverrideAccessLog(OverrideAccessLogRequest) returns (AccessLogOverrides);
+
   // Section 10.7: a single-use link that signs a browser in to the
   // dashboard's actions, when the daemon's configuration enables them.
   rpc DashboardLogin(DashboardLoginRequest) returns (DashboardLoginLink);
@@ -129,8 +133,8 @@ message Status {
   string socket = 5;
   repeated string listeners = 6;    // addresses the edge serves
   uint64 started_unix_ms = 7;
-  uint32 apps = 8;
-  uint32 releases = 9;
+  uint32 app_count = 8;             // how many applications there are
+  uint32 release_count = 9;         // how many releases, of every application
   uint32 edge_pid = 10;             // the edge process serving the listeners
   string metrics = 11;              // the metrics listener's address, or empty
   string dashboard = 12;            // the dashboard's address, or empty
@@ -411,6 +415,27 @@ message MaintenanceStatus {
   uint64 since_unix_ms = 3;         // when it was turned on, 0 when off
 }
 
+message OverrideAccessLogRequest {
+  string mode = 1;                  // on, errors or off; empty, with reset false, lists the changes in force
+  string app = 2;                   // one application; every application when empty
+  repeated string paths = 3;        // path patterns the change covers; every path when empty
+  uint64 duration_ms = 4;           // how long the change lasts; required with a mode
+  bool reset = 5;                   // put back the changes, those for app when one is given
+}
+
+message AccessLogOverrides {
+  repeated AccessLogOverride overrides = 1; // in force after the request, the newest last
+  uint32 reset = 2;                 // how many a reset put back
+}
+
+// A change in force (section 11.2).
+message AccessLogOverride {
+  string mode = 1;
+  string app = 2;                   // every application when empty
+  repeated string paths = 3;        // every path when empty
+  uint64 until_unix_ms = 4;         // when it ends
+}
+
 message GetScaleStatusRequest {
   string app = 1;
   string release = 2;               // the application's serving release when empty
@@ -492,6 +517,15 @@ message Release {
   string environment = 29;          // the environment the daemon built for the release, when it builds one
   string build_when = 30;           // the build mode in force: auto, always or never
   string bytecode = 31;             // where bytecode goes: redirect with its directory, source (precompiled when detected), or off
+  repeated ServerInstance server_instances = 32; // an http release's instances while it runs (section 9.9)
+}
+
+// An instance of an http release's command.
+message ServerInstance {
+  uint32 index = 1;
+  uint32 pid = 2;                   // 0 while it waits to be started again
+  string address = 3;               // where it listens, as an upstream names it
+  uint64 started_unix_ms = 4;       // when its process was started; 0 when not known
 }
 
 // A named mount of a release: a path served by another entrypoint in

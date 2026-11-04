@@ -52,6 +52,9 @@ pub struct NodeSettings {
     pub secrets: Vec<crate::secrets::Store>,
     /// Log rotation (section 11.3), or none for external rotation.
     pub rotation: Option<crate::rotation::Policy>,
+    /// Which records the access log writes (`[logs]` access_log,
+    /// access_log_exclude and slow, section 11.2), for every snapshot.
+    pub access_log: muru_edge::access::Filter,
     /// Whether the daemon's standard streams carry the time (`[logs]
     /// timestamps`, section 11.8).
     pub timestamps: bool,
@@ -160,6 +163,7 @@ impl NodeSettings {
             overlay_webhook,
             secrets,
             rotation,
+            access_log: access_log_from(document)?,
             timestamps: document
                 .logs
                 .as_ref()
@@ -319,6 +323,33 @@ fn h2c_from(document: &muru_config::Document) -> Result<Vec<pb::H2cPolicy>, Stri
     Ok(policies)
 }
 
+/// Which records the access log writes, from the [logs] table, with the
+/// defaults for what it leaves out.
+fn access_log_from(document: &muru_config::Document) -> Result<muru_edge::access::Filter, String> {
+    let mut filter = muru_edge::access::Filter::default();
+    let Some(logs) = &document.logs else {
+        return Ok(filter);
+    };
+
+    muru_config::check_access_log(logs.access_log.as_deref(), logs.slow.as_deref())
+        .map_err(|error| format!("[logs] {error}"))?;
+
+    if let Some(mode) = logs
+        .access_log
+        .as_deref()
+        .and_then(muru_edge::access::Mode::parse)
+    {
+        filter.mode = mode;
+    }
+
+    if let Some(slow) = &logs.slow {
+        filter.slow = muru_config::parse_duration(slow)?;
+    }
+
+    filter.exclude = logs.access_log_exclude.clone();
+    Ok(filter)
+}
+
 /// The edge limits from the [limits] table, with the defaults for the
 /// rest.
 fn limits_from(document: &muru_config::Document) -> Result<muru_edge::Limits, String> {
@@ -417,6 +448,7 @@ mod tests {
             vec![("127.0.0.1:8080".parse().unwrap(), false)]
         );
         assert_eq!(settings.limits.max_body_size, 10 * 1024 * 1024);
+        assert_eq!(settings.access_log, muru_edge::access::Filter::default());
         assert!(settings.sinks.is_empty());
         assert!(settings.secrets.is_empty());
         assert!(settings.metrics.is_none());
@@ -438,6 +470,22 @@ mod tests {
         assert_eq!(settings.limits.queue_timeout.as_secs(), 2);
         assert_eq!(settings.dashboard, Some("127.0.0.1:8090".parse().unwrap()));
         assert!(settings.dashboard_actions);
+    }
+
+    #[test]
+    fn the_logs_table_says_which_records_the_access_log_writes() {
+        let settings = settings(
+            "[logs]\naccess_log = 'errors'\nslow = '500ms'\naccess_log_exclude = ['/healthz']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.access_log,
+            muru_edge::access::Filter {
+                mode: muru_edge::access::Mode::Errors,
+                slow: std::time::Duration::from_millis(500),
+                exclude: vec!["/healthz".to_owned()],
+            }
+        );
     }
 
     #[test]
@@ -469,6 +517,11 @@ mod tests {
         let refused = |text: &str| settings(text).unwrap_err();
         assert!(refused("[[listener]]\naddress = 'eighty'\n").contains("listener address"));
         assert!(refused("[limits]\nmax_connections = 0\n").contains("[limits] max_connections"));
+        assert!(
+            refused("[logs]\naccess_log = 'some'\n")
+                .contains("[logs] access_log = \"some\" is not on, errors or off")
+        );
+        assert!(refused("[logs]\nslow = 'soon'\n").contains("[logs] slow"));
         assert!(refused("[dashboard]\nlisten = '0.0.0.0:8090'\n").contains("loopback"));
         assert!(
             refused("[[listener]]\naddress = '0.0.0.0:443'\ntls = true\nh2c = ['loopback']\n")

@@ -93,7 +93,7 @@ A connection is idle again when both directions have ended: the request directio
 
 ## 5.4 Streaming and flush policy
 
-Each yielded WSGI block or ASGI body message becomes a BODY frame unless it is coalesced. There is no per-chunk acknowledgement; the socket buffer is the only credit. Small chunks are coalesced in the worker before framing, because per-frame CPU and syscalls dominate for tiny yields:
+Each yielded WSGI block or ASGI body message becomes a BODY frame unless it is coalesced. There is no per-chunk acknowledgement; the socket buffer is the only credit. Each side asks for a 256 KiB send buffer on the link, the worker on its listening socket, whose accepted connections take it, and the edge on the socket it connects; on a Unix stream socket only the sender's send buffer limits what is written before the writer waits, and macOS starts it at 8 KiB. Small chunks are coalesced in the worker before framing, because per-frame CPU and syscalls dominate for tiny yields:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -102,7 +102,7 @@ Each yielded WSGI block or ASGI body message becomes a BODY frame unless it is c
 | coalesce_max_delay | 10 ms | flush this long after the first buffered byte |
 | first_block | immediate | head and first block go out at once, in one write |
 
-A Rust timer flushes independently of the Python thread, which satisfies PEP 3333's requirement that buffering never stops transmission while the application computes its next block. text/event-stream responses and responses marked with X-Accel-Buffering: no always flush immediately. The edge writes frames to clients without delay, merging queued frames into vectored writes when the client is slow.
+A Rust timer flushes independently of the Python thread, which satisfies PEP 3333's requirement that buffering never stops transmission while the application computes its next block. text/event-stream responses and responses marked with X-Accel-Buffering: no always flush immediately. The edge writes frames to clients without delay, merging queued frames into vectored writes when the client is slow. A BODY frame of more than 64 KiB is passed on in pieces of up to 64 KiB as they arrive, so the edge writes to the client while the worker is still sending; a client that goes away part way through one leaves the edge to read the rest of the frame before draining the response.
 
 When the application declares a Content-Length, the worker sets the END flag on the BODY frame that completes it and discards anything the application produces beyond it. Without a declared length, a bare END frame follows the last piece.
 

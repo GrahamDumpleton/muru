@@ -65,7 +65,9 @@ def test_a_rotation_policy_added_by_reload_takes_effect(tmp_path: Path) -> None:
             handle.write("\n[logs]\nsize = '4KB'\nkeep = 2\ncompress = 'off'\nevery = 'off'\n")
 
         reloaded = daemon.muructl("daemon", "reload").stdout
-        assert "changed [logs] (the daemon rotates on the new policy)" in reloaded, reloaded
+        assert "changed [logs] rotation (the daemon rotates on the new policy)" in reloaded, (
+            reloaded
+        )
         wait_for(lambda: len(archives(logs, "access.log")) >= 1, "an access log archive")
     finally:
         daemon.stop()

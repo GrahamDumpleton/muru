@@ -1900,16 +1900,21 @@ class Host:
             return
 
         # Section 11.7: stacks, and a profile of everything a worker runs,
-        # are read from outside where the interpreter allows it, so they
-        # work on a worker whose threads hold the interpreter; elsewhere
-        # the worker is asked.
+        # are read from outside where the interpreter allows it and the
+        # reading gives every frame, so they work on a worker whose
+        # threads hold the interpreter; elsewhere the worker is asked.
 
-        if op == "stacks" and self.stacks_from_outside(request_id, targets):
+        if op == "stacks" and _outside.WHOLE and self.stacks_from_outside(request_id, targets):
             return
 
         chosen = args.get("requests") or args.get("path")
 
-        if op == "profile" and not chosen and self.profile_from_outside(request_id, targets, args):
+        if (
+            op == "profile"
+            and not chosen
+            and _outside.WHOLE
+            and self.profile_from_outside(request_id, targets, args)
+        ):
             return
 
         if op == "trace":
@@ -2219,6 +2224,22 @@ class Host:
             if pending.op == "stacks":
                 self.signal(pid, signal.SIGQUIT)
                 note = "; its stacks were written to the log by faulthandler"
+
+                # Where reading from outside stops at the first C call, the
+                # worker was asked first; one that does not answer is read
+                # from outside after all, since a short stack is better
+                # than none.
+
+                threads = None if _outside.WHOLE else self.read_outside(pid)
+
+                if threads is not None:
+                    pending.answers[pid] = {
+                        "index": index,
+                        "pid": pid,
+                        "ok": True,
+                        "result": _outside.stacks_result(threads, {}),
+                    }
+                    continue
 
             pending.answers[pid] = {
                 "index": index,
@@ -2964,13 +2985,14 @@ class Host:
         """Take a worker's stacks before it is killed for the hard timeout.
 
         Section 11.7: the stacks go to the log and where the oldest request
-        was goes to the event. They are read from outside where that is
-        possible; otherwise the worker is asked, and one that cannot answer
-        within a second gets SIGQUIT, and faulthandler writes its stacks to
-        the log instead.
+        was goes to the event. They are read from outside where that gives
+        every frame; otherwise the worker is asked, and one that cannot
+        answer within a second gets SIGQUIT, so faulthandler writes its
+        stacks to the log, and is read from outside as well where that is
+        possible.
         """
 
-        outside = self.read_outside(state.pid)
+        outside = self.read_outside(state.pid) if _outside.WHOLE else None
 
         if outside is not None:
 

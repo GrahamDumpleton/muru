@@ -2,8 +2,9 @@
 
 Each release's host writes its own and its workers' tagged lines to a
 file in the log directory, and the edge writes the access log there as
-JSON lines that name the application, release, host, group and mount.
-muructl logs shows or follows either, and muructl logs reopen makes every
+JSON lines that name the application, release, host, group and mount,
+the [logs] table and an application's own table choosing which requests
+it writes. muructl logs shows or follows either, and muructl logs reopen makes every
 writer open its file again by name after an external rotation, passing
 the request on to the workers' on_reopen_logs hook when asked.
 """
@@ -21,7 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from support import server as support
-from support.daemon import SHOP, Daemon, daemon
+from support.daemon import SHOP, Daemon, daemon, start_daemon
 
 __all__ = ["daemon"]
 
@@ -124,6 +125,64 @@ def test_access_log_names_the_release(daemon: Daemon) -> None:
 
     logs = daemon.base / "logs"
     assert (logs / "apps" / "shop" / "r1.log").exists() and (logs / "access.log").exists()
+
+
+def test_what_the_access_log_writes_follows_a_reload_and_an_apply(tmp_path: Path) -> None:
+    daemon = start_daemon(tmp_path, config_extra="[logs]\naccess_log = 'errors'\n")
+    access_log = tmp_path / "logs" / "access.log"
+
+    try:
+        daemon.deploy("shop", SHOP, "--processes", "1")
+        assert daemon.request("/quiet").status == 200
+        assert daemon.request("/status/404").status == 404
+        wait_for(lambda: access_log.exists() and "/status/404" in access_log.read_text())
+        assert "/quiet" not in access_log.read_text()
+
+        # A reload turns every request's line on, for the edge running.
+
+        config = tmp_path / "muru.toml"
+        config.write_text(config.read_text().replace("'errors'", "'on'"))
+        reloaded = daemon.muructl("daemon", "reload").stdout
+        assert "[logs] access_log (the edge has it)" in reloaded, reloaded
+        assert daemon.request("/loud").status == 200
+        wait_for(lambda: "/loud" in access_log.read_text())
+
+        # The application's own table turns its lines off, errors and
+        # all; turned on again, the next line shows nothing was written in
+        # between.
+
+        applied = tmp_path / "shop.toml"
+        applied.write_text("[app.shop]\naccess_log = 'off'\n")
+        daemon.muructl("apply", "-f", str(applied))
+        assert daemon.request("/hushed").status == 200
+        assert daemon.request("/status/500").status == 500
+        applied.write_text("[app.shop]\naccess_log = 'on'\n")
+        daemon.muructl("apply", "-f", str(applied))
+        assert daemon.request("/marker").status == 200
+        wait_for(lambda: "/marker" in access_log.read_text())
+        assert "/hushed" not in access_log.read_text()
+        assert "/status/500" not in access_log.read_text()
+
+        # A change for a period covers the paths it names, is listed with
+        # the time it has left, and ends on its own, with an event each
+        # way.
+
+        changed = daemon.muructl(
+            "logging", "access", "off", "--app", "shop", "--path", "/status/*", "--for", "2s"
+        ).stdout
+        assert "no request of shop to /status/*, " in changed, changed
+        assert daemon.request("/status/503").status == 503
+        assert daemon.request("/marker-2").status == 200
+        wait_for(lambda: "/marker-2" in access_log.read_text())
+        assert "/status/503" not in access_log.read_text()
+        wait_for(lambda: "access_log.reverted" in daemon.events())
+        assert "access_log.changed" in daemon.events()
+        listed = daemon.muructl("logging", "access").stdout
+        assert "writes what the configuration says" in listed, listed
+        assert daemon.request("/status/503?again").status == 503
+        wait_for(lambda: "/status/503?again" in access_log.read_text())
+    finally:
+        daemon.stop()
 
 
 def test_logs_reopen_after_an_external_rotation(daemon: Daemon) -> None:

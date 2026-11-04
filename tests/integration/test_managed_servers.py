@@ -53,6 +53,11 @@ def report(daemon: Daemon, path: str = "/", host: str | None = None, **headers: 
     return json.loads(response.body)
 
 
+def instances(daemon: Daemon, release: str) -> list[dict]:
+    shown = json.loads(daemon.muructl("release", "show", release, "--json").stdout)
+    return shown["server_instances"]
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -117,6 +122,17 @@ def test_instances_bind_ports_and_their_count_is_fixed(daemon: Daemon) -> None:
     assert first["env"]["MURU_HTTP_BIND"].startswith("127.0.0.1:")
     assert first["env"]["PORT"] == port
     assert {seen["env"]["MURU_INSTANCE"] for seen in reports} == {"0", "1"}
+
+    # release show names each instance's process and address.
+
+    shown = instances(daemon, "legacy@r1")
+    assert [instance["index"] for instance in shown] == [0, 1]
+    assert {instance["pid"] for instance in shown} == pids
+    by_pid = {seen["pid"]: seen["env"]["MURU_HTTP_BIND"] for seen in reports}
+    assert all(by_pid[instance["pid"]] == instance["address"] for instance in shown)
+    assert all(instance["started_unix_ms"] > 0 for instance in shown)
+    text = daemon.muructl("release", "show", "legacy@r1").stdout
+    assert f"pid {shown[0]['pid']}, {shown[0]['address']}" in text
 
     refused = daemon.muructl("scale", "legacy@r1", "--processes", "3", check=False)
     assert refused.returncode != 0
@@ -200,6 +216,7 @@ def test_a_crashed_instance_is_started_again(daemon: Daemon) -> None:
     wait_for(lambda: daemon.request("/").status == 200, 20)
     after = report(daemon)["pid"]
     assert after != before
+    wait_for(lambda: [instance["pid"] for instance in instances(daemon, "legacy@r1")] == [after])
     events = daemon.muructl("events").stdout
     assert "instance 0 exited with exit status: 3; starting it again in 1s" in events
     assert f"instance 0 started again (pid {after})" in events
@@ -481,6 +498,7 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
     try:
         deploy_server(first, "legacy", "--bind", "port")
         pid = report(first)["pid"]
+        started = instances(first, "legacy@r1")[0]["started_unix_ms"]
 
         # The daemon detaches; the instance and the edge stay up.
 
@@ -490,6 +508,10 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
 
         second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
         assert report(second)["pid"] == pid
+        adopted = instances(second, "legacy@r1")
+        assert [(instance["pid"], instance["started_unix_ms"]) for instance in adopted] == [
+            (pid, started)
+        ]
         assert second.releases("legacy") == [
             {"release": "legacy@r1", "state": "ready", "serving": "yes"}
         ]

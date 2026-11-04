@@ -81,6 +81,9 @@ struct Instance {
     process: Option<Process>,
     /// When the process was started, for the backoff reset.
     started: Instant,
+    /// When the process was started, Unix milliseconds; 0 for one adopted
+    /// from a record that did not say.
+    started_unix_ms: u64,
     /// Crashes in a row, each doubling the wait before the next start.
     crashes: u32,
     /// When the next start is due, after a crash.
@@ -181,6 +184,9 @@ pub struct InstanceRecord {
     pub pid: u32,
     /// Where it listens, as an upstream names it.
     pub address: String,
+    /// When its process was started, Unix milliseconds; 0 when not known.
+    #[serde(default)]
+    pub started_unix_ms: u64,
 }
 
 /// The instances of one managed HTTP release.
@@ -225,6 +231,7 @@ impl Servers {
                 bind,
                 process: None,
                 started: Instant::now(),
+                started_unix_ms: 0,
                 crashes: 0,
                 due: None,
             });
@@ -271,6 +278,7 @@ impl Servers {
                 bind,
                 process: Some(Process::Adopted(instance.pid)),
                 started: Instant::now(),
+                started_unix_ms: instance.started_unix_ms,
                 crashes: 0,
                 due: None,
             });
@@ -358,6 +366,7 @@ impl Servers {
         let instance = &mut self.instances[position];
         instance.process = Some(Process::Child(child));
         instance.started = Instant::now();
+        instance.started_unix_ms = crate::model::now_unix_ms();
         instance.due = None;
         Ok(())
     }
@@ -500,6 +509,11 @@ impl Servers {
                     index: instance.index,
                     pid: instance.pid().unwrap_or(0),
                     address: instance.bind.address(),
+                    started_unix_ms: if instance.process.is_some() {
+                        instance.started_unix_ms
+                    } else {
+                        0
+                    },
                 })
                 .collect(),
         }

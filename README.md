@@ -44,6 +44,11 @@ configuration may change between them.
 **[Read the documentation](https://docs.muruhq.dev/)** for the tutorials,
 a guide to each feature, and how Muru works.
 
+**[Try the workshops](https://github.com/muruhq/muru-workshops)**: guided
+JupyterLab sessions that run Muru in the browser, on Binder or in GitHub
+Codespaces, with nothing to install. They exist to exercise Muru, and
+are also a quick way to see what it does.
+
 ## Contributing
 
 Muru takes contributions as requirements, not as code: open an issue

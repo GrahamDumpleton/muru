@@ -10,10 +10,11 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from muru import host
+from muru import _outside, host
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "apps"
 
@@ -297,3 +298,36 @@ def test_a_subreaper_sees_orphaned_grandchildren_as_its_children() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == ["adopted", "True", "collected", "True", "gone", "True"]
+
+
+@pytest.mark.parametrize("whole", [True, False])
+def test_a_worker_that_does_not_answer_for_stacks_is_read_from_outside_on_3_14(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, whole: bool
+) -> None:
+    """On 3.14 the worker is asked first, since reading from outside stops
+    at the first call from C; one that does not answer is read from
+    outside after all. Where the reading gives every frame it was read
+    first, so a worker left unanswered stays so."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    signals: list[tuple[int, int]] = []
+    answers: list[dict[str, Any]] = []
+    frames = [{"file": "/srv/app.py", "line": 3, "function": "application"}]
+    monkeypatch.setattr(_outside, "WHOLE", whole)
+    instance.signal = lambda pid, signum: signals.append((pid, signum))  # type: ignore[method-assign]
+    instance.read_outside = lambda pid: [(7, frames)]  # type: ignore[method-assign]
+    instance.send_to_supervisor = answers.append  # type: ignore[method-assign]
+
+    pending = host.Pending(1, "stacks", {4321: 0})
+    instance.pending[1] = pending
+    instance.finish_if_answered(pending, expired=True)
+
+    assert signals == [(4321, signal.SIGQUIT)]
+    (answer,) = answers[-1]["workers"]
+
+    if whole:
+        assert not answer["ok"] and "did not answer" in answer["error"]
+    else:
+        assert answer["ok"] and answer["result"]["outside"]
+        assert answer["result"]["threads"][0]["frames"][0]["function"] == "application"

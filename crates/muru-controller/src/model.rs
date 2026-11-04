@@ -1224,6 +1224,8 @@ pub struct App {
     /// Which applications' scale-ups the node's budget admits first, the
     /// highest first (section 7.4).
     pub priority: i32,
+    /// The application's own access log choice (section 11.2).
+    pub access_log: AccessLogSpec,
 }
 
 impl App {
@@ -1242,6 +1244,86 @@ impl App {
         }
 
         Some(text)
+    }
+}
+
+/// An application's own access log choice (section 11.2), laid over the
+/// `[logs]` table's: each key it leaves out is the table's, and its
+/// paths are left out besides the table's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessLogSpec {
+    /// `on`, `errors` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log: Option<String>,
+    /// Paths whose requests are not written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_exclude: Vec<String>,
+    /// How slow a request is to be written under `errors`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow: Option<String>,
+}
+
+impl AccessLogSpec {
+    /// The keys of an `[app.NAME]` table.
+    pub fn from_table(app: &muru_config::App) -> Self {
+        Self {
+            access_log: app.access_log.clone(),
+            access_log_exclude: app.access_log_exclude.clone(),
+            slow: app.slow.clone(),
+        }
+    }
+
+    /// Whether the application has no choice of its own.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The filter the application's records are written by, given the
+    /// node's.
+    pub fn over(&self, node: &muru_edge::access::Filter) -> muru_edge::access::Filter {
+        let mut exclude = node.exclude.clone();
+        exclude.extend(self.access_log_exclude.iter().cloned());
+
+        muru_edge::access::Filter {
+            mode: self
+                .access_log
+                .as_deref()
+                .and_then(muru_edge::access::Mode::parse)
+                .unwrap_or(node.mode),
+            slow: self
+                .slow
+                .as_deref()
+                .and_then(|slow| muru_config::parse_duration(slow).ok())
+                .unwrap_or(node.slow),
+            exclude,
+        }
+    }
+
+    /// The choice as one phrase.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return "the access log as the [logs] table says".to_owned();
+        }
+
+        let mut parts = vec![format!(
+            "access log {}",
+            self.access_log
+                .as_deref()
+                .unwrap_or("as the [logs] table says")
+        )];
+
+        if let Some(slow) = &self.slow {
+            parts.push(format!("slow from {slow}"));
+        }
+
+        if !self.access_log_exclude.is_empty() {
+            parts.push(format!(
+                "leaving out {}",
+                self.access_log_exclude.join(", ")
+            ));
+        }
+
+        parts.join(", ")
     }
 }
 

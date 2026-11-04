@@ -115,6 +115,60 @@ def certificate(directory: Path, name: str) -> tuple[Path, Path, Path]:
     return ca, cert, key
 
 
+class Closer:
+    """An HTTP/1.1 server that answers the first request on a connection
+    and closes the connection, unanswered, when the next arrives on it, as
+    a server lets a kept connection go as a request comes in."""
+
+    def __init__(self, keep_alive: str | None = None) -> None:
+        self.keep_alive = keep_alive
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self) -> None:
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+
+            threading.Thread(target=self.serve, args=(connection,), daemon=True).start()
+
+    def serve(self, connection: socket.socket) -> None:
+        with connection:
+            reader = connection.makefile("rb")
+            head = b""
+
+            while not head.endswith(b"\r\n\r\n"):
+                line = reader.readline()
+
+                if not line:
+                    return
+
+                head += line
+
+            length = 0
+
+            for line in head.split(b"\r\n"):
+                name, _, value = line.partition(b":")
+
+                if name.strip().lower() == b"content-length":
+                    length = int(value)
+
+            reader.read(length)
+            extra = f"Keep-Alive: {self.keep_alive}\r\n" if self.keep_alive else ""
+            connection.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{extra}\r\nok".encode())
+
+            # The next request on this connection is read and not answered.
+
+            while reader.readline() not in (b"\r\n", b""):
+                pass
+
+    def stop(self) -> None:
+        self.listener.close()
+
+
 class Fixture:
     """A daemon, the upstream servers and a WebSocket echo server."""
 
@@ -122,6 +176,8 @@ class Fixture:
         self.legacy = Upstream("legacy")
         self.other = Upstream("other")
         self.socket = Upstream("socket", unix=True)
+        self.closer = Closer()
+        self.brief = Closer(keep_alive="timeout=1, max=100")
         self.dead_port = support.free_port()
         self.ws_port = support.free_port()
         self.ws_server: Server = serve(echo, "127.0.0.1", self.ws_port)
@@ -172,6 +228,12 @@ health = {{ path = '/health', interval = '200ms', unhealthy_after = 1, healthy_a
 
 [upstream.gone]
 addresses = ['127.0.0.1:{self.dead_port}']
+
+[upstream.closer]
+addresses = ['127.0.0.1:{self.closer.port}']
+
+[upstream.brief]
+addresses = ['127.0.0.1:{self.brief.port}']
 
 [upstream.ws]
 addresses = ['127.0.0.1:{self.ws_port}']
@@ -243,6 +305,16 @@ upstream = 'ws'
 
 [[route]]
 host = 'site'
+path = '/closer/'
+upstream = 'closer'
+
+[[route]]
+host = 'site'
+path = '/brief/'
+upstream = 'brief'
+
+[[route]]
+host = 'site'
 path = '/h2c/'
 upstream = 'inner-h2c'
 
@@ -288,6 +360,9 @@ auth = {{ app = 'shop', path = '/auth-check', copy_headers = ['X-Auth-User'] }}
 
         for upstream in (self.legacy, self.other, self.socket):
             upstream.stop()
+
+        self.closer.stop()
+        self.brief.stop()
 
 
 def echo(connection: ServerConnection) -> None:
@@ -428,6 +503,25 @@ def test_a_dead_address_is_ejected_and_the_live_one_answers(site: Fixture) -> No
     response = call(site.daemon.port, "/gone/x", {"Accept": "application/json"})
     assert response.status == 502
     assert json.loads(response.body)["reason"] == "upstream_failed"
+
+
+def test_a_kept_connection_the_server_closed_is_retried_for_an_idempotent_request(
+    site: Fixture,
+) -> None:
+    """The server closes a kept connection as the next request arrives on
+    it. A GET goes again on a new connection; a POST, which the server may
+    have acted on, is 502. A server's Keep-Alive timeout of a second keeps
+    the edge from reusing its connections at all."""
+
+    def ask(method: str, prefix: str) -> int:
+        return site.daemon.request(f"/{prefix}/item", method=method, host="site.test").status
+
+    assert ask("GET", "closer") == 200
+    assert ask("GET", "closer") == 200
+    assert ask("POST", "closer") == 502
+
+    for method in ("GET", "POST", "POST"):
+        assert ask(method, "brief") == 200
 
 
 def test_probes_take_an_unhealthy_address_out_of_service(site: Fixture) -> None:

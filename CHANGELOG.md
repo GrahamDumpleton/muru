@@ -9,6 +9,127 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a17 (2026-11-04)
+
+### Added
+
+- Added `access_log`, `access_log_exclude` and `slow` to the daemon's
+  `[logs]` table and to an application's table, so the daemon's access log
+  can write only errors and slow requests, or nothing, for every
+  application or for one. `muructl daemon reload` and `muructl apply` change
+  what the running edge writes without a restart, and the reload reports
+  log rotation as `[logs] rotation` beside `[logs] access_log`. ([#331](https://github.com/muruhq/muru/issues/331))
+- Added each instance of a managed HTTP server to `muructl release show`,
+  with its pid and address, and to its JSON as `server_instances`, with
+  `index`, `pid`, `address` and `started_unix_ms`, so the server's
+  processes can be found without walking the daemon's process tree. ([#333](https://github.com/muruhq/muru/issues/333))
+- Added `muructl logging access`, which changes which requests the access
+  log writes (`on`, `errors` or `off`) for a period, for one application
+  or every one and for some paths or all, and goes back on its own; it
+  lists the changes in force and `--reset` puts them back. It works
+  against the daemon, a development run and `muructl serve`, and the MCP
+  server offers it as the `access_log` tool. ([#334](https://github.com/muruhq/muru/issues/334))
+
+### Changed
+
+- Changed `muructl run`'s and `muructl serve-static`'s `--access-log` to
+  mean what it means for `muructl serve` and the daemon: which requests
+  the access log writes, `on` (the default), `errors` or `off`. A file is
+  now named with `--access-log-file PATH`, which writes JSON lines there
+  in place of the terminal and can be combined with `--access-log errors`
+  to keep only errors and slow requests in a file. The run table's
+  `access_log` takes the same values, and `access_log_file` names the file
+  relative to the project. `terminal` and a file path are no longer values
+  of `--access-log`. ([#343](https://github.com/muruhq/muru/issues/343))
+
+### Fixed
+
+- Fixed `muructl debug stacks` and whole-worker profiles on Linux with
+  Python 3.14 showing only each thread's innermost frames: 3.14's reader
+  from outside stops where C code called into Python, so a request stopped
+  at `breakpoint()`, or in a callback from C, lost the application's
+  frames. On 3.14 the worker is now asked, as on macOS, and read from
+  outside only when it does not answer in time. ([#306](https://github.com/muruhq/muru/issues/306))
+- Fixed requests to an upstream or a managed HTTP server failing with 502
+  `upstream_failed` when the server closed a kept connection just as the
+  request went out on it, which servers such as Apache do routinely. A
+  GET, HEAD, OPTIONS, TRACE, PUT or DELETE request whose body is empty or
+  held whole is now sent once more on a new connection, and is marked as a
+  retry. Kept connections are also used for no longer than the server's
+  `Keep-Alive: timeout` allows. ([#329](https://github.com/muruhq/muru/issues/329))
+- Fixed two things a script reading `muructl --json` tripped over:
+  `muructl status` gave the number of applications and releases as `apps`
+  and `releases`, the names other commands use for lists, which are now
+  `app_count` and `release_count`; and `muructl apply` reported a release
+  that failed to start with the outcome `failed` alone, which now carries
+  the reason, as `release show` gives it. ([#332](https://github.com/muruhq/muru/issues/332))
+- Fixed the access log holding up requests: each line was written by the
+  request's own task, so a slow disk or a reader of standard error that
+  had stopped, such as a full pipe to a container's log collector, stalled
+  serving. Lines now go to a writer thread of their own in batches, and
+  when it falls far behind they are dropped and counted in the new
+  `muru_access_log_dropped_total` metric instead. ([#335](https://github.com/muruhq/muru/issues/335))
+- Fixed a worker's thread staying taken for good when a client went away
+  while the edge was sending a file the application had handed over with
+  `wsgi.file_wrapper` or the ASGI `pathsend` and `zerocopysend`
+  extensions: enough such clients made the release answer every request
+  with 503 `queue_full` until it was replaced. ([#336](https://github.com/muruhq/muru/issues/336))
+- Fixed static files costing the edge more than they should. Each request
+  handed work to the blocking pool three or more times (to find the file,
+  once per precompressed variant looked for, to open it and once per 64 KiB
+  read, through a second copy), so a small file cost the edge more than an
+  application serving it, and a route with a fallback application sent
+  large files more slowly. A file is now found, with its variants, in one
+  call and opened and read in another, in chunks of 256 KiB, and a file no
+  larger than a chunk is sent whole: 1 MiB files cost the edge half the CPU
+  and small ones about a third less. ([#337](https://github.com/muruhq/muru/issues/337))
+- Fixed offloaded uploads holding up every connection through the edge when
+  the spool's disk was slow: each piece of a body was handed to the blocking
+  pool on its own, and the spool directory was checked and each request's
+  files closed and removed on the threads that serve connections. A file is
+  now written in blocks of 256 KiB, each added to its digests with its write
+  on the blocking pool, and the rest of the file system work goes there too. ([#338](https://github.com/muruhq/muru/issues/338))
+- Fixed large bodies crossing the worker link slowly on macOS, where a Unix
+  socket's send buffer starts at 8 KiB, so a response was carried in 8 KiB
+  steps with a wakeup on both sides for each. Both ends of the link now ask
+  for a 256 KiB send buffer, which on macOS about doubles the requests per
+  second for bodies of 64 KiB and up and halves the worker's CPU per
+  request. ([#340](https://github.com/muruhq/muru/issues/340))
+- Fixed both ends of the worker link filling every frame's buffer with
+  zeros before reading the frame into it, a second pass over every byte of
+  a large body. ([#341](https://github.com/muruhq/muru/issues/341))
+- Fixed the edge holding a large piece of a response body until all of it
+  had arrived from the worker before sending any of it to the client. A
+  piece of more than 64 KiB is now passed on as it arrives, so the edge
+  writes to the client while the worker is still sending. ([#342](https://github.com/muruhq/muru/issues/342))
+- Fixed the daemon ignoring `MURU_WHEEL_DIR`: with no `wheel_dir` in its
+  `[tools]` table it now takes the runtime library's wheels from the
+  directory the variable names, as `muructl run` does, so a prepared
+  environment such as a container image or a devcontainer needs no daemon
+  configuration file for it. `wheel_dir` in the file wins over the
+  variable. ([#344](https://github.com/muruhq/muru/issues/344))
+- Fixed static routes reading the whole listing of every directory on a
+  request's path to check that each name matches the request's case. The
+  cost grew with the directory, so a file in a directory of 5,000 entries
+  was served at about a fortieth of the rate of one in a small directory.
+  Each name is now checked on its own: macOS reports the name an entry is
+  stored under, and on Linux the file systems that keep names as given
+  need no further check, a directory that folds case and other file
+  systems still being read. ([#347](https://github.com/muruhq/muru/issues/347))
+- Fixed files sent with `wsgi.file_wrapper` (and so Django's
+  `FileResponse`) costing the edge more than static files. The edge read
+  them in 64 KiB pieces, each a separate hand-off and copied twice; it now
+  reads them as it reads static files, in 256 KiB pieces, so a 1 MiB file
+  costs it half the CPU and is served nearly twice as fast. ([#348](https://github.com/muruhq/muru/issues/348))
+
+### Documentation
+
+- Corrected the daemon's `[tools]` reference and the interpreters guide,
+  which said that with `offline = true` builds take their wheels from
+  `wheel_dir`. An offline build installs only what the daemon's uv cache
+  already holds, and `wheel_dir` is for the runtime library. ([#350](https://github.com/muruhq/muru/issues/350))
+
+
 ## 0.1.0a16 (2026-11-03)
 
 ### Added

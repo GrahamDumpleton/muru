@@ -195,8 +195,8 @@ directory per interpreter tag, and goes to the network last:
 
 3. Else the wheel is fetched from PyPI, once per interpreter tag, with
    its published hash checked, or from a local directory of wheels named
-   by `MURU_WHEEL_DIR` under `muructl run` or `wheel_dir` in the daemon's
-   `[tools]` table.
+   by `MURU_WHEEL_DIR`, or under the daemon by `wheel_dir` in its `[tools]`
+   table, which wins over the variable.
 
 4. If that fails and the environment has `muru` of another version, it is
    used with a warning naming both versions.
@@ -220,8 +220,12 @@ uv_version = ">=0.9"              # what the daemon expects; an older uv is repo
 python_downloads = "automatic"    # or "never"
 python_install_dir = "/var/lib/muru/python"
 offline = false                   # true: nothing is ever downloaded
-wheel_dir = "/srv/wheels"         # wheels for the runtime library and builds when offline
+wheel_dir = "/srv/wheels"         # wheels for the runtime library
 ```
+
+With `offline = true`, a release's environment is built only from the
+packages the daemon's uv cache already holds. On a node that is never
+online, deploy sources with their environment already built.
 
 The daemon says at start-up which uv it found, and `muructl release show`
 prints what each release runs on:

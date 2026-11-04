@@ -142,6 +142,15 @@ it. A daemon that stops without `--shutdown`, or upgrades itself, leaves
 the instances running and the next daemon takes them over from the
 record in the release's run directory. `muructl release list` shows a
 managed server as its instance count and profile in the workers column.
+`muructl release show` lists each instance with its pid and address, and
+with `--json` as `server_instances`, each with `index`, `pid` (0 while it
+waits to be started again), `address` and `started_unix_ms`:
+
+```
+command      .venv/bin/gunicorn shop.wsgi:application
+instance 0   pid 48213, unix:/run/muru/apps/shop/r4/r1/server-0.sock
+instance 1   pid 48214, unix:/run/muru/apps/shop/r4/r1/server-1.sock
+```
 
 ## Cutting over
 

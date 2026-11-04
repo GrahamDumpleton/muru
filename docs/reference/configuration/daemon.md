@@ -22,7 +22,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `host` | table of tables, {ref}`[host.NAME] <config-daemon-host-name>` |  | Virtual hosts by name. |
 | `limits` | table, {ref}`[limits] <config-daemon-limits>` |  | Limits in force everywhere. |
 | `listener` | array of tables, {ref}`[[listener]] <config-daemon-listener>` |  | Listeners. |
-| `logs` | table, {ref}`[logs] <config-daemon-logs>` |  | Log rotation. |
+| `logs` | table, {ref}`[logs] <config-daemon-logs>` |  | Log rotation and the access log. |
 | `metrics` | table, {ref}`[metrics] <config-daemon-metrics>` |  | The metrics listener. |
 | `overlay` | table of tables, {ref}`[overlay.NAME] <config-daemon-overlay-name>` |  | Overlays by name: partial configuration laid over the routes and applications while active. |
 | `overlay_webhook` | table, {ref}`[overlay_webhook] <config-daemon-overlay-webhook>` |  | The overlays' external trigger. |
@@ -41,10 +41,13 @@ An application's table and its releases.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `access_log` | string | the `[logs]` table's | Which of the application's requests the access log writes, over the `[logs]` table's choice: `on`, `errors` or `off`. |
+| `access_log_exclude` | array of strings |  | Paths whose requests to the application the access log leaves out, besides those the `[logs]` table names. |
 | `group` | string | the user's primary group | The group, else the user's primary group. |
 | `priority` | integer | `0` | Which applications' scale-ups the node's budget admits first, the highest first. |
 | `release` | table of tables, {ref}`[app.NAME.release.ID] <config-daemon-app-name-release-id>` |  | Releases by identifier. |
 | `schedule` | array of tables, {ref}`[[app.NAME.schedule]] <config-daemon-app-name-schedule>` |  | Scheduled capacity. |
+| `slow` | string | the `[logs]` table's | How slow one of the application's requests is to be written under `access_log = "errors"`. |
 | `umask` | string | the daemon's own umask | The file creation mask, in octal, for example 027. |
 | `user` | string | the daemon's own user | The user the application's hosts and workers run as, when the daemon runs as root. |
 
@@ -550,15 +553,18 @@ A listener, one of the `[[listener]]` entries, in the daemon's own file.
 (config-daemon-logs)=
 ## `[logs]`
 
-The `[logs]` table of the daemon's file: how the daemon rotates the log files it and its processes write, and whether its standard streams carry the time.
+The `[logs]` table of the daemon's file: how the daemon rotates the log files it and its processes write, which records the access log writes, and whether its standard streams carry the time.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `access_log` | string | `"on"` | Which requests the access log writes: `on` (the default), `errors` (4xx and 5xx responses, requests at least `slow`, and WebSockets that closed other than normally or going away) or `off`. Requests not written are still counted in the metrics and shown on the dashboard. |
+| `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out: `*` matches any run of characters and `?` one, for example `/static/*`. |
 | `compress` | string | `"zstd"` | How archives are compressed: `zstd` (the default), `gzip` or `off`. |
 | `every` | string | `"daily"` | Rotate by the clock: `off`, `hourly`, `daily` (the default) or `weekly`, at the period's start in UTC. |
 | `keep` | integer | `14` | Archives kept per log. |
 | `rotate` | string | `"built-in"` | `built-in` (the default) or `external`, for logrotate. |
 | `size` | string |  | Rotate a file that reaches this size, for example 100MB. |
+| `slow` | string | `"1s"` | How slow a request is to be written under `access_log = "errors"`. |
 | `timestamps` | boolean | `false` | Put the full UTC time in front of every line the daemon writes to standard output and standard error, as `--timestamps` does, for a supervisor that stamps nothing. Files always carry the time. |
 
 (config-daemon-metrics)=
@@ -882,13 +888,13 @@ The `[tools]` table of the daemon's file: uv, and how interpreters are installed
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `offline` | boolean | `false` | No network at all: nothing is downloaded, and wheels come from `wheel_dir`. |
+| `offline` | boolean | `false` | No network at all: nothing is downloaded, so a build installs only what the daemon's uv cache already holds. |
 | `python_downloads` | string | `"automatic"` | Whether a Python the node lacks is downloaded for a release that requests it. `automatic`: Download a Python a release requests and the node lacks. `never`: Never download; a request the node cannot satisfy fails the release. |
 | `python_install_dir` | string | `python` in the state directory | Where managed interpreters go; a shared read-only directory for several daemons. |
 | `uv` | string |  | The uv to run, in place of the lookup order (`MURU_UV`, a uv beside muructl, uv on PATH, the managed copy). |
 | `uv_config` | string |  | A `uv.toml` passed to builds as their configuration file, for mirrors and TLS settings; the project's own `[tool.uv]` still applies. |
 | `uv_version` | string |  | The uv versions accepted, as a specifier such as `>=0.9`; the daemon reports what an older one cannot do. |
-| `wheel_dir` | string |  | A local directory of wheels for the runtime library and for builds when offline. |
+| `wheel_dir` | string | `MURU_WHEEL_DIR`, when set | A local directory of wheels for the runtime library. |
 
 (config-daemon-upstream-name)=
 ## `[upstream.NAME]`

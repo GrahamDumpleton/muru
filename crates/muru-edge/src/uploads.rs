@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek as _};
+use std::io::{self, Seek as _, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
@@ -29,7 +29,6 @@ use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use muru_proto::edge::v1 as edge_pb;
 use muru_proto::worker::v1 as pb;
-use tokio::io::AsyncWriteExt as _;
 
 use crate::errors::Problem;
 use crate::metrics::Sample;
@@ -37,6 +36,10 @@ use crate::metrics::Sample;
 /// What the ordinary fields of a multipart form may hold together: they
 /// stay in memory and reach the application as the request body.
 pub const FIELDS_LIMIT: usize = 10 * 1024 * 1024;
+
+/// How much of a file is gathered before it is written to the spool and
+/// added to the digests, together, on the blocking pool.
+const BLOCK: usize = 256 * 1024;
 
 /// How a route's uploads are received.
 #[derive(Debug)]
@@ -177,16 +180,14 @@ impl Spool {
     }
 
     /// The application's own directory, so that applications never see
-    /// each other's files (section 10.9).
-    fn directory(&self, app: &str) -> io::Result<PathBuf> {
+    /// each other's files (section 10.9), created with its first file.
+    fn directory(&self, app: &str) -> PathBuf {
         let name = if app.is_empty() || app.contains('/') || app.starts_with('.') {
             "_"
         } else {
             app
         };
-        let directory = self.root.join(name);
-        private_directory(&directory)?;
-        Ok(directory)
+        self.root.join(name)
     }
 }
 
@@ -288,6 +289,24 @@ pub struct Received {
     pub body: Bytes,
     /// The files, in the order they arrived.
     pub files: Vec<Stored>,
+}
+
+impl Drop for Received {
+    /// Closing a stored file, and removing a named one, wait on the file
+    /// system, so they are done on the blocking pool rather than on the
+    /// thread that serves connections.
+    fn drop(&mut self) {
+        let files = std::mem::take(&mut self.files);
+
+        if files.is_empty() {
+            return;
+        }
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || drop(files))),
+            Err(_) => drop(files),
+        }
+    }
 }
 
 impl Received {
@@ -492,9 +511,7 @@ pub async fn receive(
         }
     };
 
-    let directory = spool
-        .directory(app)
-        .map_err(|error| Refusal::SpoolFull(Some(error)))?;
+    let directory = spool.directory(app);
     let usage = spool.usage(app);
     let stream = body_stream(body, max_body_size, idle);
     let open = || Writer::create(spool, &directory, &usage, policy);
@@ -504,7 +521,7 @@ pub async fn receive(
         // the client may send.
 
         let mut stream = std::pin::pin!(stream);
-        let mut writer = open()?;
+        let mut writer = open().await?;
 
         while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
             writer.write(&chunk?).await?;
@@ -557,7 +574,7 @@ pub async fn receive(
         }
 
         let content_type = header_text(field.headers(), http::header::CONTENT_TYPE);
-        let mut writer = open()?;
+        let mut writer = open().await?;
 
         while let Some(chunk) = field.chunk().await.map_err(refusal)? {
             writer.write(&chunk).await?;
@@ -671,11 +688,24 @@ fn text_part(body: &mut BytesMut, boundary: &str, name: &str, value: &str) {
     body.extend_from_slice(b"\r\n");
 }
 
+/// Run `work`, which waits on the file system, on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|error| Err(io::Error::other(error)))
+}
+
 /// A spool file being written, with its digests and its charge against
-/// the quotas.
+/// the quotas. What arrives is gathered into blocks, and each block is
+/// written and added to the digests on the blocking pool, so the thread
+/// that serves connections spends no time in either.
 struct Writer {
-    file: tokio::fs::File,
+    /// The file, away on the blocking pool while a block is written.
+    file: Option<File>,
     name: Option<Name>,
+    pending: Vec<u8>,
     size: u64,
     max: Option<u64>,
     quota: Option<u64>,
@@ -684,19 +714,25 @@ struct Writer {
 }
 
 impl Writer {
-    fn create(
+    async fn create(
         spool: &Arc<Spool>,
         directory: &Path,
         usage: &Arc<AtomicU64>,
         policy: &Policy,
     ) -> Result<Self, Refusal> {
         let counter = spool.next.fetch_add(1, Ordering::Relaxed);
-        let (file, name) =
-            create_file(directory, counter).map_err(|error| Refusal::SpoolFull(Some(error)))?;
+        let directory = directory.to_owned();
+        let (file, name) = blocking(move || {
+            private_directory(&directory)?;
+            create_file(&directory, counter)
+        })
+        .await
+        .map_err(|error| Refusal::SpoolFull(Some(error)))?;
 
         Ok(Self {
-            file: tokio::fs::File::from_std(file),
+            file: Some(file),
             name,
+            pending: Vec::with_capacity(BLOCK),
             size: 0,
             max: policy.max_file_size,
             quota: policy.spool_quota,
@@ -726,15 +762,42 @@ impl Writer {
             return Err(Refusal::SpoolFull(None));
         }
 
-        for (_, context) in &mut self.digests {
-            context.update(chunk);
+        self.pending.extend_from_slice(chunk);
+        self.size += length;
+
+        if self.pending.len() >= BLOCK {
+            self.write_pending().await?;
         }
 
-        self.file
-            .write_all(chunk)
-            .await
-            .map_err(|error| Refusal::SpoolFull(Some(error)))?;
-        self.size += length;
+        Ok(())
+    }
+
+    /// Write the gathered block and add it to the digests, on the
+    /// blocking pool, then take the file and the block's buffer back.
+    async fn write_pending(&mut self) -> Result<(), Refusal> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut file = self.file.take().expect("the file is back between blocks");
+        let mut digests = std::mem::take(&mut self.digests);
+        let mut pending = std::mem::take(&mut self.pending);
+
+        let (file, digests, pending) = blocking(move || {
+            for (_, context) in &mut digests {
+                context.update(&pending);
+            }
+
+            file.write_all(&pending)?;
+            pending.clear();
+            Ok((file, digests, pending))
+        })
+        .await
+        .map_err(|error| Refusal::SpoolFull(Some(error)))?;
+
+        self.file = Some(file);
+        self.digests = digests;
+        self.pending = pending;
         Ok(())
     }
 
@@ -746,11 +809,8 @@ impl Writer {
         filename: String,
         content_type: String,
     ) -> Result<Stored, Refusal> {
-        self.file
-            .flush()
-            .await
-            .map_err(|error| Refusal::SpoolFull(Some(error)))?;
-        let mut file = self.file.into_std().await;
+        self.write_pending().await?;
+        let mut file = self.file.take().expect("the file is back between blocks");
         file.rewind()
             .map_err(|error| Refusal::SpoolFull(Some(error)))?;
 

@@ -52,6 +52,13 @@ pub enum Action {
         /// The priority, 0 by default.
         priority: i32,
     },
+    /// Set the application's own access log choice (section 11.2).
+    SetAppAccessLog {
+        /// The application.
+        app: String,
+        /// The choice, empty for the `[logs]` table's.
+        access_log: crate::model::AccessLogSpec,
+    },
     /// Create a release with this spec and move traffic to it.
     Deploy {
         /// The application.
@@ -167,6 +174,7 @@ impl Action {
             Action::CreateApp { .. } => "create-app",
             Action::SetAppIdentity { .. } => "set-identity",
             Action::SetAppPriority { .. } => "set-priority",
+            Action::SetAppAccessLog { .. } => "set-access-log",
             Action::Deploy { .. } => "deploy",
             Action::RemoveRelease { .. } => "remove-release",
             Action::RemoveApp { .. } => "remove-app",
@@ -195,7 +203,8 @@ impl Action {
     pub fn reconfigures(&self) -> bool {
         matches!(
             self,
-            Action::PutHost { .. }
+            Action::SetAppAccessLog { .. }
+                | Action::PutHost { .. }
                 | Action::RemoveHost { .. }
                 | Action::PutRoute { .. }
                 | Action::RemoveRoute { .. }
@@ -228,7 +237,8 @@ impl Change {
             Action::CreateApp { app }
             | Action::RemoveApp { app }
             | Action::SetAppIdentity { app, .. }
-            | Action::SetAppPriority { app, .. } => app.clone(),
+            | Action::SetAppPriority { app, .. }
+            | Action::SetAppAccessLog { app, .. } => app.clone(),
             Action::Deploy { app, id, .. } | Action::RemoveRelease { app, id } => {
                 format!("{app}@{id}")
             }
@@ -462,6 +472,26 @@ fn plan_app(
                 priority,
             },
             detail: format!("priority {priority}"),
+        });
+    }
+
+    // Section 11.2: the application's own access log choice.
+
+    let access_log = crate::model::AccessLogSpec::from_table(app);
+
+    if let Err(error) =
+        muru_config::check_access_log(access_log.access_log.as_deref(), access_log.slow.as_deref())
+    {
+        plan.errors.push(format!("{name}: {error}"));
+    } else if stored.as_ref().map_or(!access_log.is_empty(), |stored| {
+        stored.access_log != access_log
+    }) {
+        plan.changes.push(Change {
+            detail: access_log.describe(),
+            action: Action::SetAppAccessLog {
+                app: name.to_owned(),
+                access_log,
+            },
         });
     }
 
@@ -1953,6 +1983,9 @@ pub fn export(
             group: app.group.clone(),
             umask: app.umask.clone(),
             priority: (app.priority != 0).then_some(app.priority),
+            access_log: app.access_log.access_log.clone(),
+            access_log_exclude: app.access_log.access_log_exclude.clone(),
+            slow: app.access_log.slow.clone(),
             ..AppTable::default()
         };
 
@@ -5389,6 +5422,69 @@ mod tests {
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.changes.is_empty(), "{:?}", plan.changes);
         assert_eq!(plan.unchanged, 1);
+    }
+
+    #[test]
+    fn an_applications_access_log_choice_is_planned_stored_and_exported() {
+        let source = source_dir();
+        let store = store_with_shop(&source);
+        let mut document = export(&store, None, false).unwrap();
+        let app = document.app.get_mut("shop").unwrap();
+        app.access_log = Some("errors".to_owned());
+        app.slow = Some("250ms".to_owned());
+        app.access_log_exclude = vec!["/healthz".to_owned()];
+        let planned = |document: &Document| {
+            plan(
+                &store,
+                document,
+                true,
+                &Defined::default(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+
+        let first = planned(&document);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let [change] = &first.changes[..] else {
+            panic!("one change: {:?}", first.changes);
+        };
+        assert_eq!(change.action.name(), "set-access-log");
+        assert!(change.action.reconfigures(), "the edge needs a snapshot");
+        assert_eq!(
+            change.detail,
+            "access log errors, slow from 250ms, leaving out /healthz"
+        );
+
+        // Stored, it is exported as written and applies back unchanged.
+
+        let Action::SetAppAccessLog { access_log, .. } = &change.action else {
+            panic!("{:?}", change.action);
+        };
+        store.set_app_access_log("shop", access_log).unwrap();
+        assert_eq!(export(&store, None, false).unwrap(), document);
+        assert!(planned(&document).changes.is_empty());
+
+        // It is laid over the node's filter key by key.
+
+        let node = muru_edge::access::Filter {
+            exclude: vec!["/static/*".to_owned()],
+            ..muru_edge::access::Filter::default()
+        };
+        assert_eq!(
+            access_log.over(&node),
+            muru_edge::access::Filter {
+                mode: muru_edge::access::Mode::Errors,
+                slow: std::time::Duration::from_millis(250),
+                exclude: vec!["/static/*".to_owned(), "/healthz".to_owned()],
+            }
+        );
+
+        let app = document.app.get_mut("shop").unwrap();
+        app.access_log = Some("quiet".to_owned());
+        assert_eq!(
+            planned(&document).errors,
+            ["shop: access_log = \"quiet\" is not on, errors or off"]
+        );
     }
 
     #[test]

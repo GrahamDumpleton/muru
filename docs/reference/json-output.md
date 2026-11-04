@@ -51,12 +51,12 @@ $ muructl release show shop@r9 --json
 
 | Command | Prints |
 | --- | --- |
-| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `apps`, `releases`, `edge_pid` and the rest |
+| `muructl status` | The daemon's or run's status: `version`, `pid`, `listeners`, `app_count`, `release_count`, `edge_pid` and the rest |
 | `muructl daemon status` | The same as `muructl status` |
 | `muructl daemon reload` | What was reloaded: `message` |
 | `muructl app list` | `{"apps": [...]}`, each with `name`, `current_release`, `previous_release`, `user`, `maintenance` and the rest |
 | `muructl release list` | `{"releases": [...]}`, each a release as `release show` prints it |
-| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups |
+| `muructl release show` | The release: `app`, `id`, `state`, `message`, `source`, `entrypoint`, `serving`, its settings, mounts and groups; for a managed server, `server_instances`, each with `index`, `pid`, `address` and `started_unix_ms` |
 | `muructl release wait` | The release once it reached a state waited for |
 | `muructl host list` | `{"hosts": [...]}` |
 | `muructl route list` | `{"routes": [...]}` |
@@ -82,7 +82,7 @@ $ muructl release show shop@r9 --json
 | `muructl maintenance on` | `app`, `on` and `since_unix_ms` |
 | `muructl maintenance off` | `app`, `on` and `since_unix_ms` (0) |
 | `muructl dashboard login` | The sign-in link: `url`, `code`, `expires_in_s`, and with `--token` the `token` |
-| `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied` |
+| `muructl apply` | The report: `errors`, `warnings`, `notes`, `changes`, `unchanged`, `applied`. Each change has `action`, `subject`, `detail` and, once applied, `outcome`, which for a release that failed is `failed:` and the reason |
 | `muructl config diff` | The report, as `apply` prints it |
 | `muructl config export` | The desired state as a JSON document rather than TOML |
 | `muructl config show` | `document` (TOML), with `--effective` also `attributions` and `layers`, and where it came from: `version`, `node`, `time_unix_ms`, `state_version` |
@@ -97,6 +97,7 @@ $ muructl release show shop@r9 --json
 | `muructl metrics` | `{"samples": [...]}`, each with `name`, `type` (as its family declares, else `untyped`), `labels` and `value`; a value JSON cannot hold (`NaN`, `+Inf`) is kept as text |
 | `muructl websockets` | `open`, `endpoints` by application and pattern, and with `--list` each open `sockets` entry |
 | `muructl logging level` | One debug answer for each logger set, as an array |
+| `muructl logging access` | `overrides`, the changes in force after the command, the newest last, each with `mode`, `app`, `paths` and `until_unix_ms`, and `reset`, how many `--reset` put back |
 | `muructl debug status` | The debug answer: `{"release": ..., "workers": [...]}`, each worker with `index`, `pid`, `ok`, `error` and its `result` |
 | `muructl debug stacks` | The debug answer |
 | `muructl debug tasks` | The debug answer |

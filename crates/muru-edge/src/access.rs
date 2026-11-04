@@ -6,8 +6,17 @@
 //! response head arrived) and total, and the application, release, host,
 //! group and mount that served it. Records are kept in a bounded ring in
 //! memory for the dashboard and the CLI, and written to the terminal as
-//! compact lines, to a file as JSON lines, only for errors and slow
-//! requests, or not at all.
+//! compact lines or to a file as JSON lines. A filter says which are
+//! written: all of them, only errors and slow requests, or none, less the
+//! paths it leaves out. The node has one, an application may have its
+//! own, and both change while the edge runs, from the daemon's snapshots.
+//! An override changes what is written for a period, for one application
+//! or every one and some paths or all, and lapses on its own.
+//!
+//! Lines are written by a thread of their own, fed through a bounded
+//! queue, so a slow disk or a reader of standard error that has stopped
+//! never holds up a request: the request's task only queues its line, and
+//! when the queue is full the line is dropped and counted (section 11.2).
 //!
 //! A WebSocket's request ends when the worker accepts it: its line is
 //! written then, with the handshake's time. The open socket is then kept
@@ -21,7 +30,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{Metrics, SocketKey};
@@ -33,18 +42,328 @@ pub const RING_CAPACITY: usize = 1000;
 /// How many lines a follower may fall behind before it skips some.
 const FOLLOW_CAPACITY: usize = 1024;
 
+/// How many lines may wait for the writer before more are dropped.
+const WRITE_QUEUE: usize = 16 * 1024;
+
+/// How much the writer gathers into one write.
+const WRITE_BATCH: usize = 64 * 1024;
+
 /// Where access log lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Destination {
     /// Compact lines on standard error.
     Terminal,
-    /// Nothing is written; records are still kept in memory.
-    Off,
-    /// Compact lines on standard error for 4xx and 5xx responses and for
-    /// requests slower than the threshold.
-    Errors,
     /// JSON lines appended to a file.
     File(PathBuf),
+    /// Nowhere, whatever the filter says; records are still counted and
+    /// kept in memory.
+    Off,
+}
+
+/// Which records are written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Every record.
+    #[default]
+    On,
+    /// 4xx and 5xx responses, requests at least as slow as the threshold,
+    /// and WebSockets that closed other than normally or going away.
+    Errors,
+    /// None; records are still counted and kept in memory.
+    Off,
+}
+
+impl Mode {
+    /// The mode a configuration names: `on`, `errors` or `off`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "on" => Some(Self::On),
+            "errors" => Some(Self::Errors),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The mode's name, as the configuration writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Errors => "errors",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Which records are written: the mode, the threshold `errors` counts a
+/// request as slow from, and the paths never written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    /// Which records are written.
+    pub mode: Mode,
+    /// Requests at least this slow are written under `Mode::Errors`.
+    pub slow: Duration,
+    /// Path patterns whose requests are not written (`*` matches anything,
+    /// `?` one character); they are still kept in memory.
+    pub exclude: Vec<String>,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self {
+            mode: Mode::On,
+            slow: Duration::from_secs(1),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl Filter {
+    /// The filter a snapshot carries.
+    pub fn from_message(message: &muru_proto::edge::v1::AccessLog) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode).unwrap_or_default(),
+            slow: Duration::from_millis(message.slow_ms),
+            exclude: message.exclude.clone(),
+        }
+    }
+
+    /// The filter as a snapshot carries it.
+    pub fn to_message(&self) -> muru_proto::edge::v1::AccessLog {
+        muru_proto::edge::v1::AccessLog {
+            mode: self.mode.as_str().to_owned(),
+            slow_ms: u64::try_from(self.slow.as_millis()).unwrap_or(u64::MAX),
+            exclude: self.exclude.clone(),
+        }
+    }
+
+    /// Whether a record is written.
+    fn shows(&self, record: &Record) -> bool {
+        writes(self.mode, self.slow, &self.exclude, record)
+    }
+}
+
+/// Whether a record is written under a mode, a slow threshold and the
+/// paths left out.
+fn writes(mode: Mode, slow: Duration, exclude: &[String], record: &Record) -> bool {
+    // A WebSocket's close is shown with the errors when it ended other
+    // than in order; its lifetime is not a slow request.
+
+    match (mode, &record.websocket) {
+        (Mode::Off, _) => return false,
+        (Mode::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
+            return false;
+        }
+        (Mode::Errors, None) if record.status < 400 && record.total < slow => {
+            return false;
+        }
+        _ => {}
+    }
+
+    let path = record.path();
+    !exclude.iter().any(|pattern| glob_matches(pattern, path))
+}
+
+/// A change to which records are written, for a period, over the
+/// filters: for one application or every one, and for some paths or
+/// every path. A record it covers is written by its mode, with the slow
+/// threshold of the filter it replaces; one that names paths writes them
+/// even where the filter leaves them out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Override {
+    /// Which of the records it covers are written.
+    pub mode: Mode,
+    /// The application it covers, or every one when empty.
+    pub app: String,
+    /// The path patterns it covers, or every path when empty.
+    pub paths: Vec<String>,
+    /// When it ends.
+    pub until: SystemTime,
+}
+
+impl Override {
+    /// The override a request for one asks for, from now for `duration`:
+    /// the mode is on, errors or off, and the period more than nothing.
+    pub fn requested(
+        mode: &str,
+        app: &str,
+        paths: &[String],
+        duration: Duration,
+    ) -> Result<Self, String> {
+        let mode = Mode::parse(mode).ok_or_else(|| format!("{mode:?} is not on, errors or off"))?;
+
+        if duration.is_zero() {
+            return Err("a change to the access log lasts for a period: give --for".to_owned());
+        }
+
+        Ok(Self {
+            mode,
+            app: app.to_owned(),
+            paths: paths.to_vec(),
+            until: SystemTime::now() + duration,
+        })
+    }
+
+    /// What it writes, as a phrase: "only errors and slow requests of
+    /// shop to /api/*".
+    pub fn describe(&self) -> String {
+        let mut text = match self.mode {
+            Mode::On => "every request",
+            Mode::Errors => "only errors and slow requests",
+            Mode::Off => "no request",
+        }
+        .to_owned();
+
+        if !self.app.is_empty() {
+            text.push_str(&format!(" of {}", self.app));
+        }
+
+        if !self.paths.is_empty() {
+            text.push_str(&format!(" to {}", self.paths.join(", ")));
+        }
+
+        text
+    }
+
+    /// The override as the admin API reported it.
+    pub fn from_admin_message(message: &muru_proto::admin::v1::AccessLogOverride) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode).unwrap_or_default(),
+            app: message.app.clone(),
+            paths: message.paths.clone(),
+            until: UNIX_EPOCH + Duration::from_millis(message.until_unix_ms),
+        }
+    }
+
+    /// The override as the admin API reports it.
+    pub fn to_admin_message(&self) -> muru_proto::admin::v1::AccessLogOverride {
+        muru_proto::admin::v1::AccessLogOverride {
+            mode: self.mode.as_str().to_owned(),
+            app: self.app.clone(),
+            paths: self.paths.clone(),
+            until_unix_ms: self.until_unix_ms(),
+        }
+    }
+
+    /// The override a message carries.
+    pub fn from_message(message: &muru_proto::edge::v1::AccessLogOverride) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode).unwrap_or_default(),
+            app: message.app.clone(),
+            paths: message.paths.clone(),
+            until: UNIX_EPOCH + Duration::from_millis(message.until_unix_ms),
+        }
+    }
+
+    /// The override as a snapshot carries it.
+    pub fn to_message(&self) -> muru_proto::edge::v1::AccessLogOverride {
+        muru_proto::edge::v1::AccessLogOverride {
+            mode: self.mode.as_str().to_owned(),
+            app: self.app.clone(),
+            paths: self.paths.clone(),
+            until_unix_ms: self.until_unix_ms(),
+        }
+    }
+
+    /// When it ends, in Unix milliseconds.
+    pub fn until_unix_ms(&self) -> u64 {
+        self.until.duration_since(UNIX_EPOCH).map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+    }
+
+    /// Whether it is still in force at `now`.
+    pub fn in_force(&self, now: SystemTime) -> bool {
+        now < self.until
+    }
+
+    /// Whether it covers a record of `app` at `path`.
+    pub fn covers(&self, app: &str, path: &str) -> bool {
+        (self.app.is_empty() || self.app == app)
+            && (self.paths.is_empty()
+                || self.paths.iter().any(|pattern| glob_matches(pattern, path)))
+    }
+}
+
+/// The filters in force: the node's, and those of the applications that
+/// have their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    /// The filter for every application without its own.
+    pub node: Filter,
+    /// Applications' own filters, by name.
+    pub apps: BTreeMap<String, Filter>,
+    /// Changes for a period, the newest last; those past their end are
+    /// ignored.
+    pub overrides: Vec<Override>,
+}
+
+impl Filters {
+    /// The filters with one for the node and none of the applications'
+    /// own.
+    pub fn node(filter: Filter) -> Self {
+        Self {
+            node: filter,
+            apps: BTreeMap::new(),
+            overrides: Vec::new(),
+        }
+    }
+
+    /// The filters a snapshot carries, or none when it carries no
+    /// choice, which leaves the current ones in force.
+    pub fn from_snapshot(snapshot: &muru_proto::edge::v1::Snapshot) -> Option<Self> {
+        let node = snapshot.access_log.as_ref()?;
+        let apps = snapshot
+            .apps
+            .iter()
+            .filter_map(|entry| {
+                let filter = entry.access_log.as_ref()?;
+                Some((entry.app.clone(), Filter::from_message(filter)))
+            })
+            .collect();
+
+        Some(Self {
+            node: Filter::from_message(node),
+            apps,
+            overrides: snapshot
+                .access_log_overrides
+                .iter()
+                .map(Override::from_message)
+                .collect(),
+        })
+    }
+
+    /// The filter a record of `app` is written by, overrides aside.
+    pub fn for_app(&self, app: &str) -> &Filter {
+        self.apps.get(app).unwrap_or(&self.node)
+    }
+
+    /// Whether a record is written: by the newest override in force that
+    /// covers it, else by its application's filter.
+    fn shows(&self, record: &Record) -> bool {
+        let filter = self.for_app(&record.app);
+
+        if !self.overrides.is_empty() {
+            let now = SystemTime::now();
+            let path = record.path();
+            let covering = self
+                .overrides
+                .iter()
+                .rev()
+                .find(|change| change.in_force(now) && change.covers(&record.app, path));
+
+            if let Some(change) = covering {
+                let exclude = if change.paths.is_empty() {
+                    &filter.exclude[..]
+                } else {
+                    &[]
+                };
+
+                return writes(change.mode, filter.slow, exclude, record);
+            }
+        }
+
+        filter.shows(record)
+    }
 }
 
 /// Access log settings.
@@ -52,19 +371,15 @@ pub enum Destination {
 pub struct Config {
     /// Where lines go.
     pub destination: Destination,
-    /// Requests at least this slow are shown with `Destination::Errors`.
-    pub slow: Duration,
-    /// Path patterns whose requests are not written (`*` matches anything,
-    /// `?` one character); they are still kept in memory.
-    pub exclude: Vec<String>,
+    /// Which records are written until a snapshot says otherwise.
+    pub filter: Filter,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             destination: Destination::Terminal,
-            slow: Duration::from_secs(1),
-            exclude: Vec::new(),
+            filter: Filter::default(),
         }
     }
 }
@@ -337,12 +652,15 @@ pub struct Minute {
 /// The access log: a ring of recent records, per-second counters for the
 /// last minute, the request metrics, and the configured output.
 pub struct AccessLog {
-    config: Config,
+    destination: Destination,
+    /// Which records are written, swapped whole by `set_filters`.
+    filters: RwLock<Filters>,
     ring: Mutex<VecDeque<Record>>,
     minute: Mutex<[Bucket; MINUTE]>,
     metrics: Metrics,
     started: u64,
-    file: Option<Mutex<File>>,
+    /// The writer thread's queue, unless lines go nowhere.
+    writer: Option<std::sync::mpsc::SyncSender<Message>>,
     /// The WebSockets open now, by a number of their own.
     websockets: Mutex<BTreeMap<u64, Arc<Socket>>>,
     next_websocket: AtomicU64,
@@ -370,26 +688,69 @@ fn unix_seconds(time: SystemTime) -> u64 {
 }
 
 impl AccessLog {
-    /// Prepare the log, opening the file when lines go to one.
+    /// Prepare the log, opening the file when lines go to one, and start
+    /// the thread that writes them.
     pub fn new(config: Config) -> io::Result<Self> {
-        let file = match &config.destination {
-            Destination::File(path) => Some(Mutex::new(
-                OpenOptions::new().create(true).append(true).open(path)?,
-            )),
-            _ => None,
+        let output = match &config.destination {
+            Destination::File(path) => Some(Output::File {
+                file: OpenOptions::new().create(true).append(true).open(path)?,
+                path: path.clone(),
+            }),
+            Destination::Terminal => Some(Output::Terminal),
+            Destination::Off => None,
+        };
+
+        Self::with_output(config, output)
+    }
+
+    /// Prepare the log writing to `output`, or nowhere.
+    fn with_output(config: Config, output: Option<Output>) -> io::Result<Self> {
+        let metrics = Metrics::default();
+
+        let writer = match output {
+            Some(output) => {
+                let (queue, lines) = std::sync::mpsc::sync_channel(WRITE_QUEUE);
+                let dropped = metrics.access_log_dropped();
+                std::thread::Builder::new()
+                    .name("access-log".to_owned())
+                    .spawn(move || write_lines(&lines, output, &dropped))?;
+                Some(queue)
+            }
+            None => None,
         };
 
         Ok(Self {
-            config,
+            destination: config.destination,
+            filters: RwLock::new(Filters::node(config.filter)),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             minute: Mutex::new([Bucket::default(); MINUTE]),
-            metrics: Metrics::default(),
+            metrics,
             started: unix_seconds(SystemTime::now()),
-            file,
+            writer,
             websockets: Mutex::new(BTreeMap::new()),
             next_websocket: AtomicU64::new(0),
             lines: tokio::sync::broadcast::channel(FOLLOW_CAPACITY).0,
         })
+    }
+
+    /// The filters in force.
+    pub fn filters(&self) -> Filters {
+        self.filters
+            .read()
+            .expect("access log filters poisoned")
+            .clone()
+    }
+
+    /// Put new filters in force: every record completed from now on is
+    /// written by them.
+    pub fn set_filters(&self, filters: Filters) {
+        *self.filters.write().expect("access log filters poisoned") = filters;
+    }
+
+    /// Change the filters in force in place, as one step, and return
+    /// what `change` does.
+    pub fn update_filters<T>(&self, change: impl FnOnce(&mut Filters) -> T) -> T {
+        change(&mut self.filters.write().expect("access log filters poisoned"))
     }
 
     /// The request metrics the records feed (section 11.1).
@@ -549,14 +910,52 @@ impl AccessLog {
     /// Open the file again by name, for section 11.3: after an external
     /// rotation has renamed the file, lines go to a new one at the path.
     /// Nothing happens when lines do not go to a file.
+    ///
+    /// The writer thread reopens it after the lines queued before, so
+    /// this waits for them: call it where blocking is allowed.
     pub fn reopen(&self) -> io::Result<()> {
-        let (Destination::File(path), Some(file)) = (&self.config.destination, &self.file) else {
+        let (Destination::File(_), Some(writer)) = (&self.destination, &self.writer) else {
             return Ok(());
         };
 
-        let reopened = OpenOptions::new().create(true).append(true).open(path)?;
-        *file.lock().expect("access log file poisoned") = reopened;
-        Ok(())
+        let stopped = || io::Error::other("the access log's writer has stopped");
+        let (answer, answered) = std::sync::mpsc::channel();
+        writer
+            .send(Message::Reopen(answer))
+            .map_err(|_| stopped())?;
+        answered.recv().map_err(|_| stopped())?
+    }
+
+    /// Wait until every line queued so far is written, as at the end of
+    /// a run, but no longer than `within`, since a stalled destination
+    /// may never take them; call it where blocking is allowed. Whether
+    /// they were all written.
+    pub fn flush(&self, within: Duration) -> bool {
+        let Some(writer) = &self.writer else {
+            return true;
+        };
+
+        // The queue may be full of lines still to write: the request to
+        // answer waits for room, until the time is up.
+
+        let deadline = Instant::now() + within;
+        let (answer, answered) = std::sync::mpsc::channel();
+        let mut message = Message::Flush(answer);
+
+        loop {
+            match writer.try_send(message) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) if Instant::now() < deadline => {
+                    message = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
+        }
+
+        answered
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
     }
 
     /// The most recent records as JSON lines, oldest first.
@@ -576,55 +975,142 @@ impl AccessLog {
     }
 
     fn shows(&self, record: &Record) -> bool {
-        // A WebSocket's close is shown with the errors when it ended
-        // other than in order; its lifetime is not a slow request.
-
-        match (&self.config.destination, &record.websocket) {
-            (Destination::Off, _) => return false,
-            (Destination::Errors, Some(end)) if matches!(end.close, "normal" | "going_away") => {
-                return false;
-            }
-            (Destination::Errors, None)
-                if record.status < 400 && record.total < self.config.slow =>
-            {
-                return false;
-            }
-            _ => {}
+        if self.destination == Destination::Off {
+            return false;
         }
 
-        let path = record.path();
-        !self
-            .config
-            .exclude
-            .iter()
-            .any(|pattern| glob_matches(pattern, path))
+        self.filters
+            .read()
+            .expect("access log filters poisoned")
+            .shows(record)
     }
 
+    /// Queue a record's line for the writer, or drop and count it when
+    /// the writer is too far behind (section 11.2).
     fn write(&self, record: &Record) {
-        match &self.file {
-            Some(file) => {
-                let line = json_line(record);
-                let mut file = file.lock().expect("access log file poisoned");
+        let Some(writer) = &self.writer else {
+            return;
+        };
 
-                if file.write_all(line.as_bytes()).is_err() {
-                    // Section 11.2: a stalled log never holds up requests.
+        // Section 11.8: a file takes JSON lines, the terminal the compact
+        // line, or under muructl serve --log-format json the record
+        // itself.
+
+        let line = match &self.destination {
+            Destination::File(_) => json_line(record),
+            _ if muru_common::log::json() => muru_common::log::with_identity(
+                json_line(record).replacen('{', "{\"kind\":\"access\",", 1),
+            ),
+            _ => text_line(record),
+        };
+
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = writer.try_send(Message::Line(line)) {
+            self.metrics.count_access_log_dropped();
+        }
+    }
+}
+
+/// What the writer thread is given.
+enum Message {
+    /// A line to write.
+    Line(String),
+    /// Open the file again by name, answering how it went.
+    Reopen(std::sync::mpsc::Sender<io::Result<()>>),
+    /// Answer once every line before this one is written.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Where the writer thread writes.
+enum Output {
+    /// Standard error, as the process's log routes it.
+    Terminal,
+    /// A file, opened for appending, and its path for reopening.
+    File { file: File, path: PathBuf },
+    /// Another output whose every write first waits for the gate, which
+    /// stands in for a stalled destination until the gate is dropped.
+    #[cfg(test)]
+    Held {
+        inner: Box<Output>,
+        gate: std::sync::mpsc::Receiver<()>,
+    },
+}
+
+impl Output {
+    /// Write what has been gathered; a destination that cannot be written
+    /// to loses the lines and stops nothing.
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        match self {
+            Self::Terminal => muru_common::log::write(muru_common::log::Stream::Stderr, bytes),
+            Self::File { file, .. } => {
+                let _ = file.write_all(bytes);
+            }
+            #[cfg(test)]
+            Self::Held { inner, gate } => {
+                let _ = gate.recv();
+                inner.write(bytes);
+            }
+        }
+    }
+
+    /// Open the file again by name (section 11.3).
+    fn reopen(&mut self) -> io::Result<()> {
+        if let Self::File { file, path } = self {
+            *file = OpenOptions::new().create(true).append(true).open(&*path)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The writer thread: gather what is waiting into one write, up to a
+/// batch, so a busy log is a few large writes rather than one a request,
+/// and say once writing resumes how many lines were dropped meanwhile.
+fn write_lines(
+    lines: &std::sync::mpsc::Receiver<Message>,
+    mut output: Output,
+    dropped: &AtomicU64,
+) {
+    let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH);
+    let mut reported = 0;
+
+    while let Ok(first) = lines.recv() {
+        let mut next = Some(first);
+
+        while let Some(message) = next.take() {
+            match message {
+                Message::Line(line) => batch.extend_from_slice(line.as_bytes()),
+                Message::Reopen(answer) => {
+                    output.write(&batch);
+                    batch.clear();
+                    let _ = answer.send(output.reopen());
+                }
+                Message::Flush(answer) => {
+                    output.write(&batch);
+                    batch.clear();
+                    let _ = answer.send(());
                 }
             }
-            None => {
-                // Section 11.8: the terminal's compact line, or under
-                // muructl serve --log-format json the record itself.
 
-                let line = if muru_common::log::json() {
-                    muru_common::log::with_identity(json_line(record).replacen(
-                        '{',
-                        "{\"kind\":\"access\",",
-                        1,
-                    ))
-                } else {
-                    text_line(record)
-                };
-                muru_common::log::write(muru_common::log::Stream::Stderr, line.as_bytes());
+            if batch.len() < WRITE_BATCH {
+                next = lines.try_recv().ok();
             }
+        }
+
+        output.write(&batch);
+        batch.clear();
+        let now = dropped.load(Ordering::Relaxed);
+
+        if now > reported {
+            muru_common::muru_eprintln!(
+                "the access log dropped {} line{} while its writer was behind",
+                now - reported,
+                if now - reported == 1 { "" } else { "s" }
+            );
+            reported = now;
         }
     }
 }
@@ -878,8 +1364,7 @@ mod tests {
     fn per_second_counters_sum_over_the_last_minute() {
         let log = AccessLog::new(Config {
             destination: Destination::Off,
-            slow: Duration::from_secs(1),
-            exclude: Vec::new(),
+            ..Config::default()
         })
         .expect("log");
 
@@ -931,19 +1416,12 @@ mod tests {
         assert_eq!(format_bytes(30 * 1024 * 1024), "30.0MB");
     }
 
-    #[test]
-    fn errors_mode_shows_failures_and_slow_requests() {
-        let log = AccessLog::new(Config {
-            destination: Destination::Errors,
-            slow: Duration::from_millis(500),
-            exclude: vec!["/health*".to_owned()],
-        })
-        .expect("no file to open");
-        let record = |status: u16, target: &str, total: Duration| Record {
+    fn record(app: &str, status: u16, target: &str, total: Duration) -> Record {
+        Record {
             started: SystemTime::now(),
             request_id: "id".to_owned(),
             client: "127.0.0.1".parse().expect("address"),
-            app: String::new(),
+            app: app.to_owned(),
             release: String::new(),
             host: String::new(),
             group: DEFAULT.to_owned(),
@@ -964,10 +1442,192 @@ mod tests {
             client_class: "default".to_owned(),
             websocket: None,
             handoff: None,
+        }
+    }
+
+    #[test]
+    fn errors_mode_shows_failures_and_slow_requests() {
+        let log = AccessLog::new(Config {
+            destination: Destination::Terminal,
+            filter: Filter {
+                mode: Mode::Errors,
+                slow: Duration::from_millis(500),
+                exclude: vec!["/health*".to_owned()],
+            },
+        })
+        .expect("no file to open");
+        let quick = Duration::from_millis(10);
+        let slow = Duration::from_millis(900);
+        assert!(!log.shows(&record("", 200, "/", quick)));
+        assert!(log.shows(&record("", 500, "/", quick)));
+        assert!(log.shows(&record("", 200, "/", slow)));
+        assert!(!log.shows(&record("", 500, "/healthz?x=1", slow)));
+    }
+
+    #[test]
+    fn filters_are_swapped_whole_and_an_application_may_have_its_own() {
+        let log = AccessLog::new(Config::default()).expect("no file to open");
+        let quick = Duration::from_millis(10);
+        assert!(log.shows(&record("shop", 200, "/", quick)));
+
+        // The node's filter turns lines off, and one application keeps
+        // its errors.
+
+        let errors = Filter {
+            mode: Mode::Errors,
+            ..Filter::default()
         };
-        assert!(!log.shows(&record(200, "/", Duration::from_millis(10))));
-        assert!(log.shows(&record(500, "/", Duration::from_millis(10))));
-        assert!(log.shows(&record(200, "/", Duration::from_millis(900))));
-        assert!(!log.shows(&record(500, "/healthz?x=1", Duration::from_millis(900))));
+        let mut filters = Filters::node(Filter {
+            mode: Mode::Off,
+            ..Filter::default()
+        });
+        filters.apps.insert("shop".to_owned(), errors.clone());
+        log.set_filters(filters.clone());
+        assert_eq!(log.filters(), filters);
+        assert!(!log.shows(&record("blog", 500, "/", quick)));
+        assert!(!log.shows(&record("shop", 200, "/", quick)));
+        assert!(log.shows(&record("shop", 500, "/", quick)));
+
+        // A snapshot carries the same, and one without a choice changes
+        // nothing.
+
+        let snapshot = muru_proto::edge::v1::Snapshot {
+            access_log: Some(filters.node.to_message()),
+            apps: vec![muru_proto::edge::v1::AppWorkers {
+                app: "shop".to_owned(),
+                access_log: Some(errors.to_message()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(Filters::from_snapshot(&snapshot), Some(filters));
+        assert_eq!(
+            Filters::from_snapshot(&muru_proto::edge::v1::Snapshot::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_writer_that_is_behind_drops_and_counts_lines_but_holds_up_nothing() {
+        let directory = std::env::temp_dir().join(format!("muru-access-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("access.log");
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("file");
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = Output::Held {
+            inner: Box::new(Output::File {
+                file,
+                path: path.clone(),
+            }),
+            gate,
+        };
+        let config = Config {
+            destination: Destination::File(path.clone()),
+            filter: Filter::default(),
+        };
+        let log = AccessLog::with_output(config, Some(held)).expect("log");
+
+        // More lines than the queue and a batch hold, with the writer
+        // stalled: every record is taken at once, and the lines beyond
+        // what the writer took and the queue holds are dropped.
+
+        let started = Instant::now();
+        let quick = Duration::from_millis(1);
+        let total = WRITE_QUEUE + WRITE_BATCH / 10;
+
+        for _ in 0..total {
+            log.record(record("shop", 200, "/", quick));
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "nothing waited"
+        );
+        let dropped = log.metrics().access_log_dropped().load(Ordering::Relaxed) as usize;
+        assert!(dropped > 0, "nothing dropped");
+        assert_eq!(log.recent(1).len(), 1, "every record is still kept");
+
+        // Released, the writer writes what it queued, and nothing else.
+
+        drop(release);
+        assert!(log.flush(Duration::from_secs(10)));
+        let written = std::fs::read_to_string(&path).expect("log").lines().count();
+        assert_eq!(written + dropped, total);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_newest_override_in_force_that_covers_a_record_decides() {
+        let log = AccessLog::new(Config {
+            destination: Destination::Terminal,
+            filter: Filter {
+                mode: Mode::Errors,
+                exclude: vec!["/api/health".to_owned()],
+                ..Filter::default()
+            },
+        })
+        .expect("no file to open");
+        let quick = Duration::from_millis(10);
+        let later = SystemTime::now() + Duration::from_secs(60);
+        let mut filters = log.filters();
+
+        // Every request of shop's API, the excluded probe among them,
+        // and nothing at all of blog's for a while; then a change that
+        // has already ended, which is ignored.
+
+        filters.overrides = vec![
+            Override {
+                mode: Mode::On,
+                app: "shop".to_owned(),
+                paths: vec!["/api/*".to_owned()],
+                until: later,
+            },
+            Override {
+                mode: Mode::Off,
+                app: "blog".to_owned(),
+                paths: Vec::new(),
+                until: later,
+            },
+            Override {
+                mode: Mode::Off,
+                app: String::new(),
+                paths: Vec::new(),
+                until: SystemTime::now() - Duration::from_secs(1),
+            },
+        ];
+        log.set_filters(filters.clone());
+        assert!(log.shows(&record("shop", 200, "/api/items", quick)));
+        assert!(log.shows(&record("shop", 200, "/api/health", quick)));
+        assert!(!log.shows(&record("shop", 200, "/home", quick)));
+        assert!(log.shows(&record("shop", 500, "/home", quick)));
+        assert!(!log.shows(&record("blog", 500, "/", quick)));
+
+        // The newest decides where two cover a record.
+
+        filters.overrides.push(Override {
+            mode: Mode::Errors,
+            app: String::new(),
+            paths: vec!["/api/*".to_owned()],
+            until: later,
+        });
+        log.set_filters(filters.clone());
+        assert!(!log.shows(&record("shop", 200, "/api/items", quick)));
+
+        assert_eq!(
+            filters.overrides[0].describe(),
+            "every request of shop to /api/*"
+        );
+        assert!(Override::requested("loud", "", &[], Duration::from_secs(1)).is_err());
+        assert!(Override::requested("on", "", &[], Duration::ZERO).is_err());
+
+        let message = filters.overrides[0].to_message();
+        assert_eq!(message.mode, "on");
+        let back = Override::from_message(&message);
+        assert_eq!(back.until_unix_ms(), filters.overrides[0].until_unix_ms());
     }
 }
