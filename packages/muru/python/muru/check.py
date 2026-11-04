@@ -4,8 +4,9 @@
 (design specification section 6.8): the hooks module and the entrypoint
 are imported under the import check of section 6.2, the entrypoint is
 settled as WSGI, ASGI or gRPC with the signature rules the host applies,
-and the mounts are loaded the same way. Nothing is served and nothing is
-forked. The result is one JSON document on stdout, for muructl to report.
+and the mounts are loaded the same way. The on_load and pre_fork hooks
+run where the host runs them, before the check. Nothing is served and
+nothing is forked. The result is one JSON document on stdout, for muructl to report.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import traceback
 from typing import Any
 
 from muru import __version__, host, preload
+from muru._context import Context
 from muru.hooks import Hooks
 
 __all__ = ["main"]
@@ -91,6 +93,18 @@ def main(argv: list[str] | None = None) -> int:
         "errors": [],
     }
 
+    hooks = Hooks()
+    context = Context(app=host.app_name(args.app))
+
+    def failed(error: BaseException) -> None:
+        report["ok"] = False
+        report["errors"].append(
+            {
+                "error": f"{error.__class__.__name__}: {error}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+
     with preload.ImportRecorder() as recorder:
         try:
             if args.hooks:
@@ -106,14 +120,19 @@ def main(argv: list[str] | None = None) -> int:
                 loaded = load(entrypoint, interface, False, "worker", recorder)
                 loaded["mount"] = name
                 report["entrypoints"].append(loaded)
+
+            hooks.call("on_load", context)
         except Exception as error:
-            report["ok"] = False
-            report["errors"].append(
-                {
-                    "error": f"{error.__class__.__name__}: {error}",
-                    "traceback": traceback.format_exc(),
-                }
-            )
+            failed(error)
+
+    # Section 6.2: the host runs pre_fork before its import check, so
+    # what pre_fork closes is not a finding here either.
+
+    if report["ok"]:
+        try:
+            hooks.call("pre_fork", context)
+        except Exception as error:
+            failed(error)
 
     report["findings"] = [
         {

@@ -121,17 +121,17 @@ def test_unsafe_import_falls_back_to_per_worker_imports() -> None:
         assert pids == set(server.worker_pids().values())
         assert server.host_pid() not in pids
 
-        # on_load ran once in the host before the check, then on_load and
-        # pre_fork run again in each worker, before its post_fork.
+        # on_load and pre_fork ran once in the host before the check, then
+        # run again in each worker, before its post_fork.
 
-        on_load = hook_lines(server, "on_load")
-        assert on_load[0] == {
-            "pid": str(server.host_pid()),
-            "worker": "None",
-            "app": "unsafe-import-wsgi",
-        }
-        assert sorted(line["worker"] for line in on_load[1:]) == ["0", "1"]
-        assert sorted(line["worker"] for line in hook_lines(server, "pre_fork")) == ["0", "1"]
+        for name in ("on_load", "pre_fork"):
+            lines = hook_lines(server, name)
+            assert lines[0] == {
+                "pid": str(server.host_pid()),
+                "worker": "None",
+                "app": "unsafe-import-wsgi",
+            }, name
+            assert sorted(line["worker"] for line in lines[1:]) == ["0", "1"], name
     finally:
         server.stop()
 
@@ -142,6 +142,23 @@ def test_preload_true_fails_on_an_unsafe_import() -> None:
     message = str(excinfo.value)
     assert "left a connected socket" in message
     assert "preload is true" in message
+
+
+def test_what_pre_fork_closes_passes_the_import_check() -> None:
+    # Section 6.2: pre_fork runs before the check, so a socket the import
+    # left open and pre_fork closes is no finding, even with preload true.
+
+    server = support.start(
+        "unsafe_import_wsgi:application",
+        workers=WORKERS,
+        args=["--preload", "true", "--hooks", "hooks_reopen_socket"],
+    )
+
+    try:
+        assert "preload:" not in server.log()
+        assert import_pids(server, WORKERS * 8) == {server.host_pid()}
+    finally:
+        server.stop()
 
 
 def test_preload_false_imports_in_each_worker() -> None:

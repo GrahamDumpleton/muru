@@ -943,7 +943,6 @@ class Host:
         self.spawned_at: dict[int, float] = {}
         self.start_failures: dict[int, int] = {}
         self.failed = False
-        self.forked_before = False
         self.selector = selectors.DefaultSelector()
         self.outputs: dict[int, WorkerOutput] = {}
 
@@ -1078,14 +1077,6 @@ class Host:
         A worker that is not a replacement is routed to at once; a
         replacement enters routing when its first report arrives.
         """
-
-        if not self.forked_before:
-            self.forked_before = True
-
-            if self.release.preloaded and self.release.hooks is not None:
-                # Section 6.3: once in the host, before the first fork.
-
-                self.release.hooks.call("pre_fork", self.release.context)
 
         threads = preload.thread_count()
 
@@ -3972,6 +3963,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"mount {mount.name}: {mount.release.spec} is served as "
                     f"{interface_name(mount.release.resolved)}"
                 )
+
+        # Section 6.2: pre_fork runs once, before the import check, so
+        # that what it closes is not reported as crossing the fork. With
+        # --single nothing forks, so it has no occasion.
+
+        if not args.single and not hooks.call_logged("pre_fork", context):
+            return 1
 
         findings = recorder.findings()
 
