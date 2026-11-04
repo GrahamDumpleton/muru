@@ -110,7 +110,7 @@ When the application declares a Content-Length, the worker sets the END flag on 
 
 - **Client disconnect.** The edge sends ABORT on the request direction and keeps the connection. ASGI applications receive http.disconnect. WSGI applications see an empty read on wsgi.input, an error on the next response write, and their iteration is stopped after the current block. The worker finishes its response direction with END as usual, which the edge reads and discards, and the connection is idle again.
 
-- **Response before the body has been sent.** As soon as the response has ended, the edge stops sending BODY frames and sends ABORT instead, so a large upload answered immediately does not cross the link. What the worker had already accepted is discarded. Whether the client connection can be kept alive is decided by the edge (section 4.6).
+- **Response before the body has been sent.** As soon as the response has ended, the edge stops sending BODY frames and sends ABORT instead, so a large upload answered immediately does not cross the link. What the worker had already accepted is discarded, and once the response is complete the worker reads the request direction to its ABORT or END, discarding it, however much the application left unread. Whether the client connection can be kept alive is decided by the edge (section 4.6).
 
 - **Request body on demand.** The worker reads BODY frames into a bounded queue that wsgi.input and receive() pull from. When the application does not read, the queue fills, the worker stops reading the socket, and the edge stops reading from the client. The response direction is unaffected, so an application that writes before it reads cannot deadlock against a client that is still uploading.
 

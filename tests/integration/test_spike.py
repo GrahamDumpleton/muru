@@ -181,10 +181,41 @@ def test_unread_body_keeps_the_connection_alive(server: support.Server) -> None:
     assert statuses == [200] * 24
 
 
-def read_response(sock: socket.socket) -> bytes:
-    """Read one HTTP/1.1 response with a Content-Length and return its body."""
+def test_a_response_before_the_body_waits_for_the_rest_of_it(server: support.Server) -> None:
+    # Section 4.6: a response that ends before the request body is read
+    # waits for the rest of the body, within the discard limit, before it
+    # ends, so the connection is kept with the request read to its end.
+    # Ending the response first left hyper still reading a body, which
+    # some clients waited on for ever (issue 360).
 
-    data = b""
+    payload = b"x" * (512 * 1024)
+    head = b"POST /ignore HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n" % len(payload)
+
+    with socket.create_connection(("127.0.0.1", server.port), timeout=0.5) as sock:
+        sock.sendall(head + payload[:65536])
+        received = b""
+
+        try:
+            while chunk := sock.recv(65536):
+                received += chunk
+        except TimeoutError:
+            pass
+
+        assert not received.endswith(b"ignored\n"), received
+
+        sock.settimeout(30)
+        sock.sendall(payload[65536:])
+        assert read_response(sock, received) == b"ignored\n"
+
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+        assert read_response(sock) == b"Hello, world!\n"
+
+
+def read_response(sock: socket.socket, data: bytes = b"") -> bytes:
+    """Read one HTTP/1.1 response with a Content-Length and return its body.
+
+    `data` is what has already been received of it.
+    """
 
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(65536)

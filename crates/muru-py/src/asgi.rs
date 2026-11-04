@@ -303,6 +303,14 @@ impl Channel {
             return self.forward(tx, data, more).await;
         }
 
+        // Once the response is complete nothing more is delivered, and the
+        // caller goes on reading the link only to drain it: a later chunk
+        // must not wait for room, since complete() wakes a waiter once.
+
+        if self.completed.load(Ordering::Relaxed) {
+            return false;
+        }
+
         // Wait for room, unless the response ends first.
 
         let permit = tokio::select! {
