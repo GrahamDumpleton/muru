@@ -220,8 +220,12 @@ uv_version = ">=0.9"              # what the daemon expects; an older uv is repo
 python_downloads = "automatic"    # or "never"
 python_install_dir = "/var/lib/muru/python"
 offline = false                   # true: nothing is ever downloaded
-wheel_dir = "/srv/wheels"         # wheels for the runtime library and builds when offline
+wheel_dir = "/srv/wheels"         # wheels for the runtime library
 ```
+
+With `offline = true`, a release's environment is built only from the
+packages the daemon's uv cache already holds. On a node that is never
+online, deploy sources with their environment already built.
 
 The daemon says at start-up which uv it found, and `muructl release show`
 prints what each release runs on:

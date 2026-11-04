@@ -2638,7 +2638,7 @@
       "properties": {
         "offline": {
           "default": false,
-          "description": "No network at all: nothing is downloaded, and wheels come from `wheel_dir`.",
+          "description": "No network at all: nothing is downloaded, so a build installs only what the daemon's uv cache already holds.",
           "type": "boolean"
         },
         "python_downloads": {
@@ -2664,7 +2664,7 @@
           "type": "string"
         },
         "wheel_dir": {
-          "description": "A local directory of wheels for the runtime library and for builds when offline.",
+          "description": "A local directory of wheels for the runtime library.",
           "type": "string",
           "x-default": "`MURU_WHEEL_DIR`, when set"
         }

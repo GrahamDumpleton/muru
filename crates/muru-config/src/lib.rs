@@ -1241,13 +1241,12 @@ pub struct Tools {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "`python` in the state directory"))]
     pub python_install_dir: Option<String>,
-    /// No network at all: nothing is downloaded, and wheels come from
-    /// `wheel_dir`.
+    /// No network at all: nothing is downloaded, so a build installs only
+    /// what the daemon's uv cache already holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub offline: Option<bool>,
-    /// A local directory of wheels for the runtime library and for builds
-    /// when offline.
+    /// A local directory of wheels for the runtime library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "`MURU_WHEEL_DIR`, when set"))]
     pub wheel_dir: Option<String>,
