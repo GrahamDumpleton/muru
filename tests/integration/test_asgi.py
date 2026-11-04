@@ -269,6 +269,27 @@ def test_receive_after_response_gets_disconnect(server: support.Server) -> None:
     assert server.wait_for_log("after response: http.disconnect")
 
 
+def test_an_unread_body_does_not_hold_up_the_next_request(server: support.Server) -> None:
+    # Section 5.5: a body the application never receives, more than the
+    # worker holds for it by the time the response is complete, is then
+    # drained by the worker, so the edge can end the request and keep the
+    # connection. The worker stopped reading the link instead, and the next
+    # request on the connection was never answered (issue 360).
+
+    connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+
+    try:
+        for _ in range(2):
+            connection.request("POST", "/sleep?seconds=0.2", body=bytes(1024 * 1024))
+            response = connection.getresponse()
+            assert response.read() == b"slept\n"
+
+        connection.request("GET", "/")
+        assert connection.getresponse().read() == b"Hello, async world!\n"
+    finally:
+        connection.close()
+
+
 def test_lifespan_shutdown_runs_on_stop() -> None:
     instance = support.start("plain_asgi:application", workers=1, threads=None)
 

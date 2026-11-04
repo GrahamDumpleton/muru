@@ -258,7 +258,7 @@ def test_a_policy_is_validated_when_declared(daemon: Daemon, tmp_path: Path) -> 
     assert "max_spare must be at least min_spare + 2" in refused(
         "mode = 'spare'\nmax_workers = 8\nmin_spare = 2\nmax_spare = 3"
     )
-    assert "takes no other keys" in refused("max_workers = 4")
+    assert "takes no other key but advisory" in refused("max_workers = 4")
     assert "slot_utilization" in refused("mode = 'target'\nmax_workers = 4\nslot_utilization = 1.5")
     assert "over max_workers" in refused("mode = 'target'\nmax_workers = 2", processes=3)
 
