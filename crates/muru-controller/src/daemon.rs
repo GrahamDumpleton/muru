@@ -1464,6 +1464,31 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     outcome
 }
 
+/// Numbers each command run's directory of secret files.
+static COMMAND_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Give a command run's secret files, and their directory, to the user it
+/// runs as.
+fn own_secret_files(identity: crate::host::Identity, dir: &Path) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+
+    let paths =
+        std::iter::once(dir.to_path_buf()).chain(entries.flatten().map(|entry| entry.path()));
+
+    for path in paths {
+        identity.own(&path).map_err(|error| {
+            format!(
+                "giving {} to the application's user failed: {error}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Remove the pid file if it names this process: a daemon run in the
 /// foreground never wrote it, and leaves another's alone.
 fn remove_pid_file(locations: &Locations) {
@@ -1487,10 +1512,12 @@ fn forget_edge(locations: &Locations) {
     let _ = std::fs::remove_dir(edges);
 }
 
-/// Remove a release's record and the directories it leaves empty: the
-/// release's own and then its application's.
+/// Remove a release's record, its host's secret files and the
+/// directories that leaves empty: the release's own and then its
+/// application's.
 fn forget_release_dir(run_dir: &Path, record: &Path) {
     let _ = std::fs::remove_file(record);
+    let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
 
     if std::fs::remove_dir(run_dir).is_ok()
         && let Some(app_dir) = run_dir.parent()
@@ -4115,12 +4142,25 @@ impl Daemon {
             }
         };
 
+        // A command's secret files are its own, so that its end removes
+        // them without touching those of a host still running.
+
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let identity = self.resolve_identity(app, &subject)?;
-        let env = resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await?;
+        let run = COMMAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let secrets = run_dir.join("commands").join(run.to_string());
+
+        let env = match resolve_env(&self.secrets, &spec.env, &secrets).await {
+            Ok(env) => env,
+            Err(message) => {
+                let _ = std::fs::remove_dir_all(&secrets);
+                return Err(message);
+            }
+        };
 
         if let Some(identity) = identity {
             self.own_release_dirs(identity, &run_dir, app, id)?;
+            own_secret_files(identity, &secrets)?;
         }
 
         // A release that builds its environment has it once it has
@@ -4174,6 +4214,7 @@ impl Daemon {
             declared: None,
             exclusive: false,
             inputs: String::new(),
+            secrets: Some(secrets),
         };
 
         match (declared, request) {
@@ -6396,7 +6437,11 @@ impl Daemon {
             );
         }
 
+        // The next request starts the host again, which writes its secret
+        // files again.
+
         let _ = std::fs::remove_file(record);
+        let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
         running.control = None;
         running.status.clear();
         running.signals_from = None;

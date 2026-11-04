@@ -134,7 +134,7 @@ DB_PASSWORD = { secret = { store = 'local', key = 'shop-db-password' } }
 API_KEY = { secret = { store = 'vault', key = 'shop/api-key' }, as = 'file' }
 ```
 
-- **Delivery.** By default the value is delivered as an environment variable. With as = 'file', it is written to a file under the release's run directory with mode 0400 owned by the application user, and VAR_FILE holds its path, following the NAME_FILE convention. Values are resolved when a release is created and are part of the release's identity: rotating a secret means a new release, which gets the usual drain and rollback.
+- **Delivery.** By default the value is delivered as an environment variable. With as = 'file', it is written to a file under the release's run directory with mode 0400 owned by the application user, and VAR_FILE holds its path, following the NAME_FILE convention. The host's files are removed whenever it stops for good or goes idle, and written again at its next start; a detaching daemon leaves them for the host still serving. A command run with the release (section 9.12) writes its own under RUNTIME/apps/APP/RELEASE/commands/N, removed when it ends. Values are resolved when a release is created and are part of the release's identity: rotating a secret means a new release, which gets the usual drain and rollback.
 - **Handling.** Values are held only as long as needed, never written to the state store, exports, events, logs, dry-run output or diagnostic bundles, and never passed on a command line. Exports and diffs show the store and key. muructl secret set, list and remove manage file stores; list shows names only.
 
 ## 10.9 Per-application users and isolation

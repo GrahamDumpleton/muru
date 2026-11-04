@@ -65,8 +65,10 @@ NAME=STORE:KEY`, or `--secret NAME=STORE:KEY:file`, over the table.
 By default the value is delivered as the variable. With `as = 'file'` it
 is written to a file under the release's run directory that only its
 owner can read, and `NAME_FILE` holds the path, following the
-`NAME_FILE` convention that Docker and many applications use. Values
-are resolved when the release starts, from the stores as they are then;
+`NAME_FILE` convention that Docker and many applications use. The file
+is removed when the release's host stops, and written again when it
+starts. A command run with the release gets files of its own, removed
+when it ends. Values are resolved when the release starts, from the stores as they are then;
 rotating a secret therefore means deploying a new release, which gets
 the usual drain and rollback. A missing key, an unknown store or a
 failing command fails the release with a message naming the store and

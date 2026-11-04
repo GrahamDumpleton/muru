@@ -59,6 +59,22 @@ impl Drop for Claim {
     }
 }
 
+/// A run's own secret files, removed when it ends, however it ends, with
+/// the directory of the release's command runs when that leaves it empty.
+struct SecretFiles(Option<PathBuf>);
+
+impl Drop for SecretFiles {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+
+            if let Some(runs) = dir.parent() {
+                let _ = std::fs::remove_dir(runs);
+            }
+        }
+    }
+}
+
 /// A command ready to start: everything the daemon resolved from the
 /// release, so starting it needs nothing more from the daemon.
 #[derive(Debug, Clone)]
@@ -89,6 +105,9 @@ pub struct Prepared {
     pub exclusive: bool,
     /// Its inputs as its events show them.
     pub inputs: String,
+    /// The directory of its own secret files (section 10.8), removed when
+    /// it ends.
+    pub secrets: Option<PathBuf>,
 }
 
 impl Prepared {
@@ -444,6 +463,8 @@ pub fn run(
     events: Events,
     store: Arc<Store>,
 ) -> Result<mpsc::Receiver<pb::CommandOutput>, String> {
+    let secrets = SecretFiles(prepared.secrets.clone());
+
     let claim = match (&prepared.declared, prepared.exclusive) {
         (Some(name), true) => {
             let key = (prepared.app.clone(), name.clone());
@@ -469,6 +490,7 @@ pub fn run(
     tokio::spawn(async move {
         supervise(prepared, events, store, sender).await;
         drop(claim);
+        drop(secrets);
     });
 
     Ok(receiver)
@@ -778,6 +800,7 @@ mod tests {
             declared: None,
             exclusive: false,
             inputs: String::new(),
+            secrets: None,
         }
     }
 
