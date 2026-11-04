@@ -500,7 +500,7 @@ def test_memory_compares_with_a_snapshot_kept_between_two_points(daemon: Daemon)
     assert "no snapshot is kept; take one with --snapshot" in refused
 
 
-def test_a_traced_worker_leaves_routing_while_the_trace_lasts(daemon: Daemon) -> None:
+def test_a_traced_worker_keeps_serving_while_the_trace_lasts(daemon: Daemon) -> None:
     if sys.version_info < (3, 12):
         support.unavailable("trace needs Python 3.12 or later, for sys.monitoring")
 
@@ -510,22 +510,26 @@ def test_a_traced_worker_leaves_routing_while_the_trace_lasts(daemon: Daemon) ->
         return {json.loads(daemon.get("/info").body)["pid"] for _ in range(20)}
 
     wait_for(lambda: len(serving()) == 2)
+    traced: list[str] = []
     tracing = threading.Thread(
-        target=daemon.muructl, args=("debug", "trace", "plain", "--worker", "0", "--for", "4s")
+        target=lambda: traced.append(
+            daemon.muructl("debug", "trace", "plain", "--worker", "0", "--for", "3s").stdout
+        )
     )
     tracing.start()
 
+    # Requests made once the trace is under way still reach both
+    # workers, and the trace counts the ones the traced worker took.
+
     try:
-        wait_for(lambda: len(serving()) == 1, timeout=3)
-        during = serving()
+        time.sleep(1)
+        during = serving() | serving()
     finally:
         tracing.join()
 
-    assert len(during) == 1
-    wait_for(lambda: len(serving()) == 2)
-    log = daemon.muructl("logs", "plain").stdout
-    assert "leaves routing while it is traced" in log
-    assert "serves again: its trace has ended" in log
+    assert len(during) == 2
+    counted = next(line for line in traced[0].splitlines() if "application (plain_wsgi.py:" in line)
+    assert int(counted.split()[1]) >= 5, traced[0]
 
 
 def test_exec_is_off_unless_the_daemon_allows_it(daemon: Daemon, tmp_path: Path) -> None:

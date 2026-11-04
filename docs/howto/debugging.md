@@ -128,9 +128,9 @@ time spent in each, with sys.monitoring, for `--for` (10 s), and prints
 the functions that took longest with their call counts. It needs Python
 3.12 or later. Exact counts cost the worker more than sampling, so a
 worker serving requests in more than half its slots is refused unless
-`--force` is given. While the trace runs the worker takes no new
-requests, which go to the other workers of its group; one that is the
-last of its group in service keeps serving.
+`--force` is given. The worker keeps serving while the trace runs, so
+the trace counts the requests it takes meanwhile, each slowed by the
+tracing.
 
 ## Memory
 
