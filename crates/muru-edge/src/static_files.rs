@@ -509,15 +509,7 @@ fn same_names(root: &Path, components: &[String]) -> bool {
     let mut directory = root.to_path_buf();
 
     for name in components {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            return false;
-        };
-        let wanted = std::ffi::OsStr::new(name.as_str());
-
-        if !entries
-            .flatten()
-            .any(|entry| entry.file_name().as_os_str() == wanted)
-        {
+        if !stored_as_written(&directory, name) {
             return false;
         }
 
@@ -525,6 +517,135 @@ fn same_names(root: &Path, components: &[String]) -> bool {
     }
 
     true
+}
+
+/// Whether a directory's entry is stored under the name as written,
+/// asked of the entry alone: macOS reports the name an entry is stored
+/// under, on every file system it mounts.
+#[cfg(target_os = "macos")]
+fn stored_as_written(directory: &Path, name: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(path) = std::ffi::CString::new(directory.join(name).as_os_str().as_bytes()) else {
+        return false;
+    };
+
+    // SAFETY: an all-zero attrlist is valid; the fields that matter are
+    // set below.
+
+    let mut wanted: libc::attrlist = unsafe { std::mem::zeroed() };
+    wanted.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    wanted.commonattr = libc::ATTR_CMN_NAME;
+
+    // The answer is its own length, then an attrreference_t (the name's
+    // offset from the attrreference_t, and its length with the closing
+    // NUL), then the name.
+
+    let mut answer = [0u8; 12 + 1024];
+
+    // SAFETY: the path is NUL-terminated and the answer is as long as
+    // its length says.
+
+    let result = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&raw mut wanted).cast(),
+            answer.as_mut_ptr().cast(),
+            answer.len(),
+            libc::FSOPT_NOFOLLOW,
+        )
+    };
+
+    if result != 0 {
+        return false;
+    }
+
+    let word = |at: usize| {
+        u32::from_ne_bytes([answer[at], answer[at + 1], answer[at + 2], answer[at + 3]]) as usize
+    };
+    let start = 4 + word(4);
+    let end = start + word(8).saturating_sub(1);
+    answer.get(start..end) == Some(name.as_bytes())
+}
+
+/// Whether a directory's entry is stored under the name as written. On
+/// a Linux file system that keeps names as given, the canonical lookup
+/// has already matched the name exactly, unless the directory folds case
+/// (the casefold attribute of ext4, F2FS and tmpfs, which an overlay
+/// passes on); any other file system's listing is read.
+#[cfg(target_os = "linux")]
+fn stored_as_written(directory: &Path, name: &str) -> bool {
+    !folds_names(directory) || listed(directory, name)
+}
+
+/// Whether a directory may answer to a name other than as written:
+/// true unless its file system is known to keep names as given.
+#[cfg(target_os = "linux")]
+fn folds_names(directory: &Path) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    /// FS_CASEFOLD_FL in linux/fs.h.
+    const CASEFOLD: libc::c_int = 0x4000_0000;
+
+    let Ok(file) = std::fs::File::open(directory) else {
+        return true;
+    };
+
+    // SAFETY: an all-zero statfs is valid for fstatfs to fill.
+
+    let mut system: libc::statfs = unsafe { std::mem::zeroed() };
+
+    // SAFETY: the descriptor is open and the statfs is as large as its
+    // type says.
+
+    let result = unsafe { libc::fstatfs(file.as_raw_fd(), &raw mut system) };
+
+    if result != 0 {
+        return true;
+    }
+
+    let kind = system.f_type as u32;
+    let is = |magic| kind == magic as u32;
+
+    if is(libc::BTRFS_SUPER_MAGIC) || is(libc::XFS_SUPER_MAGIC) {
+        return false;
+    }
+
+    if !(is(libc::EXT4_SUPER_MAGIC)
+        || is(libc::F2FS_SUPER_MAGIC)
+        || is(libc::TMPFS_MAGIC)
+        || is(libc::OVERLAYFS_SUPER_MAGIC))
+    {
+        return true;
+    }
+
+    let mut flags: libc::c_int = 0;
+
+    // SAFETY: FS_IOC_GETFLAGS writes an int through the pointer, and the
+    // descriptor is open.
+
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) };
+    result != 0 || flags & CASEFOLD != 0
+}
+
+/// Whether a directory's entry is stored under the name as written, read
+/// from the directory's listing where nothing cheaper says.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn stored_as_written(directory: &Path, name: &str) -> bool {
+    listed(directory, name)
+}
+
+/// Whether a directory's listing holds the name exactly as written.
+#[cfg(not(target_os = "macos"))]
+fn listed(directory: &Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    let wanted = std::ffi::OsStr::new(name);
+
+    entries
+        .flatten()
+        .any(|entry| entry.file_name().as_os_str() == wanted)
 }
 
 /// The response for a file: conditional requests, ranges, precompressed

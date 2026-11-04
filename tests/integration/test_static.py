@@ -190,6 +190,8 @@ def test_hidden_climbing_and_differently_cased_paths_are_not_served(static: Stat
     assert static.get("/nested/%2e%2e/fox.txt").status == 404
     assert static.get("/logo.png").status == 404, "the file is Logo.PNG"
     assert static.get("/LOGO.png").status == 404
+    assert static.get("/nested/Deep/file.txt").status == 404, "a directory's name too"
+    assert static.get("/nested/deep/file.txt").status == 200
     assert static.get("/missing.txt").status == 404
     assert static.get("/fox.txt/").status == 404
 
