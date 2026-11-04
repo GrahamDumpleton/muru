@@ -2199,7 +2199,7 @@ fn carries_body(next: &frame::Frame, reader: &mut Reader) -> bool {
 /// connection goes back to the pool intact (section 4.10).
 async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Duration) {
     loop {
-        match tokio::time::timeout(idle_timeout, frame::read(&mut reader)).await {
+        match tokio::time::timeout(idle_timeout, read_drained(&mut reader)).await {
             Ok(Ok(Some(next))) if next.kind == kind::CONTINUE => back.continue_request(),
             Ok(Ok(Some(next))) if carries_body(&next, &mut reader) && !next.is_end() => {}
             Ok(Ok(Some(next))) if next.kind == kind::BODY || next.kind == kind::END => {
@@ -2214,6 +2214,27 @@ async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Du
             }
         }
     }
+}
+
+/// Read one frame of a response being drained. A BODY frame's payload is
+/// skipped through the reader's buffer rather than read whole, since
+/// nothing uses it, and the frame comes back with none.
+async fn read_drained(reader: &mut Reader) -> io::Result<Option<frame::Frame>> {
+    let Some(header) = frame::read_header(reader).await? else {
+        return Ok(None);
+    };
+
+    if header.kind != kind::BODY {
+        return frame::read_payload(reader, header).await.map(Some);
+    }
+
+    frame::skip(reader, header.len).await?;
+
+    Ok(Some(frame::Frame {
+        kind: header.kind,
+        flags: header.flags,
+        payload: Bytes::new(),
+    }))
 }
 
 /// How this request's failures are answered: with the error pages of

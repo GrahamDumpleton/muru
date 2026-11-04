@@ -99,9 +99,10 @@ pub async fn run(command: RuntimeCommand) -> anyhow::Result<()> {
                 wheel_dir: wheel_dir.as_deref(),
                 offline: flag || offline(),
             };
-            let filename = muru_provision::runtime::install(&options, &target).await?;
+            let installed = muru_provision::runtime::install(&options, &target).await?;
             println!(
-                "muru: unpacked {filename} into {} for {}; put the directory first on PYTHONPATH",
+                "muru: {} into {} for {}; put the directory first on PYTHONPATH",
+                installed.describe(),
                 target.display(),
                 probe.describe()
             );
@@ -436,11 +437,8 @@ pub async fn build(args: BuildArgs) -> anyhow::Result<()> {
                 wheel_dir: wheel_dir.as_deref(),
                 offline: offline(),
             };
-            let filename = muru_provision::runtime::install(&options, dir).await?;
-            println!(
-                "muru: unpacked the runtime library {filename} into {}",
-                dir.display()
-            );
+            let installed = muru_provision::runtime::install(&options, dir).await?;
+            println!("muru: {} into {}", installed.describe(), dir.display());
         }
         None => {
             let library = runtime(&probe).await?;

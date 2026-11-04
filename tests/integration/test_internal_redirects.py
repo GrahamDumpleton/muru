@@ -171,6 +171,17 @@ def test_a_redirect_within_the_application_carries_the_context(site: Daemon) -> 
     assert plain["internal"] is False and plain["redirect_url"] is None
 
 
+def test_a_large_body_before_a_redirect_is_drained_and_the_worker_kept(site: Daemon) -> None:
+    # Four MiB in one BODY frame, skipped rather than read whole. The shop
+    # has one worker, so each request after reuses the connection the
+    # drain handed back, and a drain that lost its place would fail them.
+
+    for _ in range(3):
+        response = call(site.port, "GET", f"/redirect-to?path=/internal-info&size={4 << 20}")
+        assert response.status == 200, response.body
+        assert json.loads(response.body)["internal"] is True
+
+
 def test_the_method_and_body_can_be_preserved_when_the_edge_buffered_it(site: Daemon) -> None:
     # A body without a declared length is buffered before dispatch, so
     # the sub-request can carry it again.

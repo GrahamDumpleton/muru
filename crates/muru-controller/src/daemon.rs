@@ -1137,7 +1137,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let socket = locations.admin_socket();
     let (api_stop, api_stopped) = oneshot::channel();
-    let api = crate::api::serve(socket.clone(), handle, api_stopped).await?;
+    let owns_log = writes_to(&locations.daemon_log());
+
+    // A daemon started in the background names itself in the pid file
+    // before the admin socket answers, and removes it when it exits; an
+    // upgraded one is the same process and writes the same pid.
+
+    if owns_log {
+        let path = locations.pid_file();
+
+        if let Err(error) = std::fs::write(&path, std::process::id().to_string()) {
+            tracing::warn!(%error, path = %path.display(), "writing the pid file failed");
+        }
+    }
+
+    let api = match crate::api::serve(socket.clone(), handle, api_stopped).await {
+        Ok(api) => api,
+        Err(error) => {
+            remove_pid_file(&locations);
+            return Err(error);
+        }
+    };
+
     let mut api = tokio::spawn(api);
     let serving_on = listeners
         .iter()
@@ -1164,8 +1185,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             &format!("serving on {serving_on}, admin socket {}", socket.display()),
         ),
     }
-
-    let owns_log = writes_to(&locations.daemon_log());
 
     let mut daemon = Daemon {
         store,
@@ -1359,7 +1378,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .edge
             .stop_within(deadline.saturating_duration_since(Instant::now()))
             .await;
-        let _ = std::fs::remove_file(daemon.locations.run.path.join("edge.toml"));
+        forget_edge(&daemon.locations);
         daemon.events.emit(
             "daemon.stopped",
             "daemon",
@@ -1412,6 +1431,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         triggers.abort();
     }
 
+    // The pid file goes before the socket, which muructl daemon stop waits
+    // on; an upgrade keeps it for the same pid, unless the exec fails.
+
+    if upgrade_to.is_none() {
+        remove_pid_file(&daemon.locations);
+    }
+
     let _ = std::fs::remove_file(&socket);
 
     if let Some(upgrade) = upgrade_to {
@@ -1419,6 +1445,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // still serving, so this daemon leaves as a detached one does.
 
         let error = exec_daemon(&upgrade.executable, &config.upgrade_arguments);
+        remove_pid_file(&daemon.locations);
         daemon.events.emit(
             "daemon.detached",
             "daemon",
@@ -1435,6 +1462,68 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     outcome
+}
+
+/// Numbers each command run's directory of secret files.
+static COMMAND_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Give a command run's secret files, and their directory, to the user it
+/// runs as.
+fn own_secret_files(identity: crate::host::Identity, dir: &Path) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+
+    let paths =
+        std::iter::once(dir.to_path_buf()).chain(entries.flatten().map(|entry| entry.path()));
+
+    for path in paths {
+        identity.own(&path).map_err(|error| {
+            format!(
+                "giving {} to the application's user failed: {error}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Remove the pid file if it names this process: a daemon run in the
+/// foreground never wrote it, and leaves another's alone.
+fn remove_pid_file(locations: &Locations) {
+    let path = locations.pid_file();
+    let ours = std::fs::read_to_string(&path)
+        .is_ok_and(|text| text.trim() == std::process::id().to_string());
+
+    if ours {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// After a full shutdown, remove what only a running edge needs: the
+/// record the next daemon would adopt it by, and the rate limits' shared
+/// buckets, with the edges' directory when that leaves it empty.
+fn forget_edge(locations: &Locations) {
+    let run_dir = &locations.run.path;
+    let edges = crate::edges::directory(run_dir);
+    let _ = std::fs::remove_file(run_dir.join("edge.toml"));
+    let _ = std::fs::remove_file(edges.join(crate::edges::BUCKETS_FILE));
+    let _ = std::fs::remove_dir(edges);
+}
+
+/// Remove a release's record, its host's secret files and the
+/// directories that leaves empty: the release's own and then its
+/// application's.
+fn forget_release_dir(run_dir: &Path, record: &Path) {
+    let _ = std::fs::remove_file(record);
+    let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
+
+    if std::fs::remove_dir(run_dir).is_ok()
+        && let Some(app_dir) = run_dir.parent()
+    {
+        let _ = std::fs::remove_dir(app_dir);
+    }
 }
 
 /// Section 10.8: the environment a release's host starts with, its
@@ -4053,12 +4142,25 @@ impl Daemon {
             }
         };
 
+        // A command's secret files are its own, so that its end removes
+        // them without touching those of a host still running.
+
         let run_dir = self.locations.run.path.join("apps").join(app).join(id);
         let identity = self.resolve_identity(app, &subject)?;
-        let env = resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await?;
+        let run = COMMAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let secrets = run_dir.join("commands").join(run.to_string());
+
+        let env = match resolve_env(&self.secrets, &spec.env, &secrets).await {
+            Ok(env) => env,
+            Err(message) => {
+                let _ = std::fs::remove_dir_all(&secrets);
+                return Err(message);
+            }
+        };
 
         if let Some(identity) = identity {
             self.own_release_dirs(identity, &run_dir, app, id)?;
+            own_secret_files(identity, &secrets)?;
         }
 
         // A release that builds its environment has it once it has
@@ -4112,6 +4214,7 @@ impl Daemon {
             declared: None,
             exclusive: false,
             inputs: String::new(),
+            secrets: Some(secrets),
         };
 
         match (declared, request) {
@@ -5271,7 +5374,7 @@ impl Daemon {
             tracing::warn!(%subject, "the host did not stop within the drain timeout");
         }
 
-        let _ = std::fs::remove_file(record);
+        forget_release_dir(&run_dir, &record);
         let _ = self.store.remove_scale_pins(app, id, None);
         self.set_state(&release, ReleaseState::Stopped, why);
         self.events
@@ -6334,7 +6437,11 @@ impl Daemon {
             );
         }
 
+        // The next request starts the host again, which writes its secret
+        // files again.
+
         let _ = std::fs::remove_file(record);
+        let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
         running.control = None;
         running.status.clear();
         running.signals_from = None;
@@ -7676,8 +7783,11 @@ impl Daemon {
                 .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
             let kill_at = deadline.min(Instant::now() + budget + crate::host::STOP_MARGIN);
+            let run_dir = self.locations.run.path.join("apps").join(&app).join(&id);
+            let record = running.backend.record_path(&run_dir);
             stopping.push(async move {
                 running.backend.stop_until(kill_at).await;
+                forget_release_dir(&run_dir, &record);
                 release
             });
         }
@@ -7689,6 +7799,8 @@ impl Daemon {
         {
             self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
         }
+
+        let _ = std::fs::remove_dir(self.locations.run.path.join("apps"));
     }
 
     /// Where a release's host writes its output, its directory created.

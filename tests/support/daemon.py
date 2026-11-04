@@ -15,7 +15,6 @@ import socket
 import ssl
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -284,7 +283,7 @@ def start_daemon(
     # to about a hundred bytes, so it goes under /tmp rather than pytest's
     # deep temporary directory.
 
-    run_dir = run_dir or Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    run_dir = run_dir or support.short_dir("muru-run-")
 
     if listeners is None and not config_extra:
         port = port or support.free_port()

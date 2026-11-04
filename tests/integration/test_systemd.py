@@ -16,7 +16,6 @@ import re
 import signal
 import socket
 import sys
-import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -93,7 +92,7 @@ def notifications(receiver: socket.socket, until: str, timeout: float = 30.0) ->
 def test_readiness_and_stopping_are_notified(tmp_path: Path) -> None:
     # The socket path is short, as a Unix socket path must be.
 
-    directory = Path(tempfile.mkdtemp(prefix="muru-notify-", dir="/tmp"))
+    directory = support.short_dir("muru-notify-")
     path = directory / "notify.sock"
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:

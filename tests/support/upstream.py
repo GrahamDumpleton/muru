@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -126,7 +125,7 @@ class Upstream:
                     self.wfile.write(body)
 
         if unix:
-            directory = Path(tempfile.mkdtemp(prefix="muru-up-", dir="/tmp"))
+            directory = support.short_dir("muru-up-")
             self.path: Path | None = directory / "upstream.sock"
 
             class UnixServer(ThreadingHTTPServer):

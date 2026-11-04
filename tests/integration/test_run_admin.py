@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 import threading
 import urllib.request
 from collections.abc import Callable
@@ -24,7 +23,7 @@ def runtime() -> Path:
     # A runtime directory of its own, short enough for the socket path
     # limit, as the daemon tests make theirs.
 
-    return Path(tempfile.mkdtemp(prefix="muru-rt-", dir="/tmp"))
+    return support.short_dir("muru-rt-")
 
 
 def muructl(

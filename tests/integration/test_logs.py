@@ -235,7 +235,7 @@ def test_sigusr1_reopens_the_daemons_own_log(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     base = tmp_path
-    run_dir = Path("/tmp") / f"muru-run-{os.getpid()}-{time.monotonic_ns()}"
+    run_dir = support.short_dir("muru-run-")
     port = support.free_port()
     environment = {**os.environ, "MURU_SOCKET": str(run_dir / "admin.sock")}
     started = subprocess.run(
