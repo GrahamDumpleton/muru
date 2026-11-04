@@ -417,8 +417,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         });
     }
 
-    let child = command.spawn().context("starting the daemon")?;
-    std::fs::write(locations.pid_file(), child.id().to_string())?;
+    command.spawn().context("starting the daemon")?;
 
     let started = Instant::now();
 

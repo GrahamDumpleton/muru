@@ -190,6 +190,13 @@ def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> No
     finally:
         first.stop(shutdown=True)
 
+    # Nothing is left for the next daemon to adopt: no host or edge record,
+    # no rate limit buckets, and no empty release directories.
+
+    assert not (first.run_dir / "apps").exists()
+    assert not (first.run_dir / "edge.toml").exists()
+    assert not (first.run_dir / "edge" / "rate-buckets-v1").exists()
+
     second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
     try:
@@ -329,6 +336,24 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
         )
         assert "already running" in again.stdout
+        pid = again.stdout.split("(pid ")[1].split(")")[0]
+        assert (run_dir / "daemon.pid").read_text() == pid
+
+        # A daemon that detaches is gone too, so its pid file goes with it.
+
+        detached = subprocess.run(
+            [str(muructl), "daemon", "stop", *location],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        assert "detached" in detached.stdout, detached.stdout + detached.stderr
+        assert not (run_dir / "daemon.pid").exists()
+        restarted = subprocess.run(
+            [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
+        )
+        assert restarted.returncode == 0, restarted.stdout + restarted.stderr
         status = subprocess.run(
             [str(muructl), "daemon", "status", *location],
             capture_output=True,
@@ -349,6 +374,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     assert "daemon stopped" in stopped.stdout, stopped.stdout + stopped.stderr
     assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()
+    assert not (run_dir / "daemon.pid").exists()
 
 
 def test_status_names_the_edge_process(daemon: Daemon) -> None:

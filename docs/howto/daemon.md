@@ -264,7 +264,9 @@ with the same keys `muructl run --print-config` writes.
 ## Running it
 
 `muructl daemon start` starts the daemon in the background, logging to
-`daemon.log` in the log directory, and waits until it answers; `muructl
+`daemon.log` in the log directory, and waits until it answers. The
+daemon writes its pid to `daemon.pid` in the runtime directory and
+removes the file when it exits. `muructl
 up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
 listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
@@ -303,7 +305,9 @@ host keep serving exactly as they were. The next `muructl daemon start`
 the records in the runtime directory, takes them over, and carries on,
 so a daemon restart or upgrade never costs a request. `muructl daemon
 stop --shutdown` drains every release, stops the hosts and the edge, and
-then exits, for taking a node out of service.
+then exits, for taking a node out of service. It leaves no records
+behind in the runtime directory, and the next daemon starts the current
+releases afresh.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
 its workers with it, and the next daemon starts its release again. A
