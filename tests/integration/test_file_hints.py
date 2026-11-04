@@ -207,6 +207,11 @@ def test_the_range_starts_at_the_position_and_covers_the_content_length(
     assert response.status == 200
     assert response.header("Content-Length") == "5000"
     assert response.body == BIG[1000:6000]
+
+    # Across chunks: the seek is made once, ahead of the first.
+
+    spanning = development.get("/wrapper-range/big.bin?offset=1000&length=600000")
+    assert spanning.body == BIG[1000:601000]
     assert development.get("/wrapper-range/small.txt?offset=2&length=19").body == SMALL[2:]
 
 

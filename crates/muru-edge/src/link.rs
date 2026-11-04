@@ -18,7 +18,7 @@
 //! says the application is reading it.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Seek as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -35,7 +35,7 @@ use muru_proto::descriptors::FdReader;
 use muru_proto::frame::{self, flag, kind};
 use muru_proto::worker::v1 as pb;
 use prost::Message;
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, BufReader};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -2525,7 +2525,10 @@ async fn next_frame(reader: &mut Reader) -> io::Result<Option<Next>> {
 
 /// The range of a file the edge is sending for a FILE frame.
 struct FileRange {
-    file: tokio::fs::File,
+    /// The file, away on the blocking pool while a chunk is read.
+    file: Option<std::fs::File>,
+    /// Where the range starts, until its first chunk is read.
+    offset: u64,
     remaining: u64,
     /// The frame ended the body: nothing follows the range.
     last: bool,
@@ -2726,17 +2729,9 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                         state,
                     ));
                 };
-                let mut file = tokio::fs::File::from_std(std::fs::File::from(fd));
-
-                if hint.offset > 0
-                    && let Err(error) = file.seek(std::io::SeekFrom::Start(hint.offset)).await
-                {
-                    state.finish(false);
-                    return Some((Err(BoxError::from(error)), state));
-                }
-
                 state.file = Some(FileRange {
-                    file,
+                    file: Some(std::fs::File::from(fd)),
+                    offset: hint.offset,
                     remaining: hint.length,
                     last,
                 });
@@ -2772,30 +2767,41 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
     }
 }
 
-/// The next chunk of a file range, or none once it is all sent. A file
-/// shorter than the hint said is an error, since the client was promised
-/// the length.
+/// The next chunk of a file range, or none once it is all sent: read as
+/// a static file is, a chunk to a call on the blocking pool, with the
+/// seek to the range's start in the first. A file shorter than the hint
+/// said is an error, since the client was promised the length.
 async fn read_range(range: &mut FileRange) -> Result<Option<Bytes>, BoxError> {
-    const CHUNK: usize = 64 * 1024;
-
     if range.remaining == 0 {
         return Ok(None);
     }
 
-    let wanted = usize::try_from(range.remaining.min(CHUNK as u64)).unwrap_or(CHUNK);
-    let mut buffer = vec![0u8; wanted];
-    let read = range.file.read(&mut buffer).await?;
+    let Some(mut file) = range.file.take() else {
+        return Err(BoxError::from("the hinted file was lost while being read"));
+    };
+    let offset = std::mem::take(&mut range.offset);
+    let remaining = range.remaining;
+    let (file, chunk) = tokio::task::spawn_blocking(move || {
+        if offset > 0 {
+            file.seek(std::io::SeekFrom::Start(offset))?;
+        }
 
-    if read == 0 {
+        let chunk = crate::static_files::read_chunk(&mut file, remaining)?;
+        Ok::<_, std::io::Error>((file, chunk))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    range.file = Some(file);
+
+    if chunk.is_empty() {
         return Err(BoxError::from(format!(
             "the file ended {} bytes before the hinted range did",
             range.remaining
         )));
     }
 
-    buffer.truncate(read);
-    range.remaining -= read as u64;
-    Ok(Some(Bytes::from(buffer)))
+    range.remaining -= chunk.len() as u64;
+    Ok(Some(chunk))
 }
 
 /// Send the request body as BODY frames, then END. If the response ends

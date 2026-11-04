@@ -28,7 +28,7 @@ use crate::compression::{Compression, Encoding};
 
 /// How big each chunk of a file body is: a file no larger is read and
 /// sent whole.
-const CHUNK: usize = 256 * 1024;
+pub(crate) const CHUNK: usize = 256 * 1024;
 
 /// A static route, as the snapshot describes it.
 #[derive(Debug)]
@@ -878,7 +878,7 @@ async fn body_of(
 }
 
 /// Up to a chunk of `file`, at most `remaining` bytes; empty at its end.
-fn read_chunk(file: &mut std::fs::File, remaining: u64) -> std::io::Result<Bytes> {
+pub(crate) fn read_chunk(file: &mut std::fs::File, remaining: u64) -> std::io::Result<Bytes> {
     let wanted = remaining.min(CHUNK as u64);
     let mut chunk = Vec::with_capacity(usize::try_from(wanted).unwrap_or(CHUNK));
     file.take(wanted).read_to_end(&mut chunk)?;
