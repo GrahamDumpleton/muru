@@ -4381,10 +4381,15 @@ pub struct RunSettings {
     /// Patterns that never trigger a reload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reload_exclude: Vec<String>,
-    /// Where the access log goes: terminal, off, errors or a file path.
+    /// Which requests the access log writes: `on` (the default), `errors`
+    /// or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("default" = "terminal"))]
+    #[schemars(extend("default" = "on"))]
     pub access_log: Option<String>,
+    /// A file the access log's JSON lines go to in place of the terminal,
+    /// relative to the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log_file: Option<String>,
     /// Paths left out of the access log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_exclude: Vec<String>,
@@ -4427,6 +4432,10 @@ impl RunSettings {
             reload_include: join(&self.reload_include, &over.reload_include),
             reload_exclude: join(&self.reload_exclude, &over.reload_exclude),
             access_log: over.access_log.clone().or_else(|| self.access_log.clone()),
+            access_log_file: over
+                .access_log_file
+                .clone()
+                .or_else(|| self.access_log_file.clone()),
             access_log_exclude: join(&self.access_log_exclude, &over.access_log_exclude),
             slow: over.slow.clone().or_else(|| self.slow.clone()),
             dashboard: over.dashboard.clone().or_else(|| self.dashboard.clone()),
@@ -4449,9 +4458,7 @@ impl RunSettings {
             return Err("tls_cert and tls_key go together".to_owned());
         }
 
-        if let Some(slow) = &self.slow {
-            parse_duration(slow).map_err(|error| format!("slow: {error}"))?;
-        }
+        check_access_log(self.access_log.as_deref(), self.slow.as_deref())?;
 
         if let Some(dashboard) = &self.dashboard
             && dashboard != "off"
@@ -5614,6 +5621,7 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(bad("port = 'free'").contains("not a port number or auto"));
         assert!(bad("tls_cert = 'x.pem'").contains("go together"));
         assert!(bad("slow = 'soon'").starts_with("slow:"));
+        assert!(bad("access_log = 'terminal'").contains("not on, errors or off"));
         assert!(bad("dashboard = 'yes'").contains("127.0.0.1:8081, or off"));
     }
 

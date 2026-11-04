@@ -121,14 +121,19 @@ received from the client and sent to it:
 05:47:26.402 101 GET /ws/chat/42 12kB 5m03s websocket=closed by=client code=1000 received=12 sent=40 worker=0 id=01M5P6WZD3740HFT2N80MAV4YV
 ```
 
-`--access-log` chooses where the lines go:
+`--access-log` chooses which requests get a line:
 
 | Value | Effect |
 | --- | --- |
-| `terminal` (default) | compact lines as above |
+| `on` (default) | every request |
 | `errors` | only 4xx and 5xx responses, requests slower than `--slow` (default `1s`), and WebSockets that closed other than normally or going away |
 | `off` | nothing |
-| a file path | JSON lines appended to the file, one object per request |
+
+`--access-log-file PATH` writes the lines to that file in place of the
+terminal, as JSON lines appended one object per request. The two go
+together, so `--access-log errors --access-log-file errors.jsonl` keeps
+only the requests that need attention, in a file you can read after a
+long session or a load test.
 
 `--access-log-exclude PATTERN`, repeatable, hides requests whose path
 matches: `*` matches any run of characters and `?` one, so

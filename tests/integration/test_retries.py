@@ -35,7 +35,7 @@ def test_a_request_a_worker_never_read_goes_to_another(tmp_path: Path) -> None:
         "plain_wsgi:application",
         workers=2,
         threads=2,
-        args=["--access-log", str(log)],
+        args=["--access-log-file", str(log)],
     )
 
     try:

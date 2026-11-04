@@ -125,7 +125,7 @@ Every line and record gets a time when Muru first handles it, whether or not tha
 | Output | Application and Muru lines | Access lines |
 | --- | --- | --- |
 | Standard output and standard error of a long-running command (`muructl run`, `muructl serve`, `muructl daemon run`) | no time; `--timestamps`, or `[logs] timestamps = true`, puts the full form in front of every line | their own time first: the short clock on a terminal, the full form otherwise; the full form on every line with `--timestamps` |
-| Files (a release's log, `edge.log`, `daemon.log`, and standard output or error redirected to a regular file) | always the full form in front | JSON lines (`access.log`, or `--access-log PATH` under `muructl run`) with the full form in `time` |
+| Files (a release's log, `edge.log`, `daemon.log`, and standard output or error redirected to a regular file) | always the full form in front | JSON lines (`access.log`, or `--access-log-file PATH` under `muructl run`) with the full form in `time` |
 | journald | no time, since journald stamps each line | the record's time as a field |
 | JSON records, to any output | a `time` field in the full form, never a prefix | the same |
 | `muructl logs` | the full form shown; `--no-timestamps` hides it | the same |

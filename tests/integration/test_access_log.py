@@ -189,7 +189,7 @@ def test_excluded_paths_are_hidden() -> None:
 def test_file_destination_writes_json_lines(tmp_path: Path) -> None:
     log = tmp_path / "access.log"
     server = support.start(
-        "wsgi_conformance:application", workers=1, args=["--access-log", str(log)]
+        "wsgi_conformance:application", workers=1, args=["--access-log-file", str(log)]
     )
 
     try:
@@ -211,3 +211,44 @@ def test_file_destination_writes_json_lines(tmp_path: Path) -> None:
         assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$", record["time"])
     finally:
         server.stop()
+
+
+def test_errors_alone_can_go_to_a_file(tmp_path: Path) -> None:
+    log = tmp_path / "errors.jsonl"
+    server = support.start(
+        "wsgi_conformance:application",
+        workers=1,
+        args=["--access-log", "errors", "--access-log-file", str(log)],
+    )
+
+    try:
+        assert server.get("/response/list").status == 200
+        failed = server.get("/response/raise-first")
+        assert failed.status == 500
+        deadline = time.monotonic() + 5
+
+        while time.monotonic() < deadline and not (log.exists() and log.read_text()):
+            time.sleep(0.05)
+
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        assert [record["request_id"] for record in records] == [failed.header("X-Request-ID")]
+    finally:
+        server.stop()
+
+
+def test_a_destination_is_not_a_value_of_access_log() -> None:
+    completed = subprocess.run(
+        [
+            str(support.muructl_path()),
+            "run",
+            "wsgi_conformance:application",
+            "--access-log",
+            "terminal",
+        ],
+        cwd=support.FIXTURES,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode != 0
+    assert '--access-log "terminal" is not on, errors or off' in completed.stderr

@@ -5,6 +5,7 @@ over both."""
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -95,7 +96,8 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
     directory = project(
         tmp_path / "project",
         f"port = {port}\nhttps = true\nhttps_port = {https_port}\nhosts = ['shop.localhost']\n"
-        "reload = false\naccess_log = 'errors'\ndashboard = 'off'\n",
+        "reload = false\naccess_log = 'errors'\naccess_log_file = 'errors.jsonl'\n"
+        "dashboard = 'off'\n",
     )
     server = start(directory)
 
@@ -107,14 +109,20 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
         assert "watching" not in server.log()
         assert "dashboard on" not in server.log()
 
-        # errors: a 200 is not logged, a 404 is. The access log's lines
-        # start with the time and the status, which keeps a pid or any
-        # other number in the start-up lines from matching.
+        # errors, to a file in the project: a 200 is not logged, a 404 is,
+        # and the terminal has no access lines.
 
+        log = directory / "errors.jsonl"
         assert server.get("/missing").status == 404
-        assert server.wait_for_log("404 GET /missing ")
+        deadline = time.monotonic() + 5
+
+        while time.monotonic() < deadline and not (log.exists() and log.read_text()):
+            time.sleep(0.05)
+
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        assert [(record["status"], record["target"]) for record in records] == [(404, "/missing")]
         assert not re.search(
-            r"^(?:\d{4}-\d\d-\d\dT)?\d\d:\d\d:\d\d\.\d{3}Z? 200 ",
+            r"^(?:\d{4}-\d\d-\d\dT)?\d\d:\d\d:\d\d\.\d{3}Z? \d{3} ",
             server.timed_log(),
             re.MULTILINE,
         )

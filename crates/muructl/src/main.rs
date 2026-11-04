@@ -310,9 +310,15 @@ struct ServeStaticArgs {
     #[arg(long)]
     no_compression: bool,
 
-    /// Where access log lines go: terminal, off, errors or a file path.
-    #[arg(long, default_value = "terminal")]
+    /// Which requests the access log writes: on (the default), errors
+    /// (4xx and 5xx responses and requests slower than a second) or off.
+    #[arg(long, value_name = "WHAT", default_value = "on")]
     access_log: String,
+
+    /// Write the access log to this file, as JSON lines, in place of the
+    /// terminal.
+    #[arg(long, value_name = "PATH")]
+    access_log_file: Option<PathBuf>,
 }
 
 /// Serve a directory with the edge's static file code and nothing else.
@@ -338,7 +344,11 @@ async fn serve_static(args: ServeStaticArgs) -> anyhow::Result<()> {
     } else {
         muru_edge::compression::Compression::default()
     };
-    let access_log = access_log_config(&args.access_log, muru_edge::access::Filter::default());
+    let access_log = access_log_config(
+        &args.access_log,
+        args.access_log_file.as_deref(),
+        muru_edge::access::Filter::default(),
+    )?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("installing the SIGINT handler")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -469,11 +479,15 @@ struct RunArgs {
     #[arg(long)]
     hooks: Option<String>,
 
-    /// Where access log lines go: terminal (the default), off, errors
-    /// (4xx and 5xx responses and requests slower than --slow) or a file
-    /// path, which receives JSON lines.
-    #[arg(long, value_name = "WHERE")]
+    /// Which requests the access log writes: on (the default), errors
+    /// (4xx and 5xx responses and requests slower than --slow) or off.
+    #[arg(long, value_name = "WHAT")]
     access_log: Option<String>,
+
+    /// Write the access log to this file, as JSON lines, in place of the
+    /// terminal.
+    #[arg(long, value_name = "PATH")]
+    access_log_file: Option<PathBuf>,
 
     /// Hide requests whose path matches the pattern from the access log
     /// (`*` matches anything, `?` one character). Repeatable.
@@ -1427,26 +1441,37 @@ fn limits(args: &RunArgs) -> muru_edge::Limits {
     limits
 }
 
-/// The access log a development run's `--access-log` names: terminal,
-/// off, errors (to the terminal) or a file path, with the rest of the
-/// filter as given.
+/// The access log a development run's `--access-log` and
+/// `--access-log-file` name: which requests are written (on, errors or
+/// off), to the terminal or as JSON lines to the file, with the rest of
+/// the filter as given.
 fn access_log_config(
     access_log: &str,
+    file: Option<&Path>,
     filter: muru_edge::access::Filter,
-) -> muru_edge::access::Config {
+) -> anyhow::Result<muru_edge::access::Config> {
     use muru_edge::access::{Config, Destination, Filter, Mode};
 
-    let (destination, mode) = match access_log {
-        "terminal" => (Destination::Terminal, Mode::On),
-        "off" => (Destination::Off, Mode::On),
-        "errors" => (Destination::Terminal, Mode::Errors),
-        path => (Destination::File(PathBuf::from(path)), Mode::On),
+    let mode = match access_log {
+        "on" => Mode::On,
+        "errors" => Mode::Errors,
+        "off" => {
+            return Ok(Config {
+                destination: Destination::Off,
+                filter,
+            });
+        }
+        other => anyhow::bail!("--access-log {other:?} is not on, errors or off"),
     };
 
-    Config {
+    let destination = file.map_or(Destination::Terminal, |path| {
+        Destination::File(path.to_path_buf())
+    });
+
+    Ok(Config {
         destination,
         filter: Filter { mode, ..filter },
-    }
+    })
 }
 
 /// How `muructl run` serves (section 13.1), once the flags, muru.local.toml,
@@ -1467,8 +1492,11 @@ struct Serving {
     reload_dirs: Vec<PathBuf>,
     reload_include: Vec<String>,
     reload_exclude: Vec<String>,
-    /// terminal, off, errors or a file path.
+    /// on, errors or off.
     access_log: String,
+    /// The file the access log goes to in place of the terminal,
+    /// relative to the project.
+    access_log_file: Option<PathBuf>,
     access_log_exclude: Vec<String>,
     slow: Duration,
     /// The dashboard's address, off, or none for the default.
@@ -1546,7 +1574,11 @@ impl Serving {
                 .access_log
                 .clone()
                 .or_else(|| settings.access_log.clone())
-                .unwrap_or_else(|| "terminal".to_owned()),
+                .unwrap_or_else(|| "on".to_owned()),
+            access_log_file: args
+                .access_log_file
+                .clone()
+                .or_else(|| settings.access_log_file.as_deref().map(PathBuf::from)),
             access_log_exclude: strings(&settings.access_log_exclude, &args.access_log_exclude),
             slow,
             dashboard: args
@@ -2798,14 +2830,20 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     };
 
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    let access_log_file = resolved
+        .serving
+        .access_log_file
+        .as_ref()
+        .map(|file| resolved.project.join(file));
     let access_log = access_log_config(
         &resolved.serving.access_log,
+        access_log_file.as_deref(),
         muru_edge::access::Filter {
             slow: resolved.serving.slow,
             exclude: resolved.serving.access_log_exclude.clone(),
             ..muru_edge::access::Filter::default()
         },
-    );
+    )?;
     let timeouts = worker_timeouts(&args.timeouts, resolved.timeouts.as_ref())?;
     let memory = memory_policy(&args.memory, resolved.memory.as_ref())?;
     let stop_budget = timeouts.shutdown + timeouts.websocket_drain_grace;
