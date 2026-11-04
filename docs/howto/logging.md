@@ -99,12 +99,13 @@ working.
 
 ```
 05:42:22.836 200 GET /hello 18B 0.7ms queue=0.2ms app=0.3ms worker=0 id=01M5P6WZBK740HFT2N80MAV4YV
-05:42:22.849 500 GET /error 334B 7.8ms queue=0.0ms app=0.0ms reason=app_error worker=0 id=01M5P6WZC1740HFT2N80MAV4YV
+05:42:22.849 500 GET /error 334B 7.8ms queue=0.0ms app=7.1ms reason=app_error worker=0 id=01M5P6WZC1740HFT2N80MAV4YV
 ```
 
 The time the request arrived, status, method, target, response size,
 total time, time spent waiting for a worker thread, time in the
-application, the reason when Muru generated the response, the worker,
+application (until its response began, or until it failed or was
+interrupted), the reason when Muru generated the response, the worker,
 and the request id that the `X-Request-ID` response header and the error
 page carry too. On a terminal the time is your local clock; when the
 output goes to a pipe or a file, or with `--timestamps`, it is the full

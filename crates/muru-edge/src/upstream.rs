@@ -1044,6 +1044,7 @@ pub async fn handle(
     let mut retried = false;
 
     let dispatched = Instant::now();
+    let _ = failing.dispatched.set(dispatched);
     let mut slot = Some(build_request(
         parts,
         shared,

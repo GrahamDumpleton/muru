@@ -22,7 +22,7 @@ use std::io::{self, Seek as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
@@ -1345,6 +1345,7 @@ pub(crate) fn failing<'a>(
         occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(recording),
+        dispatched: OnceLock::new(),
         errors: &context.errors,
         host: requested_host(parts),
         path: parts.uri.path().to_owned(),
@@ -1521,6 +1522,7 @@ async fn handle_inner(
         occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(None),
+        dispatched: OnceLock::new(),
         errors: &context.errors,
         host: requested_host(parts),
         path: parts.uri.path().to_owned(),
@@ -1781,6 +1783,7 @@ async fn handle_inner(
     let upgrade = upgrade.filter(|_| upgrading);
     let kept = buffered.clone();
     let dispatched = Instant::now();
+    let _ = failing.dispatched.set(dispatched);
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
 
     // The stored files stay until the request ends: an unnamed one
@@ -2315,6 +2318,9 @@ pub(crate) struct Failing<'a> {
     occasions: crate::occasions::Setting,
     version: http::Version,
     recording: Mutex<Option<Recording>>,
+    /// When the request went to the application, so that a failure
+    /// answered after that is logged with the time the application ran.
+    pub(crate) dispatched: OnceLock<Instant>,
     /// The custom pages in force (section 4.12).
     errors: &'a errors::Chain,
     /// The host and path the client asked for, for templates.
@@ -2351,7 +2357,16 @@ impl Failing<'_> {
             },
         );
 
-        if let Some(recording) = self.recording.lock().expect("recording poisoned").take() {
+        if let Some(mut recording) = self.recording.lock().expect("recording poisoned").take() {
+            // A failure after the application had the request, its END
+            // or the deadline, ran for as long as it took to come.
+
+            if let Some(dispatched) = self.dispatched.get()
+                && recording.record.application.is_zero()
+            {
+                recording.record.application = dispatched.elapsed();
+            }
+
             let bytes = response
                 .headers()
                 .get(http::header::CONTENT_LENGTH)

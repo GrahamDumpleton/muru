@@ -382,6 +382,11 @@ pub(crate) async fn handle(
     let first =
         tokio::time::timeout_at(deadline.unwrap_or(far).into(), frame::read(&mut reader)).await;
 
+    // The application ran until its head, its END or the deadline,
+    // whichever came.
+
+    recording.record.application = dispatched.elapsed();
+
     let response_head = match first {
         Err(_) => {
             back.give_reader(None);
@@ -407,7 +412,6 @@ pub(crate) async fn handle(
         }
     };
 
-    recording.record.application = dispatched.elapsed();
     let mut response = Response::new(
         Empty::<Bytes>::new()
             .map_err(|never| match never {})

@@ -83,6 +83,16 @@ def test_a_wsgi_request_past_the_soft_timeout_is_interrupted() -> None:
             server.log_since_mark(),
         ), server.log_since_mark()
 
+        # The access log has the time the application ran until it was
+        # interrupted, not none (issue 367).
+
+        assert server.wait_for_log("reason=soft_timeout")
+        ran = re.search(
+            r"\b504 GET /busy\?seconds=10 .* app=([\d.]+)(ms|s) ", server.log_since_mark()
+        )
+        assert ran, server.log_since_mark()
+        assert float(ran[1]) / (1000 if ran[2] == "ms" else 1) >= 0.9, ran[0]
+
         # The worker is the same one, and nothing is left over from the
         # interruption for the requests that follow on its threads.
 
