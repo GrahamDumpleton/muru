@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -64,6 +65,30 @@ def unavailable(reason: str) -> None:
     if os.environ.get("CI"):
         pytest.fail(f"{reason}; CI must not skip the server tests")
     pytest.skip(reason)
+
+
+# The directories short_dir has made. Some outlive the test that made them,
+# for a module's daemon or a second daemon on the first one's run
+# directory, so tests/conftest.py removes them when the session ends.
+
+_short_dirs: list[Path] = []
+
+
+def short_dir(prefix: str) -> Path:
+    """Return a new directory under /tmp, for sockets: a socket's path is
+    limited to about a hundred bytes, which pytest's temporary directories
+    on macOS come close to. It is removed when the test session ends."""
+
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
+    _short_dirs.append(directory)
+    return directory
+
+
+def remove_short_dirs() -> None:
+    """Remove every directory short_dir made."""
+
+    while _short_dirs:
+        shutil.rmtree(_short_dirs.pop(), ignore_errors=True)
 
 
 # Ports free_port has handed out. A port is free again once its probe

@@ -14,7 +14,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -282,7 +281,7 @@ def test_daemon_stop_gives_up_on_a_silent_socket(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None:
         support.unavailable("muructl is not built")
-    run_dir = Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    run_dir = support.short_dir("muru-run-")
     path = run_dir / "admin.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
@@ -310,7 +309,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():
         support.unavailable("muructl or the extension is not built")
-    run_dir = Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    run_dir = support.short_dir("muru-run-")
     port = support.free_port()
     location = [
         "--state-dir",
