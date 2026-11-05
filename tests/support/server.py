@@ -111,6 +111,22 @@ def free_port() -> int:
             return port
 
 
+def dashboard_args(args: Sequence[str]) -> tuple[list[str], int | None]:
+    """The --dashboard arguments for a run, and the port they name.
+
+    A run's dashboard is on 127.0.0.1:8081 unless told otherwise, so every
+    run the tests start would take the same port, and fail to when a run
+    outside the tests holds it (issue 378). A free port is chosen unless
+    `args` set the dashboard, or --allow-public, which turns it off.
+    """
+
+    if {"--dashboard", "--allow-public"} & set(args):
+        return [], None
+
+    port = free_port()
+    return ["--dashboard", f"127.0.0.1:{port}"], port
+
+
 @dataclass
 class Response:
     """One HTTP response, fully read."""
@@ -142,6 +158,7 @@ class Server:
     workers: int
     threads: int
     https_port: int | None = None
+    dashboard_port: int | None = None
     _log_offset: int = field(default=0, repr=False)
 
     def request(
@@ -344,7 +361,9 @@ def start(
     muructl exits before its workers are ready, the RuntimeError raised
     carries its output. Reloading is off unless `reload` is True, or None
     to leave it to muructl's default; a `--reload` or `--no-reload` in
-    `args` is left as given.
+    `args` is left as given. The dashboard is on a free port, recorded as
+    the server's `dashboard_port`, unless `args` set --dashboard or
+    --allow-public.
     """
 
     muructl = muructl_path()
@@ -356,6 +375,7 @@ def start(
     port = free_port()
     https_port = free_port() if https else None
     https_args = ["--https-port", str(https_port)] if https_port is not None else []
+    dashboard, dashboard_port = dashboard_args(args)
     options: list[str] = []
     if workers is not None:
         options += ["--processes", str(workers)]
@@ -379,6 +399,7 @@ def start(
                 sys.executable,
                 *options,
                 *https_args,
+                *dashboard,
                 *args,
             ],
             stdout=handle,
@@ -387,7 +408,7 @@ def start(
             start_new_session=new_session,
         )
 
-    server = Server(port, process, log, workers or 0, threads or 0, https_port)
+    server = Server(port, process, log, workers or 0, threads or 0, https_port, dashboard_port)
 
     try:
         wait_for_port(port, process)

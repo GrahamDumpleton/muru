@@ -43,11 +43,14 @@ def muructl() -> Path:
     return path
 
 
-def start(directory: Path, *args: str) -> support.Server:
+def start(directory: Path, *args: str, dashboard: bool = True) -> support.Server:
     """Start `muructl run` on the project with no --bind, so the table's
-    ports are the ones served, and find them in the serving line."""
+    ports are the ones served, and find them in the serving line. The
+    dashboard is on a free port unless `dashboard` is False, which leaves
+    it to the table."""
 
     log = Path(tempfile.mkstemp(prefix="muru-run-settings-", suffix=".log")[1])
+    dashboard_options, dashboard_port = support.dashboard_args(args) if dashboard else ([], None)
 
     with log.open("wb") as handle:
         process = subprocess.Popen(
@@ -59,13 +62,14 @@ def start(directory: Path, *args: str) -> support.Server:
                 sys.executable,
                 "--processes",
                 "1",
+                *dashboard_options,
                 *args,
             ],
             stdout=handle,
             stderr=subprocess.STDOUT,
         )
 
-    server = support.Server(0, process, log, 1, 1, None)
+    server = support.Server(0, process, log, 1, 1, None, dashboard_port)
     deadline = time.monotonic() + 30
 
     while time.monotonic() < deadline:
@@ -99,7 +103,7 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
         "reload = false\naccess_log = 'errors'\naccess_log_file = 'errors.jsonl'\n"
         "dashboard = 'off'\n",
     )
-    server = start(directory)
+    server = start(directory, dashboard=False)
 
     try:
         assert server.port == port
@@ -107,7 +111,7 @@ def test_the_run_table_sets_how_the_project_is_served(tmp_path: Path) -> None:
         assert server.get("/").status == 200
         assert server.wait_for_log("shop.localhost")
         assert "watching" not in server.log()
-        assert "dashboard on" not in server.log()
+        assert "dashboard" not in server.log()
 
         # errors, to a file in the project: a 200 is not logged, a 404 is,
         # and the terminal has no access lines.
