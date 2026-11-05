@@ -3505,7 +3505,20 @@ impl Daemon {
                 let scalers = self
                     .store
                     .release(app, id)
-                    .map(|release| scalers_for(&release.spec, &sockets, &record.groups, &pins, now))
+                    .map(|release| {
+                        let interface =
+                            self.info
+                                .interfaces
+                                .runs_as(app, id, "", release.spec.interface);
+                        scalers_for(
+                            &release.spec,
+                            interface,
+                            &sockets,
+                            &record.groups,
+                            &pins,
+                            now,
+                        )
+                    })
                     .unwrap_or_default();
                 let ready_at = record
                     .sockets
@@ -4599,7 +4612,8 @@ impl Daemon {
         );
         let now = Instant::now();
         let pins = self.store.scale_pins(app, id).unwrap_or_default();
-        let scalers = scalers_for(spec, &sockets, &groups, &pins, now);
+        let interface = self.info.interfaces.runs_as(app, id, "", spec.interface);
+        let scalers = scalers_for(spec, interface, &sockets, &groups, &pins, now);
         let ready_at = host
             .sockets
             .iter()
@@ -7564,6 +7578,19 @@ impl Daemon {
                     return;
                 };
 
+                // Section 7.4: the scalers were sized from the
+                // configuration when the release started, which may have
+                // left the interface to be detected; they follow what
+                // the host found.
+
+                if let Ok(release) = self.store.release(app, id) {
+                    let interface =
+                        self.info
+                            .interfaces
+                            .runs_as(app, id, "", release.spec.interface);
+                    size_scalers(&mut running.scalers, &release.spec, interface);
+                }
+
                 let Some((record, pid)) = running.backend.host().map(|host| {
                     (
                         host.run_dir().join("..").join("host.toml"),
@@ -8143,32 +8170,62 @@ fn reopen_own_log(path: &std::path::Path) {
     }
 }
 
+/// Sections 7.3 and 7.4: what one worker offers before the edge has
+/// counted any, and the threads it runs Python on at once without a GIL,
+/// by the interface the release's default mount runs as: its threads for
+/// WSGI, and for ASGI its event loop's concurrency, and its sync threads
+/// with the loop's own. gRPC calls are held on the event loop too
+/// (section 6.13).
+fn worker_size(
+    interface: muru_config::Interface,
+    threads: u32,
+    sync_threads: u32,
+    concurrency: u32,
+) -> (f64, u32) {
+    match interface {
+        muru_config::Interface::Asgi | muru_config::Interface::Grpc => {
+            (concurrency as f64, sync_threads + 1)
+        }
+        muru_config::Interface::Wsgi | muru_config::Interface::Auto => (threads as f64, threads),
+    }
+}
+
+/// Size each group's scaler for the interface the release runs as, which
+/// its host announces once it has loaded the application: a release left
+/// to be detected is sized as WSGI only until then.
+fn size_scalers(
+    scalers: &mut [GroupScaling],
+    spec: &ReleaseSpec,
+    interface: muru_config::Interface,
+) {
+    for scaling in scalers {
+        let sizes = if scaling.name == muru_edge::routing::DEFAULT_GROUP {
+            Some((spec.threads, spec.sync_threads, spec.concurrency))
+        } else {
+            spec.groups
+                .iter()
+                .find(|group| group.name == scaling.name)
+                .map(|group| (group.threads, group.sync_threads, group.concurrency))
+        };
+
+        if let Some((threads, sync_threads, concurrency)) = sizes {
+            (scaling.slots_per_worker, scaling.threads) =
+                worker_size(interface, threads, sync_threads, concurrency);
+        }
+    }
+}
+
 /// Section 7.4: the scaling state of each group of a release that is
-/// starting or adopted, from its spec, the workers it has and the pins
-/// an operator left on it.
+/// starting or adopted, from its spec, the interface it runs as, the
+/// workers it has and the pins an operator left on it.
 fn scalers_for(
     spec: &ReleaseSpec,
+    interface: muru_config::Interface,
     sockets: &[PathBuf],
     groups: &[GroupRecord],
     pins: &[(String, u32)],
     now: Instant,
 ) -> Vec<GroupScaling> {
-    // gRPC calls are held on the event loop too (section 6.13).
-
-    let asgi = matches!(
-        spec.interface,
-        muru_config::Interface::Asgi | muru_config::Interface::Grpc
-    );
-    let slots = |threads: u32, concurrency: u32| {
-        if asgi {
-            concurrency as f64
-        } else {
-            threads as f64
-        }
-    };
-    let threads = |threads: u32, sync_threads: u32| {
-        if asgi { sync_threads + 1 } else { threads }
-    };
     let memory_limit = spec
         .memory
         .soft_limit
@@ -8176,9 +8233,9 @@ fn scalers_for(
     let mut scalers = vec![GroupScaling {
         name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
         scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
-        slots_per_worker: slots(spec.threads, spec.concurrency),
+        slots_per_worker: 0.0,
         requested: None,
-        threads: threads(spec.threads, spec.sync_threads),
+        threads: 0,
         memory_limit,
         denied: None,
     }];
@@ -8191,13 +8248,15 @@ fn scalers_for(
         scalers.push(GroupScaling {
             name: group.name.clone(),
             scaler: Scaler::new(group.scaling.clone(), current as u32),
-            slots_per_worker: slots(group.threads, group.concurrency),
+            slots_per_worker: 0.0,
             requested: None,
-            threads: threads(group.threads, group.sync_threads),
+            threads: 0,
             memory_limit,
             denied: None,
         });
     }
+
+    size_scalers(&mut scalers, spec, interface);
 
     for (name, count) in pins {
         if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {
@@ -8480,5 +8539,18 @@ mod tests {
         );
         interfaces.announce("shop", "r1", Vec::new());
         assert_eq!(interfaces.announced("shop", "r1").len(), 2);
+    }
+
+    #[test]
+    fn a_release_detected_as_asgi_is_sized_by_its_event_loop() {
+        use muru_config::Interface;
+
+        // Threads 4, sync threads 8, concurrency 1000: as WSGI until the
+        // host has said what it detected, then by the loop.
+
+        assert_eq!(worker_size(Interface::Auto, 4, 8, 1000), (4.0, 4));
+        assert_eq!(worker_size(Interface::Wsgi, 4, 8, 1000), (4.0, 4));
+        assert_eq!(worker_size(Interface::Asgi, 4, 8, 1000), (1000.0, 9));
+        assert_eq!(worker_size(Interface::Grpc, 4, 8, 1000), (1000.0, 9));
     }
 }

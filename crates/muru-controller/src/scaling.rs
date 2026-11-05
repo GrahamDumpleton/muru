@@ -1347,6 +1347,26 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_under_a_worker_s_concurrency_is_short_by_one_worker_at_most() {
+        // No worker is ready, so a worker is taken to offer what the
+        // daemon sized it as: 40 requests waiting for a group scaled to
+        // zero are one worker's worth for an event loop of 1000, and
+        // ten workers' worth when it is taken for four threads.
+
+        let scaler = Scaler::new(spare(), 0);
+        let waiting = |slots_per_worker: f64| {
+            scaler.idle(&Signals {
+                queue_depth: 40.0,
+                slots_per_worker,
+                ..Signals::default()
+            })
+        };
+
+        assert!(waiting(1000.0) >= -1.0, "{}", waiting(1000.0));
+        assert_eq!(waiting(4.0), -10.0);
+    }
+
+    #[test]
     fn a_ramp_grows_by_doubling_steps_bounded_by_max_step_up() {
         let spec = ScalingSpec {
             max_workers: 32,
