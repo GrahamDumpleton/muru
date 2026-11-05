@@ -77,9 +77,12 @@ scheduled from another thread waited to run.
 
 Each worker's interpreter and executable, working directory, `sys.path`,
 the modules loaded with versions where they declare one, threads, open
-descriptors and environment, with values of keys that look like secrets
-(`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL`, `AUTH`) replaced by
-`***`.
+descriptors and environment. The value of a key that looks like a
+secret (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL` or `AUTH` in
+its name, or a name ending in `_DSN`) is replaced by `***`, and a
+password in a URL under any other key is: `DATABASE_URL` holding
+`postgres://shop:hunter2@db/shop` is shown as
+`postgres://shop:***@db/shop`.
 
 ## Profile
 

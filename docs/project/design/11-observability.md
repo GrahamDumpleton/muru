@@ -102,7 +102,7 @@ Every worker has a control connection to its host, and the host to the daemon, s
 
 **State and configuration.**
 
-- `muructl debug inspect`: the worker's sys.path, loaded modules with versions and file paths, environment with secrets redacted, resolved settings, open descriptors and sockets, and thread names.
+- `muructl debug inspect`: the worker's sys.path, loaded modules with versions and file paths, environment with secrets redacted (the value of a key with SECRET, TOKEN, PASSWORD, PASSWD, KEY, CREDENTIAL or AUTH in its name or ending in _DSN, and the password of a URL under any other key), resolved settings, open descriptors and sockets, and thread names.
 - `muructl logging level` (section 11.4) changes a logger's level for a period and reverts on its own.
 - faulthandler is enabled in every worker with its output routed to the log collector, so a crash in a C extension leaves a Python traceback rather than nothing.
 

@@ -35,7 +35,7 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 20.0) -> None:
         time.sleep(0.1)
 
 
-def deploy_plain(daemon: Daemon, processes: int = 2) -> None:
+def deploy_plain(daemon: Daemon, processes: int = 2, *arguments: str) -> None:
     assert daemon.deploy(
         "plain",
         support.FIXTURES,
@@ -45,6 +45,7 @@ def deploy_plain(daemon: Daemon, processes: int = 2) -> None:
         str(processes),
         "--threads",
         "2",
+        *arguments,
     ) == ("muru: release plain@r1 is ready and serving")
 
 
@@ -118,7 +119,14 @@ def test_stacks_are_merged_across_workers_showing_the_same_stack(daemon: Daemon)
 
 
 def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemon) -> None:
-    deploy_plain(daemon, processes=1)
+    deploy_plain(
+        daemon,
+        1,
+        "--env",
+        "DATABASE_URL=postgres://shop:hunter2@db/shop",
+        "--env",
+        "SENTRY_DSN=https://abc123@o1.ingest.sentry.io/1",
+    )
     text = daemon.muructl("debug", "inspect", "plain").stdout
     assert "worker 0 (pid" in text and "python 3." in text
     assert "plain in " in text and "(group default, " in text
@@ -131,6 +139,13 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
         0 if getattr(sys, "_is_gil_enabled", lambda: True)() else 1
     ), first
     assert "MURU_GROUP=default" in text
+
+    # A password in a URL is hidden and the rest kept, and a DSN is
+    # hidden whole (issue 376).
+
+    assert "DATABASE_URL=postgres://shop:***@db/shop" in text, text
+    assert "SENTRY_DSN=***" in text, text
+    assert "hunter2" not in text and "abc123" not in text
 
     answer = json.loads(daemon.muructl("debug", "inspect", "plain", "--json").stdout)
     result = answer["workers"][0]["result"]
