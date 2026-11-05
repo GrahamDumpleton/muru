@@ -380,6 +380,24 @@ container. To run one application in a container, with its configuration
 from the image and its logs on standard output, use `muructl serve`
 instead; [in a container](containers.md) covers it.
 
+The daemon does not know it is in a container, and does not need to: it
+resolves interpreters and builds environments as it does on a node, which
+is right in a development container, where the source is mounted and the
+network is there. An image built ahead of time, with its interpreters and
+environments in it, says so in the daemon file, and the daemon then
+installs nothing at run time and fails at once, naming what the image
+lacks:
+
+```toml
+[tools]
+offline = true                  # nothing is downloaded, the runtime library included
+python_downloads = "never"      # a Python the image lacks fails the release
+```
+
+with `--build never` on each deploy, or `when = "never"` in the project's
+`[tool.muru.build]` table or a declared release's `build` table, so that
+the environment in the image is used as it is.
+
 ## Upgrading
 
 Installing a new version of Muru changes nothing until `muructl daemon
