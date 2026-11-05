@@ -73,9 +73,6 @@ def requests() -> list[dict[str, Any]]:
 def suspend_timeouts() -> bool:
     """Take the calling thread's request out of the timeouts while a debugger holds it."""
 
-def submit(job: Callable[[], Any]) -> bool:
-    """Run job on the worker's application thread pool; False when no worker serves here."""
-
 def loop_beat() -> None:
     """Tell the loop stall watchdog that the event loop has run."""
 

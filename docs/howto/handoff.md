@@ -86,9 +86,8 @@ request's context variables are copied to the application's task.
 ## WebSockets as callbacks
 
 `muru.asgi.websocket.Handler` is an ASGI application that runs a
-WebSocket's events as calls on an object, on the worker's application
-threads, so a WSGI application handles WebSockets in ordinary
-synchronous code:
+WebSocket's events as calls on an object, on threads, so a WSGI
+application handles WebSockets in ordinary synchronous code:
 
 ```python
 from muru.asgi import websocket
@@ -154,10 +153,15 @@ The `ws` object passed to each call has:
 
 An exception from a call is logged and closes the socket with 1011,
 after which `on_disconnect` is called. When a worker stops, its open
-sockets are closed with 1001. In a worker whose own entrypoint is ASGI,
-the calls run on the event loop's pool for synchronous code, sized by
-`sync_threads`. The adapter runs under any ASGI server too, on a thread
-pool of its own, or on `executor` when one is given.
+sockets are closed with 1001.
+
+The calls run on the event loop's pool for synchronous code, sized by
+`sync_threads` (default 8), and take none of the `threads` that serve
+WSGI requests. When every thread of the pool is busy, a call waits for
+one. `muructl debug status` counts the threads running calls under
+[SYNC](debugging.md#status), and `muructl debug stacks` names the socket's
+request on each. The adapter runs under any ASGI server too, on a
+thread pool of its own, or on `executor` when one is given.
 
 ## Applications with a lifespan
 

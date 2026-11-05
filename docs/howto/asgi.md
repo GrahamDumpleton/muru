@@ -53,7 +53,7 @@ on how it is called:
 
 | Called through | Runs on | At once |
 | --- | --- | --- |
-| `asyncio.to_thread`, `loop.run_in_executor(None, ...)`, asgiref's `sync_to_async(..., thread_sensitive=False)` | the loop's own pool, threads named `muru-sync` | `sync_threads` |
+| `asyncio.to_thread`, `loop.run_in_executor(None, ...)`, asgiref's `sync_to_async(..., thread_sensitive=False)`, the calls of a [WebSocket handler](handoff.md#websockets-as-callbacks) | the loop's own pool, threads named `muru-sync` | `sync_threads` |
 | anyio's `to_thread.run_sync`, which Starlette and FastAPI use for `def` endpoints and dependencies | anyio's worker threads | `sync_threads`, which Muru sets as anyio's thread limit in place of its 40 |
 | asgiref's `sync_to_async`, thread sensitive as it is by default | one thread shared by every such call, named `muru-sync-asgiref` | 1 |
 | the same inside Django's ASGI handler, which is where a Django view's ORM calls run | a thread of the request's own | one for each request, so up to `concurrency` |

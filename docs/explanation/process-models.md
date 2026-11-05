@@ -168,10 +168,10 @@ Nothing in the framework needs to know.
 
 The handler above is Muru's WebSocket adapter: an ordinary ASGI application
 that accepts the socket and calls `on_connect`, `on_receive` and
-`on_disconnect` on application threads, one call at a time per socket and
-in order, with every call for a socket inside the same context so a value
-set in `on_connect` is visible later whichever thread runs it. Idle
-sockets cost no Python thread. `send` can be called from any thread, which
+`on_disconnect` on threads of the loop's pool for synchronous code, one
+call at a time per socket and in order, with every call for a socket
+inside the same context so a value set in `on_connect` is visible later
+whichever thread runs it. Idle sockets cost no Python thread. `send` can be called from any thread, which
 is how a broadcast is written, and a handler must not block waiting for
 another message on its own socket. The adapter runs under any ASGI server,
 and an application that already has a Django Channels consumer or a

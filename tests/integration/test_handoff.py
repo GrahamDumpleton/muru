@@ -10,6 +10,7 @@ handoff raises HandoffNotEnabled, naming the setting (ADR 0042).
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import re
@@ -311,12 +312,39 @@ def test_the_websocket_adapter_runs_callbacks_on_threads(server: support.Server)
         assert first.recv(timeout=10) == f"{name}: hello"
         assert second.recv(timeout=10) == f"{name}: hello"
 
-        # The callbacks run on the worker's application threads.
+        # The callbacks run on the loop's pool for synchronous code.
 
         first.send("thread")
-        assert not str(first.recv(timeout=10)).startswith("muru-websocket")
+        assert str(first.recv(timeout=10)).startswith("muru-sync")
 
     assert server.wait_for_log(f"chat: {name} disconnected with 1000")
+
+
+def test_websocket_callbacks_leave_the_application_threads_to_wsgi(server: support.Server) -> None:
+    url = f"ws://127.0.0.1:{server.port}/chat"
+
+    # As many sockets as the workers have application threads, each in a
+    # callback that blocks: a WSGI request still finds a thread.
+
+    count = 2 * len(server.worker_pids())
+
+    with contextlib.ExitStack() as stack:
+        sockets = [stack.enter_context(connect(url, open_timeout=10)) for _ in range(count)]
+
+        for socket_ in sockets:
+            socket_.recv(timeout=10)
+
+        for socket_ in sockets:
+            socket_.send("sleep")
+
+        time.sleep(0.2)
+        started = time.monotonic()
+        response = server.get("/")
+        assert (response.status, response.body) == (200, b"wsgi False\n")
+        assert time.monotonic() - started < 1.0
+
+        for socket_ in sockets:
+            assert socket_.recv(timeout=10) == "slept"
 
 
 def test_the_websocket_adapter_closes_on_an_exception(server: support.Server) -> None:
