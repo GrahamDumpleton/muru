@@ -303,6 +303,14 @@ impl Channel {
             return self.forward(tx, data, more).await;
         }
 
+        // Once the response is complete nothing more is delivered, and the
+        // caller goes on reading the link only to drain it: a later chunk
+        // must not wait for room, since complete() wakes a waiter once.
+
+        if self.completed.load(Ordering::Relaxed) {
+            return false;
+        }
+
         // Wait for room, unless the response ends first.
 
         let permit = tokio::select! {
@@ -644,7 +652,7 @@ impl Channel {
 
                 // Section 7.6: a WebSocket runs as long as it needs to.
 
-                self.shared.request_exempt(self.request);
+                self.shared.request_websocket(self.request);
                 let head = Outgoing::Head {
                     status: 101,
                     reason: String::new(),

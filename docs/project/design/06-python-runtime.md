@@ -21,7 +21,7 @@ sequenceDiagram
   D->>H: spawn python -m muru.host with run directory, token and settings
   H->>H: set subreaper, signal handlers, logging defaults
   H->>H: import every mount entrypoint (preload), on_load hooks
-  H->>H: pre_fork hooks, gc.freeze, thread check
+  H->>H: pre_fork hooks, import check, gc.freeze, thread check
   H-->>D: loaded
   D->>H: desired workers per group
   H->>W: fork
@@ -37,7 +37,7 @@ The host never serves requests, so its memory stays clean and shared copy-on-wri
 
 | Value | Behaviour |
 | --- | --- |
-| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead: it re-executes itself without preload, so nothing the import left behind reaches a worker. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen. The on_load hook has run once in the host by then, and runs again in each worker |
+| auto (default) | The host imports the application, then runs the import check of section 6.2. If the import left nothing behind that cannot be shared across fork, workers are forked from the host. Otherwise the host logs a warning naming what it found, raises a preload.fell_back event, and runs the release with per-worker imports instead: it re-executes itself without preload, so nothing the import left behind reaches a worker. The release still works, with slower worker replacement and no shared memory, and the warning says what to fix or what a post_fork hook must reopen. The on_load and pre_fork hooks have run once in the host by then, and run again in each worker |
 | true | Preload, and treat any finding of the import check as a release failure during warm-up. For applications whose imports are known to be fork-safe, so that a regression is caught instead of silently costing the preload benefits |
 | false | Import in each worker. The check is skipped |
 
@@ -46,7 +46,7 @@ Per-worker imports keep everything else the same: worker groups, mounts, variant
 ## 6.2 Fork safety
 
 - The host is single-threaded: no threads, event loop or Rust runtime exist before fork. Its control loop is plain Python using selectors and waitpid.
-- **The import check.** After preload and the on_load hooks, and before the first fork, the host compares the process with its state before the import and reports anything that would be shared or lost across fork: connected sockets and pipes (new descriptors whose getpeername succeeds, or that lead to a child process), threads, including native threads that the threading module cannot see (counted from /proc/self/task on Linux and from the Mach task on macOS, which catches librdkafka, grpcio and similar C libraries), child processes, and running event loops. Each finding names the descriptor or thread and, where it can be determined, the module whose import created it. Descriptors that are safe to share are not reported: regular files, unconnected UDP sockets and the host's own control channel. The findings decide what preload = 'auto' does (section 6.1), and are raised as a preload.unsafe_import event either way.
+- **The import check.** After preload and the on_load and pre_fork hooks, and before the first fork, the host compares the process with its state before the import and reports anything that would be shared or lost across fork: connected sockets and pipes (new descriptors whose getpeername succeeds, or that lead to a child process), threads, including native threads that the threading module cannot see (counted from /proc/self/task on Linux and from the Mach task on macOS, which catches librdkafka, grpcio and similar C libraries), child processes, and running event loops. Each finding names the descriptor or thread and, where it can be determined, the module whose import created it. Descriptors that are safe to share are not reported: regular files, unconnected UDP sockets and the host's own control channel. The findings decide what preload = 'auto' does (section 6.1), and are raised as a preload.unsafe_import event either way.
 - os.register_at_fork callbacks are honoured, and workers inherit only the descriptors they need.
 - A failing import fails the release during warm-up, never during live traffic.
 
@@ -66,7 +66,7 @@ Hooks live in a module named by the hooks setting. Each receives a context objec
 | Hook | Runs in | Typical use |
 | --- | --- | --- |
 | on_load | host, after import | validate configuration, warm fork-safe caches |
-| pre_fork | host, once before the first fork | close sockets and files that must not be shared |
+| pre_fork | host, once after on_load and before the import check and the first fork | close sockets and files that must not be shared, which the import check then does not report |
 | post_fork | worker, after fork | reopen database connections, reseed, start background threads |
 | on_ready | worker, before its sockets are announced | final warm-up |
 | on_drain | worker, when told to stop, before requests in flight finish | stop background work, flush |

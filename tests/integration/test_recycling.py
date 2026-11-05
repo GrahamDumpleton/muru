@@ -30,12 +30,12 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 20.0) -> None:
 
 
 def replacements(log: str) -> list[str]:
-    """The worker.recycled and worker.timeout_killed lines muructl printed."""
+    """The worker.recycled and worker.timeout_killed lines the host logged."""
 
     return [
         line
         for line in log.splitlines()
-        if line.startswith("muru: worker.") and "replaced by pid" in line
+        if line.startswith("muru.host[") and ": worker." in line and "replaced by pid" in line
     ]
 
 
@@ -132,9 +132,10 @@ def test_a_request_past_the_hard_timeout_replaces_its_worker() -> None:
         # Section 11.7: the event says where the stuck request was, from
         # the stacks taken before the worker went.
 
-        wait_for(lambda: "muru: worker.timeout_killed:" in server.log(), timeout=30)
+        wait_for(lambda: ": worker.timeout_killed: worker 0" in server.log(), timeout=30)
         assert re.search(
-            r"muru: worker\.timeout_killed: .*; at plain_wsgi\.py line \d+ in application",
+            r"muru\.host\[\d+\]: worker\.timeout_killed: .*; "
+            r"at plain_wsgi\.py line \d+ in application",
             server.log(),
         ), server.log()
         thread.join(timeout=30)

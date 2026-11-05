@@ -567,7 +567,7 @@ def test_a_session_that_may_act_promotes_rolls_back_scales_restarts_and_drains(
             return {
                 int(worker["index"]): int(worker["pid"])
                 for worker in answer["workers"]
-                if worker["ok"] and worker["result"]["ready"] and not worker["result"]["replaced"]
+                if worker["ok"] and worker["result"]["state"] == "ready"
             }
 
         # The lifted pin takes the third worker away first.

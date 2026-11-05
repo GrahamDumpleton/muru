@@ -55,13 +55,15 @@ def redirecting(
                 header, value = item.split(":", 1)
                 headers.append((f"X-Muru-Redirect-Header-{header}", value))
 
-        # A body too, which the edge drains before it routes the request on.
+        # A body too, which the edge drains before it routes the request on:
+        # with size, that many bytes in one piece.
 
+        body = b"x" * int(params["size"]) if "size" in params else b"redirect\n"
         start_response(
             f"{params.get('status', '200')} Redirecting",
-            [*headers, ("Content-Type", "text/plain"), ("Content-Length", "9")],
+            [*headers, ("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
         )
-        return [b"redirect\n"]
+        return [body]
 
     if name == "accel":
         start_response(

@@ -66,19 +66,28 @@ The argument is `module:callable`. If the virtualenv is somewhere else,
 `--python path/to/python` names its interpreter. The terminal shows:
 
 ```
+muru: fetched the runtime library muru-1.0.0-cp313-cp313-manylinux_2_28_x86_64.whl from PyPI, once
+muru: runtime library 1.0.0 from /home/dev/.cache/muru/runtime/1.0.0/cp313
 muru.host[12345]: preloaded app:application in 2 ms
 muru.host[12345]: app:application is served as WSGI
 muru.host[12345]: worker 0 started as pid 12346
+muru.host[12345]: worker 0 (pid 12346) is ready
 muru: serving app:application on http://127.0.0.1:8080 with 1 worker of 4 threads
-muru: development mode: error pages show tracebacks, nothing is persisted and only loopback is served; production runs under the daemon (muructl daemon start)
+muru: development mode: error pages show tracebacks, nothing is persisted, the run reloads on change and only loopback is served; production runs under the daemon (muructl daemon start)
 muru: dashboard on http://127.0.0.1:8081/
+muru: admin socket /run/user/1000/muru/runs/8080/admin.sock
+muru: watching /home/dev/hello for changes to **/*.py
 ```
 
-Three things happened. A host process imported your application once. It
+The first two lines are `muructl` providing the runtime library for your
+interpreter, fetched this once and kept in your user cache. Then three
+things happened. A host process imported your application once. It
 forked a worker, which is a copy of the host with the application already
-loaded. And the edge, the part of muructl that speaks HTTP, started
-listening in front of the worker. Open http://127.0.0.1:8080/hello and the
-terminal adds an access log line:
+loaded, and the worker said it was ready. And the edge, the part of
+muructl that speaks HTTP, started listening in front of the worker. The
+last two lines name the socket that `muructl`'s own commands reach this
+run on, and the directory it watches for changes. Open
+http://127.0.0.1:8080/hello and the terminal adds an access log line:
 
 ```
 05:42:22.836 200 GET /hello 18B 0.7ms queue=0.2ms app=0.3ms worker=0 id=01M5P6WZBK740HFT2N80MAV4YV
@@ -125,10 +134,13 @@ save. The terminal says what changed and that it switched to a new
 release:
 
 ```
-muru: reloading, app.py changed
+muru: reloading, /home/dev/hello/app.py changed
 muru.host[12400]: preloaded app:application in 2 ms
+muru.host[12400]: app:application is served as WSGI
 muru.host[12400]: worker 0 started as pid 12401
+muru.host[12400]: worker 0 (pid 12401) is ready
 muru: switched to release r2
+muru.host[12345]: received SIGTERM, stopping
 ```
 
 Each reload is a fresh host and worker; the old ones serve until the new
@@ -136,7 +148,9 @@ ones are ready, then stop. If the new code fails to import, the terminal
 says so and the previous release keeps serving:
 
 ```
-muru: release r3 failed to start: ...; release r2 keeps serving
+muru: reloading, /home/dev/hello/app.py changed
+muru.host[12450]: cannot load app:application: SyntaxError: expected ':' (app.py, line 1)
+muru: release r3 failed to start: the host exited with exit status: 1 before its workers were ready; release r2 keeps serving
 ```
 
 The failed attempt was still a release, so the fix after it is `r4`.

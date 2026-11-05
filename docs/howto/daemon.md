@@ -264,7 +264,9 @@ with the same keys `muructl run --print-config` writes.
 ## Running it
 
 `muructl daemon start` starts the daemon in the background, logging to
-`daemon.log` in the log directory, and waits until it answers; `muructl
+`daemon.log` in the log directory, and waits until it answers. The
+daemon writes its pid to `daemon.pid` in the runtime directory and
+removes the file when it exits. `muructl
 up` does the same and is harmless when one already runs. `muructl daemon
 status` and `muructl status` show the daemon, its edge process, its
 listener and its locations. `--metrics ADDRESS`, or a `[metrics]` table
@@ -303,7 +305,9 @@ host keep serving exactly as they were. The next `muructl daemon start`
 the records in the runtime directory, takes them over, and carries on,
 so a daemon restart or upgrade never costs a request. `muructl daemon
 stop --shutdown` drains every release, stops the hosts and the edge, and
-then exits, for taking a node out of service.
+then exits, for taking a node out of service. It leaves no records
+behind in the runtime directory, and the next daemon starts the current
+releases afresh.
 
 A host whose daemon is gone keeps its workers; a host that dies takes
 its workers with it, and the next daemon starts its release again. A
@@ -375,6 +379,24 @@ for the state store keeps the deployed releases across a restart of the
 container. To run one application in a container, with its configuration
 from the image and its logs on standard output, use `muructl serve`
 instead; [in a container](containers.md) covers it.
+
+The daemon does not know it is in a container, and does not need to: it
+resolves interpreters and builds environments as it does on a node, which
+is right in a development container, where the source is mounted and the
+network is there. An image built ahead of time, with its interpreters and
+environments in it, says so in the daemon file, and the daemon then
+installs nothing at run time and fails at once, naming what the image
+lacks:
+
+```toml
+[tools]
+offline = true                  # nothing is downloaded, the runtime library included
+python_downloads = "never"      # a Python the image lacks fails the release
+```
+
+with `--build never` on each deploy, or `when = "never"` in the project's
+`[tool.muru.build]` table or a declared release's `build` table, so that
+the environment in the image is used as it is.
 
 ## Upgrading
 

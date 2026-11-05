@@ -512,7 +512,8 @@ impl Admin for Service {
         } else {
             if request.app.is_empty() {
                 return Err(Status::invalid_argument(
-                    "name an application, or ask for the access log",
+                    "name an application, or ask for the access log; only a development \
+                     run's application can be left out",
                 ));
             }
 
@@ -755,6 +756,28 @@ impl Admin for Service {
                 })
                 .collect(),
         }))
+    }
+
+    async fn list_requests(
+        &self,
+        request: Request<pb::ListRequestsRequest>,
+    ) -> Result<Response<pb::RequestList>, Status> {
+        let request = request.into_inner();
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Requests {
+                app: request.app,
+                limit: request.limit,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?;
+        let report = done_rx
+            .await
+            .map_err(|_| Status::unavailable(STOPPING))?
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        Ok(Response::new(muru_edge::requests::admin_list(report)))
     }
 
     async fn reload_config(

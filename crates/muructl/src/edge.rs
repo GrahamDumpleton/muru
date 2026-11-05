@@ -517,6 +517,19 @@ impl EdgeControl for Control {
         )))
     }
 
+    async fn get_requests(
+        &self,
+        request: Request<pb::RequestsRequest>,
+    ) -> Result<Response<pb::Requests>, Status> {
+        let request = request.into_inner();
+        Ok(Response::new(muru_edge::requests::report(
+            &self.access_log,
+            &self.pools.current(),
+            &request.app,
+            request.limit as usize,
+        )))
+    }
+
     async fn stop(&self, _: Request<pb::StopRequest>) -> Result<Response<pb::Stopped>, Status> {
         let _ = self.stop.try_send(());
         Ok(Response::new(pb::Stopped {}))

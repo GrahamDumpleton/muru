@@ -102,6 +102,7 @@ def test_a_reader_that_stops_holds_up_no_request() -> None:
             "--chdir",
             str(support.FIXTURES),
             "--no-reload",
+            *support.dashboard_args(())[0],
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

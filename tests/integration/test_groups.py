@@ -137,7 +137,12 @@ def test_a_group_recycles_its_workers_by_its_own_count(development: support.Serv
     for _ in range(3):
         assert served_by(development.get("/slow/report?ms=10"))["group"] == "slow"
 
-    assert development.wait_for_log("(max_requests 2)")
+    # The test before this one had the slow worker serve two requests as
+    # well, so its recycle can be under way: the wait is for the line that
+    # says a worker is being replaced, not for the count alone, which its
+    # replacement's line carries too (issue 382).
+
+    assert development.wait_for_log("(max_requests 2); replacing it")
 
     for _ in range(3):
         assert served_by(development.get("/"))["group"] == "default"

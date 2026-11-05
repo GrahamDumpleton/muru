@@ -659,11 +659,8 @@ impl Admin for Service {
             return Ok(Response::new(self.lines("", "", first, live)));
         }
 
-        if request.app.is_empty() {
-            return Err(Status::invalid_argument(
-                "name an application, or ask for the access log",
-            ));
-        }
+        // A run serves one application, so none named is that one, as
+        // for the debug commands (issue 375).
 
         let release = state
             .target(&request.app, &request.release)
@@ -736,6 +733,20 @@ impl Admin for Service {
                 })
                 .collect(),
         }))
+    }
+
+    async fn list_requests(
+        &self,
+        request: Request<pb::ListRequestsRequest>,
+    ) -> Result<Response<pb::RequestList>, Status> {
+        let request = request.into_inner();
+        let report = muru_edge::requests::report(
+            &self.state.access_log,
+            &self.state.pools.current(),
+            &request.app,
+            request.limit as usize,
+        );
+        Ok(Response::new(muru_edge::requests::admin_list(report)))
     }
 
     async fn debug(

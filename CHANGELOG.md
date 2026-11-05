@@ -9,6 +9,143 @@ breaking changes, which are listed under each release.
 
 <!-- towncrier release notes start -->
 
+## 0.1.0a18 (2026-11-05)
+
+### Added
+
+- `muructl logs` with no application, against a development run, shows the
+  run's application's output, as the `debug` commands take the run's
+  application when none is named. The daemon still needs the application
+  named unless `--access` is given, and says so. ([#375](https://github.com/muruhq/muru/issues/375))
+- `muructl debug inspect` hides a password carried in a URL, whatever the
+  variable's name: `DATABASE_URL=postgres://shop:hunter2@db/shop` is shown
+  as `postgres://shop:***@db/shop`, and the rest of the URL is kept. A
+  name ending in `_DSN` is hidden whole, as those with SECRET, TOKEN,
+  PASSWORD, KEY, CREDENTIAL or AUTH in them are. ([#376](https://github.com/muruhq/muru/issues/376))
+- `muructl requests` shows the requests in flight now as `muructl websockets`
+  shows open sockets: counted by worker group, since the edge queues per
+  group, as QUEUED and QUEUED-OLDEST, THREADS (busy of the group's threads)
+  and THREAD-OLDEST, and LOOP and LOOP-OLDEST, the columns of the sides the
+  release has; and with `--list` each request, the oldest first, with its age,
+  state (queued or running), kind (`wsgi`, `wsgi streaming`, `asgi`, `asgi
+  streaming`, `grpc`, `handoff` or `upstream`), worker, method and target,
+  client and request id. Served by the daemon, a development run and `muructl
+  serve`, with `--json` and an MCP tool beside `websockets`. The edge keeps
+  the listing beside each request's access log record, spread over several
+  maps so that a request's arrival and end never queue on one lock, and a busy
+  worker's throughput measured the same with it. ([#379](https://github.com/muruhq/muru/issues/379))
+
+### Changed
+
+- `muructl debug status` shows what each side of a worker holds as of the
+  moment it answers: THREADS and THREAD-OLDEST for the application threads,
+  counting a request held at `breakpoint()` or streaming its response, and
+  LOOP and LOOP-OLDEST for the event loop, open WebSockets left out, in place
+  of one IN-FLIGHT count and an OLDEST age that could be a second old and left
+  exempt requests out. A worker that does not answer within a second is shown
+  from its last report, marked with a star. STATE is `starting`, `ready`,
+  `debugging`, `replacing` or `retiring`, ROUTED says whether the edge sends
+  it requests, and `--json` carries `state`, `routed`, `threads`, `loop` and
+  `stale` in place of `replaced`, `in_flight` and `oldest_ms`. The dashboard's
+  workers page shows the same. Every header of a `muructl` table is one word
+  now: `QUEUE-P95` in `scale status` and `REQUEST-ID` in `websockets --list`. ([#369](https://github.com/muruhq/muru/issues/369))
+
+### Fixed
+
+- When the edge discards the rest of a worker's response, after an
+  internal redirect, an error page in its place or a client that went
+  away, it no longer reads each body frame whole into memory first. A
+  drained 16 MiB response no longer costs the edge a 16 MiB allocation. ([#346](https://github.com/muruhq/muru/issues/346))
+- The note muructl prints when it provides the runtime library now says where
+  the wheel came from: `unpacked the runtime library FILE from DIR` for a
+  wheel directory, and `fetched the runtime library FILE from PyPI` for a
+  download. Before, both said "fetched". `muructl runtime install` and
+  `muructl build --runtime-dir` say the same. ([#354](https://github.com/muruhq/muru/issues/354))
+- `muructl daemon stop --shutdown` no longer leaves host and edge records,
+  empty release directories and the rate limits' buckets in the runtime
+  directory. A daemon started in the background now writes `daemon.pid`
+  itself and removes it when it exits, so the file no longer names a
+  daemon that has gone. ([#355](https://github.com/muruhq/muru/issues/355))
+- The errors for a key muru.local.toml does not take now read as sentences:
+  `processes is not a key of muru.local.toml, which takes only the [run]
+  table and the when key of [build]`, and for `[build]`, `whose [build] table
+  takes only the when key`. A scaling table with another key beside
+  `mode = 'static'` is now refused with `mode = 'static', the default, takes
+  no other key but advisory`, which also names the one key it does take. ([#359](https://github.com/muruhq/muru/issues/359))
+- A request whose response ended before its body had been read no longer
+  leaves the client connection stuck. On HTTP/1.1 the edge now reads and
+  discards the rest of the body, up to 1 MiB, before the end of the response
+  goes out, and closes the connection after the response when the remainder
+  is larger or slow to arrive; a remainder declared over 1 MiB is given up at
+  once. Ending the response first had left the connection waiting on both
+  sides with clients such as oha. An ASGI worker whose application answered
+  without receiving a body larger than it buffers now drains the rest of the
+  body once the response is complete, where it had stopped reading from the
+  edge and held up the request and the connection. ([#360](https://github.com/muruhq/muru/issues/360))
+- A worker under `muructl debug trace` keeps serving while the trace runs,
+  so the trace counts the requests it was run to look at. The host had
+  taken the traced worker out of routing, which left the trace with only
+  the requests already in flight and reported nothing for an idle worker. ([#361](https://github.com/muruhq/muru/issues/361))
+- The `pre_fork` hook now runs in the host before the preload import check,
+  so a socket or pipe the import left open and `pre_fork` closes is no
+  longer reported, as the check's advice to close it in `pre_fork` says.
+  `muructl check` runs `on_load` and `pre_fork` in the same places, so it
+  reports what the host would. The hook had run only at the first fork,
+  after the check, so following that advice never passed it. ([#365](https://github.com/muruhq/muru/issues/365))
+- The preload import check names the module whose import left a socket,
+  pipe or thread behind when that module was imported with `from package
+  import module` or `from . import module`. It had named the module doing
+  the importing instead, since importlib loads such a submodule without
+  the check seeing it as an import of its own. ([#366](https://github.com/muruhq/muru/issues/366))
+- A request the application failed, or that ran past the soft timeout or
+  the request deadline, is written to the access log with the time the
+  application ran, where it had shown `app=0.0ms` however long it took.
+  The JSON access log's `app_ms` and the application time metric get the
+  same figure, for worker, gRPC and managed server requests alike. ([#367](https://github.com/muruhq/muru/issues/367))
+- An event a worker raises, such as a request past the soft timeout, an
+  event loop stall or a recycle, is one line in a development run's
+  terminal and one in a release's log under the daemon: the host's line,
+  which now starts with the event's kind, as in `request.soft_timeout:
+  worker 0 (pid 5121): ...`. The worker had printed its own line as well,
+  and `muructl run` printed the event a third time. The start-up lines
+  `worker 0 started as pid ...` and `... is ready` are unchanged. ([#368](https://github.com/muruhq/muru/issues/368))
+- `muructl debug memory` writes every size with a unit, as `debug status`
+  does: `rss 47.4MB  pss 29.8MB  uss 28.5MB`, and the tracemalloc sizes of
+  `--snapshot` likewise. pss, uss and the tracemalloc sizes were bare
+  numbers of bytes, since they are seldom a whole number of kilobytes. ([#370](https://github.com/muruhq/muru/issues/370))
+- `muructl debug inspect` names a free-threaded build once. For a WSGI
+  worker the process model is `free-threaded` already, so the build was
+  named twice: `(group default, free-threaded, free-threaded)`. An ASGI
+  worker's model is `async`, and its line still ends `async,
+  free-threaded` on such a build. ([#371](https://github.com/muruhq/muru/issues/371))
+
+### Security
+
+- Secret files (`as = 'file'`) no longer stay on disk after the release
+  that needed them: a release's files are removed when its host stops, and
+  a command run with the release gets files of its own, removed when it
+  ends. ([#357](https://github.com/muruhq/muru/issues/357))
+
+### Documentation
+
+- The daemon guide says how a daemon run as a container's main process is told
+  that its image was built ahead of time: `offline = true` and
+  `python_downloads = "never"` in `[tools]`, and `never` as the build setting.
+  The daemon does not detect a container, since a development container wants
+  the builds and downloads a node does. ([#285](https://github.com/muruhq/muru/issues/285))
+- The tutorials show the start-up output `muructl run` prints now: the
+  runtime library line, the worker's ready line, the current development
+  mode line, the admin socket and the directory watched for changes, and a
+  reload as it is printed. ([#372](https://github.com/muruhq/muru/issues/372))
+- The debugging guide's pdb sample stops on the `breakpoint()` line, as a
+  session does on Python 3.13 and later, and the guide says that an IDE
+  stops at the line after it. ([#373](https://github.com/muruhq/muru/issues/373))
+- The debugging guide and the specification say what `muructl debug profile`
+  costs a busy worker, measured in each way the samples are taken: nothing
+  measurable at the default interval, read from outside or in the worker with
+  or without the GIL, and a few percent at a 1 ms interval. ([#374](https://github.com/muruhq/muru/issues/374))
+
+
 ## 0.1.0a17 (2026-11-04)
 
 ### Added

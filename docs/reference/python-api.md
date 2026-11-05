@@ -31,7 +31,7 @@ return value is ignored.
 | Hook | Where and when |
 | --- | --- |
 | `on_load(context)` | In the host, once, after the application is imported |
-| `pre_fork(context)` | In the host, once, before the first worker is forked |
+| `pre_fork(context)` | In the host, once, after `on_load` and before the import check and the first fork |
 | `post_fork(context)` | In each worker, right after the fork |
 | `on_ready(context)` | In each worker, after `post_fork`, before it accepts requests |
 | `on_drain(context)` | In each worker when it is told to stop, before requests in flight finish |

@@ -191,8 +191,8 @@ pub enum How {
     Environment,
     /// An unpacked wheel that was already there.
     Directory,
-    /// An unpacked wheel fetched now.
-    Fetched,
+    /// A wheel unpacked now, from the wheel directory or PyPI.
+    Installed,
     /// The environment's own `muru` of another version, because nothing
     /// matching could be had.
     Fallback,
@@ -208,8 +208,8 @@ pub struct Provided {
     pub version: String,
     /// How it was provided.
     pub how: How,
-    /// Lines worth telling: what was fetched, and the warning of a
-    /// fallback.
+    /// Lines worth telling: what was unpacked and from where, and the
+    /// warning of a fallback.
     pub notes: Vec<String>,
 }
 
@@ -226,6 +226,38 @@ impl Provided {
             ),
             (_, Some(path)) => format!("runtime library {} from {}", self.version, path.display()),
             (_, None) => format!("runtime library {}", self.version),
+        }
+    }
+}
+
+/// Where an installed wheel came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The wheel directory.
+    WheelDir(PathBuf),
+    /// PyPI, with the published hash verified.
+    PyPi,
+}
+
+/// A wheel `install` unpacked: its file name and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    /// The wheel's file name.
+    pub filename: String,
+    /// Where it came from.
+    pub origin: Origin,
+}
+
+impl Installed {
+    /// One line saying what was unpacked and from where.
+    pub fn describe(&self) -> String {
+        match &self.origin {
+            Origin::WheelDir(dir) => format!(
+                "unpacked the runtime library {} from {}",
+                self.filename,
+                dir.display()
+            ),
+            Origin::PyPi => format!("fetched the runtime library {} from PyPI", self.filename),
         }
     }
 }
@@ -356,11 +388,11 @@ pub async fn provide(
     }
 
     match install(options, &dir).await {
-        Ok(filename) => Ok(Provided {
+        Ok(installed) => Ok(Provided {
             pythonpath: Some(dir),
             version: options.version.to_owned(),
-            how: How::Fetched,
-            notes: vec![format!("fetched the runtime library {filename}, once")],
+            how: How::Installed,
+            notes: vec![format!("{}, once", installed.describe())],
         }),
         Err(error) => match installed {
             Some(found) => Ok(Provided {
@@ -386,8 +418,9 @@ pub async fn provide(
 /// Install the wheel for the probed interpreter into `target`, which then
 /// holds the `muru` package and goes on PYTHONPATH: from the wheel
 /// directory when it has one, else from PyPI unless offline, with the
-/// published hash verified. Returns the wheel's file name.
-pub async fn install(options: &Options<'_>, target: &Path) -> Result<String, RuntimeError> {
+/// published hash verified. Returns the wheel's file name and where it
+/// came from.
+pub async fn install(options: &Options<'_>, target: &Path) -> Result<Installed, RuntimeError> {
     let tag = options.probe.tag();
     let platform = format!("{} {}", options.probe.platform, options.probe.machine);
 
@@ -405,7 +438,11 @@ pub async fn install(options: &Options<'_>, target: &Path) -> Result<String, Run
                 source,
             })?;
             unpack(options.probe, name, &bytes, target)?;
-            return Ok(name.to_owned());
+
+            return Ok(Installed {
+                filename: name.to_owned(),
+                origin: Origin::WheelDir(wheel_dir.to_path_buf()),
+            });
         }
 
         if options.offline {
@@ -433,7 +470,11 @@ pub async fn install(options: &Options<'_>, target: &Path) -> Result<String, Run
     }
 
     unpack(options.probe, &filename, &bytes, target)?;
-    Ok(filename)
+
+    Ok(Installed {
+        filename,
+        origin: Origin::PyPi,
+    })
 }
 
 /// The wheel files in a directory.
@@ -842,14 +883,20 @@ mod tests {
             .block_on(provide(&options, "MURU_WHEEL_DIR"))
             .unwrap();
 
-        assert_eq!(provided.how, How::Fetched);
+        assert_eq!(provided.how, How::Installed);
         let path = provided.pythonpath.clone().unwrap();
         assert!(path.join("muru").join("__init__.py").is_file());
         assert_eq!(
             path,
             runtime_dir(&dir.path().join("runtime"), "9.9.9", &tag)
         );
-        assert!(provided.notes[0].starts_with("fetched the runtime library muru-9.9.9"));
+        assert_eq!(
+            provided.notes[0],
+            format!(
+                "unpacked the runtime library {name} from {}, once",
+                wheel_dir.display()
+            )
+        );
 
         // The second time it is already there.
 

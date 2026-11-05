@@ -69,19 +69,32 @@ def test_a_wsgi_request_past_the_soft_timeout_is_interrupted() -> None:
         # The log says which request was interrupted and where it was.
 
         assert server.wait_for_log("ran past the soft timeout of 1 s")
+        assert server.wait_for_log("muru.RequestTimeout")
         log = server.log_since_mark()
         assert "GET /busy?seconds=10" in log
         assert "muru.RequestTimeout" in log and "plain_wsgi.py" in log, log
+        assert log.count("ran past the soft timeout") == 1, log
 
         # Section 11.7: the event carries where the request was, taken
-        # before it was interrupted.
+        # before it was interrupted, and the terminal says it once, in the
+        # host's line for the event, which names its kind (issue 368).
 
-        assert server.wait_for_log("request.soft_timeout: worker 0")
         assert re.search(
-            r"request\.soft_timeout: worker 0 \(pid \d+\): request \S+ GET /busy\?seconds=10 "
+            r"muru\.host\[\d+\]: request\.soft_timeout: worker 0 \(pid \d+\): request \S+ "
+            r"GET /busy\?seconds=10 "
             r"ran past the soft timeout of 1 s at \S+ line \d+ in \w+",
             server.log_since_mark(),
         ), server.log_since_mark()
+
+        # The access log has the time the application ran until it was
+        # interrupted, not none (issue 367).
+
+        assert server.wait_for_log("reason=soft_timeout")
+        ran = re.search(
+            r"\b504 GET /busy\?seconds=10 .* app=([\d.]+)(ms|s) ", server.log_since_mark()
+        )
+        assert ran, server.log_since_mark()
+        assert float(ran[1]) / (1000 if ran[2] == "ms" else 1) >= 0.9, ran[0]
 
         # The worker is the same one, and nothing is left over from the
         # interruption for the requests that follow on its threads.

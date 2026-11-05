@@ -142,7 +142,7 @@ APP              ENDPOINT                                   OPEN
 chat             /ws/rooms/{id}                              480
 chat             /ws/notify                                   20
 $ muructl websockets chat --list --limit 2
-OPENED               FOR       RELEASE          PATH                             CLIENT           RECEIVED     SENT WORKER REQUEST ID
+OPENED               FOR       RELEASE          PATH                             CLIENT           RECEIVED     SENT WORKER REQUEST-ID
 2026-10-27T05:42:23Z 12m 4s    chat@r3          /ws/rooms/1844                   203.0.113.9            12       40 0      01M5P6WZD3740HFT2N80MAV4YV
 2026-10-27T05:42:31Z 11m 56s   chat@r3          /ws/rooms/2013                   198.51.100.4            3        9 1      01M5P6WZE1740HFT2N80MAV4YV
 (2 of 500 open shown; --limit shows more)

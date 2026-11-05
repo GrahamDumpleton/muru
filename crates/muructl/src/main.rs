@@ -262,6 +262,9 @@ enum Command {
     /// Show the WebSockets open now: how many by endpoint, or each one
     /// with --list.
     Websockets(admin::WebSocketsArgs),
+    /// Show the requests in flight now: how many by worker group, queued
+    /// or running, or each one
+    Requests(admin::RequestsArgs),
 
     /// Serve muructl's operations to a coding agent over the Model Context
     /// Protocol, and keep the skill a project carries for the agent.
@@ -1010,6 +1013,7 @@ fn main() -> anyhow::Result<()> {
             runtime.block_on(admin::metrics(socket, output.json))
         }
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
+        Command::Requests(args) => runtime.block_on(admin::requests(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {
@@ -3459,9 +3463,11 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, message, group, reason, .. } => {
+                    muru_controller::host::HostMessage::Event { kind, group, reason, .. } => {
+                        // The host has logged the event, and its line is
+                        // the one the terminal shows; the run counts it.
+
                         run_admin::count_worker_event(&label, &format!("r{}", current.release), &kind, &group, &reason);
-                        muru_common::muru_println!("{kind}: {message}");
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);

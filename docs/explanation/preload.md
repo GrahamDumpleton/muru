@@ -72,7 +72,7 @@ functions, each taking the context described below:
 | Hook | Runs | Use it for |
 | --- | --- | --- |
 | `on_load` | once in the host, after the import | checks and warm-up that are safe to share |
-| `pre_fork` | once in the host, before the first fork | closing anything that must not cross the fork |
+| `pre_fork` | once in the host, after `on_load` and before the import check and the first fork | closing anything that must not cross the fork, so the check does not report it |
 | `post_fork` | in each worker, right after the fork | opening connections, starting threads, seeding random state |
 | `on_ready` | in each worker, before it takes requests | signalling readiness to something else |
 | `on_drain` | in each worker when it is told to stop, before in-flight requests finish | stopping background work |

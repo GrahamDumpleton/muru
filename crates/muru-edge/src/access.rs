@@ -23,7 +23,7 @@
 //! in a list of its own, counted in its own metrics, and written as a
 //! second line, with the same request id, when it closes.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -664,21 +664,202 @@ pub struct AccessLog {
     /// The WebSockets open now, by a number of their own.
     websockets: Mutex<BTreeMap<u64, Arc<Socket>>>,
     next_websocket: AtomicU64,
+    /// The requests in flight now (section 11.7), by a number of their
+    /// own, spread over maps by that number so that a request's arrival
+    /// and end never queue on one lock behind every other request's.
+    live: Vec<Mutex<HashMap<u64, Arc<Live>>>>,
+    next_live: AtomicU64,
     /// Each record as its JSON line, for a follower such as `muructl
     /// logs --access` under a development run (section 13.1).
     lines: tokio::sync::broadcast::Sender<String>,
 }
 
-/// A request counted as in flight until this is dropped.
+/// How many maps the requests in flight are spread over.
+const LIVE_SHARDS: usize = 16;
+
+/// A request in flight, from its arrival to the end of its response:
+/// counted in the metrics and listed (section 11.7) until this is
+/// dropped. What the edge learns of it meanwhile, which worker took it
+/// and on which side, whether it streams, is noted here.
 pub struct InFlight {
     log: Arc<AccessLog>,
-    app: String,
-    release: String,
+    id: u64,
+    live: Arc<Live>,
+}
+
+impl InFlight {
+    /// A worker took the request: it runs there now, on the worker's
+    /// threads or on its event loop.
+    pub fn dispatched(&self, worker: usize, on_loop: bool) {
+        let mut progress = self.live.progress.lock().expect("live request poisoned");
+        progress.running = true;
+        progress.worker = Some(worker);
+        progress.side = if on_loop { Side::Loop } else { Side::Threads };
+        progress.kind = if on_loop { Kind::Asgi } else { Kind::Wsgi };
+    }
+
+    /// A gRPC call a worker took.
+    pub fn grpc(&self, worker: usize, on_loop: bool) {
+        self.dispatched(worker, on_loop);
+        self.live
+            .progress
+            .lock()
+            .expect("live request poisoned")
+            .kind = Kind::Grpc;
+    }
+
+    /// The request went to a managed server (section 9.9).
+    pub fn upstream(&self) {
+        let mut progress = self.live.progress.lock().expect("live request poisoned");
+        progress.running = true;
+        progress.kind = Kind::Upstream;
+    }
+
+    /// The worker handed the request to its other interface (section
+    /// 6.14), so it counts against that side now.
+    pub fn handed(&self, to_loop: bool) {
+        let mut progress = self.live.progress.lock().expect("live request poisoned");
+        progress.side = if to_loop { Side::Loop } else { Side::Threads };
+        progress.kind = Kind::Handoff;
+    }
+
+    /// The response head asked for immediate flushing: the response
+    /// streams, for as long as it needs to (section 7.6).
+    pub fn streaming(&self) {
+        self.live
+            .progress
+            .lock()
+            .expect("live request poisoned")
+            .streaming = true;
+    }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.log.metrics.finish(&self.app, &self.release);
+        self.log.metrics.finish(&self.live.app, &self.live.release);
+        self.log.live[shard(self.id)]
+            .lock()
+            .expect("live requests poisoned")
+            .remove(&self.id);
+    }
+}
+
+/// The map a request in flight is kept in.
+fn shard(id: u64) -> usize {
+    (id % LIVE_SHARDS as u64) as usize
+}
+
+/// A request in flight: what was known when it arrived, and its progress.
+struct Live {
+    started: Instant,
+    started_at: SystemTime,
+    request_id: String,
+    client: IpAddr,
+    app: String,
+    release: String,
+    group: String,
+    method: String,
+    target: String,
+    progress: Mutex<Progress>,
+}
+
+/// What the edge has learnt of a request in flight since it arrived.
+#[derive(Clone, Copy, Default)]
+struct Progress {
+    /// A worker or a managed server has it; until then it is queued.
+    running: bool,
+    worker: Option<usize>,
+    side: Side,
+    kind: Kind,
+    streaming: bool,
+}
+
+/// The count a request in flight is charged to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Side {
+    /// None yet, or none: a request to a managed server.
+    #[default]
+    None,
+    /// A worker's application threads.
+    Threads,
+    /// A worker's event loop.
+    Loop,
+}
+
+/// What kind of request it is, as far as the edge can tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Kind {
+    #[default]
+    Unknown,
+    Wsgi,
+    Asgi,
+    Grpc,
+    Handoff,
+    Upstream,
+}
+
+/// A request in flight, as the edge lists it (section 11.7).
+#[derive(Debug, Clone)]
+pub struct LiveRequest {
+    /// The request identifier.
+    pub request_id: String,
+    /// The client address.
+    pub client: IpAddr,
+    /// The application.
+    pub app: String,
+    /// The release.
+    pub release: String,
+    /// The worker group.
+    pub group: String,
+    /// The HTTP method.
+    pub method: String,
+    /// The path with its query string.
+    pub target: String,
+    /// When it arrived.
+    pub started: SystemTime,
+    /// How long ago.
+    pub age: Duration,
+    /// A worker or a managed server has it; otherwise it is queued.
+    pub running: bool,
+    /// Its kind as of now: `wsgi`, `wsgi streaming`, `asgi`, `asgi
+    /// streaming`, `grpc`, `handoff` or `upstream`; `-` while queued.
+    pub kind: String,
+    /// The worker that has it.
+    pub worker: Option<usize>,
+    /// The count it is charged to.
+    pub side: Side,
+}
+
+impl Live {
+    fn listed(&self, now: Instant) -> LiveRequest {
+        let progress = *self.progress.lock().expect("live request poisoned");
+
+        let kind = match (progress.kind, progress.streaming) {
+            (Kind::Wsgi, false) => "wsgi",
+            (Kind::Wsgi, true) => "wsgi streaming",
+            (Kind::Asgi, false) => "asgi",
+            (Kind::Asgi, true) => "asgi streaming",
+            (Kind::Grpc, _) => "grpc",
+            (Kind::Handoff, _) => "handoff",
+            (Kind::Upstream, _) => "upstream",
+            (Kind::Unknown, _) => "-",
+        };
+
+        LiveRequest {
+            request_id: self.request_id.clone(),
+            client: self.client,
+            app: self.app.clone(),
+            release: self.release.clone(),
+            group: self.group.clone(),
+            method: self.method.clone(),
+            target: self.target.clone(),
+            started: self.started_at,
+            age: now.saturating_duration_since(self.started),
+            running: progress.running,
+            kind: kind.to_owned(),
+            worker: progress.worker,
+            side: progress.side,
+        }
     }
 }
 
@@ -729,6 +910,10 @@ impl AccessLog {
             writer,
             websockets: Mutex::new(BTreeMap::new()),
             next_websocket: AtomicU64::new(0),
+            live: (0..LIVE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            next_live: AtomicU64::new(0),
             lines: tokio::sync::broadcast::channel(FOLLOW_CAPACITY).0,
         })
     }
@@ -758,15 +943,52 @@ impl AccessLog {
         &self.metrics
     }
 
-    /// Count a request as in flight for the application and release it
-    /// is labelled with, until the returned guard is dropped.
-    pub fn begin(self: &Arc<Self>, app: &str, release: &str) -> InFlight {
-        self.metrics.begin(app, release);
+    /// Count a request as in flight for the application and release its
+    /// record is labelled with, and list it (section 11.7), until the
+    /// returned guard is dropped.
+    pub fn begin(self: &Arc<Self>, record: &Record) -> InFlight {
+        self.metrics.begin(&record.app, &record.release);
+        let id = self.next_live.fetch_add(1, Ordering::Relaxed);
+        let live = Arc::new(Live {
+            started: Instant::now(),
+            started_at: record.started,
+            request_id: record.request_id.clone(),
+            client: record.client,
+            app: record.app.clone(),
+            release: record.release.clone(),
+            group: record.group.clone(),
+            method: record.method.clone(),
+            target: record.target.clone(),
+            progress: Mutex::new(Progress::default()),
+        });
+        self.live[shard(id)]
+            .lock()
+            .expect("live requests poisoned")
+            .insert(id, Arc::clone(&live));
         InFlight {
             log: Arc::clone(self),
-            app: app.to_owned(),
-            release: release.to_owned(),
+            id,
+            live,
         }
+    }
+
+    /// The requests in flight now, the oldest first (section 11.7).
+    pub fn requests(&self) -> Vec<LiveRequest> {
+        let now = Instant::now();
+        let mut requests: Vec<LiveRequest> = self
+            .live
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .lock()
+                    .expect("live requests poisoned")
+                    .values()
+                    .map(|live| live.listed(now))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        requests.sort_by_key(|request| std::cmp::Reverse(request.age));
+        requests
     }
 
     /// Count a redirect hop (section 4.10) in the metrics of the

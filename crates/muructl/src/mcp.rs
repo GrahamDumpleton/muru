@@ -783,6 +783,26 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "requests",
+            description: "The requests in flight now: counts by worker group of those queued, holding a thread or on an event loop, with the oldest of each, or each request with list.",
+            changes: false,
+            properties: json!({
+                "app": {"type": "string"},
+                "list": {"type": "boolean"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["requests"]);
+                command.extend(text(arguments, "app"));
+
+                if flag(arguments, "list") {
+                    command.push("--list".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
             name: "overlay_preview",
             description: "What activating an overlay now would change, without activating it.",
             changes: false,

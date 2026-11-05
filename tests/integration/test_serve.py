@@ -11,11 +11,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -75,9 +73,6 @@ class Serve:
         except subprocess.TimeoutExpired:
             self.process.kill()
             return self.process.wait()
-        finally:
-            if self.run_dir.parent == Path("/tmp"):
-                shutil.rmtree(self.run_dir, ignore_errors=True)
 
 
 def start(
@@ -96,10 +91,7 @@ def start(
     port = support.free_port()
     admin_port = support.free_port()
 
-    # A socket's path is limited to about a hundred bytes, which pytest's
-    # temporary directories on macOS come close to.
-
-    run_dir = Path(tempfile.mkdtemp(prefix="muru-serve-", dir="/tmp"))
+    run_dir = support.short_dir("muru-serve-")
 
     # The test's own flags stand in for these defaults.
 

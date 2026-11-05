@@ -218,6 +218,12 @@ def test_logs_for_an_unknown_target_are_refused(daemon: Daemon) -> None:
     assert refused.returncode != 0
     assert "nothing" in refused.stderr
 
+    # The daemon serves many applications, so one must be named (issue 375).
+
+    refused = daemon.muructl("logs", check=False)
+    assert refused.returncode != 0
+    assert "name an application, or ask for the access log" in refused.stderr, refused.stderr
+
     daemon.deploy("shop", SHOP)
     refused = daemon.muructl("logs", "shop@r9", check=False)
     assert refused.returncode != 0 and "r9" in refused.stderr
@@ -235,7 +241,7 @@ def test_sigusr1_reopens_the_daemons_own_log(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     base = tmp_path
-    run_dir = Path("/tmp") / f"muru-run-{os.getpid()}-{time.monotonic_ns()}"
+    run_dir = support.short_dir("muru-run-")
     port = support.free_port()
     environment = {**os.environ, "MURU_SOCKET": str(run_dir / "admin.sock")}
     started = subprocess.run(

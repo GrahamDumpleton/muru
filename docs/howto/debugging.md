@@ -30,15 +30,86 @@ does a run's, from the Workers link on its first page.
 
 ## Status
 
-What the host knows about each worker from its reports: pid, group,
-uptime, requests served and in flight, the age of its oldest request, its
-memory, and whether it is ready or being replaced.
+Each worker's pid, group, uptime, requests served, what it holds as of
+the moment it answers, its memory, whether the edge routes to it, and
+its state.
 
 ```
-WORKER  PID      GROUP      UP        REQUESTS   IN-FLIGHT  OLDEST    RSS       USS       STATE
-0       41213    default    318s      12044      1          12ms      48MB      31MB      ready
-1       41214    default    318s      11980      0          0ms       47MB      30MB      ready
+WORKER  PID      GROUP      UP       REQUESTS   THREADS  THREAD-OLDEST  RSS     USS     ROUTED  STATE
+0       41213    default    5m18s    12044      1/4      0.1s           48MB    31MB    yes     ready
+1       41214    default    5m18s    11980      0/4      -              47MB    30MB    yes     ready
 ```
+
+THREADS is the application threads busy of the worker's threads, and
+THREAD-OLDEST how long the longest has been held: a request holds its
+thread from the moment a pool thread picks it up, so one waiting at
+`breakpoint()` or streaming its response, which the timeouts leave
+alone, is counted for as long as it holds the thread. A worker with an
+event loop shows LOOP, the requests on the loop of its `concurrency`,
+and LOOP-OLDEST; open WebSockets are left out of both, since a socket
+may stay for hours, and `muructl websockets` counts them. A worker
+shows the sides it has, and the table the columns any worker of the
+release has, so a WSGI release has the thread columns and an ASGI
+release the loop columns. Every header is one word, so a script can
+pick a column by its name.
+
+The figures are as of the moment the status answers: the host asks each
+worker, and one that does not answer within a second, which is a hung
+one, is shown from its last report, up to a second old, its figures
+marked with a star. STATE is `starting`, `ready`, `debugging` (a
+debugger session is open, so the worker takes no requests), `replacing`
+(a fresh worker is taking its place) or `retiring` (scaled in). ROUTED
+says whether the edge sends it requests: a replacement that is ready
+but not yet announced to the edge reads `ready` and `no`.
+
+## Requests in flight
+
+`muructl requests` shows the requests in flight now, as `muructl
+websockets` shows open sockets: those queued at the edge for a worker
+slot, those holding a thread, and those on an event loop, with the age
+of the oldest of each, one row per worker group, since the edge queues
+per group and a count per release would hide which group is starved.
+The thread columns show for a release whose workers run requests on
+threads, the loop columns for one with an event loop:
+
+```console
+$ muructl requests shop
+RELEASE              GROUP        QUEUED  QUEUED-OLDEST  THREADS  THREAD-OLDEST  LOOP   LOOP-OLDEST
+shop@r7              default      3       1.2s           8/8      1m02s          14     31.0s
+shop@r7              reports      0       -              2/4      4.1s           -      -
+```
+
+`--list` lists them, the oldest first, with `--limit` (100) on how many:
+the age, whether the request is queued or running, its kind, the worker
+that has it, the method and target, the client and the request id.
+
+```console
+$ muructl requests shop --list --limit 5
+AGE      STATE    KIND            WORKER  REQUEST                                  CLIENT           REQUEST-ID
+1m02s    running  wsgi            1       GET /checkout                            10.0.0.7         01M5R1GN3RD59QX94CBQH28ENT
+31.0s    running  asgi            0       GET /live/summary                        10.0.0.9         01M5R1GN3RD59QX94CBQH28ENV
+4.1s     running  wsgi            1       GET /reports/annual                      10.0.0.7         01M5R1GN3RD59QX94CBQH28ENW
+1.2s     queued   -               -       GET /reports/monthly                     10.0.0.12        01M5R1GN3RD59QX94CBQH28ENX
+0.8s     running  wsgi streaming  0       GET /events                              10.0.0.3         01M5R1GN3RD59QX94CBQH28ENY
+```
+
+A request's kind is what the edge can tell of it as of now: `wsgi` or
+`asgi` by the side of the worker it was sent to, `wsgi streaming` or
+`asgi streaming` once its response head asked for immediate flushing
+(`text/event-stream`, or `X-Accel-Buffering: no`), which the timeouts
+leave alone but which holds its thread or loop slot, `grpc`, `handoff`
+once the worker handed it to its other interface, and `upstream` for a
+request sent to a managed server. A request that became a WebSocket
+leaves the list and is counted by `muructl websockets`; a static file
+is answered by the edge at once and is never listed.
+
+THREADS and LOOP here are what the edge charged each request to, from
+what the worker declared when it connected. `debug status` shows what
+the worker itself holds, so the two can differ for a worker serving
+both WSGI and ASGI. What a worker does inside a request, such as a
+thread waiting at `breakpoint()`, stays with `debug stacks` and
+`debug status`. The command works against the daemon, a development run
+and `muructl serve`, and `--json` gives the same figures.
 
 ## Stacks
 
@@ -77,9 +148,12 @@ scheduled from another thread waited to run.
 
 Each worker's interpreter and executable, working directory, `sys.path`,
 the modules loaded with versions where they declare one, threads, open
-descriptors and environment, with values of keys that look like secrets
-(`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL`, `AUTH`) replaced by
-`***`.
+descriptors and environment. The value of a key that looks like a
+secret (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `CREDENTIAL` or `AUTH` in
+its name, or a name ending in `_DSN`) is replaced by `***`, and a
+password in a URL under any other key is: `DATABASE_URL` holding
+`postgres://shop:hunter2@db/shop` is shown as
+`postgres://shop:***@db/shop`.
 
 ## Profile
 
@@ -99,8 +173,17 @@ starts on, so its samples are counted together whichever of its lines
 was running. The functions that took most samples are printed
 on standard error with their share. Threads waiting outside Python, such
 as idle threads of the pool, are not sampled, so the profile is of the
-work being done. Sampling costs the worker little, so it is safe on a
-release serving traffic.
+work being done.
+
+A profile at the default interval makes no measurable difference to a
+busy worker's throughput or latency, so it is safe on a release serving
+traffic. On Linux with Python 3.15 or later the samples are read from
+outside the worker, which is not interrupted at all. Elsewhere, and
+with `--path` or `--requests`, a thread of the worker takes them: with
+the GIL it waits its turn for the interpreter like any other thread,
+and on a free-threaded build it pauses the other threads for the moment
+each sample takes. Sampling much more often costs more in proportion;
+at a 1 ms interval, expect a busy worker to lose a few percent.
 
 On a busy worker, `--path` samples only the threads serving requests
 whose path starts with a prefix, and `--requests` ends the profile once
@@ -128,9 +211,9 @@ time spent in each, with sys.monitoring, for `--for` (10 s), and prints
 the functions that took longest with their call counts. It needs Python
 3.12 or later. Exact counts cost the worker more than sampling, so a
 worker serving requests in more than half its slots is refused unless
-`--force` is given. While the trace runs the worker takes no new
-requests, which go to the other workers of its group; one that is the
-last of its group in service keeps serving.
+`--force` is given. The worker keeps serving while the trace runs, so
+the trace counts the requests it takes meanwhile, each slowed by the
+tracing.
 
 ## Memory
 
@@ -233,19 +316,21 @@ the run calls it, and under `muructl run` it works as it is, with no
 ```
 $ muructl debug attach shop
 muru: attached to worker 1 at /srv/shop/views.py:42; the end of input lets the code go on
-> /srv/shop/views.py(43)checkout()
--> return charge(order)
+> /srv/shop/views.py(42)checkout()
+-> breakpoint(timeout=300)
 (Pdb) p order.total
 Decimal('120.00')
 (Pdb) continue
 muru: the session in worker 1 has ended
 ```
 
-Each line typed is a pdb command. `continue` lets the request go on and
-ends the session; so does the end of input, as does an hour in all or ten
-minutes without a line. In a worker with no breakpoint waiting, the
-session has a thread of its own, from which the worker's modules and
-state can be examined.
+The session stops on the `breakpoint()` line itself, the line the
+attach line names, as pdb does on Python 3.13 and later; on 3.11 and
+3.12 it stops at the line after it. Each line typed is a pdb command.
+`continue` lets the request go on and ends the session; so does the end
+of input, as does an hour in all or ten minutes without a line. In a
+worker with no breakpoint waiting, the session has a thread of its own,
+from which the worker's modules and state can be examined.
 
 While a session is open its worker takes no new requests, and nothing
 replaces it: recycling, the hard timeout, the memory limits and scaling
@@ -279,8 +364,9 @@ In VS Code that is an `attach` configuration naming the address:
 ```
 
 A request waiting at `breakpoint()` stops at the line after it once the
-IDE has attached, and the IDE can step through it from there; with none
-waiting, the IDE sees the worker's threads and can pause them. As with
+IDE has attached, unlike pdb, and the IDE can step through it from
+there; with none waiting, the IDE sees the worker's threads and can
+pause them. As with
 pdb, the worker takes no new requests meanwhile. Disconnecting ends the
 session and lets the code go on.
 

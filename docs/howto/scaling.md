@@ -275,7 +275,7 @@ event when it would not fit.
 ```console
 $ muructl scale status shop
 shop@r42
-GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
+GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
 default      3 -> 5       12/12      -1.0    230 ms     0/6        spare 2-12 workers, 1-4 idle
   workers: cpu 12%, gc 0%, gil wait p95 1 ms, loop lag p95 -
   diagnosis: I/O bound with exhausted slots; for the next release, more threads per worker, or more concurrency for an ASGI application

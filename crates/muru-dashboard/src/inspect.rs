@@ -59,7 +59,7 @@ pub struct WorkerFailure {
     pub error: String,
 }
 
-/// One worker's row of `debug status`.
+/// One worker's row of `debug status` (section 11.7).
 #[derive(Debug, Clone, Default)]
 pub struct StatusRow {
     /// The worker's index.
@@ -72,18 +72,102 @@ pub struct StatusRow {
     pub uptime: String,
     /// Requests it has served.
     pub requests: u64,
-    /// Requests it is serving now.
-    pub in_flight: u64,
-    /// The age of its oldest request, formatted.
-    pub oldest: String,
+    /// Its application threads, when requests run on them.
+    pub threads: Option<SideView>,
+    /// Its event loop, when it has one.
+    pub event_loop: Option<SideView>,
+    /// The sides are from the worker's last report, up to a second old,
+    /// because it did not answer within a second; their figures carry a
+    /// star.
+    pub stale: bool,
     /// Its resident size, formatted, or a dash.
     pub rss: String,
     /// Its unique size, formatted, or a dash.
     pub uss: String,
-    /// starting, ready, replaced or debugging.
+    /// Whether the edge routes requests to it.
+    pub routed: bool,
+    /// starting, ready, debugging, replacing or retiring.
     pub state: String,
     /// Why it could not be asked, when it could not.
     pub error: String,
+}
+
+/// One side of a worker, as the status shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SideView {
+    /// The requests holding it of how many it takes, as `3/4`.
+    pub busy: String,
+    /// How long the longest of them has held it, or a dash with none.
+    pub oldest: String,
+}
+
+/// The shape of a status table: the sides any worker of the release
+/// has, so it shows only the columns that apply, and whether any row is
+/// stale, so it carries the footnote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusShape {
+    /// Some worker runs requests on threads.
+    pub threads: bool,
+    /// Some worker has an event loop.
+    pub event_loop: bool,
+    /// Some row is from its worker's last report.
+    pub stale: bool,
+}
+
+impl StatusShape {
+    /// The columns of a row after the pid: the group and the figures.
+    pub fn width(&self) -> usize {
+        7 + 2 * usize::from(self.threads) + 2 * usize::from(self.event_loop)
+    }
+}
+
+/// The shape of the table the rows make.
+pub fn status_shape(rows: &[StatusRow]) -> StatusShape {
+    StatusShape {
+        threads: rows.iter().any(|row| row.threads.is_some()),
+        event_loop: rows.iter().any(|row| row.event_loop.is_some()),
+        stale: rows.iter().any(|row| row.stale),
+    }
+}
+
+/// An age as `0.4s`, `31.0s`, `1m02s` or `2h04m`.
+pub fn age(millis: u64) -> String {
+    let seconds = millis / 1000;
+
+    if seconds >= 3600 {
+        format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{:.1}s", millis as f64 / 1000.0)
+    }
+}
+
+/// An uptime as `12s`, `5m18s` or `2h04m`.
+pub fn uptime_text(seconds: u64) -> String {
+    if seconds >= 60 {
+        age(seconds * 1000)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// A side as the worker answered it, `{"busy": N, "of": M, "oldest_ms":
+/// T}`, or None when the worker has no such side.
+fn side_view(value: &serde_json::Value, stale: bool) -> Option<SideView> {
+    let busy = value["busy"].as_u64()?;
+    let of = value["of"].as_u64().unwrap_or(0);
+    let oldest = value["oldest_ms"].as_u64().unwrap_or(0);
+    let mark = if stale { "*" } else { "" };
+
+    Some(SideView {
+        busy: format!("{busy}/{of}{mark}"),
+        oldest: if busy == 0 {
+            "-".to_owned()
+        } else {
+            format!("{}{mark}", age(oldest))
+        },
+    })
 }
 
 /// One stack, as `debug stacks` shows it: a thread's frames, with the
@@ -227,28 +311,21 @@ pub fn status_rows(answer: &DebugAnswer) -> Vec<StatusRow> {
                     .map(muru_config::format_size_approx)
                     .unwrap_or_else(|| "-".to_owned())
             };
-
-            let state = if result["replaced"].as_bool() == Some(true) {
-                "replaced"
-            } else if result["debugging"].as_bool() == Some(true) {
-                "debugging"
-            } else if result["ready"].as_bool() == Some(true) {
-                "ready"
-            } else {
-                "starting"
-            };
+            let stale = result["stale"].as_bool() == Some(true);
 
             StatusRow {
                 index: worker.index,
                 pid: worker.pid,
                 group: result["group"].as_str().unwrap_or("default").to_owned(),
-                uptime: format!("{:.0}s", result["uptime_s"].as_f64().unwrap_or(0.0)),
+                uptime: uptime_text(result["uptime_s"].as_f64().unwrap_or(0.0) as u64),
                 requests: result["requests"].as_u64().unwrap_or(0),
-                in_flight: result["in_flight"].as_u64().unwrap_or(0),
-                oldest: format!("{}ms", result["oldest_ms"].as_u64().unwrap_or(0)),
+                threads: side_view(&result["threads"], stale),
+                event_loop: side_view(&result["loop"], stale),
+                stale,
                 rss: size("rss"),
                 uss: size("uss"),
-                state: state.to_owned(),
+                routed: result["routed"].as_bool() == Some(true),
+                state: result["state"].as_str().unwrap_or("starting").to_owned(),
                 error: String::new(),
             }
         })
@@ -549,14 +626,69 @@ mod tests {
     }
 
     #[test]
+    fn status_shows_each_side_a_worker_has_and_marks_a_stale_row() {
+        let answer = DebugAnswer {
+            release: "r1".to_owned(),
+            workers: vec![
+                answered(
+                    0,
+                    serde_json::json!({
+                        "group": "default", "state": "ready", "routed": true, "uptime_s": 7464.0,
+                        "requests": 18234, "stale": false,
+                        "loop": {"busy": 12, "of": 1000, "oldest_ms": 31_000},
+                    }),
+                ),
+                answered(
+                    1,
+                    serde_json::json!({
+                        "group": "default", "state": "debugging", "routed": false,
+                        "uptime_s": 62.0, "requests": 3, "stale": true,
+                        "loop": {"busy": 0, "of": 1000, "oldest_ms": 0},
+                    }),
+                ),
+            ],
+        };
+
+        let status = status_rows(&answer);
+        assert_eq!(status[0].uptime, "2h04m");
+        assert_eq!(status[0].threads, None);
+        let event_loop = status[0].event_loop.as_ref().expect("a loop side");
+        assert_eq!(
+            (event_loop.busy.as_str(), event_loop.oldest.as_str()),
+            ("12/1000", "31.0s")
+        );
+        assert_eq!(status[1].uptime, "1m02s");
+        assert!(status[1].stale && !status[1].routed);
+        assert_eq!(status[1].state, "debugging");
+        let event_loop = status[1].event_loop.as_ref().expect("a loop side");
+        assert_eq!(
+            (event_loop.busy.as_str(), event_loop.oldest.as_str()),
+            ("0/1000*", "-")
+        );
+        let shape = status_shape(&status);
+        assert_eq!(
+            shape,
+            StatusShape {
+                threads: false,
+                event_loop: true,
+                stale: true
+            }
+        );
+        assert_eq!(shape.width(), 9);
+        assert_eq!(age(400), "0.4s");
+        assert_eq!(age(62_000), "1m02s");
+    }
+
+    #[test]
     fn status_tasks_and_memory_read_the_workers_answers() {
         let answer = DebugAnswer {
             release: "r1".to_owned(),
             workers: vec![answered(
                 0,
                 serde_json::json!({
-                    "group": "hot", "ready": true, "replaced": false, "debugging": false,
-                    "uptime_s": 12.4, "requests": 7, "in_flight": 1, "oldest_ms": 30,
+                    "group": "hot", "ready": true, "state": "ready", "routed": true,
+                    "debugging": false, "uptime_s": 12.4, "requests": 7,
+                    "threads": {"busy": 1, "of": 4, "oldest_ms": 2400},
                     "rss": 50_000_000u64, "uss": 30_000_000u64,
                     "lag_ms": 0.4,
                     "tasks": [{"name": "Task-1", "coro": "serve", "waiting_on": "<Future>",
@@ -571,8 +703,23 @@ mod tests {
         let status = status_rows(&answer);
         assert_eq!(status[0].group, "hot");
         assert_eq!(status[0].state, "ready");
+        assert!(status[0].routed);
         assert_eq!(status[0].uptime, "12s");
         assert_eq!(status[0].rss, "48MB");
+        let threads = status[0].threads.as_ref().expect("a thread side");
+        assert_eq!(
+            (threads.busy.as_str(), threads.oldest.as_str()),
+            ("1/4", "2.4s")
+        );
+        assert_eq!(status[0].event_loop, None);
+        assert_eq!(
+            status_shape(&status),
+            StatusShape {
+                threads: true,
+                event_loop: false,
+                stale: false
+            }
+        );
 
         let tasks = tasks_views(&answer);
         assert_eq!(tasks[0].lag.as_deref(), Some("0.4 ms"));

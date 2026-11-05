@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -237,7 +236,7 @@ def test_a_bad_proxy_table_refuses_to_start(tmp_path: Path) -> None:
             "--state-dir",
             str(tmp_path / "state"),
             "--run-dir",
-            tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"),
+            str(support.short_dir("muru-run-")),
             "--log-dir",
             str(tmp_path / "logs"),
             "--listen",

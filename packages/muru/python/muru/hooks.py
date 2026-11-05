@@ -1,10 +1,10 @@
 """Lifecycle hooks from the module named by the hooks setting (section 6.3).
 
 Each hook is an optional module-level function taking the ``Context``:
-on_load and pre_fork run in the host after the import, post_fork, on_ready,
-on_drain and on_exit in each worker, and on_reopen_logs in a worker that
-receives SIGUSR1. With per-worker imports, on_load and pre_fork run in each
-worker before its post_fork.
+on_load and pre_fork run in the host after the import and before the
+import check, post_fork, on_ready, on_drain and on_exit in each worker, and
+on_reopen_logs in a worker that receives SIGUSR1. With per-worker imports,
+on_load and pre_fork run in each worker before its post_fork.
 """
 
 from __future__ import annotations

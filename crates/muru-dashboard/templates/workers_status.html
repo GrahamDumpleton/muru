@@ -1,7 +1,8 @@
 <h2>Workers</h2>
 {% if !error.is_empty() %}<p class="level-error">{{ error }}</p>{% endif %}
+{% let shape = crate::inspect::status_shape(status) %}
 <table>
-  <tr><th>Worker</th><th class="num">PID</th><th>Group</th><th class="num">Up</th><th class="num">Requests</th><th class="num">In flight</th><th class="num">Oldest</th><th class="num">RSS</th><th class="num">USS</th><th>State</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
+  <tr><th>Worker</th><th class="num">PID</th><th>Group</th><th class="num">Up</th><th class="num">Requests</th>{% if shape.threads %}<th class="num">Threads</th><th class="num">Thread oldest</th>{% endif %}{% if shape.event_loop %}<th class="num">Loop</th><th class="num">Loop oldest</th>{% endif %}<th class="num">RSS</th><th class="num">USS</th><th>Routed</th><th>State</th>{% if csrf.is_some() %}<th>Actions</th>{% endif %}</tr>
   {% for row in status %}
   <tr>
     <td><a href="worker?release={{ release }}&worker={{ row.index }}">{{ row.index }}</a></td>
@@ -10,13 +11,14 @@
     <td>{{ row.group }}</td>
     <td class="num">{{ row.uptime }}</td>
     <td class="num">{{ row.requests }}</td>
-    <td class="num">{{ row.in_flight }}</td>
-    <td class="num">{{ row.oldest }}</td>
+    {% if shape.threads %}{% if let Some(side) = row.threads %}<td class="num">{{ side.busy }}</td><td class="num">{{ side.oldest }}</td>{% else %}<td class="num">-</td><td class="num">-</td>{% endif %}{% endif %}
+    {% if shape.event_loop %}{% if let Some(side) = row.event_loop %}<td class="num">{{ side.busy }}</td><td class="num">{{ side.oldest }}</td>{% else %}<td class="num">-</td><td class="num">-</td>{% endif %}{% endif %}
     <td class="num">{{ row.rss }}</td>
     <td class="num">{{ row.uss }}</td>
+    <td>{% if row.routed %}yes{% else %}no{% endif %}</td>
     <td class="state-{{ row.state }}">{{ row.state }}</td>
     {% else %}
-    <td colspan="8" class="level-error">{{ row.error }}</td>
+    <td colspan="{{ shape.width() }}" class="level-error">{{ row.error }}</td>
     {% endif %}
     {% if let Some(token) = csrf %}
     <td class="actions">{% if row.state == "ready" %}<form method="post" action="actions/restart">
@@ -31,3 +33,4 @@
   </tr>
   {% endfor %}
 </table>
+{% if shape.stale %}<p class="muted">* from the worker's last report, up to a second old: it did not answer within a second.</p>{% endif %}

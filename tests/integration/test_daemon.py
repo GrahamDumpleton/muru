@@ -14,7 +14,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -190,6 +189,13 @@ def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> No
     finally:
         first.stop(shutdown=True)
 
+    # Nothing is left for the next daemon to adopt: no host or edge record,
+    # no rate limit buckets, and no empty release directories.
+
+    assert not (first.run_dir / "apps").exists()
+    assert not (first.run_dir / "edge.toml").exists()
+    assert not (first.run_dir / "edge" / "rate-buckets-v1").exists()
+
     second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
     try:
@@ -275,7 +281,7 @@ def test_daemon_stop_gives_up_on_a_silent_socket(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None:
         support.unavailable("muructl is not built")
-    run_dir = Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    run_dir = support.short_dir("muru-run-")
     path = run_dir / "admin.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
@@ -303,7 +309,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     muructl = support.muructl_path()
     if muructl is None or not support.extension_available():
         support.unavailable("muructl or the extension is not built")
-    run_dir = Path(tempfile.mkdtemp(prefix="muru-run-", dir="/tmp"))
+    run_dir = support.short_dir("muru-run-")
     port = support.free_port()
     location = [
         "--state-dir",
@@ -329,6 +335,24 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
         )
         assert "already running" in again.stdout
+        pid = again.stdout.split("(pid ")[1].split(")")[0]
+        assert (run_dir / "daemon.pid").read_text() == pid
+
+        # A daemon that detaches is gone too, so its pid file goes with it.
+
+        detached = subprocess.run(
+            [str(muructl), "daemon", "stop", *location],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        assert "detached" in detached.stdout, detached.stdout + detached.stderr
+        assert not (run_dir / "daemon.pid").exists()
+        restarted = subprocess.run(
+            [str(muructl), "up", *location], capture_output=True, text=True, check=False, timeout=60
+        )
+        assert restarted.returncode == 0, restarted.stdout + restarted.stderr
         status = subprocess.run(
             [str(muructl), "daemon", "status", *location],
             capture_output=True,
@@ -349,6 +373,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     assert "daemon stopped" in stopped.stdout, stopped.stdout + stopped.stderr
     assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()
+    assert not (run_dir / "daemon.pid").exists()
 
 
 def test_status_names_the_edge_process(daemon: Daemon) -> None:

@@ -22,7 +22,7 @@ use std::io::{self, Seek as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
@@ -38,7 +38,7 @@ use prost::Message;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::access::{AccessLog, Record};
 use crate::errors::{self, Negotiation, Problem};
@@ -50,6 +50,11 @@ use crate::{BoxError, Limits, ResponseBody, close_after, request_head};
 /// it, or after the delay, the connection is closed instead (section 4.6).
 const DISCARD_LIMIT: usize = 1024 * 1024;
 const DISCARD_DELAY: Duration = Duration::from_secs(2);
+
+/// How long the end of a response waits for the request body to be read
+/// or given up: the discard's delay, and a second for a body pump still
+/// writing to the worker when the response ended.
+const SETTLE_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a worker has to answer HELLO on a new connection. A worker
 /// that is stopped or frozen accepts the connection but never answers, and
@@ -93,6 +98,8 @@ struct WorkerSlots {
     /// The other side, which requests handed across count against
     /// (section 6.14); none when the worker declares no slots there.
     other: Option<Arc<Semaphore>>,
+    /// How many requests the other side takes at once; 0 without one.
+    other_slots: usize,
     /// Section 6.7: the mounts with threads of their own, by name.
     mounts: HashMap<String, MountSlots>,
     /// The gRPC methods its mounts registered, from HELLO (section 6.13).
@@ -112,6 +119,8 @@ struct MountSlots {
     /// The threads of its own that an ASGI mount's handoffs to WSGI run
     /// on (section 6.14).
     handoff: Option<Arc<Semaphore>>,
+    /// The mount runs its requests on the event loop.
+    on_loop: bool,
 }
 
 impl WorkerSlots {
@@ -131,6 +140,7 @@ impl WorkerSlots {
                     allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
                     connections: (connections > 0).then(|| Arc::new(Semaphore::new(connections))),
                     handoff: (handoff > 0).then(|| Arc::new(Semaphore::new(handoff))),
+                    on_loop: pool.on_loop,
                 };
                 (pool.mount.clone(), slots)
             })
@@ -151,6 +161,7 @@ impl WorkerSlots {
             path,
             default_async,
             other: (other > 0).then(|| Arc::new(Semaphore::new(other))),
+            other_slots: other,
             worker_type: hello.worker_type,
             websockets: hello.websockets,
             websocket_mounts: hello.websocket_mounts,
@@ -180,6 +191,17 @@ impl WorkerSlots {
             Some(Arc::clone(&self.semaphore))
         } else {
             self.other.clone()
+        }
+    }
+
+    /// Whether a request to the mount, holding a slot of the mount's own
+    /// unless it borrowed a shared one, runs on the event loop (section
+    /// 11.7): the mount's side when it has slots of its own, else the
+    /// default mount's.
+    fn on_loop(&self, mount: &str, borrowed: bool) -> bool {
+        match self.mounts.get(mount) {
+            Some(slots) if slots.own.is_some() && !borrowed => slots.on_loop,
+            _ => self.default_async,
         }
     }
 
@@ -395,6 +417,10 @@ pub struct WorkerStatus {
     pub async_slots: usize,
     /// Requests it is handling now.
     pub in_flight: usize,
+    /// Its application threads, on which requests run; 0 when none do.
+    pub threads: usize,
+    /// Requests its event loop holds at once; 0 without a loop.
+    pub loop_slots: usize,
 }
 
 /// A worker a pool was to connect to and could not: its socket was
@@ -475,6 +501,9 @@ pub(crate) struct Lease {
     /// Section 6.7: the slot is a shared one the request's mount borrows,
     /// which the request head tells the worker.
     pub(crate) borrowed: bool,
+    /// The request runs on the worker's event loop rather than its
+    /// threads (section 11.7).
+    pub(crate) on_loop: bool,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
     /// The pool the connection came from, when it is not the one asked:
@@ -579,6 +608,12 @@ impl LinkPool {
                 slots: worker.slots(),
                 async_slots: worker.async_slots,
                 in_flight: worker.in_flight(),
+                threads: if worker.default_async {
+                    worker.other_slots
+                } else {
+                    worker.slots()
+                },
+                loop_slots: worker.async_slots,
             })
             .collect()
     }
@@ -714,6 +749,7 @@ impl LinkPool {
                 permit,
                 worker: best,
                 borrowed,
+                on_loop: worker.on_loop(mount, borrowed),
                 websockets: worker.accepts_websockets(mount),
                 woken: None,
             });
@@ -808,6 +844,9 @@ pub(crate) struct Return {
     ended: AtomicBool,
     /// The request's stored uploads (section 4.11), dropped with it.
     uploads: Mutex<Option<crate::uploads::Received>>,
+    /// How the request body ended: None while the body pump is sending
+    /// it on, then whether it was read to its end.
+    settled: watch::Sender<Option<bool>>,
 }
 
 struct ReturnState {
@@ -836,6 +875,7 @@ impl Return {
             client_stalled: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             uploads: Mutex::new(None),
+            settled: watch::Sender::new(Some(true)),
         })
     }
 
@@ -847,6 +887,30 @@ impl Return {
     /// Tell the body pump, if it is still running, to send ABORT and stop.
     pub(crate) fn abort_request(&self) {
         self.abort.notify_one();
+    }
+
+    /// Note that the body pump is sending the request body on, so the end
+    /// of the response waits for it.
+    fn body_pending(&self) {
+        self.settled.send_replace(None);
+    }
+
+    /// Note how the request body ended: read to its end, or left unread.
+    fn body_settled(&self, read: bool) {
+        self.settled.send_replace(Some(read));
+    }
+
+    /// Wait for the request body to be read to its end or given up, and
+    /// say whether it was read, so the client connection can be kept
+    /// (section 4.6). The end of the response waits for this: once a
+    /// response has ended, hyper does not end the request body it is still
+    /// reading until the next request arrives, and some clients wait for
+    /// the connection meanwhile, so neither side moves.
+    async fn request_settled(&self) -> bool {
+        let mut settled = self.settled.subscribe();
+        let waited = tokio::time::timeout(SETTLE_WAIT, settled.wait_for(Option::is_some)).await;
+
+        matches!(waited, Ok(Ok(read)) if *read == Some(true))
     }
 
     /// Tell the body pump, if it is waiting, that the application is reading.
@@ -1181,8 +1245,9 @@ pub(crate) struct Recording {
     silent: bool,
     pub(crate) record: Record,
     started: Instant,
-    /// Counted as in flight until the recording is dropped.
-    _in_flight: crate::access::InFlight,
+    /// Counted as in flight, and listed, until the recording is dropped
+    /// (section 11.7).
+    pub(crate) in_flight: crate::access::InFlight,
 }
 
 /// Record a response the edge produced itself, such as a static file,
@@ -1199,48 +1264,50 @@ pub(crate) fn record(
 
 impl Recording {
     pub(crate) fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
+        let record = Record {
+            started: SystemTime::now(),
+            request_id: context.request_id.to_owned(),
+            client: context.peer.ip(),
+            app: context.app.clone(),
+            release: context.release.clone(),
+            host: context
+                .server_name
+                .clone()
+                .unwrap_or_else(|| requested_host(parts)),
+            group: context.group.clone(),
+            mount: if context.mount.is_empty() {
+                crate::routing::DEFAULT_GROUP.to_owned()
+            } else {
+                context.mount.clone()
+            },
+            snapshot: context.snapshot,
+            method: parts.method.as_str().to_owned(),
+            target: context.client_target.clone().unwrap_or_else(|| {
+                parts
+                    .uri
+                    .path_and_query()
+                    .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string())
+            }),
+            version: format!("{:?}", parts.version),
+            status: 0,
+            reason: String::new(),
+            bytes: 0,
+            worker: None,
+            retried: false,
+            queue: Duration::ZERO,
+            application: Duration::ZERO,
+            total: Duration::ZERO,
+            redirects: context.hops.clone(),
+            client_class: context.client_class.to_string(),
+            websocket: None,
+            handoff: None,
+        };
+
         Self {
             log: Arc::clone(&context.access_log),
             silent: context.handler.is_some(),
-            _in_flight: context.access_log.begin(&context.app, &context.release),
-            record: Record {
-                started: SystemTime::now(),
-                request_id: context.request_id.to_owned(),
-                client: context.peer.ip(),
-                app: context.app.clone(),
-                release: context.release.clone(),
-                host: context
-                    .server_name
-                    .clone()
-                    .unwrap_or_else(|| requested_host(parts)),
-                group: context.group.clone(),
-                mount: if context.mount.is_empty() {
-                    crate::routing::DEFAULT_GROUP.to_owned()
-                } else {
-                    context.mount.clone()
-                },
-                snapshot: context.snapshot,
-                method: parts.method.as_str().to_owned(),
-                target: context.client_target.clone().unwrap_or_else(|| {
-                    parts
-                        .uri
-                        .path_and_query()
-                        .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string())
-                }),
-                version: format!("{:?}", parts.version),
-                status: 0,
-                reason: String::new(),
-                bytes: 0,
-                worker: None,
-                retried: false,
-                queue: Duration::ZERO,
-                application: Duration::ZERO,
-                total: Duration::ZERO,
-                redirects: context.hops.clone(),
-                client_class: context.client_class.to_string(),
-                websocket: None,
-                handoff: None,
-            },
+            in_flight: context.access_log.begin(&record),
+            record,
             started: Instant::now(),
         }
     }
@@ -1312,6 +1379,7 @@ pub(crate) fn failing<'a>(
         occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(recording),
+        dispatched: OnceLock::new(),
         errors: &context.errors,
         host: requested_host(parts),
         path: parts.uri.path().to_owned(),
@@ -1488,6 +1556,7 @@ async fn handle_inner(
         occasions: context.occasions,
         version: parts.version,
         recording: Mutex::new(None),
+        dispatched: OnceLock::new(),
         errors: &context.errors,
         host: requested_host(parts),
         path: parts.uri.path().to_owned(),
@@ -1665,6 +1734,7 @@ async fn handle_inner(
             permit,
             worker,
             borrowed,
+            on_loop,
             websockets,
             woken,
         } = lease;
@@ -1678,6 +1748,7 @@ async fn handle_inner(
         recording.record.worker = Some(worker);
         recording.record.queue = queued.elapsed();
         recording.record.retried = retried;
+        recording.in_flight.dispatched(worker, on_loop);
 
         // Section 5.6: a worker that takes websocket scopes gets the
         // upgrade as one, with no body; any other worker sees an ordinary
@@ -1748,6 +1819,7 @@ async fn handle_inner(
     let upgrade = upgrade.filter(|_| upgrading);
     let kept = buffered.clone();
     let dispatched = Instant::now();
+    let _ = failing.dispatched.set(dispatched);
     *failing.recording.lock().expect("recording poisoned") = Some(recording);
 
     // The stored files stay until the request ends: an unnamed one
@@ -1772,6 +1844,7 @@ async fn handle_inner(
         None if end => back.give_writer(Some(writer)),
         None => match body.take() {
             Some(body) => {
+                back.body_pending();
                 tokio::spawn(pump_body(
                     body,
                     writer,
@@ -1820,6 +1893,7 @@ async fn handle_inner(
                     .as_mut()
                 {
                     recording.record.handoff = Some(if to_loop { "asgi" } else { "wsgi" });
+                    recording.in_flight.handed(to_loop);
                 }
             }
             Ok(Some(next)) if next.kind == kind::RESPONSE => {
@@ -1869,11 +1943,23 @@ async fn handle_inner(
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
 
+        // Section 11.7: a response flushed as it goes streams, for as long
+        // as it needs to, which the listing says.
+
+        if head.flush == pb::FlushPolicy::Immediate as i32 {
+            recording.in_flight.streaming();
+        }
+
         // Section 4.11: a precheck the application allows is a hop of the
         // request that follows it; one it refuses is the answer.
 
         recording.silent |= precheck && (200..300).contains(&recording.record.status);
     }
+
+    let settles = matches!(
+        failing.version,
+        http::Version::HTTP_10 | http::Version::HTTP_11
+    );
 
     // Section 4.10: an internal redirect is not a response for the client
     // but a request to route afresh. The rest of the worker's response
@@ -1883,12 +1969,10 @@ async fn handle_inner(
     if upgrade.is_none()
         && let Some(redirect) = redirect_from(&head, response_end, flags, kept)
     {
-        if response_end {
-            back.give_reader(Some(reader));
-            back.abort_request();
-        } else {
-            drain_response(reader, &back, limits.response_idle_timeout).await;
-        }
+        // A body left unread is dropped by the time this returns, and
+        // hyper closes the client connection after the final response.
+
+        set_aside(reader, &back, response_end, limits, settles).await;
 
         if let Some(recording) = recording.take() {
             recording.hop(u16::try_from(head.status).unwrap_or(500));
@@ -1911,15 +1995,15 @@ async fn handle_inner(
         && let Some(problem) =
             override_from(&head, response_end, &failing.negotiation, &context.errors)
     {
-        if response_end {
-            back.give_reader(Some(reader));
-            back.abort_request();
-        } else {
-            drain_response(reader, &back, limits.response_idle_timeout).await;
-        }
-
+        let read = set_aside(reader, &back, response_end, limits, settles).await;
         *failing.recording.lock().expect("recording poisoned") = recording.take();
-        return failing.respond(problem);
+        let response = failing.respond(problem);
+
+        return if read {
+            response
+        } else {
+            close_after(response, failing.version)
+        };
     }
 
     // Section 4.9: a file hint by path replaces the response's body with
@@ -1929,14 +2013,14 @@ async fn handle_inner(
     if upgrade.is_none()
         && let Some(path) = sendfile_from(&head, &context.sendfile)
     {
-        if response_end {
-            back.give_reader(Some(reader));
-            back.abort_request();
-        } else {
-            drain_response(reader, &back, limits.response_idle_timeout).await;
-        }
+        let read = set_aside(reader, &back, response_end, limits, settles).await;
+        let response = serve_hint(&path, parts, context, &head, &failing, recording).await;
 
-        return serve_hint(&path, parts, context, &head, &failing, recording).await;
+        return if read {
+            response
+        } else {
+            close_after(response, failing.version)
+        };
     }
 
     // The worker accepted the WebSocket: finish the handshake and relay
@@ -1987,11 +2071,19 @@ async fn handle_inner(
     // A client still waiting for 100 Continue may send the body after this
     // response, so the connection cannot be reused (section 4.6).
 
-    let close = expect_continue && !back.proceeded.load(Ordering::Relaxed);
+    let mut close = expect_continue && !back.proceeded.load(Ordering::Relaxed);
 
     let response = if response_end {
         back.give_reader(Some(reader));
         back.abort_request();
+
+        // Section 4.6: the rest of the request body is read or given up
+        // before the response goes out, and the connection is kept only
+        // when it was read.
+
+        if settles && !back.request_settled().await {
+            close = true;
+        }
 
         if let Some(recording) = recording.take() {
             let status = recording.record.status;
@@ -2012,6 +2104,7 @@ async fn handle_inner(
                 idle_timeout: limits.response_idle_timeout,
                 file: None,
                 piece: None,
+                settles,
             },
             next_chunk,
         );
@@ -2199,7 +2292,7 @@ fn carries_body(next: &frame::Frame, reader: &mut Reader) -> bool {
 /// connection goes back to the pool intact (section 4.10).
 async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Duration) {
     loop {
-        match tokio::time::timeout(idle_timeout, frame::read(&mut reader)).await {
+        match tokio::time::timeout(idle_timeout, read_drained(&mut reader)).await {
             Ok(Ok(Some(next))) if next.kind == kind::CONTINUE => back.continue_request(),
             Ok(Ok(Some(next))) if carries_body(&next, &mut reader) && !next.is_end() => {}
             Ok(Ok(Some(next))) if next.kind == kind::BODY || next.kind == kind::END => {
@@ -2216,6 +2309,48 @@ async fn drain_response(mut reader: Reader, back: &Arc<Return>, idle_timeout: Du
     }
 }
 
+/// Set aside the worker's response, which another response replaces:
+/// give the connection back once it has ended, draining what is left of
+/// it, then, on HTTP/1, wait for the request body to be read or given up
+/// (section 4.6). Says whether the client connection can be kept.
+async fn set_aside(
+    reader: Reader,
+    back: &Arc<Return>,
+    response_end: bool,
+    limits: &Limits,
+    settles: bool,
+) -> bool {
+    if response_end {
+        back.give_reader(Some(reader));
+        back.abort_request();
+    } else {
+        drain_response(reader, back, limits.response_idle_timeout).await;
+    }
+
+    !settles || back.request_settled().await
+}
+
+/// Read one frame of a response being drained. A BODY frame's payload is
+/// skipped through the reader's buffer rather than read whole, since
+/// nothing uses it, and the frame comes back with none.
+async fn read_drained(reader: &mut Reader) -> io::Result<Option<frame::Frame>> {
+    let Some(header) = frame::read_header(reader).await? else {
+        return Ok(None);
+    };
+
+    if header.kind != kind::BODY {
+        return frame::read_payload(reader, header).await.map(Some);
+    }
+
+    frame::skip(reader, header.len).await?;
+
+    Ok(Some(frame::Frame {
+        kind: header.kind,
+        flags: header.flags,
+        payload: Bytes::new(),
+    }))
+}
+
 /// How this request's failures are answered: with the error pages of
 /// section 4.12, in the client's preferred format, and a record in the
 /// access log.
@@ -2227,6 +2362,9 @@ pub(crate) struct Failing<'a> {
     occasions: crate::occasions::Setting,
     version: http::Version,
     recording: Mutex<Option<Recording>>,
+    /// When the request went to the application, so that a failure
+    /// answered after that is logged with the time the application ran.
+    pub(crate) dispatched: OnceLock<Instant>,
     /// The custom pages in force (section 4.12).
     errors: &'a errors::Chain,
     /// The host and path the client asked for, for templates.
@@ -2238,6 +2376,14 @@ impl Failing<'_> {
     /// The recording, for the response that is not a failure.
     pub(crate) fn take_recording(&self) -> Option<Recording> {
         self.recording.lock().expect("recording poisoned").take()
+    }
+
+    /// Note something of the request in flight on its listing (section
+    /// 11.7), while the recording is held here.
+    pub(crate) fn note_in_flight(&self, note: impl FnOnce(&crate::access::InFlight)) {
+        if let Some(recording) = self.recording.lock().expect("recording poisoned").as_ref() {
+            note(&recording.in_flight);
+        }
     }
 
     /// Hand the recording back, for a failure found after all.
@@ -2263,7 +2409,16 @@ impl Failing<'_> {
             },
         );
 
-        if let Some(recording) = self.recording.lock().expect("recording poisoned").take() {
+        if let Some(mut recording) = self.recording.lock().expect("recording poisoned").take() {
+            // A failure after the application had the request, its END
+            // or the deadline, ran for as long as it took to come.
+
+            if let Some(dispatched) = self.dispatched.get()
+                && recording.record.application.is_zero()
+            {
+                recording.record.application = dispatched.elapsed();
+            }
+
             let bytes = response
                 .headers()
                 .get(http::header::CONTENT_LENGTH)
@@ -2486,6 +2641,8 @@ struct BodyState {
     file: Option<FileRange>,
     /// A large BODY frame being passed on in pieces.
     piece: Option<Piece>,
+    /// The last chunk waits for the request body to settle, as on HTTP/1.
+    settles: bool,
 }
 
 /// What is left of a large BODY frame being passed on in pieces.
@@ -2540,6 +2697,18 @@ impl BodyState {
         self.back.give_reader(if intact { reader } else { None });
         self.back.abort_request();
         self.record();
+    }
+
+    /// Finish the body intact, then hold its last chunk until the request
+    /// body has been read or given up (section 4.6), so hyper sees the
+    /// request end before the response does. One left unread is dropped
+    /// by then, and hyper closes the connection after the response.
+    async fn end(&mut self) {
+        self.finish(true);
+
+        if self.settles {
+            self.back.request_settled().await;
+        }
     }
 
     fn record(&mut self) {
@@ -2619,7 +2788,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                         state.file = None;
 
                         if last {
-                            state.finish(true);
+                            state.end().await;
                         }
                     }
 
@@ -2630,7 +2799,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                     state.file = None;
 
                     if last {
-                        state.finish(true);
+                        state.end().await;
                         return None;
                     }
 
@@ -2674,7 +2843,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             state.piece = (remaining > 0).then_some(Piece { remaining, ..piece });
 
             if remaining == 0 && piece.last {
-                state.finish(true);
+                state.end().await;
             }
 
             return Some((Ok(Frame::data(chunk)), state));
@@ -2709,7 +2878,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
                 state.bytes += next.payload.len() as u64;
 
                 if next.is_end() {
-                    state.finish(true);
+                    state.end().await;
                 }
 
                 Some((Ok(Frame::data(next.payload)), state))
@@ -2739,7 +2908,7 @@ async fn next_chunk(mut state: BodyState) -> Option<(Result<Frame<Bytes>, BoxErr
             }
             Ok(Some(next)) if next.kind == kind::END => {
                 let end = pb::End::decode(next.payload).unwrap_or_default();
-                state.finish(true);
+                state.end().await;
 
                 if end.error.is_empty() {
                     None
@@ -2858,6 +3027,7 @@ async fn pump_body(
                         .is_err()
                 {
                     back.give_writer(None);
+                    back.body_settled(false);
                     return;
                 }
             }
@@ -2871,6 +3041,10 @@ async fn pump_body(
             None => break,
         }
     }
+
+    // The client has sent the whole body, whatever becomes of the link.
+
+    back.body_settled(true);
 
     let end = pb::End::default().encode_to_vec();
     if frame::write(&mut writer, kind::END, 0, end.into())
@@ -2899,22 +3073,41 @@ async fn abort(body: Incoming, mut writer: Writer, back: Arc<Return>, discard_re
 
     // hyper closes the client connection after the response if the body is
     // left unread, so read a bounded amount first. Dropping the body past
-    // the limit lets hyper close it.
+    // the limit lets hyper close it, and a remainder declared longer than
+    // the limit is given up without reading any of it.
 
-    if discard_rest {
-        let _ = tokio::time::timeout(DISCARD_DELAY, discard(body)).await;
-    }
+    let within = hyper::body::Body::size_hint(&body).lower() <= DISCARD_LIMIT as u64;
+
+    let read = if discard_rest && within {
+        matches!(
+            tokio::time::timeout(DISCARD_DELAY, discard(body)).await,
+            Ok(true)
+        )
+    } else {
+        drop(body);
+        false
+    };
+
+    back.body_settled(read);
 }
 
-async fn discard(mut body: Incoming) {
+/// Read and drop the rest of a request body, saying whether it ended
+/// within the limit.
+async fn discard(mut body: Incoming) -> bool {
     let mut seen = 0;
 
-    while let Some(Ok(next)) = body.frame().await {
-        if let Ok(data) = next.into_data() {
-            seen += data.len();
+    loop {
+        match body.frame().await {
+            None => return true,
+            Some(Err(_)) => return false,
+            Some(Ok(next)) => {
+                if let Ok(data) = next.into_data() {
+                    seen += data.len();
 
-            if seen > DISCARD_LIMIT {
-                return;
+                    if seen > DISCARD_LIMIT {
+                        return false;
+                    }
+                }
             }
         }
     }

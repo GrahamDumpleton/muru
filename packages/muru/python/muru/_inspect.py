@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -30,12 +31,15 @@ import traceback
 from collections import Counter, defaultdict
 from concurrent.futures import Future
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from muru import _debug
 
-# Environment keys whose values are not shown.
+# Environment keys whose values are not shown, as words of the key, and
+# as a suffix of it.
 
 REDACTED = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL", "AUTH")
+REDACTED_SUFFIXES = ("_DSN",)
 
 # Logger levels changed for a period, with what they were, so a reset or
 # the period's end puts them back.
@@ -517,6 +521,42 @@ def tasks(loop: asyncio.AbstractEventLoop | None) -> dict[str, Any]:
     return {"lag_ms": entries[0]["lag_ms"], "tasks": entries[1:]}
 
 
+def redact(key: str, value: str) -> str:
+    """Return the environment value as inspect shows it.
+
+    A value is hidden whole when its key looks like a secret. Otherwise a
+    password in a URL it holds, such as `postgres://shop:hunter2@db/shop`
+    under DATABASE_URL, is replaced, and the rest of the URL kept, so the
+    database and host can still be read (issue 376).
+    """
+
+    name = key.upper()
+
+    if name.endswith(REDACTED_SUFFIXES) or any(word in name for word in REDACTED):
+        return "***"
+
+    # A value may list URLs, as a cluster's are, separated by commas,
+    # semicolons or spaces; each is taken on its own.
+
+    return "".join(_redact_url(part) for part in re.split(r"([,;\s]+)", value))
+
+
+def _redact_url(text: str) -> str:
+    """Return `text` with the password of a URL replaced by ***, when it is one with a password."""
+
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text
+
+    if not parts.scheme or parts.password is None:
+        return text
+
+    userinfo, _, hostinfo = parts.netloc.rpartition("@")
+    username = userinfo.partition(":")[0]
+    return urlunsplit(parts._replace(netloc=f"{username}:***@{hostinfo}"))
+
+
 def inspect() -> dict[str, Any]:
     """Describe the worker's interpreter, modules, environment, threads and descriptors."""
 
@@ -533,10 +573,7 @@ def inspect() -> dict[str, Any]:
             "file": getattr(module, "__file__", None),
         }
 
-    environment = {
-        key: ("***" if any(word in key.upper() for word in REDACTED) else value)
-        for key, value in sorted(os.environ.items())
-    }
+    environment = {key: redact(key, value) for key, value in sorted(os.environ.items())}
     threads = [
         {"name": thread.name, "ident": thread.ident, "daemon": thread.daemon}
         for thread in threading.enumerate()

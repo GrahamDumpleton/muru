@@ -23,7 +23,7 @@ def test_development_mode_is_announced() -> None:
         # a moment after the first request is answered on a busy machine.
 
         assert server.wait_for_log("muru: development mode: error pages show tracebacks")
-        assert server.wait_for_log("muru: dashboard on http://127.0.0.1:")
+        assert server.wait_for_log(f"muru: dashboard on http://127.0.0.1:{server.dashboard_port}/")
         response = server.get("/error", headers={"Accept": "application/json"})
         assert response.status == 500
         assert "Traceback" in json.loads(response.body)["traceback"]
@@ -49,6 +49,7 @@ def start_raw(*args: str) -> tuple[subprocess.Popen[bytes], Path]:
                 sys.executable,
                 "--processes",
                 "1",
+                *support.dashboard_args(args)[0],
                 *args,
             ],
             stdout=handle,

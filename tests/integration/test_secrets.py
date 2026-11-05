@@ -122,6 +122,18 @@ def test_secrets_are_resolved_from_every_kind_of_store_and_never_shown(tmp_path:
         assert file_path.name == "API_KEY"
         assert stat.S_IMODE(file_path.stat().st_mode) == 0o400
 
+        # A command reads a file of its own, which goes when it ends, and
+        # leaves the host's in place.
+
+        read = "import os; path = os.environ['API_KEY_FILE']; print(path, open(path).read())"
+        ran = daemon.muructl("exec", "plain", "--", "python", "-c", read).stdout
+        command_file, content = ran.split()[-2:]
+        assert content == "value-for-shop/api-key"
+        assert Path(command_file) != file_path
+        assert not Path(command_file).exists()
+        assert not (daemon.run_dir / "apps" / "plain" / "r1" / "commands").exists()
+        assert file_path.exists()
+
         # What the daemon records, exports and prints names the store and
         # key, never the value.
 
@@ -172,6 +184,11 @@ def test_secrets_are_resolved_from_every_kind_of_store_and_never_shown(tmp_path:
             "serving": "",
         }
         assert daemon.get("/").status == 200, "the first release keeps serving"
+
+        # Once the release stops, its host's secret file goes too.
+
+        daemon.muructl("drain", "plain@r1")
+        assert not file_path.exists()
     finally:
         daemon.stop()
 

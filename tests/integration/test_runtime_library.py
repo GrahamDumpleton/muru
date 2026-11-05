@@ -37,7 +37,7 @@ def test_a_matching_environment_copy_is_used_and_nothing_fetched(tmp_path: Path)
 
     try:
         assert f"muru: runtime library {version('muru')} from the environment" in text
-        assert "fetched the runtime library" not in text
+        assert "the runtime library muru-" not in text
     finally:
         prov.stop(process)
 
@@ -58,7 +58,9 @@ def test_an_environment_without_muru_gets_the_library_from_the_wheel_directory(
     )
 
     try:
-        assert f"muru: fetched the runtime library muru-{wanted}-" in text
+        assert f"muru: unpacked the runtime library muru-{wanted}-" in text
+        assert f" from {wheels}, once" in text
+        assert "fetched" not in text
         unpacked = cache / "runtime" / wanted
         assert f"muru: runtime library {wanted} from {unpacked}" in text
         assert any(
@@ -79,7 +81,7 @@ def test_an_environment_without_muru_gets_the_library_from_the_wheel_directory(
     )
 
     try:
-        assert "fetched the runtime library" not in text
+        assert "the runtime library muru-" not in text
         assert f"muru: runtime library {wanted} from {unpacked}" in text
     finally:
         prov.stop(process)
@@ -133,7 +135,8 @@ def test_runtime_install_unpacks_the_library_for_an_image(tmp_path: Path) -> Non
         check=True,
     )
 
-    assert f"muru: unpacked muru-{wanted}-" in completed.stdout
+    assert f"muru: unpacked the runtime library muru-{wanted}-" in completed.stdout
+    assert f" from {wheels} into {target} for " in completed.stdout
     assert (target / "muru" / "__init__.py").is_file()
 
     imported = subprocess.run(

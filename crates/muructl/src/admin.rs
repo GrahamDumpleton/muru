@@ -417,8 +417,7 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         });
     }
 
-    let child = command.spawn().context("starting the daemon")?;
-    std::fs::write(locations.pid_file(), child.id().to_string())?;
+    command.spawn().context("starting the daemon")?;
 
     let started = Instant::now();
 
@@ -1267,7 +1266,7 @@ fn print_memory(response: &pb::DebugResponse) {
                 memory
                     .get(name)
                     .and_then(serde_json::Value::as_u64)
-                    .map(muru_config::format_size)
+                    .map(muru_config::format_size_approx)
                     .unwrap_or_else(|| "?".to_owned())
             };
             println!(
@@ -1322,8 +1321,8 @@ fn print_memory(response: &pb::DebugResponse) {
         match result["snapshot"].as_str() {
             Some("taken") => println!(
                 "  snapshot kept; tracemalloc holds {} (peak {})",
-                muru_config::format_size(result["traced"].as_u64().unwrap_or(0)),
-                muru_config::format_size(result["peak"].as_u64().unwrap_or(0))
+                muru_config::format_size_approx(result["traced"].as_u64().unwrap_or(0)),
+                muru_config::format_size_approx(result["peak"].as_u64().unwrap_or(0))
             ),
             Some("dropped") => println!("  snapshot dropped"),
             Some("none") => println!("  no snapshot was kept"),
@@ -1676,44 +1675,65 @@ fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
     })
 }
 
+/// The status table (section 11.7): a row per worker, with the columns
+/// of each side any worker of the release has, every header one word.
 fn print_status(response: &pb::DebugResponse) {
-    println!(
-        "{:<7} {:<8} {:<10} {:<9} {:<10} {:<10} {:<9} {:<9} {:<9} STATE",
-        "WORKER", "PID", "GROUP", "UP", "REQUESTS", "IN-FLIGHT", "OLDEST", "RSS", "USS"
+    let rows = muru_dashboard::inspect::status_rows(&debug_answer(response));
+    let sides = muru_dashboard::inspect::status_shape(&rows);
+    fn cells(side: &Option<muru_dashboard::inspect::SideView>) -> (&str, &str) {
+        match side {
+            Some(side) => (side.busy.as_str(), side.oldest.as_str()),
+            None => ("-", "-"),
+        }
+    }
+    let mut header = format!(
+        "{:<7} {:<8} {:<10} {:<8} {:<10}",
+        "WORKER", "PID", "GROUP", "UP", "REQUESTS"
     );
 
-    for answer in &response.workers {
-        let Some(result) = parse_result(answer) else {
-            println!("{:<7} {:<8} {}", answer.index, answer.pid, answer.error);
-            continue;
-        };
-        let size = |key: &str| {
-            result[key]
-                .as_u64()
-                .map(muru_config::format_size_approx)
-                .unwrap_or_else(|| "-".to_owned())
-        };
+    if sides.threads {
+        header += &format!(" {:<8} {:<14}", "THREADS", "THREAD-OLDEST");
+    }
 
-        let state = if result["replaced"].as_bool() == Some(true) {
-            "replaced"
-        } else if result["debugging"].as_bool() == Some(true) {
-            "debugging"
-        } else if result["ready"].as_bool() == Some(true) {
-            "ready"
-        } else {
-            "starting"
-        };
+    if sides.event_loop {
+        header += &format!(" {:<9} {:<12}", "LOOP", "LOOP-OLDEST");
+    }
+
+    println!("{header} {:<7} {:<7} {:<7} STATE", "RSS", "USS", "ROUTED");
+
+    for row in &rows {
+        if !row.error.is_empty() {
+            println!("{:<7} {:<8} {}", row.index, row.pid, row.error);
+            continue;
+        }
+
+        let mut line = format!(
+            "{:<7} {:<8} {:<10} {:<8} {:<10}",
+            row.index, row.pid, row.group, row.uptime, row.requests
+        );
+
+        if sides.threads {
+            let (busy, oldest) = cells(&row.threads);
+            line += &format!(" {busy:<8} {oldest:<14}");
+        }
+
+        if sides.event_loop {
+            let (busy, oldest) = cells(&row.event_loop);
+            line += &format!(" {busy:<9} {oldest:<12}");
+        }
+
         println!(
-            "{:<7} {:<8} {:<10} {:<9} {:<10} {:<10} {:<9} {:<9} {:<9} {state}",
-            answer.index,
-            answer.pid,
-            result["group"].as_str().unwrap_or("default"),
-            format!("{:.0}s", result["uptime_s"].as_f64().unwrap_or(0.0)),
-            result["requests"].as_u64().unwrap_or(0),
-            result["in_flight"].as_u64().unwrap_or(0),
-            format!("{}ms", result["oldest_ms"].as_u64().unwrap_or(0)),
-            size("rss"),
-            size("uss"),
+            "{line} {:<7} {:<7} {:<7} {}",
+            row.rss,
+            row.uss,
+            if row.routed { "yes" } else { "no" },
+            row.state
+        );
+    }
+
+    if sides.stale {
+        println!(
+            "* from the worker's last report, up to a second old: it did not answer within a second"
         );
     }
 }
@@ -1843,6 +1863,12 @@ fn print_inspect(response: &pb::DebugResponse) {
             continue;
         };
         let settings = &result["settings"];
+
+        // The process model already says free-threaded for WSGI on a
+        // build with the GIL off (issue 371); ASGI's is async, so the
+        // build is named after it.
+
+        let process_model = settings["process_model"].as_str().unwrap_or("?");
         println!(
             "worker {} (pid {}): python {} at {}, {} in {} (group {}, {}{})",
             answer.index,
@@ -1852,8 +1878,9 @@ fn print_inspect(response: &pb::DebugResponse) {
             settings["app"].as_str().unwrap_or("?"),
             result["cwd"].as_str().unwrap_or("?"),
             settings["group"].as_str().unwrap_or("default"),
-            settings["process_model"].as_str().unwrap_or("?"),
-            if settings["gil_enabled"].as_bool() == Some(false) {
+            process_model,
+            if settings["gil_enabled"].as_bool() == Some(false) && process_model != "free-threaded"
+            {
                 ", free-threaded"
             } else {
                 ""
@@ -2084,7 +2111,7 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<20} {:<9} {:<16} {:<32} {:<16} {:>8} {:>8} {:<6} REQUEST ID",
+        "{:<20} {:<9} {:<16} {:<32} {:<16} {:>8} {:>8} {:<6} REQUEST-ID",
         "OPENED", "FOR", "RELEASE", "PATH", "CLIENT", "RECEIVED", "SENT", "WORKER"
     );
 
@@ -2114,6 +2141,154 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
             "({} of {} open shown; --limit shows more)",
             list.sockets.len(),
             list.open
+        );
+    }
+
+    Ok(())
+}
+
+/// What `muructl requests` shows.
+#[derive(Args)]
+pub struct RequestsArgs {
+    /// Only this application's requests.
+    pub app: Option<String>,
+
+    /// List each request in flight, the oldest first, instead of
+    /// counting them by worker group.
+    #[arg(long)]
+    pub list: bool,
+
+    /// How many to list with --list.
+    #[arg(long, default_value = "100", value_name = "COUNT")]
+    pub limit: u32,
+
+    #[command(flatten)]
+    pub socket: SocketArgs,
+
+    #[command(flatten)]
+    pub output: JsonArgs,
+}
+
+/// Show the requests in flight now (section 11.7): counted by worker
+/// group, queued for a slot, holding a thread or on an event loop, with
+/// the oldest of each; or listed.
+pub async fn requests(args: RequestsArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let list = client
+        .list_requests(pb::ListRequestsRequest {
+            app: args.app.unwrap_or_default(),
+            limit: if args.list { args.limit } else { 0 },
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.output.json {
+        return print_answer(&list);
+    }
+
+    if list.in_flight == 0 && list.groups.is_empty() {
+        println!("no requests in flight");
+        return Ok(());
+    }
+
+    let age = |busy: u32, oldest_ms: u64| {
+        if busy == 0 {
+            "-".to_owned()
+        } else {
+            muru_dashboard::inspect::age(oldest_ms)
+        }
+    };
+
+    if !args.list {
+        let threads = list.groups.iter().any(|group| group.threads);
+        let event_loop = list.groups.iter().any(|group| group.event_loop);
+        let mut header = format!(
+            "{:<20} {:<12} {:<7} {:<14}",
+            "RELEASE", "GROUP", "QUEUED", "QUEUED-OLDEST"
+        );
+
+        if threads {
+            header += &format!(" {:<8} {:<14}", "THREADS", "THREAD-OLDEST");
+        }
+
+        if event_loop {
+            header += &format!(" {:<6} {:<12}", "LOOP", "LOOP-OLDEST");
+        }
+
+        println!("{}", header.trim_end());
+
+        for group in &list.groups {
+            let mut line = format!(
+                "{:<20} {:<12} {:<7} {:<14}",
+                format!("{}@{}", group.app, group.release),
+                group.group,
+                group.queued,
+                age(group.queued, group.queued_oldest_ms)
+            );
+
+            if threads {
+                let (busy, oldest) = if group.threads {
+                    (
+                        format!("{}/{}", group.threads_busy, group.threads_of),
+                        age(group.threads_busy, group.threads_oldest_ms),
+                    )
+                } else {
+                    ("-".to_owned(), "-".to_owned())
+                };
+                line += &format!(" {busy:<8} {oldest:<14}");
+            }
+
+            if event_loop {
+                let (busy, oldest) = if group.event_loop {
+                    (
+                        group.event_loop_busy.to_string(),
+                        age(group.event_loop_busy, group.event_loop_oldest_ms),
+                    )
+                } else {
+                    ("-".to_owned(), "-".to_owned())
+                };
+                line += &format!(" {busy:<6} {oldest:<12}");
+            }
+
+            println!("{}", line.trim_end());
+        }
+
+        return Ok(());
+    }
+
+    if list.in_flight == 0 {
+        println!("no requests in flight");
+        return Ok(());
+    }
+
+    println!(
+        "{:<8} {:<8} {:<15} {:<7} {:<40} {:<16} REQUEST-ID",
+        "AGE", "STATE", "KIND", "WORKER", "REQUEST", "CLIENT"
+    );
+
+    for request in &list.requests {
+        println!(
+            "{:<8} {:<8} {:<15} {:<7} {:<40} {:<16} {}",
+            muru_dashboard::inspect::age(request.age_ms),
+            request.state,
+            request.kind,
+            if request.worker < 0 {
+                "-".to_owned()
+            } else {
+                request.worker.to_string()
+            },
+            format!("{} {}", request.method, request.target),
+            request.client,
+            request.request_id
+        );
+    }
+
+    if list.requests.len() < list.in_flight as usize {
+        println!(
+            "({} of {} in flight shown; --limit shows more)",
+            list.requests.len(),
+            list.in_flight
         );
     }
 
@@ -3363,7 +3538,7 @@ fn print_scale_status(status: &pb::ScaleStatus) {
     println!("{}@{}", status.app, status.release);
     println!(
         "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} POLICY",
-        "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE P95", "REAPS"
+        "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE-P95", "REAPS"
     );
 
     for group in &status.groups {
@@ -5801,8 +5976,9 @@ pub struct LogsArgs {
     pub command: Option<LogsCommand>,
 
     /// The application, or app@release; the current release when only
-    /// the application is named.
-    #[arg(value_name = "APP[@RELEASE]", required_unless_present = "access")]
+    /// the application is named. A development run's application when
+    /// left out; the daemon needs it, unless --access is given.
+    #[arg(value_name = "APP[@RELEASE]")]
     target: Option<String>,
 
     /// Keep printing lines as they are written.
