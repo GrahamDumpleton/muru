@@ -1266,7 +1266,7 @@ fn print_memory(response: &pb::DebugResponse) {
                 memory
                     .get(name)
                     .and_then(serde_json::Value::as_u64)
-                    .map(muru_config::format_size)
+                    .map(muru_config::format_size_approx)
                     .unwrap_or_else(|| "?".to_owned())
             };
             println!(
@@ -1321,8 +1321,8 @@ fn print_memory(response: &pb::DebugResponse) {
         match result["snapshot"].as_str() {
             Some("taken") => println!(
                 "  snapshot kept; tracemalloc holds {} (peak {})",
-                muru_config::format_size(result["traced"].as_u64().unwrap_or(0)),
-                muru_config::format_size(result["peak"].as_u64().unwrap_or(0))
+                muru_config::format_size_approx(result["traced"].as_u64().unwrap_or(0)),
+                muru_config::format_size_approx(result["peak"].as_u64().unwrap_or(0))
             ),
             Some("dropped") => println!("  snapshot dropped"),
             Some("none") => println!("  no snapshot was kept"),

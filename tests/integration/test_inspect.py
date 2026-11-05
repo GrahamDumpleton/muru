@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import pstats
+import re
 import signal
 import subprocess
 import sys
@@ -460,6 +461,10 @@ def test_memory_reports_objects_and_traces_allocations(daemon: Daemon) -> None:
     assert "gc counts" in text
     assert "objects:" in text and " dict" in text
 
+    # Every size is written for a reader, with a unit (issue 370).
+
+    assert re.search(r"  rss [\d.]+[KMG]B  pss [\d.]+[KMG]B  uss [\d.]+[KMG]B$", text, re.M), text
+
     stop = threading.Event()
 
     def grow() -> None:
@@ -483,7 +488,9 @@ def test_memory_reports_objects_and_traces_allocations(daemon: Daemon) -> None:
 def test_memory_compares_with_a_snapshot_kept_between_two_points(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
     kept = daemon.muructl("debug", "memory", "plain", "--snapshot").stdout
-    assert "snapshot kept; tracemalloc holds" in kept
+    assert re.search(
+        r"snapshot kept; tracemalloc holds [\d.]+[KMG]?B \(peak [\d.]+[KMG]?B\)", kept
+    ), kept
 
     for _ in range(3):
         daemon.get("/grow?mb=1")
