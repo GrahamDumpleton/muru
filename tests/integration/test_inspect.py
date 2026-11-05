@@ -189,6 +189,64 @@ def test_tasks_list_an_asgi_workers_event_loop(daemon: Daemon) -> None:
     assert json.loads(plain)["workers"][0]["result"]["lag_ms"] is not None
 
 
+def test_status_and_stacks_show_an_asgi_workers_sync_pool(daemon: Daemon) -> None:
+    assert daemon.deploy(
+        "asgi",
+        support.FIXTURES,
+        "--entrypoint",
+        "plain_asgi:application",
+        "--processes",
+        "1",
+        "--sync-threads",
+        "2",
+        "--memory",
+        "check_interval=1s",
+    ) == ("muru: release asgi@r1 is ready and serving")
+    outcome: list[int] = []
+
+    def blocking() -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", daemon.port, timeout=60)
+
+        try:
+            connection.request("GET", "/to-thread?seconds=3")
+            outcome.append(connection.getresponse().status)
+        finally:
+            connection.close()
+
+    # Three requests each block a thread of a pool of two: both threads
+    # are busy and the third call waits for one.
+
+    threads = [threading.Thread(target=blocking) for _ in range(3)]
+
+    for thread in threads:
+        thread.start()
+
+    time.sleep(0.7)
+
+    try:
+        lines = daemon.muructl("debug", "status", "asgi").stdout.splitlines()
+        stacks = daemon.muructl("debug", "stacks", "asgi").stdout
+        labels = 'app="asgi",release="r1",group="default",worker="0"'
+        busy = f"muru_worker_sync_threads_busy{{{labels}}} 2\n"
+        wait_for(lambda: busy in daemon.muructl("metrics").stdout)
+        assert f"muru_worker_sync_threads{{{labels}}} 2\n" in daemon.muructl("metrics").stdout
+    finally:
+        for thread in threads:
+            thread.join()
+
+    assert outcome == [200, 200, 200]
+    header = lines[0].split()
+    assert header[5:9] == ["LOOP", "LOOP-OLDEST", "SYNC", "SYNC-OLDEST"], header
+    row = lines[1].split()
+    assert row[5] == "3/1000" and row[7] == "2/2", row
+    assert row[8].endswith("s") and row[8] != "-", row
+
+    # Each thread of the pool is named with the request whose call it runs.
+
+    assert stacks.count("serving GET /to-thread?seconds=3 for") == 2, stacks
+    assert "muru-sync" in stacks, stacks
+
+
 def readable_from_outside() -> bool:
     """Whether this user can read a child interpreter's stacks with PEP
     768, as a host reads its workers': Python 3.14 or later, and root on

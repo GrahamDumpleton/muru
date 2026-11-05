@@ -68,7 +68,7 @@ def memory_usage() -> dict[str, int] | None:
     """Return the worker's rss, pss and uss in bytes, or None where unmeasured."""
 
 def requests() -> list[dict[str, Any]]:
-    """Return the requests in flight: id, method, path, elapsed ms and thread."""
+    """Return the requests in flight: id, method, path, elapsed ms and threads."""
 
 def suspend_timeouts() -> bool:
     """Take the calling thread's request out of the timeouts while a debugger holds it."""
@@ -78,6 +78,12 @@ def submit(job: Callable[[], Any]) -> bool:
 
 def loop_beat() -> None:
     """Tell the loop stall watchdog that the event loop has run."""
+
+def sync_entered(request_id: str | None = None) -> None:
+    """Note that the calling thread of the loop's sync pool started a call, for a request."""
+
+def sync_left(request_id: str | None = None) -> None:
+    """Note that the calling thread of the loop's sync pool finished its call."""
 
 def gc_callback(phase: str, info: dict[str, Any]) -> None:
     """Time a collection, for gc.callbacks: start notes the time, stop records it."""

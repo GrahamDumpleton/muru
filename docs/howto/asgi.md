@@ -50,7 +50,10 @@ Synchronous code the application runs through `asyncio.to_thread`, or
 through `sync_to_async` from asgiref, goes to a thread pool of
 `--sync-threads` threads (default 8) that belongs to the loop. Both
 settings can also be given as `concurrency` and `sync_threads` in
-`[tool.muru]`.
+`[tool.muru]`. When every thread of that pool is busy, a new call waits
+for one while its request stays on the loop: `muructl debug status`
+shows the pool as SYNC, and `muru_worker_sync_threads_busy` in the
+[metrics](metrics.md) counts its busy threads.
 
 ## Lifespan
 

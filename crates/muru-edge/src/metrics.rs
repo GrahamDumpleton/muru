@@ -205,6 +205,16 @@ pub const FAMILIES: &[Family] = &[
         help: "Requests a worker has served since it started, as it last reported.",
     },
     Family {
+        name: "muru_worker_sync_threads_busy",
+        kind: Kind::Gauge,
+        help: "Threads of a worker's pool for synchronous code running a call, as it last reported.",
+    },
+    Family {
+        name: "muru_worker_sync_threads",
+        kind: Kind::Gauge,
+        help: "Threads in a worker's pool for synchronous code.",
+    },
+    Family {
         name: "muru_worker_requests_in_flight",
         kind: Kind::Gauge,
         help: "Requests a worker was serving when it last reported.",

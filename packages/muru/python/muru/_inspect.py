@@ -464,6 +464,14 @@ def stacks(active: list[dict[str, Any]], names: dict[int, str]) -> dict[str, Any
 
     known = {thread.ident: thread for thread in threading.enumerate()}
     serving = {entry["thread"]: entry for entry in active if entry.get("thread") is not None}
+
+    # An ASGI request's code runs on the loop's pool for synchronous
+    # code for as long as a call there takes.
+
+    for entry in active:
+        for ident in entry.get("sync_threads") or ():
+            serving.setdefault(ident, entry)
+
     threads = []
     own = threading.get_ident()
 

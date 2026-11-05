@@ -1692,6 +1692,7 @@ mod tests {
             group: "default".to_owned(),
             requests: 0,
             in_flight: 0,
+            sync: None,
             oldest_ms: 0,
             rss: None,
             pss: None,

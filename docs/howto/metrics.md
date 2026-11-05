@@ -63,6 +63,8 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_churn_reaps_total` | counter | app, release, group | workers the autoscaler reaped in the last hour, against its churn budget |
 | `muru_worker_requests_total` | counter | app, release, group, worker | requests a worker has served, as it last reported (under the daemon) |
 | `muru_worker_requests_in_flight` | gauge | app, release, group, worker | requests a worker was serving when it last reported |
+| `muru_worker_sync_threads_busy` | gauge | app, release, group, worker | threads of an [ASGI](asgi.md) worker's pool for synchronous code, `sync_threads` of them, that were running a `sync_to_async` or `asyncio.to_thread` call when it last reported; absent for a worker without an event loop |
+| `muru_worker_sync_threads` | gauge | app, release, group, worker | threads in that pool, so `muru_worker_sync_threads_busy` equal to it means every new call waits for one |
 | `muru_worker_cpu_seconds_total` | counter | app, release, group, worker | CPU time a worker has used, user and system, as it last reported every `check_interval` of its memory policy |
 | `muru_worker_memory_bytes` | gauge | app, release, group, worker, measure | a worker's memory as `rss`, `pss` or `uss`, measured every `check_interval` of its [memory policy](memory.md) |
 | `muru_gil_wait_seconds` | histogram | app, release, group, worker | how long a worker's threads waited for the GIL when they had work to run, in buckets from 0.1 ms to 5 s, cumulative since the worker started and reported with its memory; absent until the worker has waited at all, so a free-threaded worker never reports it |

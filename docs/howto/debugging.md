@@ -47,10 +47,23 @@ thread from the moment a pool thread picks it up, so one waiting at
 alone, is counted for as long as it holds the thread. A worker with an
 event loop shows LOOP, the requests on the loop of its `concurrency`,
 and LOOP-OLDEST; open WebSockets are left out of both, since a socket
-may stay for hours, and `muructl websockets` counts them. A worker
-shows the sides it has, and the table the columns any worker of the
-release has, so a WSGI release has the thread columns and an ASGI
-release the loop columns. Every header is one word, so a script can
+may stay for hours, and `muructl websockets` counts them. Beside them,
+SYNC is the threads of the loop's pool for synchronous code that are
+running a call, of its `sync_threads`, and SYNC-OLDEST the age of the
+oldest request with a call on one: an ASGI application whose views call
+blocking code through `asyncio.to_thread` or `sync_to_async` fills that
+pool, and at `8/8` every new call waits for a thread while the loop
+itself has room.
+
+```
+WORKER  PID      GROUP      UP       REQUESTS   LOOP      LOOP-OLDEST  SYNC    SYNC-OLDEST  RSS     USS     ROUTED  STATE
+0       41213    default    5m18s    12044      31/1000   4.2s         8/8     4.2s         52MB    34MB    yes     ready
+```
+
+A worker shows the sides it has, and the table the columns any worker
+of the release has, so a WSGI release has the thread columns and an
+ASGI release the loop and sync columns. `muructl debug stacks` names,
+on each thread of the pool, the request whose call it is running. Every header is one word, so a script can
 pick a column by its name.
 
 The figures are as of the moment the status answers: the host asks each

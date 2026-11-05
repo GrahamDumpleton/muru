@@ -14,7 +14,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from muru._context import _request_id
@@ -54,6 +54,36 @@ def heartbeat(loop: asyncio.AbstractEventLoop) -> None:
     loop.call_soon_threadsafe(beat)
 
 
+class SyncPool(ThreadPoolExecutor):
+    """The event loop's pool for synchronous code (section 6.6).
+
+    Each call is noted with the runtime while a thread of the pool runs
+    it, with the request it was made in, so the pool's busy threads and
+    the request each one serves can be seen from outside (section 11.7).
+    """
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future[Any]:
+        """Queue a call, as the executor does, noting it while it runs."""
+
+        # The request is read here, in the context of the task making
+        # the call: the thread that runs it has a context of its own
+        # unless the caller copied one.
+
+        from muru import _native
+
+        request = _request_id.get()
+
+        def held(*args: Any, **kwargs: Any) -> Any:
+            _native.sync_entered(request)
+
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _native.sync_left(request)
+
+        return super().submit(held, *args, **kwargs)
+
+
 class Loop:
     """The worker's event loop, running on a thread of its own."""
 
@@ -65,9 +95,7 @@ class Loop:
         # Section 6.6: sync_to_async and asyncio.to_thread run on a bounded
         # pool of their own, separate from any WSGI threads.
 
-        executor = ThreadPoolExecutor(
-            max_workers=max(1, sync_threads), thread_name_prefix="muru-sync"
-        )
+        executor = SyncPool(max_workers=max(1, sync_threads), thread_name_prefix="muru-sync")
         self.loop.set_default_executor(executor)
 
     def _run(self) -> None:

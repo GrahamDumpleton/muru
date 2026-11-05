@@ -88,7 +88,7 @@ type MountArgument = (
 /// The arguments are the Python signature, keyword by keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, gil_stall_timeout_ms=None, handoff=false))]
+#[pyo3(signature = (socket_path, app, threads=4, multiprocess=true, event_loop=None, runner=None, concurrency=0, on_drain=None, on_exit=None, on_reopen_logs=None, lifeline=None, mounts=Vec::new(), report=None, on_reclaim=None, memory_interval_ms=5000, control=None, on_control=None, soft_timeout_ms=None, timeout_error=None, grpc_methods=Vec::new(), loop_stall_timeout_ms=None, websocket_drain_ms=0, drain_ms=5000, gil_stall_timeout_ms=None, handoff=false, sync_threads=0))]
 fn serve(
     py: Python<'_>,
     socket_path: String,
@@ -116,6 +116,7 @@ fn serve(
     drain_ms: u64,
     gil_stall_timeout_ms: Option<u64>,
     handoff: bool,
+    sync_threads: usize,
 ) -> PyResult<()> {
     let errors = py.import("sys")?.getattr("stderr")?.unbind();
 
@@ -143,6 +144,7 @@ fn serve(
                 .unbind()
                 .into_any(),
             concurrency: concurrency.max(1),
+            sync_threads,
         }),
         (None, Some(_)) => {
             return Err(PyTypeError::new_err("a runner needs an event_loop"));
@@ -283,6 +285,27 @@ fn suspend_timeouts() -> bool {
         .is_some_and(|shared| shared.exempt_thread(thread))
 }
 
+/// Note that the calling thread, one of the event loop's pool for
+/// synchronous code (section 6.6), has started a call, for the request
+/// with the edge's id `request_id` when the call was made in one.
+#[pyfunction]
+#[pyo3(signature = (request_id=None))]
+fn sync_entered(request_id: Option<&str>) {
+    if let Some(shared) = SERVING.lock().expect("serving poisoned").upgrade() {
+        shared.sync_entered(request_id);
+    }
+}
+
+/// Note that the calling thread has finished the call `sync_entered`
+/// was told of.
+#[pyfunction]
+#[pyo3(signature = (request_id=None))]
+fn sync_left(request_id: Option<&str>) {
+    if let Some(shared) = SERVING.lock().expect("serving poisoned").upgrade() {
+        shared.sync_left(request_id);
+    }
+}
+
 /// The requests in flight, as the control thread is given them: for
 /// `muructl debug profile --requests` and `--path` (section 11.7), which
 /// look again at every sample.
@@ -321,6 +344,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(suspend_timeouts, m)?)?;
     m.add_function(wrap_pyfunction!(requests, m)?)?;
     m.add_function(wrap_pyfunction!(loop_beat, m)?)?;
+    m.add_function(wrap_pyfunction!(sync_entered, m)?)?;
+    m.add_function(wrap_pyfunction!(sync_left, m)?)?;
     m.add_function(wrap_pyfunction!(submit, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_callback, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_stats, m)?)?;

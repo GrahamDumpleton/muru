@@ -76,6 +76,8 @@ pub struct StatusRow {
     pub threads: Option<SideView>,
     /// Its event loop, when it has one.
     pub event_loop: Option<SideView>,
+    /// Its event loop's pool for synchronous code, when it has a loop.
+    pub sync: Option<SideView>,
     /// The sides are from the worker's last report, up to a second old,
     /// because it did not answer within a second; their figures carry a
     /// star.
@@ -110,6 +112,8 @@ pub struct StatusShape {
     pub threads: bool,
     /// Some worker has an event loop.
     pub event_loop: bool,
+    /// Some worker has a pool for synchronous code beside its loop.
+    pub sync: bool,
     /// Some row is from its worker's last report.
     pub stale: bool,
 }
@@ -117,7 +121,9 @@ pub struct StatusShape {
 impl StatusShape {
     /// The columns of a row after the pid: the group and the figures.
     pub fn width(&self) -> usize {
-        7 + 2 * usize::from(self.threads) + 2 * usize::from(self.event_loop)
+        7 + 2 * usize::from(self.threads)
+            + 2 * usize::from(self.event_loop)
+            + 2 * usize::from(self.sync)
     }
 }
 
@@ -126,6 +132,7 @@ pub fn status_shape(rows: &[StatusRow]) -> StatusShape {
     StatusShape {
         threads: rows.iter().any(|row| row.threads.is_some()),
         event_loop: rows.iter().any(|row| row.event_loop.is_some()),
+        sync: rows.iter().any(|row| row.sync.is_some()),
         stale: rows.iter().any(|row| row.stale),
     }
 }
@@ -321,6 +328,7 @@ pub fn status_rows(answer: &DebugAnswer) -> Vec<StatusRow> {
                 requests: result["requests"].as_u64().unwrap_or(0),
                 threads: side_view(&result["threads"], stale),
                 event_loop: side_view(&result["loop"], stale),
+                sync: side_view(&result["sync"], stale),
                 stale,
                 rss: size("rss"),
                 uss: size("uss"),
@@ -636,6 +644,7 @@ mod tests {
                         "group": "default", "state": "ready", "routed": true, "uptime_s": 7464.0,
                         "requests": 18234, "stale": false,
                         "loop": {"busy": 12, "of": 1000, "oldest_ms": 31_000},
+                        "sync": {"busy": 8, "of": 8, "oldest_ms": 31_000},
                     }),
                 ),
                 answered(
@@ -657,6 +666,9 @@ mod tests {
             (event_loop.busy.as_str(), event_loop.oldest.as_str()),
             ("12/1000", "31.0s")
         );
+        let sync = status[0].sync.as_ref().expect("a sync pool");
+        assert_eq!((sync.busy.as_str(), sync.oldest.as_str()), ("8/8", "31.0s"));
+        assert_eq!(status[1].sync, None);
         assert_eq!(status[1].uptime, "1m02s");
         assert!(status[1].stale && !status[1].routed);
         assert_eq!(status[1].state, "debugging");
@@ -671,10 +683,11 @@ mod tests {
             StatusShape {
                 threads: false,
                 event_loop: true,
+                sync: true,
                 stale: true
             }
         );
-        assert_eq!(shape.width(), 9);
+        assert_eq!(shape.width(), 11);
         assert_eq!(age(400), "0.4s");
         assert_eq!(age(62_000), "1m02s");
     }
@@ -717,6 +730,7 @@ mod tests {
             StatusShape {
                 threads: true,
                 event_loop: false,
+                sync: false,
                 stale: false
             }
         );

@@ -218,6 +218,26 @@ def detect_interface(app: Any) -> str:
     return "wsgi"
 
 
+# The sides of a worker in its report (section 11.7): its application
+# threads, its event loop and the loop's pool for synchronous code.
+
+SIDES = ("threads", "loop", "sync")
+
+
+def sync_pool(sides: dict[str, Any]) -> dict[str, int]:
+    """Return the busy threads and the size of a worker's pool for synchronous code.
+
+    Empty for a worker without an event loop, which has no such pool.
+    """
+
+    side = sides.get("sync")
+
+    if not isinstance(side, dict):
+        return {}
+
+    return {"sync_busy": int(side.get("busy", 0)), "sync_threads": int(side.get("of", 0))}
+
+
 def interface_name(interface: str) -> str:
     """Return an interface as messages name it: WSGI, ASGI or gRPC."""
 
@@ -1543,7 +1563,11 @@ class Host:
         asgi_arguments: dict[str, Any] = {}
 
         if loop is not None:
-            asgi_arguments = {"event_loop": loop.loop, "concurrency": group.concurrency}
+            asgi_arguments = {
+                "event_loop": loop.loop,
+                "concurrency": group.concurrency,
+                "sync_threads": max(1, group.sync_threads),
+            }
 
         if loop is not None and lifespan is not None:
             asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
@@ -2245,7 +2269,7 @@ class Host:
                 "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
-                **{key: sides[key] for key in ("threads", "loop") if key in sides},
+                **{key: sides[key] for key in SIDES if key in sides},
                 "stale": live is None and bool(state.sides),
                 **state.memory,
             },
@@ -2486,7 +2510,7 @@ class Host:
             state.requests = int(report.get("requests", state.requests))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
-            state.sides = {key: report[key] for key in ("threads", "loop") if key in report}
+            state.sides = {key: report[key] for key in SIDES if key in report}
 
             if "rss" in report:
                 measured = True
@@ -2646,6 +2670,7 @@ class Host:
                         "requests": state.requests,
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
+                        **sync_pool(state.sides),
                         **state.memory,
                         **state.signals,
                     }

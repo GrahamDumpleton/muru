@@ -1699,6 +1699,10 @@ fn print_status(response: &pb::DebugResponse) {
         header += &format!(" {:<9} {:<12}", "LOOP", "LOOP-OLDEST");
     }
 
+    if sides.sync {
+        header += &format!(" {:<7} {:<12}", "SYNC", "SYNC-OLDEST");
+    }
+
     println!("{header} {:<7} {:<7} {:<7} STATE", "RSS", "USS", "ROUTED");
 
     for row in &rows {
@@ -1720,6 +1724,11 @@ fn print_status(response: &pb::DebugResponse) {
         if sides.event_loop {
             let (busy, oldest) = cells(&row.event_loop);
             line += &format!(" {busy:<9} {oldest:<12}");
+        }
+
+        if sides.sync {
+            let (busy, oldest) = cells(&row.sync);
+            line += &format!(" {busy:<7} {oldest:<12}");
         }
 
         println!(

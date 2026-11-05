@@ -3289,6 +3289,22 @@ impl Daemon {
                     worker.in_flight as f64,
                 ));
 
+                // Section 6.6: an ASGI worker's pool for synchronous
+                // code, which fills while every new call waits.
+
+                if let Some((busy, threads)) = worker.sync {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_sync_threads_busy",
+                        &labels,
+                        busy as f64,
+                    ));
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_sync_threads",
+                        &labels,
+                        threads as f64,
+                    ));
+                }
+
                 // Section 7.3: the worker's own signals, as histograms
                 // once it has observed anything.
 
