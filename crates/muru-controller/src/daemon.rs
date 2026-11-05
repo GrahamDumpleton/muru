@@ -2127,6 +2127,14 @@ impl Daemon {
                     slots_busy: pools.iter().map(|pool| pool.busy as usize).sum(),
                     websockets: pools.iter().map(|pool| pool.websockets as usize).sum(),
                     slots_total: pools.iter().map(|pool| pool.slots as usize).sum(),
+                    threads: muru_dashboard::SlotSide::of(
+                        pools.iter().map(|pool| pool.threads_busy as usize).sum(),
+                        pools.iter().map(|pool| pool.threads as usize).sum(),
+                    ),
+                    event_loop: muru_dashboard::SlotSide::of(
+                        pools.iter().map(|pool| pool.loop_busy as usize).sum(),
+                        pools.iter().map(|pool| pool.loop_slots as usize).sum(),
+                    ),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: clock_hms(release.created_unix_ms),
                 });

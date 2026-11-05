@@ -167,6 +167,22 @@ pub struct SocketRow {
     pub request_id: String,
 }
 
+impl Data {
+    /// Whether any worker runs requests on threads, so the workers
+    /// table has that column.
+    pub fn has_threads(&self) -> bool {
+        self.workers.iter().any(|worker| worker.threads.is_some())
+    }
+
+    /// Whether any worker has an event loop, so the workers table has
+    /// that column.
+    pub fn has_event_loop(&self) -> bool {
+        self.workers
+            .iter()
+            .any(|worker| worker.event_loop.is_some())
+    }
+}
+
 /// One worker's row.
 #[derive(Debug, Clone)]
 pub struct Worker {
@@ -174,11 +190,46 @@ pub struct Worker {
     pub index: usize,
     /// The link socket it listens on.
     pub link: String,
-    /// Requests it can handle at once.
+    /// Requests it can handle at once, on both sides together.
     pub slots: usize,
     /// Slots busy now: handling a request, or holding an open WebSocket
     /// on a mount that does not bound its sockets apart from them.
     pub busy: usize,
+    /// Its threads, when requests run on them.
+    pub threads: Option<SlotSide>,
+    /// Its event loop, when it has one.
+    pub event_loop: Option<SlotSide>,
+}
+
+/// One side of a worker or of a release's workers, its threads or its
+/// event loop: a request is held against the side that runs it, so each
+/// has its own slots and its own busy ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SlotSide {
+    /// Slots holding a request, or an open WebSocket.
+    pub busy: usize,
+    /// Slots in all.
+    pub slots: usize,
+}
+
+impl SlotSide {
+    /// The side with these busy slots of these slots; none without slots,
+    /// which is a side the workers do not have.
+    pub fn of(busy: usize, slots: usize) -> Option<Self> {
+        (slots > 0).then_some(Self { busy, slots })
+    }
+}
+
+impl std::fmt::Display for SlotSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.busy, self.slots)
+    }
+}
+
+/// A side as a table cell: its busy slots of its slots, `3/4`, or a dash
+/// for a row without that side.
+pub fn side_cell(side: &Option<SlotSide>) -> String {
+    side.map_or_else(|| "-".to_owned(), |side| side.to_string())
 }
 
 /// One recent request, already formatted.
@@ -277,6 +328,24 @@ pub struct NodeData {
     pub logs: Vec<LogPanel>,
 }
 
+impl NodeData {
+    /// Whether any release's workers run requests on threads, so the
+    /// releases table has that column.
+    pub fn has_threads(&self) -> bool {
+        self.releases().any(|release| release.threads.is_some())
+    }
+
+    /// Whether any release's workers have an event loop, so the
+    /// releases table has that column.
+    pub fn has_event_loop(&self) -> bool {
+        self.releases().any(|release| release.event_loop.is_some())
+    }
+
+    fn releases(&self) -> impl Iterator<Item = &ReleaseRow> {
+        self.apps.iter().flat_map(|app| app.releases.iter())
+    }
+}
+
 /// An application and its releases.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AppRow {
@@ -369,8 +438,12 @@ pub struct ReleaseRow {
     pub slots_busy: usize,
     /// WebSockets open, each holding a slot.
     pub websockets: usize,
-    /// Slots in all.
+    /// Slots in all, on both sides together.
     pub slots_total: usize,
+    /// Its workers' threads, when requests run on them.
+    pub threads: Option<SlotSide>,
+    /// Its workers' event loops, when they have one.
+    pub event_loop: Option<SlotSide>,
     /// Requests waiting for a slot.
     pub waiting: usize,
     /// When it was created, as a clock time.
@@ -1392,4 +1465,42 @@ fn metrics_response(text: String) -> Response<Body> {
         .headers_mut()
         .insert(CACHE_CONTROL, "no-store".parse().expect("static"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_side_is_shown_as_busy_of_slots_and_a_missing_one_as_a_dash() {
+        assert_eq!(side_cell(&SlotSide::of(3, 4)), "3/4");
+        assert_eq!(side_cell(&SlotSide::of(0, 1000)), "0/1000");
+        assert_eq!(SlotSide::of(0, 0), None);
+        assert_eq!(side_cell(&None), "-");
+    }
+
+    #[test]
+    fn a_table_has_the_columns_of_the_sides_its_rows_have() {
+        let release = |threads, event_loop| ReleaseRow {
+            threads,
+            event_loop,
+            ..ReleaseRow::default()
+        };
+        let node = |releases| NodeData {
+            apps: vec![AppRow {
+                releases,
+                ..AppRow::default()
+            }],
+            ..NodeData::default()
+        };
+
+        let wsgi = node(vec![release(SlotSide::of(1, 4), None)]);
+        assert!(wsgi.has_threads() && !wsgi.has_event_loop());
+
+        let mixed = node(vec![
+            release(SlotSide::of(1, 4), None),
+            release(None, SlotSide::of(12, 1000)),
+        ]);
+        assert!(mixed.has_threads() && mixed.has_event_loop());
+    }
 }

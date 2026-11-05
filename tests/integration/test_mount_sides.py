@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import shutil
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -52,6 +53,17 @@ def test_an_asgi_mount_beside_a_wsgi_application_takes_no_thread(tmp_path: Path)
 
     try:
         assert "of 2 threads and an event loop of concurrency 1000" in instance.log()
+
+        # The dashboard's workers table shows each side with its own
+        # slots, where one figure would hide a full thread pool.
+
+        url = f"http://127.0.0.1:{instance.dashboard_port}/"
+
+        with urllib.request.urlopen(url, timeout=10) as response:
+            page = response.read().decode()
+
+        assert '<th class="num">Threads</th><th class="num">Loop</th>' in page
+        assert '<td class="num">0/2</td><td class="num">0/1000</td>' in page
 
         # Eight requests to the mount and two to the application, each
         # of half a second, all run at once: the mount's are on the

@@ -152,6 +152,8 @@ fn collect(inputs: &Inputs) -> Data {
             link: worker.path.display().to_string(),
             slots: worker.slots,
             busy: worker.in_flight,
+            threads: muru_dashboard::SlotSide::of(worker.threads_busy, worker.threads),
+            event_loop: muru_dashboard::SlotSide::of(worker.loop_busy, worker.loop_slots),
         })
         .collect();
     let websockets = muru_controller::dashboard::websockets_view(muru_edge::endpoints::report(

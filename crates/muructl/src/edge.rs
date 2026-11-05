@@ -459,6 +459,13 @@ impl EdgeControl for Control {
                     workers: workers.len() as u32,
                     slots: workers.iter().map(|worker| worker.slots as u32).sum(),
                     busy: workers.iter().map(|worker| worker.in_flight as u32).sum(),
+                    threads: workers.iter().map(|worker| worker.threads as u32).sum(),
+                    threads_busy: workers
+                        .iter()
+                        .map(|worker| worker.threads_busy as u32)
+                        .sum(),
+                    loop_slots: workers.iter().map(|worker| worker.loop_slots as u32).sum(),
+                    loop_busy: workers.iter().map(|worker| worker.loop_busy as u32).sum(),
                     waiting: pool.waiting() as u32,
                     websockets: open as u32,
                 });

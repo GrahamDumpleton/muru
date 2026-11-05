@@ -98,6 +98,8 @@ def test_pages_show_the_node_its_releases_requests_events_and_logs(
     assert "<title>Muru: daemon</title>" in page
     assert f"http://127.0.0.1:{daemon.port}" in page
     assert "shop@r1" in page and "ready" in page
+    assert '<th class="num">Threads</th>' in page and '<td class="num">0/6</td>' in page
+    assert '<th class="num">Loop</th>' not in page
     assert "/catalogue" in page
     assert "release.ready" in page
     assert "shop: served /catalogue" in page
@@ -136,6 +138,12 @@ def test_the_gateway_serves_the_same_figures_as_json(served: tuple[Daemon, int])
     assert apps[0]["releases"][0]["serving"] is True
     assert apps[0]["releases"][0]["workers"] == 2
     assert apps[0]["releases"][0]["slots_total"] == 6
+
+    # The shop is WSGI, two processes of three threads, with no event
+    # loop, so its slots are all on the threads.
+
+    assert apps[0]["releases"][0]["threads"] == {"busy": 0, "slots": 6}
+    assert apps[0]["releases"][0]["event_loop"] is None
 
     releases = fetch_json(port, "/v1/apps/shop/releases")
     assert releases == apps[0]["releases"]
