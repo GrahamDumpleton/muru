@@ -169,6 +169,10 @@ clean:
     cargo clean
     rm -rf docs/_build .nox .pytest_cache .mypy_cache .ruff_cache
 
+# Remove the dev profile's build output only, which is where builds pile up.
+mostlyclean:
+    cargo clean --profile dev
+
 # Install a cargo tool with cargo-binstall when available, otherwise from source.
 _cargo-tool +tools:
     for tool in {{tools}}; do \
