@@ -11,8 +11,10 @@ exec.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -99,6 +101,19 @@ def test_a_session_debugs_the_request_at_its_breakpoint(tmp_path: Path) -> None:
         assert "muru: attached to worker" in session.stderr
         assert "paused.py" in session.stderr
         assert "(Pdb) 20" in session.stdout.replace("\n", " ")
+
+        # pdb stops on the breakpoint() line itself from Python 3.13, and
+        # at the line after it before that (issue 373).
+
+        stopped = re.search(r"> .*paused\.py\((\d+)\)application\(\)\n-> (.*)\n", session.stdout)
+        assert stopped, session.stdout
+        attached = re.search(r"attached to worker \d+ at .*paused\.py:(\d+);", session.stderr)
+        assert attached, session.stderr
+        on_breakpoint = sys.version_info >= (3, 13)
+        assert int(stopped[1]) == int(attached[1]) + (0 if on_breakpoint else 1), stopped[0]
+        assert stopped[2].startswith("breakpoint(" if on_breakpoint else "start_response("), (
+            stopped[0]
+        )
         thread.join(30)
         assert answers[0].body == b"value=99"
 

@@ -233,19 +233,21 @@ the run calls it, and under `muructl run` it works as it is, with no
 ```
 $ muructl debug attach shop
 muru: attached to worker 1 at /srv/shop/views.py:42; the end of input lets the code go on
-> /srv/shop/views.py(43)checkout()
--> return charge(order)
+> /srv/shop/views.py(42)checkout()
+-> breakpoint(timeout=300)
 (Pdb) p order.total
 Decimal('120.00')
 (Pdb) continue
 muru: the session in worker 1 has ended
 ```
 
-Each line typed is a pdb command. `continue` lets the request go on and
-ends the session; so does the end of input, as does an hour in all or ten
-minutes without a line. In a worker with no breakpoint waiting, the
-session has a thread of its own, from which the worker's modules and
-state can be examined.
+The session stops on the `breakpoint()` line itself, the line the
+attach line names, as pdb does on Python 3.13 and later; on 3.11 and
+3.12 it stops at the line after it. Each line typed is a pdb command.
+`continue` lets the request go on and ends the session; so does the end
+of input, as does an hour in all or ten minutes without a line. In a
+worker with no breakpoint waiting, the session has a thread of its own,
+from which the worker's modules and state can be examined.
 
 While a session is open its worker takes no new requests, and nothing
 replaces it: recycling, the hard timeout, the memory limits and scaling
@@ -279,8 +281,9 @@ In VS Code that is an `attach` configuration naming the address:
 ```
 
 A request waiting at `breakpoint()` stops at the line after it once the
-IDE has attached, and the IDE can step through it from there; with none
-waiting, the IDE sees the worker's threads and can pause them. As with
+IDE has attached, unlike pdb, and the IDE can step through it from
+there; with none waiting, the IDE sees the worker's threads and can
+pause them. As with
 pdb, the worker takes no new requests meanwhile. Disconnecting ends the
 session and lets the code go on.
 
