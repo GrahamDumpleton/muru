@@ -123,6 +123,14 @@ def test_workers_message_lists_the_routed_sockets_by_group(tmp_path: Path) -> No
     instance.mounts = [settled, unsettled]
     assert instance.workers_message()["interfaces"] == {"": "wsgi", "ws": "asgi"}
 
+    # What a worker settled and reported is announced with the host's
+    # own, and is news only the first time.
+
+    assert instance.settle({"other": "wsgi", "odd": "soap"})
+    assert not instance.settle({"other": "wsgi"})
+    assert not instance.settle("wsgi")
+    assert instance.workers_message()["interfaces"] == {"": "wsgi", "ws": "asgi", "other": "wsgi"}
+
 
 def test_a_mount_takes_threads_of_its_own() -> None:
     context = host.Context(app="shop")

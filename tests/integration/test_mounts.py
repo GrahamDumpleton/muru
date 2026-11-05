@@ -14,10 +14,12 @@ mount, and its paths must lie within them (ADR 0033).
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
+import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,14 @@ def report(response: support.Response) -> dict[str, Any]:
     assert response.status == 200, response.body
     details: dict[str, Any] = json.loads(response.body)
     return details
+
+
+def wait_for(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+
+    while not predicate():
+        assert time.monotonic() < deadline, "the condition never held"
+        time.sleep(0.1)
 
 
 @pytest.fixture(scope="module")
@@ -186,6 +196,27 @@ interface = "asgi"
     refused = daemon.muructl("apply", "-f", str(config), check=False)
     assert refused.returncode == 1
     assert "mounts asgi plain_asgi:application at /async, recorded asgi" in refused.stdout
+
+
+def test_interfaces_the_workers_settle_are_listed_as_detected(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # Imported in each worker, the applications are never loaded by the
+    # host, so what they are comes from the workers.
+
+    project = tmp_path / "mounted"
+    shutil.copytree(MOUNTED, project, ignore=shutil.ignore_patterns("__pycache__"))
+    table = (project / "muru.toml").read_text()
+    (project / "muru.toml").write_text('preload = "false"\n' + table)
+    assert daemon.deploy("mounted", project) == "muru: release mounted@r1 is ready and serving"
+    assert report(daemon.request("/asgi/info"))["mount"] == "asgi"
+
+    def shown() -> list[str]:
+        listing = daemon.muructl("release", "show", "mounted@r1").stdout
+        return [" ".join(line.split()) for line in listing.splitlines()]
+
+    wait_for(lambda: "entrypoint mounted:wsgi_app, WSGI (detected)" in shown())
+    assert "mount asgi /asgi from mounted:asgi_app, ASGI (detected)" in shown()
 
 
 def test_a_group_must_serve_the_mounts_its_paths_reach(daemon: Daemon, tmp_path: Path) -> None:

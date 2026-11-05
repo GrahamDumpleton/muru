@@ -1018,6 +1018,12 @@ class Host:
         self.version = 0
         self.acked = 0
 
+        # Section 6.7: the interfaces the workers settled themselves, by
+        # mount, for an application imported in each worker or made by a
+        # factory there, which the host never loads.
+
+        self.settled_by_workers: dict[str, str] = {}
+
         if control is not None:
             try:
                 os.unlink(control)
@@ -1365,6 +1371,25 @@ class Host:
                         f"worker {index} serves mount {name}: {mounted.spec} as "
                         f"{interface_name(mounted.resolved)}"
                     )
+
+            # What this worker settled that the host could not, the
+            # default mount's under the empty name, goes to the host,
+            # which announces it with its own (section 6.7).
+
+            settled = {
+                name: mounted.resolved
+                for name, _, mounted, _ in realised
+                if name not in known_mounts and mounted.resolved is not None
+            }
+
+            if not known and release.resolved is not None:
+                settled[""] = release.resolved
+
+            if settled and report is not None:
+                try:
+                    os.write(report, (json.dumps({"interfaces": settled}) + "\n").encode())
+                except OSError:
+                    pass
 
             # Section 6.14: a handoff is checked against the interface it
             # hands from, and a WSGI application that hands to ASGI needs
@@ -1831,19 +1856,39 @@ class Host:
         }
 
     def interfaces(self) -> dict[str, str]:
-        """Return the interfaces settled in the host, by mount, the default as ``""``.
+        """Return the interfaces settled so far, by mount, the default as ``""``.
 
-        One that each worker settles, importing the application itself or
-        calling a factory, is not known here and is left out.
+        Those the host settled when it loaded the applications, and those
+        its workers settled and reported, importing the application
+        themselves or calling a factory; one no worker has reported yet
+        is left out.
         """
 
-        settled = {"": self.release.resolved} if self.release.resolved else {}
+        settled = dict(self.settled_by_workers)
+
+        if self.release.resolved:
+            settled[""] = self.release.resolved
 
         for mount in self.mounts:
             if mount.release.resolved:
                 settled[mount.name] = mount.release.resolved
 
         return settled
+
+    def settle(self, interfaces: Any) -> bool:
+        """Take the interfaces a worker settled itself; say whether any is new."""
+
+        if not isinstance(interfaces, dict):
+            return False
+
+        found = {
+            str(mount): interface
+            for mount, interface in interfaces.items()
+            if interface in ("wsgi", "asgi", "grpc")
+        }
+        changed = any(self.settled_by_workers.get(mount) != found[mount] for mount in found)
+        self.settled_by_workers.update(found)
+        return changed
 
     def announce(self) -> int:
         """Tell the supervisor the worker sockets changed; return the version."""
@@ -2424,6 +2469,16 @@ class Host:
                             f"timeout of {gil_stall:g} s",
                         },
                     )
+
+                continue
+
+            # Section 6.7: what the worker settled its entrypoints as,
+            # sent once before it serves; the supervisor is told when it
+            # is news.
+
+            if "interfaces" in report:
+                if self.settle(report["interfaces"]):
+                    self.announce()
 
                 continue
 
