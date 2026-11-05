@@ -178,6 +178,15 @@ pub enum Command {
         /// Answered with the edge's report.
         done: oneshot::Sender<anyhow::Result<pb::WebSockets>>,
     },
+    /// The requests in flight on the edge (section 11.7).
+    Requests {
+        /// Only this application's; all when empty.
+        app: String,
+        /// How many to list, the oldest first.
+        limit: u32,
+        /// Answered with the edge's report.
+        done: oneshot::Sender<anyhow::Result<pb::Requests>>,
+    },
     /// Create a release and apply the blue/green strategy.
     Deploy {
         /// The application.
@@ -3673,6 +3682,9 @@ impl Daemon {
             }
             Command::WebSockets { app, limit, done } => {
                 let _ = done.send(self.edge.websockets(&app, limit).await);
+            }
+            Command::Requests { app, limit, done } => {
+                let _ = done.send(self.edge.requests(&app, limit).await);
             }
             Command::Dashboard { done } => {
                 let _ = done.send(self.dashboard_data().await);

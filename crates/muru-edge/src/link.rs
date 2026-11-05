@@ -98,6 +98,8 @@ struct WorkerSlots {
     /// The other side, which requests handed across count against
     /// (section 6.14); none when the worker declares no slots there.
     other: Option<Arc<Semaphore>>,
+    /// How many requests the other side takes at once; 0 without one.
+    other_slots: usize,
     /// Section 6.7: the mounts with threads of their own, by name.
     mounts: HashMap<String, MountSlots>,
     /// The gRPC methods its mounts registered, from HELLO (section 6.13).
@@ -117,6 +119,8 @@ struct MountSlots {
     /// The threads of its own that an ASGI mount's handoffs to WSGI run
     /// on (section 6.14).
     handoff: Option<Arc<Semaphore>>,
+    /// The mount runs its requests on the event loop.
+    on_loop: bool,
 }
 
 impl WorkerSlots {
@@ -136,6 +140,7 @@ impl WorkerSlots {
                     allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
                     connections: (connections > 0).then(|| Arc::new(Semaphore::new(connections))),
                     handoff: (handoff > 0).then(|| Arc::new(Semaphore::new(handoff))),
+                    on_loop: pool.on_loop,
                 };
                 (pool.mount.clone(), slots)
             })
@@ -156,6 +161,7 @@ impl WorkerSlots {
             path,
             default_async,
             other: (other > 0).then(|| Arc::new(Semaphore::new(other))),
+            other_slots: other,
             worker_type: hello.worker_type,
             websockets: hello.websockets,
             websocket_mounts: hello.websocket_mounts,
@@ -185,6 +191,17 @@ impl WorkerSlots {
             Some(Arc::clone(&self.semaphore))
         } else {
             self.other.clone()
+        }
+    }
+
+    /// Whether a request to the mount, holding a slot of the mount's own
+    /// unless it borrowed a shared one, runs on the event loop (section
+    /// 11.7): the mount's side when it has slots of its own, else the
+    /// default mount's.
+    fn on_loop(&self, mount: &str, borrowed: bool) -> bool {
+        match self.mounts.get(mount) {
+            Some(slots) if slots.own.is_some() && !borrowed => slots.on_loop,
+            _ => self.default_async,
         }
     }
 
@@ -400,6 +417,10 @@ pub struct WorkerStatus {
     pub async_slots: usize,
     /// Requests it is handling now.
     pub in_flight: usize,
+    /// Its application threads, on which requests run; 0 when none do.
+    pub threads: usize,
+    /// Requests its event loop holds at once; 0 without a loop.
+    pub loop_slots: usize,
 }
 
 /// A worker a pool was to connect to and could not: its socket was
@@ -480,6 +501,9 @@ pub(crate) struct Lease {
     /// Section 6.7: the slot is a shared one the request's mount borrows,
     /// which the request head tells the worker.
     pub(crate) borrowed: bool,
+    /// The request runs on the worker's event loop rather than its
+    /// threads (section 11.7).
+    pub(crate) on_loop: bool,
     /// Whether the worker accepts websocket scopes.
     websockets: bool,
     /// The pool the connection came from, when it is not the one asked:
@@ -584,6 +608,12 @@ impl LinkPool {
                 slots: worker.slots(),
                 async_slots: worker.async_slots,
                 in_flight: worker.in_flight(),
+                threads: if worker.default_async {
+                    worker.other_slots
+                } else {
+                    worker.slots()
+                },
+                loop_slots: worker.async_slots,
             })
             .collect()
     }
@@ -719,6 +749,7 @@ impl LinkPool {
                 permit,
                 worker: best,
                 borrowed,
+                on_loop: worker.on_loop(mount, borrowed),
                 websockets: worker.accepts_websockets(mount),
                 woken: None,
             });
@@ -1214,8 +1245,9 @@ pub(crate) struct Recording {
     silent: bool,
     pub(crate) record: Record,
     started: Instant,
-    /// Counted as in flight until the recording is dropped.
-    _in_flight: crate::access::InFlight,
+    /// Counted as in flight, and listed, until the recording is dropped
+    /// (section 11.7).
+    pub(crate) in_flight: crate::access::InFlight,
 }
 
 /// Record a response the edge produced itself, such as a static file,
@@ -1232,48 +1264,50 @@ pub(crate) fn record(
 
 impl Recording {
     pub(crate) fn new(context: &Context<'_>, parts: &http::request::Parts) -> Self {
+        let record = Record {
+            started: SystemTime::now(),
+            request_id: context.request_id.to_owned(),
+            client: context.peer.ip(),
+            app: context.app.clone(),
+            release: context.release.clone(),
+            host: context
+                .server_name
+                .clone()
+                .unwrap_or_else(|| requested_host(parts)),
+            group: context.group.clone(),
+            mount: if context.mount.is_empty() {
+                crate::routing::DEFAULT_GROUP.to_owned()
+            } else {
+                context.mount.clone()
+            },
+            snapshot: context.snapshot,
+            method: parts.method.as_str().to_owned(),
+            target: context.client_target.clone().unwrap_or_else(|| {
+                parts
+                    .uri
+                    .path_and_query()
+                    .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string())
+            }),
+            version: format!("{:?}", parts.version),
+            status: 0,
+            reason: String::new(),
+            bytes: 0,
+            worker: None,
+            retried: false,
+            queue: Duration::ZERO,
+            application: Duration::ZERO,
+            total: Duration::ZERO,
+            redirects: context.hops.clone(),
+            client_class: context.client_class.to_string(),
+            websocket: None,
+            handoff: None,
+        };
+
         Self {
             log: Arc::clone(&context.access_log),
             silent: context.handler.is_some(),
-            _in_flight: context.access_log.begin(&context.app, &context.release),
-            record: Record {
-                started: SystemTime::now(),
-                request_id: context.request_id.to_owned(),
-                client: context.peer.ip(),
-                app: context.app.clone(),
-                release: context.release.clone(),
-                host: context
-                    .server_name
-                    .clone()
-                    .unwrap_or_else(|| requested_host(parts)),
-                group: context.group.clone(),
-                mount: if context.mount.is_empty() {
-                    crate::routing::DEFAULT_GROUP.to_owned()
-                } else {
-                    context.mount.clone()
-                },
-                snapshot: context.snapshot,
-                method: parts.method.as_str().to_owned(),
-                target: context.client_target.clone().unwrap_or_else(|| {
-                    parts
-                        .uri
-                        .path_and_query()
-                        .map_or_else(|| parts.uri.path().to_owned(), |target| target.to_string())
-                }),
-                version: format!("{:?}", parts.version),
-                status: 0,
-                reason: String::new(),
-                bytes: 0,
-                worker: None,
-                retried: false,
-                queue: Duration::ZERO,
-                application: Duration::ZERO,
-                total: Duration::ZERO,
-                redirects: context.hops.clone(),
-                client_class: context.client_class.to_string(),
-                websocket: None,
-                handoff: None,
-            },
+            in_flight: context.access_log.begin(&record),
+            record,
             started: Instant::now(),
         }
     }
@@ -1700,6 +1734,7 @@ async fn handle_inner(
             permit,
             worker,
             borrowed,
+            on_loop,
             websockets,
             woken,
         } = lease;
@@ -1713,6 +1748,7 @@ async fn handle_inner(
         recording.record.worker = Some(worker);
         recording.record.queue = queued.elapsed();
         recording.record.retried = retried;
+        recording.in_flight.dispatched(worker, on_loop);
 
         // Section 5.6: a worker that takes websocket scopes gets the
         // upgrade as one, with no body; any other worker sees an ordinary
@@ -1857,6 +1893,7 @@ async fn handle_inner(
                     .as_mut()
                 {
                     recording.record.handoff = Some(if to_loop { "asgi" } else { "wsgi" });
+                    recording.in_flight.handed(to_loop);
                 }
             }
             Ok(Some(next)) if next.kind == kind::RESPONSE => {
@@ -1905,6 +1942,13 @@ async fn handle_inner(
     if let Some(recording) = recording.as_mut() {
         recording.record.application = dispatched.elapsed();
         recording.record.status = u16::try_from(head.status).unwrap_or(500);
+
+        // Section 11.7: a response flushed as it goes streams, for as long
+        // as it needs to, which the listing says.
+
+        if head.flush == pb::FlushPolicy::Immediate as i32 {
+            recording.in_flight.streaming();
+        }
 
         // Section 4.11: a precheck the application allows is a hop of the
         // request that follows it; one it refuses is the answer.
@@ -2332,6 +2376,14 @@ impl Failing<'_> {
     /// The recording, for the response that is not a failure.
     pub(crate) fn take_recording(&self) -> Option<Recording> {
         self.recording.lock().expect("recording poisoned").take()
+    }
+
+    /// Note something of the request in flight on its listing (section
+    /// 11.7), while the recording is held here.
+    pub(crate) fn note_in_flight(&self, note: impl FnOnce(&crate::access::InFlight)) {
+        if let Some(recording) = self.recording.lock().expect("recording poisoned").as_ref() {
+            note(&recording.in_flight);
+        }
     }
 
     /// Hand the recording back, for a failure found after all.

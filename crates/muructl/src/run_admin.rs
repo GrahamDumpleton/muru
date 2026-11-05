@@ -735,6 +735,20 @@ impl Admin for Service {
         }))
     }
 
+    async fn list_requests(
+        &self,
+        request: Request<pb::ListRequestsRequest>,
+    ) -> Result<Response<pb::RequestList>, Status> {
+        let request = request.into_inner();
+        let report = muru_edge::requests::report(
+            &self.state.access_log,
+            &self.state.pools.current(),
+            &request.app,
+            request.limit as usize,
+        );
+        Ok(Response::new(muru_edge::requests::admin_list(report)))
+    }
+
     async fn debug(
         &self,
         request: Request<pb::DebugRequest>,

@@ -347,6 +347,7 @@ pub(crate) async fn handle(
     let mut recording = recording;
     recording.record.worker = Some(lease.worker);
     recording.record.queue = queued.elapsed();
+    recording.in_flight.grpc(lease.worker, lease.on_loop);
     let dispatched = Instant::now();
     let mut reader = lease.conn.reader;
     let mut writer = lease.conn.writer;

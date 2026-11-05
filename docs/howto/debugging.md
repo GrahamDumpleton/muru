@@ -62,6 +62,55 @@ debugger session is open, so the worker takes no requests), `replacing`
 says whether the edge sends it requests: a replacement that is ready
 but not yet announced to the edge reads `ready` and `no`.
 
+## Requests in flight
+
+`muructl requests` shows the requests in flight now, as `muructl
+websockets` shows open sockets: those queued at the edge for a worker
+slot, those holding a thread, and those on an event loop, with the age
+of the oldest of each, one row per worker group, since the edge queues
+per group and a count per release would hide which group is starved.
+The thread columns show for a release whose workers run requests on
+threads, the loop columns for one with an event loop:
+
+```console
+$ muructl requests shop
+RELEASE              GROUP        QUEUED  QUEUED-OLDEST  THREADS  THREAD-OLDEST  LOOP   LOOP-OLDEST
+shop@r7              default      3       1.2s           8/8      1m02s          14     31.0s
+shop@r7              reports      0       -              2/4      4.1s           -      -
+```
+
+`--list` lists them, the oldest first, with `--limit` (100) on how many:
+the age, whether the request is queued or running, its kind, the worker
+that has it, the method and target, the client and the request id.
+
+```console
+$ muructl requests shop --list --limit 5
+AGE      STATE    KIND            WORKER  REQUEST                                  CLIENT           REQUEST-ID
+1m02s    running  wsgi            1       GET /checkout                            10.0.0.7         01M5R1GN3RD59QX94CBQH28ENT
+31.0s    running  asgi            0       GET /live/summary                        10.0.0.9         01M5R1GN3RD59QX94CBQH28ENV
+4.1s     running  wsgi            1       GET /reports/annual                      10.0.0.7         01M5R1GN3RD59QX94CBQH28ENW
+1.2s     queued   -               -       GET /reports/monthly                     10.0.0.12        01M5R1GN3RD59QX94CBQH28ENX
+0.8s     running  wsgi streaming  0       GET /events                              10.0.0.3         01M5R1GN3RD59QX94CBQH28ENY
+```
+
+A request's kind is what the edge can tell of it as of now: `wsgi` or
+`asgi` by the side of the worker it was sent to, `wsgi streaming` or
+`asgi streaming` once its response head asked for immediate flushing
+(`text/event-stream`, or `X-Accel-Buffering: no`), which the timeouts
+leave alone but which holds its thread or loop slot, `grpc`, `handoff`
+once the worker handed it to its other interface, and `upstream` for a
+request sent to a managed server. A request that became a WebSocket
+leaves the list and is counted by `muructl websockets`; a static file
+is answered by the edge at once and is never listed.
+
+THREADS and LOOP here are what the edge charged each request to, from
+what the worker declared when it connected. `debug status` shows what
+the worker itself holds, so the two can differ for a worker serving
+both WSGI and ASGI. What a worker does inside a request, such as a
+thread waiting at `breakpoint()`, stays with `debug stacks` and
+`debug status`. The command works against the daemon, a development run
+and `muructl serve`, and `--json` gives the same figures.
+
 ## Stacks
 
 The Python stack of every thread in every worker, with the request a

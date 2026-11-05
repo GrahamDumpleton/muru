@@ -262,6 +262,9 @@ enum Command {
     /// Show the WebSockets open now: how many by endpoint, or each one
     /// with --list.
     Websockets(admin::WebSocketsArgs),
+    /// Show the requests in flight now: how many by worker group, queued
+    /// or running, or each one
+    Requests(admin::RequestsArgs),
 
     /// Serve muructl's operations to a coding agent over the Model Context
     /// Protocol, and keep the skill a project carries for the agent.
@@ -1010,6 +1013,7 @@ fn main() -> anyhow::Result<()> {
             runtime.block_on(admin::metrics(socket, output.json))
         }
         Command::Websockets(args) => runtime.block_on(admin::websockets(args)),
+        Command::Requests(args) => runtime.block_on(admin::requests(args)),
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {

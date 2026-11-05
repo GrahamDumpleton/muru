@@ -474,6 +474,7 @@ impl Shared {
                     max: clamp(max),
                     connections: clamp(connections),
                     handoff_threads: clamp(handoff_threads),
+                    on_loop: mount.runner.is_some(),
                 })
             })
             .collect()

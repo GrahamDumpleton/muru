@@ -91,6 +91,10 @@ service Admin {
   // The WebSockets open now, counted by endpoint and listed.
   rpc ListWebSockets(ListWebSocketsRequest) returns (WebSocketList);
 
+  // The requests in flight now, queued or running, counted by worker
+  // group and listed (section 11.7).
+  rpc ListRequests(ListRequestsRequest) returns (RequestList);
+
   // Re-read the daemon's configuration file for what can change while
   // running (section 13.3).
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
@@ -180,6 +184,52 @@ message OpenWebSocket {
   uint64 sent = 12;                 // messages to the client
   uint64 received_bytes = 13;
   uint64 sent_bytes = 14;
+}
+
+message ListRequestsRequest {
+  string app = 1;                   // only this application's; all when empty
+  uint32 limit = 2;                 // requests listed, the oldest first; 0 for none
+}
+
+// The requests in flight (section 11.7): counted by worker group, since
+// the edge queues per group, and listed.
+message RequestList {
+  uint32 in_flight = 1;             // requests in flight, of the application asked for
+  repeated RequestGroup groups = 2;
+  repeated InFlightRequest requests = 3;
+}
+
+// One worker group's requests in flight: those queued for a slot, those
+// holding a thread of the group's threads, and those on an event loop,
+// each with the age of the oldest.
+message RequestGroup {
+  string app = 1;
+  string release = 2;
+  string group = 3;
+  uint32 queued = 4;
+  uint64 queued_oldest_ms = 5;
+  bool threads = 6;                 // the group's workers run requests on threads
+  uint32 threads_busy = 7;
+  uint32 threads_of = 8;
+  uint64 threads_oldest_ms = 9;
+  bool event_loop = 10;             // the group's workers have an event loop
+  uint32 event_loop_busy = 11;
+  uint64 event_loop_oldest_ms = 12;
+}
+
+message InFlightRequest {
+  string request_id = 1;
+  string client = 2;
+  string app = 3;
+  string release = 4;
+  string group = 5;
+  string method = 6;
+  string target = 7;                // the path with its query string
+  string state = 8;                 // queued or running
+  string kind = 9;                  // wsgi, wsgi streaming, asgi, asgi streaming, grpc, handoff or upstream; - while queued
+  int32 worker = 10;                // -1 when none has it
+  uint64 started_unix_ms = 11;
+  uint64 age_ms = 12;
 }
 
 message ListAppsRequest {}

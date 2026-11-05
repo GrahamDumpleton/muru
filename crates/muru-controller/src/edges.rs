@@ -355,6 +355,21 @@ impl EdgeProcess {
             .into_inner())
     }
 
+    /// The requests in flight on the edge, of one application or all when
+    /// `app` is empty: counted by worker group, and the first `limit`
+    /// listed, the oldest first (section 11.7).
+    pub async fn requests(&self, app: &str, limit: u32) -> anyhow::Result<pb::Requests> {
+        let mut client = connect(&self.spec.control).await?;
+        Ok(client
+            .get_requests(pb::RequestsRequest {
+                app: app.to_owned(),
+                limit,
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("the edge did not answer: {}", status.message()))?
+            .into_inner())
+    }
+
     /// The edge's metrics as samples (section 11.1).
     pub async fn metrics(&self) -> anyhow::Result<Vec<muru_edge::metrics::Sample>> {
         let mut client = connect(&self.spec.control).await?;

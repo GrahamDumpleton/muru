@@ -2147,6 +2147,154 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `muructl requests` shows.
+#[derive(Args)]
+pub struct RequestsArgs {
+    /// Only this application's requests.
+    pub app: Option<String>,
+
+    /// List each request in flight, the oldest first, instead of
+    /// counting them by worker group.
+    #[arg(long)]
+    pub list: bool,
+
+    /// How many to list with --list.
+    #[arg(long, default_value = "100", value_name = "COUNT")]
+    pub limit: u32,
+
+    #[command(flatten)]
+    pub socket: SocketArgs,
+
+    #[command(flatten)]
+    pub output: JsonArgs,
+}
+
+/// Show the requests in flight now (section 11.7): counted by worker
+/// group, queued for a slot, holding a thread or on an event loop, with
+/// the oldest of each; or listed.
+pub async fn requests(args: RequestsArgs) -> anyhow::Result<()> {
+    let mut client = client::connect(&args.socket.socket()?).await?;
+    let list = client
+        .list_requests(pb::ListRequestsRequest {
+            app: args.app.unwrap_or_default(),
+            limit: if args.list { args.limit } else { 0 },
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if args.output.json {
+        return print_answer(&list);
+    }
+
+    if list.in_flight == 0 && list.groups.is_empty() {
+        println!("no requests in flight");
+        return Ok(());
+    }
+
+    let age = |busy: u32, oldest_ms: u64| {
+        if busy == 0 {
+            "-".to_owned()
+        } else {
+            muru_dashboard::inspect::age(oldest_ms)
+        }
+    };
+
+    if !args.list {
+        let threads = list.groups.iter().any(|group| group.threads);
+        let event_loop = list.groups.iter().any(|group| group.event_loop);
+        let mut header = format!(
+            "{:<20} {:<12} {:<7} {:<14}",
+            "RELEASE", "GROUP", "QUEUED", "QUEUED-OLDEST"
+        );
+
+        if threads {
+            header += &format!(" {:<8} {:<14}", "THREADS", "THREAD-OLDEST");
+        }
+
+        if event_loop {
+            header += &format!(" {:<6} {:<12}", "LOOP", "LOOP-OLDEST");
+        }
+
+        println!("{}", header.trim_end());
+
+        for group in &list.groups {
+            let mut line = format!(
+                "{:<20} {:<12} {:<7} {:<14}",
+                format!("{}@{}", group.app, group.release),
+                group.group,
+                group.queued,
+                age(group.queued, group.queued_oldest_ms)
+            );
+
+            if threads {
+                let (busy, oldest) = if group.threads {
+                    (
+                        format!("{}/{}", group.threads_busy, group.threads_of),
+                        age(group.threads_busy, group.threads_oldest_ms),
+                    )
+                } else {
+                    ("-".to_owned(), "-".to_owned())
+                };
+                line += &format!(" {busy:<8} {oldest:<14}");
+            }
+
+            if event_loop {
+                let (busy, oldest) = if group.event_loop {
+                    (
+                        group.event_loop_busy.to_string(),
+                        age(group.event_loop_busy, group.event_loop_oldest_ms),
+                    )
+                } else {
+                    ("-".to_owned(), "-".to_owned())
+                };
+                line += &format!(" {busy:<6} {oldest:<12}");
+            }
+
+            println!("{}", line.trim_end());
+        }
+
+        return Ok(());
+    }
+
+    if list.in_flight == 0 {
+        println!("no requests in flight");
+        return Ok(());
+    }
+
+    println!(
+        "{:<8} {:<8} {:<15} {:<7} {:<40} {:<16} REQUEST-ID",
+        "AGE", "STATE", "KIND", "WORKER", "REQUEST", "CLIENT"
+    );
+
+    for request in &list.requests {
+        println!(
+            "{:<8} {:<8} {:<15} {:<7} {:<40} {:<16} {}",
+            muru_dashboard::inspect::age(request.age_ms),
+            request.state,
+            request.kind,
+            if request.worker < 0 {
+                "-".to_owned()
+            } else {
+                request.worker.to_string()
+            },
+            format!("{} {}", request.method, request.target),
+            request.client,
+            request.request_id
+        );
+    }
+
+    if list.requests.len() < list.in_flight as usize {
+        println!(
+            "({} of {} in flight shown; --limit shows more)",
+            list.requests.len(),
+            list.in_flight
+        );
+    }
+
+    Ok(())
+}
+
 /// Re-read the daemon's configuration file.
 pub async fn daemon_reload(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.socket()?).await?;
