@@ -285,25 +285,41 @@ fn suspend_timeouts() -> bool {
         .is_some_and(|shared| shared.exempt_thread(thread))
 }
 
-/// Note that the calling thread, one of the event loop's pool for
-/// synchronous code (section 6.6), has started a call, for the request
-/// with the edge's id `request_id` when the call was made in one.
+/// Note that the calling thread, one of a pool for synchronous code
+/// (section 6.6), has started a call, for the request with the edge's id
+/// `request_id` when the call was made in one. `pool` is the pool's
+/// place in `pool::SYNC_POOLS`.
 #[pyfunction]
-#[pyo3(signature = (request_id=None))]
-fn sync_entered(request_id: Option<&str>) {
+#[pyo3(signature = (request_id=None, pool=0))]
+fn sync_entered(request_id: Option<&str>, pool: usize) {
     if let Some(shared) = SERVING.lock().expect("serving poisoned").upgrade() {
-        shared.sync_entered(request_id);
+        shared.sync_entered(request_id, pool);
     }
 }
 
 /// Note that the calling thread has finished the call `sync_entered`
 /// was told of.
 #[pyfunction]
-#[pyo3(signature = (request_id=None))]
-fn sync_left(request_id: Option<&str>) {
+#[pyo3(signature = (request_id=None, pool=0))]
+fn sync_left(request_id: Option<&str>, pool: usize) {
     if let Some(shared) = SERVING.lock().expect("serving poisoned").upgrade() {
-        shared.sync_left(request_id);
+        shared.sync_left(request_id, pool);
     }
+}
+
+/// Say how many threads a pool for synchronous code has (section 6.6),
+/// and how many are running a call when the runtime samples the pool
+/// instead of being told of each call. Returns whether a worker is
+/// serving here to take it.
+#[pyfunction]
+#[pyo3(signature = (pool, threads, busy=None))]
+fn sync_pool(pool: usize, threads: u32, busy: Option<u32>) -> bool {
+    let Some(shared) = SERVING.lock().expect("serving poisoned").upgrade() else {
+        return false;
+    };
+
+    shared.sync_pool(pool, threads, busy);
+    true
 }
 
 /// The requests in flight, as the control thread is given them: for
@@ -346,6 +362,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(loop_beat, m)?)?;
     m.add_function(wrap_pyfunction!(sync_entered, m)?)?;
     m.add_function(wrap_pyfunction!(sync_left, m)?)?;
+    m.add_function(wrap_pyfunction!(sync_pool, m)?)?;
     m.add_function(wrap_pyfunction!(submit, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_callback, m)?)?;
     m.add_function(wrap_pyfunction!(gc::gc_stats, m)?)?;

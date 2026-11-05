@@ -47,8 +47,11 @@ views run on threads through Django's own `sync_to_async` handling.
 - `--concurrency` (default 1000) is how many requests one worker holds on
   its loop at once; `--processes` adds workers.
 
-- `--sync-threads` (default 8) sizes the pool behind `asyncio.to_thread`
-  and `sync_to_async` calls that use the loop's default executor.
+- `--sync-threads` (default 8) is how many `def` endpoints and
+  dependencies, and `asyncio.to_thread` calls, a worker runs at once:
+  Starlette and FastAPI run synchronous code on anyio's worker threads,
+  whose limit Muru sets to it. See
+  [where synchronous code runs](asgi.md#one-event-loop-per-worker).
 
 - The body size limit, timeouts and HTTPS options of `muructl run` apply
   exactly as they do to WSGI applications.

@@ -219,23 +219,25 @@ def detect_interface(app: Any) -> str:
 
 
 # The sides of a worker in its report (section 11.7): its application
-# threads, its event loop and the loop's pool for synchronous code.
+# threads, its event loop, the fullest of the pools synchronous code
+# runs on for the loop, and each of those pools by name.
 
-SIDES = ("threads", "loop", "sync")
+SIDES = ("threads", "loop", "sync", "sync_pools")
 
 
-def sync_pool(sides: dict[str, Any]) -> dict[str, int]:
-    """Return the busy threads and the size of a worker's pool for synchronous code.
+def sync_pools(sides: dict[str, Any]) -> dict[str, Any]:
+    """Return a worker's pools for synchronous code, for the status sent to the supervisor.
 
-    Empty for a worker without an event loop, which has no such pool.
+    Each by name with its busy threads and its threads; empty for a
+    worker without an event loop, which has no such pool.
     """
 
-    side = sides.get("sync")
+    pools = sides.get("sync_pools")
 
-    if not isinstance(side, dict):
+    if not isinstance(pools, dict):
         return {}
 
-    return {"sync_busy": int(side.get("busy", 0)), "sync_threads": int(side.get("of", 0))}
+    return {"sync_pools": pools}
 
 
 def interface_name(interface: str) -> str:
@@ -1475,6 +1477,12 @@ class Host:
                 loop = _asgi.Loop(group.sync_threads)
                 loop.start()
 
+                # Section 6.6: anyio and asgiref run synchronous code on
+                # threads of their own, which the worker bounds and
+                # counts from here on.
+
+                loop.adopt_sync_pools()
+
             if loop is not None and release.resolved == "asgi":
                 lifespan = _asgi.Lifespan(app, loop, release.spec)
                 lifespan.startup()
@@ -2672,7 +2680,7 @@ class Host:
                         "requests": state.requests,
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
-                        **sync_pool(state.sides),
+                        **sync_pools(state.sides),
                         **state.memory,
                         **state.signals,
                     }

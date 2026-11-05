@@ -46,14 +46,25 @@ not seen by another. Up to `--concurrency` requests (default 1000) are in
 flight on the loop at once; the edge queues beyond that, as it does for
 threads, and answers 503 when the queue timeout passes.
 
-Synchronous code the application runs through `asyncio.to_thread`, or
-through `sync_to_async` from asgiref, goes to a thread pool of
-`--sync-threads` threads (default 8) that belongs to the loop. Both
-settings can also be given as `concurrency` and `sync_threads` in
-`[tool.muru]`. When every thread of that pool is busy, a new call waits
-for one while its request stays on the loop: `muructl debug status`
-shows the pool as SYNC, and `muru_worker_sync_threads_busy` in the
-[metrics](metrics.md) counts its busy threads.
+`--sync-threads` (default 8) bounds the synchronous code a worker runs
+for its loop at once. Both settings can also be given as `concurrency`
+and `sync_threads` in `[tool.muru]`. Which threads run the code depends
+on how it is called:
+
+| Called through | Runs on | At once |
+| --- | --- | --- |
+| `asyncio.to_thread`, `loop.run_in_executor(None, ...)`, asgiref's `sync_to_async(..., thread_sensitive=False)` | the loop's own pool, threads named `muru-sync` | `sync_threads` |
+| anyio's `to_thread.run_sync`, which Starlette and FastAPI use for `def` endpoints and dependencies | anyio's worker threads | `sync_threads`, which Muru sets as anyio's thread limit in place of its 40 |
+| asgiref's `sync_to_async`, thread sensitive as it is by default | one thread shared by every such call, named `muru-sync-asgiref` | 1 |
+| the same inside Django's ASGI handler, which is where a Django view's ORM calls run | a thread of the request's own | one for each request, so up to `concurrency` |
+
+An application that sets anyio's thread limit itself, in its lifespan
+startup, keeps its own figure. When every thread of a pool is busy, a
+new call there waits for one while its request stays on the loop:
+`muructl debug status` shows the fullest of the first three pools as
+SYNC, and `muru_worker_sync_threads_busy` in the [metrics](metrics.md)
+counts the busy threads of each. The per-request threads of Django's
+handler are counted by neither.
 
 ## Lifespan
 

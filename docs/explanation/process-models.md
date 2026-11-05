@@ -63,9 +63,10 @@ which every connection's coroutine runs. The configured concurrency is how
 many requests the worker accepts at once, and WebSockets have a separate
 limit because they live longer.
 
-Synchronous code called through `sync_to_async` or `asyncio.to_thread` runs
-on a separate bounded thread pool in the same worker, so a blocking call
-cannot stall the loop.
+Synchronous code called through `asyncio.to_thread`, or through a
+framework's own way of running `def` views, runs on threads apart from
+the loop in the same worker, bounded by `sync_threads`, so a blocking
+call cannot stall the loop.
 
 ## Choosing processes and threads
 

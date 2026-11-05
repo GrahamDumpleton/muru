@@ -92,10 +92,10 @@ pub struct WorkerStatus {
     pub in_flight: u64,
     /// The age of its oldest request, in milliseconds.
     pub oldest_ms: u64,
-    /// The threads of its event loop's pool for synchronous code that
-    /// are running a call, and how many the pool has (section 6.6);
-    /// none for a worker without a loop.
-    pub sync: Option<(u64, u64)>,
+    /// The pools synchronous code runs on for its event loop (section
+    /// 6.6), each by name with its threads running a call and the
+    /// threads it has; empty for a worker without a loop.
+    pub sync_pools: Vec<(String, u64, u64)>,
     /// Resident set size in bytes, when measured.
     pub rss: Option<u64>,
     /// Proportional set size in bytes, when measured.
@@ -278,9 +278,21 @@ impl HostMessage {
                                 requests: worker["requests"].as_u64().unwrap_or(0),
                                 in_flight: worker["in_flight"].as_u64().unwrap_or(0),
                                 oldest_ms: worker["oldest_ms"].as_u64().unwrap_or(0),
-                                sync: worker["sync_busy"]
-                                    .as_u64()
-                                    .zip(worker["sync_threads"].as_u64()),
+                                sync_pools: worker["sync_pools"]
+                                    .as_object()
+                                    .map(|pools| {
+                                        pools
+                                            .iter()
+                                            .filter_map(|(name, pool)| {
+                                                Some((
+                                                    name.clone(),
+                                                    pool["busy"].as_u64()?,
+                                                    pool["of"].as_u64()?,
+                                                ))
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
                                 rss: worker["rss"].as_u64(),
                                 pss: worker["pss"].as_u64(),
                                 uss: worker["uss"].as_u64(),

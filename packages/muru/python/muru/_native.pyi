@@ -79,11 +79,14 @@ def submit(job: Callable[[], Any]) -> bool:
 def loop_beat() -> None:
     """Tell the loop stall watchdog that the event loop has run."""
 
-def sync_entered(request_id: str | None = None) -> None:
-    """Note that the calling thread of the loop's sync pool started a call, for a request."""
+def sync_entered(request_id: str | None = None, pool: int = 0) -> None:
+    """Note that the calling thread of a pool for sync code started a call, for a request."""
 
-def sync_left(request_id: str | None = None) -> None:
-    """Note that the calling thread of the loop's sync pool finished its call."""
+def sync_left(request_id: str | None = None, pool: int = 0) -> None:
+    """Note that the calling thread of a pool for sync code finished its call."""
+
+def sync_pool(pool: int, threads: int, busy: int | None = None) -> bool:
+    """Say how many threads a pool for sync code has, and how many are busy when sampled."""
 
 def gc_callback(phase: str, info: dict[str, Any]) -> None:
     """Time a collection, for gc.callbacks: start notes the time, stop records it."""

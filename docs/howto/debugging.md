@@ -48,12 +48,15 @@ alone, is counted for as long as it holds the thread. A worker with an
 event loop shows LOOP, the requests on the loop of its `concurrency`,
 and LOOP-OLDEST; open WebSockets are left out of both, since a socket
 may stay for hours, and `muructl websockets` counts them. Beside them,
-SYNC is the threads of the loop's pool for synchronous code that are
-running a call, of its `sync_threads`, and SYNC-OLDEST the age of the
-oldest request with a call on one: an ASGI application whose views call
-blocking code through `asyncio.to_thread` or `sync_to_async` fills that
-pool, and at `8/8` every new call waits for a thread while the loop
-itself has room.
+SYNC is the threads running synchronous code for the loop, of the
+threads that may: an ASGI application whose views call blocking code
+fills them, and at `8/8` every new call waits for a thread while the
+loop itself has room. Such code runs on one of
+[three pools](asgi.md#one-event-loop-per-worker), the loop's own,
+anyio's and asgiref's shared thread, and SYNC is the fullest of them,
+the one whose calls wait first; `--json` gives each as `sync_pools`.
+SYNC-OLDEST is the age of the oldest request with a call on the loop's
+pool or asgiref's thread, and a dash when the busy threads are anyio's.
 
 ```
 WORKER  PID      GROUP      UP       REQUESTS   LOOP      LOOP-OLDEST  SYNC    SYNC-OLDEST  RSS     USS     ROUTED  STATE
