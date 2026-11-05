@@ -275,6 +275,12 @@ pub(crate) mod tests {
     /// threads, and a fork on one thread copies every open descriptor into
     /// its child until that child execs, which makes executing a script
     /// another thread is still writing fail with `ETXTBSY`.
+    ///
+    /// Neither the shell that writes the script nor the script itself
+    /// looks anything up on PATH, since a test on another thread may have
+    /// emptied PATH for a moment: the script keeps `calls` beside itself
+    /// with `${0%/*}`, where `dirname` would have gone missing and left the
+    /// file at the root.
     pub(crate) fn fake_uv(dir: &Path, answer: Option<&str>) -> PathBuf {
         let path = dir.join("uv");
 
@@ -284,13 +290,13 @@ pub(crate) mod tests {
         };
 
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\ncase \"$*\" in\n*--version*) echo 'uv 0.9.9';;\n*python\\ find*) {find};;\n*) echo \"unexpected $*\" >&2; exit 1;;\nesac\n"
+            "#!/bin/sh\necho \"$@\" >> \"${{0%/*}}/calls\"\ncase \"$*\" in\n*--version*) echo 'uv 0.9.9';;\n*python\\ find*) {find};;\n*) echo \"unexpected $*\" >&2; exit 1;;\nesac\n"
         );
 
-        let written = Command::new("sh")
+        let written = Command::new("/bin/sh")
             .args([
                 "-c",
-                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "printf '%s' \"$2\" > \"$1\" && /bin/chmod 755 \"$1\"",
                 "sh",
             ])
             .arg(&path)
