@@ -266,10 +266,15 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A fake uv: a script that answers `python find` with `answer` (a
     /// path, or nothing with uv's own error) and `--version` with 0.9.9.
+    ///
+    /// A child shell writes the script, so that no descriptor of the test
+    /// process is ever open on it for writing: the tests run on parallel
+    /// threads, and a fork on one thread copies every open descriptor into
+    /// its child until that child execs, which makes executing a script
+    /// another thread is still writing fail with `ETXTBSY`.
     pub(crate) fn fake_uv(dir: &Path, answer: Option<&str>) -> PathBuf {
         let path = dir.join("uv");
 
@@ -278,14 +283,26 @@ pub(crate) mod tests {
             None => "echo 'error: No interpreter found for Python 3.99 in virtual environments, managed installations, or search path' >&2; exit 2".to_owned(),
         };
 
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\ncase \"$*\" in\n*--version*) echo 'uv 0.9.9';;\n*python\\ find*) {find};;\n*) echo \"unexpected $*\" >&2; exit 1;;\nesac\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\ncase \"$*\" in\n*--version*) echo 'uv 0.9.9';;\n*python\\ find*) {find};;\n*) echo \"unexpected $*\" >&2; exit 1;;\nesac\n"
+        );
+
+        let written = Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "sh",
+            ])
+            .arg(&path)
+            .arg(script)
+            .status()
+            .unwrap();
+
+        assert!(
+            written.success(),
+            "writing the fake uv at {}",
+            path.display()
+        );
         path
     }
 
