@@ -85,7 +85,7 @@ Every worker has a control connection to its host, and the host to the daemon, s
 
 **Profiling for a period.**
 
-- `muructl debug profile --for 30s`: sampling with the standard library's profiler, of one worker or every worker of a release at once, written locally as collapsed stacks for a flame graph or as pstats. No overhead on the worker and safe on production, which is the point of sampling.
+- `muructl debug profile --for 30s`: sampling with the standard library's profiler, of one worker or every worker of a release at once, written locally as collapsed stacks for a flame graph or as pstats. Safe on production, which is the point of sampling: at the default interval a profile costs a busy worker nothing measurable, whether read from outside (Linux, Python 3.15 and later) or taken by a thread of the worker, which with the GIL waits its turn for the interpreter and on a free-threaded build pauses the other threads for the moment each sample takes; at a 1 ms interval a busy worker loses a few percent (issue 374).
 - `muructl debug trace --for 10s`: in-process sys.monitoring for exact call counts and times when sampling is too coarse. It costs the worker something, so it refuses a worker above a load threshold unless forced; the worker keeps serving while it runs, so the trace sees the requests it takes meanwhile.
 - `--requests N --path PREFIX`: profile or trace only the next N requests matching a path or header rather than everything on a busy worker.
 

@@ -102,8 +102,17 @@ starts on, so its samples are counted together whichever of its lines
 was running. The functions that took most samples are printed
 on standard error with their share. Threads waiting outside Python, such
 as idle threads of the pool, are not sampled, so the profile is of the
-work being done. Sampling costs the worker little, so it is safe on a
-release serving traffic.
+work being done.
+
+A profile at the default interval makes no measurable difference to a
+busy worker's throughput or latency, so it is safe on a release serving
+traffic. On Linux with Python 3.15 or later the samples are read from
+outside the worker, which is not interrupted at all. Elsewhere, and
+with `--path` or `--requests`, a thread of the worker takes them: with
+the GIL it waits its turn for the interpreter like any other thread,
+and on a free-threaded build it pauses the other threads for the moment
+each sample takes. Sampling much more often costs more in proportion;
+at a 1 ms interval, expect a busy worker to lose a few percent.
 
 On a busy worker, `--path` samples only the threads serving requests
 whose path starts with a prefix, and `--requests` ends the profile once
