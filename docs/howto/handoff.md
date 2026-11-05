@@ -226,7 +226,11 @@ the request has been handed off.
 
 When every thread is busy, a request handed over waits in the worker, in
 turn, for one. If its deadline has passed by the time a thread takes it,
-it is answered 503 with reason `queue_full`.
+it is answered 503 with reason `queue_full`. How long requests wait is
+measured: `muru_handoff_queue_wait_seconds` in the [metrics](metrics.md),
+and the 95th percentile as `handoff wait p95` in `muructl scale status`,
+whose [diagnosis](scaling.md#watching-and-overriding) names the wait
+once it reaches 100 ms.
 
 ## How handoffs are counted
 

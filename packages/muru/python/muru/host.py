@@ -2529,6 +2529,8 @@ class Host:
                         "gil_wait_us",
                         "loop_lag",
                         "loop_lag_us",
+                        "handoff_wait",
+                        "handoff_wait_us",
                         "gc",
                     )
                     if key in report

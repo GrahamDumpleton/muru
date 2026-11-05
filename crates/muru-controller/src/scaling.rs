@@ -161,6 +161,10 @@ pub struct WorkerSignals {
     pub gil_wait_p95_ms: Option<f64>,
     /// The 95th percentile lateness of the event loop, in milliseconds.
     pub loop_lag_p95_ms: Option<f64>,
+    /// The 95th percentile wait for a thread of the requests handed
+    /// from ASGI to WSGI (section 6.14), in milliseconds; none when no
+    /// request was handed over between the reports.
+    pub handoff_queue_wait_p95_ms: Option<f64>,
     /// The share of a worker's wall time spent in garbage collection,
     /// averaged over the workers (section 11.1).
     pub gc_share: Option<f64>,
@@ -181,6 +185,7 @@ impl WorkerSignals {
         let mut cores = Vec::new();
         let mut gil_wait = Vec::new();
         let mut loop_lag = Vec::new();
+        let mut handoff_wait = Vec::new();
         let mut gc = Vec::new();
         let wall_ms = elapsed.as_millis() as f64;
 
@@ -205,6 +210,11 @@ impl WorkerSignals {
 
             add_growth(&mut gil_wait, &worker.gil_wait, &earlier.gil_wait);
             add_growth(&mut loop_lag, &worker.loop_lag, &earlier.loop_lag);
+            add_growth(
+                &mut handoff_wait,
+                &worker.handoff_wait,
+                &earlier.handoff_wait,
+            );
 
             // Time collecting since the earlier report, over every
             // generation, as a share of the wall time.
@@ -223,6 +233,7 @@ impl WorkerSignals {
             cores: mean(&cores),
             gil_wait_p95_ms: p95_ms(&gil_wait),
             loop_lag_p95_ms: p95_ms(&loop_lag),
+            handoff_queue_wait_p95_ms: p95_ms(&handoff_wait),
             gc_share: mean(&gc),
         }
     }
@@ -267,8 +278,8 @@ fn p95_ms(counts: &[u64]) -> Option<f64> {
 /// release, from its slots, its queue and its workers' own signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnosis {
-    /// The bottleneck: cpu, gil, io, heavy, loop, memory, gc, idle or
-    /// none.
+    /// The bottleneck: cpu, gil, io, heavy, loop, handoff, memory, gc,
+    /// idle or none.
     pub bottleneck: &'static str,
     /// The bottleneck in words.
     pub summary: &'static str,
@@ -331,6 +342,17 @@ pub fn diagnose(
             "cpu",
             "CPU bound",
             "more processes, up to the node's cores; more threads will not help",
+        );
+    }
+
+    // Section 6.14: requests handed from ASGI to WSGI wait inside the
+    // worker for a thread, where the edge's queue does not see them.
+
+    if signals.handoff_queue_wait_p95_ms.unwrap_or(0.0) >= 100.0 {
+        return diagnosis(
+            "handoff",
+            "requests handed to WSGI wait for a thread",
+            "more threads for the requests handed over, or a mount for the paths that are",
         );
     }
 
@@ -1703,8 +1725,42 @@ mod tests {
             gil_wait_us: 0,
             loop_lag: Vec::new(),
             loop_lag_us: 0,
+            handoff_wait: Vec::new(),
+            handoff_wait_us: 0,
             gc: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_handoff_wait_is_the_growth_between_two_reports() {
+        // Twenty requests handed to WSGI between the reports: ten took
+        // a thread within a millisecond and ten waited up to half a
+        // second, so the 95th percentile is the half second.
+
+        let zeros = vec![0; 11];
+        let mut before = worker(1, 0, zeros.clone(), true);
+        before.handoff_wait = vec![5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+        let mut after = worker(1, 0, zeros.clone(), true);
+        after.handoff_wait = vec![5, 5, 15, 15, 15, 15, 15, 25, 25, 25, 25];
+        let signals = WorkerSignals::between(
+            &[before.clone()],
+            &[after],
+            "default",
+            Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(signals.handoff_queue_wait_p95_ms, Some(500.0));
+
+        // With none handed over meanwhile there is nothing to measure.
+
+        let unchanged = WorkerSignals::between(
+            &[before.clone()],
+            &[before],
+            "default",
+            Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(unchanged.handoff_queue_wait_p95_ms, None);
     }
 
     #[test]
@@ -1808,6 +1864,29 @@ mod tests {
         assert_eq!(diagnose(0.05, None, &quiet, false).bottleneck, "idle");
         assert_eq!(diagnose(0.5, None, &quiet, false).bottleneck, "none");
         assert_eq!(diagnose(0.5, None, &lagging, false).bottleneck, "loop");
+
+        // Requests handed to WSGI waiting for a thread inside the
+        // worker, which the slots at the edge do not show; a cause of
+        // slow threads is named before it.
+
+        let handing = WorkerSignals {
+            handoff_queue_wait_p95_ms: Some(500.0),
+            ..WorkerSignals::default()
+        };
+        assert_eq!(diagnose(0.2, None, &handing, false).bottleneck, "handoff");
+        assert_eq!(
+            diagnose(
+                0.2,
+                None,
+                &WorkerSignals {
+                    worker_cpu: Some(0.95),
+                    ..handing.clone()
+                },
+                false
+            )
+            .bottleneck,
+            "cpu"
+        );
         assert_eq!(diagnose(0.9, None, &busy_cpu, true).bottleneck, "memory");
         assert!(
             diagnose(0.9, None, &quiet, false)

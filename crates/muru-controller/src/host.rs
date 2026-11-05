@@ -116,6 +116,11 @@ pub struct WorkerStatus {
     pub loop_lag: Vec<u64>,
     /// The sum of its event loop's lateness, in microseconds.
     pub loop_lag_us: u64,
+    /// The waits for a thread of the requests it handed from ASGI to
+    /// WSGI (section 6.14), likewise.
+    pub handoff_wait: Vec<u64>,
+    /// The sum of those waits, in microseconds.
+    pub handoff_wait_us: u64,
     /// Its garbage collections by generation (section 11.1), those with
     /// a collection so far.
     pub gc: Vec<GcGeneration>,
@@ -285,6 +290,8 @@ impl HostMessage {
                                 gil_wait_us: worker["gil_wait_us"].as_u64().unwrap_or(0),
                                 loop_lag: counts(&worker["loop_lag"]),
                                 loop_lag_us: worker["loop_lag_us"].as_u64().unwrap_or(0),
+                                handoff_wait: counts(&worker["handoff_wait"]),
+                                handoff_wait_us: worker["handoff_wait_us"].as_u64().unwrap_or(0),
                                 gc: generations(&worker["gc"]),
                             })
                             .collect()

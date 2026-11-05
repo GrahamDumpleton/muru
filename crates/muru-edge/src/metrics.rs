@@ -230,6 +230,11 @@ pub const FAMILIES: &[Family] = &[
         help: "A worker's memory as it last reported it, by measure: rss, pss or uss.",
     },
     Family {
+        name: "muru_handoff_queue_wait_seconds",
+        kind: Kind::Histogram,
+        help: "How long requests handed from ASGI to WSGI waited for a thread.",
+    },
+    Family {
         name: "muru_gil_wait_seconds",
         kind: Kind::Histogram,
         help: "How long a worker's threads waited for the GIL when they had work to run, as it last reported.",

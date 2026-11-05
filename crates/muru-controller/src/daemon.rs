@@ -2196,6 +2196,10 @@ impl Daemon {
                     gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
                     gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
                     loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    handoff_wait: status
+                        .workers
+                        .handoff_queue_wait_p95_ms
+                        .map(|wait| format!("{wait:.0} ms")),
                     diagnosis: status.diagnosis.summary.to_owned(),
                     advice: status.diagnosis.advice.to_owned(),
                     last_decision: status
@@ -3327,6 +3331,12 @@ impl Daemon {
                     &labels,
                     &worker.loop_lag,
                     worker.loop_lag_us,
+                ));
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_handoff_queue_wait_seconds",
+                    &labels,
+                    &worker.handoff_wait,
+                    worker.handoff_wait_us,
                 ));
 
                 // Section 11.1: its garbage collections, by generation.

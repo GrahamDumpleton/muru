@@ -341,6 +341,12 @@ impl NodeData {
         self.releases().any(|release| release.event_loop.is_some())
     }
 
+    /// Whether any group handed requests from ASGI to WSGI, so the
+    /// scaling table has the column for their wait.
+    pub fn has_handoff_wait(&self) -> bool {
+        self.scaling.iter().any(|row| row.handoff_wait.is_some())
+    }
+
     fn releases(&self) -> impl Iterator<Item = &ReleaseRow> {
         self.apps.iter().flat_map(|app| app.releases.iter())
     }
@@ -391,6 +397,9 @@ pub struct ScalingRow {
     pub gil_wait: String,
     /// The 95th percentile event loop lag, formatted, or a dash.
     pub loop_lag: String,
+    /// The 95th percentile wait for a thread of the requests handed
+    /// from ASGI to WSGI, formatted; none for a group that handed none.
+    pub handoff_wait: Option<String>,
     /// The bottleneck in words.
     pub diagnosis: String,
     /// The tuning it suggests, or empty.

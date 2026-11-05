@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import sys
 import threading
 import time
@@ -192,6 +193,25 @@ def test_handoff_under_the_daemon(daemon: Daemon, tmp_path: Path) -> None:
         assert socket_.recv(timeout=10) == "hello from wsgi"
 
     assert daemon.request("/plain/x").status == 409
+
+    # Section 7.3: the wait for a thread of each request handed from
+    # ASGI to WSGI is measured in the worker and exported once its host
+    # has reported, every few seconds.
+
+    assert [daemon.request("/api/slow").status for _ in range(2)] == [200, 200]
+    counted = re.compile(r"^muru_handoff_queue_wait_seconds_count\{[^}]*\} (\d+)$", re.MULTILINE)
+
+    def handed() -> int:
+        text = daemon.muructl("metrics").stdout
+        return sum(int(count) for count in counted.findall(text))
+
+    deadline = time.monotonic() + 30
+
+    while handed() < 2:
+        assert time.monotonic() < deadline, daemon.muructl("metrics").stdout
+        time.sleep(0.5)
+
+    assert "# TYPE muru_handoff_queue_wait_seconds histogram\n" in daemon.muructl("metrics").stdout
 
     # The setting is part of the declared release, compared on apply.
 
