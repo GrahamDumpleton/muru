@@ -140,6 +140,28 @@ def test_a_mount_takes_threads_of_its_own() -> None:
             host.Mount.parse(text, context, 4)
 
 
+def test_a_mount_takes_limits_of_its_own_whether_declared_or_left_to_be_detected() -> None:
+    context = host.Context(app="shop")
+
+    # The limits follow the threads, which may be left empty.
+
+    detected = host.Mount.parse("live=/live=shop:live=auto==500,2000", context, 4)
+    assert (detected.threads, detected.limits) == (None, (500, 2000))
+    declared = host.Mount.parse("live=/live=shop:live=asgi==500,0", context, 4)
+    assert (declared.threads, declared.limits) == (None, (500, 0))
+    both = host.Mount.parse("live=/live=shop:live=auto=4,4=500,0", context, 4)
+    assert (both.threads, both.limits) == ((4, 4), (500, 0))
+
+    for text in (
+        "live=/live=shop:live=wsgi==500,0",
+        "live=/live=shop:live=auto==500",
+        "live=/live=shop:live=auto==-1,0",
+        "live=/live=shop:live=auto=",
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.Mount.parse(text, context, 4)
+
+
 def test_a_restart_is_refused_for_a_worker_the_host_cannot_replace(tmp_path: Path) -> None:
     release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
     instance = host.Host(release, str(tmp_path), workers=1, threads=1)

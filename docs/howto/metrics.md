@@ -53,9 +53,8 @@ Names start with `muru_`. Where they apply, labels name the application
 | `muru_handoffs_total` | counter | app, release, group, to | requests the worker [handed](handoff.md) from WSGI to ASGI (`to` is `asgi`) or from ASGI to WSGI (`wsgi`); such a request is marked `handoff` in the [access log](logging.md) |
 | `muru_auth_requests_total` | counter | result | [authentication sub-requests](auth-subrequests.md) by result: `allowed`, `cached`, `denied` or `unavailable` |
 | `muru_queue_depth` | gauge | app, release, group | requests waiting for a slot |
-| `muru_slots_busy` | gauge | app, release, group | slots handling a request or holding an open WebSocket |
-| `muru_slots_total` | gauge | app, release, group | slots across the workers: threads, or the event loop's concurrency |
-| `muru_async_slots_busy` | gauge | app, release, group | requests held on the event loops of [ASGI](asgi.md) workers, the part of `muru_slots_busy` that is not on threads |
+| `muru_slots_busy` | gauge | app, release, group, side | slots handling a request or holding an open WebSocket, on the workers' `threads` or their event `loop` |
+| `muru_slots_total` | gauge | app, release, group, side | slots across the workers: `threads`, or the event `loop`'s concurrency |
 | `muru_capacity_utilisation` | gauge | app, release, group | busy slots over slots, sampled every second and averaged over the last 30 seconds: how saturated the group is, the signal to [autoscale](#saturation-for-an-autoscaler) on |
 | `muru_upstream_health` | gauge | upstream, address | 1 for an [upstream](upstreams.md) address in service, 0 for one its probes found unhealthy or that was ejected after failed requests |
 | `muru_workers_ready` | gauge | app, release, group | workers listening for requests (under the daemon) |
@@ -100,7 +99,8 @@ How many slots are busy, and how long requests wait for one, say more:
 
 - `muru_capacity_utilisation` is the share of a group's slots in use,
   averaged over the last 30 seconds, from 0 to 1. A sustained value near
-  1 means requests are starting to queue.
+  1 means requests are starting to queue. For a group whose workers have
+  threads and an event loop it is the busier side's share.
 - The `queue` phase of `muru_request_duration_seconds` is how long
   requests waited for a slot:
   `histogram_quantile(0.95, sum by (le) (rate(muru_request_duration_seconds_bucket{phase="queue"}[2m])))`.

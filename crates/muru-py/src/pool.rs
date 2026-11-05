@@ -443,15 +443,18 @@ impl Shared {
         names
     }
 
-    /// The mounts' own threads and limits, for HELLO (section 6.7). An
-    /// ASGI mount's threads are those its handoffs to WSGI run on
-    /// (section 6.14).
+    /// Every named mount, for HELLO (sections 5.1 and 6.7): the side it
+    /// runs on, which is the count its requests are held against at the
+    /// edge, and its own threads and limits when it has them, all 0 for
+    /// one that shares its side's count. An ASGI mount's threads are
+    /// those its handoffs to WSGI run on (section 6.14).
     pub fn mount_pools(&self) -> Vec<muru_proto::worker::v1::MountPool> {
         let clamp = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
 
-        self.mounts
+        let mut pools: Vec<_> = self
+            .mounts
             .iter()
-            .filter_map(|(name, mount)| {
+            .map(|(name, mount)| {
                 let handoff_threads = match (mount.handoff, &mount.runner, mount.threads) {
                     (true, Some(_), Some((threads, _))) => threads,
                     _ => 0,
@@ -464,20 +467,43 @@ impl Shared {
                     (None, Some((concurrency, connections))) => {
                         (concurrency, concurrency, connections)
                     }
-                    (None, None) if handoff_threads > 0 => (0, 0, 0),
-                    (None, None) => return None,
+                    (None, None) => (0, 0, 0),
                 };
 
-                Some(muru_proto::worker::v1::MountPool {
+                muru_proto::worker::v1::MountPool {
                     mount: name.clone(),
                     reserved: clamp(reserved),
                     max: clamp(max),
                     connections: clamp(connections),
                     handoff_threads: clamp(handoff_threads),
                     on_loop: mount.runner.is_some(),
-                })
+                }
             })
-            .collect()
+            .collect();
+        pools.sort_by(|a, b| a.mount.cmp(&b.mount));
+        pools
+    }
+
+    /// Whether anything the worker serves runs on the shared thread pool
+    /// (section 6.7), which is when HELLO declares its threads: a WSGI
+    /// default mount, a WSGI mount without threads of its own or that
+    /// borrows, or an ASGI application that hands requests to WSGI
+    /// (section 6.14) without threads of its own for them.
+    pub fn uses_threads(&self) -> bool {
+        let default_on_loop = self.asgi.as_ref().is_some_and(|asgi| asgi.runner.is_some());
+
+        if !default_on_loop || self.handoff {
+            return true;
+        }
+
+        self.mounts
+            .values()
+            .any(|mount| match (&mount.runner, mount.threads) {
+                (None, None) => true,
+                (None, Some((reserved, max))) => reserved < max,
+                (Some(_), None) => mount.handoff,
+                (Some(_), Some(_)) => false,
+            })
     }
 
     /// Stop the shared pool and the mounts' own, letting their queued

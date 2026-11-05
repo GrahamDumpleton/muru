@@ -230,7 +230,9 @@ it is answered 503 with reason `queue_full`.
 
 ## How handoffs are counted
 
-A request handed across counts against the side it was handed to: the
+A request counts against the side that runs it, the worker's `threads`
+or its event loop's `concurrency`, as [mounts are counted](mounts.md#how-requests-are-counted).
+A request handed across moves to the side it was handed to: the
 worker's threads, or the threads of the mount's own, for a handoff to
 WSGI, and its event loop for a handoff to ASGI. Its place on the side it
 came from is free for another request at once. When the side it moves

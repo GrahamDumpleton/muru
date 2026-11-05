@@ -72,6 +72,24 @@ impl Signals {
                 .map(|(_, value)| value.clone())
         };
 
+        // Section 5.1: a group's workers hold requests on their threads
+        // and on their event loops, each side with slots of its own, so
+        // the slots are sampled by side: the total, then the busy ones.
+
+        let mut sides: Vec<(String, f64, f64)> = Vec::new();
+        let mut side = |sample: &Sample| -> usize {
+            let name = label(sample, "side").unwrap_or_default();
+
+            match sides.iter().position(|(side, _, _)| *side == name) {
+                Some(index) => index,
+                None => {
+                    sides.push((name, 0.0, 0.0));
+                    sides.len() - 1
+                }
+            }
+        };
+        let mut slots: Vec<(usize, bool, f64)> = Vec::new();
+
         for sample in samples {
             if label(sample, "app").as_deref() != Some(app)
                 || label(sample, "release").as_deref() != Some(release)
@@ -81,8 +99,8 @@ impl Signals {
             }
 
             match sample.name.as_str() {
-                "muru_slots_busy" => signals.busy += sample.value,
-                "muru_slots_total" => signals.total += sample.value,
+                "muru_slots_busy" => slots.push((side(sample), true, sample.value)),
+                "muru_slots_total" => slots.push((side(sample), false, sample.value)),
                 "muru_queue_depth" => signals.queue_depth += sample.value,
                 "muru_request_duration_seconds_bucket"
                     if label(sample, "phase").as_deref() == Some("queue") =>
@@ -100,6 +118,27 @@ impl Signals {
                     entry.1 += sample.value;
                 }
                 _ => {}
+            }
+        }
+
+        for (index, busy, value) in slots {
+            if busy {
+                sides[index].2 += value;
+            } else {
+                sides[index].1 += value;
+            }
+        }
+
+        // Section 7.4: the group is as busy as its busier side, the one
+        // with the larger share of its slots in use, which is the one
+        // that runs out first; the first of two that are level.
+
+        for (_, total, busy) in sides {
+            let busier = signals.total <= 0.0 || busy * signals.total > signals.busy * total;
+
+            if total > 0.0 && busier {
+                signals.total = total;
+                signals.busy = busy;
             }
         }
 
@@ -1569,6 +1608,29 @@ mod tests {
         let signals = Signals::from_samples(&at(100.0), "shop", "r1", "default", 2, 4.0, None);
         assert_eq!((signals.busy, signals.total, signals.ready), (3.0, 8.0, 2));
         assert_eq!(signals.queue_buckets.len(), 3);
+
+        // A group whose workers have threads and an event loop is as
+        // busy as its busier side, whichever that is, and the threads
+        // when the two are level.
+
+        let sided = |threads: f64, on_loop: f64| {
+            let samples = [
+                sample("muru_slots_total", "default", &[("side", "threads")], 4.0),
+                sample(
+                    "muru_slots_busy",
+                    "default",
+                    &[("side", "threads")],
+                    threads,
+                ),
+                sample("muru_slots_total", "default", &[("side", "loop")], 1000.0),
+                sample("muru_slots_busy", "default", &[("side", "loop")], on_loop),
+            ];
+            let signals = Signals::from_samples(&samples, "shop", "r1", "default", 1, 4.0, None);
+            (signals.busy, signals.total)
+        };
+        assert_eq!(sided(4.0, 20.0), (4.0, 4.0));
+        assert_eq!(sided(1.0, 900.0), (900.0, 1000.0));
+        assert_eq!(sided(0.0, 0.0), (0.0, 4.0));
 
         let spec = ScalingSpec {
             mode: ScalingMode::Target,

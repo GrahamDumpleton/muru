@@ -724,14 +724,25 @@ impl HostProcess {
                 .threads
                 .filter(|_| mount.interface == muru_config::Interface::Asgi);
 
-            if let Some(threads) = mount.threads.filter(|_| handoff_threads.is_none()) {
-                text.push_str(&format!("={},{}", threads.reserved(), threads.max()));
-            } else if mount.concurrency.is_some() || mount.max_connections.is_some() {
+            // Section 6.7: the mount's own threads, then its own limits,
+            // either of which may be absent; a mount left to be detected
+            // may carry limits, which its worker checks against what it
+            // detects.
+
+            let threads = mount
+                .threads
+                .filter(|_| handoff_threads.is_none())
+                .map(|threads| format!("{},{}", threads.reserved(), threads.max()))
+                .unwrap_or_default();
+
+            if mount.concurrency.is_some() || mount.max_connections.is_some() {
                 text.push_str(&format!(
-                    "={},{}",
+                    "={threads}={},{}",
                     mount.concurrency.unwrap_or(0),
                     mount.max_connections.unwrap_or(0)
                 ));
+            } else if !threads.is_empty() {
+                text.push_str(&format!("={threads}"));
             }
 
             command.arg("--mount").arg(text);

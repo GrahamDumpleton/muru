@@ -1,10 +1,11 @@
 """Limits of an ASGI mount's own (design specification section 6.7).
 
-An ASGI mount with `concurrency` has slots of its own at the edge, so its
-requests neither take the WSGI threads nor wait for them, and one with
-`max_connections` holds that many open WebSockets apart from the requests
-it runs: an accepted socket gives its request slot back, and a handshake
-beyond the bound waits at the edge until the queue timeout.
+An ASGI mount with `concurrency` has slots of its own at the edge, apart
+from the event loop's others, and one with `max_connections` holds that
+many open WebSockets apart from the requests it runs: an accepted socket
+gives its request slot back, and a handshake beyond the bound waits at
+the edge until the queue timeout. The mount's interface is left to be
+detected, which its limits are checked against when the worker starts.
 """
 
 from __future__ import annotations

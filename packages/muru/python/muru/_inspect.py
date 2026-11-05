@@ -54,13 +54,15 @@ def handle(
     active: list[dict[str, Any]],
     loop: asyncio.AbstractEventLoop | None = None,
     names: dict[int, str] | None = None,
-    slots: int = 0,
+    threads: int = 0,
+    concurrency: int = 0,
 ) -> str:
     """Answer one request line.
 
     `active` lists the requests in flight, `names` the runtime's own
     threads by identifier, which Python's threading module does not know,
-    and `slots` how many requests the worker serves at once.
+    `threads` how many requests the worker runs at once on threads and
+    `concurrency` how many its event loop holds at once, 0 without one.
     """
 
     request_id: Any = None
@@ -93,11 +95,14 @@ def handle(
                 str(args.get("path", "")),
             )
         elif op == "trace":
+            on_threads = sum(1 for request in active if request.get("thread") is not None)
             result = trace(
                 float(args.get("duration_s", 10.0)),
                 bool(args.get("force", False)),
-                len(active),
-                slots,
+                [
+                    (on_threads, threads, "threads"),
+                    (len(active) - on_threads, concurrency, "event loop slots"),
+                ],
                 int(args.get("top", 30)),
             )
         elif op == "memory":
@@ -224,11 +229,15 @@ def profile(
     return result
 
 
-def trace(duration: float, force: bool, busy: int, slots: int, top: int) -> dict[str, Any]:
+def trace(
+    duration: float, force: bool, sides: list[tuple[int, int, str]], top: int
+) -> dict[str, Any]:
     """Count calls and time every Python function with sys.monitoring.
 
     Exact, unlike sampling, and costly: a worker serving requests in more
-    than half its slots is refused unless `force` is set.
+    than half the slots of a side, its threads or its event loop, each
+    given as the busy slots, the slots and what they are, is refused
+    unless `force` is set.
     """
 
     monitoring = getattr(sys, "monitoring", None)
@@ -236,10 +245,11 @@ def trace(duration: float, force: bool, busy: int, slots: int, top: int) -> dict
     if monitoring is None:
         raise RuntimeError("trace needs Python 3.12 or later, for sys.monitoring")
 
-    if not force and slots and busy * 2 > slots:
-        raise RuntimeError(
-            f"the worker is busy ({busy} of {slots} slots); --force traces it anyway"
-        )
+    for busy, slots, what in sides:
+        if not force and slots and busy * 2 > slots:
+            raise RuntimeError(
+                f"the worker is busy ({busy} of {slots} {what}); --force traces it anyway"
+            )
 
     tool = monitoring.PROFILER_ID
     monitoring.use_tool_id(tool, "muru")

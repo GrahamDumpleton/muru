@@ -511,42 +511,51 @@ class Mount:
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
-        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]].
+        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX[=CONCURRENCY,CONNECTIONS]]].
 
-        A gRPC mount's PATH is empty, and for an ASGI mount the last part
-        is CONCURRENCY,CONNECTIONS instead.
+        A gRPC mount's PATH is empty. RESERVED,MAX are the mount's own
+        threads and may be left empty before CONCURRENCY,CONNECTIONS, an
+        ASGI mount's own limits. A mount whose interface is left to be
+        detected may carry limits, which its worker checks against what
+        it detects.
         """
 
-        form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]"
+        form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX[=CONCURRENCY,CONNECTIONS]]]"
         parts = text.split("=")
         interface = parts[3] if len(parts) >= 4 else "auto"
         path_given = parts[1].startswith("/") if len(parts) > 1 else False
 
-        if len(parts) not in (3, 4, 5) or not parts[0] or path_given == (interface == "grpc"):
+        if len(parts) not in (3, 4, 5, 6) or not parts[0] or path_given == (interface == "grpc"):
             raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
 
         if interface not in INTERFACES:
             raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
 
-        own: tuple[int, int] | None = None
-        limits: tuple[int, int] | None = None
-
-        if len(parts) == 5:
+        def pair(part: str) -> tuple[int, int]:
             try:
-                first, second = (int(part) for part in parts[4].split(","))
+                first, second = (int(number) for number in part.split(","))
             except ValueError:
                 raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
 
-            if interface == "asgi":
-                if first < 0 or second < 0:
-                    raise argparse.ArgumentTypeError(f"{text!r} has limits below nothing")
+            return first, second
 
-                limits = (first, second)
-            else:
-                if first < 0 or second < max(first, 1):
-                    raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+        own: tuple[int, int] | None = None
+        limits: tuple[int, int] | None = None
 
-                own = (first, second)
+        if len(parts) >= 5 and (parts[4] or len(parts) == 5):
+            own = pair(parts[4])
+
+            if own[0] < 0 or own[1] < max(own[0], 1):
+                raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+
+        if len(parts) == 6:
+            limits = pair(parts[5])
+
+            if limits[0] < 0 or limits[1] < 0:
+                raise argparse.ArgumentTypeError(f"{text!r} has limits below nothing")
+
+            if interface in ("wsgi", "grpc"):
+                raise argparse.ArgumentTypeError(f"{text!r} has limits only an ASGI mount takes")
 
         release = Release(parts[2], None, context, threads=threads, interface=interface)
         return cls(parts[0], parts[1], release, own, limits)
@@ -1388,6 +1397,18 @@ class Host:
                         f"mount {name}: an ASGI mount's threads are a fixed pool, a number"
                     )
 
+                # Section 6.7: limits size a mount's place on the event
+                # loop, so a mount left to be detected that turns out to
+                # run on threads is refused them here, as an ASGI one is
+                # refused threads above.
+
+                if limits[name] is not None and mounted.resolved != "asgi":
+                    raise ValueError(
+                        f"mount {name}: concurrency and max_connections are an ASGI mount's, "
+                        f"which runs on the event loop, and {mounted.spec} is "
+                        f"{interface_name(mounted.resolved or 'wsgi')}, which runs on threads"
+                    )
+
             # Section 6.5: the shared pool serves a WSGI default mount and
             # every WSGI mount that has no threads of its own or borrows;
             # section 6.14: and the requests an ASGI application without
@@ -1566,7 +1587,8 @@ class Host:
                     active,
                     loop.loop if loop is not None else None,
                     names,
-                    slots=group.threads if loop is None else group.concurrency,
+                    threads=shared_threads + sum(own[0] for _, _, _, own in realised if own),
+                    concurrency=group.concurrency if loop is not None else 0,
                 ),
                 grpc_methods=grpc_methods,
                 handoff=self.handoff is not None,
@@ -3742,9 +3764,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--mount",
         action="append",
         default=[],
-        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]",
-        help="a named mount served by another entrypoint at a path; for an ASGI mount "
-        "the last part is CONCURRENCY,CONNECTIONS",
+        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX[=CONCURRENCY,CONNECTIONS]]]",
+        help="a named mount served by another entrypoint at a path, with its own threads "
+        "and, for an ASGI mount, its own limits",
     )
     parser.add_argument(
         "--log-level",

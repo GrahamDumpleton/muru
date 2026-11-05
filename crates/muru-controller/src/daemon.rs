@@ -540,10 +540,9 @@ pub struct Info {
     /// WebSockets open by application and release, from the edge's
     /// metrics as last sampled.
     pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
-    /// What each release's entrypoints were detected as, by application
-    /// and release, then by mount, the default mount's under the empty
-    /// name: as its host last announced them.
-    pub interfaces: std::sync::Mutex<Interfaces>,
+    /// What each release's entrypoints run as, as its host last
+    /// announced them.
+    pub interfaces: Interfaces,
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
@@ -552,8 +551,72 @@ pub struct Info {
     pub provisioning: crate::provision::Provisioning,
 }
 
-/// Detected interfaces by application and release, then by mount.
-pub type Interfaces = HashMap<(String, String), Vec<(String, String)>>;
+/// What each release's entrypoints run as (section 6.7): the interface
+/// its host settled for each, a declared one as declared and one left to
+/// be detected as the callable showed, as the host last announced them.
+/// Everything that needs an interface once a release has started takes
+/// it from `runs_as`, never from the configuration, where it may still
+/// say `auto`.
+#[derive(Debug, Default)]
+pub struct Interfaces {
+    /// By application and release.
+    announced: std::sync::Mutex<HashMap<(String, String), Announced>>,
+}
+
+/// What one release's host announced: each mount with its interface, the
+/// default mount's under the empty name.
+type Announced = Vec<(String, String)>;
+
+impl Interfaces {
+    /// Record what a release's host announced, each mount with its
+    /// interface. An announcement that names none leaves the last as it
+    /// was: a host says nothing of what each worker settles for itself.
+    pub fn announce(&self, app: &str, release: &str, interfaces: Vec<(String, String)>) {
+        if interfaces.is_empty() {
+            return;
+        }
+
+        self.announced
+            .lock()
+            .expect("interfaces poisoned")
+            .insert((app.to_owned(), release.to_owned()), interfaces);
+    }
+
+    /// What a release's host announced, each mount with its interface;
+    /// nothing before its first announcement.
+    pub fn announced(&self, app: &str, release: &str) -> Vec<(String, String)> {
+        self.announced
+            .lock()
+            .expect("interfaces poisoned")
+            .get(&(app.to_owned(), release.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The interface a release's default mount, under the empty name,
+    /// or a named mount runs as: what its host announced, and
+    /// `configured` only until it has announced one for the mount.
+    pub fn runs_as(
+        &self,
+        app: &str,
+        release: &str,
+        mount: &str,
+        configured: muru_config::Interface,
+    ) -> muru_config::Interface {
+        let announced = self.announced(app, release);
+        let found = announced
+            .iter()
+            .find(|(name, _)| name == mount)
+            .map(|(_, interface)| interface.as_str());
+
+        match found {
+            Some("wsgi") => muru_config::Interface::Wsgi,
+            Some("asgi") => muru_config::Interface::Asgi,
+            Some("grpc") => muru_config::Interface::Grpc,
+            _ => configured,
+        }
+    }
+}
 
 /// What a ReopenLogs command reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1071,7 +1134,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             ..client_rules.defined()
         }),
-        interfaces: std::sync::Mutex::new(Interfaces::new()),
+        interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
@@ -7495,17 +7558,12 @@ impl Daemon {
                 groups,
                 interfaces,
             } => {
-                if !interfaces.is_empty() {
-                    self.info
-                        .interfaces
-                        .lock()
-                        .expect("interfaces poisoned")
-                        .insert(key.clone(), interfaces);
-                }
+                self.info.interfaces.announce(app, id, interfaces);
 
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+
                 let Some((record, pid)) = running.backend.host().map(|host| {
                     (
                         host.run_dir().join("..").join("host.toml"),
@@ -8380,5 +8438,47 @@ mod tests {
     #[test]
     fn the_clock_state_can_be_read_here() {
         assert!(clock_synchronised().is_some());
+    }
+
+    #[test]
+    fn an_interface_is_the_announced_one_and_the_configured_one_only_until_then() {
+        use muru_config::Interface;
+
+        let interfaces = Interfaces::default();
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "", Interface::Auto),
+            Interface::Auto
+        );
+
+        interfaces.announce(
+            "shop",
+            "r1",
+            vec![
+                (String::new(), "asgi".to_owned()),
+                ("legacy".to_owned(), "wsgi".to_owned()),
+            ],
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "", Interface::Auto),
+            Interface::Asgi
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "legacy", Interface::Auto),
+            Interface::Wsgi
+        );
+
+        // A mount the host did not name, another release, and an
+        // announcement that names nothing, which leaves the last one.
+
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "live", Interface::Auto),
+            Interface::Auto
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r2", "", Interface::Wsgi),
+            Interface::Wsgi
+        );
+        interfaces.announce("shop", "r1", Vec::new());
+        assert_eq!(interfaces.announced("shop", "r1").len(), 2);
     }
 }

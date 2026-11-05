@@ -2070,14 +2070,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .and_then(|app| app.current)
         .as_deref()
         == Some(release.id.as_str());
-    let detected = handle
-        .info
-        .interfaces
-        .lock()
-        .expect("interfaces poisoned")
-        .get(&(release.app.clone(), release.id.clone()))
-        .cloned()
-        .unwrap_or_default();
+    let detected = handle.info.interfaces.announced(&release.app, &release.id);
     let websockets = handle
         .info
         .websockets

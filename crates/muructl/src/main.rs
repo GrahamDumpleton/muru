@@ -2124,20 +2124,21 @@ async fn host_control(
     }
 }
 
-/// What a worker takes at once, as its HELLO declared it: threads, its
-/// event loop's concurrency, or both when the default mount is WSGI and
-/// a mount is ASGI.
+/// What a worker takes at once, as its HELLO declared it: the threads of
+/// its shared pool, its event loop's concurrency, or both when it serves
+/// WSGI and ASGI. A mount's own threads or concurrency are on the
+/// mount's line.
 fn capacity(worker: Option<muru_edge::link::WorkerStatus>, threads: usize) -> String {
     let threads_of = |count: usize| admin::counted(count, "thread", "threads");
 
     match worker {
-        Some(worker) if worker.worker_type == "asgi" => format!("concurrency {}", worker.slots),
-        Some(worker) if worker.async_slots > 0 => format!(
+        Some(worker) if worker.shared_threads > 0 && worker.concurrency > 0 => format!(
             "{} and an event loop of concurrency {}",
-            threads_of(worker.slots),
-            worker.async_slots
+            threads_of(worker.shared_threads),
+            worker.concurrency
         ),
-        Some(worker) => threads_of(worker.slots),
+        Some(worker) if worker.concurrency > 0 => format!("concurrency {}", worker.concurrency),
+        Some(worker) => threads_of(worker.shared_threads),
         None => threads_of(threads),
     }
 }
@@ -2182,7 +2183,8 @@ fn group_serves(group: &muru_config::Group) -> String {
     format!("{serves}{asks}{}", admin::group_mounts(&group.mounts))
 }
 
-/// What a named mount serves, from where, and on which threads.
+/// What a named mount serves, from where, and with which threads or
+/// limits of its own.
 fn mount_serves(mount: &muru_config::Mount) -> String {
     let mut serves = if mount.path.is_empty() {
         format!("serves the gRPC services of {}", mount.entrypoint)
@@ -2199,6 +2201,22 @@ fn mount_serves(mount: &muru_config::Mount) -> String {
             threads.reserved, threads.max
         )),
         None => {}
+    }
+
+    let sockets = |count: usize| admin::counted(count, "open WebSocket", "open WebSockets");
+
+    match (mount.concurrency, mount.max_connections) {
+        (Some(concurrency), Some(connections)) => serves.push_str(&format!(
+            " with concurrency {concurrency} of its own and up to {}",
+            sockets(connections)
+        )),
+        (Some(concurrency), None) => {
+            serves.push_str(&format!(" with concurrency {concurrency} of its own"));
+        }
+        (None, Some(connections)) => {
+            serves.push_str(&format!(" with up to {}", sockets(connections)));
+        }
+        (None, None) => {}
     }
 
     if mount.internal.unwrap_or(false) {

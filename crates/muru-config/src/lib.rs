@@ -417,11 +417,12 @@ pub struct Mount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<MountThreads>,
     /// Requests an ASGI mount runs at once on each worker, slots of its
-    /// own at the edge; it shares the worker's slots when absent.
+    /// own at the edge; it shares the event loop's concurrency when
+    /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
     /// Open WebSockets an ASGI mount holds at once on each worker, apart
-    /// from the requests it runs; unbounded but by its slots when absent.
+    /// from the requests it runs; each holds a request slot when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
     /// The interface the mount's requests may be handed to (section
@@ -512,13 +513,19 @@ pub fn check_handoff(handoff: Option<Handoff>, interface: Option<Interface>) -> 
     }
 }
 
-/// Section 6.7: check an ASGI mount's own limits. Both belong to a mount
-/// declared ASGI, since they size its place on the event loop, and each
-/// is at least one.
+/// Section 6.7: check an ASGI mount's own limits. Both size the mount's
+/// place on the event loop, so a mount declared WSGI or gRPC takes
+/// neither; a mount whose interface is left to be detected takes them,
+/// and its worker refuses them when it detects anything but ASGI. Each
+/// is at least one. Threads beside them are those an ASGI mount hands
+/// requests to, with `handoff = 'wsgi'` (section 6.14), since no other
+/// mount has both threads and a place on the loop.
 pub fn check_mount_limits(
     concurrency: Option<usize>,
     max_connections: Option<usize>,
     interface: Option<Interface>,
+    threads: Option<MountThreads>,
+    handoff: Option<Handoff>,
 ) -> Result<(), String> {
     for (name, value) in [
         ("concurrency", concurrency),
@@ -528,14 +535,23 @@ pub fn check_mount_limits(
             continue;
         };
 
-        if interface != Some(Interface::Asgi) {
+        if let Some(interface @ (Interface::Wsgi | Interface::Grpc)) = interface {
             return Err(format!(
-                "{name}: only a mount declared interface = 'asgi' takes it"
+                "{name}: only an ASGI mount takes it, and this one is declared interface = \
+                 '{interface}'"
             ));
         }
 
         if value == 0 {
             return Err(format!("{name}: must be at least 1"));
+        }
+
+        if threads.is_some() && handoff != Some(Handoff::Wsgi) {
+            return Err(format!(
+                "{name}: a mount has threads or {name}, not both: threads are a WSGI mount's and \
+                 {name} an ASGI mount's, whose threads are only for the requests it hands to \
+                 WSGI, with handoff = 'wsgi'"
+            ));
         }
     }
 
@@ -5792,6 +5808,44 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 .contains("a gRPC application takes no handoff")
         );
         assert!(parse_muru_toml("handoff = 'grpc'\n").is_err());
+    }
+
+    #[test]
+    fn a_mount_s_limits_are_an_asgi_mount_s_declared_or_left_to_be_detected() {
+        let limits = |interface, threads, handoff| {
+            check_mount_limits(Some(500), Some(2000), interface, threads, handoff)
+        };
+
+        // Declared ASGI, and left to be detected, where the worker
+        // checks them against what it finds.
+
+        assert!(limits(Some(Interface::Asgi), None, None).is_ok());
+        assert!(limits(Some(Interface::Auto), None, None).is_ok());
+        assert!(limits(None, None, None).is_ok());
+        assert!(check_mount_limits(None, None, Some(Interface::Wsgi), None, None).is_ok());
+
+        for interface in [Interface::Wsgi, Interface::Grpc] {
+            assert!(
+                limits(Some(interface), None, None)
+                    .unwrap_err()
+                    .starts_with("concurrency: only an ASGI mount takes it")
+            );
+        }
+
+        assert_eq!(
+            check_mount_limits(None, Some(0), None, None, None).unwrap_err(),
+            "max_connections: must be at least 1"
+        );
+
+        // Threads beside them are those an ASGI mount hands requests to.
+
+        let threads = Some(MountThreads::Fixed(4));
+        assert!(limits(None, threads, Some(Handoff::Wsgi)).is_ok());
+        assert!(
+            limits(None, threads, None)
+                .unwrap_err()
+                .starts_with("concurrency: a mount has threads or concurrency, not both")
+        );
     }
 
     #[test]

@@ -210,8 +210,9 @@ worth one interval.
 time spent in each, with sys.monitoring, for `--for` (10 s), and prints
 the functions that took longest with their call counts. It needs Python
 3.12 or later. Exact counts cost the worker more than sampling, so a
-worker serving requests in more than half its slots is refused unless
-`--force` is given. The worker keeps serving while the trace runs, so
+worker serving requests on more than half its threads, or holding more
+than half its event loop's concurrency, is refused unless `--force` is
+given. The worker keeps serving while the trace runs, so
 the trace counts the requests it takes meanwhile, each slowed by the
 tracing.
 

@@ -477,7 +477,7 @@ def test_trace_counts_calls_and_refuses_a_busy_worker(daemon: Daemon) -> None:
         for thread in threads:
             thread.join()
 
-    assert "the worker is busy (2 of 2 slots)" in refused
+    assert "the worker is busy (2 of 2 threads)" in refused
     assert "total ms" in forced
 
 

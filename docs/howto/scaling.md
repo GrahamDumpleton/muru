@@ -28,7 +28,9 @@ The group starts with `processes` workers, never fewer than `min_workers`.
 Idle workers are counted in worker equivalents: free slots (threads, or an
 event loop's concurrency) over the slots a worker offers, with workers
 still starting counted as capacity on the way and requests waiting at the
-edge counted as slots wanted. When fewer than `min_spare` idle workers
+edge counted as slots wanted. A group whose workers serve both WSGI and
+ASGI has threads and an event loop, and is as busy as the busier of the
+two. When fewer than `min_spare` idle workers
 remain for `scale_out_window` (5 seconds by default), the group grows by
 what is missing, up to `max_step_up` (4) at a time and never past
 `max_workers`. While requests queue at the edge the group is saturated and

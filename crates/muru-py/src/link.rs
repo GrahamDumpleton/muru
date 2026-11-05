@@ -857,10 +857,12 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         _ => return,
     }
 
-    // Section 5.1: the edge acts on what HELLO declares. A worker whose
-    // default mount is ASGI runs requests on its loop, one whose default
-    // is WSGI on its threads; a worker with mounts of both kinds declares
-    // both, and the edge sizes it by the default mount's capacity.
+    // Section 5.1: the edge acts on what HELLO declares. A worker declares
+    // the threads of its shared pool when anything it serves runs on
+    // them, and its loop's concurrency when it has a loop; the edge
+    // holds a count for each and charges a request to the side its mount
+    // runs on, which worker_type says for the default mount and
+    // mount_pools for each named one.
 
     let default_is_asgi = shared
         .asgi
@@ -869,10 +871,10 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
     let hello = pb::Hello {
         protocol_version: pb::PROTOCOL_VERSION.to_owned(),
         worker_type: if default_is_asgi { "asgi" } else { "wsgi" }.to_owned(),
-        slots: if default_is_asgi && !shared.handoff {
-            0
-        } else {
+        slots: if shared.uses_threads() {
             u32::try_from(shared.threads).unwrap_or(u32::MAX)
+        } else {
+            0
         },
         async_slots: shared
             .asgi

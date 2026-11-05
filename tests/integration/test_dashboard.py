@@ -104,7 +104,10 @@ def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, in
         'muru_requests_total{app="wsgi-conformance",release="r1",group="default",'
         'mount="default",status="2xx",client_class="default"} ' in text
     ), text
-    assert 'muru_slots_total{app="wsgi-conformance",release="r1",group="default"} ' in text, text
+    assert (
+        'muru_slots_total{app="wsgi-conformance",release="r1",group="default",side="threads"} '
+        in text
+    ), text
     assert "muru_snapshot_version 0\n" in text, text
 
 

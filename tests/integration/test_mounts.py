@@ -272,6 +272,16 @@ def test_invalid_mounts_are_refused(daemon: Daemon, tmp_path: Path) -> None:
             "threads = { reserved = 3, max = 2 }\n",
             "max 2 must be at least 1 and no less than reserved 3",
         ),
+        (
+            "[app.shop.release.r1.mounts.x]\npath = '/x'\nentrypoint = 'a:b'\n"
+            "interface = 'wsgi'\nconcurrency = 5\n",
+            "concurrency: only an ASGI mount takes it, and this one is declared interface = 'wsgi'",
+        ),
+        (
+            "[app.shop.release.r1.mounts.x]\npath = '/x'\nentrypoint = 'a:b'\n"
+            "threads = 2\nmax_connections = 5\n",
+            "max_connections: a mount has threads or max_connections, not both",
+        ),
     ]:
         config.write_text(
             f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n\n{table}"
