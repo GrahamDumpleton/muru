@@ -3459,9 +3459,11 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, message, group, reason, .. } => {
+                    muru_controller::host::HostMessage::Event { kind, group, reason, .. } => {
+                        // The host has logged the event, and its line is
+                        // the one the terminal shows; the run counts it.
+
                         run_admin::count_worker_event(&label, &format!("r{}", current.release), &kind, &group, &reason);
-                        muru_common::muru_println!("{kind}: {message}");
                     }
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);

@@ -290,10 +290,13 @@ fn watchdog_loop(shared: &Arc<Shared>, timeout: Duration, stop: &AtomicBool, rep
                 request.path,
                 wsgi::describe_seconds(timeout)
             );
-            eprintln!("muru: {message}, interrupting it");
 
-            if let Some(fd) = report {
-                report_event(fd, "request.soft_timeout", "warning", &message);
+            // Section 11.7: the host logs the event, so the worker says
+            // it only when there is no host to tell.
+
+            match report {
+                Some(fd) => report_event(fd, "request.soft_timeout", "warning", &message),
+                None => eprintln!("muru: {message}, interrupting it"),
             }
         }
     }
@@ -358,10 +361,10 @@ fn loop_watch(timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
             silent.as_secs_f64(),
             wsgi::describe_seconds(timeout)
         );
-        eprintln!("muru: {message}");
 
-        if let Some(fd) = report {
-            report_event(fd, "worker.loop_stalled", "error", &message);
+        match report {
+            Some(fd) => report_event(fd, "worker.loop_stalled", "error", &message),
+            None => eprintln!("muru: {message}"),
         }
     }
 }
@@ -422,10 +425,10 @@ fn gil_watch(timeout: Duration, stop: &AtomicBool, report: Option<i32>) {
             silent.as_secs_f64(),
             wsgi::describe_seconds(timeout)
         );
-        eprintln!("muru: {message}");
 
-        if let Some(fd) = report {
-            report_event(fd, "worker.gil_stalled", "error", &message);
+        match report {
+            Some(fd) => report_event(fd, "worker.gil_stalled", "error", &message),
+            None => eprintln!("muru: {message}"),
         }
     }
 }

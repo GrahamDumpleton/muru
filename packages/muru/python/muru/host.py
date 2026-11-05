@@ -201,6 +201,12 @@ def resolve_app(
     return target
 
 
+# Section 11.7: the events whose logged line does not name the kind, the
+# start-up lines of every worker.
+
+UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
+
+
 def detect_interface(app: Any) -> str:
     """Return ``asgi`` for a coroutine function or an awaitable ``__call__``, else ``wsgi``."""
 
@@ -1831,10 +1837,12 @@ class Host:
 
         `group` and `reason` are the worker's group and the event's reason
         as one word, which the supervisor counts (section 11.1); the
-        message says the same in words.
+        message says the same in words. The line logged is the one line the
+        event has in a run's terminal and a release's log, so it names the
+        kind, except for the start-up lines every worker has.
         """
 
-        log(message)
+        log(message if kind in UNNAMED_EVENTS else f"{kind}: {message}")
         event = {"type": "event", "kind": kind, "level": level, "message": message}
 
         if group is not None:

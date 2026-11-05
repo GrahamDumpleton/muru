@@ -33,7 +33,11 @@ def wait_for(
 
 
 def recycled(log: str) -> list[str]:
-    return [line for line in log.splitlines() if line.startswith("muru: worker.recycled:")]
+    return [
+        line
+        for line in log.splitlines()
+        if line.startswith("muru.host[") and ": worker.recycled: " in line
+    ]
 
 
 def test_a_worker_over_the_hard_limit_is_replaced_at_once() -> None:

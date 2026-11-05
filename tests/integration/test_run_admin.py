@@ -136,7 +136,7 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
             runtime, "restart", "plain-wsgi", "--worker", "1", cwd=support.FIXTURES
         ).stdout
         assert "worker 1" in restarted and "is being replaced by pid" in restarted
-        assert server.wait_for_log("muru: worker.restarted:")
+        assert server.wait_for_log(": worker.restarted: worker 1")
 
         # A change to what the access log writes goes into the run's edge
         # at once and is printed as the daemon records it.
