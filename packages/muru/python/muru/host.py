@@ -201,6 +201,12 @@ def resolve_app(
     return target
 
 
+# Section 11.7: the events whose logged line does not name the kind, the
+# start-up lines of every worker.
+
+UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
+
+
 def detect_interface(app: Any) -> str:
     """Return ``asgi`` for a coroutine function or an awaitable ``__call__``, else ``wsgi``."""
 
@@ -760,6 +766,11 @@ class WorkerState:
     oldest_ms: int = 0
     ready: bool = False
 
+    # Section 11.7: what the worker's threads and loop held as of its
+    # last report, for a status it cannot answer live.
+
+    sides: dict[str, Any] = field(default_factory=dict)
+
     # Section 7.6: when the worker last reported, so one that has gone
     # silent altogether is noticed.
 
@@ -943,7 +954,6 @@ class Host:
         self.spawned_at: dict[int, float] = {}
         self.start_failures: dict[int, int] = {}
         self.failed = False
-        self.forked_before = False
         self.selector = selectors.DefaultSelector()
         self.outputs: dict[int, WorkerOutput] = {}
 
@@ -976,7 +986,6 @@ class Host:
 
         self.outside = _outside.Reader()
         self.outside_errors: dict[int, str] = {}
-        self.traced: dict[int, list[WorkerState]] = {}
         self.wake_write: int | None = None
         self.generation: dict[int, int] = {}
         self.routed: dict[int, str | None] = {}
@@ -1079,14 +1088,6 @@ class Host:
         A worker that is not a replacement is routed to at once; a
         replacement enters routing when its first report arrives.
         """
-
-        if not self.forked_before:
-            self.forked_before = True
-
-            if self.release.preloaded and self.release.hooks is not None:
-                # Section 6.3: once in the host, before the first fork.
-
-                self.release.hooks.call("pre_fork", self.release.context)
 
         threads = preload.thread_count()
 
@@ -1841,10 +1842,12 @@ class Host:
 
         `group` and `reason` are the worker's group and the event's reason
         as one word, which the supervisor counts (section 11.1); the
-        message says the same in words.
+        message says the same in words. The line logged is the one line the
+        event has in a run's terminal and a release's log, so it names the
+        kind, except for the start-up lines every worker has.
         """
 
-        log(message)
+        log(message if kind in UNNAMED_EVENTS else f"{kind}: {message}")
         event = {"type": "event", "kind": kind, "level": level, "message": message}
 
         if group is not None:
@@ -1880,17 +1883,7 @@ class Host:
             return
 
         if op == "status":
-            self.send_to_supervisor(
-                {
-                    "type": "response",
-                    "id": request_id,
-                    "workers": [
-                        self.status_of(state)
-                        for state in sorted(self.states.values(), key=lambda s: s.index)
-                        if wanted is None or state.index == wanted
-                    ],
-                }
-            )
+            self.answer_status(request_id, wanted)
             return
 
         if not targets:
@@ -1916,9 +1909,6 @@ class Host:
             and self.profile_from_outside(request_id, targets, args)
         ):
             return
-
-        if op == "trace":
-            self.trace_started(request_id, targets)
 
         pending = Pending(request_id, op, targets)
         pending.deadline = time.monotonic() + float(args.get("timeout_s", CONTROL_TIMEOUT_SECONDS))
@@ -2116,14 +2106,63 @@ class Host:
         retirement.announced_at = time.monotonic()
         log(f"worker {state.index} (pid {state.pid}) leaves routing: scaled in")
 
-    def status_of(self, state: WorkerState) -> dict[str, Any]:
-        """One worker's state as the host knows it.
+    def answer_status(self, request_id: int, wanted: int | None) -> None:
+        """Answer `debug status` with each worker's state and what it holds.
 
-        A worker is routed once the host's latest announcement names it
-        and the supervisor has acknowledged that announcement, so the edge
-        routes to it; a replacement still warming, or a worker out of
-        routing while it is traced or debugged, is not.
+        Section 11.7: a worker's report is up to a second old, so each
+        worker is asked what its threads and its loop hold as of now, as
+        the stacks ask for its bookkeeping; one that does not answer
+        within a second, which is a hung one, is shown from its last
+        report, marked stale.
         """
+
+        chosen = [
+            state
+            for state in sorted(self.states.values(), key=lambda s: s.index)
+            if wanted is None or state.index == wanted
+        ]
+        targets = {state.pid: state.index for state in chosen if state.pid in self.control_sockets}
+
+        def answered(pending: Pending) -> None:
+            workers = []
+
+            for state in chosen:
+                answer = pending.answers.get(state.pid)
+                live = answer.get("result") if answer is not None and answer.get("ok") else None
+                workers.append(self.status_of(state, live))
+
+            self.send_to_supervisor({"type": "response", "id": request_id, "workers": workers})
+
+        if not targets:
+            answered(Pending(request_id, "slots", {}))
+            return
+
+        self.ask_workers(targets, "slots", {}, 1.0, answered)
+
+    def status_of(self, state: WorkerState, live: dict[str, Any] | None) -> dict[str, Any]:
+        """One worker's state as the host knows it, with what it holds.
+
+        `live` is what the worker answered its threads and loop hold now;
+        without one, its last report's figures stand, marked stale. A
+        worker is routed once the host's latest announcement names it and
+        the supervisor has acknowledged that announcement, so the edge
+        routes to it; a replacement still warming, or a worker out of
+        routing while it is debugged, is not. Its state is `starting`,
+        `ready`, `debugging` (a debugger session is open), `replacing` (a
+        fresh worker takes its place) or `retiring` (scaled in).
+        """
+
+        sides = state.sides if live is None else live
+        leaving = self.replacing.get(state.index)
+
+        if state.replaced:
+            status = "retiring" if leaving is not None and leaving.retire else "replacing"
+        elif state.debug_sessions:
+            status = "debugging"
+        elif state.ready:
+            status = "ready"
+        else:
+            status = "starting"
 
         return {
             "index": state.index,
@@ -2133,14 +2172,14 @@ class Host:
                 "group": self.placement[state.index][0].name,
                 "generation": state.generation,
                 "socket": state.path,
+                "state": status,
                 "ready": state.ready,
-                "replaced": state.replaced,
                 "routed": self.routed.get(state.index) == state.path and self.acked >= self.version,
                 "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
-                "in_flight": state.in_flight,
-                "oldest_ms": state.oldest_ms,
+                **{key: sides[key] for key in ("threads", "loop") if key in sides},
+                "stale": live is None and bool(state.sides),
                 **state.memory,
             },
         }
@@ -2250,9 +2289,6 @@ class Host:
 
         self.pending.pop(pending.id, None)
 
-        if pending.op == "trace":
-            self.trace_ended(pending.id)
-
         if pending.op == "attach":
             for pid, answer in pending.answers.items():
                 state = self.states.get(pid)
@@ -2271,59 +2307,6 @@ class Host:
                 "workers": sorted(pending.answers.values(), key=lambda answer: answer["index"]),
             }
         )
-
-    def trace_started(self, request_id: int, targets: dict[int, int]) -> None:
-        """Take traced workers out of routing while their trace lasts.
-
-        Section 11.7: tracing slows a worker, so the edge's requests go to
-        the others of its group meanwhile. A worker stays in routing when
-        it is the last of its group that is, and finishes the requests it
-        has either way.
-        """
-
-        taken = []
-
-        for pid in targets:
-            state = self.states.get(pid)
-
-            if state is None or self.routed.get(state.index) is None:
-                continue
-
-            group = self.placement[state.index][0]
-            others = [
-                other
-                for other in self.states.values()
-                if other.pid != pid
-                and self.placement[other.index][0] is group
-                and self.routed.get(other.index) is not None
-            ]
-
-            if not others:
-                continue
-
-            self.routed[state.index] = None
-            taken.append(state)
-            log(f"worker {state.index} (pid {state.pid}) leaves routing while it is traced")
-
-        if taken:
-            self.traced[request_id] = taken
-            self.announce()
-
-    def trace_ended(self, request_id: int) -> None:
-        """Put workers back in routing once their trace has answered."""
-
-        returned = False
-
-        for state in self.traced.pop(request_id, []):
-            if state.replaced or state.debug_sessions or state.pid not in self.states:
-                continue
-
-            self.routed[state.index] = state.path
-            returned = True
-            log(f"worker {state.index} (pid {state.pid}) serves again: its trace has ended")
-
-        if returned:
-            self.announce()
 
     def debugging(self, state: WorkerState, change: int) -> None:
         """Count a debugger session opening or ending in a worker.
@@ -2426,6 +2409,7 @@ class Host:
             state.requests = int(report.get("requests", state.requests))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
+            state.sides = {key: report[key] for key in ("threads", "loop") if key in report}
 
             if "rss" in report:
                 measured = True
@@ -4032,6 +4016,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"mount {mount.name}: {mount.release.spec} is served as "
                     f"{interface_name(mount.release.resolved)}"
                 )
+
+        # Section 6.2: pre_fork runs once, before the import check, so
+        # that what it closes is not reported as crossing the fork. With
+        # --single nothing forks, so it has no occasion.
+
+        if not args.single and not hooks.call_logged("pre_fork", context):
+            return 1
 
         findings = recorder.findings()
 

@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import pstats
+import re
 import signal
 import subprocess
 import sys
@@ -34,7 +35,7 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 20.0) -> None:
         time.sleep(0.1)
 
 
-def deploy_plain(daemon: Daemon, processes: int = 2) -> None:
+def deploy_plain(daemon: Daemon, processes: int = 2, *arguments: str) -> None:
     assert daemon.deploy(
         "plain",
         support.FIXTURES,
@@ -44,6 +45,7 @@ def deploy_plain(daemon: Daemon, processes: int = 2) -> None:
         str(processes),
         "--threads",
         "2",
+        *arguments,
     ) == ("muru: release plain@r1 is ready and serving")
 
 
@@ -53,7 +55,10 @@ def test_status_lists_every_worker_with_its_figures(daemon: Daemon) -> None:
 
     def status_rows() -> list[list[str]]:
         lines = daemon.muructl("debug", "status", "plain").stdout.splitlines()
-        assert lines[0].split()[:4] == ["WORKER", "PID", "GROUP", "UP"]
+        assert lines[0].split() == [
+            "WORKER", "PID", "GROUP", "UP", "REQUESTS", "THREADS", "THREAD-OLDEST",
+            "RSS", "USS", "ROUTED", "STATE",
+        ]  # fmt: skip
         return [line.split() for line in lines[1:]]
 
     # The figures come from the workers' reports, once a second.
@@ -117,17 +122,39 @@ def test_stacks_are_merged_across_workers_showing_the_same_stack(daemon: Daemon)
 
 
 def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemon) -> None:
-    deploy_plain(daemon, processes=1)
+    deploy_plain(
+        daemon,
+        1,
+        "--env",
+        "DATABASE_URL=postgres://shop:hunter2@db/shop",
+        "--env",
+        "SENTRY_DSN=https://abc123@o1.ingest.sentry.io/1",
+    )
     text = daemon.muructl("debug", "inspect", "plain").stdout
     assert "worker 0 (pid" in text and "python 3." in text
     assert "plain in " in text and "(group default, " in text
     assert "modules loaded" in text
     assert "MURU_GROUP=default" in text
 
+    # A password in a URL is hidden and the rest kept, and a DSN is
+    # hidden whole (issue 376).
+
+    assert "DATABASE_URL=postgres://shop:***@db/shop" in text, text
+    assert "SENTRY_DSN=***" in text, text
+    assert "hunter2" not in text and "abc123" not in text
+
     answer = json.loads(daemon.muructl("debug", "inspect", "plain", "--json").stdout)
     result = answer["workers"][0]["result"]
     assert "plain_wsgi" in result["modules"]
     assert result["settings"]["app"] == "plain"
+
+    # A build with the GIL off is named free-threaded once, in the process
+    # model (issue 371). The worker says whether its GIL is off: the test's
+    # own interpreter may differ, since an extension it loads can turn the
+    # GIL back on in a free-threaded build.
+
+    first = text.splitlines()[0]
+    assert first.count("free-threaded") == (0 if result["settings"]["gil_enabled"] else 1), first
     assert result["descriptors"]["count"] is None or result["descriptors"]["count"] > 3
     assert any(name == "MainThread" for name in (t["name"] for t in result["threads"]))
 
@@ -460,6 +487,10 @@ def test_memory_reports_objects_and_traces_allocations(daemon: Daemon) -> None:
     assert "gc counts" in text
     assert "objects:" in text and " dict" in text
 
+    # Every size is written for a reader, with a unit (issue 370).
+
+    assert re.search(r"  rss [\d.]+[KMG]B  pss [\d.]+[KMG]B  uss [\d.]+[KMG]B$", text, re.M), text
+
     stop = threading.Event()
 
     def grow() -> None:
@@ -483,7 +514,9 @@ def test_memory_reports_objects_and_traces_allocations(daemon: Daemon) -> None:
 def test_memory_compares_with_a_snapshot_kept_between_two_points(daemon: Daemon) -> None:
     deploy_plain(daemon, processes=1)
     kept = daemon.muructl("debug", "memory", "plain", "--snapshot").stdout
-    assert "snapshot kept; tracemalloc holds" in kept
+    assert re.search(
+        r"snapshot kept; tracemalloc holds [\d.]+[KMG]?B \(peak [\d.]+[KMG]?B\)", kept
+    ), kept
 
     for _ in range(3):
         daemon.get("/grow?mb=1")
@@ -500,7 +533,7 @@ def test_memory_compares_with_a_snapshot_kept_between_two_points(daemon: Daemon)
     assert "no snapshot is kept; take one with --snapshot" in refused
 
 
-def test_a_traced_worker_leaves_routing_while_the_trace_lasts(daemon: Daemon) -> None:
+def test_a_traced_worker_keeps_serving_while_the_trace_lasts(daemon: Daemon) -> None:
     if sys.version_info < (3, 12):
         support.unavailable("trace needs Python 3.12 or later, for sys.monitoring")
 
@@ -510,22 +543,26 @@ def test_a_traced_worker_leaves_routing_while_the_trace_lasts(daemon: Daemon) ->
         return {json.loads(daemon.get("/info").body)["pid"] for _ in range(20)}
 
     wait_for(lambda: len(serving()) == 2)
+    traced: list[str] = []
     tracing = threading.Thread(
-        target=daemon.muructl, args=("debug", "trace", "plain", "--worker", "0", "--for", "4s")
+        target=lambda: traced.append(
+            daemon.muructl("debug", "trace", "plain", "--worker", "0", "--for", "3s").stdout
+        )
     )
     tracing.start()
 
+    # Requests made once the trace is under way still reach both
+    # workers, and the trace counts the ones the traced worker took.
+
     try:
-        wait_for(lambda: len(serving()) == 1, timeout=3)
-        during = serving()
+        time.sleep(1)
+        during = serving() | serving()
     finally:
         tracing.join()
 
-    assert len(during) == 1
-    wait_for(lambda: len(serving()) == 2)
-    log = daemon.muructl("logs", "plain").stdout
-    assert "leaves routing while it is traced" in log
-    assert "serves again: its trace has ended" in log
+    assert len(during) == 2
+    counted = next(line for line in traced[0].splitlines() if "application (plain_wsgi.py:" in line)
+    assert int(counted.split()[1]) >= 5, traced[0]
 
 
 def test_exec_is_off_unless_the_daemon_allows_it(daemon: Daemon, tmp_path: Path) -> None:

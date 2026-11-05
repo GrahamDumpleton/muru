@@ -11,8 +11,10 @@ exec.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -76,6 +78,37 @@ def in_background(
     return thread, answers
 
 
+def test_status_counts_a_request_waiting_at_a_breakpoint(daemon: Daemon, tmp_path: Path) -> None:
+    deploy_paused(daemon, tmp_path / "source")
+    thread, answers = in_background(lambda: daemon.get("/pause?4"))
+
+    try:
+        wait_for(lambda: "debug.breakpoint" in daemon.events())
+        time.sleep(1.2)
+
+        # The request holds its thread though the timeouts leave it alone,
+        # and the age is as of now, not the worker's last report.
+
+        status = json.loads(daemon.muructl("debug", "status", "paused", "--json").stdout)
+        held = [
+            worker["result"]["threads"]
+            for worker in status["workers"]
+            if worker["result"]["threads"]["busy"]
+        ]
+        assert len(held) == 1 and held[0]["of"] == 2, status
+        assert held[0]["oldest_ms"] > 1000, held
+        assert all(not worker["result"]["stale"] for worker in status["workers"])
+
+        lines = daemon.muructl("debug", "status", "paused").stdout.splitlines()
+        assert "THREADS THREAD-OLDEST" in " ".join(lines[0].split())
+        assert "LOOP" not in lines[0]
+        assert any(line.split()[5] == "1/2" for line in lines[1:]), lines
+    finally:
+        thread.join()
+
+    assert answers[0].body == b"value=20"
+
+
 def test_attach_is_refused_unless_exec_is_allowed(daemon: Daemon, tmp_path: Path) -> None:
     deploy_paused(daemon, tmp_path / "source")
     refused = daemon.muructl("debug", "attach", "paused", "--worker", "0", check=False, stdin="")
@@ -99,6 +132,19 @@ def test_a_session_debugs_the_request_at_its_breakpoint(tmp_path: Path) -> None:
         assert "muru: attached to worker" in session.stderr
         assert "paused.py" in session.stderr
         assert "(Pdb) 20" in session.stdout.replace("\n", " ")
+
+        # pdb stops on the breakpoint() line itself from Python 3.13, and
+        # at the line after it before that (issue 373).
+
+        stopped = re.search(r"> .*paused\.py\((\d+)\)application\(\)\n-> (.*)\n", session.stdout)
+        assert stopped, session.stdout
+        attached = re.search(r"attached to worker \d+ at .*paused\.py:(\d+);", session.stderr)
+        assert attached, session.stderr
+        on_breakpoint = sys.version_info >= (3, 13)
+        assert int(stopped[1]) == int(attached[1]) + (0 if on_breakpoint else 1), stopped[0]
+        assert stopped[2].startswith("breakpoint(" if on_breakpoint else "start_response("), (
+            stopped[0]
+        )
         thread.join(30)
         assert answers[0].body == b"value=99"
 

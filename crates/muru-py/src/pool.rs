@@ -95,6 +95,9 @@ pub struct RequestInfo {
     /// Exempt from the timeouts: a streaming response or a WebSocket
     /// (section 7.6), which run as long as they need to.
     pub exempt: bool,
+    /// An accepted WebSocket, which holds no slot the status counts
+    /// (section 11.7).
+    pub websocket: bool,
     /// The request's way out to the edge, for giving it up (section 7.6)
     /// when the host condemns the worker and the code serving it cannot
     /// be interrupted.
@@ -471,6 +474,7 @@ impl Shared {
                     max: clamp(max),
                     connections: clamp(connections),
                     handoff_threads: clamp(handoff_threads),
+                    on_loop: mount.runner.is_some(),
                 })
             })
             .collect()
@@ -523,6 +527,7 @@ impl Shared {
                     interrupt: Arc::clone(&interrupt),
                     timed_out: false,
                     exempt: false,
+                    websocket: false,
                     outgoing: None,
                     abandoned: false,
                 },
@@ -615,6 +620,21 @@ impl Shared {
             .get_mut(&id)
         {
             info.exempt = true;
+        }
+    }
+
+    /// Note that a request became a WebSocket: exempt from the timeouts,
+    /// and not a slot the status counts (section 11.7), since an open
+    /// socket may stay for hours.
+    pub fn request_websocket(&self, id: u64) {
+        if let Some(info) = self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .get_mut(&id)
+        {
+            info.exempt = true;
+            info.websocket = true;
         }
     }
 
@@ -886,6 +906,114 @@ impl Shared {
             .map(|info| now.saturating_duration_since(info.started).as_millis() as u64)
             .max()
             .unwrap_or(0)
+    }
+
+    /// What each side of the worker holds now (section 11.7): the
+    /// application threads, when requests run on them, and the event
+    /// loop, when there is one. A request holds a thread from the moment
+    /// a pool thread picks it up, whatever the timeouts make of it, so
+    /// one held at `breakpoint()` or streaming its response counts; a
+    /// request holds the loop while its channel serves it, except an
+    /// accepted WebSocket, which may stay for hours.
+    pub fn sides(&self) -> Sides {
+        let default_is_asgi = self.asgi.as_ref().is_some_and(|asgi| asgi.runner.is_some());
+        let has_threads = !default_is_asgi
+            || self.handoff
+            || self
+                .mounts
+                .values()
+                .any(|mount| mount.runner.is_none() || mount.handoff);
+        let reserved: usize = self
+            .mounts
+            .values()
+            .filter(|mount| mount.pool.is_some())
+            .map(|mount| mount.threads.map_or(0, |(reserved, _)| reserved))
+            .sum();
+        let now = Instant::now();
+        let mut threads = has_threads.then(|| Side::of(self.threads + reserved));
+        let mut event_loop = self.asgi.as_ref().map(|asgi| Side::of(asgi.concurrency));
+
+        for info in self
+            .active
+            .lock()
+            .expect("active requests poisoned")
+            .values()
+        {
+            let elapsed = now.saturating_duration_since(info.started).as_millis() as u64;
+
+            if info.thread.is_some() {
+                if let Some(side) = threads.as_mut() {
+                    side.hold(elapsed);
+                }
+            } else if info.channel.is_some()
+                && !info.websocket
+                && let Some(side) = event_loop.as_mut()
+            {
+                side.hold(elapsed);
+            }
+        }
+
+        Sides {
+            threads,
+            event_loop,
+        }
+    }
+}
+
+/// What one side of a worker holds (section 11.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Side {
+    /// The requests on it now.
+    pub busy: usize,
+    /// How many it takes at once.
+    pub of: usize,
+    /// How long the longest of them has been there, in milliseconds;
+    /// zero with none.
+    pub oldest_ms: u64,
+}
+
+impl Side {
+    fn of(of: usize) -> Self {
+        Self {
+            busy: 0,
+            of,
+            oldest_ms: 0,
+        }
+    }
+
+    fn hold(&mut self, elapsed_ms: u64) {
+        self.busy += 1;
+        self.oldest_ms = self.oldest_ms.max(elapsed_ms);
+    }
+
+    /// The side as a JSON object.
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"busy\":{},\"of\":{},\"oldest_ms\":{}}}",
+            self.busy, self.of, self.oldest_ms
+        )
+    }
+}
+
+/// Both sides of a worker, each absent when the worker has no such side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sides {
+    /// The application threads.
+    pub threads: Option<Side>,
+    /// The event loop.
+    pub event_loop: Option<Side>,
+}
+
+impl Sides {
+    /// The sides as JSON object members, `"threads":{...},"loop":{...}`,
+    /// without braces, for a report line or a control answer; empty
+    /// with neither side.
+    pub fn json_members(&self) -> String {
+        [("threads", self.threads), ("loop", self.event_loop)]
+            .into_iter()
+            .filter_map(|(name, side)| side.map(|side| format!("\"{name}\":{}", side.json())))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

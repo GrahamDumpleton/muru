@@ -51,13 +51,16 @@ muructl run chat:application
 The terminal shows:
 
 ```
+muru: runtime library 1.0.0 from /home/dev/.cache/muru/runtime/1.0.0/cp313
 muru.host[4242]: preloaded chat:application in 1 ms
 muru.host[4242]: chat:application is served as ASGI
 muru.host[4242]: worker 0 started as pid 4243
 muru.host[4242]: worker 0 (pid 4243) is ready
 muru: serving chat:application on http://127.0.0.1:8080 with 1 worker of concurrency 1000
-muru: development mode: error pages show tracebacks, nothing is persisted and only loopback is served; production runs under the daemon (muructl daemon start)
+muru: development mode: error pages show tracebacks, nothing is persisted, the run reloads on change and only loopback is served; production runs under the daemon (muructl daemon start)
 muru: dashboard on http://127.0.0.1:8081/
+muru: admin socket /run/user/1000/muru/runs/8080/admin.sock
+muru: watching /home/dev/chat for changes to **/*.py
 ```
 
 Muru saw that `application` is a coroutine function and serves it as

@@ -652,7 +652,7 @@ impl Channel {
 
                 // Section 7.6: a WebSocket runs as long as it needs to.
 
-                self.shared.request_exempt(self.request);
+                self.shared.request_websocket(self.request);
                 let head = Outgoing::Head {
                     status: 101,
                     reason: String::new(),

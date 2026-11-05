@@ -160,7 +160,8 @@ def run_until_serving(
     with `stop`."""
 
     log = Path(tempfile.mkstemp(prefix="muru-provisioning-", suffix=".log")[1])
-    command = [str(muructl()), "run", str(directory), "--port", "auto", "--processes", "1", *args]
+    command = [str(muructl()), "run", str(directory), "--port", "auto", "--processes", "1"]
+    command += [*support.dashboard_args(args)[0], *args]
 
     if python is not None:
         command += ["--python", str(python)]

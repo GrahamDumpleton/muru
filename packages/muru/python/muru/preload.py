@@ -21,6 +21,7 @@ import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from importlib.util import resolve_name
 from types import ModuleType, TracebackType
 from typing import Any
@@ -326,7 +327,7 @@ class ImportRecorder:
         level: int = 0,
     ) -> ModuleType:
         original = self._original_import or builtins.__import__
-        full_name = name
+        full_name: str | None = name
 
         if level > 0:
             package = globals.get("__package__") if globals else None
@@ -334,11 +335,57 @@ class ImportRecorder:
             try:
                 full_name = resolve_name("." * level + name, str(package or ""))
             except (ImportError, ValueError):
-                full_name = name
+                full_name = None
 
-        if full_name in sys.modules:
+        def call() -> ModuleType:
             return original(name, globals, locals, fromlist, level)
-        return self._record(full_name, lambda: original(name, globals, locals, fromlist, level))
+
+        # importlib loads a submodule named in fromlist, as in `from shop
+        # import db`, without coming back through __import__, so that
+        # whatever it leaves would be put down to the module importing it.
+        # The package and each such submodule are recorded as imports of
+        # their own first, and the import itself then finds them loaded.
+
+        if fromlist and full_name:
+            if full_name not in sys.modules:
+                self._record(full_name, partial(importlib.import_module, full_name))
+
+            self._import_fromlist(full_name, fromlist)
+            return call()
+
+        if full_name is None or full_name in sys.modules:
+            return call()
+        return self._record(full_name, call)
+
+    def _import_fromlist(self, package_name: str, fromlist: Any) -> None:
+        """Record the import of each submodule a fromlist names that is not loaded yet.
+
+        As importlib does, a name the package already has is taken as it
+        is, and a name that is no submodule is left for the import itself
+        to refuse.
+        """
+
+        package = sys.modules.get(package_name)
+
+        if package is None or not hasattr(package, "__path__"):
+            return
+
+        names = [entry for entry in fromlist if entry != "*"]
+
+        if "*" in fromlist:
+            names.extend(getattr(package, "__all__", ()))
+
+        for entry in names:
+            submodule = f"{package_name}.{entry}"
+
+            if not isinstance(entry, str) or hasattr(package, entry) or submodule in sys.modules:
+                continue
+
+            try:
+                self._record(submodule, partial(importlib.import_module, submodule))
+            except ModuleNotFoundError as error:
+                if error.name != submodule:
+                    raise
 
     def _record(self, module: str, run: Callable[[], ModuleType]) -> ModuleType:
         fds_before = _fd_numbers()

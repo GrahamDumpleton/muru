@@ -14,7 +14,7 @@ def server() -> Iterator[Server]:
         "asgi_conformance:application",
         workers=1,
         threads=None,
-        # No dashboard: its default port would clash with the servers of other suites.
+        # No dashboard: the conformance suite has no use for one.
         args=["--dashboard", "off"],
     )
 

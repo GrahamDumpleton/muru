@@ -45,6 +45,7 @@ message MountPool {
   uint32 max = 3;
   uint32 connections = 4;
   uint32 handoff_threads = 5;
+  bool on_loop = 6;                 // the mount runs its requests on the event loop
 }
 
 // A gRPC method a worker serves (section 6.13). A path ending in / is a

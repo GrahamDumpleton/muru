@@ -44,6 +44,7 @@ pub mod metrics;
 pub mod occasions;
 pub mod proxy;
 pub mod ratelimit;
+pub mod requests;
 pub mod routing;
 pub mod static_files;
 pub mod tls;

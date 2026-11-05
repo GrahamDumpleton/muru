@@ -94,6 +94,34 @@ def test_connected_socket_is_attributed_to_its_module(modules: Path) -> None:
     assert "pre_fork" in findings[0].advice
 
 
+@pytest.mark.parametrize("statement", ["from shop import db", "from . import db", "import shop.db"])
+def test_a_submodule_imported_from_its_package_is_named(modules: Path, statement: str) -> None:
+    package = modules / "shop"
+    package.mkdir()
+    write_module(package, "__init__", "")
+    write_module(
+        package,
+        "db",
+        "import socket\nPAIR = socket.socketpair()\n\n"
+        "def cleanup():\n    PAIR[0].close()\n    PAIR[1].close()\n",
+    )
+    write_module(package, "wsgi", f"{statement}\n")
+    with preload.ImportRecorder() as recorder:
+        recorder.import_module("shop.wsgi")
+    findings = recorder.findings()
+    assert findings, "a socketpair left open was not reported"
+    assert {finding.module for finding in findings} == {"shop.db"}
+
+
+def test_a_name_that_is_no_submodule_is_refused_as_without_the_check(modules: Path) -> None:
+    package = modules / "shop"
+    package.mkdir()
+    write_module(package, "__init__", "VALUE = 1\n")
+    write_module(package, "wsgi", "from shop import VALUE, missing\n")
+    with preload.ImportRecorder() as recorder, pytest.raises(ImportError, match="missing"):
+        recorder.import_module("shop.wsgi")
+
+
 def test_unconnected_udp_socket_is_not_reported(modules: Path) -> None:
     write_module(
         modules,

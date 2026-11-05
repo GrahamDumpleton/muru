@@ -73,6 +73,23 @@ def test_the_import_check_warns_and_strict_fails(tmp_path: Path) -> None:
     assert strict.returncode != 0
     assert "fail the check under --strict" in strict.stdout
 
+    # As in the host, pre_fork runs before the check, so what it closes
+    # is not reported.
+
+    directory = tmp_path / "project"
+    directory.mkdir()
+
+    for name in ("preload_wsgi.py", "unsafe_import_wsgi.py", "hooks_reopen_socket.py"):
+        shutil.copy(support.FIXTURES / name, directory / name)
+
+    (directory / "pyproject.toml").write_text(
+        "[tool.muru]\nentrypoint = 'unsafe_import_wsgi:application'\n"
+        "hooks = 'hooks_reopen_socket'\n"
+    )
+    closed = check(str(directory), "--strict")
+    assert closed.returncode == 0, closed.stdout + closed.stderr
+    assert "warning" not in closed.stdout
+
 
 def test_env_file_supplies_what_the_import_reads(tmp_path: Path) -> None:
     directory = tmp_path / "project"

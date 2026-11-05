@@ -301,6 +301,15 @@ python = '{sys.executable}'
             wait_for(lambda: "websockets 1 open" in words("status"))
             assert "websockets 1 open" in words("release", "show", "chat@r1")
 
+            # An open socket holds no loop slot debug status counts, so a
+            # chat worker with idle sockets does not read as busy.
+
+            status = json.loads(daemon.muructl("debug", "status", "chat", "--json").stdout)
+            sides = status["workers"][0]["result"]
+            assert sides["loop"] == {"busy": 0, "of": 1000, "oldest_ms": 0}, sides
+            assert "threads" not in sides
+            assert "LOOP LOOP-OLDEST" in words("debug", "status", "chat")
+
         wait_for(lambda: words("websockets") == "no WebSockets open")
         access = daemon.muructl("logs", "--access").stdout
         assert "101 GET /ws/echo/42" in access

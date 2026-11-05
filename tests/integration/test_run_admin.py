@@ -123,6 +123,13 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert json.loads(raw)["status"] == 200
         output = muructl(runtime, "logs", "plain-wsgi", cwd=support.FIXTURES).stdout
         assert "muru.host[" in output and "is ready" in output
+
+        # The run's application need not be named (issue 375).
+
+        output = muructl(runtime, "logs", cwd=support.FIXTURES).stdout
+        assert "muru.host[" in output and "is ready" in output
+        wrong = muructl(runtime, "logs", "other", cwd=support.FIXTURES, check=False)
+        assert "no application other here" in wrong.stderr, wrong.stderr
         assert "no WebSockets open" in muructl(runtime, "websockets", cwd=support.FIXTURES).stdout
 
         # Logging levels and a restart go through the host as they do
@@ -136,7 +143,7 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
             runtime, "restart", "plain-wsgi", "--worker", "1", cwd=support.FIXTURES
         ).stdout
         assert "worker 1" in restarted and "is being replaced by pid" in restarted
-        assert server.wait_for_log("muru: worker.restarted:")
+        assert server.wait_for_log(": worker.restarted: worker 1")
 
         # A change to what the access log writes goes into the run's edge
         # at once and is printed as the daemon records it.
