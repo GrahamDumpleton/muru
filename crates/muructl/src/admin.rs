@@ -1842,6 +1842,12 @@ fn print_inspect(response: &pb::DebugResponse) {
             continue;
         };
         let settings = &result["settings"];
+
+        // The process model already says free-threaded for WSGI on a
+        // build with the GIL off (issue 371); ASGI's is async, so the
+        // build is named after it.
+
+        let process_model = settings["process_model"].as_str().unwrap_or("?");
         println!(
             "worker {} (pid {}): python {} at {}, {} in {} (group {}, {}{})",
             answer.index,
@@ -1851,8 +1857,9 @@ fn print_inspect(response: &pb::DebugResponse) {
             settings["app"].as_str().unwrap_or("?"),
             result["cwd"].as_str().unwrap_or("?"),
             settings["group"].as_str().unwrap_or("default"),
-            settings["process_model"].as_str().unwrap_or("?"),
-            if settings["gil_enabled"].as_bool() == Some(false) {
+            process_model,
+            if settings["gil_enabled"].as_bool() == Some(false) && process_model != "free-threaded"
+            {
                 ", free-threaded"
             } else {
                 ""

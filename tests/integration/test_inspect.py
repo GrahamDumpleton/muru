@@ -123,6 +123,13 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
     assert "worker 0 (pid" in text and "python 3." in text
     assert "plain in " in text and "(group default, " in text
     assert "modules loaded" in text
+
+    # A free-threaded build is named once, in the process model (issue 371).
+
+    first = text.splitlines()[0]
+    assert first.count("free-threaded") == (
+        0 if getattr(sys, "_is_gil_enabled", lambda: True)() else 1
+    ), first
     assert "MURU_GROUP=default" in text
 
     answer = json.loads(daemon.muructl("debug", "inspect", "plain", "--json").stdout)
