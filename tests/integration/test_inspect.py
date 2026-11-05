@@ -131,13 +131,6 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
     assert "worker 0 (pid" in text and "python 3." in text
     assert "plain in " in text and "(group default, " in text
     assert "modules loaded" in text
-
-    # A free-threaded build is named once, in the process model (issue 371).
-
-    first = text.splitlines()[0]
-    assert first.count("free-threaded") == (
-        0 if getattr(sys, "_is_gil_enabled", lambda: True)() else 1
-    ), first
     assert "MURU_GROUP=default" in text
 
     # A password in a URL is hidden and the rest kept, and a DSN is
@@ -151,6 +144,14 @@ def test_inspect_describes_the_interpreter_modules_and_environment(daemon: Daemo
     result = answer["workers"][0]["result"]
     assert "plain_wsgi" in result["modules"]
     assert result["settings"]["app"] == "plain"
+
+    # A build with the GIL off is named free-threaded once, in the process
+    # model (issue 371). The worker says whether its GIL is off: the test's
+    # own interpreter may differ, since an extension it loads can turn the
+    # GIL back on in a free-threaded build.
+
+    first = text.splitlines()[0]
+    assert first.count("free-threaded") == (0 if result["settings"]["gil_enabled"] else 1), first
     assert result["descriptors"]["count"] is None or result["descriptors"]["count"] > 3
     assert any(name == "MainThread" for name in (t["name"] for t in result["threads"]))
 
