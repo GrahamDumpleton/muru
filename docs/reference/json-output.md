@@ -98,7 +98,7 @@ $ muructl release show shop@r9 --json
 | `muructl websockets` | `open`, `endpoints` by application and pattern, and with `--list` each open `sockets` entry |
 | `muructl logging level` | One debug answer for each logger set, as an array |
 | `muructl logging access` | `overrides`, the changes in force after the command, the newest last, each with `mode`, `app`, `paths` and `until_unix_ms`, and `reset`, how many `--reset` put back |
-| `muructl debug status` | The debug answer: `{"release": ..., "workers": [...]}`, each worker with `index`, `pid`, `ok`, `error` and its `result` |
+| `muructl debug status` | The debug answer: `{"release": ..., "workers": [...]}`, each worker with `index`, `pid`, `ok`, `error` and its `result`: `group`, `generation`, `socket`, `state` (`starting`, `ready`, `debugging`, `replacing` or `retiring`), `ready`, `routed`, `debugging`, `uptime_s`, `requests`, `threads` and `loop` (each `busy`, `of` and `oldest_ms`, present for the sides the worker has), `stale` (the sides are from the worker's last report, since it did not answer within a second) and its memory figures |
 | `muructl debug stacks` | The debug answer |
 | `muructl debug tasks` | The debug answer |
 | `muructl debug inspect` | The debug answer |

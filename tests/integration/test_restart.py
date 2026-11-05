@@ -37,7 +37,7 @@ def workers(daemon: Daemon) -> dict[int, int]:
     return {
         int(worker["index"]): int(worker["pid"])
         for worker in status["workers"]
-        if worker["ok"] and worker["result"]["ready"] and not worker["result"]["replaced"]
+        if worker["ok"] and worker["result"]["state"] == "ready"
     }
 
 

@@ -56,7 +56,7 @@ muructl scale status busy
 
 ```
 busy@r1
-GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
+GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
 default      1            0/2        1.0     -          0/6        spare 1-8 workers, 1-3 idle
   workers: cpu -, gil wait p95 -, loop lag p95 -
   diagnosis: idle
@@ -88,7 +88,7 @@ muructl scale status busy
 
 ```
 busy@r1
-GROUP        WORKERS      SLOTS      IDLE    QUEUE P95  REAPS      POLICY
+GROUP        WORKERS      SLOTS      IDLE    QUEUE-P95  REAPS      POLICY
 default      5            7/10       1.0     1000 ms    0/6        spare 1-8 workers, 1-3 idle
   workers: cpu 1%, gil wait p95 0 ms, loop lag p95 -
   diagnosis: within capacity

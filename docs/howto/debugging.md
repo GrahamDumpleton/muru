@@ -30,15 +30,37 @@ does a run's, from the Workers link on its first page.
 
 ## Status
 
-What the host knows about each worker from its reports: pid, group,
-uptime, requests served and in flight, the age of its oldest request, its
-memory, and whether it is ready or being replaced.
+Each worker's pid, group, uptime, requests served, what it holds as of
+the moment it answers, its memory, whether the edge routes to it, and
+its state.
 
 ```
-WORKER  PID      GROUP      UP        REQUESTS   IN-FLIGHT  OLDEST    RSS       USS       STATE
-0       41213    default    318s      12044      1          12ms      48MB      31MB      ready
-1       41214    default    318s      11980      0          0ms       47MB      30MB      ready
+WORKER  PID      GROUP      UP       REQUESTS   THREADS  THREAD-OLDEST  RSS     USS     ROUTED  STATE
+0       41213    default    5m18s    12044      1/4      0.1s           48MB    31MB    yes     ready
+1       41214    default    5m18s    11980      0/4      -              47MB    30MB    yes     ready
 ```
+
+THREADS is the application threads busy of the worker's threads, and
+THREAD-OLDEST how long the longest has been held: a request holds its
+thread from the moment a pool thread picks it up, so one waiting at
+`breakpoint()` or streaming its response, which the timeouts leave
+alone, is counted for as long as it holds the thread. A worker with an
+event loop shows LOOP, the requests on the loop of its `concurrency`,
+and LOOP-OLDEST; open WebSockets are left out of both, since a socket
+may stay for hours, and `muructl websockets` counts them. A worker
+shows the sides it has, and the table the columns any worker of the
+release has, so a WSGI release has the thread columns and an ASGI
+release the loop columns. Every header is one word, so a script can
+pick a column by its name.
+
+The figures are as of the moment the status answers: the host asks each
+worker, and one that does not answer within a second, which is a hung
+one, is shown from its last report, up to a second old, its figures
+marked with a star. STATE is `starting`, `ready`, `debugging` (a
+debugger session is open, so the worker takes no requests), `replacing`
+(a fresh worker is taking its place) or `retiring` (scaled in). ROUTED
+says whether the edge sends it requests: a replacement that is ready
+but not yet announced to the edge reads `ready` and `no`.
 
 ## Stacks
 

@@ -100,9 +100,10 @@ Each running release on the page links to its workers, where the
 dashboard shows what [`muructl debug`](debugging.md) shows:
 
 - the release's workers as `debug status` lists them: pid, group,
-  uptime, requests served and in flight, the age of the oldest request,
-  memory, and whether each is ready, starting, being replaced or being
-  debugged, refreshed every two seconds;
+  uptime, requests served, what its threads and its event loop hold and
+  for how long, memory, whether the edge routes to it, and whether each
+  is starting, ready, being debugged, being replaced or retiring,
+  refreshed every two seconds;
 - their stacks as `debug stacks` shows them: the Python stack of every
   thread with the request each is serving, threads showing the same
   stack across workers shown once, taken when the page opens and again

@@ -1675,44 +1675,65 @@ fn debug_json(response: &pb::DebugResponse) -> serde_json::Value {
     })
 }
 
+/// The status table (section 11.7): a row per worker, with the columns
+/// of each side any worker of the release has, every header one word.
 fn print_status(response: &pb::DebugResponse) {
-    println!(
-        "{:<7} {:<8} {:<10} {:<9} {:<10} {:<10} {:<9} {:<9} {:<9} STATE",
-        "WORKER", "PID", "GROUP", "UP", "REQUESTS", "IN-FLIGHT", "OLDEST", "RSS", "USS"
+    let rows = muru_dashboard::inspect::status_rows(&debug_answer(response));
+    let sides = muru_dashboard::inspect::status_shape(&rows);
+    fn cells(side: &Option<muru_dashboard::inspect::SideView>) -> (&str, &str) {
+        match side {
+            Some(side) => (side.busy.as_str(), side.oldest.as_str()),
+            None => ("-", "-"),
+        }
+    }
+    let mut header = format!(
+        "{:<7} {:<8} {:<10} {:<8} {:<10}",
+        "WORKER", "PID", "GROUP", "UP", "REQUESTS"
     );
 
-    for answer in &response.workers {
-        let Some(result) = parse_result(answer) else {
-            println!("{:<7} {:<8} {}", answer.index, answer.pid, answer.error);
-            continue;
-        };
-        let size = |key: &str| {
-            result[key]
-                .as_u64()
-                .map(muru_config::format_size_approx)
-                .unwrap_or_else(|| "-".to_owned())
-        };
+    if sides.threads {
+        header += &format!(" {:<8} {:<14}", "THREADS", "THREAD-OLDEST");
+    }
 
-        let state = if result["replaced"].as_bool() == Some(true) {
-            "replaced"
-        } else if result["debugging"].as_bool() == Some(true) {
-            "debugging"
-        } else if result["ready"].as_bool() == Some(true) {
-            "ready"
-        } else {
-            "starting"
-        };
+    if sides.event_loop {
+        header += &format!(" {:<9} {:<12}", "LOOP", "LOOP-OLDEST");
+    }
+
+    println!("{header} {:<7} {:<7} {:<7} STATE", "RSS", "USS", "ROUTED");
+
+    for row in &rows {
+        if !row.error.is_empty() {
+            println!("{:<7} {:<8} {}", row.index, row.pid, row.error);
+            continue;
+        }
+
+        let mut line = format!(
+            "{:<7} {:<8} {:<10} {:<8} {:<10}",
+            row.index, row.pid, row.group, row.uptime, row.requests
+        );
+
+        if sides.threads {
+            let (busy, oldest) = cells(&row.threads);
+            line += &format!(" {busy:<8} {oldest:<14}");
+        }
+
+        if sides.event_loop {
+            let (busy, oldest) = cells(&row.event_loop);
+            line += &format!(" {busy:<9} {oldest:<12}");
+        }
+
         println!(
-            "{:<7} {:<8} {:<10} {:<9} {:<10} {:<10} {:<9} {:<9} {:<9} {state}",
-            answer.index,
-            answer.pid,
-            result["group"].as_str().unwrap_or("default"),
-            format!("{:.0}s", result["uptime_s"].as_f64().unwrap_or(0.0)),
-            result["requests"].as_u64().unwrap_or(0),
-            result["in_flight"].as_u64().unwrap_or(0),
-            format!("{}ms", result["oldest_ms"].as_u64().unwrap_or(0)),
-            size("rss"),
-            size("uss"),
+            "{line} {:<7} {:<7} {:<7} {}",
+            row.rss,
+            row.uss,
+            if row.routed { "yes" } else { "no" },
+            row.state
+        );
+    }
+
+    if sides.stale {
+        println!(
+            "* from the worker's last report, up to a second old: it did not answer within a second"
         );
     }
 }
@@ -2090,7 +2111,7 @@ pub async fn websockets(args: WebSocketsArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<20} {:<9} {:<16} {:<32} {:<16} {:>8} {:>8} {:<6} REQUEST ID",
+        "{:<20} {:<9} {:<16} {:<32} {:<16} {:>8} {:>8} {:<6} REQUEST-ID",
         "OPENED", "FOR", "RELEASE", "PATH", "CLIENT", "RECEIVED", "SENT", "WORKER"
     );
 
@@ -3369,7 +3390,7 @@ fn print_scale_status(status: &pb::ScaleStatus) {
     println!("{}@{}", status.app, status.release);
     println!(
         "{:<12} {:<12} {:<10} {:<7} {:<10} {:<10} POLICY",
-        "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE P95", "REAPS"
+        "GROUP", "WORKERS", "SLOTS", "IDLE", "QUEUE-P95", "REAPS"
     );
 
     for group in &status.groups {

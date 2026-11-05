@@ -78,6 +78,37 @@ def in_background(
     return thread, answers
 
 
+def test_status_counts_a_request_waiting_at_a_breakpoint(daemon: Daemon, tmp_path: Path) -> None:
+    deploy_paused(daemon, tmp_path / "source")
+    thread, answers = in_background(lambda: daemon.get("/pause?4"))
+
+    try:
+        wait_for(lambda: "debug.breakpoint" in daemon.events())
+        time.sleep(1.2)
+
+        # The request holds its thread though the timeouts leave it alone,
+        # and the age is as of now, not the worker's last report.
+
+        status = json.loads(daemon.muructl("debug", "status", "paused", "--json").stdout)
+        held = [
+            worker["result"]["threads"]
+            for worker in status["workers"]
+            if worker["result"]["threads"]["busy"]
+        ]
+        assert len(held) == 1 and held[0]["of"] == 2, status
+        assert held[0]["oldest_ms"] > 1000, held
+        assert all(not worker["result"]["stale"] for worker in status["workers"])
+
+        lines = daemon.muructl("debug", "status", "paused").stdout.splitlines()
+        assert "THREADS THREAD-OLDEST" in " ".join(lines[0].split())
+        assert "LOOP" not in lines[0]
+        assert any(line.split()[5] == "1/2" for line in lines[1:]), lines
+    finally:
+        thread.join()
+
+    assert answers[0].body == b"value=20"
+
+
 def test_attach_is_refused_unless_exec_is_allowed(daemon: Daemon, tmp_path: Path) -> None:
     deploy_paused(daemon, tmp_path / "source")
     refused = daemon.muructl("debug", "attach", "paused", "--worker", "0", check=False, stdin="")

@@ -55,7 +55,10 @@ def test_status_lists_every_worker_with_its_figures(daemon: Daemon) -> None:
 
     def status_rows() -> list[list[str]]:
         lines = daemon.muructl("debug", "status", "plain").stdout.splitlines()
-        assert lines[0].split()[:4] == ["WORKER", "PID", "GROUP", "UP"]
+        assert lines[0].split() == [
+            "WORKER", "PID", "GROUP", "UP", "REQUESTS", "THREADS", "THREAD-OLDEST",
+            "RSS", "USS", "ROUTED", "STATE",
+        ]  # fmt: skip
         return [line.split() for line in lines[1:]]
 
     # The figures come from the workers' reports, once a second.

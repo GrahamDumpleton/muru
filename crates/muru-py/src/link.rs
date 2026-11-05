@@ -571,6 +571,22 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
             continue;
         }
 
+        // And what each side holds, for `debug status`, which asks each
+        // worker as of now rather than reading its last report.
+
+        if let Some(id) = slots_request(&line) {
+            let text = format!(
+                "{{\"id\":{id},\"ok\":true,\"result\":{{{}}}}}",
+                shared.sides().json_members()
+            );
+
+            if writer.write_all(text.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+                break;
+            }
+
+            continue;
+        }
+
         // Section 7.6: so is giving up the requests of a condemned worker,
         // whose stuck code may hold the interpreter for good.
 
@@ -617,6 +633,16 @@ fn control_thread(fd: i32, handler: Py<PyAny>, shared: Arc<Shared>) {
 /// writes it: `{"id": N, "op": "bookkeeping", ...}`.
 fn bookkeeping_request(line: &str) -> Option<i64> {
     if !line.contains("\"op\": \"bookkeeping\"") {
+        return None;
+    }
+
+    control_id(line)
+}
+
+/// The id of a request line asking what each side holds, as the host
+/// writes it: `{"id": N, "op": "slots", ...}`.
+fn slots_request(line: &str) -> Option<i64> {
+    if !line.contains("\"op\": \"slots\"") {
         return None;
     }
 
@@ -739,6 +765,16 @@ fn report_thread(fd: i32, shared: &Shared, memory_interval: Duration, stop: &Ato
             shared.oldest_ms(),
             shared.total()
         );
+
+        // Section 11.7: what each side holds, as of this report, for a
+        // status the worker cannot answer live.
+
+        let sides = shared.sides().json_members();
+
+        if !sides.is_empty() {
+            line.push(',');
+            line.push_str(&sides);
+        }
 
         if last_measured.is_none_or(|at| at.elapsed() >= memory_interval) {
             last_measured = Some(Instant::now());
