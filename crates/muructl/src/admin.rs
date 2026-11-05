@@ -5807,8 +5807,9 @@ pub struct LogsArgs {
     pub command: Option<LogsCommand>,
 
     /// The application, or app@release; the current release when only
-    /// the application is named.
-    #[arg(value_name = "APP[@RELEASE]", required_unless_present = "access")]
+    /// the application is named. A development run's application when
+    /// left out; the daemon needs it, unless --access is given.
+    #[arg(value_name = "APP[@RELEASE]")]
     target: Option<String>,
 
     /// Keep printing lines as they are written.

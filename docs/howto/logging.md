@@ -254,7 +254,9 @@ $ muructl logs --access --lines 1
 ```
 
 `--no-timestamps` leaves the times off. The same command against a
-development run shows the run's lines with their times as well.
+development run shows the run's lines with their times as well, and
+there the application can be left out, as `muructl logs` alone, since a
+run serves one; the daemon needs it named unless `--access` is given.
 
 ### What the daemon's access log writes
 

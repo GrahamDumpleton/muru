@@ -123,6 +123,13 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert json.loads(raw)["status"] == 200
         output = muructl(runtime, "logs", "plain-wsgi", cwd=support.FIXTURES).stdout
         assert "muru.host[" in output and "is ready" in output
+
+        # The run's application need not be named (issue 375).
+
+        output = muructl(runtime, "logs", cwd=support.FIXTURES).stdout
+        assert "muru.host[" in output and "is ready" in output
+        wrong = muructl(runtime, "logs", "other", cwd=support.FIXTURES, check=False)
+        assert "no application other here" in wrong.stderr, wrong.stderr
         assert "no WebSockets open" in muructl(runtime, "websockets", cwd=support.FIXTURES).stdout
 
         # Logging levels and a restart go through the host as they do

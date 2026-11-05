@@ -512,7 +512,8 @@ impl Admin for Service {
         } else {
             if request.app.is_empty() {
                 return Err(Status::invalid_argument(
-                    "name an application, or ask for the access log",
+                    "name an application, or ask for the access log; only a development \
+                     run's application can be left out",
                 ));
             }
 

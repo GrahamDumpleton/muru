@@ -659,11 +659,8 @@ impl Admin for Service {
             return Ok(Response::new(self.lines("", "", first, live)));
         }
 
-        if request.app.is_empty() {
-            return Err(Status::invalid_argument(
-                "name an application, or ask for the access log",
-            ));
-        }
+        // A run serves one application, so none named is that one, as
+        // for the debug commands (issue 375).
 
         let release = state
             .target(&request.app, &request.release)
