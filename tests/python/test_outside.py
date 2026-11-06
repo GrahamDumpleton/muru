@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import textwrap
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from muru import _outside
+from muru import _asgi, _native, _outside
 
 REPORT = textwrap.dedent(
     """\
@@ -67,6 +68,23 @@ class Unwinder:
         return self.trace
 
 
+def fake_proc(tmp_path: Path, pid: int, process: bytes, threads: dict[int, bytes]) -> str:
+    """Write the `comm` files Linux shows for a process and its threads.
+
+    Returns the directory that stands for /proc.
+    """
+
+    proc = tmp_path / "proc"
+    (proc / str(pid)).mkdir(parents=True)
+    (proc / str(pid) / "comm").write_bytes(process + b"\n")
+
+    for tid, name in {pid: process, **threads}.items():
+        (proc / str(pid) / "task" / str(tid)).mkdir(parents=True)
+        (proc / str(pid) / "task" / str(tid) / "comm").write_bytes(name + b"\n")
+
+    return str(proc)
+
+
 def busy_in_summarise(tmp_path: Path) -> Any:
     """A thread in summarise's loop, called from build_report, innermost first."""
 
@@ -82,7 +100,8 @@ def test_a_profile_samples_on_after_a_failed_read(
     trace = busy_in_summarise(tmp_path)
     monkeypatch.setattr(_outside, "_unwinder", lambda pid: Unwinder([failure, failure], trace))
 
-    results = _outside.Reader().profile([1], 0.2, 0.01, {1: {"7": "muru-app-0"}})
+    reader = _outside.Reader(str(tmp_path / "proc"))
+    results = reader.profile([1], 0.2, 0.01, {1: {"7": "muru-app-0"}})
 
     # Each function is labelled by the line it starts on, as inside.
 
@@ -109,7 +128,7 @@ def test_stacks_are_read_again_after_a_failed_read(
     failure = RuntimeError("Failed to parse initial frame in chain")
     trace = busy_in_summarise(tmp_path)
     monkeypatch.setattr(_outside, "_unwinder", lambda pid: Unwinder([failure], trace))
-    reader = _outside.Reader()
+    reader = _outside.Reader(str(tmp_path / "proc"))
 
     threads = reader.stacks(1)
 
@@ -165,7 +184,8 @@ def test_threads_read_from_outside_are_named_and_given_their_requests() -> None:
     # thread serving a request and one running an ASGI request's
     # synchronous code by theirs.
 
-    result = _outside.stacks_result([(101, frames), (102, frames), (103, frames)], bookkeeping)
+    threads = [(101, frames, "muru-app-0"), (102, frames, None), (103, frames, None)]
+    result = _outside.stacks_result(threads, bookkeeping)
 
     assert [(thread["name"], thread["request"]) for thread in result["threads"]] == [
         ("muru-app-0", served),
@@ -175,5 +195,106 @@ def test_threads_read_from_outside_are_named_and_given_their_requests() -> None:
 
     # Elsewhere the identifier is Python's.
 
-    result = _outside.stacks_result([(12, frames)], {"active": [awaited], "names": {}})
+    result = _outside.stacks_result([(12, frames, None)], {"active": [awaited], "names": {}})
     assert result["threads"][0]["request"] == awaited
+
+
+def test_a_thread_the_runtime_does_not_name_is_named_by_the_operating_system() -> None:
+    frames = [{"file": "app.py", "line": 3, "function": "view"}]
+    bookkeeping = {"active": [], "names": {"101": "muru-app-billing-0"}}
+    threads = [(101, frames, "muru-app-billin"), (102, frames, "reporter"), (103, frames, None)]
+
+    # The runtime's name is whole where the operating system's is cut.
+
+    result = _outside.stacks_result(threads, bookkeeping)
+    assert [thread["name"] for thread in result["threads"]] == [
+        "muru-app-billing-0",
+        "reporter",
+        "thread-103",
+    ]
+
+
+def test_the_names_linux_holds_are_read_by_tid(tmp_path: Path) -> None:
+    threads = {
+        41: b"muru-loop",
+        42: b"python3.15",
+        43: b"abcdefghijklmn\xc3",
+        44: b"bad\xffbyte",
+        45: b"",
+    }
+    names = _outside.Names(40, fake_proc(tmp_path, 40, b"python3.15", threads))
+
+    # The main thread is the one whose TID is the pid. A thread with the
+    # process's name inherited it, a character cut in two by the 15-byte
+    # limit is dropped, and a thread that has ended has no name.
+
+    assert names.get(40) == "MainThread"
+    assert names.get(41) == "muru-loop"
+    assert names.get(42) is None
+    assert names.get(43) == "abcdefghijklmn"
+    assert names.get(44) == "bad\ufffdbyte"
+    assert names.get(45) is None
+    assert names.get(46) is None
+
+
+def test_stacks_carry_the_names_linux_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    report = tmp_path / "report.py"
+    report.write_text(REPORT)
+    frame = (str(report), 9, "summarise")
+    trace = [(40, [frame]), (41, [frame]), (42, [frame])]
+    monkeypatch.setattr(_outside, "_unwinder", lambda pid: Unwinder([], trace))
+    proc = fake_proc(tmp_path, 40, b"python3.15", {41: b"muru-loop"})
+
+    threads = _outside.Reader(proc).stacks(40)
+
+    assert [(ident, name) for ident, _frames, name in threads] == [
+        (40, "MainThread"),
+        (41, "muru-loop"),
+        (42, None),
+    ]
+
+
+def test_a_profile_names_threads_as_linux_does_asking_once_each(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    report = tmp_path / "report.py"
+    report.write_text(REPORT)
+    frames = [(str(report), 9, "summarise")]
+    trace = [(40, frames), (41, frames), (42, frames)]
+    monkeypatch.setattr(_outside, "_unwinder", lambda pid: Unwinder([], trace))
+    proc = fake_proc(tmp_path, 40, b"python3.15", {41: b"muru-loop", 42: b"muru-app-0"})
+    reads: list[str] = []
+    comm = _outside._comm
+
+    def counted(path: str) -> str | None:
+        reads.append(path)
+        return comm(path)
+
+    monkeypatch.setattr(_outside, "_comm", counted)
+
+    results = _outside.Reader(proc).profile([40], 0.1, 0.01, {40: {"42": "muru-app-0"}})
+
+    # The main thread, whose TID is the pid, is not sampled; the loop
+    # thread is named by Linux, read once over every round, and the
+    # thread the runtime names is not asked about.
+
+    stacks = results[40]["result"]["stacks"]
+    assert sorted(stack.split(";")[0] for stack in stacks) == ["muru-app-0", "muru-loop"]
+    assert results[40]["result"]["rounds"] > 1
+    assert sorted(path.split("/")[-2] for path in reads) == ["40", "41"]
+
+
+def test_the_loop_thread_tells_the_runtime_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    named: list[tuple[str, str]] = []
+
+    def name_thread(name: str) -> None:
+        named.append((name, threading.current_thread().name))
+
+    monkeypatch.setattr(_native, "name_thread", name_thread)
+    loop = _asgi.Loop(sync_threads=1)
+    loop.start()
+    loop.stop()
+
+    assert ("muru-loop", "muru-loop") in named

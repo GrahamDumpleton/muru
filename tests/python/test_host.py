@@ -346,7 +346,7 @@ def test_a_worker_that_does_not_answer_for_stacks_is_read_from_outside_on_3_14(
     frames = [{"file": "/srv/app.py", "line": 3, "function": "application"}]
     monkeypatch.setattr(_outside, "WHOLE", whole)
     instance.signal = lambda pid, signum: signals.append((pid, signum))  # type: ignore[method-assign]
-    instance.read_outside = lambda pid: [(7, frames)]  # type: ignore[method-assign]
+    instance.read_outside = lambda pid: [(7, frames, None)]  # type: ignore[method-assign]
     instance.send_to_supervisor = answers.append  # type: ignore[method-assign]
 
     pending = host.Pending(1, "stacks", {4321: 0})

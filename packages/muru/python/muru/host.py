@@ -2956,7 +2956,7 @@ class Host:
 
         self.finish_if_answered(pending)
 
-    def read_outside(self, pid: int) -> list[tuple[int, list[dict[str, Any]]]] | None:
+    def read_outside(self, pid: int) -> list[_outside.Thread] | None:
         """Read a worker's threads from outside, or return None.
 
         The first time reading is found impossible is logged.
