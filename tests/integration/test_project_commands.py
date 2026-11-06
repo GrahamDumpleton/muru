@@ -80,7 +80,13 @@ if __name__ == "__main__":
         os.kill(os.getpid(), signum)
 
     signal.signal(signal.SIGTERM, stopped)
-    Path("hold.pid").write_text(str(os.getpid()))
+
+    # The pid is written under another name and renamed into place, so
+    # the test, which waits for hold.pid to appear, never reads it half
+    # written.
+
+    Path("hold.pid.part").write_text(str(os.getpid()))
+    os.replace("hold.pid.part", "hold.pid")
     print("holding", flush=True)
     time.sleep(60)
 """
