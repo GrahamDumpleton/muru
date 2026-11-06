@@ -683,6 +683,9 @@ pub struct Underway(Arc<Mutex<Runs>>);
 struct Runs {
     /// Each command's stopper and the task that runs it to its end.
     runs: Vec<(Stopper, tokio::task::JoinHandle<()>)>,
+    /// The stoppers of the commands `stop_all` is stopping, for
+    /// `kill_all`.
+    stopping: Vec<Stopper>,
     /// Whether `stop_all` has been called, after which none is started.
     closed: bool,
 }
@@ -716,7 +719,9 @@ impl Underway {
         let mut runs = {
             let mut underway = self.0.lock().expect("commands under way poisoned");
             underway.closed = true;
-            std::mem::take(&mut underway.runs)
+            let runs = std::mem::take(&mut underway.runs);
+            underway.stopping = runs.iter().map(|(stopper, _)| stopper.clone()).collect();
+            runs
         };
 
         for (stopper, _) in &runs {
@@ -745,6 +750,21 @@ impl Underway {
             if !supervised.is_finished() {
                 let _ = tokio::time::timeout_at(killed_by, supervised).await;
             }
+        }
+    }
+
+    /// Kill the session of every command under way at once, those
+    /// `stop_all` is stopping included, whose wait then ends as they do.
+    pub fn kill_all(&self) {
+        let underway = self.0.lock().expect("commands under way poisoned");
+
+        for stopper in underway
+            .runs
+            .iter()
+            .map(|(stopper, _)| stopper)
+            .chain(&underway.stopping)
+        {
+            stopper.kill();
         }
     }
 }
@@ -1894,6 +1914,59 @@ mod tests {
 
         let refused = underway.run(prepared(&["true"], dir.path().join("r1.log")), recorded());
         assert!(refused.is_err());
+    }
+
+    #[tokio::test]
+    async fn killing_the_commands_under_way_cuts_the_shutdown_short() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let underway = Underway::default();
+        let mut output = underway
+            .run(
+                prepared(
+                    &[
+                        "sh",
+                        "-c",
+                        "trap '' TERM; echo started; while :; do sleep 0.1; done",
+                    ],
+                    dir.path().join("r1.log"),
+                ),
+                recorded(),
+            )
+            .expect("started");
+        assert_eq!(output.recv().await.expect("a line").line, "started");
+
+        // The shutdown would wait out the grace period for a command past
+        // SIGTERM; killing them all, as a second Ctrl-C does, ends it.
+
+        let stopping = {
+            let underway = underway.clone();
+
+            tokio::spawn(async move {
+                underway
+                    .stop_all(
+                        "muructl run shut down",
+                        tokio::time::Instant::now() + LONG_GRACE,
+                    )
+                    .await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        underway.kill_all();
+        tokio::time::timeout(ENDS_IN, stopping)
+            .await
+            .expect("the shutdown ended once the commands were killed")
+            .expect("the shutdown's task");
+
+        let messages = collect(output).await;
+        let last = messages.last().expect("a last message");
+        assert_eq!(last.exit_code, 128 + libc::SIGKILL, "{}", last.message);
+        assert!(
+            last.message
+                .starts_with("stopped because muructl run shut down; it was killed by signal 9"),
+            "{}",
+            last.message
+        );
     }
 
     #[tokio::test]

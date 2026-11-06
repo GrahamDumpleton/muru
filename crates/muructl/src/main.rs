@@ -3588,7 +3588,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         ),
     };
 
-    let stopping_commands = {
+    let mut stopping_commands = {
         let commands = commands.clone();
 
         tokio::spawn(async move {
@@ -3656,7 +3656,23 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // The lines of the last requests are written before the run exits, unless
     // the destination has stalled.
 
-    let _ = stopping_commands.await;
+    // In development, another Ctrl-C or SIGTERM, whether during the drain
+    // or while the commands are waited for, kills the commands still
+    // running rather than give them their grace period. muructl serve and
+    // a container's main process keep to their budget.
+
+    if serve.is_none() && !muru_controller::shutdown::is_main_process() {
+        loop {
+            tokio::select! {
+                _ = &mut stopping_commands => break,
+                _ = interrupt.recv() => commands.kill_all(),
+                _ = terminate.recv() => commands.kill_all(),
+            }
+        }
+    } else {
+        let _ = stopping_commands.await;
+    }
+
     let _ = tokio::task::spawn_blocking(move || written.flush(Duration::from_secs(2))).await;
     let _ = admin_stop_tx.send(());
 
