@@ -43,7 +43,7 @@ run = ['python', 'tasks.py', 'hold']
 exclusive = true
 
 [tool.muru.commands.slow]
-run = ['python', 'tasks.py', 'hold']
+run = ['python', 'tasks.py', 'hold', 'tidy']
 timeout = '1s'
 """
 
@@ -72,10 +72,15 @@ if __name__ == "__main__":
         print("to standard error", file=sys.stderr)
         sys.exit(int(sys.argv[3]))
 
-    # A stop is noted before the signal does what it would have done.
+    # A stop is noted before the signal does what it would have done, or,
+    # tidying up, before the command exits with 0.
 
     def stopped(signum, frame):
         Path("hold.stopped").write_text(signal.Signals(signum).name)
+
+        if "tidy" in sys.argv:
+            sys.exit(0)
+
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
@@ -223,7 +228,7 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert called.returncode == 4, called.stderr
     lines = [json.loads(line) for line in called.stdout.splitlines()]
     assert lines[0]["line"] == "report to out for report"
-    assert lines[-1]["finished"] and lines[-1]["exit_code"] == 4
+    assert lines[-1]["finished"] and lines[-1]["exit_code"] == 4 and not lines[-1]["ok"]
 
     # A one-off command gets the same interpreter and environment.
 
@@ -241,11 +246,12 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     assert one_off.stdout == f"{sys.executable} hello\n"
 
     # Its timeout stops it, and so does a signal that ends muructl: the
-    # command gets SIGTERM, and muructl exits once it has ended.
+    # command gets SIGTERM, and muructl exits once it has ended. A command
+    # that exits with 0 once stopped has not succeeded.
 
     slow = muructl(runtime, project, "command", "run", "slow", *python)
-    assert slow.returncode == 128 + signal.SIGTERM
-    assert "ran past its timeout of 1s" in slow.stderr
+    assert slow.returncode == 1
+    assert "ran past its timeout of 1s; it exited with status 0" in slow.stderr
     assert (project / "hold.stopped").read_text() == "SIGTERM"
     (project / "hold.pid").unlink()
     (project / "hold.stopped").unlink()

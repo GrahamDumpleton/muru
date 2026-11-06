@@ -508,8 +508,9 @@ fn finish(name: &str, arguments: &JsonObject, result: CallToolResult) -> CallToo
 const COMMAND_OUTPUT_LINES: usize = 500;
 
 /// A command's JSON lines as one result: its output, standard error lines
-/// marked, the last lines only when there are many, then how it ended.
-/// A refusal (`{"error": ...}`) is the error's sentence.
+/// marked, the last lines only when there are many, then how it ended, a
+/// tool error unless it succeeded. A refusal (`{"error": ...}`) is the
+/// error's sentence.
 fn command_result(printed: &str, stderr: &str) -> CallToolResult {
     let messages: Vec<Value> = printed
         .lines()
@@ -538,12 +539,13 @@ fn command_result(printed: &str, stderr: &str) -> CallToolResult {
         })
         .collect();
     let omitted = lines.len().saturating_sub(COMMAND_OUTPUT_LINES);
-    let exit_code = last["exit_code"].as_i64().unwrap_or(0);
+    let ok = last["ok"] == true;
 
     let mut answer = json!({
         "release": last["release"],
         "output": lines[omitted..],
-        "exit_code": exit_code,
+        "exit_code": last["exit_code"].as_i64().unwrap_or(0),
+        "ok": ok,
         "message": last["message"],
     });
 
@@ -555,7 +557,7 @@ fn command_result(printed: &str, stderr: &str) -> CallToolResult {
         serde_json::to_string_pretty(&answer).unwrap_or_default(),
     )];
 
-    if exit_code == 0 {
+    if ok {
         CallToolResult::success(text)
     } else {
         CallToolResult::error(text)
@@ -1297,7 +1299,7 @@ mod tests {
         let printed = [
             r#"{"release":"r1","line":"migrating","stderr":false,"finished":false}"#,
             r#"{"release":"r1","line":"warning","stderr":true,"finished":false}"#,
-            r#"{"release":"r1","line":"","stderr":false,"finished":true,"exit_code":2,"message":"exited with status 2 after 3s"}"#,
+            r#"{"release":"r1","line":"","stderr":false,"finished":true,"exit_code":2,"message":"exited with status 2 after 3s","ok":false}"#,
         ]
         .join("\n");
         let result = super::command_result(&printed, "");
@@ -1307,7 +1309,15 @@ mod tests {
         let answer: serde_json::Value = serde_json::from_str(text).expect("JSON");
         assert_eq!(answer["output"], json!(["migrating", "stderr: warning"]));
         assert_eq!(answer["exit_code"], 2);
+        assert_eq!(answer["ok"], false);
         assert_eq!(answer["release"], "r1");
+
+        // Success is what the command's end says, not its status alone.
+
+        let ran = r#"{"release":"r1","line":"","stderr":false,"finished":true,"exit_code":0,"message":"exited with status 0 after 1s","ok":true}"#;
+        assert_eq!(super::command_result(ran, "").is_error, Some(false));
+        let stopped = r#"{"release":"r1","line":"","stderr":false,"finished":true,"exit_code":0,"message":"stopped because it ran past its timeout of 1s; it exited with status 0 after 1s","ok":false}"#;
+        assert_eq!(super::command_result(stopped, "").is_error, Some(true));
 
         let refused = super::command_result("{\n  \"error\": \"shop needs the input who\"\n}", "");
         assert_eq!(refused.is_error, Some(true));

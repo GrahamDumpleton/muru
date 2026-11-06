@@ -944,6 +944,7 @@ message CommandOutput {
   bool finished = 4;                // the last message: the command has ended
   int32 exit_code = 5;              // on the last message: its exit status, 128 + the signal when killed
   string message = 6;               // on the last message: how it ended, as a sentence
+  bool ok = 7;                      // on the last message: it exited with 0 and was not stopped
 }
 
 message ReopenLogsRequest {

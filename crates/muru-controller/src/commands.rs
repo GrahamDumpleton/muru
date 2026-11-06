@@ -1080,6 +1080,7 @@ fn finished(prepared: &Prepared, ending: &Ending) -> pb::CommandOutput {
         finished: true,
         exit_code: ending.code,
         message: ending.message.clone(),
+        ok: ending.ok,
         ..Default::default()
     }
 }
@@ -1451,6 +1452,7 @@ mod tests {
         let last = messages.last().expect("a last message");
         assert!(last.finished);
         assert_eq!(last.exit_code, 2);
+        assert!(!last.ok);
         assert!(
             last.message.starts_with("exited with status 2 after"),
             "{}",
@@ -1471,8 +1473,35 @@ mod tests {
         let last = messages.last().expect("a last message");
         assert!(last.finished);
         assert_eq!(last.exit_code, 128 + libc::SIGTERM);
+        assert!(!last.ok);
         assert!(
             last.message.contains("ran past its timeout"),
+            "{}",
+            last.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_that_exits_with_0_once_stopped_has_not_succeeded() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let mut command = prepared(
+            &[
+                "sh",
+                "-c",
+                "trap 'exit 0' TERM; while :; do sleep 0.1; done",
+            ],
+            dir.path().join("r1.log"),
+        );
+        command.timeout = Some(Duration::from_millis(200));
+        let messages = collect(run(command, recorded()).expect("started").output).await;
+
+        let last = messages.last().expect("a last message");
+        assert_eq!(last.exit_code, 0);
+        assert!(!last.ok);
+        assert!(
+            last.message.starts_with(
+                "stopped because it ran past its timeout of 200ms; it exited with status 0"
+            ),
             "{}",
             last.message
         );
@@ -1711,6 +1740,7 @@ mod tests {
 
         let last = messages.last().expect("a last message");
         assert_eq!(last.exit_code, 0, "{}", last.message);
+        assert!(last.ok);
         assert!(messages.iter().any(|message| message.line == "done"));
     }
 

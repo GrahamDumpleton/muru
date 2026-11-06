@@ -100,8 +100,9 @@ directory and `deploy`'s settings, without the daemon.
 - After `apply`: the report's `errors` are empty and `changes` lists what
   happened; with `dry_run`, what would.
 
-- After `run_command`: `exit_code` is 0; otherwise `output` holds what the
-  command printed, standard error lines marked `stderr:`.
+- After `run_command`: `ok` is true; otherwise `message` says how the
+  command ended, a stop at its timeout included, and `output` holds what
+  it printed, standard error lines marked `stderr:`.
 
 ## Things to know
 

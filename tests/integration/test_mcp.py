@@ -249,6 +249,7 @@ def test_declared_commands_run_through_the_tools(daemon: Daemon, tmp_path: Path)
         assert not failed, text
         ran = json.loads(text)
         assert (ran["output"], ran["exit_code"], ran["release"]) == (["hello bob "], 0, "r1")
+        assert ran["ok"] is True, ran
 
         # A secret input given as a value is refused before anything runs.
 
@@ -261,6 +262,7 @@ def test_declared_commands_run_through_the_tools(daemon: Daemon, tmp_path: Path)
         assert failed, text
         ran = json.loads(text)
         assert ran["output"] == ["stderr: failing"] and ran["exit_code"] == 3, ran
+        assert ran["ok"] is False, ran
 
         failed, text = client.call("run_command", target="ops", name="greet")
         assert failed and "greet needs the input who" in text, text

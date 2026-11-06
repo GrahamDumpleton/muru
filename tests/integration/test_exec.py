@@ -75,6 +75,7 @@ def test_exec_exits_with_the_command_status(tmp_path: Path) -> None:
         assert messages[0]["line"] == "hi" and messages[0]["release"] == "r1", messages
         assert messages[-1]["finished"] is True, messages
         assert messages[-1]["exit_code"] == 0, messages
+        assert messages[-1]["ok"] is True, messages
 
         refused = daemon.muructl("exec", "nothing", "--", "true", check=False)
         assert refused.returncode != 0 and "nothing" in refused.stderr, refused.stderr

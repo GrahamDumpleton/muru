@@ -31,7 +31,7 @@ ones it names.
 | `drain` | changes | `muructl drain` | `release` |
 | `rollout` | changes | `muructl rollout canary`, `pause`, `resume`, `promote` or `abort` | `action`, `release` (canary), `app` (the others), `steps`, `hold` |
 | `scale` | changes | `muructl scale` | `target`, `group`, `processes`, `unpin` |
-| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code` and `message`, as a tool error when the exit status is not 0 | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
+| `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references) |
 | `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |

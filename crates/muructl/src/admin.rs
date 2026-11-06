@@ -6482,15 +6482,15 @@ async fn run_command(
     anyhow::bail!("the daemon stopped answering before the command ended")
 }
 
-/// Print a message of a command's stream, and give its exit status when
-/// it is the last.
+/// Print a message of a command's stream, and give muructl's exit status
+/// when it is the last.
 fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<i32>> {
     use std::io::Write as _;
 
     if json {
         println!("{}", serde_json::to_string(output)?);
     } else if output.finished {
-        if output.exit_code != 0 {
+        if !output.ok {
             eprintln!("muru: the command {}", output.message);
         }
     } else if output.stderr {
@@ -6501,10 +6501,20 @@ fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<
 
     if output.finished {
         std::io::stdout().flush()?;
-        return Ok(Some(output.exit_code));
+        return Ok(Some(exit_status(output)));
     }
 
     Ok(None)
+}
+
+/// muructl's exit status for how a command ended: the command's own, or
+/// 1 for a command that was stopped and exited with 0 all the same.
+fn exit_status(output: &pb::CommandOutput) -> i32 {
+    if !output.ok && output.exit_code == 0 {
+        1
+    } else {
+        output.exit_code
+    }
 }
 
 /// Run a command of the project here in this process (section 9.12):
@@ -6572,19 +6582,7 @@ async fn run_own(
                     anyhow::bail!("the command's end was not reported");
                 };
 
-                // The end is said even when the command exits with 0 once
-                // stopped, which show_output passes over as a success.
-
-                if message.finished && !json {
-                    use std::io::Write as _;
-
-                    std::io::stdout().flush()?;
-                    eprintln!("muru: the command {}", message.message);
-                } else {
-                    show_output(&message, json)?;
-                }
-
-                if message.finished {
+                if show_output(&message, json)?.is_some() {
                     return Ok(128 + signalled);
                 }
             }
@@ -6907,6 +6905,21 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 #[cfg(test)]
 mod tests {
     use super::metric_samples;
+
+    #[test]
+    fn muructl_exits_with_the_status_or_1_for_a_stopped_command_that_exited_with_0() {
+        let ending = |exit_code, ok| super::pb::CommandOutput {
+            finished: true,
+            exit_code,
+            ok,
+            ..Default::default()
+        };
+
+        assert_eq!(super::exit_status(&ending(0, true)), 0);
+        assert_eq!(super::exit_status(&ending(3, false)), 3);
+        assert_eq!(super::exit_status(&ending(143, false)), 143);
+        assert_eq!(super::exit_status(&ending(0, false)), 1);
+    }
 
     #[test]
     fn metric_samples_carry_names_types_labels_and_values() {
