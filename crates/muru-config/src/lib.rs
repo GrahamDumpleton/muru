@@ -1811,6 +1811,10 @@ pub struct Host {
     /// them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<ResponseHeaders>,
+    /// What the host's maintenance mode lets through (section 4.12),
+    /// while `muructl maintenance on --host` has it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
 }
 
 /// What a virtual host or a route does to the headers of a request

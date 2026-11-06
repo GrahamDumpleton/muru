@@ -81,7 +81,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
 | `logging` | table, {ref}`[app.NAME.release.ID.logging] <config-daemon-app-name-release-id-logging>` |  | How Python logging is set up in the workers. |
-| `maintenance` | table, {ref}`[app.NAME.release.ID.maintenance] <config-daemon-app-name-release-id-maintenance>` |  | What maintenance mode lets through. |
+| `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What maintenance mode lets through. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced, with jitter; off when absent. |
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The memory policy for the workers. |
@@ -215,18 +215,6 @@ The `[logging.python]` table: what loggers without handlers of their own do, set
 | `format` | string | `standard`; `json` under `muructl serve --log-format json` | The format of the platform handler: standard, json, or a logging format string. |
 | `level` | string | `"WARNING"` | The root logger's level. `DEBUG`: Everything. `INFO`: Informational messages and above. `WARNING`: Python's default: warnings and above. `ERROR`: Errors and above. `CRITICAL`: Only critical messages. |
 | `loggers` | table of strings |  | Levels for named loggers. |
-
-(config-daemon-app-name-release-id-maintenance)=
-## `[app.NAME.release.ID.maintenance]`
-
-What maintenance mode lets through, the `maintenance` table of a release.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `bypass_cookie` | string |  | A `name=value` cookie that lets a client through. |
-| `exempt_addresses` | array of strings |  | Client addresses, or ranges in CIDR form, served as usual. |
-| `exempt_paths` | array of strings |  | Path prefixes served as usual while the application is in maintenance. |
-| `retry_after` | string | `"60s"` | The `Retry-After` the maintenance page carries, for example 5m. |
 
 (config-daemon-app-name-release-id-memory)=
 ## `[app.NAME.release.ID.memory]`
@@ -498,6 +486,7 @@ A virtual host, the `[host.NAME]` table.
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
 | `https_redirect` | boolean | `false` | Redirect plain HTTP requests to HTTPS. |
 | `listeners` | array of strings |  | The listener addresses it answers on; every listener when empty. |
+| `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What the host's maintenance mode lets through, while `muructl maintenance on --host` has it on. |
 | `max_body_size` | string | `max_body_size` in `[limits]` | The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it. |
 | `names` | array of strings |  | The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot. |
 | `rate_limits` | array of strings |  | The `[rate_limit.NAME]` tables applied to every request for the host, before a route's. |
@@ -507,6 +496,20 @@ A virtual host, the `[host.NAME]` table.
 | `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of a request for the host's routes, each replacing the daemon's `[limits]` value. A route's own replace them. |
 | `tls` | table, {ref}`[host.NAME.tls] <config-daemon-host-name-tls>` |  | Its certificate and key, for TLS listeners. |
 | `use_canonical_name` | boolean | `false` | Give the application the canonical name as SERVER_NAME rather than the name matched. |
+
+(config-daemon-host-name-maintenance)=
+## `[host.NAME.maintenance]`
+
+What maintenance mode lets through, the `maintenance` table of a release.
+
+The same keys apply at `[app.NAME.release.ID.maintenance]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bypass_cookie` | string |  | A `name=value` cookie that lets a client through. |
+| `exempt_addresses` | array of strings |  | Client addresses, or ranges in CIDR form, served as usual. |
+| `exempt_paths` | array of strings |  | Path prefixes served as usual while the application is in maintenance. |
+| `retry_after` | string | `"60s"` | The `Retry-After` the maintenance page carries, for example 5m. |
 
 (config-daemon-host-name-request-headers)=
 ## `[host.NAME.request_headers]`

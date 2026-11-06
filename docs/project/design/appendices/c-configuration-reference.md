@@ -87,7 +87,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | name | route | none | 9.10 |
 | methods (deny, answer), mode | route | none, read_only, none | 4.15 |
 | error_pages, error_override | global, host, application (release), route | built-in, off | 4.12 |
-| maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release | none, none, none, 60s | 4.12 |
+| maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release, host | none, none, none, 60s | 4.12 |
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |
 | names, listeners, tls, canonical, https_redirect, use_canonical_name, canonical_redirect | host | none, all, none, none, false, false, false | 4.3 |
 | access_log, slow, access_log_exclude | `[logs]`, host, application | on, 1s, none | 11.2 |

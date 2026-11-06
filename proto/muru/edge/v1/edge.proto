@@ -319,6 +319,7 @@ message Host {
   CompressionChoice compression = 16;   // section 4.17: the host's own compression settings; none when absent
   HeaderRules request_headers = 17;     // section 4.7: applied to the host's requests before anything serves them
   HeaderRules response_headers = 18;    // applied to every response to the host's requests
+  Maintenance maintenance = 19;         // section 4.12: the host's maintenance mode and its exemptions; off when absent
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or

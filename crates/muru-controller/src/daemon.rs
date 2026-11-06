@@ -284,6 +284,16 @@ pub enum Command {
         /// Answered with when maintenance began, or none when it is off.
         done: oneshot::Sender<Result<Option<u64>, String>>,
     },
+    /// Section 4.12: serve the maintenance page for every route of a
+    /// virtual host, or serve the host as usual again.
+    SetHostMaintenance {
+        /// The virtual host.
+        host: String,
+        /// On or off.
+        on: bool,
+        /// Answered with when maintenance began, or none when it is off.
+        done: oneshot::Sender<Result<Option<u64>, String>>,
+    },
     /// Blue/green (section 9.2): move all of an application's traffic to a
     /// release now and drain the one that served.
     PromoteRelease {
@@ -904,6 +914,9 @@ struct Daemon {
     /// The applications in maintenance mode (section 4.12), with when
     /// each was put there.
     maintenance: HashMap<String, u64>,
+    /// The virtual hosts in maintenance mode (section 4.12), with when
+    /// each was turned on.
+    host_maintenance: HashMap<String, u64>,
     /// Section 9.10: the overlays in the warm-up lead before a window,
     /// with the release each keeps running meanwhile.
     warm_ups: BTreeMap<String, Option<(String, String)>>,
@@ -1281,6 +1294,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         clients,
         enforcement: crate::clients::Enforcement::default(),
         maintenance: HashMap::new(),
+        host_maintenance: HashMap::new(),
         warm_ups: BTreeMap::new(),
         clock: (None, false),
         secrets: settings.secrets.clone(),
@@ -2346,6 +2360,11 @@ impl Daemon {
             .unwrap_or_default()
             .into_iter()
             .map(|(name, host)| HostRow {
+                maintenance_since: self
+                    .host_maintenance
+                    .get(&name)
+                    .map(|since| clock_hms(*since))
+                    .unwrap_or_default(),
                 name,
                 names: host.names,
                 listeners: host.listeners,
@@ -3564,6 +3583,12 @@ impl Daemon {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        self.host_maintenance = self
+            .store
+            .host_maintenance()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         let apps = match self.store.apps() {
             Ok(apps) => apps,
@@ -3878,6 +3903,9 @@ impl Daemon {
             }
             Command::SetMaintenance { app, on, done } => {
                 let _ = done.send(self.set_maintenance(&app, on).await);
+            }
+            Command::SetHostMaintenance { host, on, done } => {
+                let _ = done.send(self.set_host_maintenance(&host, on).await);
             }
             Command::OverrideAccessLog {
                 change,
@@ -5294,7 +5322,17 @@ impl Daemon {
                 .filter(|choice| !choice.is_empty())
                 .map(|choice| choice.choice().to_message());
 
+            // Section 4.12: the host's maintenance mode, with its
+            // exemptions. A host removed since it was turned on is no
+            // longer in it.
+
+            let maintenance = self
+                .host_maintenance
+                .contains_key(&name)
+                .then(|| maintenance_message(true, host.maintenance.as_ref()));
+
             hosts.push(pb::Host {
+                maintenance,
                 name,
                 limits,
                 access_log,
@@ -7253,6 +7291,58 @@ impl Daemon {
 
         self.push_snapshot().await?;
         Ok(self.maintenance.get(app).copied())
+    }
+
+    /// Section 4.12: put a virtual host into maintenance mode or take it
+    /// out, recorded so a daemon restart keeps it, announced as an event,
+    /// and pushed to the edge.
+    async fn set_host_maintenance(&mut self, host: &str, on: bool) -> Result<Option<u64>, String> {
+        let known = self
+            .store
+            .hosts()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|(name, _)| name == host);
+
+        if !known {
+            return Err(format!("no virtual host named {host}"));
+        }
+
+        let was = self.host_maintenance.get(host).copied();
+        let subject = format!("host {host}");
+
+        match (on, was) {
+            (true, Some(since)) => return Ok(Some(since)),
+            (false, None) => return Ok(None),
+            (true, None) => {
+                let since = crate::model::now_unix_ms();
+                self.store
+                    .set_host_maintenance(host, Some(since))
+                    .map_err(|error| error.to_string())?;
+                self.host_maintenance.insert(host.to_owned(), since);
+                self.events.emit(
+                    "maintenance.changed",
+                    &subject,
+                    "notice",
+                    "maintenance on: the edge serves the maintenance page for every route of the host",
+                );
+            }
+            (false, Some(_)) => {
+                self.store
+                    .set_host_maintenance(host, None)
+                    .map_err(|error| error.to_string())?;
+                self.host_maintenance.remove(host);
+                self.events.emit(
+                    "maintenance.changed",
+                    &subject,
+                    "notice",
+                    "maintenance off: the host serves again",
+                );
+            }
+        }
+
+        self.push_snapshot().await?;
+        Ok(self.host_maintenance.get(host).copied())
     }
 
     /// Section 11.2: put a change to the access log in force, or put the

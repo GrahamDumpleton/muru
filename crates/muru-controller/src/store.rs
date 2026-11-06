@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS maintenance (
     app TEXT PRIMARY KEY,
     since_unix_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS host_maintenance (
+    host TEXT PRIMARY KEY,
+    since_unix_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS upstreams (
     name TEXT PRIMARY KEY,
     spec TEXT NOT NULL,
@@ -137,7 +141,7 @@ CREATE TABLE IF NOT EXISTS command_runs (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// The store.
 pub struct Store {
@@ -164,9 +168,10 @@ impl Store {
         // 9.10), version 8 the client classes and rate limits of applied
         // files (sections 4.14 and 4.15), version 9 the application's
         // priority (section 7.4), added to an older table here, version
-        // 10 the last run of each command (section 9.12), and version 11
-        // the application's own access log choice (section 11.2), added
-        // to an older table here.
+        // 10 the last run of each command (section 9.12), version 11 the
+        // application's own access log choice (section 11.2), added to
+        // an older table here, and version 12 the virtual hosts in
+        // maintenance mode (section 4.12).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -457,6 +462,44 @@ impl Store {
         })
     }
 
+    /// Section 4.12: the virtual hosts in maintenance mode, each with
+    /// when it was turned on.
+    pub fn host_maintenance(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT host, since_unix_ms FROM host_maintenance ORDER BY host")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Put a virtual host into maintenance mode, or take it out.
+    pub fn set_host_maintenance(
+        &self,
+        host: &str,
+        since_unix_ms: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            match since_unix_ms {
+                Some(since) => {
+                    connection.execute(
+                        "INSERT INTO host_maintenance (host, since_unix_ms) VALUES (?1, ?2) \
+                         ON CONFLICT(host) DO NOTHING",
+                        params![host, since as i64],
+                    )?;
+                }
+                None => {
+                    connection.execute("DELETE FROM host_maintenance WHERE host = ?1", [host])?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     /// Every virtual host, by name, with its definition.
     pub fn hosts(&self) -> Result<Vec<(String, VirtualHost)>, StoreError> {
         self.with(|connection| {
@@ -494,6 +537,7 @@ impl Store {
     pub fn delete_host(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| {
             connection.execute("DELETE FROM routes WHERE host = ?1", [name])?;
+            connection.execute("DELETE FROM host_maintenance WHERE host = ?1", [name])?;
             connection.execute("DELETE FROM hosts WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -1268,6 +1312,27 @@ mod tests {
         store.delete_app("shop").unwrap();
         assert!(store.command_runs("shop").unwrap().is_empty());
         assert_eq!(store.command_runs("blog").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hosts_in_maintenance_are_kept_until_turned_off_or_removed() {
+        let store = Store::in_memory().unwrap();
+        store.put_host("shop", &VirtualHost::default()).unwrap();
+        store.put_host("blog", &VirtualHost::default()).unwrap();
+        assert!(store.host_maintenance().unwrap().is_empty());
+
+        store.set_host_maintenance("shop", Some(1000)).unwrap();
+        store.set_host_maintenance("shop", Some(2000)).unwrap();
+        store.set_host_maintenance("blog", Some(3000)).unwrap();
+        assert_eq!(
+            store.host_maintenance().unwrap(),
+            [("blog".to_owned(), 3000), ("shop".to_owned(), 1000)],
+            "turning it on again keeps when it began"
+        );
+
+        store.set_host_maintenance("blog", None).unwrap();
+        store.delete_host("shop").unwrap();
+        assert!(store.host_maintenance().unwrap().is_empty());
     }
 
     #[test]

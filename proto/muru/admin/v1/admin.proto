@@ -455,14 +455,16 @@ message DashboardLoginLink {
 }
 
 message SetMaintenanceRequest {
-  string app = 1;
+  string app = 1;                   // the application, or empty with host
   bool on = 2;
+  string host = 3;                  // the virtual host instead of an application
 }
 
 message MaintenanceStatus {
-  string app = 1;
+  string app = 1;                   // the application, or empty for a virtual host
   bool on = 2;
   uint64 since_unix_ms = 3;         // when it was turned on, 0 when off
+  string host = 4;                  // the virtual host, or empty for an application
 }
 
 message OverrideAccessLogRequest {
@@ -778,6 +780,7 @@ message Host {
   string compression = 14;            // "off" when the host turns compression off, "set" when it has other settings of its own (section 4.17)
   string request_headers = 15;        // what the host removes from and sets on requests (section 4.7), as one phrase
   string response_headers = 16;       // what the host removes from, sets on and adds to responses, as one phrase
+  bool maintenance = 17;              // the edge serves the maintenance page for the host (section 4.12)
 }
 
 message ListRoutesRequest {}

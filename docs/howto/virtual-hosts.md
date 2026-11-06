@@ -158,6 +158,7 @@ timeouts = { request_deadline = "120s" }
 | `request_headers`, `response_headers` | the [headers](headers.md) removed, set and added | are applied after them |
 | `error_pages`, `error_override` | the [error pages](error-pages.md) | is consulted first |
 | `rate_limits` | the [rate limits](client-classes.md) every request draws from | are drawn from as well |
+| `maintenance` | what the host's [maintenance mode](error-pages.md#a-whole-virtual-host) lets through | |
 
 Here every request for `api.example.com` may carry 1MB and take 30
 seconds, except under `/import`, where the route allows 200MB and 120

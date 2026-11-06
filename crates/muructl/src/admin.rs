@@ -4227,11 +4227,17 @@ async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
 /// The `muructl maintenance` subcommands (section 4.12).
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
-    /// Serve the application's maintenance page at the edge: 503
-    /// maintenance, except for what its exemptions let through.
+    /// Serve the maintenance page at the edge for an application, or
+    /// with --host for every route of a virtual host: 503 maintenance,
+    /// except for what its exemptions let through.
     On {
         /// The application.
-        app: String,
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        app: Option<String>,
+
+        /// The virtual host, instead of an application.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4240,10 +4246,16 @@ pub enum MaintenanceCommand {
         output: JsonArgs,
     },
 
-    /// Serve the application as usual again.
+    /// Serve the application, or with --host the virtual host, as usual
+    /// again.
     Off {
         /// The application.
-        app: String,
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        app: Option<String>,
+
+        /// The virtual host, instead of an application.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
 
         #[command(flatten)]
         socket: SocketArgs,
@@ -4255,28 +4267,47 @@ pub enum MaintenanceCommand {
 
 /// Turn maintenance mode on or off.
 pub async fn maintenance(command: MaintenanceCommand) -> anyhow::Result<()> {
-    let (app, on, socket, json) = match command {
+    let (app, host, on, socket, json) = match command {
         MaintenanceCommand::On {
             app,
+            host,
             socket,
             output,
-        } => (app, true, socket, output.json),
+        } => (app, host, true, socket, output.json),
         MaintenanceCommand::Off {
             app,
+            host,
             socket,
             output,
-        } => (app, false, socket, output.json),
+        } => (app, host, false, socket, output.json),
     };
 
     let mut client = client::connect(&socket.socket()?).await?;
     let status = client
-        .set_maintenance(pb::SetMaintenanceRequest { app, on })
+        .set_maintenance(pb::SetMaintenanceRequest {
+            app: app.unwrap_or_default(),
+            host: host.unwrap_or_default(),
+            on,
+        })
         .await
         .map_err(explain)?
         .into_inner();
 
     if json {
         return print_answer(&status);
+    }
+
+    if !status.host.is_empty() {
+        if status.on {
+            println!(
+                "muru: host {} is in maintenance: clients get 503 maintenance until `muructl maintenance off --host {}`",
+                status.host, status.host
+            );
+        } else {
+            println!("muru: host {} serves as usual again", status.host);
+        }
+
+        return Ok(());
     }
 
     if status.on {
@@ -4403,6 +4434,12 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             } else {
                 " (default)"
             });
+        }
+
+        // Section 4.12: the edge serves the host's maintenance page.
+
+        if host.maintenance {
+            names.push_str(" [maintenance]");
         }
 
         // Sections 4.3, 4.6 and 11.2: what the host sets for its routes.

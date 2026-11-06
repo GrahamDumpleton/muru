@@ -225,15 +225,41 @@ impl Admin for Service {
         request: Request<pb::SetMaintenanceRequest>,
     ) -> Result<Response<pb::MaintenanceStatus>, Status> {
         let request = request.into_inner();
-        self.handle.store.app(&request.app).map_err(not_found)?;
         let (done_tx, done_rx) = oneshot::channel();
-        self.handle
-            .commands
-            .send(Command::SetMaintenance {
+
+        // Section 4.12: a virtual host, or an application.
+
+        let command = if request.host.is_empty() {
+            self.handle.store.app(&request.app).map_err(not_found)?;
+            Command::SetMaintenance {
                 app: request.app.clone(),
                 on: request.on,
                 done: done_tx,
-            })
+            }
+        } else if !request.app.is_empty() {
+            return Err(Status::invalid_argument(
+                "maintenance is for an application or a virtual host, not both",
+            ));
+        } else {
+            let hosts = self.handle.store.hosts().map_err(internal)?;
+
+            if !hosts.iter().any(|(name, _)| *name == request.host) {
+                return Err(Status::not_found(format!(
+                    "no virtual host named {}",
+                    request.host
+                )));
+            }
+
+            Command::SetHostMaintenance {
+                host: request.host.clone(),
+                on: request.on,
+                done: done_tx,
+            }
+        };
+
+        self.handle
+            .commands
+            .send(command)
             .await
             .map_err(|_| Status::unavailable(STOPPING))?;
         let since = done_rx
@@ -242,6 +268,7 @@ impl Admin for Service {
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(pb::MaintenanceStatus {
             app: request.app,
+            host: request.host,
             on: since.is_some(),
             since_unix_ms: since.unwrap_or(0),
         }))
@@ -1295,10 +1322,12 @@ impl Admin for Service {
         _: Request<pb::ListHostsRequest>,
     ) -> Result<Response<pb::ListHostsResponse>, Status> {
         let hosts = self.handle.store.hosts().map_err(internal)?;
+        let maintenance = self.handle.store.host_maintenance().map_err(internal)?;
         Ok(Response::new(pb::ListHostsResponse {
             hosts: hosts
                 .into_iter()
                 .map(|(name, host)| pb::Host {
+                    maintenance: maintenance.iter().any(|(host, _)| *host == name),
                     name,
                     names: host.names,
                     listeners: host.listeners,

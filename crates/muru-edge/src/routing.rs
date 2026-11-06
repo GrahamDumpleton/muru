@@ -51,6 +51,8 @@ pub struct Host {
     pub request_headers: Option<Arc<crate::headers::Rules>>,
     /// The host's rules for response headers.
     pub response_headers: Option<Arc<crate::headers::Rules>>,
+    /// The host's maintenance mode (section 4.12), when it is on.
+    pub maintenance: Option<Arc<Maintenance>>,
     /// The name requests for the host's other names are redirected to,
     /// when the host redirects them.
     pub canonical: Option<String>,
@@ -1195,6 +1197,12 @@ pub enum Decision {
         /// To this name.
         canonical: Option<String>,
     },
+    /// The host is in maintenance mode (section 4.12) and the request is
+    /// not one its exemptions let through (503).
+    Maintenance {
+        /// The Retry-After the page carries, in seconds.
+        retry_after: u32,
+    },
     /// No virtual host answers to that name on this listener (421).
     Misdirected,
     /// The host has no route for the path (404).
@@ -1590,6 +1598,14 @@ impl Routing {
                     .map(Arc::new),
                 canonical: (host.canonical_redirect && !host.canonical.is_empty())
                     .then(|| normalise(&host.canonical)),
+                maintenance: host
+                    .maintenance
+                    .as_ref()
+                    .map(Maintenance::from_message)
+                    .transpose()
+                    .map_err(|error| anyhow::anyhow!("host {}: {error}", host.name))?
+                    .flatten()
+                    .map(Arc::new),
                 request_headers: crate::headers::rules_of(host.request_headers.as_ref()).map_err(
                     |error| anyhow::anyhow!("host {}: request_headers: {error}", host.name),
                 )?,
@@ -2047,6 +2063,18 @@ impl Routing {
             if https || canonical.is_some() {
                 return Decision::Redirect { https, canonical };
             }
+
+            // Section 4.12: a host in maintenance answers 503 for every
+            // route it has, whatever serves it, except for what its
+            // exemptions let through.
+
+            if let Some(maintenance) = &host.maintenance
+                && !maintenance.exempts(path, client.peer, client.headers)
+            {
+                return Decision::Maintenance {
+                    retry_after: maintenance.retry_after,
+                };
+            }
         }
 
         let Some(route) = self.routes[index]
@@ -2484,6 +2512,7 @@ mod tests {
         match decision {
             Decision::Serve { server_name, .. } => server_name,
             Decision::Redirect { .. } => Some("redirect".to_owned()),
+            Decision::Maintenance { .. } => Some("maintenance".to_owned()),
             Decision::Misdirected => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
             Decision::InternalOnly => Some("internal".to_owned()),

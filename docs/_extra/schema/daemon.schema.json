@@ -1002,6 +1002,10 @@
           },
           "type": "array"
         },
+        "maintenance": {
+          "$ref": "#/$defs/Maintenance",
+          "description": "What the host's maintenance mode lets through, while `muructl maintenance on --host` has it on."
+        },
         "max_body_size": {
           "description": "The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it.",
           "type": "string",

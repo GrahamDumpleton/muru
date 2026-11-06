@@ -1029,20 +1029,24 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "maintenance",
-            description: "Serve an application's maintenance page at the edge (on), or serve it as usual again (off).",
+            description: "Serve the maintenance page at the edge for an application, or for every route of a virtual host (on), or serve it as usual again (off). Give app or host.",
             changes: true,
             properties: json!({
                 "app": {"type": "string"},
+                "host": {"type": "string", "description": "A virtual host, instead of an application"},
                 "on": {"type": "boolean"},
             }),
-            required: &["app", "on"],
+            required: &["on"],
             command: |arguments| {
                 let state = if flag(arguments, "on") { "on" } else { "off" };
-                Ok([
-                    words(&["maintenance", state]),
-                    vec![needed(arguments, "app")?],
-                ]
-                .concat())
+
+                let target = match (text(arguments, "app"), text(arguments, "host")) {
+                    (Some(app), None) => vec![app],
+                    (None, Some(host)) => vec!["--host".to_owned(), host],
+                    _ => return Err("give one of app and host".to_owned()),
+                };
+
+                Ok([words(&["maintenance", state]), target].concat())
             },
         },
         Spec {

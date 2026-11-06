@@ -405,3 +405,82 @@ routes.shop-info = { response_headers = { set = { X-Locked = "yes" } } }
         refused = apply(daemon, broken)
         assert refused.returncode != 0, table
         assert expected in refused.stdout + refused.stderr, refused.stdout + refused.stderr
+
+
+def test_a_host_in_maintenance_answers_503_for_every_route(daemon: Daemon, tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "page.html").write_text("<p>a file</p>")
+    (tmp_path / "down.html").write_text("<p>back soon</p>")
+    config = tmp_path / "hosts.toml"
+    config.write_text(
+        ECHO
+        + f"""[host.shop]
+names = ["shop.test"]
+maintenance = {{ exempt_paths = ["/info"], bypass_cookie = "bypass=yes", retry_after = "90s" }}
+error_pages = {{ "503:maintenance" = {{ file = "{tmp_path / "down.html"}" }} }}
+
+[host.other]
+names = ["other.test"]
+
+[[route]]
+host = "shop"
+app = "echo"
+
+[[route]]
+host = "shop"
+path = "/files"
+static = "{files}"
+
+[[route]]
+host = "other"
+app = "echo"
+"""
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    daemon.wait_for_routing("echo")
+    assert daemon.request("/files/page.html", host="shop.test").status == 200
+
+    switched = daemon.muructl("maintenance", "on", "--host", "shop").stdout
+    assert "host shop is in maintenance" in switched, switched
+
+    # Every route of the host answers 503 maintenance with the host's
+    # page, the static route included, and a path with no route too.
+
+    for path in ["/", "/files/page.html", "/text"]:
+        response = daemon.request(path, host="shop.test")
+        assert response.status == 503, path
+        headers = {name.lower(): value for name, value in response.headers}
+        assert headers["retry-after"] == "90"
+        assert response.body == b"<p>back soon</p>", response.body
+
+    # What the host's exemptions let through is served, and so is every
+    # other host, the same application included.
+
+    assert daemon.request("/info", host="shop.test").status == 200
+    cookie = {"Cookie": "bypass=yes"}
+    assert daemon.request("/files/page.html", host="shop.test", headers=cookie).status == 200
+    assert daemon.request("/", host="other.test").status == 200
+
+    assert "[maintenance]" in daemon.muructl("host", "list").stdout
+    listed = json.loads(daemon.muructl("host", "list", "--json").stdout)["hosts"]
+    assert {host["name"]: host.get("maintenance", False) for host in listed} == {
+        "other": False,
+        "shop": True,
+    }
+    assert any(
+        "maintenance.changed" in line and "host shop" in line and "maintenance on" in line
+        for line in daemon.muructl("events").stdout.splitlines()
+    )
+
+    # It is off again when told, and the names are checked.
+
+    assert "host shop serves as usual again" in (
+        daemon.muructl("maintenance", "off", "--host", "shop").stdout
+    )
+    assert daemon.request("/", host="shop.test").status == 200
+    unknown = daemon.muructl("maintenance", "on", "--host", "nowhere", check=False)
+    assert unknown.returncode != 0 and "no virtual host named nowhere" in unknown.stderr
+    both = daemon.muructl("maintenance", "on", "echo", "--host", "shop", check=False)
+    assert both.returncode != 0

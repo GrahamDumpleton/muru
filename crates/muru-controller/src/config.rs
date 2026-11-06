@@ -925,6 +925,15 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        // Section 4.12: what the host's maintenance mode lets through.
+
+        if let Some(table) = &host.maintenance
+            && let Err(error) = muru_config::check_maintenance(table)
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
         // Section 4.7: the host's rules for request and response
         // headers.
 

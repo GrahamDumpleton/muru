@@ -1692,6 +1692,15 @@ async fn serve<I>(
                             canonical.as_deref(),
                         ))
                     }
+                    (None, routing::Decision::Maintenance { retry_after }) => {
+                        let mut problem = errors::Problem::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "maintenance",
+                            "The site is down for maintenance.",
+                        );
+                        problem.retry_after = Some(retry_after);
+                        link::Handled::Response(link::reject(&parts, &context, problem))
+                    }
                     (None, routing::Decision::Misdirected) => {
                         link::Handled::Response(link::reject(
                             &parts,
