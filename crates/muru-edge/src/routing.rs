@@ -254,6 +254,9 @@ pub struct GroupSockets {
     pub methods: Vec<String>,
     /// Its workers.
     pub sockets: Vec<std::path::PathBuf>,
+    /// The group's own limits on a request (section 4.6), over its
+    /// release's.
+    pub limits: crate::RequestLimits,
 }
 
 /// A named mount of a release, as a snapshot or a development run names it.
@@ -274,6 +277,9 @@ pub struct MountPath {
     pub cgi_local_redirect: bool,
     /// The file hints by path the mount may give (section 4.9).
     pub sendfile: Arc<Sendfile>,
+    /// The mount's own limits on a request (section 4.6), over its
+    /// group's and its release's.
+    pub limits: crate::RequestLimits,
 }
 
 /// A directory of a release's own files (section 4.9), served under a
@@ -318,6 +324,9 @@ pub struct Selection {
     /// The origins that may call the release through gRPC-Web (section
     /// 6.13).
     pub grpc_web: Arc<crate::grpc::WebOrigins>,
+    /// The limits on a request of what serves it (section 4.6): the
+    /// mount's over the worker group's over the release's.
+    pub limits: crate::RequestLimits,
 }
 
 /// What a request brings to the release choice (section 9.4): its
@@ -560,6 +569,7 @@ fn upstream_selection(upstream: &Arc<Upstream>) -> Selection {
         upstream: Some(Arc::clone(upstream)),
         grpc_web: Arc::default(),
         static_path: None,
+        limits: crate::RequestLimits::default(),
     }
 }
 
@@ -689,6 +699,10 @@ pub struct AppPools {
     server: Option<Arc<Upstream>>,
     /// Section 6.13: the origins that may call it through gRPC-Web.
     grpc_web: Arc<crate::grpc::WebOrigins>,
+    /// The release's own limits on a request (section 4.6), which the
+    /// default group's requests have and a named group's or a mount's own
+    /// are laid over.
+    limits: crate::RequestLimits,
 }
 
 /// A path that selects a worker group (section 7.1).
@@ -705,6 +719,8 @@ struct GroupPath {
     name: String,
     /// Its workers.
     pool: Arc<LinkPool>,
+    /// The group's own limits on a request (section 4.6).
+    limits: crate::RequestLimits,
 }
 
 impl GroupPath {
@@ -800,6 +816,7 @@ impl AppPools {
                     methods: group.methods.clone(),
                     name: group.name.clone(),
                     pool: Arc::clone(&pool),
+                    limits: group.limits,
                 });
             }
         }
@@ -829,6 +846,7 @@ impl AppPools {
                 accel_redirect: mount.accel_redirect,
                 cgi_local_redirect: mount.cgi_local_redirect,
                 sendfile: Arc::clone(&mount.sendfile),
+                limits: mount.limits,
             })
             .collect();
         mounts.sort_by_key(|mount| std::cmp::Reverse(mount.path.len()));
@@ -846,6 +864,7 @@ impl AppPools {
             maintenance: None,
             server: None,
             grpc_web: Arc::default(),
+            limits: crate::RequestLimits::default(),
         })
     }
 
@@ -864,6 +883,7 @@ impl AppPools {
             maintenance: None,
             server: None,
             grpc_web: Arc::default(),
+            limits: crate::RequestLimits::default(),
         }
     }
 
@@ -908,6 +928,22 @@ impl AppPools {
         self
     }
 
+    /// The same pools with the release's own limits on a request
+    /// (section 4.6).
+    pub fn with_limits(mut self, limits: crate::RequestLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The request deadlines the release and its groups set, for the
+    /// longest in force.
+    fn deadlines(&self) -> impl Iterator<Item = std::time::Duration> + '_ {
+        std::iter::once(self.limits)
+            .chain(self.groups.iter().map(|group| group.limits))
+            .chain(self.mounts.iter().map(|mount| mount.limits))
+            .filter_map(|limits| limits.request_deadline)
+    }
+
     /// The same pools in maintenance mode, or out of it.
     pub fn with_maintenance(mut self, maintenance: Option<Arc<Maintenance>>) -> Self {
         self.maintenance = maintenance;
@@ -942,18 +978,25 @@ impl AppPools {
                 upstream: Some(Arc::clone(server)),
                 grpc_web: Arc::default(),
                 static_path: None,
+                limits: self.limits,
             });
         }
 
         let carried = client.host.map(normalise);
-        let (group, pool) = self
+        let (group, pool, group_limits) = self
             .groups
             .iter()
             .find(|group| {
                 prefix_matches(&group.prefix, path) && group.takes(client, carried.as_deref())
             })
-            .map(|group| (group.name.clone(), Arc::clone(&group.pool)))
-            .unwrap_or_else(|| (DEFAULT_GROUP.to_owned(), Arc::clone(&self.default)));
+            .map(|group| (group.name.clone(), Arc::clone(&group.pool), group.limits))
+            .unwrap_or_else(|| {
+                (
+                    DEFAULT_GROUP.to_owned(),
+                    Arc::clone(&self.default),
+                    crate::RequestLimits::default(),
+                )
+            });
         let mount = self
             .mounts
             .iter()
@@ -1003,6 +1046,10 @@ impl AppPools {
             upstream: None,
             grpc_web: Arc::clone(&self.grpc_web),
             static_path,
+            limits: mount
+                .map_or_else(crate::RequestLimits::default, |mount| mount.limits)
+                .or(group_limits)
+                .or(self.limits),
         })
     }
 
@@ -1359,6 +1406,7 @@ impl Routing {
             .await?
             .with_errors(Arc::new(errors))
             .with_maintenance(maintenance)
+            .with_limits(crate::RequestLimits::from_message(app.limits.as_ref()))
             .with_sendfile(Sendfile::new(&app.sendfile_roots, &app.sendfile_header))
             .with_waking(&app.waking_groups)
             .with_grpc_web(&app.grpc_web_origins)
@@ -1850,7 +1898,8 @@ impl Routing {
     }
 
     /// The longest request deadline in force (section 4.6): the node's,
-    /// or a virtual host's or a route's own when one is longer, which is
+    /// or a virtual host's, a route's, a release's or a worker group's
+    /// own when one is longer, which is
     /// how long an edge that stops gives its requests to finish.
     pub fn longest_deadline(&self, node: std::time::Duration) -> std::time::Duration {
         self.hosts
@@ -1858,6 +1907,11 @@ impl Routing {
             .map(|host| host.limits)
             .chain(self.routes.iter().flatten().map(|route| route.limits))
             .filter_map(|limits| limits.request_deadline)
+            .chain(
+                self.app_pools()
+                    .iter()
+                    .flat_map(|pools| pools.deadlines().collect::<Vec<_>>()),
+            )
             .fold(node, std::time::Duration::max)
     }
 
@@ -2014,12 +2068,12 @@ impl Routing {
 
             return match selection {
                 Some(selection) => Decision::Serve {
+                    request_limits: selection.limits,
                     selection,
                     server_name: None,
                     cookies,
                     auth: None,
                     upload: None,
-                    request_limits: crate::RequestLimits::default(),
                     limits: Vec::new(),
                     methods: None,
                     mode: None,
@@ -2111,6 +2165,9 @@ impl Routing {
                     origin,
                 )
             };
+            let served = fallback
+                .as_ref()
+                .map_or_else(crate::RequestLimits::default, |selection| selection.limits);
             return Decision::Static {
                 route: Arc::clone(static_route),
                 prefix: route.path.clone(),
@@ -2122,7 +2179,7 @@ impl Routing {
                 }),
                 cookies,
                 auth: route.auth.clone(),
-                request_limits: route.limits.or(host.limits),
+                request_limits: route.limits.or(served).or(host.limits),
                 limits: host
                     .rate_limits
                     .iter()
@@ -2159,12 +2216,12 @@ impl Routing {
         };
 
         Decision::Serve {
-            selection,
             server_name,
             cookies,
             auth: route.auth.clone(),
             upload: route.upload.clone(),
-            request_limits: route.limits.or(host.limits),
+            request_limits: route.limits.or(selection.limits).or(host.limits),
+            selection,
             limits: host
                 .rate_limits
                 .iter()
@@ -2243,6 +2300,7 @@ impl Routing {
                 upstream: None,
                 grpc_web: Arc::default(),
                 static_path: None,
+                limits: crate::RequestLimits::default(),
             }),
         }
     }
@@ -2320,6 +2378,7 @@ fn mounts_of(app: &pb::AppWorkers) -> Vec<MountPath> {
             accel_redirect: mount.accel_redirect,
             cgi_local_redirect: mount.cgi_local_redirect,
             sendfile: Sendfile::new(&mount.sendfile_roots, &mount.sendfile_header),
+            limits: crate::RequestLimits::from_message(mount.limits.as_ref()),
         })
         .collect()
 }
@@ -2334,6 +2393,7 @@ fn groups_of(app: &pb::AppWorkers) -> Vec<GroupSockets> {
             hosts: group.hosts.clone(),
             methods: group.methods.clone(),
             sockets: paths(&group.sockets),
+            limits: crate::RequestLimits::from_message(group.limits.as_ref()),
         })
         .collect()
 }

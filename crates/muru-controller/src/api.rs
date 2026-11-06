@@ -1635,6 +1635,7 @@ impl Admin for Service {
                 .read()
                 .expect("limits poisoned")
                 .clone();
+            layers.extend(config::served_layers(&self.handle.store, &document).map_err(internal)?);
             layers.extend(config::route_layers(&self.handle.store, &document, &limits));
             (attributions, layers)
         } else {

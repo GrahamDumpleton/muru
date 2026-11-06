@@ -429,6 +429,11 @@ pub struct Mount {
     /// 6.14); none when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
+    /// The largest body of a request the mount serves, for example 200MB
+    /// (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the worker group's, else the release's"))]
+    pub max_body_size: Option<String>,
 }
 
 /// Check a name against section 3.2: lowercase letters, digits and
@@ -706,6 +711,11 @@ pub struct Group {
     /// the release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The largest body of a request the group serves, for example 200MB
+    /// (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
+    pub max_body_size: Option<String>,
     /// The group's own memory policy (section 7.7), each key the
     /// release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -898,9 +908,16 @@ pub struct Release {
     /// example 1h, with jitter; off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
-    /// The timeouts the host enforces on its workers (section 7.6).
+    /// The timeouts the host enforces on its workers (section 7.6), and
+    /// those of a request the release serves, which the edge enforces
+    /// (section 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The largest body of a request the release serves, for example
+    /// 50MB (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `max_body_size` in `[limits]`"))]
+    pub max_body_size: Option<String>,
     /// The memory policy for the workers (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
@@ -1326,8 +1343,9 @@ pub struct SecretStore {
 }
 
 /// The `[timeouts]` table of a release or a `[tool.muru]` table (section
-/// 7.6): the timeouts the host enforces on its workers. The edge's own
-/// timeouts are the daemon's `[limits]`.
+/// 7.6): the timeouts the host enforces on its workers, and the four the
+/// edge enforces on a request the release serves (section 4.6), which
+/// are otherwise the virtual host's or the daemon's `[limits]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
@@ -1366,6 +1384,49 @@ pub struct Timeouts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = "30s"))]
     pub gil_stall_timeout: Option<String>,
+    /// Time a request served here may wait for a worker, which the edge
+    /// enforces (section 4.6); the virtual host's when absent, or else
+    /// the daemon's `[limits]` value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `queue_timeout` in `[limits]`"))]
+    pub queue_timeout: Option<String>,
+    /// Time a request served here may take to produce its response head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `request_deadline` in `[limits]`"))]
+    pub request_deadline: Option<String>,
+    /// Time a client may pause while sending a body to what is served
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `body_idle_timeout` in `[limits]`"))]
+    pub body_idle_timeout: Option<String>,
+    /// Time a worker here may pause mid-response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `response_idle_timeout` in `[limits]`"))]
+    pub response_idle_timeout: Option<String>,
+}
+
+impl Timeouts {
+    /// The timeouts of one request the table sets (section 4.6), which
+    /// the edge enforces, apart from those the host does.
+    pub fn request(&self) -> RequestTimeouts {
+        RequestTimeouts {
+            queue_timeout: self.queue_timeout.clone(),
+            request_deadline: self.request_deadline.clone(),
+            body_idle_timeout: self.body_idle_timeout.clone(),
+            response_idle_timeout: self.response_idle_timeout.clone(),
+        }
+    }
+}
+
+/// Check and parse the limits a release, a worker group or a mount sets
+/// on the requests it serves (section 4.6): its `max_body_size`, and the
+/// request timeouts of its `timeouts` table.
+pub fn check_served_limits(
+    max_body_size: Option<&str>,
+    timeouts: Option<&Timeouts>,
+) -> Result<RequestLimitSettings, String> {
+    let request = timeouts.map(Timeouts::request);
+    check_request_limits(max_body_size, request.as_ref())
 }
 
 /// The `[logging.python]` table (section 11.4): what loggers without
@@ -5189,9 +5250,16 @@ pub struct ToolMuru {
     /// How long a worker lives before it is replaced (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
-    /// The timeouts the host enforces on its workers (section 7.6).
+    /// The timeouts the host enforces on its workers (section 7.6), and
+    /// those of a request the release serves, which the edge enforces
+    /// (section 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
+    /// The largest body of a request the release serves, for example
+    /// 50MB (section 4.6), which the edge enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the host's, else `max_body_size` in `[limits]`"))]
+    pub max_body_size: Option<String>,
     /// The memory policy for the workers (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,

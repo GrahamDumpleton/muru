@@ -171,6 +171,12 @@ When `muructl run` starts, a mount's line names what it has of its own:
 muru: mount ws serves /ws from chat.asgi:websocket_app with concurrency 500 of its own and up to 2000 open WebSockets
 ```
 
+A mount of either interface takes `max_body_size`, the largest body of
+a request it serves, in place of the release's, so an upload mount can
+accept large bodies while the rest of the application keeps a small
+limit. [Timeouts](timeouts.md#with-the-application) has the order the
+limits are taken in.
+
 Mounts share one interpreter: two applications that rely on process-wide
 globals need separate releases.
 

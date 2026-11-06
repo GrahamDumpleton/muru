@@ -82,6 +82,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
 | `logging` | table, {ref}`[app.NAME.release.ID.logging] <config-daemon-app-name-release-id-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[host.NAME.maintenance] <config-daemon-host-name-maintenance>` |  | What maintenance mode lets through. |
+| `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
 | `max_lifetime` | string |  | How long a worker lives before it is replaced, for example 1h, with jitter; off when absent. |
 | `max_requests` | integer |  | Requests a worker serves before it is replaced, with jitter; off when absent. |
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The memory policy for the workers. |
@@ -100,7 +101,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `stop_signal` | string | the profile's, `TERM` | The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's. |
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | `4` | Application threads per worker. |
-| `timeouts` | table, {ref}`[app.NAME.release.ID.timeouts] <config-daemon-app-name-release-id-timeouts>` |  | The timeouts the host enforces on its workers. |
+| `timeouts` | table, {ref}`[app.NAME.release.ID.timeouts] <config-daemon-app-name-release-id-timeouts>` |  | The timeouts the host enforces on its workers, and those of a request the release serves, which the edge enforces. |
 
 (config-daemon-app-name-release-id-build)=
 ## `[app.NAME.release.ID.build]`
@@ -172,6 +173,7 @@ A worker group, the `[app.NAME.release.ID.groups.NAME]` or `[tool.muru.groups.NA
 | --- | --- | --- | --- |
 | `concurrency` | integer | the release's | Requests an ASGI worker's event loop takes at once. |
 | `match` | table, {ref}`[app.NAME.release.ID.groups.NAME.match] <config-daemon-app-name-release-id-groups-name-match>` |  | What the group asks of a request beside its path: the client classes, hosts and methods it takes, each list any of its entries; a group asking more comes before one asking less, and a group with lists and no `paths` takes every path. |
+| `max_body_size` | string | the release's | The largest body of a request the group serves, for example 200MB, which the edge enforces. |
 | `max_lifetime` | string | the release's | How long a worker of the group lives before it is replaced, for example 1h, with jitter. |
 | `max_requests` | integer | the release's | Requests a worker of the group serves before it is replaced, with jitter. |
 | `memory` | table, {ref}`[app.NAME.release.ID.memory] <config-daemon-app-name-release-id-memory>` |  | The group's own memory policy, each key the release's when absent. |
@@ -247,6 +249,7 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `handoff` | string |  | The interface the mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `internal` | boolean | `false` | Reachable only through internal redirects: a client's request for its path is answered 404. |
+| `max_body_size` | string | the worker group's, else the release's | The largest body of a request the mount serves, for example 200MB, which the edge enforces. |
 | `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
@@ -318,16 +321,20 @@ A directory of an application's own files, an entry of the `[[tool.muru.static]]
 (config-daemon-app-name-release-id-timeouts)=
 ## `[app.NAME.release.ID.timeouts]`
 
-The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers. The edge's own timeouts are the daemon's `[limits]`.
+The `[timeouts]` table of a release or a `[tool.muru]` table: the timeouts the host enforces on its workers, and the four the edge enforces on a request the release serves, which are otherwise the virtual host's or the daemon's `[limits]`.
 
 The same keys apply at `[app.NAME.release.ID.groups.NAME.timeouts]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `body_idle_timeout` | string | the host's, else `body_idle_timeout` in `[limits]` | Time a client may pause while sending a body to what is served here. |
 | `gil_stall_timeout` | string | `"30s"` | How long a worker may go with no thread running Python, or with no report to its host, before it is replaced as for the hard timeout. |
 | `hard_drain_grace` | string | `"10s"` | How long a worker being replaced is given to finish its other requests before it is told to stop. |
 | `hard_timeout` | string |  | How long a request may run in a worker before the worker is replaced, for example 60s; off when absent. Must exceed the soft timeout by at least 5s. |
 | `loop_stall_timeout` | string | `"10s"` | How long an ASGI worker's event loop may go without running before the worker is replaced as for the hard timeout. |
+| `queue_timeout` | string | the host's, else `queue_timeout` in `[limits]` | Time a request served here may wait for a worker, which the edge enforces; the virtual host's when absent, or else the daemon's `[limits]` value. |
+| `request_deadline` | string | the host's, else `request_deadline` in `[limits]` | Time a request served here may take to produce its response head. |
+| `response_idle_timeout` | string | the host's, else `response_idle_timeout` in `[limits]` | Time a worker here may pause mid-response. |
 | `shutdown_timeout` | string | `"5s"` | How long a worker told to stop is given before it is killed, counted from when its WebSockets are closed. |
 | `soft_timeout` | string |  | How long a request may run in a worker before it is interrupted by raising `muru.RequestTimeout` in its thread, for example 30s; off when absent. |
 | `websocket_drain_grace` | string | `"0s"` | How long a worker told to stop keeps its open WebSockets before it closes them with 1001. |

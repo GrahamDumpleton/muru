@@ -522,7 +522,22 @@ fn plan_app(
             continue;
         };
 
+        // Section 4.6: the limits the release sets on the requests it
+        // serves, which no deploy flag carries.
+
+        let served = match muru_config::check_served_limits(
+            table.max_body_size.as_deref(),
+            table.timeouts.as_ref(),
+        ) {
+            Ok(served) => served,
+            Err(error) => {
+                plan.errors.push(format!("{name}@{id}: {error}"));
+                continue;
+            }
+        };
+
         let tables = Tables {
+            limits: (!served.is_empty()).then_some(served),
             groups: (!table.groups.is_empty()).then_some(&table.groups),
             mounts: (!table.mounts.is_empty()).then_some(&table.mounts),
             static_dirs: (!table.static_dirs.is_empty()).then_some(&table.static_dirs[..]),
@@ -2350,6 +2365,9 @@ pub struct Tables<'a> {
     pub maintenance: Option<&'a muru_config::Maintenance>,
     /// Commands (section 9.12).
     pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
+    /// The release's own limits on the requests it serves (section
+    /// 4.6): `max_body_size` and the request timeouts of `timeouts`.
+    pub limits: Option<muru_config::RequestLimitSettings>,
     /// Whether the request is a declared release's table rather than a
     /// deploy's flags, which names its layer (section 3.3).
     pub declared: bool,
@@ -2642,6 +2660,17 @@ pub fn resolve_spec(
         .map(|(_, table)| table)
         .unwrap_or_default();
 
+    // Section 4.6: the limits the release sets on the requests it
+    // serves, a declared release's own or else the source's table's.
+
+    let served = match tables.limits {
+        Some(declared) => declared,
+        None => muru_config::check_served_limits(
+            table.max_body_size.as_deref(),
+            table.timeouts.as_ref(),
+        )?,
+    };
+
     // The entrypoint from the request replaces the table's with its
     // factory settings, as muructl run does (section 13.1).
 
@@ -2791,7 +2820,16 @@ pub fn resolve_spec(
             ));
         }
 
+        // Section 4.6: the group's own limits on the requests it serves.
+
+        let served = muru_config::check_served_limits(
+            group.max_body_size.as_deref(),
+            group.timeouts.as_ref(),
+        )
+        .map_err(|error| format!("worker group {name}: {error}"))?;
+
         resolved_groups.push(GroupSpec {
+            limits: crate::model::ServedLimits::from_settings(&served),
             name: name.clone(),
             paths: group.paths.clone(),
             mounts: group.mounts.clone(),
@@ -2876,7 +2914,13 @@ pub fn resolve_spec(
         // Section 4.10: a mount's redirect settings, with the release's
         // as the defaults.
 
+        // Section 4.6: the largest body of a request the mount serves.
+
+        let served = muru_config::check_request_limits(mount.max_body_size.as_deref(), None)
+            .map_err(|error| format!("mount {name}: {error}"))?;
+
         resolved_mounts.push(MountSpec {
+            limits: crate::model::ServedLimits::from_settings(&served),
             name: name.clone(),
             path,
             entrypoint: mount.entrypoint.clone(),
@@ -3130,6 +3174,7 @@ pub fn resolve_spec(
     muru_config::check_handoff(handoff, Some(interface))?;
 
     Ok(ReleaseSpec {
+        limits: crate::model::ServedLimits::from_settings(&served),
         source,
         entrypoint,
         interface,
@@ -3853,10 +3898,80 @@ pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>,
     Ok(lines)
 }
 
+/// A level's own limits on a request by the key a table gives each, with
+/// its value as the table writes it, those set alone.
+fn served_settings(limits: &crate::model::ServedLimits) -> Vec<(String, String)> {
+    limits
+        .max_body_size_text()
+        .map(|size| ("max_body_size".to_owned(), size))
+        .into_iter()
+        .chain(
+            limits
+                .timeouts()
+                .into_iter()
+                .map(|(key, value)| (format!("timeouts.{key}"), value)),
+        )
+        .collect()
+}
+
+/// Section 4.6: the limits on a request that the releases an exported
+/// document declares set, with those of their worker groups and mounts,
+/// one line a limit, for `config show --effective`.
+pub fn served_layers(store: &Store, document: &Document) -> Result<Vec<String>, StoreError> {
+    let mut lines = Vec::new();
+
+    for (app, table) in &document.app {
+        for id in table.release.keys() {
+            let spec = store.release(app, id)?.spec;
+
+            for (key, value) in served_settings(&spec.limits) {
+                lines.push(format!("{app}@{id}: {key} = {value} (the release)"));
+            }
+
+            for group in &spec.groups {
+                for (key, value) in served_settings(&group.limits) {
+                    lines.push(format!(
+                        "{app}@{id} group {}: {key} = {value} (the worker group)",
+                        group.name
+                    ));
+                }
+            }
+
+            for mount in &spec.mounts {
+                for (key, value) in served_settings(&mount.limits) {
+                    lines.push(format!(
+                        "{app}@{id} mount {}: {key} = {value} (the mount)",
+                        mount.name
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(lines)
+}
+
+/// A `timeouts` table with a level's request timeouts put in (section
+/// 4.6), the table made when the level sets any and there was none.
+fn with_served(
+    table: Option<muru_config::Timeouts>,
+    limits: &crate::model::ServedLimits,
+) -> Option<muru_config::Timeouts> {
+    if limits.timeouts().is_empty() {
+        return table;
+    }
+
+    let mut table = table.unwrap_or_default();
+    limits.fill(&mut table);
+    Some(table)
+}
+
 /// Section 4.6: the limits of each route an exported document declares,
 /// with the level each came from, one line a limit, for `config show
-/// --effective`: the route, its virtual host, the daemon's `[limits]`
-/// table or the default.
+/// --effective`: the route, the serving release of the application it
+/// routes to, its virtual host, the daemon's `[limits]` table or the
+/// default. A worker group or a mount of the release may set its own for
+/// the requests it serves, which `served_layers` lists.
 pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits) -> Vec<String> {
     let stored: BTreeMap<String, VirtualHost> =
         store.hosts().unwrap_or_default().into_iter().collect();
@@ -3883,11 +3998,28 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
             .unwrap_or_default();
         let size = |bytes: u64| muru_config::format_size(bytes);
         let time = |duration: Duration| muru_config::format_duration(duration);
+        let millis = |ms: u64| time(Duration::from_millis(ms));
+
+        // The release that serves the route's application, when it has
+        // one and nothing else chooses among its releases.
+
+        let serving = (!route.app.is_empty())
+            .then(|| store.app(&route.app).ok()?.current)
+            .flatten()
+            .and_then(|id| Some((store.release(&route.app, &id).ok()?.spec.limits, id)));
+        let release = serving
+            .as_ref()
+            .map_or_else(crate::model::ServedLimits::default, |(limits, _)| *limits);
+        let release_layer = serving
+            .as_ref()
+            .map(|(_, id)| format!("release {}@{id}", route.app))
+            .unwrap_or_default();
 
         let settings = [
             (
                 "max_body_size",
                 own.max_body_size.map(size),
+                release.max_body_size.map(size),
                 host.max_body_size.map(size),
                 size(node.max_body_size),
                 node.max_body_size == defaults.max_body_size,
@@ -3895,6 +4027,7 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
             (
                 "timeouts.queue_timeout",
                 own.queue_timeout.map(time),
+                release.queue_timeout_ms.map(millis),
                 host.queue_timeout.map(time),
                 time(node.queue_timeout),
                 node.queue_timeout == defaults.queue_timeout,
@@ -3902,6 +4035,7 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
             (
                 "timeouts.request_deadline",
                 own.request_deadline.map(time),
+                release.request_deadline_ms.map(millis),
                 host.request_deadline.map(time),
                 time(node.request_deadline),
                 node.request_deadline == defaults.request_deadline,
@@ -3909,6 +4043,7 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
             (
                 "timeouts.body_idle_timeout",
                 own.body_idle_timeout.map(time),
+                release.body_idle_timeout_ms.map(millis),
                 host.body_idle_timeout.map(time),
                 time(node.body_idle_timeout),
                 node.body_idle_timeout == defaults.body_idle_timeout,
@@ -3916,18 +4051,20 @@ pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits
             (
                 "timeouts.response_idle_timeout",
                 own.response_idle_timeout.map(time),
+                release.response_idle_timeout_ms.map(millis),
                 host.response_idle_timeout.map(time),
                 time(node.response_idle_timeout),
                 node.response_idle_timeout == defaults.response_idle_timeout,
             ),
         ];
 
-        for (key, route_value, host_value, node_value, node_is_default) in settings {
-            let (value, layer) = match (route_value, host_value) {
-                (Some(value), _) => (value, "the route".to_owned()),
-                (None, Some(value)) => (value, format!("host {}", route.host)),
-                (None, None) if node_is_default => (node_value, "default".to_owned()),
-                (None, None) => (node_value, "[limits]".to_owned()),
+        for (key, route_value, release_value, host_value, node_value, node_is_default) in settings {
+            let (value, layer) = match (route_value, release_value, host_value) {
+                (Some(value), _, _) => (value, "the route".to_owned()),
+                (None, Some(value), _) => (value, release_layer.clone()),
+                (None, None, Some(value)) => (value, format!("host {}", route.host)),
+                (None, None, None) if node_is_default => (node_value, "default".to_owned()),
+                (None, None, None) => (node_value, "[limits]".to_owned()),
             };
 
             lines.push(format!(
@@ -4183,7 +4320,9 @@ fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, 
             websocket_drain_grace: request.websocket_drain_grace_ms.map(format_ms),
             loop_stall_timeout: request.loop_stall_timeout_ms.map(format_ms),
             gil_stall_timeout: request.gil_stall_timeout_ms.map(format_ms),
+            ..muru_config::Timeouts::default()
         }),
+        max_body_size: None,
         memory: memory_given.then(muru_config::Memory::default),
         env: BTreeMap::new(),
         accel_redirect: request.accel_redirect,
@@ -4247,6 +4386,10 @@ fn resolve_http_spec(
     muru_config::check_sendfile(&table.sendfile_roots, table.sendfile_header.as_deref())?;
 
     Ok(ReleaseSpec {
+        limits: tables
+            .limits
+            .map(|declared| crate::model::ServedLimits::from_settings(&declared))
+            .unwrap_or_default(),
         source,
         entrypoint: String::new(),
         interface: muru_config::Interface::Auto,
@@ -4799,10 +4942,14 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 timeout: Some(format_ms(http.readiness_timeout_ms)),
             }),
             stop_signal: http.stop_signal.clone(),
-            timeouts: Some(muru_config::Timeouts {
-                shutdown_timeout: Some(format_ms(spec.timeouts.shutdown_timeout_ms)),
-                ..muru_config::Timeouts::default()
-            }),
+            max_body_size: spec.limits.max_body_size_text(),
+            timeouts: with_served(
+                Some(muru_config::Timeouts {
+                    shutdown_timeout: Some(format_ms(spec.timeouts.shutdown_timeout_ms)),
+                    ..muru_config::Timeouts::default()
+                }),
+                &spec.limits,
+            ),
             env: env_table_from(&spec.env),
             error_pages: spec.error_pages.clone(),
             error_override: spec.error_override.clone(),
@@ -4861,7 +5008,8 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         sync_threads: Some(group.sync_threads as usize),
                         concurrency: Some(group.concurrency as usize),
                         scaling: scaling_table(&group.scaling),
-                        timeouts: group.timeouts.table(),
+                        timeouts: with_served(group.timeouts.table(), &group.limits),
+                        max_body_size: group.limits.max_body_size_text(),
                         memory: group.memory.as_ref().map(crate::model::MemoryPolicy::table),
                         max_requests: group.max_requests,
                         max_lifetime: group.max_lifetime_ms.map(format_ms),
@@ -4895,6 +5043,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                         concurrency: mount.concurrency.map(|value| value as usize),
                         max_connections: mount.max_connections.map(|value| value as usize),
                         handoff: mount.handoff,
+                        max_body_size: mount.limits.max_body_size_text(),
                     },
                 )
             })
@@ -4908,33 +5057,38 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         max_lifetime: spec
             .max_lifetime_ms
             .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
-        timeouts: (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
-            muru_config::Timeouts {
-                soft_timeout: spec
-                    .timeouts
-                    .soft_timeout_ms
-                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
-                hard_timeout: spec
-                    .timeouts
-                    .hard_timeout_ms
-                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
-                hard_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.hard_drain_grace_ms,
-                ))),
-                shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.shutdown_timeout_ms,
-                ))),
-                websocket_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.websocket_drain_grace_ms,
-                ))),
-                loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.loop_stall_timeout_ms,
-                ))),
-                gil_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
-                    spec.timeouts.gil_stall_timeout_ms,
-                ))),
-            }
-        }),
+        max_body_size: spec.limits.max_body_size_text(),
+        timeouts: with_served(
+            (spec.timeouts != crate::model::WorkerTimeouts::default()).then(|| {
+                muru_config::Timeouts {
+                    soft_timeout: spec
+                        .timeouts
+                        .soft_timeout_ms
+                        .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                    hard_timeout: spec
+                        .timeouts
+                        .hard_timeout_ms
+                        .map(|ms| muru_config::format_duration(Duration::from_millis(ms))),
+                    hard_drain_grace: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.hard_drain_grace_ms,
+                    ))),
+                    shutdown_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.shutdown_timeout_ms,
+                    ))),
+                    websocket_drain_grace: Some(muru_config::format_duration(
+                        Duration::from_millis(spec.timeouts.websocket_drain_grace_ms),
+                    )),
+                    loop_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.loop_stall_timeout_ms,
+                    ))),
+                    gil_stall_timeout: Some(muru_config::format_duration(Duration::from_millis(
+                        spec.timeouts.gil_stall_timeout_ms,
+                    ))),
+                    ..muru_config::Timeouts::default()
+                }
+            }),
+            &spec.limits,
+        ),
         env: env_table_from(&spec.env),
         memory: (spec.memory != crate::model::MemoryPolicy::default()).then(|| {
             muru_config::Memory {
@@ -5204,6 +5358,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         describe_ms(recorded.max_lifetime_ms),
     );
     compare(
+        "request limits",
+        declared.limits.describe(),
+        recorded.limits.describe(),
+    );
+    compare(
         "soft_timeout",
         describe_ms(declared.timeouts.soft_timeout_ms),
         describe_ms(recorded.timeouts.soft_timeout_ms),
@@ -5432,6 +5591,7 @@ fn describe_groups(groups: &[GroupSpec]) -> String {
             ]
             .into_iter()
             .filter_map(|(name, ms)| ms.map(|ms| format!("{name} {}", describe_ms(Some(ms)))))
+            .chain((!group.limits.is_empty()).then(|| group.limits.describe()))
             .collect::<Vec<_>>();
 
             format!(
@@ -5514,6 +5674,10 @@ fn describe_mounts(mounts: &[MountSpec]) -> String {
 
             if let Some(handoff) = mount.handoff {
                 flags.push(format!("handoff {handoff}"));
+            }
+
+            if !mount.limits.is_empty() {
+                flags.push(mount.limits.describe());
             }
 
             let flags = if flags.is_empty() {

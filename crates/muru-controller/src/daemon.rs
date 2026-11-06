@@ -5155,7 +5155,23 @@ impl Daemon {
                     .ok()
                     .filter(|app| !app.access_log.is_empty())
                     .map(|app| app.access_log.choice().to_message());
+
+                // Section 4.6: the limits the release, its groups and its
+                // mounts set on the requests they serve.
+
+                let spec = self
+                    .store
+                    .release(name, id)
+                    .ok()
+                    .map(|release| release.spec);
+                let group_limits = |group: &str| {
+                    spec.as_ref()
+                        .and_then(|spec| spec.groups.iter().find(|own| own.name == group))
+                        .and_then(|own| own.limits.message())
+                };
+
                 apps.push(pb::AppWorkers {
+                    limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
                     serving: self.serving.get(name) == Some(id),
@@ -5187,6 +5203,7 @@ impl Daemon {
                         .groups
                         .iter()
                         .map(|group| pb::Group {
+                            limits: group_limits(&group.name),
                             name: group.name.clone(),
                             paths: group.paths.clone(),
                             client_classes: group.client_classes.clone(),
@@ -5208,6 +5225,7 @@ impl Daemon {
                                 .mounts
                                 .iter()
                                 .map(|mount| pb::Mount {
+                                    limits: mount.limits.message(),
                                     name: mount.name.clone(),
                                     path: mount.path.clone(),
                                     internal: mount.internal,

@@ -160,8 +160,10 @@ timeouts = { request_deadline = "120s" }
 | `rate_limits` | the [rate limits](client-classes.md) every request draws from | are drawn from as well |
 | `maintenance` | what the host's [maintenance mode](error-pages.md#a-whole-virtual-host) lets through | |
 
-Here every request for `api.example.com` may carry 1MB and take 30
-seconds, except under `/import`, where the route allows 200MB and 120
+A host's limits are a site's defaults: an application that [sets its
+own](timeouts.md#with-the-application) in its release keeps them, and a
+route replaces both. Here every request for `api.example.com` may carry
+1MB and take 30 seconds, except under `/import`, where the route allows 200MB and 120
 seconds and keeps the host's 2 second queue timeout. A key the host
 leaves out is the daemon's own: its `[limits]` and `[logs]` tables, or
 the default. `muructl host list` shows what each host sets, and

@@ -1211,6 +1211,7 @@ mod tests {
 
     fn spec() -> ReleaseSpec {
         ReleaseSpec {
+            limits: crate::model::ServedLimits::default(),
             source: PathBuf::from("/srv/shop"),
             entrypoint: "shop.wsgi:application".to_owned(),
             interface: Interface::Auto,

@@ -75,9 +75,9 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
 | timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group | off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
-| timeouts (queue_timeout, request_deadline, body_idle_timeout, response_idle_timeout) | host, route | 5s, 300s, 60s, 60s, from `[limits]` | 4.6 |
+| timeouts (queue_timeout, request_deadline, body_idle_timeout, response_idle_timeout) | host, release, group, route | 5s, 300s, 60s, 60s, from `[limits]` | 4.6 |
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
-| max_body_size | `[limits]`, host, route | 10MB | 4.6 |
+| max_body_size | `[limits]`, host, release, group, mount, route | 10MB | 4.6 |
 | buffer_body, chunked_body, buffer_response | route and wider | off, buffer, on | 4.6 |
 | max_header_bytes, max_headers, header_read_timeout | `[limits]`, a listener's `limits` | 64KiB, 100, 30s | 4.6 |
 | upload, max_file_size, max_files, hash, precheck, spool_quota | route (spool_quota also in the daemon's [limits], for every application together) | off, unlimited, 100 (at most 500), [sha256], false, 10GB per application (none for the node) | 4.11 |

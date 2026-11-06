@@ -123,8 +123,9 @@ message Limits {
 }
 
 // Section 4.6: the limits one level sets on a request, each in place of
-// the level beneath's: a route's over its virtual host's over the
-// node's. A field left at 0 says nothing.
+// the level beneath's: a route's over those of the mount, the worker
+// group and the release that serve the request, over its virtual host's,
+// over the node's. A field left at 0 says nothing.
 message RequestLimits {
   uint64 max_body_size = 1;
   uint64 queue_timeout_ms = 2;
@@ -420,6 +421,7 @@ message AppWorkers {
   repeated StaticDir static_dirs = 17;  // section 4.9: the release's own directories of files, by path prefix
   reserved 18;
   AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
+  RequestLimits limits = 20;            // section 4.6: the release's own limits on a request, over its host's; none when absent
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge
@@ -445,6 +447,7 @@ message Mount {
   bool cgi_local_redirect = 6;          // a 200 with a local Location and no body is an internal redirect
   repeated string sendfile_roots = 7;   // section 4.9: directories the mount's X-Muru-Sendfile paths must lie in
   string sendfile_header = 8;           // a second header honoured as X-Muru-Sendfile is; none when empty
+  RequestLimits limits = 9;             // section 4.6: the mount's own limits on a request, over its group's and release's
 }
 
 message Group {
@@ -454,6 +457,7 @@ message Group {
   repeated string client_classes = 4;   // section 4.14: the classes the group takes, ahead of groups naming none
   repeated string hosts = 5;            // ADR 0033: the hosts it takes, lower case; every host when empty
   repeated string methods = 6;          // ADR 0033: the methods it takes, upper case; every method when empty
+  RequestLimits limits = 7;             // section 4.6: the group's own limits on a request, over its release's
 }
 
 message Applied {
