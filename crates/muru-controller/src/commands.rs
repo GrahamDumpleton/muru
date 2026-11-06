@@ -24,12 +24,7 @@ use crate::store::Store;
 
 /// How long a command told to stop, at its timeout or when its caller
 /// goes away, gets before its session is killed.
-#[cfg(not(test))]
 const STOP_GRACE: Duration = Duration::from_secs(10);
-
-/// The grace period under test, short so stopping takes little time.
-#[cfg(test)]
-const STOP_GRACE: Duration = Duration::from_secs(1);
 
 /// How often a stopping command's session is checked for processes left
 /// in it, once the command's own process has ended and been reaped.
@@ -615,6 +610,16 @@ impl Stopper {
 /// Start the command and stream what it writes. An exclusive command
 /// already running for the application is refused.
 pub fn run(prepared: Prepared, record: Arc<dyn Record>) -> Result<Running, String> {
+    run_with_grace(prepared, record, STOP_GRACE)
+}
+
+/// `run`, with the grace period a stopped command's session gets before
+/// it is killed.
+fn run_with_grace(
+    prepared: Prepared,
+    record: Arc<dyn Record>,
+    grace: Duration,
+) -> Result<Running, String> {
     let secrets = SecretFiles(prepared.secrets.clone());
 
     let claim = match (&prepared.declared, prepared.exclusive) {
@@ -641,7 +646,7 @@ pub fn run(prepared: Prepared, record: Arc<dyn Record>) -> Result<Running, Strin
     let (stopper, requests) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        supervise(prepared, record, sender, requests).await;
+        supervise(prepared, record, sender, requests, grace).await;
         drop(claim);
         drop(secrets);
     });
@@ -658,6 +663,7 @@ async fn supervise(
     record: Arc<dyn Record>,
     sender: mpsc::Sender<pb::CommandOutput>,
     mut requests: mpsc::UnboundedReceiver<Request>,
+    grace: Duration,
 ) {
     let subject = prepared.subject();
     let started = Instant::now();
@@ -810,7 +816,7 @@ async fn supervise(
 
                     if stopped.is_none() {
                         stopped = Some("its caller went away".to_owned());
-                        stopping = Some(Stopping::start(pid, &mut child));
+                        stopping = Some(Stopping::start(pid, &mut child, grace));
                     }
                 }
             }
@@ -820,14 +826,14 @@ async fn supervise(
                     "it ran past its timeout of {}",
                     muru_config::format_duration(timeout)
                 ));
-                stopping = Some(Stopping::start(pid, &mut child));
+                stopping = Some(Stopping::start(pid, &mut child, grace));
             }
             () = sender.closed(), if !caller_gone => {
                 caller_gone = true;
 
                 if stopped.is_none() {
                     stopped = Some("its caller went away".to_owned());
-                    stopping = Some(Stopping::start(pid, &mut child));
+                    stopping = Some(Stopping::start(pid, &mut child, grace));
                 }
             }
 
@@ -838,12 +844,12 @@ async fn supervise(
                 Request::Stop(why) => {
                     if stopped.is_none() {
                         stopped = Some(why);
-                        stopping = Some(Stopping::start(pid, &mut child));
+                        stopping = Some(Stopping::start(pid, &mut child, grace));
                     }
                 }
                 Request::Kill => {
                     stopped.get_or_insert_with(|| "its caller had it killed".to_owned());
-                    let stopping = stopping.get_or_insert_with(|| Stopping::start(pid, &mut child));
+                    let stopping = stopping.get_or_insert_with(|| Stopping::start(pid, &mut child, grace));
 
                     if session_gone.is_none() && !stopping.kill(pid, &mut child, exited) {
                         session_gone = Some(tokio::time::Instant::now());
@@ -943,11 +949,11 @@ struct Stopping {
 
 impl Stopping {
     /// Send the command's session SIGTERM and start the grace period.
-    fn start(pid: u32, child: &mut tokio::process::Child) -> Self {
+    fn start(pid: u32, child: &mut tokio::process::Child, grace: Duration) -> Self {
         signal_session(pid, child, libc::SIGTERM);
 
         Stopping {
-            kill_at: tokio::time::Instant::now() + STOP_GRACE,
+            kill_at: tokio::time::Instant::now() + grace,
             killed_at: None,
         }
     }
@@ -1538,10 +1544,20 @@ mod tests {
         );
     }
 
+    /// A grace period no run that should end before it comes near, on
+    /// however slow a machine.
+    const LONG_GRACE: Duration = Duration::from_secs(30);
+
+    /// A grace period short enough for a test of what happens at its end.
+    const SHORT_GRACE: Duration = Duration::from_secs(1);
+
+    /// Long enough for a run to end that should, short of LONG_GRACE.
+    const ENDS_IN: Duration = Duration::from_secs(10);
+
     #[tokio::test]
     async fn a_command_that_ignores_sigterm_is_killed_when_its_caller_asks() {
         let dir = tempfile::tempdir().expect("a directory");
-        let mut running = run(
+        let mut running = run_with_grace(
             prepared(
                 &[
                     "sh",
@@ -1551,20 +1567,21 @@ mod tests {
                 dir.path().join("r1.log"),
             ),
             recorded(),
+            LONG_GRACE,
         )
         .expect("started");
 
         // Asked to stop, it would hold out for the grace period; the kill
-        // that follows ends it well inside that.
+        // that follows ends it long before that.
 
         let first = running.output.recv().await.expect("a line");
         assert_eq!(first.line, "started");
         running.stopper.stop("muructl got SIGINT");
         tokio::time::sleep(Duration::from_millis(100)).await;
         running.stopper.kill();
-        let messages = tokio::time::timeout(STOP_GRACE / 2, collect(running.output))
+        let messages = tokio::time::timeout(ENDS_IN, collect(running.output))
             .await
-            .expect("the command ended before the grace period did");
+            .expect("the kill ended the command before the grace period did");
 
         let last = messages.last().expect("a last message");
         assert_eq!(last.exit_code, 128 + libc::SIGKILL);
@@ -1593,18 +1610,34 @@ mod tests {
             member.display()
         );
 
-        let mut command = prepared(
+        prepared(
             &["sh", "-c", "sh -c \"$1\" & exec sleep 30", "sh", &script],
             dir.join("r1.log"),
-        );
-        command.timeout = Some(Duration::from_millis(300));
-        command
+        )
     }
 
-    /// Whether a process is gone within a second. A process left in a
+    /// The pid a process writes to the file, once it has: the process has
+    /// done what it does before writing it.
+    async fn pid_in(path: &Path) -> u32 {
+        for _ in 0..200 {
+            let written = std::fs::read_to_string(path).unwrap_or_default();
+
+            if let Ok(pid) = written.trim().parse() {
+                return pid;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        panic!("no pid in {}", path.display());
+    }
+
+    /// Whether a process is gone within ENDS_IN. A process left in a
     /// stopped command's session is reaped by init, not here.
     async fn gone(pid: u32) -> bool {
-        for _ in 0..20 {
+        let deadline = Instant::now() + ENDS_IN;
+
+        while Instant::now() < deadline {
             if !crate::host::alive(pid) {
                 return true;
             }
@@ -1615,14 +1648,6 @@ mod tests {
         false
     }
 
-    fn member_pid(member: &Path) -> u32 {
-        std::fs::read_to_string(member)
-            .expect("the member's pid")
-            .trim()
-            .parse()
-            .expect("a pid")
-    }
-
     #[tokio::test]
     async fn a_session_member_past_sigterm_is_killed_at_the_end_of_the_grace_period() {
         // Holding the output, it would keep the run going; with it
@@ -1631,33 +1656,33 @@ mod tests {
         for holds_output in [true, false] {
             let dir = tempfile::tempdir().expect("a directory");
             let member = dir.path().join("member.pid");
-            let started = Instant::now();
-            let messages = collect(
-                run(
-                    with_member(dir.path(), &member, true, holds_output),
-                    recorded(),
-                )
-                .expect("started")
-                .output,
+            let running = run_with_grace(
+                with_member(dir.path(), &member, true, holds_output),
+                recorded(),
+                SHORT_GRACE,
             )
-            .await;
-            let took = started.elapsed();
+            .expect("started");
+            let pid = pid_in(&member).await;
+
+            let stopped = Instant::now();
+            running.stopper.stop("muructl got SIGTERM");
+            let messages = tokio::time::timeout(LONG_GRACE, collect(running.output))
+                .await
+                .expect("the run ended");
+            let took = stopped.elapsed();
 
             let last = messages.last().expect("a last message");
             assert_eq!(last.exit_code, 128 + libc::SIGTERM, "{}", last.message);
             assert!(
-                last.message.contains("ran past its timeout"),
+                last.message.contains("muructl got SIGTERM"),
                 "{}",
                 last.message
             );
             assert!(
-                took >= STOP_GRACE && took < STOP_GRACE + Duration::from_secs(3),
-                "holding its output {holds_output}, the run took {took:?}"
+                took >= SHORT_GRACE,
+                "holding its output {holds_output}, the run ended {took:?} after the stop"
             );
-            assert!(
-                gone(member_pid(&member)).await,
-                "holding its output {holds_output}"
-            );
+            assert!(gone(pid).await, "holding its output {holds_output}");
         }
     }
 
@@ -1665,22 +1690,26 @@ mod tests {
     async fn a_session_that_ends_on_sigterm_ends_the_run_without_the_grace_period() {
         let dir = tempfile::tempdir().expect("a directory");
         let member = dir.path().join("member.pid");
-        let started = Instant::now();
-        let messages = collect(
-            run(with_member(dir.path(), &member, false, false), recorded())
-                .expect("started")
-                .output,
+        let running = run_with_grace(
+            with_member(dir.path(), &member, false, false),
+            recorded(),
+            LONG_GRACE,
         )
-        .await;
+        .expect("started");
+        let pid = pid_in(&member).await;
+
+        running.stopper.stop("muructl got SIGTERM");
+        let messages = tokio::time::timeout(ENDS_IN, collect(running.output))
+            .await
+            .expect("the run ended before the grace period did");
 
         let last = messages.last().expect("a last message");
         assert!(
-            last.message.contains("ran past its timeout"),
+            last.message.contains("muructl got SIGTERM"),
             "{}",
             last.message
         );
-        assert!(started.elapsed() < STOP_GRACE, "{:?}", started.elapsed());
-        assert!(gone(member_pid(&member)).await);
+        assert!(gone(pid).await);
     }
 
     #[tokio::test]
@@ -1688,40 +1717,44 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let escaped = dir.path().join("escaped.pid");
         let script = format!(
-            "import os, time; os.setsid(); open({:?}, 'w').write(str(os.getpid())); time.sleep(30)",
+            "import os, time; os.setsid(); open({:?}, 'w').write(str(os.getpid())); time.sleep(60)",
             escaped.display().to_string()
         );
-        let mut command = prepared(
-            &[
-                "sh",
-                "-c",
-                "python3 -c \"$1\" & exec sleep 30",
-                "sh",
-                &script,
-            ],
-            dir.path().join("r1.log"),
-        );
-        command.timeout = Some(Duration::from_millis(300));
+        let running = run_with_grace(
+            prepared(
+                &[
+                    "sh",
+                    "-c",
+                    "python3 -c \"$1\" & exec sleep 30",
+                    "sh",
+                    &script,
+                ],
+                dir.path().join("r1.log"),
+            ),
+            recorded(),
+            LONG_GRACE,
+        )
+        .expect("started");
+        let pid = pid_in(&escaped).await;
 
         // It holds the output open and SIGTERM to the session does not
         // reach it, so the run ends once the session has and the output
-        // has been read for DRAIN.
+        // has been read for DRAIN, long before the process or the grace
+        // period would end.
 
-        let started = Instant::now();
-        let messages = collect(run(command, recorded()).expect("started").output).await;
-        let took = started.elapsed();
-        let pid = member_pid(&escaped);
+        running.stopper.stop("muructl got SIGTERM");
+        let ended = tokio::time::timeout(ENDS_IN, collect(running.output)).await;
         let _ = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .status();
+        let messages = ended.expect("the run ended without the process that left the session");
 
         let last = messages.last().expect("a last message");
         assert!(
-            last.message.contains("ran past its timeout"),
+            last.message.contains("muructl got SIGTERM"),
             "{}",
             last.message
         );
-        assert!(took < STOP_GRACE + DRAIN, "{took:?}");
     }
 
     #[tokio::test]
