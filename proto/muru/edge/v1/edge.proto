@@ -480,10 +480,14 @@ message PoolState {
   string release = 2;
   string group = 3;
   uint32 workers = 4;
-  uint32 slots = 5;
-  uint32 busy = 6;
+  uint32 slots = 5;                     // on both sides together
+  uint32 busy = 6;                      // on both sides together
   uint32 waiting = 7;
   uint32 websockets = 8;                // open WebSockets, each holding a slot
+  uint32 threads = 9;                   // slots on the workers' threads, 0 when nothing runs on them
+  uint32 threads_busy = 10;
+  uint32 loop_slots = 11;               // slots on the workers' event loops, 0 without one
+  uint32 loop_busy = 12;
 }
 
 message WebSocketsRequest {

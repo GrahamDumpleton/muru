@@ -193,6 +193,14 @@ def stacks_result(
         for key in (entry.get("thread"), entry.get("native"))
         if key is not None
     }
+
+    # An ASGI request's code runs on a pool for synchronous code for as
+    # long as a call there takes.
+
+    for entry in active:
+        for key in (*(entry.get("sync_threads") or ()), *(entry.get("sync_native") or ())):
+            serving.setdefault(key, entry)
+
     found = [
         {
             "ident": ident,

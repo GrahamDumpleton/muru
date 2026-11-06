@@ -9,9 +9,9 @@
 </div>
 <h2 style="margin-top:1rem">Workers <a href="workers?release={{ data.target }}" class="note">stacks, tasks and memory</a></h2>
 <table>
-  <tr><th>Worker</th><th>Link</th><th class="num">Slots</th><th class="num">Busy</th></tr>
+  <tr><th>Worker</th><th>Link</th>{% if data.has_threads() %}<th class="num">Threads</th>{% endif %}{% if data.has_event_loop() %}<th class="num">Loop</th>{% endif %}</tr>
   {% for worker in data.workers %}
-  <tr><td>{{ worker.index }}</td><td>{{ worker.link }}</td><td class="num">{{ worker.slots }}</td><td class="num">{{ worker.busy }}</td></tr>
+  <tr><td>{{ worker.index }}</td><td>{{ worker.link }}</td>{% if data.has_threads() %}<td class="num">{{ crate::side_cell(worker.threads) }}</td>{% endif %}{% if data.has_event_loop() %}<td class="num">{{ crate::side_cell(worker.event_loop) }}</td>{% endif %}</tr>
   {% endfor %}
 </table>
 {% include "websockets.html" %}

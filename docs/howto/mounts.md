@@ -71,10 +71,31 @@ the default mount's interface.
 A worker with any ASGI mount runs one event loop, and every ASGI
 application on it, the default mount's or a named one's, has its own
 lifespan: each is started before the worker is ready and shut down when
-it stops, with its own `state` copied into its requests. WSGI mounts share
-the worker's thread pool unless they have threads of their own. A worker
-whose default mount is WSGI is sized by its threads at the edge, one whose
-default is ASGI by its concurrency.
+it stops, with its own `state` copied into its requests.
+
+## How requests are counted
+
+WSGI requests count against `threads` and ASGI requests against
+`concurrency`, whichever the release's own entrypoint is. Each worker
+runs that many of each at once, and requests beyond either wait at the
+edge until the queue timeout:
+
+```toml
+threads = 4            # WSGI requests: the application's and any WSGI mount's
+concurrency = 1000     # ASGI requests and open WebSockets: any ASGI mount's
+
+entrypoint = "shop.wsgi:application"
+
+[mounts.live]
+path = "/live"
+entrypoint = "shop.live:app"
+```
+
+Here requests to `/live` never take one of the four threads, and the
+WSGI application's requests never take a place on the event loop. A
+WebSocket is on the event loop from its handshake, and an open socket
+holds one of the loop's places for its life. The interface a mount was
+detected as decides its side, as a declared `interface` does.
 
 ## Threads of a mount's own
 
@@ -113,22 +134,21 @@ the requests it [hands to WSGI](handoff.md#from-asgi-to-wsgi) run on.
 ## Limits of an ASGI mount's own
 
 An ASGI mount runs on the worker's event loop and, without limits of its
-own, shares the worker's slots: beside a WSGI application its requests
-and open WebSockets take the WSGI threads' places at the edge, so a few
-hundred open sockets can hold every thread. Two settings give the mount
-a place of its own on each worker:
+own, shares the loop's `concurrency` with every other ASGI application
+in the worker. Two settings give the mount a place of its own on each
+worker, so that it cannot take the whole loop and the others cannot
+take its share:
 
 ```toml
 [mounts.ws]
 path = "/ws"
 entrypoint = "chat.asgi:websocket_app"
-interface = "asgi"
 concurrency = 500
 max_connections = 2000
 ```
 
 `concurrency` is the requests the mount runs at once, slots the edge
-holds for it apart from the worker's others, and `max_connections` the
+holds for it apart from the loop's others, and `max_connections` the
 open WebSockets it holds at once. A WebSocket handshake takes one of
 each; once the application accepts the socket it gives its request slot
 back and keeps its place among the connections for the life of the
@@ -136,9 +156,20 @@ socket, so the mount's requests are not held up by its sockets. Requests
 and handshakes beyond either limit wait at the edge until the queue
 timeout. Either may be set alone: with `concurrency` alone, open
 sockets hold request slots as they do without limits, and with
-`max_connections` alone, requests share the worker's slots. Both need
-the mount declared `interface = "asgi"`, and both are per worker, like
-`threads`.
+`max_connections` alone, requests share the loop's concurrency. Both
+are per worker, like `threads`.
+
+Both belong to an ASGI mount. A mount declared `interface = "wsgi"` is
+refused them when the configuration is read, and a mount whose
+interface is detected is refused them when its workers start, if it
+turns out to be WSGI. A mount with `threads` as well as either has
+`handoff = "wsgi"`.
+
+When `muructl run` starts, a mount's line names what it has of its own:
+
+```
+muru: mount ws serves /ws from chat.asgi:websocket_app with concurrency 500 of its own and up to 2000 open WebSockets
+```
 
 Mounts share one interpreter: two applications that rely on process-wide
 globals need separate releases.

@@ -105,8 +105,8 @@ mount serves, and returns the application.
 
 `Handler`, `Socket` and `ConnectionClosed`: the WebSocket adapter, an ASGI
 application that runs a socket's events as calls on an object, on
-application threads (see [WebSockets as
-callbacks](../howto/handoff.md#websockets-as-callbacks)).
+threads of the event loop's pool for synchronous code (see [WebSockets
+as callbacks](../howto/handoff.md#websockets-as-callbacks)).
 
 ## `muru.HandoffNotEnabled`
 

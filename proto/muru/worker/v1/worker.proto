@@ -21,24 +21,26 @@ service Worker {
 message Hello {
   string protocol_version = 1;
   string worker_type = 2;           // wsgi or asgi: the side the default mount runs on
-  uint32 slots = 3;                 // requests the worker runs at once on its shared thread pool
-  uint32 async_slots = 4;           // requests the worker holds on its event loop at once
+  uint32 slots = 3;                 // requests the worker runs at once on its shared thread pool, 0 when nothing it serves runs there
+  uint32 async_slots = 4;           // requests the worker holds on its event loop at once, 0 without a loop
   bool websockets = 5;              // the default mount accepts websocket scopes
   bool files = 6;                   // accepts FILE frames
   uint32 max_message_size = 7;      // largest WebSocket message, bytes
   repeated GrpcMethod grpc_methods = 8; // the gRPC methods its mounts registered (section 6.13)
-  repeated MountPool mount_pools = 9; // mounts with slots or connections of their own (section 6.7)
+  repeated MountPool mount_pools = 9; // every named mount: the side it runs on, and its own slots or connections when it has them (section 6.7)
   repeated string websocket_mounts = 10; // the named mounts that accept websocket scopes (section 6.14)
 }
 
-// A mount's own slots (section 6.7). For a WSGI mount, reserved threads
-// only it uses and the most requests it runs at once; requests beyond the
-// reserved threads, up to the maximum, borrow threads of the shared pool.
-// For an ASGI mount, reserved and max are both its concurrency, or 0 for
-// one that shares the worker's slots, and connections bounds the open
-// WebSockets it holds apart from the requests it runs, 0 for no bound of
-// its own; handoff_threads are the threads of its own that requests it
-// hands to WSGI run on, 0 when they use the shared pool (section 6.14).
+// A named mount (section 6.7): the side it runs on, whose count its
+// requests are held against (section 5.1), and its own slots when it has
+// them. For a WSGI mount, reserved threads only it uses and the most
+// requests it runs at once; requests beyond the reserved threads, up to
+// the maximum, borrow threads of the shared pool. For an ASGI mount,
+// reserved and max are both its concurrency. Both are 0 for a mount that
+// shares its side's count. connections bounds the open WebSockets an ASGI
+// mount holds apart from the requests it runs, 0 for no bound of its own;
+// handoff_threads are the threads of its own that requests it hands to
+// WSGI run on, 0 when they use the shared pool (section 6.14).
 message MountPool {
   string mount = 1;
   uint32 reserved = 2;

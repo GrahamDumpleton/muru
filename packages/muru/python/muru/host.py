@@ -218,6 +218,28 @@ def detect_interface(app: Any) -> str:
     return "wsgi"
 
 
+# The sides of a worker in its report (section 11.7): its application
+# threads, its event loop, the fullest of the pools synchronous code
+# runs on for the loop, and each of those pools by name.
+
+SIDES = ("threads", "loop", "sync", "sync_pools")
+
+
+def sync_pools(sides: dict[str, Any]) -> dict[str, Any]:
+    """Return a worker's pools for synchronous code, for the status sent to the supervisor.
+
+    Each by name with its busy threads and its threads; empty for a
+    worker without an event loop, which has no such pool.
+    """
+
+    pools = sides.get("sync_pools")
+
+    if not isinstance(pools, dict):
+        return {}
+
+    return {"sync_pools": pools}
+
+
 def interface_name(interface: str) -> str:
     """Return an interface as messages name it: WSGI, ASGI or gRPC."""
 
@@ -511,42 +533,51 @@ class Mount:
 
     @classmethod
     def parse(cls, text: str, context: Context, threads: int) -> Mount:
-        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]].
+        """Parse NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX[=CONCURRENCY,CONNECTIONS]]].
 
-        A gRPC mount's PATH is empty, and for an ASGI mount the last part
-        is CONCURRENCY,CONNECTIONS instead.
+        A gRPC mount's PATH is empty. RESERVED,MAX are the mount's own
+        threads and may be left empty before CONCURRENCY,CONNECTIONS, an
+        ASGI mount's own limits. A mount whose interface is left to be
+        detected may carry limits, which its worker checks against what
+        it detects.
         """
 
-        form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]"
+        form = "NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX[=CONCURRENCY,CONNECTIONS]]]"
         parts = text.split("=")
         interface = parts[3] if len(parts) >= 4 else "auto"
         path_given = parts[1].startswith("/") if len(parts) > 1 else False
 
-        if len(parts) not in (3, 4, 5) or not parts[0] or path_given == (interface == "grpc"):
+        if len(parts) not in (3, 4, 5, 6) or not parts[0] or path_given == (interface == "grpc"):
             raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
 
         if interface not in INTERFACES:
             raise argparse.ArgumentTypeError(f"{interface!r} is not an interface")
 
-        own: tuple[int, int] | None = None
-        limits: tuple[int, int] | None = None
-
-        if len(parts) == 5:
+        def pair(part: str) -> tuple[int, int]:
             try:
-                first, second = (int(part) for part in parts[4].split(","))
+                first, second = (int(number) for number in part.split(","))
             except ValueError:
                 raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
 
-            if interface == "asgi":
-                if first < 0 or second < 0:
-                    raise argparse.ArgumentTypeError(f"{text!r} has limits below nothing")
+            return first, second
 
-                limits = (first, second)
-            else:
-                if first < 0 or second < max(first, 1):
-                    raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+        own: tuple[int, int] | None = None
+        limits: tuple[int, int] | None = None
 
-                own = (first, second)
+        if len(parts) >= 5 and (parts[4] or len(parts) == 5):
+            own = pair(parts[4])
+
+            if own[0] < 0 or own[1] < max(own[0], 1):
+                raise argparse.ArgumentTypeError(f"{text!r} has threads that cannot run")
+
+        if len(parts) == 6:
+            limits = pair(parts[5])
+
+            if limits[0] < 0 or limits[1] < 0:
+                raise argparse.ArgumentTypeError(f"{text!r} has limits below nothing")
+
+            if interface in ("wsgi", "grpc"):
+                raise argparse.ArgumentTypeError(f"{text!r} has limits only an ASGI mount takes")
 
         release = Release(parts[2], None, context, threads=threads, interface=interface)
         return cls(parts[0], parts[1], release, own, limits)
@@ -1009,6 +1040,12 @@ class Host:
         self.version = 0
         self.acked = 0
 
+        # Section 6.7: the interfaces the workers settled themselves, by
+        # mount, for an application imported in each worker or made by a
+        # factory there, which the host never loads.
+
+        self.settled_by_workers: dict[str, str] = {}
+
         if control is not None:
             try:
                 os.unlink(control)
@@ -1357,6 +1394,25 @@ class Host:
                         f"{interface_name(mounted.resolved)}"
                     )
 
+            # What this worker settled that the host could not, the
+            # default mount's under the empty name, goes to the host,
+            # which announces it with its own (section 6.7).
+
+            settled = {
+                name: mounted.resolved
+                for name, _, mounted, _ in realised
+                if name not in known_mounts and mounted.resolved is not None
+            }
+
+            if not known and release.resolved is not None:
+                settled[""] = release.resolved
+
+            if settled and report is not None:
+                try:
+                    os.write(report, (json.dumps({"interfaces": settled}) + "\n").encode())
+                except OSError:
+                    pass
+
             # Section 6.14: a handoff is checked against the interface it
             # hands from, and a WSGI application that hands to ASGI needs
             # the loop as much as an ASGI one.
@@ -1388,6 +1444,18 @@ class Host:
                         f"mount {name}: an ASGI mount's threads are a fixed pool, a number"
                     )
 
+                # Section 6.7: limits size a mount's place on the event
+                # loop, so a mount left to be detected that turns out to
+                # run on threads is refused them here, as an ASGI one is
+                # refused threads above.
+
+                if limits[name] is not None and mounted.resolved != "asgi":
+                    raise ValueError(
+                        f"mount {name}: concurrency and max_connections are an ASGI mount's, "
+                        f"which runs on the event loop, and {mounted.spec} is "
+                        f"{interface_name(mounted.resolved or 'wsgi')}, which runs on threads"
+                    )
+
             # Section 6.5: the shared pool serves a WSGI default mount and
             # every WSGI mount that has no threads of its own or borrows;
             # section 6.14: and the requests an ASGI application without
@@ -1408,6 +1476,12 @@ class Host:
             if any_asgi:
                 loop = _asgi.Loop(group.sync_threads)
                 loop.start()
+
+                # Section 6.6: anyio and asgiref run synchronous code on
+                # threads of their own, which the worker bounds and
+                # counts from here on.
+
+                loop.adopt_sync_pools()
 
             if loop is not None and release.resolved == "asgi":
                 lifespan = _asgi.Lifespan(app, loop, release.spec)
@@ -1497,7 +1571,11 @@ class Host:
         asgi_arguments: dict[str, Any] = {}
 
         if loop is not None:
-            asgi_arguments = {"event_loop": loop.loop, "concurrency": group.concurrency}
+            asgi_arguments = {
+                "event_loop": loop.loop,
+                "concurrency": group.concurrency,
+                "sync_threads": max(1, group.sync_threads),
+            }
 
         if loop is not None and lifespan is not None:
             asgi_arguments["runner"] = _asgi.runner(app, loop, lifespan.state)
@@ -1566,7 +1644,8 @@ class Host:
                     active,
                     loop.loop if loop is not None else None,
                     names,
-                    slots=group.threads if loop is None else group.concurrency,
+                    threads=shared_threads + sum(own[0] for _, _, _, own in realised if own),
+                    concurrency=group.concurrency if loop is not None else 0,
                 ),
                 grpc_methods=grpc_methods,
                 handoff=self.handoff is not None,
@@ -1809,19 +1888,39 @@ class Host:
         }
 
     def interfaces(self) -> dict[str, str]:
-        """Return the interfaces settled in the host, by mount, the default as ``""``.
+        """Return the interfaces settled so far, by mount, the default as ``""``.
 
-        One that each worker settles, importing the application itself or
-        calling a factory, is not known here and is left out.
+        Those the host settled when it loaded the applications, and those
+        its workers settled and reported, importing the application
+        themselves or calling a factory; one no worker has reported yet
+        is left out.
         """
 
-        settled = {"": self.release.resolved} if self.release.resolved else {}
+        settled = dict(self.settled_by_workers)
+
+        if self.release.resolved:
+            settled[""] = self.release.resolved
 
         for mount in self.mounts:
             if mount.release.resolved:
                 settled[mount.name] = mount.release.resolved
 
         return settled
+
+    def settle(self, interfaces: Any) -> bool:
+        """Take the interfaces a worker settled itself; say whether any is new."""
+
+        if not isinstance(interfaces, dict):
+            return False
+
+        found = {
+            str(mount): interface
+            for mount, interface in interfaces.items()
+            if interface in ("wsgi", "asgi", "grpc")
+        }
+        changed = any(self.settled_by_workers.get(mount) != found[mount] for mount in found)
+        self.settled_by_workers.update(found)
+        return changed
 
     def announce(self) -> int:
         """Tell the supervisor the worker sockets changed; return the version."""
@@ -2178,7 +2277,7 @@ class Host:
                 "debugging": state.debug_sessions > 0,
                 "uptime_s": round(time.monotonic() - state.started_at, 1),
                 "requests": state.requests,
-                **{key: sides[key] for key in ("threads", "loop") if key in sides},
+                **{key: sides[key] for key in SIDES if key in sides},
                 "stale": live is None and bool(state.sides),
                 **state.memory,
             },
@@ -2405,11 +2504,21 @@ class Host:
 
                 continue
 
+            # Section 6.7: what the worker settled its entrypoints as,
+            # sent once before it serves; the supervisor is told when it
+            # is news.
+
+            if "interfaces" in report:
+                if self.settle(report["interfaces"]):
+                    self.announce()
+
+                continue
+
             state.last_report_at = time.monotonic()
             state.requests = int(report.get("requests", state.requests))
             state.in_flight = int(report.get("in_flight", state.in_flight))
             state.oldest_ms = int(report.get("oldest_ms", state.oldest_ms))
-            state.sides = {key: report[key] for key in ("threads", "loop") if key in report}
+            state.sides = {key: report[key] for key in SIDES if key in report}
 
             if "rss" in report:
                 measured = True
@@ -2428,6 +2537,8 @@ class Host:
                         "gil_wait_us",
                         "loop_lag",
                         "loop_lag_us",
+                        "handoff_wait",
+                        "handoff_wait_us",
                         "gc",
                     )
                     if key in report
@@ -2569,6 +2680,7 @@ class Host:
                         "requests": state.requests,
                         "in_flight": state.in_flight,
                         "oldest_ms": state.oldest_ms,
+                        **sync_pools(state.sides),
                         **state.memory,
                         **state.signals,
                     }
@@ -3742,9 +3854,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--mount",
         action="append",
         default=[],
-        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX]]",
-        help="a named mount served by another entrypoint at a path; for an ASGI mount "
-        "the last part is CONCURRENCY,CONNECTIONS",
+        metavar="NAME=PATH=ENTRYPOINT[=INTERFACE[=RESERVED,MAX[=CONCURRENCY,CONNECTIONS]]]",
+        help="a named mount served by another entrypoint at a path, with its own threads "
+        "and, for an ASGI mount, its own limits",
     )
     parser.add_argument(
         "--log-level",

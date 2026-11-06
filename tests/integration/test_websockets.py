@@ -249,12 +249,14 @@ def test_open_websockets_are_counted_apart_from_requests() -> None:
 
             # The overview's In flight tile counts what the metric does,
             # the sockets stand in their own tile, and the worker's busy
-            # slots include the two the sockets hold.
+            # slots on its event loop include the two the sockets hold.
 
             overview = read("/fragment/overview")
             assert '<div class="label">In flight</div><div class="value">0</div>' in overview
             assert '<div class="label">WebSockets open</div><div class="value">2</div>' in overview
-            assert re.search(r'<th class="num">Busy</th>.*?<td class="num">2</td>', overview, re.S)
+            assert re.search(
+                r'<th class="num">Loop</th>.*?<td class="num">2/\d+</td>', overview, re.S
+            )
 
         # Each close is a line of its own, with who closed, the code and
         # the messages each way; the lifetime goes to its own histogram.

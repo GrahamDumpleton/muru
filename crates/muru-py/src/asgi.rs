@@ -37,6 +37,10 @@ pub struct Asgi {
     pub resolver: Py<PyAny>,
     /// How many requests the loop holds at once: the async slots in HELLO.
     pub concurrency: usize,
+    /// The threads of the loop's pool for synchronous code (section
+    /// 6.6), which `sync_to_async` and `asyncio.to_thread` run on; 0
+    /// when the worker was not told.
+    pub sync_threads: usize,
 }
 
 /// A message on its way to the application's `receive()`.

@@ -19,6 +19,7 @@ specification is maintained.
 | Worker link server | Rust inside the extension, started after fork. No grpcio anywhere in the worker |
 | Application threads | A fixed pool of long-lived threads with persistent Python thread states, each request in a fresh contextvars context (ADR 0022) |
 | WSGI and ASGI in one worker | Requests handed across per request in either direction: the muru.wsgi_to_asgi environ key and the asgi_to_wsgi scope extension, with lifespan registration and a WebSocket adapter under muru.asgi, each direction enabled by a handoff setting (ADR 0023, ADR 0042) |
+| Counting requests in a worker with both interfaces | The side that runs a request counts it: threads for WSGI, the event loop's concurrency for ASGI, whichever the default mount is, with a detected interface resolved once and used everywhere after start-up (ADR 0048) |
 | Preload | auto by default everywhere: preload with an import check, falling back to per-worker imports when the import left sockets, threads, child processes or event loops behind (sections 6.1 and 6.2) |
 | Releases | Immutable. Configuration changes are new releases |
 | Provisioning | One procedure, muructl build, called by muructl run, the daemon's Building state and the image build stage. Install from locks, never resolve. One knob, build.when: auto builds what is missing and leaves what exists alone, always builds on every start and lock change, never builds nothing; the same key in development and under the daemon. A missing interpreter is installed only where an environment would be built (ADR 0036) |

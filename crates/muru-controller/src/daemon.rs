@@ -540,10 +540,9 @@ pub struct Info {
     /// WebSockets open by application and release, from the edge's
     /// metrics as last sampled.
     pub websockets: std::sync::Mutex<HashMap<(String, String), u64>>,
-    /// What each release's entrypoints were detected as, by application
-    /// and release, then by mount, the default mount's under the empty
-    /// name: as its host last announced them.
-    pub interfaces: std::sync::Mutex<Interfaces>,
+    /// What each release's entrypoints run as, as its host last
+    /// announced them.
+    pub interfaces: Interfaces,
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
@@ -552,8 +551,72 @@ pub struct Info {
     pub provisioning: crate::provision::Provisioning,
 }
 
-/// Detected interfaces by application and release, then by mount.
-pub type Interfaces = HashMap<(String, String), Vec<(String, String)>>;
+/// What each release's entrypoints run as (section 6.7): the interface
+/// its host settled for each, a declared one as declared and one left to
+/// be detected as the callable showed, as the host last announced them.
+/// Everything that needs an interface once a release has started takes
+/// it from `runs_as`, never from the configuration, where it may still
+/// say `auto`.
+#[derive(Debug, Default)]
+pub struct Interfaces {
+    /// By application and release.
+    announced: std::sync::Mutex<HashMap<(String, String), Announced>>,
+}
+
+/// What one release's host announced: each mount with its interface, the
+/// default mount's under the empty name.
+type Announced = Vec<(String, String)>;
+
+impl Interfaces {
+    /// Record what a release's host announced, each mount with its
+    /// interface. An announcement that names none leaves the last as it
+    /// was: a host says nothing of what each worker settles for itself.
+    pub fn announce(&self, app: &str, release: &str, interfaces: Vec<(String, String)>) {
+        if interfaces.is_empty() {
+            return;
+        }
+
+        self.announced
+            .lock()
+            .expect("interfaces poisoned")
+            .insert((app.to_owned(), release.to_owned()), interfaces);
+    }
+
+    /// What a release's host announced, each mount with its interface;
+    /// nothing before its first announcement.
+    pub fn announced(&self, app: &str, release: &str) -> Vec<(String, String)> {
+        self.announced
+            .lock()
+            .expect("interfaces poisoned")
+            .get(&(app.to_owned(), release.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The interface a release's default mount, under the empty name,
+    /// or a named mount runs as: what its host announced, and
+    /// `configured` only until it has announced one for the mount.
+    pub fn runs_as(
+        &self,
+        app: &str,
+        release: &str,
+        mount: &str,
+        configured: muru_config::Interface,
+    ) -> muru_config::Interface {
+        let announced = self.announced(app, release);
+        let found = announced
+            .iter()
+            .find(|(name, _)| name == mount)
+            .map(|(_, interface)| interface.as_str());
+
+        match found {
+            Some("wsgi") => muru_config::Interface::Wsgi,
+            Some("asgi") => muru_config::Interface::Asgi,
+            Some("grpc") => muru_config::Interface::Grpc,
+            _ => configured,
+        }
+    }
+}
 
 /// What a ReopenLogs command reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1071,7 +1134,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             },
             ..client_rules.defined()
         }),
-        interfaces: std::sync::Mutex::new(Interfaces::new()),
+        interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
         servers: std::sync::Mutex::new(HashMap::new()),
         provisioning,
@@ -2064,6 +2127,14 @@ impl Daemon {
                     slots_busy: pools.iter().map(|pool| pool.busy as usize).sum(),
                     websockets: pools.iter().map(|pool| pool.websockets as usize).sum(),
                     slots_total: pools.iter().map(|pool| pool.slots as usize).sum(),
+                    threads: muru_dashboard::SlotSide::of(
+                        pools.iter().map(|pool| pool.threads_busy as usize).sum(),
+                        pools.iter().map(|pool| pool.threads as usize).sum(),
+                    ),
+                    event_loop: muru_dashboard::SlotSide::of(
+                        pools.iter().map(|pool| pool.loop_busy as usize).sum(),
+                        pools.iter().map(|pool| pool.loop_slots as usize).sum(),
+                    ),
                     waiting: pools.iter().map(|pool| pool.waiting as usize).sum(),
                     created: clock_hms(release.created_unix_ms),
                 });
@@ -2125,6 +2196,10 @@ impl Daemon {
                     gc: measured(status.workers.gc_share.map(|share| share * 100.0), "%"),
                     gil_wait: measured(status.workers.gil_wait_p95_ms, " ms"),
                     loop_lag: measured(status.workers.loop_lag_p95_ms, " ms"),
+                    handoff_wait: status
+                        .workers
+                        .handoff_queue_wait_p95_ms
+                        .map(|wait| format!("{wait:.0} ms")),
                     diagnosis: status.diagnosis.summary.to_owned(),
                     advice: status.diagnosis.advice.to_owned(),
                     last_decision: status
@@ -3226,6 +3301,25 @@ impl Daemon {
                     worker.in_flight as f64,
                 ));
 
+                // Section 6.6: the pools an ASGI worker runs synchronous
+                // code on, each of which fills while every new call
+                // waits.
+
+                for (pool, busy, threads) in &worker.sync_pools {
+                    let mut labels = labels.to_vec();
+                    labels.push(("pool", pool.as_str()));
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_sync_threads_busy",
+                        &labels,
+                        *busy as f64,
+                    ));
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_worker_sync_threads",
+                        &labels,
+                        *threads as f64,
+                    ));
+                }
+
                 // Section 7.3: the worker's own signals, as histograms
                 // once it has observed anything.
 
@@ -3240,6 +3334,12 @@ impl Daemon {
                     &labels,
                     &worker.loop_lag,
                     worker.loop_lag_us,
+                ));
+                samples.extend(muru_edge::metrics::signal_histogram(
+                    "muru_handoff_queue_wait_seconds",
+                    &labels,
+                    &worker.handoff_wait,
+                    worker.handoff_wait_us,
                 ));
 
                 // Section 11.1: its garbage collections, by generation.
@@ -3442,7 +3542,20 @@ impl Daemon {
                 let scalers = self
                     .store
                     .release(app, id)
-                    .map(|release| scalers_for(&release.spec, &sockets, &record.groups, &pins, now))
+                    .map(|release| {
+                        let interface =
+                            self.info
+                                .interfaces
+                                .runs_as(app, id, "", release.spec.interface);
+                        scalers_for(
+                            &release.spec,
+                            interface,
+                            &sockets,
+                            &record.groups,
+                            &pins,
+                            now,
+                        )
+                    })
                     .unwrap_or_default();
                 let ready_at = record
                     .sockets
@@ -4536,7 +4649,8 @@ impl Daemon {
         );
         let now = Instant::now();
         let pins = self.store.scale_pins(app, id).unwrap_or_default();
-        let scalers = scalers_for(spec, &sockets, &groups, &pins, now);
+        let interface = self.info.interfaces.runs_as(app, id, "", spec.interface);
+        let scalers = scalers_for(spec, interface, &sockets, &groups, &pins, now);
         let ready_at = host
             .sockets
             .iter()
@@ -7495,17 +7609,25 @@ impl Daemon {
                 groups,
                 interfaces,
             } => {
-                if !interfaces.is_empty() {
-                    self.info
-                        .interfaces
-                        .lock()
-                        .expect("interfaces poisoned")
-                        .insert(key.clone(), interfaces);
-                }
+                self.info.interfaces.announce(app, id, interfaces);
 
                 let Some(running) = self.running.get_mut(&key) else {
                     return;
                 };
+
+                // Section 7.4: the scalers were sized from the
+                // configuration when the release started, which may have
+                // left the interface to be detected; they follow what
+                // the host found.
+
+                if let Ok(release) = self.store.release(app, id) {
+                    let interface =
+                        self.info
+                            .interfaces
+                            .runs_as(app, id, "", release.spec.interface);
+                    size_scalers(&mut running.scalers, &release.spec, interface);
+                }
+
                 let Some((record, pid)) = running.backend.host().map(|host| {
                     (
                         host.run_dir().join("..").join("host.toml"),
@@ -8085,32 +8207,62 @@ fn reopen_own_log(path: &std::path::Path) {
     }
 }
 
+/// Sections 7.3 and 7.4: what one worker offers before the edge has
+/// counted any, and the threads it runs Python on at once without a GIL,
+/// by the interface the release's default mount runs as: its threads for
+/// WSGI, and for ASGI its event loop's concurrency, and its sync threads
+/// with the loop's own. gRPC calls are held on the event loop too
+/// (section 6.13).
+fn worker_size(
+    interface: muru_config::Interface,
+    threads: u32,
+    sync_threads: u32,
+    concurrency: u32,
+) -> (f64, u32) {
+    match interface {
+        muru_config::Interface::Asgi | muru_config::Interface::Grpc => {
+            (concurrency as f64, sync_threads + 1)
+        }
+        muru_config::Interface::Wsgi | muru_config::Interface::Auto => (threads as f64, threads),
+    }
+}
+
+/// Size each group's scaler for the interface the release runs as, which
+/// its host announces once it has loaded the application: a release left
+/// to be detected is sized as WSGI only until then.
+fn size_scalers(
+    scalers: &mut [GroupScaling],
+    spec: &ReleaseSpec,
+    interface: muru_config::Interface,
+) {
+    for scaling in scalers {
+        let sizes = if scaling.name == muru_edge::routing::DEFAULT_GROUP {
+            Some((spec.threads, spec.sync_threads, spec.concurrency))
+        } else {
+            spec.groups
+                .iter()
+                .find(|group| group.name == scaling.name)
+                .map(|group| (group.threads, group.sync_threads, group.concurrency))
+        };
+
+        if let Some((threads, sync_threads, concurrency)) = sizes {
+            (scaling.slots_per_worker, scaling.threads) =
+                worker_size(interface, threads, sync_threads, concurrency);
+        }
+    }
+}
+
 /// Section 7.4: the scaling state of each group of a release that is
-/// starting or adopted, from its spec, the workers it has and the pins
-/// an operator left on it.
+/// starting or adopted, from its spec, the interface it runs as, the
+/// workers it has and the pins an operator left on it.
 fn scalers_for(
     spec: &ReleaseSpec,
+    interface: muru_config::Interface,
     sockets: &[PathBuf],
     groups: &[GroupRecord],
     pins: &[(String, u32)],
     now: Instant,
 ) -> Vec<GroupScaling> {
-    // gRPC calls are held on the event loop too (section 6.13).
-
-    let asgi = matches!(
-        spec.interface,
-        muru_config::Interface::Asgi | muru_config::Interface::Grpc
-    );
-    let slots = |threads: u32, concurrency: u32| {
-        if asgi {
-            concurrency as f64
-        } else {
-            threads as f64
-        }
-    };
-    let threads = |threads: u32, sync_threads: u32| {
-        if asgi { sync_threads + 1 } else { threads }
-    };
     let memory_limit = spec
         .memory
         .soft_limit
@@ -8118,9 +8270,9 @@ fn scalers_for(
     let mut scalers = vec![GroupScaling {
         name: muru_edge::routing::DEFAULT_GROUP.to_owned(),
         scaler: Scaler::new(spec.scaling.clone(), sockets.len() as u32),
-        slots_per_worker: slots(spec.threads, spec.concurrency),
+        slots_per_worker: 0.0,
         requested: None,
-        threads: threads(spec.threads, spec.sync_threads),
+        threads: 0,
         memory_limit,
         denied: None,
     }];
@@ -8133,13 +8285,15 @@ fn scalers_for(
         scalers.push(GroupScaling {
             name: group.name.clone(),
             scaler: Scaler::new(group.scaling.clone(), current as u32),
-            slots_per_worker: slots(group.threads, group.concurrency),
+            slots_per_worker: 0.0,
             requested: None,
-            threads: threads(group.threads, group.sync_threads),
+            threads: 0,
             memory_limit,
             denied: None,
         });
     }
+
+    size_scalers(&mut scalers, spec, interface);
 
     for (name, count) in pins {
         if let Some(scaling) = scalers.iter_mut().find(|scaling| &scaling.name == name) {
@@ -8380,5 +8534,60 @@ mod tests {
     #[test]
     fn the_clock_state_can_be_read_here() {
         assert!(clock_synchronised().is_some());
+    }
+
+    #[test]
+    fn an_interface_is_the_announced_one_and_the_configured_one_only_until_then() {
+        use muru_config::Interface;
+
+        let interfaces = Interfaces::default();
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "", Interface::Auto),
+            Interface::Auto
+        );
+
+        interfaces.announce(
+            "shop",
+            "r1",
+            vec![
+                (String::new(), "asgi".to_owned()),
+                ("legacy".to_owned(), "wsgi".to_owned()),
+            ],
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "", Interface::Auto),
+            Interface::Asgi
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "legacy", Interface::Auto),
+            Interface::Wsgi
+        );
+
+        // A mount the host did not name, another release, and an
+        // announcement that names nothing, which leaves the last one.
+
+        assert_eq!(
+            interfaces.runs_as("shop", "r1", "live", Interface::Auto),
+            Interface::Auto
+        );
+        assert_eq!(
+            interfaces.runs_as("shop", "r2", "", Interface::Wsgi),
+            Interface::Wsgi
+        );
+        interfaces.announce("shop", "r1", Vec::new());
+        assert_eq!(interfaces.announced("shop", "r1").len(), 2);
+    }
+
+    #[test]
+    fn a_release_detected_as_asgi_is_sized_by_its_event_loop() {
+        use muru_config::Interface;
+
+        // Threads 4, sync threads 8, concurrency 1000: as WSGI until the
+        // host has said what it detected, then by the loop.
+
+        assert_eq!(worker_size(Interface::Auto, 4, 8, 1000), (4.0, 4));
+        assert_eq!(worker_size(Interface::Wsgi, 4, 8, 1000), (4.0, 4));
+        assert_eq!(worker_size(Interface::Asgi, 4, 8, 1000), (1000.0, 9));
+        assert_eq!(worker_size(Interface::Grpc, 4, 8, 1000), (1000.0, 9));
     }
 }

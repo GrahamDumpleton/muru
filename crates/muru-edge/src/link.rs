@@ -85,32 +85,52 @@ struct WorkerSlots {
     websockets: bool,
     /// The named mounts that accept websocket scopes (section 6.14).
     websocket_mounts: Vec<String>,
-    /// Requests the worker takes at once, from its HELLO: its threads for
-    /// a WSGI worker, its event loop concurrency for an ASGI one.
-    slots: usize,
-    /// Requests its event loop holds at once, from its HELLO; 0 for a
-    /// worker with no loop.
-    async_slots: usize,
     /// Its default mount runs on the event loop.
     default_async: bool,
-    /// The default mount's side: its threads, or its loop's concurrency.
-    semaphore: Arc<Semaphore>,
-    /// The other side, which requests handed across count against
-    /// (section 6.14); none when the worker declares no slots there.
-    other: Option<Arc<Semaphore>>,
-    /// How many requests the other side takes at once; 0 without one.
-    other_slots: usize,
-    /// Section 6.7: the mounts with threads of their own, by name.
+    /// Section 5.1: the count of its shared thread pool, which a request
+    /// to anything that runs on a thread is held against; none when
+    /// nothing it serves does.
+    threads: Option<Side>,
+    /// The count of its event loop, which a request to anything that
+    /// runs on the loop is held against; none for a worker with no loop.
+    event_loop: Option<Side>,
+    /// Section 6.7: its named mounts, by name, each with the side it runs
+    /// on and the slots of its own when it has them.
     mounts: HashMap<String, MountSlots>,
     /// The gRPC methods its mounts registered, from HELLO (section 6.13).
     grpc: Vec<pb::GrpcMethod>,
     idle: Mutex<Vec<Conn>>,
 }
 
-/// A mount's own slots on one worker (section 6.7): its reserved slots,
-/// and for one that borrows, its allowance of the shared pool's; for an
-/// ASGI mount, its concurrency, or none when it shares the worker's
-/// slots, and the open WebSockets it may hold apart from them.
+/// One side of a worker (section 5.1): how many requests it takes at
+/// once, and the count of the places free.
+struct Side {
+    slots: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl Side {
+    fn new(slots: usize) -> Option<Self> {
+        (slots > 0).then(|| Self {
+            slots,
+            semaphore: Arc::new(Semaphore::new(slots)),
+        })
+    }
+
+    /// Requests holding a place. One handed across to a full side is
+    /// over the count and is not seen until it takes a place.
+    fn busy(&self) -> usize {
+        self.slots
+            .saturating_sub(self.semaphore.available_permits())
+    }
+}
+
+/// A named mount on one worker (section 6.7): the side it runs on and,
+/// when it has them, slots of its own. For a WSGI mount those are its
+/// reserved threads and, for one that borrows, its allowance of the
+/// shared pool's; for an ASGI mount, its concurrency, and the open
+/// WebSockets it may hold apart from them. A mount without slots of its
+/// own is held against its side's count.
 struct MountSlots {
     reserved: usize,
     own: Option<Arc<Semaphore>>,
@@ -118,14 +138,14 @@ struct MountSlots {
     connections: Option<Arc<Semaphore>>,
     /// The threads of its own that an ASGI mount's handoffs to WSGI run
     /// on (section 6.14).
-    handoff: Option<Arc<Semaphore>>,
+    handoff: Option<Side>,
     /// The mount runs its requests on the event loop.
     on_loop: bool,
 }
 
 impl WorkerSlots {
     fn new(path: PathBuf, hello: pb::Hello, conn: Conn) -> Self {
-        let slots = capacity(&hello);
+        let (threads, event_loop, default_async) = sides(&hello);
         let mounts = hello
             .mount_pools
             .iter()
@@ -139,70 +159,75 @@ impl WorkerSlots {
                     own: (max > 0).then(|| Arc::new(Semaphore::new(reserved))),
                     allowance: (max > reserved).then(|| Arc::new(Semaphore::new(max - reserved))),
                     connections: (connections > 0).then(|| Arc::new(Semaphore::new(connections))),
-                    handoff: (handoff > 0).then(|| Arc::new(Semaphore::new(handoff))),
+                    handoff: Side::new(handoff),
                     on_loop: pool.on_loop,
                 };
                 (pool.mount.clone(), slots)
             })
             .collect();
 
-        // Section 6.14: the default mount's side is the shared count; the
-        // other side is the one requests handed across move to.
-
-        let default_async = hello.worker_type == "asgi";
-        let other = usize::try_from(if default_async {
-            hello.slots
-        } else {
-            hello.async_slots
-        })
-        .unwrap_or(usize::MAX);
-
         Self {
             path,
             default_async,
-            other: (other > 0).then(|| Arc::new(Semaphore::new(other))),
-            other_slots: other,
+            threads,
+            event_loop,
             worker_type: hello.worker_type,
             websockets: hello.websockets,
             websocket_mounts: hello.websocket_mounts,
-            slots,
-            async_slots: usize::try_from(hello.async_slots).unwrap_or(usize::MAX),
-            semaphore: Arc::new(Semaphore::new(slots)),
             mounts,
             grpc: hello.grpc_methods,
             idle: Mutex::new(vec![conn]),
         }
     }
 
+    /// Whether a request to the mount runs on the event loop (sections
+    /// 5.1 and 11.7): what the worker declared for a named mount, and
+    /// the default mount's side for the default mount, or for a mount
+    /// the worker did not name.
+    fn on_loop(&self, mount: &str) -> bool {
+        self.mounts
+            .get(mount)
+            .map_or(self.default_async, |slots| slots.on_loop)
+    }
+
+    /// One of the worker's two sides, when it has it.
+    fn side(&self, on_loop: bool) -> Option<&Side> {
+        if on_loop {
+            self.event_loop.as_ref()
+        } else {
+            self.threads.as_ref()
+        }
+    }
+
+    /// Section 5.1: the count a request to the mount is held against
+    /// when the mount has no slots of its own, or borrows: that of the
+    /// side the mount runs on. A worker that declared nothing for that
+    /// side holds the request against the side it has.
+    fn count(&self, mount: &str) -> &Arc<Semaphore> {
+        let on_loop = self.on_loop(mount);
+
+        &self
+            .side(on_loop)
+            .or_else(|| self.side(!on_loop))
+            .expect("a worker has a side")
+            .semaphore
+    }
+
     /// The count a request to the mount moves to when it is handed to the
     /// event loop or to the threads (section 6.14): the mount's own
-    /// handoff threads, else the worker's side.
-    fn side(&self, to_loop: bool, mount: &str) -> Option<Arc<Semaphore>> {
+    /// handoff threads, else the worker's side; none when the worker
+    /// declared nothing there.
+    fn handed_to(&self, to_loop: bool, mount: &str) -> Option<Arc<Semaphore>> {
         if !to_loop
             && let Some(handoff) = self
                 .mounts
                 .get(mount)
                 .and_then(|slots| slots.handoff.as_ref())
         {
-            return Some(Arc::clone(handoff));
+            return Some(Arc::clone(&handoff.semaphore));
         }
 
-        if to_loop == self.default_async {
-            Some(Arc::clone(&self.semaphore))
-        } else {
-            self.other.clone()
-        }
-    }
-
-    /// Whether a request to the mount, holding a slot of the mount's own
-    /// unless it borrowed a shared one, runs on the event loop (section
-    /// 11.7): the mount's side when it has slots of its own, else the
-    /// default mount's.
-    fn on_loop(&self, mount: &str, borrowed: bool) -> bool {
-        match self.mounts.get(mount) {
-            Some(slots) if slots.own.is_some() && !borrowed => slots.on_loop,
-            _ => self.default_async,
-        }
+        self.side(to_loop).map(|side| Arc::clone(&side.semaphore))
     }
 
     /// Whether a request to the mount takes a WebSocket upgrade as a
@@ -215,34 +240,39 @@ impl WorkerSlots {
         }
     }
 
-    /// Its slots: the shared pool's and the mounts' reserved ones.
-    fn slots(&self) -> usize {
-        self.slots
+    /// The slots of one side: the side's own count, the reserved slots
+    /// of the mounts that run on it and, for the threads, the pools that
+    /// ASGI mounts hand requests to.
+    fn slots(&self, on_loop: bool) -> usize {
+        self.side(on_loop).map_or(0, |side| side.slots)
             + self
                 .mounts
                 .values()
-                .map(|mount| mount.reserved)
+                .map(|mount| mount.slots(on_loop))
                 .sum::<usize>()
     }
 
-    /// Requests it is running, on the shared pool and the mounts' own.
-    fn in_flight(&self) -> usize {
-        self.slots - self.semaphore.available_permits()
+    /// Requests it holds on one side, against the side's own count and
+    /// against the slots of the mounts that run on it.
+    fn busy(&self, on_loop: bool) -> usize {
+        self.side(on_loop).map_or(0, Side::busy)
             + self
                 .mounts
                 .values()
-                .map(|mount| {
-                    mount.own.as_ref().map_or(0, |own| {
-                        mount.reserved.saturating_sub(own.available_permits())
-                    })
-                })
+                .map(|mount| mount.busy(on_loop))
                 .sum::<usize>()
+    }
+
+    /// Requests it holds, on both sides.
+    fn in_flight(&self) -> usize {
+        self.busy(false) + self.busy(true)
     }
 
     /// Slots free for a request to the mount: its own and what it may
-    /// borrow, or the shared pool's for a mount without slots of its own.
+    /// borrow, or those of the side it runs on for a mount without slots
+    /// of its own.
     fn free(&self, mount: &str) -> usize {
-        let shared = self.semaphore.available_permits();
+        let shared = self.count(mount).available_permits();
 
         let Some(own) = self.mounts.get(mount).and_then(|slots| slots.own.as_ref()) else {
             return shared;
@@ -256,8 +286,8 @@ impl WorkerSlots {
     }
 
     /// Take a slot for a request to the mount, waiting for one: one of
-    /// its own first, else a shared one within its allowance, else the
-    /// shared pool's for a mount without slots of its own. A WebSocket
+    /// its own first, else a shared one within its allowance, else one
+    /// of the side it runs on for a mount without slots of its own. A WebSocket
     /// upgrade to a mount that bounds its open sockets first takes a
     /// place among them, which it keeps once accepted. Says whether the
     /// slot was borrowed.
@@ -275,11 +305,10 @@ impl WorkerSlots {
             _ => None,
         };
 
+        let shared = self.count(mount);
+
         let Some(own) = slots.and_then(|slots| slots.own.as_ref()) else {
-            let permit = Arc::clone(&self.semaphore)
-                .acquire_owned()
-                .await
-                .map_err(closed)?;
+            let permit = Arc::clone(shared).acquire_owned().await.map_err(closed)?;
             return Ok((Slot::new(permit, None, connection), false));
         };
 
@@ -294,7 +323,7 @@ impl WorkerSlots {
 
         let borrowed = async {
             let allowed = Arc::clone(allowance).acquire_owned().await?;
-            let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
+            let permit = Arc::clone(shared).acquire_owned().await?;
             Ok::<_, tokio::sync::AcquireError>((permit, allowed))
         };
 
@@ -308,6 +337,46 @@ impl WorkerSlots {
                 Ok((Slot::new(permit, Some(allowed), connection), true))
             }
         }
+    }
+}
+
+impl MountSlots {
+    /// What the mount adds to a side's slots: its reserved slots on the
+    /// side it runs on, and on the threads, those its handoffs to WSGI
+    /// run on.
+    fn slots(&self, on_loop: bool) -> usize {
+        let reserved = if self.on_loop == on_loop {
+            self.reserved
+        } else {
+            0
+        };
+
+        let handoff = self
+            .handoff
+            .as_ref()
+            .filter(|_| !on_loop)
+            .map_or(0, |handoff| handoff.slots);
+
+        reserved + handoff
+    }
+
+    /// Requests holding the slots `slots` counts.
+    fn busy(&self, on_loop: bool) -> usize {
+        let own = self
+            .own
+            .as_ref()
+            .filter(|_| self.on_loop == on_loop)
+            .map_or(0, |own| {
+                self.reserved.saturating_sub(own.available_permits())
+            });
+
+        let handoff = self
+            .handoff
+            .as_ref()
+            .filter(|_| !on_loop)
+            .map_or(0, Side::busy);
+
+        own + handoff
     }
 }
 
@@ -401,26 +470,75 @@ impl Drop for Slot {
     }
 }
 
-/// What a worker's pool looks like right now.
+/// What a worker's pool looks like right now (section 5.1): a request is
+/// held against the side that runs it, so each side has its own slots
+/// and its own count of the busy ones.
 #[derive(Debug, Clone)]
 pub struct WorkerStatus {
     /// The worker's index.
     pub index: usize,
     /// Its link socket.
     pub path: PathBuf,
-    /// What it called itself in HELLO: wsgi or asgi.
+    /// The side its default mount runs on, as it said in HELLO: wsgi or
+    /// asgi.
     pub worker_type: String,
-    /// Requests it can handle at once: threads, or the loop's concurrency.
+    /// Requests it can hold at once, on its threads and its event loop
+    /// together.
     pub slots: usize,
-    /// Requests its event loop holds at once, 0 without a loop: beside
-    /// the threads, a WSGI worker has one when a mount is ASGI.
-    pub async_slots: usize,
-    /// Requests it is handling now.
+    /// Requests it holds now, on both sides.
     pub in_flight: usize,
-    /// Its application threads, on which requests run; 0 when none do.
+    /// Requests it runs at once on threads: the shared pool's, the
+    /// reserved threads of its mounts and the threads ASGI mounts hand
+    /// requests to; 0 when nothing it serves runs on a thread.
     pub threads: usize,
-    /// Requests its event loop holds at once; 0 without a loop.
+    /// Requests it holds on those threads now.
+    pub threads_busy: usize,
+    /// Requests its event loop holds at once: its concurrency and the
+    /// concurrency of the mounts with their own; 0 without a loop.
     pub loop_slots: usize,
+    /// Requests it holds on its event loop now.
+    pub loop_busy: usize,
+    /// The threads of its shared pool; 0 when nothing runs on them.
+    pub shared_threads: usize,
+    /// Its event loop's own concurrency; 0 without a loop.
+    pub concurrency: usize,
+}
+
+impl WorkerStatus {
+    /// The slots and the busy slots of each side the worker has, by the
+    /// side's name: `threads`, then `loop`.
+    pub fn sides(&self) -> impl Iterator<Item = (&'static str, usize, usize)> {
+        [
+            (SIDE_THREADS, self.threads, self.threads_busy),
+            (SIDE_LOOP, self.loop_slots, self.loop_busy),
+        ]
+        .into_iter()
+        .filter(|(_, slots, _)| *slots > 0)
+    }
+}
+
+/// The name of a worker's thread side, as the metrics label it.
+pub const SIDE_THREADS: &str = "threads";
+
+/// The name of a worker's event loop side, as the metrics label it.
+pub const SIDE_LOOP: &str = "loop";
+
+/// Of the slots and busy slots of each side, the busier side's: the one
+/// with the larger share of its slots busy, and the first of two that
+/// are level. A group is as busy as its busier side, which is the one
+/// that runs out first (section 7.4).
+pub fn busier(sides: impl IntoIterator<Item = (usize, usize)>) -> (usize, usize) {
+    let mut busiest = (0, 0);
+
+    for (slots, busy) in sides {
+        // busy / slots against the busiest so far, without dividing.
+
+        if slots > 0 && (busiest.0 == 0 || busy * busiest.0 > busiest.1 * slots) {
+            busiest = (slots, busy);
+        }
+    }
+
+    busiest
 }
 
 /// A worker a pool was to connect to and could not: its socket was
@@ -605,15 +723,14 @@ impl LinkPool {
                 index,
                 path: worker.path.clone(),
                 worker_type: worker.worker_type.clone(),
-                slots: worker.slots(),
-                async_slots: worker.async_slots,
+                slots: worker.slots(false) + worker.slots(true),
                 in_flight: worker.in_flight(),
-                threads: if worker.default_async {
-                    worker.other_slots
-                } else {
-                    worker.slots()
-                },
-                loop_slots: worker.async_slots,
+                threads: worker.slots(false),
+                threads_busy: worker.busy(false),
+                loop_slots: worker.slots(true),
+                loop_busy: worker.busy(true),
+                shared_threads: worker.side(false).map_or(0, |side| side.slots),
+                concurrency: worker.side(true).map_or(0, |side| side.slots),
             })
             .collect()
     }
@@ -749,7 +866,7 @@ impl LinkPool {
                 permit,
                 worker: best,
                 borrowed,
-                on_loop: worker.on_loop(mount, borrowed),
+                on_loop: worker.on_loop(mount),
                 websockets: worker.accepts_websockets(mount),
                 woken: None,
             });
@@ -765,19 +882,22 @@ impl LinkPool {
     }
 }
 
-/// How many requests a worker takes at once: on its threads when it has
-/// them, otherwise on its event loop.
-fn capacity(hello: &pb::Hello) -> usize {
-    // The default mount's side: an ASGI worker that hands requests to WSGI
-    // declares threads as well, which are the other side (section 6.14).
+/// A worker's two sides, from its HELLO (section 5.1): the count of its
+/// shared threads, the count of its event loop, and whether its default
+/// mount runs on the loop. A side the worker declared nothing for is
+/// none, except the default mount's, which takes one request at a time
+/// at the least. A worker that declared no threads has its default mount
+/// on the loop whatever it called itself.
+fn sides(hello: &pb::Hello) -> (Option<Side>, Option<Side>, bool) {
+    let threads = usize::try_from(hello.slots).unwrap_or(usize::MAX);
+    let event_loop = usize::try_from(hello.async_slots).unwrap_or(usize::MAX);
+    let default_async = hello.worker_type == "asgi" || (threads == 0 && event_loop > 0);
 
-    let declared = if hello.worker_type == "asgi" || hello.slots == 0 {
-        hello.async_slots
+    if default_async {
+        (Side::new(threads), Side::new(event_loop.max(1)), true)
     } else {
-        hello.slots
-    };
-
-    usize::try_from(declared).unwrap_or(usize::MAX).max(1)
+        (Side::new(threads.max(1)), Side::new(event_loop), false)
+    }
 }
 
 async fn connect(path: &PathBuf) -> io::Result<(Conn, pb::Hello)> {
@@ -929,7 +1049,7 @@ impl Return {
     /// Section 6.14: the worker handed the request to its event loop, or
     /// to its threads, so the request counts there.
     fn detach(&self, to_loop: bool, mount: &str) {
-        let Some(target) = self.pool.workers[self.worker].side(to_loop, mount) else {
+        let Some(target) = self.pool.workers[self.worker].handed_to(to_loop, mount) else {
             return;
         };
 
@@ -3128,10 +3248,23 @@ mod tests {
 
     use tokio::sync::Semaphore;
 
-    use super::{Kept, LinkPool, Slot};
+    use super::{Kept, LinkPool, Slot, busier};
 
     /// A worker that answers HELLO on every connection and counts them.
     fn fake_worker(path: &Path) -> Arc<AtomicUsize> {
+        fake_worker_saying(
+            path,
+            pb::Hello {
+                protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                slots: 2,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A worker that answers every connection with `hello`, and counts
+    /// the connections.
+    fn fake_worker_saying(path: &Path, hello: pb::Hello) -> Arc<AtomicUsize> {
         let listener = UnixListener::bind(path).unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&accepted);
@@ -3141,17 +3274,13 @@ mod tests {
                 count.fetch_add(1, Ordering::SeqCst);
                 let (read_half, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(FdReader::new(read_half));
+                let reply = hello.clone();
 
                 tokio::spawn(async move {
                     let Ok(Some(_)) = frame::read(&mut reader).await else {
                         return;
                     };
 
-                    let reply = pb::Hello {
-                        protocol_version: pb::PROTOCOL_VERSION.to_owned(),
-                        slots: 2,
-                        ..Default::default()
-                    };
                     let _ = frame::write(&mut writer, kind::HELLO, 0, reply.encode_to_vec().into())
                         .await;
 
@@ -3163,6 +3292,200 @@ mod tests {
         });
 
         accepted
+    }
+
+    /// A pool of one worker that said `hello`.
+    async fn pool_of(dir: &Path, hello: pb::Hello) -> LinkPool {
+        let path = dir.join("worker-0.sock");
+        fake_worker_saying(&path, hello);
+        LinkPool::connect(std::slice::from_ref(&path), &Kept::default())
+            .await
+            .unwrap()
+    }
+
+    /// A named mount without slots of its own, on one side.
+    fn mount(name: &str, on_loop: bool) -> pb::MountPool {
+        pb::MountPool {
+            mount: name.to_owned(),
+            on_loop,
+            ..Default::default()
+        }
+    }
+
+    /// Whether a request to the mount is given a slot at once.
+    async fn waits(pool: &LinkPool, mount: &str) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire(mount))
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn an_asgi_mount_beside_a_wsgi_application_is_held_against_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_of(
+            dir.path(),
+            pb::Hello {
+                protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                worker_type: "wsgi".to_owned(),
+                slots: 2,
+                async_slots: 5,
+                mount_pools: vec![mount("live", true), mount("reports", false)],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // More requests to the ASGI mount than the worker has threads
+        // are all dispatched, and none of them holds a thread.
+
+        let mut held = Vec::new();
+
+        for _ in 0..3 {
+            let lease = pool.acquire("live").await.unwrap();
+            assert!(lease.on_loop);
+            held.push(lease);
+        }
+
+        let status = &pool.workers()[0];
+        assert_eq!((status.threads, status.threads_busy), (2, 0));
+        assert_eq!((status.loop_slots, status.loop_busy), (5, 3));
+
+        // The WSGI application and the WSGI mount share the threads, and
+        // a full thread pool does not hold the ASGI mount back.
+
+        let first = pool.acquire("").await.unwrap();
+        assert!(!first.on_loop);
+        held.push(first);
+        held.push(pool.acquire("reports").await.unwrap());
+        assert!(waits(&pool, "").await);
+        assert!(waits(&pool, "reports").await);
+        held.push(pool.acquire("live").await.unwrap());
+
+        let status = &pool.workers()[0];
+        assert_eq!(status.threads_busy, 2);
+        assert_eq!(status.loop_busy, 4);
+        assert_eq!((status.slots, status.in_flight), (7, 6));
+    }
+
+    #[tokio::test]
+    async fn a_wsgi_mount_beside_an_asgi_application_is_held_against_the_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_of(
+            dir.path(),
+            pb::Hello {
+                protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                worker_type: "asgi".to_owned(),
+                slots: 1,
+                async_slots: 5,
+                mount_pools: vec![mount("legacy", false)],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // The mount's requests queue at the edge once its threads are
+        // busy, however much room the loop has.
+
+        let legacy = pool.acquire("legacy").await.unwrap();
+        assert!(!legacy.on_loop);
+        assert!(waits(&pool, "legacy").await);
+
+        let default = pool.acquire("").await.unwrap();
+        assert!(default.on_loop);
+
+        let status = &pool.workers()[0];
+        assert_eq!((status.threads, status.threads_busy), (1, 1));
+        assert_eq!((status.loop_slots, status.loop_busy), (5, 1));
+    }
+
+    #[tokio::test]
+    async fn a_mount_that_borrows_takes_a_thread_whatever_the_default_mount_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_of(
+            dir.path(),
+            pb::Hello {
+                protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                worker_type: "asgi".to_owned(),
+                slots: 1,
+                async_slots: 5,
+                mount_pools: vec![pb::MountPool {
+                    reserved: 1,
+                    max: 2,
+                    ..mount("reports", false)
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let own = pool.acquire("reports").await.unwrap();
+        assert!(!own.borrowed);
+        let borrowed = pool.acquire("reports").await.unwrap();
+        assert!(borrowed.borrowed);
+        assert!(waits(&pool, "reports").await);
+
+        let status = &pool.workers()[0];
+        assert_eq!((status.threads, status.threads_busy), (2, 2));
+        assert_eq!(status.loop_busy, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mount_the_worker_did_not_name_is_held_against_the_default_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_of(
+            dir.path(),
+            pb::Hello {
+                protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                worker_type: "wsgi".to_owned(),
+                slots: 1,
+                async_slots: 5,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let lease = pool.acquire("live").await.unwrap();
+        assert!(!lease.on_loop);
+        assert!(waits(&pool, "live").await);
+    }
+
+    #[tokio::test]
+    async fn an_asgi_worker_that_runs_nothing_on_threads_has_only_its_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_of(
+            dir.path(),
+            pb::Hello {
+                protocol_version: pb::PROTOCOL_VERSION.to_owned(),
+                worker_type: "asgi".to_owned(),
+                async_slots: 3,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let status = &pool.workers()[0];
+        assert_eq!((status.threads, status.loop_slots), (0, 3));
+        assert_eq!(
+            status.sides().collect::<Vec<_>>(),
+            vec![(super::SIDE_LOOP, 3, 0)]
+        );
+    }
+
+    #[test]
+    fn a_group_is_as_busy_as_its_busier_side() {
+        // Four threads all busy beside a loop with room: the threads.
+
+        assert_eq!(busier([(4, 4), (1000, 20)]), (4, 4));
+
+        // A full loop beside idle threads: the loop.
+
+        assert_eq!(busier([(4, 1), (1000, 900)]), (1000, 900));
+
+        // Level, the first; a side without slots is never chosen.
+
+        assert_eq!(busier([(4, 0), (1000, 0)]), (4, 0));
+        assert_eq!(busier([(0, 0), (1000, 0)]), (1000, 0));
+        assert_eq!(busier([]), (0, 0));
     }
 
     #[tokio::test]
@@ -3208,7 +3531,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
-        assert_eq!(first.workers[0].slots, 2);
+        assert_eq!(first.workers()[0].threads, 2);
+        assert_eq!(first.workers()[0].loop_slots, 0);
 
         // The next routing keeps the worker, connections and all, and
         // connects only to what is new to it; a socket that is missing

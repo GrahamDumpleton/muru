@@ -222,12 +222,12 @@ A mount, the `[app.NAME.release.ID.mounts.NAME]` or `[tool.muru.mounts.NAME]` ta
 | `accel_redirect` | boolean | the release's | Treat an `X-Accel-Redirect` response header from the mount as an internal redirect. |
 | `accept_redirects_from` | array of strings |  | Other applications whose internal redirects may reach the mount when it is internal; the release's own always may. |
 | `cgi_local_redirect` | boolean | the release's | Treat a 200 response with a `Location` starting with `/` and no body as an internal redirect, the CGI convention. |
-| `concurrency` | integer |  | Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the worker's slots when absent. |
+| `concurrency` | integer |  | Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the event loop's concurrency when absent. |
 | `entrypoint` | string | required | The application as module:callable. |
 | `handoff` | string |  | The interface the mount's requests may be handed to; none when absent. `asgi`: Continue the request as an ASGI application on the event loop. `wsgi`: Continue the request as a WSGI callable on the thread pool. |
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `internal` | boolean | `false` | Reachable only through internal redirects: a client's request for its path is answered 404. |
-| `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; unbounded but by its slots when absent. |
+| `max_connections` | integer |  | Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent. |
 | `path` | string |  | The path prefix; the longest wins, on segment boundaries. A gRPC mount has none: its calls are matched by service name. |
 | `sendfile_header` | string | the release's | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile`. |
 | `sendfile_roots` | array of strings | the release's | Directories a path in an `X-Muru-Sendfile` response header must lie in for the edge to serve the file; the release's when absent, and an empty list refuses every hint. |

@@ -63,9 +63,10 @@ which every connection's coroutine runs. The configured concurrency is how
 many requests the worker accepts at once, and WebSockets have a separate
 limit because they live longer.
 
-Synchronous code called through `sync_to_async` or `asyncio.to_thread` runs
-on a separate bounded thread pool in the same worker, so a blocking call
-cannot stall the loop.
+Synchronous code called through `asyncio.to_thread`, or through a
+framework's own way of running `def` views, runs on threads apart from
+the loop in the same worker, bounded by `sync_threads`, so a blocking
+call cannot stall the loop.
 
 ## Choosing processes and threads
 
@@ -167,10 +168,10 @@ Nothing in the framework needs to know.
 
 The handler above is Muru's WebSocket adapter: an ordinary ASGI application
 that accepts the socket and calls `on_connect`, `on_receive` and
-`on_disconnect` on application threads, one call at a time per socket and
-in order, with every call for a socket inside the same context so a value
-set in `on_connect` is visible later whichever thread runs it. Idle
-sockets cost no Python thread. `send` can be called from any thread, which
+`on_disconnect` on threads of the loop's pool for synchronous code, one
+call at a time per socket and in order, with every call for a socket
+inside the same context so a value set in `on_connect` is visible later
+whichever thread runs it. Idle sockets cost no Python thread. `send` can be called from any thread, which
 is how a broadcast is written, and a handler must not block waiting for
 another message on its own socket. The adapter runs under any ASGI server,
 and an application that already has a Django Channels consumer or a

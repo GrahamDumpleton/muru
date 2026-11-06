@@ -50,6 +50,12 @@ def test_page_shows_workers_requests_and_logs(dashboard: tuple[support.Server, i
     assert "<title>Muru: wsgi_conformance:application</title>" in page
     assert "release r1" in page
     assert "Workers" in page and page.count("worker-") >= 2
+
+    # A WSGI application's workers have threads and no event loop, so
+    # the workers table has the one column.
+
+    assert '<th class="num">Threads</th>' in page
+    assert '<th class="num">Loop</th>' not in page
     assert "/response/list" in page
     assert "/response/raise-first" in page and "app_error" in page
     assert "muru.host[" in page and "preloaded" in page
@@ -104,7 +110,10 @@ def test_metrics_are_served_beside_the_pages(dashboard: tuple[support.Server, in
         'muru_requests_total{app="wsgi-conformance",release="r1",group="default",'
         'mount="default",status="2xx",client_class="default"} ' in text
     ), text
-    assert 'muru_slots_total{app="wsgi-conformance",release="r1",group="default"} ' in text, text
+    assert (
+        'muru_slots_total{app="wsgi-conformance",release="r1",group="default",side="threads"} '
+        in text
+    ), text
     assert "muru_snapshot_version 0\n" in text, text
 
 

@@ -398,7 +398,13 @@ impl AsgiToWsgi {
         let runtime = self.runtime.clone();
         let pool = self.pool.clone();
 
+        // Section 7.3: how long the request waits for a thread, from now
+        // to a thread of the pool taking the job.
+
+        let handed = std::time::Instant::now();
+
         let job: crate::pool::Job = Box::new(move |py| {
+            crate::signals::HANDOFF_WAIT.record(handed.elapsed());
             let sink = Sink {
                 tx: tx.clone(),
                 interrupt: Arc::clone(&interrupt),

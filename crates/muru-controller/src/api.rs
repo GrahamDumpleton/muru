@@ -2021,6 +2021,7 @@ fn scale_message(
                 worker_cpu: status.workers.worker_cpu,
                 gil_wait_p95_ms: status.workers.gil_wait_p95_ms,
                 loop_lag_p95_ms: status.workers.loop_lag_p95_ms,
+                handoff_queue_wait_p95_ms: status.workers.handoff_queue_wait_p95_ms,
                 gc_share: status.workers.gc_share,
                 bottleneck: status.diagnosis.bottleneck.to_owned(),
                 diagnosis: status.diagnosis.summary.to_owned(),
@@ -2070,14 +2071,7 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         .and_then(|app| app.current)
         .as_deref()
         == Some(release.id.as_str());
-    let detected = handle
-        .info
-        .interfaces
-        .lock()
-        .expect("interfaces poisoned")
-        .get(&(release.app.clone(), release.id.clone()))
-        .cloned()
-        .unwrap_or_default();
+    let detected = handle.info.interfaces.announced(&release.app, &release.id);
     let websockets = handle
         .info
         .websockets

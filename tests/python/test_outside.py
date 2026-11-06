@@ -144,3 +144,36 @@ def test_a_function_is_found_where_it_starts(
 
 def test_a_file_that_cannot_be_read_gives_the_running_line(tmp_path: Path) -> None:
     assert _outside.first_line(str(tmp_path / "gone.py"), 9, "summarise") == 9
+
+
+def test_threads_read_from_outside_are_named_and_given_their_requests() -> None:
+    frames = [{"file": "app.py", "line": 3, "function": "view"}]
+    served = {"request_id": "one", "thread": 11, "native": 101}
+    awaited = {
+        "request_id": "two",
+        "thread": None,
+        "native": None,
+        "sync_threads": [12],
+        "sync_native": [102],
+    }
+    bookkeeping = {
+        "active": [served, awaited],
+        "names": {"101": "muru-app-0", "102": "muru-sync_0"},
+    }
+
+    # Linux knows a thread by its native identifier, and so finds the
+    # thread serving a request and one running an ASGI request's
+    # synchronous code by theirs.
+
+    result = _outside.stacks_result([(101, frames), (102, frames), (103, frames)], bookkeeping)
+
+    assert [(thread["name"], thread["request"]) for thread in result["threads"]] == [
+        ("muru-app-0", served),
+        ("muru-sync_0", awaited),
+        ("thread-103", None),
+    ]
+
+    # Elsewhere the identifier is Python's.
+
+    result = _outside.stacks_result([(12, frames)], {"active": [awaited], "names": {}})
+    assert result["threads"][0]["request"] == awaited

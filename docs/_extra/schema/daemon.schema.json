@@ -1399,7 +1399,7 @@
           "x-default": "the release's"
         },
         "concurrency": {
-          "description": "Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the worker's slots when absent.",
+          "description": "Requests an ASGI mount runs at once on each worker, slots of its own at the edge; it shares the event loop's concurrency when absent.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -1423,7 +1423,7 @@
           "type": "boolean"
         },
         "max_connections": {
-          "description": "Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; unbounded but by its slots when absent.",
+          "description": "Open WebSockets an ASGI mount holds at once on each worker, apart from the requests it runs; each holds a request slot when absent.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

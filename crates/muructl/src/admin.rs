@@ -1699,6 +1699,10 @@ fn print_status(response: &pb::DebugResponse) {
         header += &format!(" {:<9} {:<12}", "LOOP", "LOOP-OLDEST");
     }
 
+    if sides.sync {
+        header += &format!(" {:<7} {:<12}", "SYNC", "SYNC-OLDEST");
+    }
+
     println!("{header} {:<7} {:<7} {:<7} STATE", "RSS", "USS", "ROUTED");
 
     for row in &rows {
@@ -1720,6 +1724,11 @@ fn print_status(response: &pb::DebugResponse) {
         if sides.event_loop {
             let (busy, oldest) = cells(&row.event_loop);
             line += &format!(" {busy:<9} {oldest:<12}");
+        }
+
+        if sides.sync {
+            let (busy, oldest) = cells(&row.sync);
+            line += &format!(" {busy:<7} {oldest:<12}");
         }
 
         println!(
@@ -3593,8 +3602,16 @@ fn print_scale_status(status: &pb::ScaleStatus) {
         let measured = |value: Option<f64>, unit: &str| {
             value.map_or("-".to_owned(), |value| format!("{value:.0}{unit}"))
         };
+
+        // Section 6.14: the wait for a thread of requests handed from
+        // ASGI to WSGI, for a group that handed any over.
+
+        let handoff = group
+            .handoff_queue_wait_p95_ms
+            .map(|wait| format!(", handoff wait p95 {wait:.0} ms"))
+            .unwrap_or_default();
         println!(
-            "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}",
+            "  workers: cpu {}, gc {}, gil wait p95 {}, loop lag p95 {}{handoff}",
             measured(group.worker_cpu.map(|cpu| cpu * 100.0), "%"),
             measured(group.gc_share.map(|share| share * 100.0), "%"),
             measured(group.gil_wait_p95_ms, " ms"),
