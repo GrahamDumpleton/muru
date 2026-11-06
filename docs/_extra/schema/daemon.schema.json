@@ -553,7 +553,7 @@
     },
     "Compression": {
       "additionalProperties": false,
-      "description": "The `[compression]` table: how the edge compresses responses. Every key is optional.",
+      "description": "The `[compression]` table: how the edge compresses responses. Every key is optional. A virtual host and a route take the same table, where a key left out is the level beneath's.",
       "properties": {
         "enabled": {
           "default": true,
@@ -953,6 +953,10 @@
           "default": false,
           "description": "Redirect requests for the host's other names to the canonical name.",
           "type": "boolean"
+        },
+        "compression": {
+          "$ref": "#/$defs/Compression",
+          "description": "How responses to the host's requests are compressed, each key replacing the daemon's `[compression]` value. A route's own replace them."
         },
         "default": {
           "default": false,
@@ -2126,6 +2130,10 @@
           "default": "strict",
           "description": "`strict` (the default), which matches names as they are on disk, or `insensitive`.",
           "type": "string"
+        },
+        "compression": {
+          "$ref": "#/$defs/Compression",
+          "description": "How the route's responses are compressed, each key replacing the host's, or else the daemon's `[compression]` value."
         },
         "error_override": {
           "$ref": "#/$defs/ErrorOverride",

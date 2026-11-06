@@ -30,11 +30,39 @@ types = ['text/*', 'application/json']
 level = 'fast'
 ```
 
+A [virtual host](virtual-hosts.md#settings-for-a-hosts-routes) and a
+route each take a `compression` table with the same keys. A key the
+route sets is used, else the host's, else the daemon's table's, else the
+default:
+
+```toml
+[host.api]
+names = ["api.example.com"]
+compression = { types = ["application/json"], level = "fast" }
+
+[[route]]
+host = "api"
+app = "api"
+
+[[route]]
+host = "api"
+path = "/exports"
+app = "api"
+compression = { enabled = false }
+```
+
+Responses for `api.example.com` are compressed when they are JSON, at
+the fast level, with the encodings and the smallest size the daemon's
+table gives. Under `/exports` nothing is compressed. The settings are
+those of the route the client's request matched, and of the host alone
+for a response no route gives, such as a 404 for a path with no route.
+
 An application keeps one response uncompressed with the header
 `X-Muru-Compress: off`, which the edge removes before sending, or with
 `Cache-Control: no-transform`. Responses that mix secrets with input the
 client controls, such as a CSRF token on a page that echoes a query
-parameter, should opt out: compressing them exposes the BREACH class of
+parameter, should opt out, or be served by a route with `compression =
+{ enabled = false }`: compressing them exposes the BREACH class of
 attacks, where an attacker learns a secret from the compressed length.
 `HEAD` responses, `204`, `304` and responses already encoded are never
 compressed.

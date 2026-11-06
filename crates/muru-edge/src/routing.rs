@@ -44,6 +44,9 @@ pub struct Host {
     pub rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
     /// The limits of a request for the host's routes (section 4.6).
     pub limits: crate::RequestLimits,
+    /// The compression policy for the host's routes (section 4.17), when
+    /// the host sets any of it: the node's with the host's laid over.
+    pub compression: Option<Arc<crate::compression::Compression>>,
     /// The name requests for the host's other names are redirected to,
     /// when the host redirects them.
     pub canonical: Option<String>,
@@ -136,6 +139,10 @@ struct Route {
     /// The limits of the route's requests, over the host's (section
     /// 4.6).
     limits: crate::RequestLimits,
+    /// The compression policy for the route's responses (section 4.17),
+    /// when the route sets any of it: the host's with the route's laid
+    /// over.
+    compression: Option<Arc<crate::compression::Compression>>,
     /// The rate limits the route's requests draw from after the host's
     /// (section 4.15).
     rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
@@ -1123,6 +1130,8 @@ pub struct Routing {
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
+    /// Whether any host or route has compression settings of its own.
+    compression_varies: bool,
 }
 
 /// Where a request goes.
@@ -1245,6 +1254,7 @@ impl Routing {
             default_policy: None,
             default_app: None,
             h2c: HashMap::new(),
+            compression_varies: false,
         }
     }
 
@@ -1492,6 +1502,7 @@ impl Routing {
             default_policy,
             default_app: default_name,
             h2c,
+            compression_varies: false,
         };
 
         for host in &snapshot.hosts {
@@ -1529,6 +1540,13 @@ impl Routing {
                 errors: Arc::new(errors),
                 rate_limits: named_limits(&host.rate_limits, &format!("host {}", host.name)),
                 limits: crate::RequestLimits::from_message(host.limits.as_ref()),
+                compression: host
+                    .compression
+                    .as_ref()
+                    .map(|choice| routing.compression.with(choice))
+                    .transpose()
+                    .map_err(|error| anyhow::anyhow!("host {}: compression: {error}", host.name))?
+                    .map(Arc::new),
                 canonical: (host.canonical_redirect && !host.canonical.is_empty())
                     .then(|| normalise(&host.canonical)),
             });
@@ -1577,7 +1595,23 @@ impl Routing {
                         anyhow::anyhow!("route {} {}: {error}", route.host, route.path)
                     })?
                     .map(Arc::new);
+                let compression = route
+                    .compression
+                    .as_ref()
+                    .map(|choice| {
+                        routing.hosts[index]
+                            .compression
+                            .as_deref()
+                            .unwrap_or(&routing.compression)
+                            .with(choice)
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("route {} {}: compression: {error}", route.host, route.path)
+                    })?
+                    .map(Arc::new);
                 routing.routes[index].push(Route {
+                    compression,
                     path: route.path.clone(),
                     classes: route.client_classes.clone(),
                     app: route.app.clone(),
@@ -1607,6 +1641,13 @@ impl Routing {
                 });
             }
         }
+
+        routing.compression_varies = routing.hosts.iter().any(|host| host.compression.is_some())
+            || routing
+                .routes
+                .iter()
+                .flatten()
+                .any(|route| route.compression.is_some());
 
         // Section 4.14: of routes with the same path, those for client
         // classes come before the one for every request.
@@ -1719,6 +1760,35 @@ impl Routing {
     /// How responses are compressed (section 4.17).
     pub fn compression(&self) -> &crate::compression::Compression {
         &self.compression
+    }
+
+    /// The compression policy for a client's request (section 4.17):
+    /// the route's own over its host's over the node's, by the host the
+    /// request named and its path.
+    pub fn compression_for(
+        &self,
+        name: Option<&str>,
+        path: &str,
+        class: &str,
+        listener: &str,
+    ) -> &crate::compression::Compression {
+        // Most nodes set compression once, so no host or route is looked
+        // for.
+
+        if !self.compression_varies {
+            return &self.compression;
+        }
+
+        let Some(index) = self.host_for(name, listener) else {
+            return &self.compression;
+        };
+
+        self.routes[index]
+            .iter()
+            .find(|route| route.matches(path, class))
+            .and_then(|route| route.compression.as_deref())
+            .or(self.hosts[index].compression.as_deref())
+            .unwrap_or(&self.compression)
     }
 
     /// The same tables with this compression policy, for a development

@@ -183,6 +183,53 @@ impl Compression {
         })
     }
 
+    /// The policy with a virtual host's or a route's own settings laid
+    /// over it, key by key, checked as [`Self::from_snapshot`] checks.
+    pub fn with(&self, choice: &pb::CompressionChoice) -> Result<Self, String> {
+        let mut encodings = Vec::new();
+
+        for token in &choice.encodings {
+            let encoding = Encoding::parse(token)
+                .ok_or_else(|| format!("{token:?} is not an encoding: br, zstd or gzip"))?;
+
+            if !encodings.contains(&encoding) {
+                encodings.push(encoding);
+            }
+        }
+
+        let level = if choice.level.is_empty() {
+            self.level
+        } else {
+            Level::parse(&choice.level).ok_or_else(|| {
+                format!("{:?} is not a level: fast, default or best", choice.level)
+            })?
+        };
+
+        Ok(Self {
+            enabled: choice.enabled.unwrap_or(self.enabled),
+            encodings: if encodings.is_empty() {
+                self.encodings.clone()
+            } else {
+                encodings
+            },
+            min_size: if choice.min_size == 0 {
+                self.min_size
+            } else {
+                choice.min_size
+            },
+            types: if choice.types.is_empty() {
+                self.types.clone()
+            } else {
+                choice
+                    .types
+                    .iter()
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .collect()
+            },
+            level,
+        })
+    }
+
     /// The policy as a snapshot carries it.
     pub fn to_message(&self) -> pb::Compression {
         pb::Compression {
@@ -560,6 +607,49 @@ mod tests {
 
     fn value(text: &str) -> HeaderValue {
         HeaderValue::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn a_levels_own_settings_are_laid_over_the_one_beneath() {
+        let node = Compression::default();
+        let host = node
+            .with(&pb::CompressionChoice {
+                enabled: Some(false),
+                min_size: 4096,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!host.enabled);
+        assert_eq!(host.min_size, 4096);
+        assert_eq!(host.encodings, node.encodings);
+        assert_eq!(host.types, node.types);
+
+        let route = host
+            .with(&pb::CompressionChoice {
+                enabled: Some(true),
+                encodings: vec!["gzip".to_owned(), "gzip".to_owned()],
+                types: vec![" Text/HTML ".to_owned()],
+                level: "best".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(route.enabled);
+        assert_eq!(route.encodings, vec![Encoding::Gzip]);
+        assert_eq!(
+            route.min_size, 4096,
+            "the host's, which the route leaves alone"
+        );
+        assert_eq!(route.types, vec!["text/html".to_owned()]);
+        assert_eq!(route.level, Level::Best);
+        assert_eq!(node.with(&pb::CompressionChoice::default()).unwrap(), node);
+
+        let error = node
+            .with(&pb::CompressionChoice {
+                encodings: vec!["deflate".to_owned()],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.contains("is not an encoding"), "{error}");
     }
 
     #[test]

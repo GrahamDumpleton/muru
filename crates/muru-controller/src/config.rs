@@ -925,6 +925,16 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        // Section 4.17: the host's own compression settings.
+
+        if let Some(table) = &host.compression
+            && let Err(error) = crate::daemon::compression_choice(table)
+        {
+            plan.errors
+                .push(format!("host {name}: compression: {error}"));
+            valid = false;
+        }
+
         // Section 4.12: the host's error pages, with absolute file paths.
 
         if let Err(error) = check_error_tables(&host.error_pages, host.error_override.as_ref()) {
@@ -1270,6 +1280,18 @@ fn plan_routes(store: &Store, document: &Document, defined: &Defined, plan: &mut
                     .push(format!("route {} {}: {error}", route.host, route.path));
                 valid = false;
             }
+        }
+
+        // Section 4.17: the route's own compression settings.
+
+        if let Some(table) = &route.compression
+            && let Err(error) = crate::daemon::compression_choice(table)
+        {
+            plan.errors.push(format!(
+                "route {} {}: compression: {error}",
+                route.host, route.path
+            ));
+            valid = false;
         }
 
         // Section 9.4: a traffic policy names releases of the route's

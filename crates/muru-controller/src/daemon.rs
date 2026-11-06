@@ -2001,6 +2001,46 @@ pub(crate) fn compression_message(
     muru_edge::compression::Compression::from_snapshot(&message).map(|policy| policy.to_message())
 }
 
+/// A virtual host's or a route's own `compression` table as the snapshot
+/// carries it, checked as the `[compression]` table is: the keys given,
+/// and nothing for the rest, which the level beneath supplies.
+pub(crate) fn compression_choice(
+    table: &muru_config::Compression,
+) -> Result<pb::CompressionChoice, String> {
+    let min_size = match &table.min_size {
+        Some(text) => {
+            match muru_config::parse_size(text).map_err(|error| format!("min_size: {error}"))? {
+                0 => return Err("min_size must be at least 1 byte".to_owned()),
+                size => size,
+            }
+        }
+        None => 0,
+    };
+
+    if table.encodings.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "encodings names no encoding; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    if table.types.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "types names no content type; enabled = false turns compression off".to_owned(),
+        );
+    }
+
+    let choice = pb::CompressionChoice {
+        enabled: table.enabled,
+        encodings: table.encodings.clone().unwrap_or_default(),
+        min_size,
+        types: table.types.clone().unwrap_or_default(),
+        level: table.level.clone().unwrap_or_default(),
+    };
+
+    muru_edge::compression::Compression::default().with(&choice)?;
+    Ok(choice)
+}
+
 /// A host's certificate chain and key as PEM text, for the snapshot.
 fn read_pem_pair(certificate: &str, key: &str) -> anyhow::Result<(String, String)> {
     let chain =
@@ -5203,6 +5243,10 @@ impl Daemon {
                 name,
                 limits,
                 access_log,
+                compression: host
+                    .compression
+                    .as_ref()
+                    .and_then(|table| compression_choice(table).ok()),
                 canonical_redirect: host.canonical_redirect,
                 names: host.names,
                 listeners: host.listeners,
@@ -5236,6 +5280,10 @@ impl Daemon {
             .into_iter()
             .map(|route| pb::Route {
                 upload: upload_message(&route),
+                compression: route
+                    .compression
+                    .as_ref()
+                    .and_then(|table| compression_choice(table).ok()),
                 limits: muru_config::check_request_limits(
                     route.max_body_size.as_deref(),
                     route.timeouts.as_ref(),

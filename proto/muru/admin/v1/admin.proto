@@ -775,6 +775,7 @@ message Host {
   string max_body_size = 11;          // the host's own body limit, as configured (section 4.6)
   map<string, string> timeouts = 12;  // the host's own request timeouts, as configured
   string access_log = 13;             // the host's own access log choice (section 11.2): on, errors or off
+  string compression = 14;            // "off" when the host turns compression off, "set" when it has other settings of its own (section 4.17)
 }
 
 message ListRoutesRequest {}
@@ -802,6 +803,7 @@ message Route {
   repeated string client_classes = 16; // the client classes the route takes (section 4.14); every request when empty
   map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
   map<string, string> timeouts = 18; // the route's own request timeouts, as configured (section 4.6)
+  string compression = 19;          // "off" when the route turns compression off, "set" when it has other settings of its own (section 4.17)
 }
 
 message ListUpstreamsRequest {}

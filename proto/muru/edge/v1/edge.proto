@@ -241,6 +241,17 @@ message Compression {
 }
 
 // Section 4.7: which peers may speak for the client, and how.
+// Section 4.17: a virtual host's or a route's own compression settings,
+// laid over the level beneath's key by key: the route's over its host's
+// over the node's.
+message CompressionChoice {
+  optional bool enabled = 1;            // the level beneath's when absent
+  repeated string encodings = 2;        // br, zstd, gzip in preference order; the level beneath's when empty
+  uint64 min_size = 3;                  // bodies smaller than this are left alone; the level beneath's when 0
+  repeated string types = 4;            // content types, exact or family/*; the level beneath's when empty
+  string level = 5;                     // fast, default or best; the level beneath's when empty
+}
+
 message Proxy {
   repeated string trusted = 1;          // addresses, CIDR ranges, loopback, private, unix
   repeated string headers = 2;          // header types applied from trusted peers
@@ -265,6 +276,7 @@ message Host {
   RequestLimits limits = 13;            // section 4.6: the limits of a request for the host's routes; none when absent
   bool canonical_redirect = 14;         // requests for the host's other names are redirected to the canonical name
   AccessLogChoice access_log = 15;      // section 11.2: the host's own access log choice; none when absent
+  CompressionChoice compression = 16;   // section 4.17: the host's own compression settings; none when absent
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -297,6 +309,7 @@ message Route {
   string mode = 25;                     // the site mode the application sees as muru.mode; none when empty
   repeated string client_classes = 26;  // section 4.14: the classes the route takes; every request when empty
   RequestLimits limits = 27;            // section 4.6: the limits of the route's requests, over the host's; none when absent
+  CompressionChoice compression = 28;   // section 4.17: the route's own compression settings, over the host's; none when absent
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.

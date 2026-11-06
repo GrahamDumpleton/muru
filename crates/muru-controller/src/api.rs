@@ -1312,6 +1312,7 @@ impl Admin for Service {
                     max_body_size: host.max_body_size.unwrap_or_default(),
                     timeouts: timeouts_map(host.timeouts.as_ref()),
                     access_log: host.access_log.unwrap_or_default(),
+                    compression: compression_note(host.compression.as_ref()),
                 })
                 .collect(),
         }))
@@ -1393,6 +1394,7 @@ impl Admin for Service {
                     },
                     max_body_size: route.max_body_size.clone().unwrap_or_default(),
                     timeouts: timeouts_map(route.timeouts.as_ref()),
+                    compression: compression_note(route.compression.as_ref()),
                     host: route.host,
                     path: route.path,
                     app: route.app,
@@ -1628,6 +1630,17 @@ fn timeouts_map(timeouts: Option<&muru_config::RequestTimeouts>) -> BTreeMap<Str
     .into_iter()
     .filter_map(|(key, value)| Some((key.to_owned(), value.clone()?)))
     .collect()
+}
+
+/// A host's or a route's own compression settings (section 4.17) as one
+/// word: off when it turns compression off, set when it sets anything
+/// else, and nothing without a table.
+fn compression_note(table: Option<&muru_config::Compression>) -> String {
+    match table {
+        None => String::new(),
+        Some(table) if table.enabled == Some(false) => "off".to_owned(),
+        Some(_) => "set".to_owned(),
+    }
 }
 
 impl Service {

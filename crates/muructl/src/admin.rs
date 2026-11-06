@@ -4423,6 +4423,10 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             names.push_str(&format!(" [access log {}]", host.access_log));
         }
 
+        if !host.compression.is_empty() {
+            names.push_str(&format!(" [compression {}]", host.compression));
+        }
+
         println!(
             "{:<16} {:<8} {:<10} {names}",
             host.name,
@@ -4619,6 +4623,10 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
 
         if !route.timeouts.is_empty() {
             target.push_str(&format!(" [{}]", timeouts_note(&route.timeouts)));
+        }
+
+        if !route.compression.is_empty() {
+            target.push_str(&format!(" [compression {}]", route.compression));
         }
 
         if !route.upload.is_empty() {

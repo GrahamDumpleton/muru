@@ -1558,7 +1558,8 @@ pub struct Http2Limits {
 }
 
 /// The `[compression]` table (section 4.17): how the edge compresses
-/// responses. Every key is optional.
+/// responses. Every key is optional. A virtual host and a route take the
+/// same table, where a key left out is the level beneath's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Compression {
@@ -1740,6 +1741,11 @@ pub struct Host {
     /// `[logs]` table leaves out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_log_exclude: Vec<String>,
+    /// How responses to the host's requests are compressed (section
+    /// 4.17), each key replacing the daemon's `[compression]` value. A
+    /// route's own replace them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
 }
 
 /// The timeouts of one request (section 4.6), the `timeouts` table of a
@@ -1956,6 +1962,10 @@ pub struct Route {
     /// or else the daemon's `[limits]` value (section 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<RequestTimeouts>,
+    /// How the route's responses are compressed (section 4.17), each key
+    /// replacing the host's, or else the daemon's `[compression]` value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
     /// Section 4.11: `multipart` or `raw` makes the edge receive and store
     /// uploads before the application sees the request; off without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5707,6 +5717,10 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 queue_timeout: Some("2s".to_owned()),
                 ..RequestTimeouts::default()
             }),
+            compression: Some(Compression {
+                enabled: Some(false),
+                ..Compression::default()
+            }),
             upload: Some("multipart".to_owned()),
             max_file_size: None,
             max_files: Some(5),
@@ -5736,6 +5750,8 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(text.contains("[host.shop.timeouts]"), "{text}");
         assert!(text.contains("request_deadline = \"30s\""), "{text}");
         assert!(text.contains("[route.timeouts]"), "{text}");
+        assert!(text.contains("[route.compression]"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
         assert!(text.contains("queue_timeout = \"2s\""), "{text}");
         assert!(text.contains("[[route]]"), "{text}");
         assert!(

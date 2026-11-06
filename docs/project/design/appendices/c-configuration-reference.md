@@ -99,7 +99,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | logging.python level, format, request_id, capture_warnings, loggers | global, application, release | WARNING (Python default), standard, false, false, none | 11.4 |
 | rotate (size, every, keep, compress, naming), reopen_on_rename, on_overflow | log sinks | daily, 14, zstd, built-in | 11.3 |
 | readiness, liveness (path, timeout, expect, required, interval, failures), checks | mount, release | none (built-in signals only) | 9.11 |
-| compression (enabled, encodings, min_size, types, level), decompress_requests | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default, false | 4.17 |
+| compression (enabled, encodings, min_size, types, level) | global, host, route | enabled, br zstd gzip, 1KB, text and JSON types, default | 4.17 |
+| decompress_requests | route | false | 4.17 |
 | max_connections, max_connections_per_client, high_water, min_idle_timeout, overload_reserve, keep_alive_timeout, keep_alive_timeout_proxy, max_requests_per_connection, `http2.*`, `websocket.*` | listener, mount | see 4.18 | 4.18 |
 | auth (app or upstream, path, timeout, copy_headers, cache) | route | none | 4.16 |
 | upstream (route target), fallback.upstream, traffic.split upstream:NAME | route | none | 4.13 |

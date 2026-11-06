@@ -1173,6 +1173,16 @@ async fn serve<I>(
                     .map(str::to_owned)
                     .or_else(|| parts.uri.host().map(str::to_owned))
             });
+
+            // Section 4.17: the compression policy of the route the
+            // client's request names, over its host's and the node's.
+
+            let compression = routing.compression_for(
+                host.as_deref(),
+                parts.uri.path(),
+                &client_class,
+                &listener,
+            );
             let mut body = Some(body);
             let mut buffered: Option<Bytes> = None;
             let mut origin: Option<routing::Origin> = None;
@@ -1501,7 +1511,7 @@ async fn serve<I>(
                                     &within,
                                     &target,
                                     &parts.headers,
-                                    routing.compression(),
+                                    compression,
                                 )
                                 .await
                                 {
@@ -1609,7 +1619,7 @@ async fn serve<I>(
                             &within,
                             &target,
                             &parts.headers,
-                            routing.compression(),
+                            compression,
                         )
                         .await;
 
@@ -1839,12 +1849,8 @@ async fn serve<I>(
             // Section 4.17: compressed for the client when the policy and
             // the response allow it.
 
-            let mut response = compression::apply(
-                routing.compression(),
-                &method,
-                accept_encoding.as_ref(),
-                response,
-            );
+            let mut response =
+                compression::apply(compression, &method, accept_encoding.as_ref(), response);
 
             // Section 4.18: the connection closes after its share of
             // requests.

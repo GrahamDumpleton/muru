@@ -9,6 +9,7 @@ its requests the access log writes.
 
 from __future__ import annotations
 
+import gzip
 import http.client
 import json
 import subprocess
@@ -227,3 +228,67 @@ app = "echo"
     assert "host shop: canonical_redirect needs a canonical name" in (
         refused.stdout + refused.stderr
     )
+
+
+def test_a_host_and_a_route_set_compression_over_the_nodes(daemon: Daemon, tmp_path: Path) -> None:
+    config = tmp_path / "hosts.toml"
+    config.write_text(
+        ECHO
+        + """[host.raw]
+names = ["raw.test"]
+compression = { enabled = false }
+
+[host.other]
+names = ["other.test"]
+
+[[route]]
+host = "raw"
+app = "echo"
+
+[[route]]
+host = "raw"
+path = "/info"
+app = "echo"
+compression = { enabled = true, encodings = ["gzip"], min_size = "100" }
+
+[[route]]
+host = "other"
+app = "echo"
+"""
+    )
+    applied = apply(daemon, config)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    daemon.wait_for_routing("echo")
+
+    def encoding(path: str, host: str) -> tuple[str | None, bytes]:
+        response = daemon.request(path, host=host, headers={"Accept-Encoding": "br, gzip"})
+        assert response.status == 200, response.body
+        headers = {name.lower(): value for name, value in response.headers}
+        return headers.get("content-encoding"), response.body
+
+    # A host with no settings of its own has the node's, the host that
+    # turns compression off sends its responses as they are, and its
+    # route that turns it on again offers the encodings it names, for
+    # bodies of the size it names.
+
+    assert encoding("/text", "other.test")[0] == "br"
+    coded, body = encoding("/text", "raw.test")
+    assert coded is None and body.startswith(b"The quick brown fox")
+    assert encoding("/info", "other.test")[0] is None, "under the node's 1KB"
+    coded, body = encoding("/info", "raw.test")
+    assert coded == "gzip"
+    assert "environ" in json.loads(gzip.decompress(body))
+
+    assert "[compression off]" in daemon.muructl("host", "list").stdout
+    assert "[compression set]" in daemon.muructl("route", "list").stdout
+
+    # The table is checked as the node's is.
+
+    config.write_text(
+        config.read_text().replace(
+            "compression = { enabled = false }", 'compression = { level = "max" }'
+        )
+    )
+    refused = apply(daemon, config)
+    assert refused.returncode != 0
+    assert 'host raw: compression: "max" is not a level' in refused.stdout + refused.stderr

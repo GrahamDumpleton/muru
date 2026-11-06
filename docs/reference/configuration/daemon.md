@@ -387,7 +387,9 @@ A `[[client_class]]` rule. A request gets the class when every input the rule na
 (config-daemon-compression)=
 ## `[compression]`
 
-The `[compression]` table: how the edge compresses responses. Every key is optional.
+The `[compression]` table: how the edge compresses responses. Every key is optional. A virtual host and a route take the same table, where a key left out is the level beneath's.
+
+The same keys apply at `[host.NAME.compression]` and `[route.compression]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -490,6 +492,7 @@ A virtual host, the `[host.NAME]` table.
 | `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out. |
 | `canonical` | string |  | The name the host is known by, for `use_canonical_name`. |
 | `canonical_redirect` | boolean | `false` | Redirect requests for the host's other names to the canonical name. |
+| `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How responses to the host's requests are compressed, each key replacing the daemon's `[compression]` value. A route's own replace them. |
 | `default` | boolean | `false` | Answer requests whose host matches no virtual host, which are otherwise refused with 421. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
@@ -773,6 +776,7 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `auth` | table, {ref}`[route.auth] <config-daemon-route-auth>` |  | An authorisation decision the edge asks an application for before it serves the route. |
 | `cache` | table, {ref}`[route.cache] <config-daemon-route-cache>` |  | The cache headers files are sent with. |
 | `case` | string | `"strict"` | `strict` (the default), which matches names as they are on disk, or `insensitive`. |
+| `compression` | table, {ref}`[compression] <config-daemon-compression>` |  | How the route's responses are compressed, each key replacing the host's, or else the daemon's `[compression]` value. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
 | `fallback` | table, {ref}`[route.fallback] <config-daemon-route-fallback>` |  | What takes a request no file answers. |
