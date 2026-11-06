@@ -1216,6 +1216,10 @@
           "$ref": "#/$defs/ListenerLimits",
           "description": "The listener's own limits on its connections and on reading a request's head, each replacing the `[limits]` value for the connections it accepts."
         },
+        "proxy": {
+          "$ref": "#/$defs/Proxy",
+          "description": "The listener's own trusted proxies and header types, in place of the whole `[proxy]` table for the connections it accepts. An empty table trusts nothing."
+        },
         "tls": {
           "default": false,
           "description": "Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI.",

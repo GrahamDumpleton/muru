@@ -41,6 +41,9 @@ pub struct NodeSettings {
     /// Section 4.18: the listeners with limits of their own, with those
     /// limits.
     pub listener_limits: Vec<pb::ListenerLimits>,
+    /// Section 4.7: the listeners with proxy settings of their own, with
+    /// those settings.
+    pub listener_proxies: Vec<pb::ListenerProxy>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard and JSON gateway are served, or nowhere.
@@ -157,6 +160,7 @@ impl NodeSettings {
             limits: limits_from(document)?,
             h2c: h2c_from(document)?,
             listener_limits: listener_limits_from(document)?,
+            listener_proxies: listener_proxies_from(document)?,
             metrics: metrics_from(document, overrides.metrics)?,
             dashboard: dashboard_from(document, overrides.dashboard)?,
             dashboard_actions: document
@@ -325,6 +329,30 @@ fn h2c_from(document: &muru_config::Document) -> Result<Vec<pb::H2cPolicy>, Stri
     }
 
     Ok(policies)
+}
+
+/// Section 4.7: each listener's own `proxy` table as the snapshot carries
+/// it, checked as the `[proxy]` table is.
+fn listener_proxies_from(
+    document: &muru_config::Document,
+) -> Result<Vec<pb::ListenerProxy>, String> {
+    let mut all = Vec::new();
+
+    for listener in &document.listener {
+        let Some(table) = &listener.proxy else {
+            continue;
+        };
+
+        let proxy = crate::daemon::proxy_message(table);
+        muru_edge::proxy::Trust::from_snapshot(&proxy)
+            .map_err(|error| format!("listener {}: proxy: {error}", listener.address))?;
+        all.push(pb::ListenerProxy {
+            listener: listener.address.clone(),
+            proxy: Some(proxy),
+        });
+    }
+
+    Ok(all)
 }
 
 /// Section 4.18: each listener's own `limits` table as the snapshot
@@ -616,6 +644,36 @@ mod tests {
             .is_err(),
             "a limit on one request is not a listener's to set"
         );
+    }
+
+    #[test]
+    fn a_listener_has_proxy_settings_of_its_own_in_place_of_the_nodes() {
+        let settings = settings(
+            "[proxy]\ntrusted = ['loopback']\n\
+             [[listener]]\naddress = '0.0.0.0:80'\nproxy = {}\n\
+             [[listener]]\naddress = '10.0.0.1:8080'\n\
+             [listener.proxy]\ntrusted = ['10.0.0.0/8']\nheaders = ['x-forwarded-for']\nrecursive = false\n\
+             [[listener]]\naddress = '0.0.0.0:443'\ntls = true\n",
+        )
+        .unwrap();
+        assert_eq!(settings.listener_proxies.len(), 2);
+        let public = &settings.listener_proxies[0];
+        assert_eq!(public.listener, "0.0.0.0:80");
+        assert!(
+            public.proxy.as_ref().unwrap().trusted.is_empty(),
+            "an empty table trusts nothing"
+        );
+        let internal = settings.listener_proxies[1].proxy.as_ref().unwrap();
+        assert_eq!(internal.trusted, ["10.0.0.0/8"]);
+        assert_eq!(internal.headers, ["x-forwarded-for"]);
+        assert!(!internal.recursive);
+        assert_eq!(settings.proxy.as_ref().unwrap().trusted, ["loopback"]);
+
+        let error = super::tests::settings(
+            "[[listener]]\naddress = '0.0.0.0:80'\nproxy = { trusted = ['not an address'] }\n",
+        )
+        .unwrap_err();
+        assert!(error.starts_with("listener 0.0.0.0:80: proxy:"), "{error}");
     }
 
     #[test]

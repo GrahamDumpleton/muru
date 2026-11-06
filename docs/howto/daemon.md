@@ -414,8 +414,8 @@ file again, checks it whole, and applies what changed:
 
 - the `[proxy]`, `[compression]`, `[error_pages]`, `[error_override]`,
   `[[client_class]]`, `[rate_limit]` and `[limits]` tables, and the
-  `h2c` setting and `limits` table of a `[[listener]]` entry, which the
-  edge is given at once; a connection already open keeps the limits it was accepted
+  `h2c` setting and the `limits` and `proxy` tables of a `[[listener]]`
+  entry, which the edge is given at once; a connection already open keeps the limits it was accepted
   under;
 
 - the `[[listener]]` entries: a changed set starts a new edge on the new

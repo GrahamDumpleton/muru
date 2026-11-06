@@ -78,6 +78,41 @@ the setting, so `X_Forwarded_For` can never reach an application as
 secure: a virtual host that asks for HTTPS does not redirect it, and the
 application sees `https`.
 
+## A listener's own proxies
+
+A node that serves the public on one listener and a load balancer on
+another trusts the load balancer on its listener alone. A `[[listener]]`
+entry takes a `proxy` table with the keys of `[proxy]`:
+
+```toml
+[[listener]]
+address = "0.0.0.0:443"
+tls = true
+
+[[listener]]
+address = "10.0.0.5:8080"
+
+[listener.proxy]
+trusted = ["10.0.0.0/8"]
+headers = ["x-forwarded-for", "x-forwarded-proto"]
+```
+
+For the connections a listener accepts, its `proxy` table is used in
+place of the whole `[proxy]` table: a key it leaves out has its default,
+not the `[proxy]` table's value. Here nothing is trusted on port 443,
+whatever address connects, and peers in `10.0.0.0/8` are believed on
+port 8080. A listener with an empty table, `proxy = {}`, trusts nothing
+on a node whose `[proxy]` table trusts some peers, and a listener
+without the key has the `[proxy]` table.
+
+A trusted proxy's connections are exempt from the per-client connection
+share and are kept idle for `keep_alive_timeout_proxy`, as the
+[connections guide](connections.md) describes, on the listeners where it
+is trusted.
+
+`muructl daemon reload` applies a changed `[proxy]` table and a changed
+`proxy` table of a listener to the requests that arrive from then on.
+
 A `[proxy]` table in a file given to `muructl apply` is reported and not
 applied; it belongs in the daemon's own file, and a daemon whose table
 does not parse refuses to start and says which entry is wrong.

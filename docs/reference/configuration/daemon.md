@@ -601,6 +601,7 @@ A listener, one of the `[[listener]]` entries, in the daemon's own file.
 | `address` | string | required | The address, as IP:PORT. |
 | `h2c` | array of strings | every client | On a listener without TLS, the clients that may speak HTTP/2 in cleartext (h2c), as addresses, ranges, loopback or private; every client when omitted, none when empty. The others are served HTTP/1.1. |
 | `limits` | table, {ref}`[listener.limits] <config-daemon-listener-limits>` |  | The listener's own limits on its connections and on reading a request's head, each replacing the `[limits]` value for the connections it accepts. |
+| `proxy` | table, {ref}`[proxy] <config-daemon-proxy>` |  | The listener's own trusted proxies and header types, in place of the whole `[proxy]` table for the connections it accepts. An empty table trusts nothing. |
 | `tls` | boolean | `false` | Whether TLS is terminated on it, with the certificates of the virtual hosts it serves, chosen by SNI. |
 
 (config-daemon-listener-limits)=
@@ -777,6 +778,8 @@ The `[overlay_webhook]` table: where the daemon takes signed requests from monit
 ## `[proxy]`
 
 The `[proxy]` table: which peers are trusted to speak for the client, and through which headers.
+
+The same keys apply at `[listener.proxy]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

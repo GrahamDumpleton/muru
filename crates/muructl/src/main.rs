@@ -1927,6 +1927,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
         tls: false,
         h2c: None,
         limits: None,
+        proxy: None,
     }];
 
     if resolved.serving.tls() {
@@ -1935,6 +1936,7 @@ fn declarative(args: &RunArgs, resolved: &Resolved) -> anyhow::Result<String> {
             tls: true,
             h2c: None,
             limits: None,
+            proxy: None,
         });
     }
 

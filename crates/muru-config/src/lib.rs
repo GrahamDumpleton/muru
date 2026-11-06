@@ -1612,6 +1612,11 @@ pub struct Listener {
     /// `[limits]` value for the connections it accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ListenerLimits>,
+    /// The listener's own trusted proxies and header types (section
+    /// 4.7), in place of the whole `[proxy]` table for the connections
+    /// it accepts. An empty table trusts nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<Proxy>,
 }
 
 /// A listener's `limits` table (sections 4.6 and 4.18): the keys of
@@ -5980,6 +5985,10 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                     max_connections: Some(500),
                     ..ListenerLimits::default()
                 }),
+                proxy: Some(Proxy {
+                    trusted: vec!["10.0.0.0/8".to_owned()],
+                    ..Proxy::default()
+                }),
             }],
             limits: Some(Limits {
                 max_body_size: Some("100MB".to_owned()),
@@ -6100,6 +6109,8 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");
         assert!(text.contains("[listener.limits]"), "{text}");
+        assert!(text.contains("[listener.proxy]"), "{text}");
+        assert!(text.contains("trusted = [\"10.0.0.0/8\"]"), "{text}");
         assert!(text.contains("max_connections = 500"), "{text}");
         assert!(text.contains("canonical_redirect = true"), "{text}");
         assert!(text.contains("[host.shop.timeouts]"), "{text}");

@@ -1139,6 +1139,9 @@ pub struct Routing {
     /// Section 6.13: the listeners that limit cleartext HTTP/2 to some
     /// clients.
     h2c: HashMap<SocketAddr, crate::proxy::Networks>,
+    /// Section 4.7: the listeners with proxy settings of their own, in
+    /// place of the node's for their connections.
+    listener_trust: HashMap<SocketAddr, Trust>,
     /// Whether any host or route has compression settings or header
     /// rules of its own.
     sites_vary: bool,
@@ -1278,6 +1281,7 @@ impl Routing {
             default_policy: None,
             default_app: None,
             h2c: HashMap::new(),
+            listener_trust: HashMap::new(),
             sites_vary: false,
         }
     }
@@ -1479,6 +1483,18 @@ impl Routing {
             h2c.insert(listener, networks);
         }
 
+        let mut listener_trust = HashMap::new();
+
+        for own in &snapshot.listener_proxies {
+            let listener: SocketAddr = own
+                .listener
+                .parse()
+                .map_err(|_| anyhow::anyhow!("proxy: {:?} is not IP:PORT", own.listener))?;
+            let trust = Trust::from_snapshot(&own.proxy.clone().unwrap_or_default())
+                .map_err(|error| anyhow::anyhow!("listener {listener}: proxy: {error}"))?;
+            listener_trust.insert(listener, trust);
+        }
+
         // Section 5.1: a worker that could not be connected to is reported
         // rather than refusing the snapshot.
 
@@ -1526,6 +1542,7 @@ impl Routing {
             default_policy,
             default_app: default_name,
             h2c,
+            listener_trust,
             sites_vary: false,
         };
 
@@ -1796,9 +1813,11 @@ impl Routing {
         Chain::new(levels)
     }
 
-    /// Which peers may speak for the client (section 4.7).
-    pub fn trust(&self) -> &Trust {
-        &self.trust
+    /// Which peers may speak for the client (section 4.7) on the
+    /// listener at `local`: the listener's own settings when it has
+    /// them, else the node's.
+    pub fn trust_on(&self, local: &SocketAddr) -> &Trust {
+        self.listener_trust.get(local).unwrap_or(&self.trust)
     }
 
     /// Section 6.13: whether a client may speak HTTP/2 in cleartext on
@@ -2362,6 +2381,7 @@ mod tests {
             access_log: None,
             access_log_overrides: Vec::new(),
             listener_limits: Vec::new(),
+            listener_proxies: Vec::new(),
             worker_sockets: Vec::new(),
             default_app: String::new(),
             default_release: String::new(),

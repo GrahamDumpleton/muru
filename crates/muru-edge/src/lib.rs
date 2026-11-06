@@ -1037,7 +1037,7 @@ async fn accept(
         // listener answers 503 while the reserve lasts and closes beyond
         // it, pausing a moment before the next accept.
 
-        let trusted = shared.pools.current().trust().trusts(&peer);
+        let trusted = shared.pools.current().trust_on(&local).trusts(&peer);
 
         let guard = match admission.admit(peer.ip(), trusted) {
             connections::Admission::Accept(guard) => guard,
@@ -1261,7 +1261,7 @@ async fn serve<I>(
 
             let routing = shared.pools.current();
             let (mut parts, body) = request.into_parts();
-            let forwarded = routing.trust().resolve(&peer, &mut parts.headers);
+            let forwarded = routing.trust_on(&local).resolve(&peer, &mut parts.headers);
             let accept_encoding = parts.headers.get(http::header::ACCEPT_ENCODING).cloned();
             let method = parts.method.clone();
 
