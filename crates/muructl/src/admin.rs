@@ -6483,24 +6483,27 @@ async fn run_command(
 }
 
 /// Print a message of a command's stream, and give muructl's exit status
-/// when it is the last.
+/// when it is the last. Output that cannot be written, to a terminal that
+/// has gone or a pipe nothing reads, is an error rather than a panic.
 fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<i32>> {
     use std::io::Write as _;
 
+    let mut stdout = std::io::stdout().lock();
+
     if json {
-        println!("{}", serde_json::to_string(output)?);
+        writeln!(stdout, "{}", serde_json::to_string(output)?)?;
     } else if output.finished {
         if !output.ok {
-            eprintln!("muru: the command {}", output.message);
+            writeln!(std::io::stderr(), "muru: the command {}", output.message)?;
         }
     } else if output.stderr {
-        eprintln!("{}", output.line);
+        writeln!(std::io::stderr(), "{}", output.line)?;
     } else {
-        println!("{}", output.line);
+        writeln!(stdout, "{}", output.line)?;
     }
 
     if output.finished {
-        std::io::stdout().flush()?;
+        stdout.flush()?;
         return Ok(Some(exit_status(output)));
     }
 
@@ -6520,9 +6523,9 @@ fn exit_status(output: &pb::CommandOutput) -> i32 {
 /// Run a command of the project here in this process (section 9.12):
 /// nothing else is running to ask, as in a Kubernetes Job. The command
 /// gets what muructl serve and muructl run would serve the application
-/// with. SIGINT or SIGTERM stops it as a caller going away does under the
-/// daemon, and muructl exits once it has ended; a second signal kills it
-/// at once.
+/// with. SIGINT, SIGTERM or SIGHUP stops it as a caller going away does
+/// under the daemon, and muructl exits once it has ended; a second signal
+/// kills it at once.
 async fn run_own(
     request: pb::RunCommandRequest,
     project: &crate::project_commands::ProjectArgs,
@@ -6537,6 +6540,7 @@ async fn run_own(
         crate::project_commands::prepare(&context, request).map_err(anyhow::Error::msg)?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
 
     let muru_controller::commands::Running {
         mut output,
@@ -6560,6 +6564,7 @@ async fn run_own(
             }
             _ = interrupt.recv() => break libc::SIGINT,
             _ = terminate.recv() => break libc::SIGTERM,
+            _ = hangup.recv() => break libc::SIGHUP,
         }
     };
 
@@ -6568,11 +6573,12 @@ async fn run_own(
     // output is read on to the last message, which comes once the command
     // has ended and been reaped, so muructl exits only after it.
 
-    let name = if signalled == libc::SIGINT {
-        "SIGINT"
-    } else {
-        "SIGTERM"
+    let name = match signalled {
+        libc::SIGINT => "SIGINT",
+        libc::SIGHUP => "SIGHUP",
+        _ => "SIGTERM",
     };
+
     stopper.stop(format!("muructl got {name}"));
 
     loop {
@@ -6582,12 +6588,18 @@ async fn run_own(
                     anyhow::bail!("the command's end was not reported");
                 };
 
-                if show_output(&message, json)?.is_some() {
+                // After SIGHUP the terminal may be gone. Output that cannot
+                // be shown does not stop muructl waiting for the command.
+
+                let _ = show_output(&message, json);
+
+                if message.finished {
                     return Ok(128 + signalled);
                 }
             }
             _ = interrupt.recv() => stopper.kill(),
             _ = terminate.recv() => stopper.kill(),
+            _ = hangup.recv() => stopper.kill(),
         }
     }
 }

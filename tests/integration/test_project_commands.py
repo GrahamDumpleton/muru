@@ -247,7 +247,8 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
 
     # Its timeout stops it, and so does a signal that ends muructl: the
     # command gets SIGTERM, and muructl exits once it has ended. A command
-    # that exits with 0 once stopped has not succeeded.
+    # that exits with 0 once stopped has not succeeded. SIGHUP, as from a
+    # terminal closed, is taken as SIGINT and SIGTERM are.
 
     slow = muructl(runtime, project, "command", "run", "slow", *python)
     assert slow.returncode == 1
@@ -269,12 +270,12 @@ def test_a_command_runs_on_its_own_when_nothing_serves_the_project(
     try:
         wait_until((project / "hold.pid").exists, "the command never started")
         pid = int((project / "hold.pid").read_text())
-        held.send_signal(signal.SIGTERM)
+        held.send_signal(signal.SIGHUP)
         _, stderr = held.communicate(timeout=30)
-        assert held.returncode == 128 + signal.SIGTERM
+        assert held.returncode == 128 + signal.SIGHUP
         assert gone(pid)
         assert (project / "hold.stopped").read_text() == "SIGTERM"
-        assert "muru: the command stopped because muructl got SIGTERM" in stderr, stderr
+        assert "muru: the command stopped because muructl got SIGHUP" in stderr, stderr
     finally:
         held.kill()
 

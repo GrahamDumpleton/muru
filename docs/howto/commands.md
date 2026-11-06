@@ -196,9 +196,10 @@ command where the session will last, under `nohup`, `tmux` or a CI job,
 so a dropped connection does not stop it halfway.
 
 When `muructl` runs the command itself, because nothing serves the
-project, Ctrl-C or SIGTERM stops the command the same way. `muructl`
-waits for it to end, says why it was stopped, and exits with 128 plus the
-signal it got, 130 for Ctrl-C and 143 for SIGTERM:
+project, Ctrl-C, SIGTERM or the SIGHUP of its terminal closing stops the
+command the same way. `muructl` waits for it to end, says why it was
+stopped, and exits with 128 plus the signal it got: 130 for Ctrl-C, 143
+for SIGTERM and 129 for SIGHUP:
 
 ```console
 $ muructl command run migrate
@@ -207,8 +208,8 @@ Running migrations:
 muru: the command stopped because muructl got SIGINT; it was killed by signal 15 after 4s
 ```
 
-A second Ctrl-C or SIGTERM kills the command, and anything it started,
-at once.
+A second Ctrl-C, SIGTERM or SIGHUP kills the command, and anything it
+started, at once.
 
 ## What is recorded
 
