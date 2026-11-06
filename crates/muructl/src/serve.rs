@@ -538,6 +538,106 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     result
 }
 
+/// The settings every layer beneath the flags gives: the project's serve
+/// table, the file `config` or MURU_SERVE_CONFIG names, then the
+/// environment.
+fn below_flags(
+    table: Option<&(PathBuf, muru_config::ToolMuru)>,
+    config: Option<&Path>,
+    read: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Layered> {
+    let mut layered = Layered::default();
+
+    if let Some((path, tool)) = table
+        && let Some(serve) = &tool.serve
+    {
+        layered.over(from_table(serve), &format!("[serve] in {}", path.display()));
+    }
+
+    let config = config
+        .map(Path::to_path_buf)
+        .or_else(|| read("MURU_SERVE_CONFIG").map(PathBuf::from));
+
+    if let Some(path) = &config {
+        let file = muru_config::load_serve_file(path).map_err(|error| anyhow::anyhow!(error))?;
+        layered.over(from_table(&file), &path.display().to_string());
+    }
+
+    let mut environment = from_environment(read)?;
+
+    if !environment.contains_key("run_dir")
+        && let Some(dir) = read("MURU_RUN_DIR")
+    {
+        environment.insert("run_dir", Value::Text(dir));
+    }
+
+    layered.over(environment, "environment");
+    Ok(layered)
+}
+
+/// Section 13.9: the interpreter the settings name, else the image
+/// contract's, /app/.venv, when nothing nearer names one: an active
+/// virtual environment or the project's own .venv, which muructl run
+/// looks at next.
+fn python_setting(
+    layered: &Layered,
+    project: &Path,
+    read: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    layered.text("python").map(str::to_owned).or_else(|| {
+        let app_venv = Path::new("/app/.venv/bin/python");
+        let nearer = read("VIRTUAL_ENV").is_some() || project.join(".venv").is_dir();
+        (!nearer && app_venv.exists()).then(|| app_venv.display().to_string())
+    })
+}
+
+/// What a command run for the project takes from where `serve` takes
+/// its settings (section 9.12), so a Job and a Deployment made from one
+/// image and environment find the same project, interpreter and runtime
+/// library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSettings {
+    /// The project directory.
+    pub project: PathBuf,
+    /// The interpreter a setting names, or the image contract's.
+    pub python: Option<String>,
+    /// The image's runtime directory, when a setting names one.
+    pub runtime_dir: Option<PathBuf>,
+}
+
+/// The settings a command takes: each flag, else what `serve` would use.
+pub fn command_settings(
+    chdir: Option<&Path>,
+    config: Option<&Path>,
+    python: Option<&str>,
+    runtime_dir: Option<&Path>,
+    read: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<CommandSettings> {
+    let project = chdir
+        .map(Path::to_path_buf)
+        .or_else(|| read("MURU_SERVE_CHDIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let table = muru_config::load_project(&project)?;
+    let mut layered = below_flags(table.as_ref(), config, &read)?;
+    let mut flags = BTreeMap::new();
+
+    if let Some(python) = python {
+        flags.insert("python", Value::Text(python.to_owned()));
+    }
+
+    if let Some(dir) = runtime_dir {
+        flags.insert("runtime_dir", Value::Text(dir.display().to_string()));
+    }
+
+    layered.over(flags, "command line");
+
+    Ok(CommandSettings {
+        python: python_setting(&layered, &project, &read),
+        runtime_dir: layered.text("runtime_dir").map(PathBuf::from),
+        project,
+    })
+}
+
 /// Lay the settings, check them, and turn them into `muructl run`'s
 /// arguments with what is `serve`'s own beside them.
 fn prepare(
@@ -559,34 +659,8 @@ fn prepare(
         _ => chdir.clone().unwrap_or_else(|| PathBuf::from(".")),
     };
 
-    let mut layered = Layered::default();
     let table = muru_config::load_project(&project)?;
-
-    if let Some((path, tool)) = &table
-        && let Some(serve) = &tool.serve
-    {
-        layered.over(from_table(serve), &format!("[serve] in {}", path.display()));
-    }
-
-    let config = args
-        .config
-        .clone()
-        .or_else(|| read("MURU_SERVE_CONFIG").map(PathBuf::from));
-
-    if let Some(path) = &config {
-        let file = muru_config::load_serve_file(path).map_err(|error| anyhow::anyhow!(error))?;
-        layered.over(from_table(&file), &path.display().to_string());
-    }
-
-    let mut environment = from_environment(&read)?;
-
-    if !environment.contains_key("run_dir")
-        && let Some(dir) = read("MURU_RUN_DIR")
-    {
-        environment.insert("run_dir", Value::Text(dir));
-    }
-
-    layered.over(environment, "environment");
+    let mut layered = below_flags(table.as_ref(), args.config.as_deref(), &read)?;
     layered.over(from_flags(args), "command line");
 
     // An entrypoint from a layer is the argument, unless the argument is
@@ -809,13 +883,7 @@ fn prepare(
     // Section 13.9: the image contract's interpreter, /app/.venv among
     // the places muructl run looks, when nothing nearer names one.
 
-    let python = layered.text("python").map(str::to_owned).or_else(|| {
-        let app_venv = Path::new("/app/.venv/bin/python");
-        let nearer = read("VIRTUAL_ENV").is_some() || project.join(".venv").is_dir();
-        (!nearer && app_venv.exists()).then(|| app_venv.display().to_string())
-    });
-
-    if let Some(python) = python {
+    if let Some(python) = python_setting(&layered, &project, &read) {
         argv.extend(["--python".to_owned(), python]);
     }
 
@@ -901,6 +969,24 @@ pub fn group_writable(dir: &Path) {
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770));
 }
 
+/// The runtime library the interpreter's own environment holds, when it
+/// is muructl's version, which needs nothing put on PYTHONPATH.
+pub fn environment_library(python: &muru_provision::Resolved) -> Option<muru_provision::Provided> {
+    let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
+
+    python
+        .probe
+        .muru
+        .as_ref()
+        .filter(|found| found.version == version)
+        .map(|_| muru_provision::Provided {
+            pythonpath: None,
+            version,
+            how: muru_provision::runtime::How::Environment,
+            notes: Vec::new(),
+        })
+}
+
 /// Section 13.9: the runtime library, from the environment when it
 /// matches muructl's version, else from the image's runtime directory,
 /// and never fetched.
@@ -908,18 +994,11 @@ pub fn runtime_library(
     python: &muru_provision::Resolved,
     runtime_dir: &Path,
 ) -> anyhow::Result<muru_provision::Provided> {
-    let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
-
-    if let Some(found) = &python.probe.muru
-        && found.version == version
-    {
-        return Ok(muru_provision::Provided {
-            pythonpath: None,
-            version,
-            how: muru_provision::runtime::How::Environment,
-            notes: Vec::new(),
-        });
+    if let Some(own) = environment_library(python) {
+        return Ok(own);
     }
+
+    let version = muru_provision::runtime::pep440(env!("CARGO_PKG_VERSION"));
 
     let package = runtime_dir.join("muru");
     let installed = std::fs::read_dir(runtime_dir)
@@ -1030,6 +1109,59 @@ mod tests {
         Cli::try_parse_from(std::iter::once("serve").chain(argv.iter().copied()))
             .expect("parses")
             .args
+    }
+
+    #[test]
+    fn a_command_finds_its_settings_where_serve_does() {
+        let dir = tempfile::tempdir().expect("a directory");
+        std::fs::write(
+            dir.path().join("muru.toml"),
+            "entrypoint = 'app:application'\n[serve]\npython = '/table/python'\n\
+             runtime_dir = '/table/runtime'\n",
+        )
+        .expect("the project file");
+        let project = dir.path().display().to_string();
+        let environment = |name: &str| match name {
+            "MURU_SERVE_CHDIR" => Some(project.clone()),
+            "MURU_SERVE_PYTHON" => Some("/env/python".to_owned()),
+            "VIRTUAL_ENV" => Some("/venv".to_owned()),
+            _ => None,
+        };
+
+        // The environment over the project's serve table, and a flag
+        // over both.
+
+        let settings = command_settings(None, None, None, None, environment).expect("settings");
+        assert_eq!(settings.project, dir.path());
+        assert_eq!(settings.python.as_deref(), Some("/env/python"));
+        assert_eq!(
+            settings.runtime_dir.as_deref(),
+            Some(Path::new("/table/runtime"))
+        );
+
+        let flagged = command_settings(
+            Some(dir.path()),
+            None,
+            Some("/flag/python"),
+            Some(Path::new("/flag/runtime")),
+            environment,
+        )
+        .expect("settings");
+        assert_eq!(flagged.python.as_deref(), Some("/flag/python"));
+        assert_eq!(
+            flagged.runtime_dir.as_deref(),
+            Some(Path::new("/flag/runtime"))
+        );
+
+        // Nothing set leaves both to be found as a run finds them.
+
+        let bare = tempfile::tempdir().expect("a directory");
+        let unset = command_settings(Some(bare.path()), None, None, None, |name: &str| {
+            (name == "VIRTUAL_ENV").then(|| "/venv".to_owned())
+        })
+        .expect("settings");
+        assert_eq!(unset.python, None);
+        assert_eq!(unset.runtime_dir, None);
     }
 
     #[test]

@@ -390,6 +390,64 @@ def test_probe_answers_over_the_run_directory(tmp_path: Path) -> None:
     assert gone.returncode == 1
 
 
+def test_a_command_of_the_project_runs_through_the_serve(tmp_path: Path) -> None:
+    # Section 9.12: muructl in the container, as kubectl exec runs it,
+    # runs the project's commands through the serve it finds in the run
+    # directory, with what the application is served with.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "pyproject.toml").write_text(
+        """[tool.muru]
+entrypoint = 'app:application'
+env = { GREETING = 'hello' }
+
+[tool.muru.commands.greet]
+run = ['python', '-c', 'import os, sys; print(os.environ["GREETING"], sys.argv[1])', '{name}']
+inputs.name = { default = 'pod' }
+"""
+    )
+    serve = start(tmp_path, "--chdir", str(project), "--log-format", "json", app=None)
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(muructl), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+        )
+
+    try:
+        listed = run("command", "list")
+        assert listed.returncode == 0, listed.stderr
+        assert listed.stdout.startswith("app@r1\n") and "greet" in listed.stdout, listed.stdout
+
+        ran = run("command", "run", "greet")
+        assert ran.returncode == 0, ran.stderr
+        assert ran.stdout == "hello pod\n"
+
+        # Its output and events are records of the serve's one stream.
+
+        serve.wait_for("command.finished: greet")
+        records = [json.loads(line) for line in serve.stdout]
+        assert any(record["message"] == "[command greet] hello pod" for record in records)
+        assert any(
+            record["kind"] == "muru" and record["message"].startswith("command.started: greet")
+            for record in records
+        )
+
+        one_off = run("exec", "--", "python", "-c", "import sys; sys.exit(7)")
+        assert one_off.returncode == 7, one_off.stderr
+    finally:
+        assert serve.stop() == 0
+
+
 def test_an_unwritable_run_directory_says_what_fixes_it(tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("root can write anywhere")

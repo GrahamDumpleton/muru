@@ -3279,7 +3279,7 @@ pub fn resolve_spec(
 /// inputs with names Python accepts as keywords, patterns that compile,
 /// no default where one is required or secret, and every placeholder an
 /// input, a secret one only in `env`, where no command line shows it.
-fn resolve_commands(
+pub fn resolve_commands(
     tables: &BTreeMap<String, muru_config::CommandTable>,
 ) -> Result<Vec<crate::model::CommandSpec>, String> {
     let mut commands = Vec::with_capacity(tables.len());

@@ -122,6 +122,34 @@ impl SocketArgs {
         self.locations.as_arguments()
     }
 
+    /// The socket of whatever serves the project now (section 9.12): a
+    /// muructl serve in the run directory, of this project when one is
+    /// `named`, else a development run started from it. One that no
+    /// longer answers is passed over.
+    pub fn serving(&self, project: &Path, named: bool) -> Option<PathBuf> {
+        let answers = |socket: &Path| std::os::unix::net::UnixStream::connect(socket).is_ok();
+
+        let serve_dir = std::env::var_os("MURU_RUN_DIR").map_or_else(
+            || PathBuf::from(crate::serve::DEFAULT_RUN_DIR),
+            PathBuf::from,
+        );
+        let serve_socket = serve_dir.join(crate::serve::ADMIN_SOCKET);
+
+        let serve = std::fs::read(serve_dir.join("serve.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::run_admin::RunInfo>(&bytes).ok())
+            .filter(|info| !named || info.project == project);
+
+        if serve.is_some() && answers(&serve_socket) {
+            return Some(serve_socket);
+        }
+
+        crate::run_admin::runs(&self.locations.resolve().run.path)
+            .into_iter()
+            .find(|run| run.project == project && answers(&run.socket))
+            .map(|run| run.socket)
+    }
+
     /// The socket to connect to (design specification section 13.8): as
     /// given, else a muructl serve's in its run directory, else a
     /// development run's from this project, else the daemon's when it
@@ -5743,13 +5771,16 @@ pub async fn events(
     Ok(())
 }
 
-/// What `muructl exec` takes: a release and the command to run with it.
+/// What `muructl exec` takes: a release, or the project here, and the
+/// command to run with it.
 #[derive(Args)]
 pub struct RunExecArgs {
     /// The application, or app@release; the current release when only
-    /// the application is named.
+    /// the application is named. With none, the project in the current
+    /// directory: through a muructl run or muructl serve of it when one
+    /// is up, else by this command itself.
     #[arg(value_name = "APP[@RELEASE]")]
-    target: String,
+    target: Option<String>,
 
     /// The command and its arguments, after `--`, run without a shell;
     /// `python` is the release's interpreter.
@@ -5763,11 +5794,16 @@ pub struct RunExecArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    #[command(flatten)]
+    project: crate::project_commands::ProjectArgs,
 }
 
-/// Run a one-off command with a release and exit with its status.
+/// Run a one-off command with a release, or for the project here, and
+/// exit with its status.
 pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
-    let (app, release) = target_release(&args.target)?;
+    let place = Place::find(args.target.as_deref(), &args.socket, &args.project)?;
+    let (app, release) = place.target()?;
     let request = pb::RunCommandRequest {
         app,
         release,
@@ -5775,39 +5811,138 @@ pub async fn exec(args: RunExecArgs) -> anyhow::Result<i32> {
         ..Default::default()
     };
 
-    run_command(request, &args.socket, args.json).await
+    run_command(request, &place, args.json).await
+}
+
+/// Where a command runs (section 9.12): through an admin socket, the
+/// daemon's for a named application and a development run's or muructl
+/// serve's for the project here, or by this command itself.
+enum Place<'a> {
+    /// Through an admin socket, with the application and release named.
+    Socket {
+        /// The socket.
+        socket: PathBuf,
+        /// The application and release, as given.
+        target: Option<&'a str>,
+    },
+    /// By this command, for the project the flags find.
+    Own(&'a crate::project_commands::ProjectArgs),
+}
+
+impl<'a> Place<'a> {
+    /// With an application named, the daemon; with none, the socket
+    /// given, else a muructl serve or development run of the project
+    /// that answers, else this command itself.
+    fn find(
+        target: Option<&'a str>,
+        socket: &SocketArgs,
+        project: &'a crate::project_commands::ProjectArgs,
+    ) -> anyhow::Result<Self> {
+        if let Some(target) = target {
+            if let Some(flag) = project.given() {
+                anyhow::bail!(
+                    "{flag} finds the project a command runs for when no application is \
+                     named; {target} runs with its release's own code, under the daemon"
+                );
+            }
+
+            return Ok(Self::Socket {
+                socket: socket.socket()?,
+                target: Some(target),
+            });
+        }
+
+        if let Some(given) = &socket.socket {
+            return Ok(Self::Socket {
+                socket: given.clone(),
+                target: None,
+            });
+        }
+
+        Ok(
+            match socket.serving(&project.project(), project.chdir.is_some()) {
+                Some(socket) => Self::Socket {
+                    socket,
+                    target: None,
+                },
+                None => Self::Own(project),
+            },
+        )
+    }
+
+    /// The application and release to ask for: those named, or none,
+    /// which a run takes as the application it serves.
+    fn target(&self) -> anyhow::Result<(String, String)> {
+        match self {
+            Self::Socket {
+                target: Some(target),
+                ..
+            } => target_release(target),
+            _ => Ok((String::new(), String::new())),
+        }
+    }
+
+    /// The commands declared there.
+    async fn commands(&self) -> anyhow::Result<pb::ListCommandsResponse> {
+        match self {
+            Self::Socket { socket, .. } => {
+                let (app, release) = self.target()?;
+                let mut client = client::connect(socket).await?;
+                Ok(client
+                    .list_commands(pb::ListCommandsRequest { app, release })
+                    .await
+                    .map_err(explain)?
+                    .into_inner())
+            }
+            Self::Own(project) => {
+                crate::project_commands::listed(&project.project()).map_err(anyhow::Error::msg)
+            }
+        }
+    }
 }
 
 /// The `muructl command` subcommands.
 #[derive(Subcommand)]
 pub enum CommandCommand {
     /// List the commands a release declares, with their inputs and each
-    /// one's last run.
-    List {
-        /// The application, or app@release; the current release when
-        /// only the application is named.
-        #[arg(value_name = "APP[@RELEASE]")]
-        target: String,
+    /// one's last run; or, with no application, those of the project in
+    /// the current directory.
+    List(Box<CommandListArgs>),
 
-        #[command(flatten)]
-        socket: SocketArgs,
-
-        #[command(flatten)]
-        output: JsonArgs,
-    },
-
-    /// Run a command the release declares, with its inputs, and exit with
-    /// its status.
+    /// Run a declared command, with its inputs, and exit with its status:
+    /// a release's under the daemon, or, with no application, one of the
+    /// project in the current directory.
+    #[command(allow_missing_positional = true)]
     Run(Box<CommandRunArgs>),
+}
+
+/// What `muructl command list` takes.
+#[derive(Args)]
+pub struct CommandListArgs {
+    /// The application, or app@release; the current release when only
+    /// the application is named. With none, the project here.
+    #[arg(value_name = "APP[@RELEASE]")]
+    target: Option<String>,
+
+    #[command(flatten)]
+    socket: SocketArgs,
+
+    #[command(flatten)]
+    project: crate::project_commands::ProjectArgs,
+
+    #[command(flatten)]
+    output: JsonArgs,
 }
 
 /// What `muructl command run` takes.
 #[derive(Args)]
 pub struct CommandRunArgs {
     /// The application, or app@release; the current release when only
-    /// the application is named.
+    /// the application is named. With none, the project in the current
+    /// directory: through a muructl run or muructl serve of it when one
+    /// is up, else by this command itself.
     #[arg(value_name = "APP[@RELEASE]")]
-    target: String,
+    target: Option<String>,
 
     /// The command's name.
     name: String,
@@ -5817,7 +5952,7 @@ pub struct CommandRunArgs {
     inputs: Vec<(String, String)>,
 
     /// An input's value from one of the daemon's secret stores, so it
-    /// never passes through this command.
+    /// never passes through this command; for a named application only.
     #[arg(long = "secret-input", value_name = "NAME=STORE/KEY", value_parser = parse_input)]
     secret_inputs: Vec<(String, String)>,
 
@@ -5832,6 +5967,9 @@ pub struct CommandRunArgs {
 
     #[command(flatten)]
     socket: SocketArgs,
+
+    #[command(flatten)]
+    project: crate::project_commands::ProjectArgs,
 }
 
 /// Parse NAME=VALUE for --input and --secret-input.
@@ -5847,21 +5985,25 @@ fn parse_input(text: &str) -> Result<(String, String), String> {
     Ok((name.to_owned(), value.to_owned()))
 }
 
-/// List the commands a release declares.
-pub async fn command_list(target: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
-    let (app, release) = target_release(&target)?;
-    let mut client = client::connect(&socket.socket()?).await?;
-    let listed = client
-        .list_commands(pb::ListCommandsRequest { app, release })
-        .await
-        .map_err(explain)?
-        .into_inner();
+/// List the commands a release declares, or the project here does.
+pub async fn command_list(args: CommandListArgs) -> anyhow::Result<()> {
+    let project = &args.project;
+    let place = Place::find(args.target.as_deref(), &args.socket, project)?;
+    let listed = place.commands().await?;
 
-    if json {
+    if args.output.json {
         return print_answer(&listed);
     }
 
-    println!("{}@{}", listed.app, listed.release);
+    if listed.release.is_empty() {
+        println!(
+            "{}, the project in {}",
+            listed.app,
+            project.project().display()
+        );
+    } else {
+        println!("{}@{}", listed.app, listed.release);
+    }
 
     if listed.commands.is_empty() {
         println!("  declares no commands");
@@ -5944,11 +6086,12 @@ pub async fn command_list(target: String, socket: SocketArgs, json: bool) -> any
 
 /// Run a declared command and exit with its status. A required input
 /// not given is asked for when standard input is a terminal, a secret one
-/// without echo; otherwise the daemon refuses the run and says which.
+/// without echo; otherwise the run is refused, saying which.
 pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
     use std::io::{IsTerminal as _, Read as _};
 
-    let (app, release) = target_release(&args.target)?;
+    let place = Place::find(args.target.as_deref(), &args.socket, &args.project)?;
+    let (app, release) = place.target()?;
     let mut inputs: std::collections::BTreeMap<String, String> = args.inputs.into_iter().collect();
     let secret_inputs: std::collections::BTreeMap<String, String> =
         args.secret_inputs.into_iter().collect();
@@ -5963,15 +6106,7 @@ pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
             value.trim_end_matches(['\n', '\r']).to_owned(),
         );
     } else if std::io::stdin().is_terminal() && !args.json {
-        let mut client = client::connect(&args.socket.socket()?).await?;
-        let listed = client
-            .list_commands(pb::ListCommandsRequest {
-                app: app.clone(),
-                release: release.clone(),
-            })
-            .await
-            .map_err(explain)?
-            .into_inner();
+        let listed = place.commands().await?;
         let declared = listed
             .commands
             .iter()
@@ -6000,7 +6135,7 @@ pub async fn command_run(args: CommandRunArgs) -> anyhow::Result<i32> {
         ..Default::default()
     };
 
-    run_command(request, &args.socket, args.json).await
+    run_command(request, &place, args.json).await
 }
 
 /// Ask for an input's value on the terminal, without echo for a secret
@@ -6051,18 +6186,21 @@ fn target_release(target: &str) -> anyhow::Result<(String, String)> {
     }
 }
 
-/// Run a command through the daemon, printing its output as it arrives,
+/// Run a command where it belongs, printing its output as it arrives,
 /// standard error to standard error, and return its exit status. A
 /// command that fails says how on standard error, as muructl's other
 /// errors do.
 async fn run_command(
     request: pb::RunCommandRequest,
-    socket: &SocketArgs,
+    place: &Place<'_>,
     json: bool,
 ) -> anyhow::Result<i32> {
-    use std::io::Write as _;
+    let socket = match place {
+        Place::Socket { socket, .. } => socket,
+        Place::Own(project) => return run_own(request, project, json).await,
+    };
 
-    let mut client = client::connect(&socket.socket()?).await?;
+    let mut client = client::connect(socket).await?;
     let mut stream = client
         .run_command(request)
         .await
@@ -6070,27 +6208,92 @@ async fn run_command(
         .into_inner();
 
     while let Some(output) = stream.next().await {
-        let output = output.map_err(explain)?;
-
-        if json {
-            println!("{}", serde_json::to_string(&output)?);
-        } else if output.finished {
-            if output.exit_code != 0 {
-                eprintln!("muru: the command {}", output.message);
-            }
-        } else if output.stderr {
-            eprintln!("{}", output.line);
-        } else {
-            println!("{}", output.line);
-        }
-
-        if output.finished {
-            std::io::stdout().flush()?;
-            return Ok(output.exit_code);
+        if let Some(code) = show_output(&output.map_err(explain)?, json)? {
+            return Ok(code);
         }
     }
 
     anyhow::bail!("the daemon stopped answering before the command ended")
+}
+
+/// Print a message of a command's stream, and give its exit status when
+/// it is the last.
+fn show_output(output: &pb::CommandOutput, json: bool) -> anyhow::Result<Option<i32>> {
+    use std::io::Write as _;
+
+    if json {
+        println!("{}", serde_json::to_string(output)?);
+    } else if output.finished {
+        if output.exit_code != 0 {
+            eprintln!("muru: the command {}", output.message);
+        }
+    } else if output.stderr {
+        eprintln!("{}", output.line);
+    } else {
+        println!("{}", output.line);
+    }
+
+    if output.finished {
+        std::io::stdout().flush()?;
+        return Ok(Some(output.exit_code));
+    }
+
+    Ok(None)
+}
+
+/// Run a command of the project here in this process (section 9.12):
+/// nothing else is running to ask, as in a Kubernetes Job. The command
+/// gets what muructl serve and muructl run would serve the application
+/// with, and a signal that would end muructl stops it first, as a caller
+/// going away does under the daemon.
+async fn run_own(
+    request: pb::RunCommandRequest,
+    project: &crate::project_commands::ProjectArgs,
+    json: bool,
+) -> anyhow::Result<i32> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let request = muru_controller::commands::CommandRequest::from_message(request)
+        .map_err(anyhow::Error::msg)?;
+    let context = crate::project_commands::own(project).await?;
+    let prepared =
+        crate::project_commands::prepare(&context, request).map_err(anyhow::Error::msg)?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+
+    let mut output = muru_controller::commands::run(
+        prepared,
+        std::sync::Arc::new(muru_controller::commands::Unrecorded),
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let signalled = loop {
+        tokio::select! {
+            message = output.recv() => {
+                let Some(message) = message else {
+                    anyhow::bail!("the command's end was not reported");
+                };
+
+                if let Some(code) = show_output(&message, json)? {
+                    return Ok(code);
+                }
+            }
+            _ = interrupt.recv() => break libc::SIGINT,
+            _ = terminate.recv() => break libc::SIGTERM,
+        }
+    };
+
+    // The stream closed is the caller gone: the command's session gets
+    // SIGTERM and, after the grace period, SIGKILL, and the stream ends
+    // once the command has.
+
+    output.close();
+
+    while let Some(message) = output.recv().await {
+        show_output(&message, json)?;
+    }
+
+    Ok(128 + signalled)
 }
 
 /// What `muructl logs` takes: a release's output, or the access log,

@@ -609,22 +609,10 @@ impl Admin for Service {
         request: Request<pb::RunCommandRequest>,
     ) -> Result<Response<CommandStream>, Status> {
         let request = request.into_inner();
-        let release = self.current_release(&request.app, &request.release)?;
-
-        let command = match (request.name.is_empty(), request.argv.is_empty()) {
-            (true, false) => crate::commands::CommandRequest::OneOff(request.argv),
-            (false, true) => crate::commands::CommandRequest::Declared {
-                name: request.name,
-                inputs: request.inputs.into_iter().collect(),
-                secret_inputs: request.secret_inputs.into_iter().collect(),
-            },
-            (true, true) => return Err(Status::invalid_argument("name the command to run")),
-            (false, false) => {
-                return Err(Status::invalid_argument(
-                    "name a declared command or give a one-off one, not both",
-                ));
-            }
-        };
+        let app = request.app.clone();
+        let release = self.current_release(&app, &request.release)?;
+        let command = crate::commands::CommandRequest::from_message(request)
+            .map_err(Status::invalid_argument)?;
 
         // Section 9.12: the daemon resolves what the release runs with,
         // then the command runs here, outside the daemon's loop, for as
@@ -634,7 +622,7 @@ impl Admin for Service {
         self.handle
             .commands
             .send(Command::PrepareCommand {
-                app: request.app.clone(),
+                app,
                 id: release,
                 request: command,
                 done: done_tx,
@@ -648,8 +636,10 @@ impl Admin for Service {
 
         let output = crate::commands::run(
             prepared,
-            self.handle.events.clone(),
-            self.handle.store.clone(),
+            std::sync::Arc::new(crate::commands::Recorded {
+                events: self.handle.events.clone(),
+                store: self.handle.store.clone(),
+            }),
         )
         .map_err(Status::failed_precondition)?;
         let stream =
@@ -680,37 +670,7 @@ impl Admin for Service {
         let commands = spec
             .commands
             .iter()
-            .map(|command| pb::CommandInfo {
-                name: command.name.clone(),
-                description: command.description.clone(),
-                run: command.run.clone(),
-                call: command.call.clone().unwrap_or_default(),
-                inputs: command
-                    .inputs
-                    .iter()
-                    .map(|input| pb::CommandInputInfo {
-                        name: input.name.clone(),
-                        description: input.description.clone(),
-                        required: input.required,
-                        default: input.default.clone().unwrap_or_default(),
-                        pattern: input.pattern.clone().unwrap_or_default(),
-                        secret: input.secret,
-                    })
-                    .collect(),
-                timeout: command
-                    .timeout_ms
-                    .map(|ms| muru_config::format_duration(Duration::from_millis(ms)))
-                    .unwrap_or_default(),
-                exclusive: command.exclusive,
-                last_run: runs.get(&command.name).map(|run| pb::CommandRun {
-                    release: run.release.clone(),
-                    started_unix_ms: run.started_unix_ms,
-                    duration_ms: run.duration_ms,
-                    exit_code: run.exit_code,
-                    ok: run.ok,
-                    message: run.message.clone(),
-                }),
-            })
+            .map(|command| crate::commands::info(command, runs.get(&command.name)))
             .collect();
 
         Ok(Response::new(pb::ListCommandsResponse {

@@ -14,6 +14,7 @@ mod edge;
 mod init;
 mod log_format;
 mod mcp;
+mod project_commands;
 mod provision;
 mod pstats;
 mod run_admin;
@@ -1017,13 +1018,8 @@ fn main() -> anyhow::Result<()> {
         Command::Mcp { command } => runtime.block_on(mcp::run(command)),
         Command::Exec(args) => exit_with(runtime, admin::exec(args)),
         Command::Commands {
-            command:
-                admin::CommandCommand::List {
-                    target,
-                    socket,
-                    output,
-                },
-        } => runtime.block_on(admin::command_list(target, socket, output.json)),
+            command: admin::CommandCommand::List(args),
+        } => runtime.block_on(admin::command_list(*args)),
         Command::Commands {
             command: admin::CommandCommand::Run(args),
         } => exit_with(runtime, admin::command_run(*args)),
@@ -3052,6 +3048,14 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         spec.logging.format = Some("json".to_owned());
     }
 
+    // Section 9.12: what the application is served with, which a command
+    // of the project run through the admin socket runs with too.
+
+    let served = Arc::new(run_admin::Served {
+        interpreter: std::sync::Mutex::new((spec.python.clone(), spec.pythonpath.clone())),
+        env: spec.env.clone(),
+    });
+
     let logs = Logs::default();
     let group_tables = resolved.groups.clone();
     let mounts = mount_paths(&resolved);
@@ -3380,6 +3384,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             access_log: edge.access_log(),
             logs: logs.clone(),
             host: Arc::clone(&host_link),
+            served: Arc::clone(&served),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
@@ -3607,6 +3612,7 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
 
                         spec.python = python.python.clone();
                         spec.pythonpath = library.pythonpath.clone();
+                        served.replace(spec.python.clone(), spec.pythonpath.clone());
                     }
                     Ok(false) => {}
                     Err(error) => {

@@ -1,7 +1,9 @@
 //! Commands (design specification section 9.12): a process started with a
 //! release's interpreter, environment, user and source directory, whose
 //! output streams to the caller and into the release's log, and whose end
-//! is recorded as an event.
+//! is recorded as an event. The daemon runs them for a release; a
+//! development run, `muructl serve` and muructl on its own run them for
+//! the project they serve or stand in, each recording a run its own way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -24,6 +26,47 @@ use crate::store::Store;
 /// goes away, gets before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// Where a run of a command is recorded, beyond the stream its caller
+/// reads. The daemon keeps events and each command's last run; a
+/// development run and `muructl serve` write to their own output; a
+/// command muructl runs on its own records nothing.
+pub trait Record: Send + Sync {
+    /// A line the command wrote, or the last one saying how it ended.
+    fn output(&self, _label: &str, _line: &str, _stderr: bool) {}
+
+    /// The run started, finished or failed.
+    fn event(&self, _kind: &str, _subject: &str, _level: &'static str, _message: &str) {}
+
+    /// A declared command's run ended.
+    fn ended(&self, _app: &str, _name: &str, _run: &CommandRun) {}
+}
+
+/// The daemon's record: events in the store and on the stream, and the
+/// last run of each declared command.
+pub struct Recorded {
+    /// The event stream.
+    pub events: Events,
+    /// The store.
+    pub store: Arc<Store>,
+}
+
+impl Record for Recorded {
+    fn event(&self, kind: &str, subject: &str, level: &'static str, message: &str) {
+        self.events.emit(kind, subject, level, message);
+    }
+
+    fn ended(&self, app: &str, name: &str, run: &CommandRun) {
+        if let Err(error) = self.store.record_command_run(app, name, run) {
+            tracing::warn!(%error, "recording the run of {name} failed");
+        }
+    }
+}
+
+/// No record at all: the caller's stream is everything.
+pub struct Unrecorded;
+
+impl Record for Unrecorded {}
+
 /// What a caller asks to run.
 #[derive(Debug, Clone)]
 pub enum CommandRequest {
@@ -38,6 +81,23 @@ pub enum CommandRequest {
         /// Inputs taken from a secret store, as STORE/KEY.
         secret_inputs: BTreeMap<String, String>,
     },
+}
+
+impl CommandRequest {
+    /// What an admin API request asks to run: a declared command by
+    /// name, or a one-off one, and not both.
+    pub fn from_message(request: pb::RunCommandRequest) -> Result<Self, &'static str> {
+        match (request.name.is_empty(), request.argv.is_empty()) {
+            (true, false) => Ok(Self::OneOff(request.argv)),
+            (false, true) => Ok(Self::Declared {
+                name: request.name,
+                inputs: request.inputs.into_iter().collect(),
+                secret_inputs: request.secret_inputs.into_iter().collect(),
+            }),
+            (true, true) => Err("name the command to run"),
+            (false, false) => Err("name a declared command or give a one-off one, not both"),
+        }
+    }
 }
 
 /// The declared commands running now that run one at a time, by
@@ -94,8 +154,9 @@ pub struct Prepared {
     /// Whom it runs as, when the daemon is root and the application
     /// names a user (section 10.9).
     pub identity: Option<Identity>,
-    /// The release's log, which its output is appended to.
-    pub log: PathBuf,
+    /// The release's log, which its output is appended to; none where
+    /// the record takes the output instead.
+    pub log: Option<PathBuf>,
     /// How long it may run before it is stopped; no limit when absent.
     pub timeout: Option<Duration>,
     /// The declared command's name, whose last run is recorded; none for
@@ -186,7 +247,13 @@ pub fn environment(
     }
 
     set.push(("MURU_APP".to_owned(), app.to_owned()));
-    set.push(("MURU_RELEASE".to_owned(), release.to_owned()));
+
+    // A command run for a project on its own has no release to name.
+
+    if !release.is_empty() {
+        set.push(("MURU_RELEASE".to_owned(), release.to_owned()));
+    }
+
     set.push(("MURU_RELEASE_DIR".to_owned(), source.display().to_string()));
 
     env.retain(|(name, _)| !set.iter().any(|(key, _)| key == name) && !name.starts_with("MURU_"));
@@ -443,6 +510,42 @@ pub fn describe_inputs(command: &CommandSpec, values: &BTreeMap<String, String>)
         .join(", ")
 }
 
+/// A declared command as the admin API lists it, with its last run when
+/// one is kept.
+pub fn info(command: &CommandSpec, last_run: Option<&CommandRun>) -> pb::CommandInfo {
+    pb::CommandInfo {
+        name: command.name.clone(),
+        description: command.description.clone(),
+        run: command.run.clone(),
+        call: command.call.clone().unwrap_or_default(),
+        inputs: command
+            .inputs
+            .iter()
+            .map(|input| pb::CommandInputInfo {
+                name: input.name.clone(),
+                description: input.description.clone(),
+                required: input.required,
+                default: input.default.clone().unwrap_or_default(),
+                pattern: input.pattern.clone().unwrap_or_default(),
+                secret: input.secret,
+            })
+            .collect(),
+        timeout: command
+            .timeout_ms
+            .map(|ms| muru_config::format_duration(Duration::from_millis(ms)))
+            .unwrap_or_default(),
+        exclusive: command.exclusive,
+        last_run: last_run.map(|run| pb::CommandRun {
+            release: run.release.clone(),
+            started_unix_ms: run.started_unix_ms,
+            duration_ms: run.duration_ms,
+            exit_code: run.exit_code,
+            ok: run.ok,
+            message: run.message.clone(),
+        }),
+    }
+}
+
 /// How a command ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ending {
@@ -460,8 +563,7 @@ struct Ending {
 /// exclusive command already running for the application is refused.
 pub fn run(
     prepared: Prepared,
-    events: Events,
-    store: Arc<Store>,
+    record: Arc<dyn Record>,
 ) -> Result<mpsc::Receiver<pb::CommandOutput>, String> {
     let secrets = SecretFiles(prepared.secrets.clone());
 
@@ -488,7 +590,7 @@ pub fn run(
     let (sender, receiver) = mpsc::channel(256);
 
     tokio::spawn(async move {
-        supervise(prepared, events, store, sender).await;
+        supervise(prepared, record, sender).await;
         drop(claim);
         drop(secrets);
     });
@@ -499,18 +601,19 @@ pub fn run(
 /// Run the command to its end, relaying its output and recording it.
 async fn supervise(
     prepared: Prepared,
-    events: Events,
-    store: Arc<Store>,
+    record: Arc<dyn Record>,
     sender: mpsc::Sender<pb::CommandOutput>,
 ) {
     let subject = prepared.subject();
     let started = Instant::now();
     let started_unix_ms = now_unix_ms();
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&prepared.log)
-        .ok();
+    let mut log = prepared.log.as_ref().and_then(|log| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .ok()
+    });
 
     let mut command = Command::new(&prepared.argv[0]);
     command
@@ -535,7 +638,7 @@ async fn supervise(
                 message: format!("{} could not be started: {error}", prepared.argv[0]),
                 ok: false,
             };
-            events.emit(
+            record.event(
                 "command.failed",
                 &subject,
                 "warning",
@@ -553,7 +656,7 @@ async fn supervise(
     } else {
         format!(", with {}", prepared.inputs)
     };
-    events.emit(
+    record.event(
         "command.started",
         &subject,
         "info",
@@ -602,6 +705,8 @@ async fn supervise(
                     let _ = writeln!(log, "[command {}] {line}", prepared.label);
                 }
 
+                record.output(&prepared.label, &line, stderr);
+
                 let message = pb::CommandOutput {
                     release: prepared.release.clone(),
                     line,
@@ -644,12 +749,14 @@ async fn supervise(
         let _ = writeln!(log, "[command {}] {}", prepared.label, ending.message);
     }
 
+    record.output(&prepared.label, &ending.message, false);
+
     let (kind, level) = if ending.ok {
         ("command.finished", "info")
     } else {
         ("command.failed", "warning")
     };
-    events.emit(
+    record.event(
         kind,
         &subject,
         level,
@@ -666,9 +773,7 @@ async fn supervise(
             message: ending.message.clone(),
         };
 
-        if let Err(error) = store.record_command_run(&prepared.app, name, &run) {
-            tracing::warn!(%error, "recording the run of {name} failed");
-        }
+        record.ended(&prepared.app, name, &run);
     }
 
     if !caller_gone {
@@ -795,13 +900,21 @@ mod tests {
             env: vec![("GREETING".to_owned(), "hello".to_owned())],
             cwd: std::env::temp_dir(),
             identity: None,
-            log,
+            log: Some(log),
             timeout: None,
             declared: None,
             exclusive: false,
             inputs: String::new(),
             secrets: None,
         }
+    }
+
+    fn recorded() -> Arc<dyn Record> {
+        let store = store();
+        Arc::new(Recorded {
+            events: Events::new(store.clone()),
+            store,
+        })
     }
 
     fn store() -> Arc<Store> {
@@ -1115,15 +1228,12 @@ mod tests {
     async fn output_streams_in_lines_and_the_end_comes_last() {
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("r1.log");
-        let store = store();
-        let events = Events::new(store.clone());
         let receiver = run(
             prepared(
                 &["sh", "-c", "echo $GREETING; echo oops >&2; exit 2"],
                 log.clone(),
             ),
-            events.clone(),
-            store,
+            recorded(),
         )
         .expect("started");
         let messages = collect(receiver).await;
@@ -1152,11 +1262,9 @@ mod tests {
     #[tokio::test]
     async fn a_command_past_its_timeout_is_stopped() {
         let dir = tempfile::tempdir().expect("a directory");
-        let store = store();
-        let events = Events::new(store.clone());
         let mut command = prepared(&["sleep", "30"], dir.path().join("r1.log"));
         command.timeout = Some(Duration::from_millis(200));
-        let messages = collect(run(command, events, store).expect("started")).await;
+        let messages = collect(run(command, recorded()).expect("started")).await;
 
         let last = messages.last().expect("a last message");
         assert!(last.finished);
@@ -1171,13 +1279,10 @@ mod tests {
     #[tokio::test]
     async fn a_program_that_is_not_found_ends_with_127() {
         let dir = tempfile::tempdir().expect("a directory");
-        let store = store();
-        let events = Events::new(store.clone());
         let messages = collect(
             run(
                 prepared(&["no-such-program-anywhere"], dir.path().join("r1.log")),
-                events,
-                store,
+                recorded(),
             )
             .expect("started"),
         )
@@ -1186,5 +1291,65 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].exit_code, 127);
         assert!(messages[0].message.contains("could not be started"));
+    }
+
+    /// A record that keeps what it is given, as a development run's does.
+    #[derive(Default)]
+    struct Kept {
+        output: Mutex<Vec<String>>,
+        events: Mutex<Vec<String>>,
+        ended: Mutex<Vec<(String, i32)>>,
+    }
+
+    impl Record for Kept {
+        fn output(&self, label: &str, line: &str, _stderr: bool) {
+            self.output
+                .lock()
+                .expect("output")
+                .push(format!("[command {label}] {line}"));
+        }
+
+        fn event(&self, kind: &str, subject: &str, _level: &'static str, _message: &str) {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("{kind} {subject}"));
+        }
+
+        fn ended(&self, _app: &str, name: &str, run: &CommandRun) {
+            self.ended
+                .lock()
+                .expect("ended")
+                .push((name.to_owned(), run.exit_code));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_log_is_recorded_by_whoever_started_it() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let kept = Arc::new(Kept::default());
+        let mut command = prepared(&["sh", "-c", "echo hello; exit 3"], dir.path().join("x"));
+        command.log = None;
+        command.label = "migrate".to_owned();
+        command.declared = Some("migrate".to_owned());
+        let messages = collect(run(command, kept.clone()).expect("started")).await;
+
+        assert_eq!(messages.last().expect("a last message").exit_code, 3);
+        assert!(!dir.path().join("x").exists());
+
+        let output = kept.output.lock().expect("output").clone();
+        assert_eq!(output[0], "[command migrate] hello");
+        assert!(
+            output[1].starts_with("[command migrate] exited with status 3 after"),
+            "{output:?}"
+        );
+        assert_eq!(
+            *kept.events.lock().expect("events"),
+            ["command.started shop@r1", "command.failed shop@r1"]
+        );
+        assert_eq!(
+            *kept.ended.lock().expect("ended"),
+            [("migrate".to_owned(), 3)]
+        );
     }
 }
