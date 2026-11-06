@@ -91,12 +91,11 @@ one project settings file wherever it lives.
 
 - **`--print-config` shows what a command would use.** On `muructl run`
   and `muructl serve` it prints the resolved settings in the shape of
-  the project's file, each with the layer that set it. The conversion of
-  a run to the daemon's format is kept behind a hidden
-  `--print-daemon-config`. Its output restates every resolved value in a
-  release's table, where it then stands over the project's own file, and
-  the path from a development run to the daemon wants working out before
-  a flag is offered for it.
+  the project's file, each with the layer that set it. A run is not
+  converted to the daemon's format: its output restated every resolved
+  value in a release's table, where it then stood over the project's own
+  file. ADR 0052 gives the writing of a release's table a command of its
+  own.
 
 - **The daemon's default file keeps its name.** No project's file lives
   in `/etc/muru` or a user's configuration directory, so `muru.toml`
@@ -124,8 +123,9 @@ one project settings file wherever it lives.
 - Bad: the daemon's file and a project's still share the name
   `muru.toml`, told apart by where they are.
 
-- Bad: nothing offered converts a development run to the daemon's
-  format. A release's table needs only its `source`, and `muructl
+- Bad: a development run is not converted to the daemon's format. A
+  release's table is written by `muructl render` from the settings a
+  deploy takes (ADR 0052), it needs only its `source`, and `muructl
   deploy` needs no file.
 
 ## More information

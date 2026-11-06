@@ -61,7 +61,8 @@ threads = 4
 
 The file is named `muru.daemon.toml` because `muru.toml` beside the code
 is the project's own settings file. What the table leaves out comes from
-that file, or from `[tool.muru]` in `pyproject.toml`.
+that file, or from `[tool.muru]` in `pyproject.toml`. `muructl render
+shop . > muru.daemon.toml` writes the file from those settings.
 
 Then the agent, through the tools:
 
