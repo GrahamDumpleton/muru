@@ -125,6 +125,9 @@ pub struct RunState {
     pub host: SharedHostLink,
     /// What the application is served with, for its commands.
     pub served: Arc<Served>,
+    /// The commands running through the admin socket, which the run's
+    /// shutdown stops and waits for.
+    pub commands: muru_controller::commands::Underway,
 }
 
 /// What the run serves the application with, which a command of the
@@ -736,6 +739,7 @@ impl Admin for Service {
             Arc::new(crate::project_commands::Printed {
                 logs: state.logs.clone(),
             }),
+            &state.commands,
         )
         .map_err(Status::failed_precondition)?;
         let stream =

@@ -24,7 +24,7 @@ use crate::store::Store;
 
 /// How long a command told to stop, at its timeout or when its caller
 /// goes away, gets before its session is killed.
-const STOP_GRACE: Duration = Duration::from_secs(10);
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// How often a stopping command's session is checked for processes left
 /// in it, once the command's own process has ended and been reaped.
@@ -620,6 +620,15 @@ fn run_with_grace(
     record: Arc<dyn Record>,
     grace: Duration,
 ) -> Result<Running, String> {
+    start(prepared, record, grace).map(|(running, _)| running)
+}
+
+/// `run_with_grace`, and the task that runs the command to its end.
+fn start(
+    prepared: Prepared,
+    record: Arc<dyn Record>,
+    grace: Duration,
+) -> Result<(Running, tokio::task::JoinHandle<()>), String> {
     let secrets = SecretFiles(prepared.secrets.clone());
 
     let claim = match (&prepared.declared, prepared.exclusive) {
@@ -645,16 +654,99 @@ fn run_with_grace(
     let (sender, output) = mpsc::channel(256);
     let (stopper, requests) = mpsc::unbounded_channel();
 
-    tokio::spawn(async move {
+    let supervised = tokio::spawn(async move {
         supervise(prepared, record, sender, requests, grace).await;
         drop(claim);
         drop(secrets);
     });
 
-    Ok(Running {
+    let running = Running {
         output,
         stopper: Stopper(stopper),
-    })
+    };
+    Ok((running, supervised))
+}
+
+/// How long `Underway::stop_all` waits for a command whose session it has
+/// sent SIGKILL.
+const KILLED_WAIT: Duration = Duration::from_secs(3);
+
+/// The commands a process has running for its callers, kept so that its
+/// shutdown can stop them and wait for them, rather than end with them
+/// still running. A command is stopped as at its timeout, and its caller
+/// hears how it ended.
+#[derive(Clone, Default)]
+pub struct Underway(Arc<Mutex<Runs>>);
+
+/// The commands under way, and whether the shutdown has begun.
+#[derive(Default)]
+struct Runs {
+    /// Each command's stopper and the task that runs it to its end.
+    runs: Vec<(Stopper, tokio::task::JoinHandle<()>)>,
+    /// Whether `stop_all` has been called, after which none is started.
+    closed: bool,
+}
+
+impl Underway {
+    /// Start the command, as `run` does, and keep it until it ends. A
+    /// command is refused once the shutdown has begun.
+    pub fn run(
+        &self,
+        prepared: Prepared,
+        record: Arc<dyn Record>,
+    ) -> Result<mpsc::Receiver<pb::CommandOutput>, String> {
+        let mut runs = self.0.lock().expect("commands under way poisoned");
+
+        if runs.closed {
+            return Err("commands are not started while shutting down".to_owned());
+        }
+
+        let (running, supervised) = start(prepared, record, STOP_GRACE)?;
+        runs.runs
+            .retain(|(_, supervised)| !supervised.is_finished());
+        runs.runs.push((running.stopper, supervised));
+        Ok(running.output)
+    }
+
+    /// Stop every command under way because of `why`, such as "muructl
+    /// serve shut down", and wait for them to end. Each session gets
+    /// SIGTERM, and SIGKILL at the end of the grace period or at
+    /// `deadline`, whichever comes first.
+    pub async fn stop_all(&self, why: &str, deadline: tokio::time::Instant) {
+        let mut runs = {
+            let mut underway = self.0.lock().expect("commands under way poisoned");
+            underway.closed = true;
+            std::mem::take(&mut underway.runs)
+        };
+
+        for (stopper, _) in &runs {
+            stopper.stop(why);
+        }
+
+        for (_, supervised) in &mut runs {
+            let _ = tokio::time::timeout_at(deadline, supervised).await;
+        }
+
+        // What is still running at the deadline is killed, and given a
+        // moment to end.
+
+        for (stopper, supervised) in &runs {
+            if !supervised.is_finished() {
+                stopper.kill();
+            }
+        }
+
+        // A task that has finished has given its output, or has no need
+        // to, and is not polled again.
+
+        let killed_by = tokio::time::Instant::now() + KILLED_WAIT;
+
+        for (_, supervised) in &mut runs {
+            if !supervised.is_finished() {
+                let _ = tokio::time::timeout_at(killed_by, supervised).await;
+            }
+        }
+    }
 }
 
 /// Run the command to its end, relaying its output and recording it.
@@ -1755,6 +1847,53 @@ mod tests {
             "{}",
             last.message
         );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_stops_the_commands_under_way_by_its_deadline() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let underway = Underway::default();
+        let mut output = underway
+            .run(
+                prepared(
+                    &[
+                        "sh",
+                        "-c",
+                        "trap '' TERM; echo started; while :; do sleep 0.1; done",
+                    ],
+                    dir.path().join("r1.log"),
+                ),
+                recorded(),
+            )
+            .expect("started");
+        assert_eq!(output.recv().await.expect("a line").line, "started");
+
+        // Past SIGTERM, it is killed at the shutdown's deadline, long
+        // before its own grace period would end.
+
+        let stopping = Instant::now();
+        underway
+            .stop_all(
+                "muructl serve shut down",
+                tokio::time::Instant::now() + Duration::from_millis(300),
+            )
+            .await;
+        assert!(stopping.elapsed() < STOP_GRACE, "{:?}", stopping.elapsed());
+
+        let messages = collect(output).await;
+        let last = messages.last().expect("a last message");
+        assert_eq!(last.exit_code, 128 + libc::SIGKILL, "{}", last.message);
+        assert!(
+            last.message
+                .starts_with("stopped because muructl serve shut down; it was killed by signal 9"),
+            "{}",
+            last.message
+        );
+
+        // Once the shutdown has begun, no command starts.
+
+        let refused = underway.run(prepared(&["true"], dir.path().join("r1.log")), recorded());
+        assert!(refused.is_err());
     }
 
     #[tokio::test]

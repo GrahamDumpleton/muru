@@ -388,5 +388,32 @@ def test_a_command_runs_through_a_development_run_of_the_project(
         assert server.wait_for_log("command.failed: hold: stopped because its caller went away"), (
             server.log()
         )
+
+        # The run stopping stops a command running through it, which gets
+        # SIGTERM, and its caller hears how it ended.
+
+        (project / "hold.pid").unlink()
+        (project / "hold.stopped").unlink()
+        held = subprocess.Popen(
+            command(runtime, project, "command", "run", "hold"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            cwd=project,
+            env=environment(runtime),
+        )
+
+        try:
+            wait_until((project / "hold.pid").exists, "the command never started")
+            pid = int((project / "hold.pid").read_text())
+            server.stop()
+            _, stderr = held.communicate(timeout=30)
+            assert held.returncode == 128 + signal.SIGTERM, stderr
+            assert "muru: the command stopped because muructl run shut down" in stderr, stderr
+            assert gone(pid)
+            assert (project / "hold.stopped").read_text() == "SIGTERM"
+        finally:
+            held.kill()
     finally:
         server.stop()

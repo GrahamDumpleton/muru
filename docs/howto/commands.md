@@ -188,12 +188,14 @@ JSON lines (see [JSON output](../reference/json-output.md)).
 
 Interrupting `muructl`, with Ctrl-C or by closing the session it runs in,
 stops the command: it gets SIGTERM and, ten seconds later, SIGKILL, along
-with anything it started. A command past its `timeout` is stopped the
-same way, and `muructl` says so and exits with the command's status, or
-with 1 when the command exits with 0 once stopped. Something it started
-that has left its session, as a daemon does, is not stopped. Run a long
-command where the session will last, under `nohup`, `tmux` or a CI job,
-so a dropped connection does not stop it halfway.
+with anything it started. A command past its `timeout` is stopped the same
+way, and `muructl` says so and exits with the command's status, or with 1
+when the command exits with 0 once stopped. So is a command that runs
+through the daemon, `muructl run` or `muructl serve` when that shuts down,
+inside its shutdown budget when it has one. Something it started that has
+left its session, as a daemon does, is not stopped. Run a long command
+where the session will last, under `nohup`, `tmux` or a CI job, so a
+dropped connection does not stop it halfway.
 
 When `muructl` runs the command itself, because nothing serves the
 project, Ctrl-C, SIGTERM or the SIGHUP of its terminal closing stops the

@@ -3204,6 +3204,8 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // never share one; muructl finds it from the file beside it.
 
     let (admin_stop_tx, admin_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let commands = muru_controller::commands::Underway::default();
+    let mut admin_serving = None;
     let runtime = muru_controller::locations::Locations::resolve(&Default::default())
         .run
         .path;
@@ -3254,12 +3256,13 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
             logs: logs.clone(),
             host: Arc::clone(&host_link),
             served: Arc::clone(&served),
+            commands: commands.clone(),
         });
 
         match run_admin::serve(state, admin_stop_rx).await {
             Ok(serving) => {
                 muru_common::muru_println!("admin socket {}", registration.socket.display());
-                tokio::spawn(serving);
+                admin_serving = Some(tokio::spawn(serving));
             }
             Err(error) => muru_common::muru_println!("no admin socket: {error:#}"),
         }
@@ -3568,6 +3571,36 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
         health.stopping();
     }
 
+    // Section 9.12: the commands running through the admin socket are
+    // stopped as at their timeout while the rest stops, inside the same
+    // budget, and waited for, so each caller hears how its command ended
+    // and none is left running.
+
+    let (verb, commands_deadline) = match &serve {
+        Some(mode) => ("serve", Instant::now() + mode.shutdown.budget),
+        None if muru_controller::shutdown::is_main_process() => (
+            "run",
+            Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET,
+        ),
+        None => (
+            "run",
+            Instant::now() + muru_controller::commands::STOP_GRACE,
+        ),
+    };
+
+    let stopping_commands = {
+        let commands = commands.clone();
+
+        tokio::spawn(async move {
+            commands
+                .stop_all(
+                    &format!("muructl {verb} shut down"),
+                    commands_deadline.into(),
+                )
+                .await;
+        })
+    };
+
     // Section 13.4: the edge stops accepting and lets the requests in
     // flight finish before the host is told to stop, so no request is
     // written to a worker that is going. As a container's main process
@@ -3623,8 +3656,18 @@ async fn run_with(args: RunArgs, serve: Option<serve::Mode>) -> anyhow::Result<(
     // The lines of the last requests are written before the run exits, unless
     // the destination has stalled.
 
+    let _ = stopping_commands.await;
     let _ = tokio::task::spawn_blocking(move || written.flush(Duration::from_secs(2))).await;
     let _ = admin_stop_tx.send(());
+
+    // The admin socket finishes the streams it is sending, the commands'
+    // last messages among them, unless a client holds one open, such as
+    // `muructl logs --follow`.
+
+    if let Some(serving) = admin_serving {
+        let _ = tokio::time::timeout(Duration::from_secs(1), serving).await;
+    }
+
     drop(registration);
     let _ = std::fs::remove_dir_all(&run_dir);
 
