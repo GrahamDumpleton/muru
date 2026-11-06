@@ -62,6 +62,11 @@ html_theme_options = {
     "source_directory": "docs/",
 }
 
+# A link is tried again before it counts as broken, so a server's passing
+# error, such as GitHub's 500, does not fail the check.
+
+linkcheck_retries = 3
+
 autodoc_typehints = "description"
 copybutton_prompt_text = r">>> |\.\.\. |\$ "
 copybutton_prompt_is_regexp = True
