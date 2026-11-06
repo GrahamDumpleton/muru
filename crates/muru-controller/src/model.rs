@@ -1299,6 +1299,31 @@ impl AccessLogSpec {
         }
     }
 
+    /// The keys of a `[host.NAME]` table.
+    pub fn from_host(host: &muru_config::Host) -> Self {
+        Self {
+            access_log: host.access_log.clone(),
+            access_log_exclude: host.access_log_exclude.clone(),
+            slow: host.slow.clone(),
+        }
+    }
+
+    /// The choice as the edge lays it over the levels beneath: the keys
+    /// given, and none for the rest.
+    pub fn choice(&self) -> muru_edge::access::Choice {
+        muru_edge::access::Choice {
+            mode: self
+                .access_log
+                .as_deref()
+                .and_then(muru_edge::access::Mode::parse),
+            slow: self
+                .slow
+                .as_deref()
+                .and_then(|slow| muru_config::parse_duration(slow).ok()),
+            exclude: self.access_log_exclude.clone(),
+        }
+    }
+
     /// The choice as one phrase.
     pub fn describe(&self) -> String {
         if self.is_empty() {

@@ -26,8 +26,8 @@ use crate::host::{HostProcess, HostSpec};
 use crate::locations::Locations;
 use crate::logs::Logs;
 use crate::model::{
-    Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState, RolloutStep,
-    now_unix_ms, valid_name,
+    AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
+    RolloutStep, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus, Scaler, Signals};
@@ -519,6 +519,8 @@ pub struct Info {
     /// The addresses the edge serves, each with whether it carries TLS,
     /// as a reload may change them.
     pub listeners: std::sync::RwLock<Vec<(SocketAddr, bool)>>,
+    /// The node's limits (section 4.6), as a reload may change them.
+    pub limits: std::sync::RwLock<muru_edge::Limits>,
     /// When the daemon started, Unix milliseconds.
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
@@ -1121,6 +1123,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let info = Arc::new(Info {
         locations: locations.clone(),
         listeners: std::sync::RwLock::new(listeners.clone()),
+        limits: std::sync::RwLock::new(settings.limits.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
         metrics,
@@ -1668,6 +1671,19 @@ fn service_identity(named: Option<&str>) -> anyhow::Result<Option<crate::host::I
         "the edge and applications run as the service user"
     );
     Ok(Some(identity))
+}
+
+/// A level's limits on a request (section 4.6) as the snapshot carries
+/// them, or none when the level says nothing.
+fn request_limits_message(limits: &muru_config::RequestLimitSettings) -> Option<pb::RequestLimits> {
+    muru_edge::RequestLimits {
+        max_body_size: limits.max_body_size,
+        queue_timeout: limits.queue_timeout,
+        request_deadline: limits.request_deadline,
+        body_idle_timeout: limits.body_idle_timeout,
+        response_idle_timeout: limits.response_idle_timeout,
+    }
+    .to_message()
 }
 
 /// Section 4.11: a route's upload settings for the edge, with their
@@ -2424,6 +2440,7 @@ impl Daemon {
         self.error_pages = settings.error_pages;
         self.error_override = settings.error_override;
         self.limits = settings.limits;
+        *self.info.limits.write().expect("limits poisoned") = self.limits.clone();
         self.access_log = settings.access_log;
         self.h2c = settings.h2c;
         self.client_rules = settings.client_rules;
@@ -2683,9 +2700,28 @@ impl Daemon {
 
     /// How long an edge is given to finish its connections when it is
     /// replaced: the request deadline, so a response in flight can
-    /// complete, and a little over.
+    /// complete, and a little over. A virtual host or a route may set a
+    /// deadline of its own (section 4.6), so it is the longest of them.
     fn drain_grace(&self) -> Duration {
-        self.limits.request_deadline + Duration::from_secs(5)
+        let hosts = self
+            .store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, host)| host.timeouts);
+        let routes = self
+            .store
+            .routes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|route| route.timeouts);
+        let longest = hosts
+            .chain(routes)
+            .filter_map(|timeouts| timeouts.request_deadline)
+            .filter_map(|text| muru_config::parse_duration(&text).ok())
+            .fold(self.limits.request_deadline, Duration::max);
+
+        longest + Duration::from_secs(5)
     }
 
     /// Section 9.10: the routes and the applications in maintenance mode
@@ -4988,14 +5024,14 @@ impl Daemon {
         for (name, id) in routable {
             if let Some(running) = self.running.get(&(name.clone(), id.clone())) {
                 // Section 11.2: the application's own access log choice,
-                // laid over the node's.
+                // which the edge lays over its host's and the node's.
 
                 let access_log = self
                     .store
                     .app(name)
                     .ok()
                     .filter(|app| !app.access_log.is_empty())
-                    .map(|app| app.access_log.over(&self.access_log).to_message());
+                    .map(|app| app.access_log.choice().to_message());
                 apps.push(pb::AppWorkers {
                     app: name.clone(),
                     release: id.clone(),
@@ -5150,8 +5186,24 @@ impl Daemon {
             let (certificate_pem, key_pem) =
                 self.certificates.get(&name).cloned().unwrap_or_default();
 
+            // Sections 4.6 and 11.2: the host's limits on a request and
+            // its access log choice, which were checked when applied.
+
+            let limits = muru_config::check_request_limits(
+                host.max_body_size.as_deref(),
+                host.timeouts.as_ref(),
+            )
+            .ok()
+            .and_then(|limits| request_limits_message(&limits));
+            let access_log = Some(AccessLogSpec::from_host(&host))
+                .filter(|choice| !choice.is_empty())
+                .map(|choice| choice.choice().to_message());
+
             hosts.push(pb::Host {
                 name,
+                limits,
+                access_log,
+                canonical_redirect: host.canonical_redirect,
                 names: host.names,
                 listeners: host.listeners,
                 certificate_pem,
@@ -5184,11 +5236,12 @@ impl Daemon {
             .into_iter()
             .map(|route| pb::Route {
                 upload: upload_message(&route),
-                max_body_size: route
-                    .max_body_size
-                    .as_deref()
-                    .and_then(|size| muru_config::parse_size(size).ok())
-                    .unwrap_or(0),
+                limits: muru_config::check_request_limits(
+                    route.max_body_size.as_deref(),
+                    route.timeouts.as_ref(),
+                )
+                .ok()
+                .and_then(|limits| request_limits_message(&limits)),
                 traffic: self.route_traffic(&route, &included, &rollouts),
                 client_classes: route.classes().to_vec(),
                 host: route.host,

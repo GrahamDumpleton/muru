@@ -4405,6 +4405,24 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             });
         }
 
+        // Sections 4.3, 4.6 and 11.2: what the host sets for its routes.
+
+        if host.canonical_redirect {
+            names.push_str(&format!(" [redirects to {}]", host.canonical));
+        }
+
+        if !host.max_body_size.is_empty() {
+            names.push_str(&format!(" [max body {}]", host.max_body_size));
+        }
+
+        if !host.timeouts.is_empty() {
+            names.push_str(&format!(" [{}]", timeouts_note(&host.timeouts)));
+        }
+
+        if !host.access_log.is_empty() {
+            names.push_str(&format!(" [access log {}]", host.access_log));
+        }
+
         println!(
             "{:<16} {:<8} {:<10} {names}",
             host.name,
@@ -4418,6 +4436,16 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// A host's or a route's own request timeouts as one note, in the order
+/// of the keys.
+fn timeouts_note(timeouts: &std::collections::BTreeMap<String, String>) -> String {
+    timeouts
+        .iter()
+        .map(|(key, value)| format!("{key} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The upstream subcommands (section 4.13).
@@ -4587,6 +4615,10 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
 
         if !route.max_body_size.is_empty() {
             target.push_str(&format!(" [max body {}]", route.max_body_size));
+        }
+
+        if !route.timeouts.is_empty() {
+            target.push_str(&format!(" [{}]", timeouts_note(&route.timeouts)));
         }
 
         if !route.upload.is_empty() {
@@ -5300,7 +5332,7 @@ pub async fn config_show(
     }
 
     if !export.layers.is_empty() {
-        println!("# The releases' settings, and the layer each came from:");
+        println!("# The releases' settings and the routes' limits, and the layer each came from:");
 
         for line in &export.layers {
             println!("#   {line}");

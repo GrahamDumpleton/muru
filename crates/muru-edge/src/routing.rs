@@ -29,6 +29,8 @@ use crate::upstream::Upstream;
 pub struct Host {
     /// The host's name in the configuration.
     pub name: String,
+    /// The same, shared with the requests the host takes.
+    pub label: Arc<str>,
     /// The listener addresses it answers on; every listener when empty.
     pub listeners: Vec<String>,
     /// Plain HTTP requests are redirected to HTTPS.
@@ -40,6 +42,11 @@ pub struct Host {
     /// The rate limits every request for the host draws from (section
     /// 4.15).
     pub rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
+    /// The limits of a request for the host's routes (section 4.6).
+    pub limits: crate::RequestLimits,
+    /// The name requests for the host's other names are redirected to,
+    /// when the host redirects them.
+    pub canonical: Option<String>,
 }
 
 /// Maintenance mode for an application (section 4.12): the edge answers
@@ -126,8 +133,9 @@ struct Route {
     auth: Option<Arc<crate::auth::Auth>>,
     /// How uploads are received before dispatch (section 4.11).
     upload: Option<Arc<crate::uploads::Policy>>,
-    /// The route's body limit, in place of the edge's (section 4.6).
-    max_body_size: Option<u64>,
+    /// The limits of the route's requests, over the host's (section
+    /// 4.6).
+    limits: crate::RequestLimits,
     /// The rate limits the route's requests draw from after the host's
     /// (section 4.15).
     rate_limits: Vec<Arc<crate::ratelimit::Limit>>,
@@ -1133,8 +1141,9 @@ pub enum Decision {
         auth: Option<Arc<crate::auth::Auth>>,
         /// How the route's uploads are received (section 4.11).
         upload: Option<Arc<crate::uploads::Policy>>,
-        /// The route's body limit, in place of the edge's (section 4.6).
-        max_body_size: Option<u64>,
+        /// The route's limits on the request over its host's (section
+        /// 4.6).
+        request_limits: crate::RequestLimits,
         /// The host's and the route's rate limits (section 4.15).
         limits: Vec<Arc<crate::ratelimit::Limit>>,
         /// The methods the route refuses.
@@ -1142,8 +1151,14 @@ pub enum Decision {
         /// The route's site mode.
         mode: Option<Arc<str>>,
     },
-    /// Redirected to HTTPS: the host insists on it.
-    Redirect,
+    /// Redirected: to HTTPS when the host insists on it, to the host's
+    /// canonical name when the request named another, or both at once.
+    Redirect {
+        /// To HTTPS.
+        https: bool,
+        /// To this name.
+        canonical: Option<String>,
+    },
     /// No virtual host answers to that name on this listener (421).
     Misdirected,
     /// The host has no route for the path (404).
@@ -1173,6 +1188,9 @@ pub enum Decision {
         cookies: Vec<String>,
         /// The check the route asks for first (section 4.16).
         auth: Option<Arc<crate::auth::Auth>>,
+        /// The route's limits on the request over its host's (section
+        /// 4.6), for what the fallback serves.
+        request_limits: crate::RequestLimits,
         /// The host's and the route's rate limits (section 4.15).
         limits: Vec<Arc<crate::ratelimit::Limit>>,
     },
@@ -1185,6 +1203,17 @@ impl Decision {
         match self {
             Self::Serve { limits, .. } | Self::Static { limits, .. } => limits,
             _ => &[],
+        }
+    }
+
+    /// The limits the route sets on the request, over its host's
+    /// (section 4.6); nothing where no route serves it.
+    pub fn request_limits(&self) -> crate::RequestLimits {
+        match self {
+            Self::Serve { request_limits, .. } | Self::Static { request_limits, .. } => {
+                *request_limits
+            }
+            _ => crate::RequestLimits::default(),
         }
     }
 }
@@ -1493,11 +1522,15 @@ impl Routing {
             };
             routing.hosts.push(Host {
                 name: host.name.clone(),
+                label: Arc::from(host.name.as_str()),
                 listeners: host.listeners.clone(),
                 https_redirect: host.https_redirect,
                 server_name,
                 errors: Arc::new(errors),
                 rate_limits: named_limits(&host.rate_limits, &format!("host {}", host.name)),
+                limits: crate::RequestLimits::from_message(host.limits.as_ref()),
+                canonical: (host.canonical_redirect && !host.canonical.is_empty())
+                    .then(|| normalise(&host.canonical)),
             });
             routing.routes.push(Vec::new());
         }
@@ -1561,7 +1594,7 @@ impl Routing {
                         .upload
                         .as_ref()
                         .and_then(crate::uploads::Policy::from_message),
-                    max_body_size: (route.max_body_size > 0).then_some(route.max_body_size),
+                    limits: crate::RequestLimits::from_message(route.limits.as_ref()),
                     rate_limits: named_limits(
                         &route.rate_limits,
                         &format!("route {} {}", route.host, route.path),
@@ -1804,7 +1837,7 @@ impl Routing {
                     cookies,
                     auth: None,
                     upload: None,
-                    max_body_size: None,
+                    request_limits: crate::RequestLimits::default(),
                     limits: Vec::new(),
                     methods: None,
                     mode: None,
@@ -1833,8 +1866,21 @@ impl Routing {
             ..*client
         };
 
-        if host.https_redirect && !tls && origin.is_none() {
-            return Decision::Redirect;
+        // Section 4.3: a client's own request is redirected to HTTPS
+        // when the host insists on it, and to the canonical name when
+        // the host redirects its other names there, in one redirect.
+
+        if origin.is_none() {
+            let https = host.https_redirect && !tls;
+            let canonical = host
+                .canonical
+                .as_ref()
+                .filter(|canonical| name.map(normalise).as_ref() != Some(*canonical))
+                .cloned();
+
+            if https || canonical.is_some() {
+                return Decision::Redirect { https, canonical };
+            }
         }
 
         let Some(route) = self.routes[index]
@@ -1882,6 +1928,7 @@ impl Routing {
                 }),
                 cookies,
                 auth: route.auth.clone(),
+                request_limits: route.limits.or(host.limits),
                 limits: host
                     .rate_limits
                     .iter()
@@ -1923,7 +1970,7 @@ impl Routing {
             cookies,
             auth: route.auth.clone(),
             upload: route.upload.clone(),
-            max_body_size: route.max_body_size,
+            request_limits: route.limits.or(host.limits),
             limits: host
                 .rate_limits
                 .iter()
@@ -2004,6 +2051,18 @@ impl Routing {
                 static_path: None,
             }),
         }
+    }
+
+    /// The configured name of the virtual host a request's host selects
+    /// on a listener, as a redirect may name it too; none without one.
+    pub fn host_name(&self, name: Option<&str>, listener: &str) -> Option<Arc<str>> {
+        if self.hosts.is_empty() {
+            return None;
+        }
+
+        self.host_for(name, listener)
+            .or_else(|| name.and_then(|name| self.hosts.iter().position(|host| host.name == name)))
+            .map(|index| Arc::clone(&self.hosts[index].label))
     }
 
     /// The host a name selects on a listener: exact, wildcard, default.
@@ -2256,7 +2315,7 @@ mod tests {
     fn serves(decision: Decision) -> Option<String> {
         match decision {
             Decision::Serve { server_name, .. } => server_name,
-            Decision::Redirect => Some("redirect".to_owned()),
+            Decision::Redirect { .. } => Some("redirect".to_owned()),
             Decision::Misdirected => Some("421".to_owned()),
             Decision::NoRoute => Some("404".to_owned()),
             Decision::InternalOnly => Some("internal".to_owned()),
@@ -2323,6 +2382,89 @@ mod tests {
             serves(select(&routing, None, "/", plain, false)),
             None,
             "no host header falls to the default host"
+        );
+    }
+
+    #[test]
+    fn a_hosts_limits_and_canonical_name_reach_its_routes() {
+        let mut snapshot = snapshot();
+        snapshot.hosts[1].limits = Some(pb::RequestLimits {
+            max_body_size: 1024,
+            request_deadline_ms: 30_000,
+            ..Default::default()
+        });
+        snapshot.hosts[1].canonical = "WWW.example.com".to_owned();
+        snapshot.hosts[1].canonical_redirect = true;
+        snapshot.routes[2].limits = Some(pb::RequestLimits {
+            max_body_size: 4096,
+            queue_timeout_ms: 2000,
+            ..Default::default()
+        });
+        let routing = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Routing::from_snapshot(&snapshot, None))
+            .unwrap();
+        let plain = "127.0.0.1:8080";
+
+        // The route's limits are laid over its host's, and both over the
+        // node's.
+
+        let limits = select(&routing, Some("www.example.com"), "/", plain, false).request_limits();
+        assert_eq!(
+            limits,
+            crate::RequestLimits {
+                max_body_size: Some(4096),
+                queue_timeout: Some(std::time::Duration::from_secs(2)),
+                request_deadline: Some(std::time::Duration::from_secs(30)),
+                body_idle_timeout: None,
+                response_idle_timeout: None,
+            }
+        );
+        let node = crate::Limits::default();
+        let in_force = limits.over(&node);
+        assert_eq!(in_force.max_body_size, 4096);
+        assert_eq!(
+            in_force.request_deadline,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(in_force.body_idle_timeout, node.body_idle_timeout);
+        assert_eq!(in_force.max_headers, node.max_headers);
+        assert!(
+            select(&routing, None, "/missing", "127.0.0.1:9", false)
+                .request_limits()
+                .is_empty()
+        );
+
+        // Another of the host's names is redirected to the canonical one;
+        // a host that only insists on HTTPS redirects to nothing else.
+
+        match select(&routing, Some("blog.example.com:8080"), "/", plain, false) {
+            Decision::Redirect { https, canonical } => {
+                assert!(!https);
+                assert_eq!(canonical.as_deref(), Some("www.example.com"));
+            }
+            _ => panic!("not redirected"),
+        }
+
+        match select(&routing, Some("shop.example.com"), "/", plain, false) {
+            Decision::Redirect { https, canonical } => {
+                assert!(https);
+                assert_eq!(canonical, None);
+            }
+            _ => panic!("not redirected"),
+        }
+
+        // A request's host is known by its configured name.
+
+        assert_eq!(
+            routing
+                .host_name(Some("blog.example.com"), plain)
+                .as_deref(),
+            Some("any")
+        );
+        assert_eq!(
+            routing.host_name(Some("other.test"), "127.0.0.1:8443"),
+            None
         );
     }
 

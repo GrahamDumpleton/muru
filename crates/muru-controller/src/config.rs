@@ -85,7 +85,7 @@ pub enum Action {
         /// The host's name.
         name: String,
         /// Its definition.
-        host: VirtualHost,
+        host: Box<VirtualHost>,
         /// Whether it is new rather than changed.
         new: bool,
     },
@@ -890,6 +890,41 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             valid = false;
         }
 
+        if host.canonical_redirect && host.canonical.is_none() {
+            plan.errors.push(format!(
+                "host {name}: canonical_redirect needs a canonical name"
+            ));
+            valid = false;
+        }
+
+        if let Some(canonical) = &host.canonical {
+            let normalised = muru_edge::routing::normalise(canonical);
+
+            if normalised.is_empty() || normalised.contains('*') || normalised.contains('/') {
+                plan.errors.push(format!(
+                    "host {name}: canonical: {canonical:?} is not a host name"
+                ));
+                valid = false;
+            }
+        }
+
+        // Sections 4.6 and 11.2: the host's limits on a request and its
+        // access log choice.
+
+        if let Err(error) =
+            muru_config::check_request_limits(host.max_body_size.as_deref(), host.timeouts.as_ref())
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
+        if let Err(error) =
+            muru_config::check_access_log(host.access_log.as_deref(), host.slow.as_deref())
+        {
+            plan.errors.push(format!("host {name}: {error}"));
+            valid = false;
+        }
+
         // Section 4.12: the host's error pages, with absolute file paths.
 
         if let Err(error) = check_error_tables(&host.error_pages, host.error_override.as_ref()) {
@@ -921,7 +956,7 @@ fn plan_hosts(store: &Store, document: &Document, rate_limits: &[String], plan: 
             recorded => plan.changes.push(Change {
                 action: Action::PutHost {
                     name: name.clone(),
-                    host: host.clone(),
+                    host: Box::new(host.clone()),
                     new: recorded.is_none(),
                 },
                 detail: describe_host(host),
@@ -3774,6 +3809,94 @@ pub fn release_layers(store: &Store, document: &Document) -> Result<Vec<String>,
     }
 
     Ok(lines)
+}
+
+/// Section 4.6: the limits of each route an exported document declares,
+/// with the level each came from, one line a limit, for `config show
+/// --effective`: the route, its virtual host, the daemon's `[limits]`
+/// table or the default.
+pub fn route_layers(store: &Store, document: &Document, node: &muru_edge::Limits) -> Vec<String> {
+    let stored: BTreeMap<String, VirtualHost> =
+        store.hosts().unwrap_or_default().into_iter().collect();
+    let defaults = muru_edge::Limits::default();
+    let mut lines = Vec::new();
+
+    for route in &document.route {
+        let own = muru_config::check_request_limits(
+            route.max_body_size.as_deref(),
+            route.timeouts.as_ref(),
+        )
+        .unwrap_or_default();
+        let host = document
+            .host
+            .get(&route.host)
+            .or_else(|| stored.get(&route.host))
+            .and_then(|host| {
+                muru_config::check_request_limits(
+                    host.max_body_size.as_deref(),
+                    host.timeouts.as_ref(),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let size = |bytes: u64| muru_config::format_size(bytes);
+        let time = |duration: Duration| muru_config::format_duration(duration);
+
+        let settings = [
+            (
+                "max_body_size",
+                own.max_body_size.map(size),
+                host.max_body_size.map(size),
+                size(node.max_body_size),
+                node.max_body_size == defaults.max_body_size,
+            ),
+            (
+                "timeouts.queue_timeout",
+                own.queue_timeout.map(time),
+                host.queue_timeout.map(time),
+                time(node.queue_timeout),
+                node.queue_timeout == defaults.queue_timeout,
+            ),
+            (
+                "timeouts.request_deadline",
+                own.request_deadline.map(time),
+                host.request_deadline.map(time),
+                time(node.request_deadline),
+                node.request_deadline == defaults.request_deadline,
+            ),
+            (
+                "timeouts.body_idle_timeout",
+                own.body_idle_timeout.map(time),
+                host.body_idle_timeout.map(time),
+                time(node.body_idle_timeout),
+                node.body_idle_timeout == defaults.body_idle_timeout,
+            ),
+            (
+                "timeouts.response_idle_timeout",
+                own.response_idle_timeout.map(time),
+                host.response_idle_timeout.map(time),
+                time(node.response_idle_timeout),
+                node.response_idle_timeout == defaults.response_idle_timeout,
+            ),
+        ];
+
+        for (key, route_value, host_value, node_value, node_is_default) in settings {
+            let (value, layer) = match (route_value, host_value) {
+                (Some(value), _) => (value, "the route".to_owned()),
+                (None, Some(value)) => (value, format!("host {}", route.host)),
+                (None, None) if node_is_default => (node_value, "default".to_owned()),
+                (None, None) => (node_value, "[limits]".to_owned()),
+            };
+
+            lines.push(format!(
+                "route {} {}: {key} = {value} ({layer})",
+                route.host,
+                route.key()
+            ));
+        }
+    }
+
+    lines
 }
 
 /// Section 4.9: the release's own directories of files, layered by

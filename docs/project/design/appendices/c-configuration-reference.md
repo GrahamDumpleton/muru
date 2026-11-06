@@ -18,7 +18,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | `[daemon]` | daemon file | paths (state, run, logs), admin socket and TCP access, roles, budgets, offline mode, debug_exec (section 11.7) |
 | `[tools]` | daemon file | uv path and version constraints, its configuration file, interpreter downloads and install directory, offline mode and the wheel directory (section 8.4) |
 | `[[edge.pool]]`, `[[listener]]` | daemon file | listeners, protocols, processes, threads |
-| `[proxy]` | daemon, host or listener | trusted proxies and header types |
+| `[proxy]` | daemon or listener | trusted proxies and header types |
 | `[metrics]` | daemon file | the internal address `/metrics` is served on (`listen`), none by default |
 | `[dashboard]` | daemon file | the loopback address the dashboard and JSON gateway are served on (`listen`), none by default, and whether signed-in sessions may act (`actions`, false) |
 | `[overlay_webhook]` | daemon file | the address of the overlays' signed webhook (`listen`) and its key (`secret` or `secret_file`), none by default |
@@ -74,10 +74,12 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
 | max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
-| timeouts (queue_timeout, request_deadline, soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | group, route | 5s, 300s, off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
+| timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group | off, off, 10s, 5s, 10s, 30s, 60s | 7.6 |
+| timeouts (queue_timeout, request_deadline, body_idle_timeout, response_idle_timeout) | host, route | 5s, 300s, 60s, 60s, from `[limits]` | 4.6 |
 | response.flush, coalesce_min_bytes, coalesce_max_delay, first_block | release, route | coalesce, 16KiB, 10ms, immediate | 5.4 |
-| max_body_size, buffer_body, chunked_body, buffer_response | route and wider | 10MB, off, buffer, on | 4.6 |
-| max_header_bytes, max_headers, header_read_timeout | listener, host | 64KiB, 100, 30s | 4.6 |
+| max_body_size | `[limits]`, host, route | 10MB | 4.6 |
+| buffer_body, chunked_body, buffer_response | route and wider | off, buffer, on | 4.6 |
+| max_header_bytes, max_headers, header_read_timeout | `[limits]`, listener | 64KiB, 100, 30s | 4.6 |
 | upload, max_file_size, max_files, hash, precheck, spool_quota | route (spool_quota also in the daemon's [limits], for every application together) | off, unlimited, 100 (at most 500), [sha256], false, 10GB per application (none for the node) | 4.11 |
 | static (directory or release_path), index, fallback, listing, case (strict by default), cache, follow_symlinks, stat_cache | route | none | 4.9 |
 | sendfile_roots, sendfile_header | release, mount, upstream | none, none | 4.9 |
@@ -87,7 +89,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | error_pages, error_override | global, host, application (release), route | built-in, off | 4.12 |
 | maintenance (exempt_paths, exempt_addresses, bypass_cookie, retry_after) | release | none, none, none, 60s | 4.12 |
 | accept_redirects_from, internal | route, mount | none, false | 4.10 |
-| names, listeners, tls, canonical, https_redirect, use_canonical_name | host | none, all, none, none, false, false | 4.3 |
+| names, listeners, tls, canonical, https_redirect, use_canonical_name, canonical_redirect | host | none, all, none, none, false, false, false | 4.3 |
+| access_log, slow, access_log_exclude | `[logs]`, host, application | on, 1s, none | 11.2 |
 | traffic: split, sticky, hash_key, salt, sticky_grace, classes | route | 100% to newest ready release, off, cookie, per route, 10m, none | 9.4, 4.14 |
 | retention of superseded releases | application | 30m | 9.1 |
 | reload.mode, paths, include, exclude, respect_gitignore, debounce, poll | application | off, source, `**/*.py`, none, true, 300ms, false | 9.8 |

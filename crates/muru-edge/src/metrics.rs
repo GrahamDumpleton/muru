@@ -1238,6 +1238,7 @@ mod tests {
             app: "shop".to_owned(),
             release: "r1".to_owned(),
             host: "shop.example.com".to_owned(),
+            virtual_host: "shop".to_owned(),
             group: "default".to_owned(),
             mount: "default".to_owned(),
             snapshot: 3,

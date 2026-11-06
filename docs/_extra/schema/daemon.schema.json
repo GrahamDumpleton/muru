@@ -933,9 +933,26 @@
       "additionalProperties": false,
       "description": "A virtual host, the `[host.NAME]` table.",
       "properties": {
+        "access_log": {
+          "description": "Which of the host's requests the access log writes: `on`, `errors` or `off`, replacing the `[logs]` table's. An application's own replaces it.",
+          "type": "string",
+          "x-default": "`access_log` in `[logs]`"
+        },
+        "access_log_exclude": {
+          "description": "Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "canonical": {
           "description": "The name the host is known by, for `use_canonical_name`.",
           "type": "string"
+        },
+        "canonical_redirect": {
+          "default": false,
+          "description": "Redirect requests for the host's other names to the canonical name.",
+          "type": "boolean"
         },
         "default": {
           "default": false,
@@ -965,6 +982,11 @@
           },
           "type": "array"
         },
+        "max_body_size": {
+          "description": "The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it.",
+          "type": "string",
+          "x-default": "`max_body_size` in `[limits]`"
+        },
         "names": {
           "description": "The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot.",
           "items": {
@@ -978,6 +1000,15 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "slow": {
+          "description": "How slow a request is to be written under `access_log = \"errors\"`.",
+          "type": "string",
+          "x-default": "`slow` in `[logs]`"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/RequestTimeouts",
+          "description": "The timeouts of a request for the host's routes, each replacing the daemon's `[limits]` value. A route's own replace them."
         },
         "tls": {
           "$ref": "#/$defs/HostTls",
@@ -2041,6 +2072,33 @@
         }
       ]
     },
+    "RequestTimeouts": {
+      "additionalProperties": false,
+      "description": "The timeouts of one request, the `timeouts` table of a virtual host or a route. Each key replaces the same key of the level beneath, down to the daemon's `[limits]`.",
+      "properties": {
+        "body_idle_timeout": {
+          "description": "Time a client may pause while sending a body.",
+          "type": "string",
+          "x-default": "`body_idle_timeout` in `[limits]`"
+        },
+        "queue_timeout": {
+          "description": "Time a request may wait for a worker.",
+          "type": "string",
+          "x-default": "`queue_timeout` in `[limits]`"
+        },
+        "request_deadline": {
+          "description": "Time a request may take to produce its response head.",
+          "type": "string",
+          "x-default": "`request_deadline` in `[limits]`"
+        },
+        "response_idle_timeout": {
+          "description": "Time a worker may pause mid-response.",
+          "type": "string",
+          "x-default": "`response_idle_timeout` in `[limits]`"
+        }
+      },
+      "type": "object"
+    },
     "Route": {
       "additionalProperties": false,
       "description": "A route, one of the `[[route]]` entries: a path prefix of a virtual host to an application.",
@@ -2118,9 +2176,9 @@
           "description": "The client classes the route takes; every request without it. Among routes with the same path, one naming the request's class comes first."
         },
         "max_body_size": {
-          "description": "The largest request body, for example 1GB, replacing the daemon's `[limits]` value for the route. On an upload route it bounds the body as received, files included.",
+          "description": "The largest request body, for example 1GB, replacing the host's, or else the daemon's `[limits]` value, for the route. On an upload route it bounds the body as received, files included.",
           "type": "string",
-          "x-default": "`max_body_size` in `[limits]`"
+          "x-default": "the host's `max_body_size`"
         },
         "max_file_size": {
           "description": "The largest uploaded file, for example 512MB; no limit without it.",
@@ -2175,6 +2233,10 @@
         "static": {
           "description": "The directory served by the edge, instead of an application.",
           "type": "string"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/RequestTimeouts",
+          "description": "The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value."
         },
         "traffic": {
           "$ref": "#/$defs/Traffic",

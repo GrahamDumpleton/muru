@@ -253,6 +253,108 @@ impl Limits {
     }
 }
 
+/// The limits one level sets on a request (section 4.6): a virtual
+/// host's, or a route's. Each is none where the level says nothing, and
+/// the level beneath's is in force.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestLimits {
+    /// The largest request body accepted.
+    pub max_body_size: Option<u64>,
+    /// How long a request may wait for a worker.
+    pub queue_timeout: Option<Duration>,
+    /// How long a request may take to produce its response head.
+    pub request_deadline: Option<Duration>,
+    /// How long a client may pause while sending a body.
+    pub body_idle_timeout: Option<Duration>,
+    /// How long a worker may pause mid-response.
+    pub response_idle_timeout: Option<Duration>,
+}
+
+impl RequestLimits {
+    /// The limits a snapshot carries for a level; a field at 0 says
+    /// nothing.
+    pub fn from_message(message: Option<&muru_proto::edge::v1::RequestLimits>) -> Self {
+        let Some(message) = message else {
+            return Self::default();
+        };
+
+        let duration = |millis: u64| (millis > 0).then(|| Duration::from_millis(millis));
+
+        Self {
+            max_body_size: (message.max_body_size > 0).then_some(message.max_body_size),
+            queue_timeout: duration(message.queue_timeout_ms),
+            request_deadline: duration(message.request_deadline_ms),
+            body_idle_timeout: duration(message.body_idle_timeout_ms),
+            response_idle_timeout: duration(message.response_idle_timeout_ms),
+        }
+    }
+
+    /// The limits as a snapshot carries them, or none when the level
+    /// says nothing.
+    pub fn to_message(&self) -> Option<muru_proto::edge::v1::RequestLimits> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let millis = |duration: Option<Duration>| {
+            duration.map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+        };
+
+        Some(muru_proto::edge::v1::RequestLimits {
+            max_body_size: self.max_body_size.unwrap_or(0),
+            queue_timeout_ms: millis(self.queue_timeout),
+            request_deadline_ms: millis(self.request_deadline),
+            body_idle_timeout_ms: millis(self.body_idle_timeout),
+            response_idle_timeout_ms: millis(self.response_idle_timeout),
+        })
+    }
+
+    /// Whether the level says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// These limits with the wider level's wherever these say nothing.
+    #[must_use]
+    pub fn or(self, wider: Self) -> Self {
+        Self {
+            max_body_size: self.max_body_size.or(wider.max_body_size),
+            queue_timeout: self.queue_timeout.or(wider.queue_timeout),
+            request_deadline: self.request_deadline.or(wider.request_deadline),
+            body_idle_timeout: self.body_idle_timeout.or(wider.body_idle_timeout),
+            response_idle_timeout: self.response_idle_timeout.or(wider.response_idle_timeout),
+        }
+    }
+
+    /// The node's limits with these laid over them.
+    #[must_use]
+    pub fn over(&self, node: &Limits) -> Limits {
+        let mut limits = node.clone();
+
+        if let Some(size) = self.max_body_size {
+            limits.max_body_size = size;
+        }
+
+        for (value, field) in [
+            (self.queue_timeout, &mut limits.queue_timeout),
+            (self.request_deadline, &mut limits.request_deadline),
+            (self.body_idle_timeout, &mut limits.body_idle_timeout),
+            (
+                self.response_idle_timeout,
+                &mut limits.response_idle_timeout,
+            ),
+        ] {
+            if let Some(duration) = value {
+                *field = duration;
+            }
+        }
+
+        limits
+    }
+}
+
 /// The limits in force with what is derived from them, swapped together
 /// when a snapshot changes them (section 4.6); a connection takes those
 /// current when it is accepted and keeps them.
@@ -1083,6 +1185,12 @@ async fn serve<I>(
             let mut checks = 0usize;
             let mut admitted = false;
 
+            // Section 4.6: the limits of the route the client's own
+            // request matched, over its host's and the node's, which its
+            // sub-requests keep.
+
+            let mut in_force = Arc::clone(&limits);
+
             let response = loop {
                 let decision = routing.select(
                     host.as_deref(),
@@ -1101,6 +1209,14 @@ async fn serve<I>(
                     },
                     origin.as_ref(),
                 );
+
+                if origin.is_none() && handling.is_none() {
+                    let own = decision.request_limits();
+
+                    if !own.is_empty() {
+                        in_force = Arc::new(own.over(&limits));
+                    }
+                }
 
                 // Section 4.12: the error pages in force come from the
                 // route, the release the request was routed to, the host
@@ -1134,8 +1250,9 @@ async fn serve<I>(
                     development: shared.development,
                     occasions: shared.occasions,
                     access_log: Arc::clone(&shared.access_log),
-                    limits: Arc::clone(&limits),
+                    limits: Arc::clone(&in_force),
                     server_name: None,
+                    virtual_host: routing.host_name(host.as_deref(), &listener),
                     app: String::new(),
                     release: String::new(),
                     group: String::new(),
@@ -1306,7 +1423,7 @@ async fn serve<I>(
                             cookies,
                             auth: _,
                             upload,
-                            max_body_size,
+                            request_limits: _,
                             limits: _,
                             methods: _,
                             mode,
@@ -1347,17 +1464,11 @@ async fn serve<I>(
                             context.sendfile = selection.sendfile;
                             context.grpc_web = selection.grpc_web;
 
-                            // Sections 4.6 and 4.11: the route's body limit
-                            // and uploads apply to a client's own request,
-                            // whose body has not been read yet.
+                            // Section 4.11: the route's uploads apply to
+                            // a client's own request, whose body has not
+                            // been read yet.
 
                             if origin.is_none() {
-                                if let Some(size) = max_body_size {
-                                    let mut limits = (*context.limits).clone();
-                                    limits.max_body_size = size;
-                                    context.limits = Arc::new(limits);
-                                }
-
                                 context.upload = upload;
                             }
 
@@ -1416,11 +1527,14 @@ async fn serve<I>(
                             }
                         }
                     }
-                    (None, routing::Decision::Redirect) => {
-                        link::Handled::Response(link::redirect_to_https(
+                    (None, routing::Decision::Redirect { https, canonical }) => {
+                        link::Handled::Response(link::redirect(
                             &parts,
                             &context,
-                            SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443)),
+                            https.then(|| {
+                                SocketAddr::new(local.ip(), shared.https_port.unwrap_or(443))
+                            }),
+                            canonical.as_deref(),
                         ))
                     }
                     (None, routing::Decision::Misdirected) => {
@@ -1471,6 +1585,7 @@ async fn serve<I>(
                             server_name,
                             cookies,
                             auth: _,
+                            request_limits: _,
                             limits: _,
                         },
                     ) => {

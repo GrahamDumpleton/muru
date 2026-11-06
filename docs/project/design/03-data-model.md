@@ -66,7 +66,7 @@ Settings resolve from the most general to the most specific, and each layer only
 3. The application's own [tool.muru] table, read from the release source (section 6.8).
 4. Application settings in the controller.
 5. Release settings, then worker group and mount settings.
-6. For request handling: virtual host settings, then route settings.
+6. For request handling: route settings. A virtual host's settings are its site's defaults and sit beneath the application's, between layers 2 and 3, so a request's setting is the first set of the route, the mount or worker group, the release, the virtual host, the node and the default (ADR 0049).
 7. Flags given at deploy time, and time-limited runtime overrides such as log levels or temporary scale floors.
 
 muructl config show --effective prints the merged result with the layer each value came from.

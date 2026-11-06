@@ -486,16 +486,36 @@ A virtual host, the `[host.NAME]` table.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `access_log` | string | `access_log` in `[logs]` | Which of the host's requests the access log writes: `on`, `errors` or `off`, replacing the `[logs]` table's. An application's own replaces it. |
+| `access_log_exclude` | array of strings |  | Paths whose requests the access log leaves out, besides those the `[logs]` table leaves out. |
 | `canonical` | string |  | The name the host is known by, for `use_canonical_name`. |
+| `canonical_redirect` | boolean | `false` | Redirect requests for the host's other names to the canonical name. |
 | `default` | boolean | `false` | Answer requests whose host matches no virtual host, which are otherwise refused with 421. |
 | `error_override` | table, {ref}`[error_override] <config-daemon-error-override>` |  | Replace the application's own error responses with error pages. |
 | `error_pages` | table of tables, {ref}`[error_pages.STATUS] <config-daemon-error-pages-status>` |  | Custom error pages, by status or status:reason. |
 | `https_redirect` | boolean | `false` | Redirect plain HTTP requests to HTTPS. |
 | `listeners` | array of strings |  | The listener addresses it answers on; every listener when empty. |
+| `max_body_size` | string | `max_body_size` in `[limits]` | The largest request body for the host's routes, for example 1MB, replacing the daemon's `[limits]` value. A route's own replaces it. |
 | `names` | array of strings |  | The names it answers to: exact names, or `*.example.com` for one label. Compared case-insensitively, without a port or trailing dot. |
 | `rate_limits` | array of strings |  | The `[rate_limit.NAME]` tables applied to every request for the host, before a route's. |
+| `slow` | string | `slow` in `[logs]` | How slow a request is to be written under `access_log = "errors"`. |
+| `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of a request for the host's routes, each replacing the daemon's `[limits]` value. A route's own replace them. |
 | `tls` | table, {ref}`[host.NAME.tls] <config-daemon-host-name-tls>` |  | Its certificate and key, for TLS listeners. |
 | `use_canonical_name` | boolean | `false` | Give the application the canonical name as SERVER_NAME rather than the name matched. |
+
+(config-daemon-host-name-timeouts)=
+## `[host.NAME.timeouts]`
+
+The timeouts of one request, the `timeouts` table of a virtual host or a route. Each key replaces the same key of the level beneath, down to the daemon's `[limits]`.
+
+The same keys apply at `[route.timeouts]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `body_idle_timeout` | string | `body_idle_timeout` in `[limits]` | Time a client may pause while sending a body. |
+| `queue_timeout` | string | `queue_timeout` in `[limits]` | Time a request may wait for a worker. |
+| `request_deadline` | string | `request_deadline` in `[limits]` | Time a request may take to produce its response head. |
+| `response_idle_timeout` | string | `response_idle_timeout` in `[limits]` | Time a worker may pause mid-response. |
 
 (config-daemon-host-name-tls)=
 ## `[host.NAME.tls]`
@@ -761,7 +781,7 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `index` | array of strings | `["index.html"]` | The files tried, in order, when a directory is requested. |
 | `internal` | boolean | `false` | Reachable only through internal redirects: a client's request for the path is answered 404. |
 | `match` | table, {ref}`[rate_limit.NAME.match] <config-daemon-rate-limit-name-match>` |  | The client classes the route takes; every request without it. Among routes with the same path, one naming the request's class comes first. |
-| `max_body_size` | string | `max_body_size` in `[limits]` | The largest request body, for example 1GB, replacing the daemon's `[limits]` value for the route. On an upload route it bounds the body as received, files included. |
+| `max_body_size` | string | the host's `max_body_size` | The largest request body, for example 1GB, replacing the host's, or else the daemon's `[limits]` value, for the route. On an upload route it bounds the body as received, files included. |
 | `max_file_size` | string |  | The largest uploaded file, for example 512MB; no limit without it. |
 | `max_files` | integer | `100` | The most files in one request. |
 | `methods` | table, {ref}`[route.methods] <config-daemon-route-methods>` |  | Methods the route refuses. |
@@ -773,6 +793,7 @@ A route, one of the `[[route]]` entries: a path prefix of a virtual host to an a
 | `redirect_slash` | boolean | `true` | Whether a directory asked for without a trailing slash is redirected to the slash form. |
 | `spool_quota` | string | `"10GB"` | What the application's stored uploads may hold at once when a request on the route arrives. |
 | `static` | string |  | The directory served by the edge, instead of an application. |
+| `timeouts` | table, {ref}`[host.NAME.timeouts] <config-daemon-host-name-timeouts>` |  | The timeouts of the route's requests, each replacing the host's, or else the daemon's `[limits]` value. |
 | `traffic` | table, {ref}`[route.traffic] <config-daemon-route-traffic>` |  | How requests are shared between the application's releases; without it every request goes to the serving release. |
 | `upload` | string |  | `multipart` or `raw` makes the edge receive and store uploads before the application sees the request; off without it. |
 | `upstream` | string |  | The HTTP upstream that takes the requests, instead of an application. |

@@ -1168,6 +1168,9 @@ pub struct Context<'a> {
     /// The virtual host name the application sees as SERVER_NAME, when a
     /// host matched (section 4.3).
     pub server_name: Option<String>,
+    /// The configured name of the virtual host the request is for, when
+    /// one takes it.
+    pub virtual_host: Option<Arc<str>>,
     /// The application the request goes to, for the access log; empty
     /// before routing, or when nothing names it.
     pub app: String,
@@ -1246,6 +1249,7 @@ impl<'a> Context<'a> {
             access_log: Arc::clone(&self.access_log),
             limits: Arc::clone(&self.limits),
             server_name: self.server_name.clone(),
+            virtual_host: self.virtual_host.clone(),
             app: String::new(),
             release: String::new(),
             group: String::new(),
@@ -1394,6 +1398,11 @@ impl Recording {
                 .server_name
                 .clone()
                 .unwrap_or_else(|| requested_host(parts)),
+            virtual_host: context
+                .virtual_host
+                .as_deref()
+                .unwrap_or_default()
+                .to_owned(),
             group: context.group.clone(),
             mount: if context.mount.is_empty() {
                 crate::routing::DEFAULT_GROUP.to_owned()
@@ -1511,24 +1520,58 @@ pub(crate) fn redirect_to_https(
     context: &Context<'_>,
     to: SocketAddr,
 ) -> Response<ResponseBody> {
+    redirect(parts, context, Some(to), None)
+}
+
+/// Redirect a request to the same path and query elsewhere (section
+/// 4.3): over HTTPS on the port of `https`, under the name `canonical`
+/// in place of the one the client used, or both.
+pub(crate) fn redirect(
+    parts: &http::request::Parts,
+    context: &Context<'_>,
+    https: Option<SocketAddr>,
+    canonical: Option<&str>,
+) -> Response<ResponseBody> {
     let recording = Recording::new(context, parts);
-    let host = parts
-        .headers
-        .get(http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(crate::routing::host_only)
-        .or_else(|| parts.uri.host().map(str::to_owned))
-        .unwrap_or_else(|| match to.ip() {
+    let asked = context.forwarded_host.clone().or_else(|| {
+        parts
+            .headers
+            .get(http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| parts.uri.authority().map(|authority| authority.to_string()))
+    });
+
+    let host = canonical
+        .map(str::to_owned)
+        .or_else(|| asked.as_deref().map(crate::routing::host_only))
+        .unwrap_or_else(|| match https.map_or(context.local.ip(), |to| to.ip()) {
             std::net::IpAddr::V4(ip) => ip.to_string(),
             std::net::IpAddr::V6(ip) => format!("[{ip}]"),
         });
 
-    let port = if to.port() == 443 {
-        String::new()
-    } else {
-        format!(":{}", to.port())
+    // Over HTTPS the port is the TLS listener's. Otherwise it is the one
+    // the client used, which its Host header carries when it is not the
+    // scheme's own.
+
+    let (scheme, port) = match https {
+        Some(to) => ("https", (to.port() != 443).then(|| to.port())),
+        None => {
+            let own = if context.scheme == "https" { 443 } else { 80 };
+            let port = context.forwarded_port.or_else(|| {
+                let asked = asked.as_deref()?;
+                asked
+                    .strip_prefix(crate::routing::host_only(asked).as_str())?
+                    .strip_prefix(':')?
+                    .parse()
+                    .ok()
+            });
+            (context.scheme, port.filter(|port| *port != own))
+        }
     };
-    let location = format!("https://{host}{port}{}", recording.record.target);
+
+    let port = port.map_or_else(String::new, |port| format!(":{port}"));
+    let location = format!("{scheme}://{host}{port}{}", recording.record.target);
     let empty = Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed_unsync();

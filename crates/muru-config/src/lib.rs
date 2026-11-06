@@ -1710,6 +1710,149 @@ pub struct Host {
     /// host (section 4.15), before a route's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rate_limits: Vec<String>,
+    /// Redirect requests for the host's other names to the canonical
+    /// name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub canonical_redirect: bool,
+    /// The largest request body for the host's routes, for example 1MB,
+    /// replacing the daemon's `[limits]` value (section 4.6). A route's
+    /// own replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`max_body_size` in `[limits]`"))]
+    pub max_body_size: Option<String>,
+    /// The timeouts of a request for the host's routes, each replacing
+    /// the daemon's `[limits]` value (section 4.6). A route's own
+    /// replace them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<RequestTimeouts>,
+    /// Which of the host's requests the access log writes: `on`,
+    /// `errors` or `off`, replacing the `[logs]` table's (section 11.2).
+    /// An application's own replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`access_log` in `[logs]`"))]
+    pub access_log: Option<String>,
+    /// How slow a request is to be written under `access_log = "errors"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`slow` in `[logs]`"))]
+    pub slow: Option<String>,
+    /// Paths whose requests the access log leaves out, besides those the
+    /// `[logs]` table leaves out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_log_exclude: Vec<String>,
+}
+
+/// The timeouts of one request (section 4.6), the `timeouts` table of a
+/// virtual host or a route. Each key replaces the same key of the level
+/// beneath, down to the daemon's `[limits]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestTimeouts {
+    /// Time a request may wait for a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`queue_timeout` in `[limits]`"))]
+    pub queue_timeout: Option<String>,
+    /// Time a request may take to produce its response head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`request_deadline` in `[limits]`"))]
+    pub request_deadline: Option<String>,
+    /// Time a client may pause while sending a body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`body_idle_timeout` in `[limits]`"))]
+    pub body_idle_timeout: Option<String>,
+    /// Time a worker may pause mid-response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`response_idle_timeout` in `[limits]`"))]
+    pub response_idle_timeout: Option<String>,
+}
+
+/// The limits one level sets on a request (section 4.6), as numbers:
+/// the body size in bytes and the timeouts. Each is none where the level
+/// says nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestLimitSettings {
+    /// The largest request body, in bytes.
+    pub max_body_size: Option<u64>,
+    /// Time a request may wait for a worker.
+    pub queue_timeout: Option<Duration>,
+    /// Time a request may take to produce its response head.
+    pub request_deadline: Option<Duration>,
+    /// Time a client may pause while sending a body.
+    pub body_idle_timeout: Option<Duration>,
+    /// Time a worker may pause mid-response.
+    pub response_idle_timeout: Option<Duration>,
+}
+
+impl RequestLimitSettings {
+    /// Whether the level sets nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Check and parse the limits a level sets on a request: `max_body_size`
+/// of at least a byte, and timeouts of more than nothing.
+pub fn check_request_limits(
+    max_body_size: Option<&str>,
+    timeouts: Option<&RequestTimeouts>,
+) -> Result<RequestLimitSettings, String> {
+    let mut settings = RequestLimitSettings::default();
+
+    if let Some(size) = max_body_size {
+        let bytes = parse_size(size).map_err(|error| format!("max_body_size: {error}"))?;
+
+        if bytes == 0 {
+            return Err(
+                "max_body_size must be at least 1 byte; leave it out for the max_body_size of [limits]"
+                    .to_owned(),
+            );
+        }
+
+        settings.max_body_size = Some(bytes);
+    }
+
+    let Some(timeouts) = timeouts else {
+        return Ok(settings);
+    };
+
+    for (key, value, field) in [
+        (
+            "queue_timeout",
+            &timeouts.queue_timeout,
+            &mut settings.queue_timeout,
+        ),
+        (
+            "request_deadline",
+            &timeouts.request_deadline,
+            &mut settings.request_deadline,
+        ),
+        (
+            "body_idle_timeout",
+            &timeouts.body_idle_timeout,
+            &mut settings.body_idle_timeout,
+        ),
+        (
+            "response_idle_timeout",
+            &timeouts.response_idle_timeout,
+            &mut settings.response_idle_timeout,
+        ),
+    ] {
+        let Some(text) = value else {
+            continue;
+        };
+
+        let duration = parse_duration(text).map_err(|error| format!("timeouts.{key}: {error}"))?;
+
+        if duration.is_zero() {
+            return Err(format!(
+                "timeouts.{key} must be more than 0; leave it out for the {key} of [limits]"
+            ));
+        }
+
+        *field = Some(duration);
+    }
+
+    Ok(settings)
 }
 
 /// A virtual host's certificate chain and private key, as PEM files.
@@ -1802,12 +1945,17 @@ pub struct Route {
     /// it serves the route (section 4.16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
-    /// The largest request body, for example 1GB, replacing the daemon's
-    /// `[limits]` value for the route (section 4.6). On an upload route
-    /// it bounds the body as received, files included.
+    /// The largest request body, for example 1GB, replacing the host's,
+    /// or else the daemon's `[limits]` value, for the route (section
+    /// 4.6). On an upload route it bounds the body as received, files
+    /// included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-default" = "`max_body_size` in `[limits]`"))]
+    #[schemars(extend("x-default" = "the host's `max_body_size`"))]
     pub max_body_size: Option<String>,
+    /// The timeouts of the route's requests, each replacing the host's,
+    /// or else the daemon's `[limits]` value (section 4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<RequestTimeouts>,
     /// Section 4.11: `multipart` or `raw` makes the edge receive and store
     /// uploads before the application sees the request; off without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2974,14 +3122,7 @@ pub const DEFAULT_SPOOL_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
 /// The upload keys other than `upload` need it, and `max_files` stays
 /// within what one request can pass to a worker.
 pub fn check_upload(route: &Route) -> Result<Option<UploadSettings>, String> {
-    if let Some(size) = &route.max_body_size
-        && parse_size(size).map_err(|error| format!("max_body_size: {error}"))? == 0
-    {
-        return Err(
-            "max_body_size must be at least 1 byte; leave it out for the max_body_size of [limits]"
-                .to_owned(),
-        );
-    }
+    check_request_limits(route.max_body_size.as_deref(), route.timeouts.as_ref())?;
 
     let Some(mode) = &route.upload else {
         let stray = [
@@ -5420,6 +5561,58 @@ traffic = { classes = { ai-crawler = 'r1' } }"
     }
 
     #[test]
+    fn a_levels_request_limits_are_parsed_and_must_be_more_than_nothing() {
+        assert_eq!(
+            check_request_limits(None, None),
+            Ok(RequestLimitSettings::default())
+        );
+        assert!(check_request_limits(None, None).unwrap().is_empty());
+
+        let timeouts = RequestTimeouts {
+            queue_timeout: Some("2s".to_owned()),
+            request_deadline: Some("30s".to_owned()),
+            body_idle_timeout: None,
+            response_idle_timeout: Some("250ms".to_owned()),
+        };
+        assert_eq!(
+            check_request_limits(Some("1MB"), Some(&timeouts)),
+            Ok(RequestLimitSettings {
+                max_body_size: Some(1024 * 1024),
+                queue_timeout: Some(Duration::from_secs(2)),
+                request_deadline: Some(Duration::from_secs(30)),
+                body_idle_timeout: None,
+                response_idle_timeout: Some(Duration::from_millis(250)),
+            })
+        );
+
+        let error = check_request_limits(Some("0"), None).unwrap_err();
+        assert!(
+            error.starts_with("max_body_size must be at least 1 byte"),
+            "{error}"
+        );
+        let error = check_request_limits(Some("lots"), None).unwrap_err();
+        assert!(error.starts_with("max_body_size:"), "{error}");
+
+        let zero = RequestTimeouts {
+            request_deadline: Some("0s".to_owned()),
+            ..RequestTimeouts::default()
+        };
+        let error = check_request_limits(None, Some(&zero)).unwrap_err();
+        assert!(
+            error.starts_with("timeouts.request_deadline must be more than 0"),
+            "{error}"
+        );
+
+        let unreadable = RequestTimeouts {
+            queue_timeout: Some("soon".to_owned()),
+            ..RequestTimeouts::default()
+        };
+        let error = check_request_limits(None, Some(&unreadable)).unwrap_err();
+        assert!(error.starts_with("timeouts.queue_timeout:"), "{error}");
+        assert!(toml::from_str::<Host>("timeouts = { deadline = '1s' }").is_err());
+    }
+
+    #[test]
     fn sizes_and_durations_are_written_in_the_largest_exact_unit() {
         assert_eq!(format_size(100 * 1024 * 1024), "100MB");
         assert_eq!(format_size(64 * 1024), "64KB");
@@ -5475,6 +5668,14 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                     key: "certs/shop-key.pem".to_owned(),
                 }),
                 https_redirect: true,
+                canonical: Some("shop.example.com".to_owned()),
+                canonical_redirect: true,
+                max_body_size: Some("1MB".to_owned()),
+                timeouts: Some(RequestTimeouts {
+                    request_deadline: Some("30s".to_owned()),
+                    ..RequestTimeouts::default()
+                }),
+                access_log: Some("errors".to_owned()),
                 ..Host::default()
             },
         );
@@ -5502,6 +5703,10 @@ traffic = { classes = { ai-crawler = 'r1' } }"
                 ..Traffic::default()
             }),
             max_body_size: Some("1GB".to_owned()),
+            timeouts: Some(RequestTimeouts {
+                queue_timeout: Some("2s".to_owned()),
+                ..RequestTimeouts::default()
+            }),
             upload: Some("multipart".to_owned()),
             max_file_size: None,
             max_files: Some(5),
@@ -5527,6 +5732,11 @@ traffic = { classes = { ai-crawler = 'r1' } }"
         assert!(text.contains("[route.traffic]"), "{text}");
         assert!(text.contains("r2 = 10"), "{text}");
         assert!(text.contains("[host.shop]"), "{text}");
+        assert!(text.contains("canonical_redirect = true"), "{text}");
+        assert!(text.contains("[host.shop.timeouts]"), "{text}");
+        assert!(text.contains("request_deadline = \"30s\""), "{text}");
+        assert!(text.contains("[route.timeouts]"), "{text}");
+        assert!(text.contains("queue_timeout = \"2s\""), "{text}");
         assert!(text.contains("[[route]]"), "{text}");
         assert!(
             text.contains("entrypoint = \"shop.wsgi:application\""),

@@ -66,11 +66,22 @@ message Snapshot {
 // Section 11.2: which access records are written, where the edge was
 // told to write them. A record not written is still counted and kept
 // in memory. The daemon sends the [logs] table's choice in every
-// snapshot, and an application's own on its AppWorkers entries.
+// snapshot, a virtual host's own on its Host entry and an application's
+// own on its AppWorkers entries.
 message AccessLog {
   string mode = 1;                      // on, errors or off; on when empty
   uint64 slow_ms = 2;                   // a request at least this slow is written under errors
   repeated string exclude = 3;          // path patterns never written, * any run of characters and ? one
+}
+
+// Section 11.2: a virtual host's or an application's own choice of
+// which access records are written, laid over the node's: a key it
+// leaves out is the level beneath's, the application's over its host's
+// over the node's, and its paths are left out besides theirs.
+message AccessLogChoice {
+  string mode = 1;                      // on, errors or off; the level beneath's when empty
+  optional uint64 slow_ms = 2;          // the level beneath's when absent
+  repeated string exclude = 3;          // path patterns never written, besides the levels' beneath
 }
 
 // Section 11.2: a change to which access records are written, for a
@@ -107,6 +118,17 @@ message Limits {
   uint64 websocket_max_message_size = 16;
   uint64 websocket_ping_interval_ms = 17;
   uint64 websocket_idle_timeout_ms = 18;
+}
+
+// Section 4.6: the limits one level sets on a request, each in place of
+// the level beneath's: a route's over its virtual host's over the
+// node's. A field left at 0 says nothing.
+message RequestLimits {
+  uint64 max_body_size = 1;
+  uint64 queue_timeout_ms = 2;
+  uint64 request_deadline_ms = 3;
+  uint64 body_idle_timeout_ms = 4;
+  uint64 response_idle_timeout_ms = 5;
 }
 
 // Section 6.13: who may speak HTTP/2 in cleartext on a listener without
@@ -240,6 +262,9 @@ message Host {
   repeated ErrorPage error_pages = 10;  // section 4.12: the host's pages
   ErrorOverride error_override = 11;
   repeated string rate_limits = 12;     // section 4.15: applied to every request for the host
+  RequestLimits limits = 13;            // section 4.6: the limits of a request for the host's routes; none when absent
+  bool canonical_redirect = 14;         // requests for the host's other names are redirected to the canonical name
+  AccessLogChoice access_log = 15;      // section 11.2: the host's own access log choice; none when absent
 }
 
 // A route (section 4.5): a path prefix of a host to an application, or
@@ -266,11 +291,12 @@ message Route {
   string upstream = 19;                 // section 4.13: the upstream that takes the requests, instead of an application
   string fallback_upstream = 20;        // the upstream that takes requests no file answers, for a static route
   Upload upload = 21;                   // section 4.11: uploads received and stored by the edge; off when absent
-  uint64 max_body_size = 22;            // section 4.6: the route's body limit; the edge's own when 0
+  reserved 22;
   repeated string rate_limits = 23;     // section 4.15: applied after the host's
   Methods methods = 24;                 // methods the route refuses; none when absent
   string mode = 25;                     // the site mode the application sees as muru.mode; none when empty
   repeated string client_classes = 26;  // section 4.14: the classes the route takes; every request when empty
+  RequestLimits limits = 27;            // section 4.6: the limits of the route's requests, over the host's; none when absent
 }
 
 // Section 4.11: how a route's uploads are received before dispatch.
@@ -334,7 +360,8 @@ message AppWorkers {
   repeated string waking_groups = 15;   // section 7.4: groups, "default" among them, whose requests wait to be woken when they have no workers
   repeated string grpc_web_origins = 16; // section 6.13: the origins whose pages may call it through gRPC-Web, or *; no CORS when empty
   repeated StaticDir static_dirs = 17;  // section 4.9: the release's own directories of files, by path prefix
-  AccessLog access_log = 18;            // section 11.2: the application's own access log choice; the snapshot's when absent
+  reserved 18;
+  AccessLogChoice access_log = 19;      // section 11.2: the application's own access log choice; none when absent
 }
 
 // Section 4.9: a directory of a release's own files, served by the edge

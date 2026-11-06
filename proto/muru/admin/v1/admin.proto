@@ -752,7 +752,7 @@ message ExportConfigResponse {
   uint64 time_unix_ms = 4;
   uint64 state_version = 5;         // the last event sequence number
   repeated string attributions = 6; // with effective: what each active overlay sets that is in force
-  repeated string layers = 7;       // with effective: each release setting and the layer it came from (section 3.3)
+  repeated string layers = 7;       // with effective: each release setting and each route's limits, with the layer it came from (section 3.3)
 }
 
 message ListHostsRequest {}
@@ -771,6 +771,10 @@ message Host {
   bool https_redirect = 7;
   bool use_canonical_name = 8;
   bool default = 9;
+  bool canonical_redirect = 10;       // other names are redirected to the canonical name
+  string max_body_size = 11;          // the host's own body limit, as configured (section 4.6)
+  map<string, string> timeouts = 12;  // the host's own request timeouts, as configured
+  string access_log = 13;             // the host's own access log choice (section 11.2): on, errors or off
 }
 
 message ListRoutesRequest {}
@@ -797,6 +801,7 @@ message Route {
   string max_body_size = 15;        // the route's own body limit, as configured (section 4.6)
   repeated string client_classes = 16; // the client classes the route takes (section 4.14); every request when empty
   map<string, string> traffic_classes = 17; // a client class to the release, or upstream:NAME, that takes its requests
+  map<string, string> timeouts = 18; // the route's own request timeouts, as configured (section 4.6)
 }
 
 message ListUpstreamsRequest {}

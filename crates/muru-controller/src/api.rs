@@ -1308,6 +1308,10 @@ impl Admin for Service {
                     https_redirect: host.https_redirect,
                     use_canonical_name: host.use_canonical_name,
                     default: host.default,
+                    canonical_redirect: host.canonical_redirect,
+                    max_body_size: host.max_body_size.unwrap_or_default(),
+                    timeouts: timeouts_map(host.timeouts.as_ref()),
+                    access_log: host.access_log.unwrap_or_default(),
                 })
                 .collect(),
         }))
@@ -1388,6 +1392,7 @@ impl Admin for Service {
                         (None, _) => String::new(),
                     },
                     max_body_size: route.max_body_size.clone().unwrap_or_default(),
+                    timeouts: timeouts_map(route.timeouts.as_ref()),
                     host: route.host,
                     path: route.path,
                     app: route.app,
@@ -1576,10 +1581,19 @@ impl Admin for Service {
         }
 
         let (attributions, layers) = if request.effective {
-            (
-                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?,
-                config::release_layers(&self.handle.store, &document).map_err(internal)?,
-            )
+            let attributions =
+                config::make_effective(&self.handle.store, &mut document, app).map_err(internal)?;
+            let mut layers =
+                config::release_layers(&self.handle.store, &document).map_err(internal)?;
+            let limits = self
+                .handle
+                .info
+                .limits
+                .read()
+                .expect("limits poisoned")
+                .clone();
+            layers.extend(config::route_layers(&self.handle.store, &document, &limits));
+            (attributions, layers)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1596,6 +1610,24 @@ impl Admin for Service {
             layers,
         }))
     }
+}
+
+/// A host's or a route's own request timeouts (section 4.6), by key, as
+/// configured.
+fn timeouts_map(timeouts: Option<&muru_config::RequestTimeouts>) -> BTreeMap<String, String> {
+    let Some(timeouts) = timeouts else {
+        return BTreeMap::new();
+    };
+
+    [
+        ("queue_timeout", &timeouts.queue_timeout),
+        ("request_deadline", &timeouts.request_deadline),
+        ("body_idle_timeout", &timeouts.body_idle_timeout),
+        ("response_idle_timeout", &timeouts.response_idle_timeout),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key.to_owned(), value.clone()?)))
+    .collect()
 }
 
 impl Service {

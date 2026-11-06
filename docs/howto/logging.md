@@ -286,12 +286,28 @@ quiet while the rest are logged:
 access_log = 'off'
 ```
 
-The application's `access_log` and `slow` replace the `[logs]` table's
-for its requests, and its `access_log_exclude` paths are left out as
-well as the table's. `muructl daemon reload` applies a changed `[logs]`
-table, and `muructl apply` a changed application table, to the running
-edge without restarting anything: every request completed from then on
-is written by the new choice.
+A [virtual host](virtual-hosts.md#settings-for-a-hosts-routes) takes the
+same three keys for the requests it serves, whatever application
+answers them:
+
+```toml
+[host.intranet]
+names = ["intranet.example.com"]
+access_log = "errors"
+slow = "2s"
+access_log_exclude = ["/healthz"]
+```
+
+For a request, `access_log` and `slow` are the application's when it
+sets them, else the host's, else the `[logs]` table's, and the paths
+all three leave out are left out. A request the edge answers before an
+application is chosen, such as a 404 for a path with no route, is
+written by its host's choice.
+
+`muructl daemon reload` applies a changed `[logs]` table, and `muructl
+apply` a changed application or host table, to the running edge without
+restarting anything: every request completed from then on is written by
+the new choice.
 
 ### Changing the access log for a while
 

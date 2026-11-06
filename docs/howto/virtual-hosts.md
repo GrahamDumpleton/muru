@@ -122,6 +122,84 @@ With `https_redirect = true`, plain HTTP requests to the host are answered
 with 307 to the same host, path and query on the first TLS listener's
 port; other hosts are unaffected.
 
+## Settings for a host's routes
+
+A host carries settings for every route it has, written once:
+
+```toml
+[host.api]
+names = ["api.example.com"]
+max_body_size = "1MB"
+timeouts = { request_deadline = "30s", queue_timeout = "2s" }
+access_log = "errors"
+rate_limits = ["crawlers"]
+
+[host.api.error_pages]
+503 = { file = "pages/busy.html" }
+
+[[route]]
+host = "api"
+app = "api"
+
+[[route]]
+host = "api"
+path = "/import"
+app = "api"
+max_body_size = "200MB"
+timeouts = { request_deadline = "120s" }
+```
+
+| Key | Sets for the host's requests | A route's own |
+| --- | --- | --- |
+| `max_body_size` | the largest request body | replaces it |
+| `timeouts` | `queue_timeout`, `request_deadline`, `body_idle_timeout` and `response_idle_timeout`, as [timeouts](timeouts.md#under-the-daemon) describes | replaces it key by key |
+| `access_log`, `slow`, `access_log_exclude` | which requests the [access log](logging.md#what-the-daemons-access-log-writes) writes | |
+| `error_pages`, `error_override` | the [error pages](error-pages.md) | is consulted first |
+| `rate_limits` | the [rate limits](client-classes.md) every request draws from | are drawn from as well |
+
+Here every request for `api.example.com` may carry 1MB and take 30
+seconds, except under `/import`, where the route allows 200MB and 120
+seconds and keeps the host's 2 second queue timeout. A key the host
+leaves out is the daemon's own: its `[limits]` and `[logs]` tables, or
+the default. `muructl host list` shows what each host sets, and
+`muructl config show --effective` lists every route's limits with the
+level each came from:
+
+```
+#   route api /: max_body_size = 1MB (host api)
+#   route api /import: max_body_size = 200MB (the route)
+#   route api /import: timeouts.queue_timeout = 2s (host api)
+```
+
+## The canonical name
+
+A host with several names can send every request to one of them:
+
+```toml
+[host.shop]
+names = ["example.com", "www.example.com"]
+canonical = "www.example.com"
+canonical_redirect = true
+https_redirect = true
+```
+
+With `canonical_redirect = true`, a request for any name other than the
+`canonical` one is answered with 307 to the canonical name, with the
+same path and query, and the port the request came to when it is not
+the scheme's own. A request that must also move to HTTPS is sent there
+in the same redirect:
+
+| Request | Answer |
+| --- | --- |
+| `https://example.com/a?b=1` | 307 to `https://www.example.com/a?b=1` |
+| `http://example.com/a?b=1` | 307 to `https://www.example.com/a?b=1` |
+| `https://www.example.com/a?b=1` | served |
+
+Every name the host matches is redirected, a wildcard's included, so a
+host that serves a different site under each name leaves it off. The
+`canonical` name need not be one of the host's `names`: a host for a
+retired name redirects to wherever the canonical name is served.
+
 ## Commands
 
 ```

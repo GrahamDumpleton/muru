@@ -24,6 +24,50 @@ load balancers and clients handle better than slow successes. `deadline`
 bounds the slowest acceptable request; the access log shows `app=` time per
 request, so the right value is the slowest legitimate one plus margin.
 
+## Under the daemon
+
+The daemon's configuration file sets the timeouts for the node in its
+`[limits]` table, where the first five are `header_read_timeout`,
+`queue_timeout`, `request_deadline`, `body_idle_timeout` and
+`response_idle_timeout`:
+
+```toml
+[limits]
+request_deadline = "60s"
+queue_timeout = "5s"
+```
+
+A [virtual host](virtual-hosts.md#settings-for-a-hosts-routes) and a
+route each take a `timeouts` table with the last four of those, for the
+requests they serve. A key set on the route is used, else the host's, else the
+`[limits]` table's, else the default:
+
+```toml
+[host.api]
+names = ["api.example.com"]
+timeouts = { request_deadline = "30s", queue_timeout = "2s" }
+
+[[route]]
+host = "api"
+app = "api"
+
+[[route]]
+host = "api"
+path = "/reports"
+app = "api"
+timeouts = { request_deadline = "120s" }
+```
+
+A request for `/reports/monthly` has 120 seconds and waits at most 2
+seconds for a worker; every other request for the host has 30 seconds.
+The limits are those of the route the client's request matched: an
+[internal redirect](internal-redirects.md) to another route keeps them.
+`header_read_timeout` is read before the request names its host, so it
+is set for the node alone. `muructl config show --effective` lists each
+route's timeouts with where each came from.
+
+## Past the deadline
+
 A request past its deadline keeps running in the worker after the client
 has been answered, unless a soft timeout interrupts it or a hard timeout
 replaces its worker. Both are off by default. The application can see
@@ -227,4 +271,7 @@ broken connection pool, see [restarting a worker](recycling.md#restarting-a-work
 
 The body size limit is a limit rather than a timeout, but lives beside
 them: `--max-body-size 100MB` (the development default; 10 MB with
-`--allow-public`), with 413 `body_too_large` when it is passed.
+`--allow-public`), with 413 `body_too_large` when it is passed. Under
+the daemon it is `max_body_size` in the `[limits]` table, on a virtual
+host and on a route, the route's replacing the host's and the host's
+the table's.

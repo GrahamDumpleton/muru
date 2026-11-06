@@ -135,16 +135,53 @@ impl Filter {
             exclude: self.exclude.clone(),
         }
     }
+}
 
-    /// Whether a record is written.
-    fn shows(&self, record: &Record) -> bool {
-        writes(self.mode, self.slow, &self.exclude, record)
+/// A virtual host's or an application's own choice of which records are
+/// written, laid over the node's filter: a key it leaves out is the
+/// level beneath's, and its paths are left out besides theirs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Choice {
+    /// Which records are written, when the level says.
+    pub mode: Option<Mode>,
+    /// Requests at least this slow are written under `Mode::Errors`,
+    /// when the level says.
+    pub slow: Option<Duration>,
+    /// Path patterns whose requests are not written, besides those of
+    /// the levels beneath.
+    pub exclude: Vec<String>,
+}
+
+impl Choice {
+    /// The choice a snapshot carries.
+    pub fn from_message(message: &muru_proto::edge::v1::AccessLogChoice) -> Self {
+        Self {
+            mode: Mode::parse(&message.mode),
+            slow: message.slow_ms.map(Duration::from_millis),
+            exclude: message.exclude.clone(),
+        }
+    }
+
+    /// The choice as a snapshot carries it.
+    pub fn to_message(&self) -> muru_proto::edge::v1::AccessLogChoice {
+        muru_proto::edge::v1::AccessLogChoice {
+            mode: self.mode.map_or("", Mode::as_str).to_owned(),
+            slow_ms: self
+                .slow
+                .map(|slow| u64::try_from(slow.as_millis()).unwrap_or(u64::MAX)),
+            exclude: self.exclude.clone(),
+        }
+    }
+
+    /// Whether the level says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 
 /// Whether a record is written under a mode, a slow threshold and the
-/// paths left out.
-fn writes(mode: Mode, slow: Duration, exclude: &[String], record: &Record) -> bool {
+/// paths each level leaves out.
+fn writes(mode: Mode, slow: Duration, exclude: &[&[String]], record: &Record) -> bool {
     // A WebSocket's close is shown with the errors when it ended other
     // than in order; its lifetime is not a slow request.
 
@@ -160,7 +197,10 @@ fn writes(mode: Mode, slow: Duration, exclude: &[String], record: &Record) -> bo
     }
 
     let path = record.path();
-    !exclude.iter().any(|pattern| glob_matches(pattern, path))
+    !exclude
+        .iter()
+        .flat_map(|level| level.iter())
+        .any(|pattern| glob_matches(pattern, path))
 }
 
 /// A change to which records are written, for a period, over the
@@ -284,25 +324,29 @@ impl Override {
     }
 }
 
-/// The filters in force: the node's, and those of the applications that
-/// have their own.
+/// The filters in force: the node's, and the choices of the virtual
+/// hosts and the applications that have their own, an application's
+/// over its host's over the node's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filters {
-    /// The filter for every application without its own.
+    /// The filter for every request no host or application chooses for.
     pub node: Filter,
-    /// Applications' own filters, by name.
-    pub apps: BTreeMap<String, Filter>,
+    /// Virtual hosts' own choices, by configured name.
+    pub hosts: BTreeMap<String, Choice>,
+    /// Applications' own choices, by name.
+    pub apps: BTreeMap<String, Choice>,
     /// Changes for a period, the newest last; those past their end are
     /// ignored.
     pub overrides: Vec<Override>,
 }
 
 impl Filters {
-    /// The filters with one for the node and none of the applications'
+    /// The filters with one for the node and no host's or application's
     /// own.
     pub fn node(filter: Filter) -> Self {
         Self {
             node: filter,
+            hosts: BTreeMap::new(),
             apps: BTreeMap::new(),
             overrides: Vec::new(),
         }
@@ -312,17 +356,26 @@ impl Filters {
     /// choice, which leaves the current ones in force.
     pub fn from_snapshot(snapshot: &muru_proto::edge::v1::Snapshot) -> Option<Self> {
         let node = snapshot.access_log.as_ref()?;
+        let hosts = snapshot
+            .hosts
+            .iter()
+            .filter_map(|entry| {
+                let choice = entry.access_log.as_ref()?;
+                Some((entry.name.clone(), Choice::from_message(choice)))
+            })
+            .collect();
         let apps = snapshot
             .apps
             .iter()
             .filter_map(|entry| {
-                let filter = entry.access_log.as_ref()?;
-                Some((entry.app.clone(), Filter::from_message(filter)))
+                let choice = entry.access_log.as_ref()?;
+                Some((entry.app.clone(), Choice::from_message(choice)))
             })
             .collect();
 
         Some(Self {
             node: Filter::from_message(node),
+            hosts,
             apps,
             overrides: snapshot
                 .access_log_overrides
@@ -332,15 +385,26 @@ impl Filters {
         })
     }
 
-    /// The filter a record of `app` is written by, overrides aside.
-    pub fn for_app(&self, app: &str) -> &Filter {
-        self.apps.get(app).unwrap_or(&self.node)
-    }
-
     /// Whether a record is written: by the newest override in force that
-    /// covers it, else by its application's filter.
+    /// covers it, else by the filter of its application over its host's
+    /// over the node's.
     fn shows(&self, record: &Record) -> bool {
-        let filter = self.for_app(&record.app);
+        let host = self.hosts.get(&record.virtual_host);
+        let app = self.apps.get(&record.app);
+        let levels = [app, host];
+        let mode = levels
+            .iter()
+            .find_map(|level| level.and_then(|choice| choice.mode))
+            .unwrap_or(self.node.mode);
+        let slow = levels
+            .iter()
+            .find_map(|level| level.and_then(|choice| choice.slow))
+            .unwrap_or(self.node.slow);
+        let exclude = [
+            &self.node.exclude[..],
+            host.map_or(&[][..], |choice| &choice.exclude),
+            app.map_or(&[][..], |choice| &choice.exclude),
+        ];
 
         if !self.overrides.is_empty() {
             let now = SystemTime::now();
@@ -353,16 +417,16 @@ impl Filters {
 
             if let Some(change) = covering {
                 let exclude = if change.paths.is_empty() {
-                    &filter.exclude[..]
+                    &exclude[..]
                 } else {
                     &[]
                 };
 
-                return writes(change.mode, filter.slow, exclude, record);
+                return writes(change.mode, slow, exclude, record);
             }
         }
 
-        filter.shows(record)
+        writes(mode, slow, &exclude, record)
     }
 }
 
@@ -399,6 +463,9 @@ pub struct Record {
     pub release: String,
     /// The virtual host that matched, else the host the client asked for.
     pub host: String,
+    /// The configured name of the virtual host that took the request,
+    /// which chooses its filter; empty without one. It is not written.
+    pub virtual_host: String,
     /// The worker group: `default`, or a named group's name.
     pub group: String,
     /// The mount: `default`, or a named mount's name.
@@ -1646,6 +1713,7 @@ mod tests {
             app: app.to_owned(),
             release: String::new(),
             host: String::new(),
+            virtual_host: String::new(),
             group: DEFAULT.to_owned(),
             mount: DEFAULT.to_owned(),
             snapshot: 0,
@@ -1695,9 +1763,9 @@ mod tests {
         // The node's filter turns lines off, and one application keeps
         // its errors.
 
-        let errors = Filter {
-            mode: Mode::Errors,
-            ..Filter::default()
+        let errors = Choice {
+            mode: Some(Mode::Errors),
+            ..Choice::default()
         };
         let mut filters = Filters::node(Filter {
             mode: Mode::Off,
@@ -1710,6 +1778,55 @@ mod tests {
         assert!(!log.shows(&record("shop", 200, "/", quick)));
         assert!(log.shows(&record("shop", 500, "/", quick)));
 
+        // A virtual host chooses for its requests, key by key over the
+        // node's, and an application's own choice is laid over its
+        // host's. The paths each level leaves out add up.
+
+        let on = |host: &str, app: &str, status: u16, target: &str, total: Duration| Record {
+            virtual_host: host.to_owned(),
+            ..record(app, status, target, total)
+        };
+        let three = Duration::from_secs(3);
+        let mut layered = Filters::node(Filter {
+            exclude: vec!["/healthz".to_owned()],
+            ..Filter::default()
+        });
+        layered.hosts.insert(
+            "intranet".to_owned(),
+            Choice {
+                mode: Some(Mode::Errors),
+                slow: Some(Duration::from_secs(2)),
+                exclude: vec!["/static/*".to_owned()],
+            },
+        );
+        layered.apps.insert(
+            "reports".to_owned(),
+            Choice {
+                slow: Some(Duration::from_secs(5)),
+                exclude: vec!["/poll".to_owned()],
+                ..Choice::default()
+            },
+        );
+        layered.apps.insert(
+            "wiki".to_owned(),
+            Choice {
+                mode: Some(Mode::On),
+                ..Choice::default()
+            },
+        );
+        log.set_filters(layered.clone());
+        assert!(log.shows(&on("shop", "shop", 200, "/", quick)));
+        assert!(!log.shows(&on("intranet", "home", 200, "/", quick)));
+        assert!(log.shows(&on("intranet", "home", 500, "/", quick)));
+        assert!(log.shows(&on("intranet", "home", 200, "/", three)));
+        assert!(!log.shows(&on("intranet", "reports", 200, "/", three)));
+        assert!(log.shows(&on("intranet", "wiki", 200, "/", quick)));
+        assert!(!log.shows(&on("intranet", "home", 500, "/static/a.css", quick)));
+        assert!(!log.shows(&on("intranet", "reports", 500, "/poll", quick)));
+        assert!(!log.shows(&on("intranet", "wiki", 200, "/healthz", quick)));
+        assert!(log.shows(&on("shop", "shop", 200, "/static/a.css", quick)));
+        log.set_filters(filters.clone());
+
         // A snapshot carries the same, and one without a choice changes
         // nothing.
 
@@ -1720,8 +1837,16 @@ mod tests {
                 access_log: Some(errors.to_message()),
                 ..Default::default()
             }],
+            hosts: vec![muru_proto::edge::v1::Host {
+                name: "intranet".to_owned(),
+                access_log: Some(layered.hosts["intranet"].to_message()),
+                ..Default::default()
+            }],
             ..Default::default()
         };
+        filters
+            .hosts
+            .insert("intranet".to_owned(), layered.hosts["intranet"].clone());
         assert_eq!(Filters::from_snapshot(&snapshot), Some(filters));
         assert_eq!(
             Filters::from_snapshot(&muru_proto::edge::v1::Snapshot::default()),
