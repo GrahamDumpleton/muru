@@ -164,6 +164,7 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     )
     .await?;
     let pools = edge.pools();
+    let routed = Arc::clone(&pools);
     let listeners = edge.listeners();
     let connections = edge.connections();
     let limits = edge.limits();
@@ -251,8 +252,13 @@ pub async fn run(args: EdgeRunArgs) -> anyhow::Result<()> {
     // Whatever waits in a listener's backlog is accepted by the daemon's
     // next edge, which holds the same sockets.
 
+    // The grace is the longest request deadline in force, a host's or a
+    // route's own included (section 4.6).
+
     if outcome.is_ok() {
-        let grace = limits.current().request_deadline;
+        let grace = routed
+            .current()
+            .longest_deadline(limits.current().request_deadline);
         muru_common::muru_eprintln!("edge draining (pid {})", std::process::id());
 
         if !drainer.drain(grace).await {

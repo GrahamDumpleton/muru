@@ -1814,6 +1814,18 @@ impl Routing {
         &self.compression
     }
 
+    /// The longest request deadline in force (section 4.6): the node's,
+    /// or a virtual host's or a route's own when one is longer, which is
+    /// how long an edge that stops gives its requests to finish.
+    pub fn longest_deadline(&self, node: std::time::Duration) -> std::time::Duration {
+        self.hosts
+            .iter()
+            .map(|host| host.limits)
+            .chain(self.routes.iter().flatten().map(|route| route.limits))
+            .filter_map(|limits| limits.request_deadline)
+            .fold(node, std::time::Duration::max)
+    }
+
     /// What the host and the route a client's request names set for it
     /// (sections 4.7 and 4.17), by the host the request named and its
     /// path: the node's alone where no host takes it, and the host's
@@ -2588,6 +2600,13 @@ mod tests {
             }
             _ => panic!("not redirected"),
         }
+
+        // An edge that stops waits for the longest deadline any level
+        // sets.
+
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(routing.longest_deadline(second), 30 * second);
+        assert_eq!(routing.longest_deadline(300 * second), 300 * second);
 
         // A request's host is known by its configured name.
 
